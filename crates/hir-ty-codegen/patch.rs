@@ -759,6 +759,10 @@ pub(super) struct Base {
     /// edit is made: the next edit waits for it, and asks itself when it is of another
     /// revision or the threads were stopped.
     settling: Option<Settling>,
+    /// The revisions the database went through since the last edit by taking in files it did
+    /// not have, each from one to the next: the edit they are of pushes them, so what was made
+    /// of the items at one of them is of the next too.
+    went: Vec<(salsa::Revision, salsa::Revision)>,
 }
 
 /// See [`Base::making`].
@@ -1467,6 +1471,7 @@ impl Base {
             making: None,
             reitem: None,
             settling: None,
+            went: Vec::new(),
         })
         .map(|mut base| {
             base.make_items(db, cg.symbols);
@@ -1549,6 +1554,7 @@ impl Base {
             making: None,
             reitem: None,
             settling: None,
+            went: Vec::new(),
         }
     }
 
@@ -1888,10 +1894,32 @@ impl Base {
         let Some(making) = self.making.take() else { return };
         let made = making.lock().unwrap_or_else(|e| e.into_inner()).take();
         let now = salsa::plumbing::current_revision(db);
-        self.items = made.filter(|(at, _)| *at == now).map(|(_, items)| items);
+        let why = match &made {
+            None => "not made before the edit",
+            Some(_) => "made of another revision",
+        };
+        self.items = made.filter(|(at, _)| self.of_now(*at, now)).map(|(_, items)| items);
         if self.items.is_none() && std::env::var_os("RA_JIT_STATS").is_some() {
-            eprintln!("items: not made before the edit");
+            eprintln!("items: {why}");
         }
+    }
+
+    /// Whether what was made at revision `at` is of `now`: the database went from one to the
+    /// other by taking in files alone, which the next edit pushes.
+    fn of_now(&self, mut at: salsa::Revision, now: salsa::Revision) -> bool {
+        while at != now {
+            match self.went.iter().find(|(from, _)| *from == at) {
+                Some(&(_, to)) => at = to,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Notes that the database went from revision `from` to `to` by taking in files it did
+    /// not have, which the next edit is of.
+    pub(super) fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        self.went.push((from, to));
     }
 
     /// Once the patch of an edit is made: what the edit asked about refers to now is asked on
@@ -1940,14 +1968,14 @@ impl Base {
         if files.is_empty() {
             return;
         }
-        let settling = self.settling.take();
-        let Some(items) = &mut self.items else { return };
-        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
         let now = salsa::plumbing::current_revision(db);
-        let settled = settling
+        let settled = (self.settling.take().filter(|_| self.items.is_some()))
             .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
             .and_then(|it| it.recv().ok())
-            .filter(|(at, _)| *at == now);
+            .filter(|(at, _)| self.of_now(*at, now));
+        self.went.clear();
+        let Some(items) = &mut self.items else { return };
+        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
         let taken = probe(|| {
             hir_ty::attach_db(db, || {
                 let took = start.elapsed();

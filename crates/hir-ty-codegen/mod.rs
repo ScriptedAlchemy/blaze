@@ -407,6 +407,11 @@ fn do_edits_follow() -> bool {
 
 pub use blaze_items::Fan;
 
+/// The revision the database is at, which [`Rejections::files_added`] is told of.
+pub fn revision(db: &dyn HirDatabase) -> salsa::Revision {
+    salsa::plumbing::current_revision(db)
+}
+
 /// See [`SymbolResolver::in_background`].
 pub type Background = Box<dyn FnOnce(&dyn HirDatabase, &Fan<'_>) + Send>;
 
@@ -1529,6 +1534,14 @@ impl Rejections {
             rustc.touch_added(db, crates, files);
         }
         self.forget();
+    }
+
+    /// Notes that the database went from revision `from` to `to` by taking in files it did not
+    /// have, which the next edit is of: see [`revision`].
+    pub fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        if let Some(base) = &mut self.base {
+            base.files_added(from, to);
+        }
     }
 
     /// Before an edit of `files`, of the revision before it, with the threads `fan` has.

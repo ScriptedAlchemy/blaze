@@ -8815,7 +8815,13 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db, &changed).added {
+            let from = hir_ty_codegen::revision(&db);
+            let added = tree.added(&mut db, &changed).added;
+            if !added.is_empty() {
+                let to = hir_ty_codegen::revision(&db);
+                programs.iter_mut().for_each(|it| it.known.files_added(from, to));
+            }
+            for (file, path) in added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,

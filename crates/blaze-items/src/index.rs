@@ -214,7 +214,7 @@ impl Index {
     pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
         let dirty: Vec<FileId> = self.dirty.drain().collect();
         if !dirty.is_empty() {
-            let declared = self.declared(db, &dirty);
+            let declared = self.declared(db, fan, &dirty);
             let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
             let mut entries = entries_of(db, fan, &ids).into_iter();
             for (file, now) in declared {
@@ -239,16 +239,31 @@ impl Index {
         self.dirty.extend(files.iter().copied());
     }
 
-    /// The items each of `files` declares now.
-    fn declared(&self, db: &dyn HirDatabase, files: &[FileId]) -> Vec<(FileId, Vec<ItemId>)> {
-        let of = |file: FileId| {
-            let mut now = Vec::new();
-            for krate in self.crates_of(db, file) {
-                declared_in(db, krate, file, &mut now);
-            }
-            (file, now)
+    /// The items each of `files` declares now, on the threads `fan` has.
+    fn declared(
+        &self,
+        db: &dyn HirDatabase,
+        fan: &Fan<'_>,
+        files: &[FileId],
+    ) -> Vec<(FileId, Vec<ItemId>)> {
+        let crates: Vec<Vec<Crate>> = files.iter().map(|&it| self.crates_of(db, it)).collect();
+        let declared: Vec<OnceLock<Vec<ItemId>>> = files.iter().map(|_| OnceLock::new()).collect();
+        let work = |db: &dyn HirDatabase, at: usize| {
+            declared[at].get_or_init(|| {
+                let mut now = Vec::new();
+                for &krate in &crates[at] {
+                    declared_in(db, krate, files[at], &mut now);
+                }
+                now
+            });
         };
-        files.iter().map(|&file| of(file)).collect()
+        fan(files.len(), &work);
+        (0..files.len()).for_each(|at| work(db, at));
+        files
+            .iter()
+            .copied()
+            .zip(declared.into_iter().map(|it| it.into_inner().unwrap_or_default()))
+            .collect()
     }
 
     /// Notes that an edit since [`Index::before_edit`] can have changed the bindings of modules.
@@ -366,7 +381,8 @@ impl Index {
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
         let mut counterparts: FxHashMap<ItemId, ItemId> = FxHashMap::default();
         let mut written = 0;
-        let declared = self.declared(db, &rewritten);
+        let declared = self.declared(db, fan, &rewritten);
+        let declared_at = start.elapsed();
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
         let mut entries = entries_of(db, fan, &ids).into_iter();
         for (file, now) in declared {
@@ -471,11 +487,12 @@ impl Index {
         if std::env::var_os("RA_JIT_STATS").is_some() {
             let took: Vec<u128> = took.iter().map(|it| it.as_micros()).collect();
             eprintln!(
-                "items-pushed: {} of {} crates around; crates {} us, bindings {}, files {}, names {}, users {}",
+                "items-pushed: {} of {} crates around; crates {} us, bindings {}, declared {}, files {}, names {}, users {}",
                 around.len(),
                 self.crates.len(),
                 took[0],
                 took[1],
+                declared_at.as_micros(),
                 took[2],
                 took[3],
                 took[4]
