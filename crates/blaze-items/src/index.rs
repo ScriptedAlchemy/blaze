@@ -238,6 +238,8 @@ impl Index {
         db: &dyn HirDatabase,
         files: &[FileId],
     ) -> Result<Pushed, &'static str> {
+        let start = std::time::Instant::now();
+        let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
             let crates = self.crates_of(db, file);
@@ -272,6 +274,7 @@ impl Index {
             };
             bound.entry(name.clone()).or_default().push(it);
         };
+        took.push(start.elapsed());
         let mut rewritten: Vec<FileId> = files.to_vec();
         let mut scopes = Vec::new();
         for &krate in &around {
@@ -305,6 +308,7 @@ impl Index {
             scopes.push((krate, now));
         }
 
+        took.push(start.elapsed());
         // The files written again, beside their entries.
         let cx = form::Cx::new(db);
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
@@ -353,6 +357,7 @@ impl Index {
             self.dirty.remove(&file);
         }
 
+        took.push(start.elapsed());
         // What is written with a name bound to something else now, written again.
         let pushed =
             Pushed { changed: FxHashSet::default(), bound, methods, files: Vec::new(), written: 0 };
@@ -390,6 +395,7 @@ impl Index {
             self.scopes.insert(krate, now);
         }
 
+        took.push(start.elapsed());
         // And what sees one of those through its interface.
         let mut queue: Vec<ItemId> = changed.iter().copied().collect();
         while let Some(id) = queue.pop() {
@@ -405,6 +411,20 @@ impl Index {
                     queue.push(user);
                 }
             }
+        }
+        took.push(start.elapsed());
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let took: Vec<u128> = took.iter().map(|it| it.as_micros()).collect();
+            eprintln!(
+                "items-pushed: {} of {} crates around; crates {} us, bindings {}, files {}, names {}, users {}",
+                around.len(),
+                self.crates.len(),
+                took[0],
+                took[1],
+                took[2],
+                took[3],
+                took[4]
+            );
         }
         Ok(Pushed { changed, files: rewritten, written, ..pushed })
     }
