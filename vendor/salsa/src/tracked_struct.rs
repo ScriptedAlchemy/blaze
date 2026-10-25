@@ -737,11 +737,15 @@ where
                 .expect("already verified that generation is not maximum");
         }
 
-        // A field that is the same keeps its revision when the struct is less durable now, as a
-        // backdated memo does: the input that made it so was set at its old durability, which
-        // has every reader verify, and a reader that verifies takes the durability of the
-        // field as it is now.
+        // A struct less durable now has every field changed, as a memo less durable is not
+        // backdated (`can_backdate`).
         let durability = unsafe { &mut (*data_raw).durability };
+        if current_deps.durability < *durability {
+            let new_revisions = C::new_revisions(current_deps.changed_at);
+            for i in 0..C::TRACKED_FIELD_INDICES.len() {
+                revisions[i].store(new_revisions[i].load());
+            }
+        }
         *durability = current_deps.durability;
         // SAFETY: `updated_at` is never exclusively borrowed, so borrowing it is sound
         // release the lock

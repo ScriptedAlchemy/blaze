@@ -42,10 +42,11 @@ impl MemoHeader {
         // OR write many tests showing that it is (and fixing the case where it didn't correctly account for today).
         revisions.cycle_heads().is_empty()
             && !self.may_be_provisional()
-        // A value that became less durable than it was is still backdated. Its readers had
-        // its old durability or a lower one, which the write that made it re-execute reported
-        // as changed: each verifies again, and takes the lower durability then
-        // (`deep_verify_memo`). See the test `durable_to_less_durable`.
+            // Careful: if the value became less durable than it
+            // used to be, that is a "breaking change" that our
+            // consumers must be aware of. Becoming *more* durable
+            // is not. See the test `durable_to_less_durable`.
+            && revisions.durability.load() >= self.revisions.durability.load()
     }
 
     fn backdate(&self, index: DatabaseKeyIndex, revisions: &mut QueryRevisions) {

@@ -57,10 +57,11 @@ fn counted_add3(db: &dyn Database, a: N, b: N, c: N) -> u32 {
     add(db, a, b) + c.value(db)
 }
 
-/// A value that became less durable but is the same is backdated: what read it is verified
-/// rather than run again, and takes the lower durability, so a change after reaches it.
+/// A value that became less durable is not backdated: what read it runs again and takes the
+/// lower durability, so a change after reaches it, and a write of low durability alone after
+/// that is verified without running it.
 #[test]
-fn less_durable_is_backdated() {
+fn less_durable_runs_again() {
     let mut db = salsa::DatabaseImpl::new();
     let runs = || SUMS.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -72,16 +73,15 @@ fn less_durable_is_backdated() {
 
     a.set_value(&mut db).with_durability(Durability::LOW).to(11);
     assert_eq!(counted_add3(&db, a, b, c), 66);
-    assert_eq!(runs(), 1);
+    assert_eq!(runs(), 2);
 
     a.set_value(&mut db).to(22);
     assert_eq!(counted_add3(&db, a, b, c), 77);
-    assert_eq!(runs(), 2);
+    assert_eq!(runs(), 3);
 
-    // Only what is of low durability changed: the sum is verified without walking to `a`.
     db.synthetic_write(Durability::LOW);
     assert_eq!(counted_add3(&db, a, b, c), 77);
-    assert_eq!(runs(), 2);
+    assert_eq!(runs(), 3);
 }
 
 #[salsa::tracked]
@@ -104,10 +104,10 @@ fn read_sum(db: &dyn Database, a: N, b: N) -> u32 {
     sum(db, a, b).value(db)
 }
 
-/// A field of a tracked struct made again less durable but the same keeps its revision: what
-/// read it is verified rather than run again, and a change after reaches it.
+/// A field of a tracked struct made again less durable is changed: what read it runs again,
+/// and a change after reaches it.
 #[test]
-fn less_durable_field_is_kept() {
+fn less_durable_field_runs_again() {
     let mut db = salsa::DatabaseImpl::new();
     let runs = || READS.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -118,13 +118,13 @@ fn less_durable_field_is_kept() {
 
     a.set_value(&mut db).with_durability(Durability::LOW).to(11);
     assert_eq!(read_sum(&db, a, b), 33);
-    assert_eq!(runs(), 1);
+    assert_eq!(runs(), 2);
 
     a.set_value(&mut db).to(22);
     assert_eq!(read_sum(&db, a, b), 44);
-    assert_eq!(runs(), 2);
+    assert_eq!(runs(), 3);
 
     db.synthetic_write(Durability::LOW);
     assert_eq!(read_sum(&db, a, b), 44);
-    assert_eq!(runs(), 2);
+    assert_eq!(runs(), 3);
 }
