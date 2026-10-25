@@ -1883,15 +1883,26 @@ impl Base {
     /// Before an edit of `files`: what the edits before it left of the items is taken in, of
     /// the revision they left.
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+        let start = std::time::Instant::now();
         self.take_made(db);
         let Some(items) = &mut self.items else { return };
         let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
         let taken = probe(|| {
             hir_ty::attach_db(db, || {
+                let took = start.elapsed();
                 if let Some(asked) = reitem {
                     items.settle(db, &asked, compiled, instances);
                 }
+                let settled = start.elapsed();
                 items.index.before_edit(db, files);
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    eprintln!(
+                        "items-before: taken {} us, settled {} us, written {} us",
+                        took.as_micros(),
+                        (settled - took).as_micros(),
+                        (start.elapsed() - settled).as_micros()
+                    );
+                }
             })
         });
         if taken.is_none() {

@@ -8972,11 +8972,27 @@ fn run_holding(
         homed.extend(&editing);
         homed.sort_unstable();
         homed.dedup();
+        let homes = read.elapsed();
         home_in_rustcs(&db, &listed, &mut programs, &homed);
+        let homed_in = read.elapsed();
         outlines.before_edit(&db, &listed, &editing);
+        let outlined = read.elapsed();
+        let mut checked = Duration::ZERO;
         for program in &mut programs {
+            let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
+            checked += at.elapsed();
             program.known.before_edit(&db, &editing);
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "read-us: texts={} homes={} outlines={} checked={} known={}",
+                homes.as_micros(),
+                (homed_in - homes).as_micros(),
+                (outlined - homed_in).as_micros(),
+                checked.as_micros(),
+                (read.elapsed() - outlined - checked).as_micros()
+            );
         }
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
