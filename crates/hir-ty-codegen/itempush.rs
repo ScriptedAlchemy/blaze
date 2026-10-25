@@ -74,6 +74,12 @@ impl ItemPush {
             .copied()
             .filter(|it| it.data(db).origin.is_local())
             .collect();
+        // A base of code from the store resolved the names of few crates: each thread takes
+        // one, and waits on the others its crate depends on.
+        let resolve = |db: &dyn HirDatabase, at: usize| {
+            _ = hir_def::nameres::crate_def_map(db, crates[at]);
+        };
+        fan(crates.len(), &resolve);
         let modules = blaze_items::modules_in(db, &crates);
         let declared = start.elapsed();
         let parts = |n: usize| n.div_ceil(PART);

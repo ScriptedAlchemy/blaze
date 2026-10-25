@@ -760,7 +760,7 @@ impl CodegenUnit {
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
                 };
-                base.settle_later(db, symbols);
+                base.after_patch(db, symbols);
                 known.put_base(base);
                 return Ok(Some(unit));
             }

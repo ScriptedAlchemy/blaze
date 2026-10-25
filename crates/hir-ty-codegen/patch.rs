@@ -1466,30 +1466,38 @@ impl Base {
             settling: None,
         })
         .map(|mut base| {
-            if super::do_edits_follow()
-                && std::env::var_os("RA_JIT_ITEM_PUSH").is_none_or(|it| it != "0")
-            {
-                let making = Making::default();
-                let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
-                let (compiled, instances) =
-                    (base.compiled.clone(), base.instances.keys().cloned().collect::<Vec<_>>());
-                let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
-                    let start = std::time::Instant::now();
-                    let items = ItemPush::new(db, fan, &compiled, &instances);
-                    if std::env::var_os("RA_JIT_STATS").is_some() {
-                        eprintln!(
-                            "items-us: {} for {} items",
-                            start.elapsed().as_micros(),
-                            items.index.items()
-                        );
-                    }
-                    *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
-                };
-                cg.symbols.in_background(db, Box::new(work));
-                base.making = Some(making);
-            }
+            base.make_items(db, cg.symbols);
             base
         })
+    }
+
+    /// Has [`Self::items`] made on threads of their own, of the revision the database is at,
+    /// when edits are to follow.
+    fn make_items(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.rustc
+            || !super::do_edits_follow()
+            || std::env::var_os("RA_JIT_ITEM_PUSH").is_some_and(|it| it == "0")
+        {
+            return;
+        }
+        let making = Making::default();
+        let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
+        let (compiled, instances) =
+            (self.compiled.clone(), self.instances.keys().cloned().collect::<Vec<_>>());
+        let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
+            let start = std::time::Instant::now();
+            let items = ItemPush::new(db, fan, &compiled, &instances);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-us: {} for {} items",
+                    start.elapsed().as_micros(),
+                    items.index.items()
+                );
+            }
+            *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
+        };
+        symbols.in_background(db, Box::new(work));
+        self.making = Some(making);
     }
 
     /// The executable rustc linked as a base, before anything of it is known: `home` takes
@@ -1884,9 +1892,15 @@ impl Base {
     }
 
     /// Once the patch of an edit is made: what the edit asked about refers to now is asked on
-    /// threads of their own, of the revision the patch is of, for the next edit to take.
-    pub(super) fn settle_later(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
-        let (Some(_), Some(asked)) = (&self.items, &self.reitem) else { return };
+    /// threads of their own, of the revision the patch is of, for the next edit to take; with
+    /// no items, those are made again, as an edit stopped the threads making them or left
+    /// them unable to tell.
+    pub(super) fn after_patch(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.items.is_none() {
+            self.reitem = None;
+            return self.make_items(db, symbols);
+        }
+        let Some(asked) = &self.reitem else { return };
         let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
         let (send, settling) = std::sync::mpsc::channel();
         let at = salsa::plumbing::current_revision(db);
