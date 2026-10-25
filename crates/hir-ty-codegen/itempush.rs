@@ -66,20 +66,21 @@ impl ItemPush {
             .copied()
             .filter(|it| it.data(db).origin.is_local())
             .collect();
-        let items = blaze_items::declared_by(db, &crates);
+        let (items, bodies) = blaze_items::declared_by(db, &crates);
         let declared = start.elapsed();
         let instances: Vec<&Instance> = instances.keys().collect();
         let parts = |n: usize| n.div_ceil(PART);
-        let (of_items, of_roots) = (parts(items.len()), parts(compiled.len()));
+        let (of_items, of_bodies, of_roots) =
+            (parts(items.len()), parts(bodies.len()), parts(compiled.len()));
         fn lock<T>(n: usize) -> Vec<OnceLock<T>> {
             (0..n).map(|_| OnceLock::new()).collect()
         }
-        let entries: Vec<OnceLock<blaze_items::Entries>> = lock(of_items);
+        let entries: Vec<OnceLock<blaze_items::Entries>> = lock(of_items + of_bodies);
         let roots: Vec<OnceLock<Vec<Told>>> = lock(of_roots);
         let of_instances: Vec<OnceLock<Vec<Told>>> = lock(parts(instances.len()));
         let part = |all: usize, at: usize| at * PART..((at + 1) * PART).min(all);
         let work = |db: &dyn HirDatabase, at: usize| {
-            if let Some(at) = at.checked_sub(of_items + of_roots) {
+            if let Some(at) = at.checked_sub(of_items + of_bodies + of_roots) {
                 of_instances[at].get_or_init(|| {
                     let refs = Refs::new(db);
                     let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
@@ -90,7 +91,7 @@ impl ItemPush {
                         .map(|i| used_by_instance(db, &refs, instances[i], &mut of_body))
                         .collect::<Vec<_>>()
                 });
-            } else if let Some(at) = at.checked_sub(of_items) {
+            } else if let Some(at) = at.checked_sub(of_items + of_bodies) {
                 roots[at].get_or_init(|| {
                     let refs = Refs::new(db);
                     part(compiled.len(), at)
@@ -98,10 +99,13 @@ impl ItemPush {
                         .collect::<Vec<_>>()
                 });
             } else {
-                entries[at].get_or_init(|| blaze_items::entries(db, &items[part(items.len(), at)]));
+                entries[at].get_or_init(|| match at.checked_sub(of_items) {
+                    Some(at) => blaze_items::entries_in_bodies(db, &bodies[part(bodies.len(), at)]),
+                    None => blaze_items::entries(db, &items[part(items.len(), at)]),
+                });
             }
         };
-        let count = of_items + of_roots + of_instances.len();
+        let count = entries.len() + of_roots + of_instances.len();
         symbols.in_parallel(count, &|db, _, at| work(db, at));
         (0..count).for_each(|at| work(db, at));
         let made = start.elapsed();

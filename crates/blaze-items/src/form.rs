@@ -632,7 +632,13 @@ impl<'db> Cx<'db> {
                 match unevaluated.def.0 {
                     GeneralConstId::ConstId(it) => f.item(ItemId::Const(it)),
                     GeneralConstId::StaticId(it) => f.item(ItemId::Static(it)),
-                    GeneralConstId::AnonConstId(_) => f.miss("an anonymous constant"),
+                    // Written where it is used, it is as much a part of it as a closure is.
+                    GeneralConstId::AnonConstId(it) => {
+                        match self.db.mir_body(InferBodyId::AnonConstId(it)) {
+                            Ok(body) => self.mir(f, body),
+                            Err(_) => f.miss("no MIR for an anonymous constant"),
+                        }
+                    }
                 }
                 self.args(f, unevaluated.args);
             }

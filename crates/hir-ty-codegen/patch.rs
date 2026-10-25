@@ -1853,10 +1853,12 @@ impl Base {
     /// the revision they left.
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
         let Some(items) = &mut self.items else { return };
-        if let Some(asked) = self.reitem.take() {
-            items.settle(db, &asked, &self.compiled, &self.instances);
-        }
-        items.index.before_edit(db, files);
+        hir_ty::attach_db(db, || {
+            if let Some(asked) = self.reitem.take() {
+                items.settle(db, &asked, &self.compiled, &self.instances);
+            }
+            items.index.before_edit(db, files);
+        });
     }
 
     /// Notes that `files` of `crates` changed in their items: what can have changed is what
@@ -1866,7 +1868,7 @@ impl Base {
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
         let start = std::time::Instant::now();
         let pushed = match &mut self.items {
-            Some(items) if !self.rustc => items.index.push(db, files),
+            Some(items) if !self.rustc => hir_ty::attach_db(db, || items.index.push(db, files)),
             Some(_) => Err("a base of rustc's"),
             None => Err("no items"),
         };

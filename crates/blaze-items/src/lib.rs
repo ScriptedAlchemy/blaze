@@ -35,7 +35,9 @@ use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
-pub use index::{Entries, Index, Pushed, code_names, declared_by, entries, file_of, modules_of};
+pub use index::{
+    Entries, Index, Pushed, code_names, declared_by, entries, entries_in_bodies, file_of, modules_of,
+};
 
 /// What items refer to, for many of them in turn.
 pub struct Refs<'db>(form::Cx<'db>);
@@ -410,13 +412,28 @@ fn components(n: usize, edges: &[Vec<Target>]) -> Vec<Vec<usize>> {
 /// The items a crate declares: in its modules, in the impls and traits there, and in the
 /// blocks of the bodies of all of them.
 fn declared(db: &dyn HirDatabase, krate: Crate, out: &mut Vec<ItemId>) {
-    let mut modules = vec![hir::Crate::from(krate).root_module(db)];
     let mut bodies = Vec::new();
+    in_modules(db, krate, out, &mut bodies);
+    in_bodies(db, bodies, out);
+}
+
+/// The items declared in the modules of `krate`, and the bodies in which more can be.
+fn in_modules(
+    db: &dyn HirDatabase,
+    krate: Crate,
+    out: &mut Vec<ItemId>,
+    bodies: &mut Vec<DefWithBodyId>,
+) {
+    let mut modules = vec![hir::Crate::from(krate).root_module(db)];
     while let Some(module) = modules.pop() {
         modules.extend(module.children(db));
         let id = hir_def::ModuleId::from(module);
-        in_scope(db, id.def_map(db).module(db, id).scope(db), out, &mut bodies);
+        in_scope(db, id.def_map(db).module(db, id).scope(db), out, bodies);
     }
+}
+
+/// The items declared in `bodies`, and in the bodies of those.
+fn in_bodies(db: &dyn HirDatabase, mut bodies: Vec<DefWithBodyId>, out: &mut Vec<ItemId>) {
     while let Some(body) = bodies.pop() {
         for (_, def_map) in Body::of(db, body).blocks(db) {
             for (_, module) in def_map.modules(db) {
