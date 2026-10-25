@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""commits.py PROJECT REPO COMMIT... [--work DIR] [--rounds N]: edit-to-result of real commits.
+"""commits.py PROJECT REPO COMMIT... [--work DIR] [--rounds N] [--keep]: edit-to-result of real commits.
 
 For each commit, a checkout of its parent (no `.git`, as leanprof.py copies one) is built with
 `cargo ra-jit build` and left until the daemon has built its own base; then the commit's files
@@ -7,8 +7,9 @@ are written into it (removed files removed) and `cargo ra-jit build` is timed, t
 are written back and it is timed again, `--rounds` times (default 2). The project's build
 arguments and environment are bench.py's; REPO is a full clone with the commits. Prints a line
 per commit and writes them as JSON to WORK/commits.json, with the lines of what the daemon said
-of each edit that tell how it took it (all it said is in WORK/<commit>/said-*.log). It measures
-and checks nothing.
+of each edit that tell how it took it (all it said is in WORK/<commit>/said-*.log). A commit's
+checkout, home and store are deleted once it is measured, a nushell one being 15 GB, unless
+`--keep`. It measures and checks nothing.
 """
 import json, os, re, shutil, subprocess, sys, time
 
@@ -17,7 +18,7 @@ from cargo_ra_jit import Side, wait_warm
 from memsplit import wait_own_base
 
 # What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
-SAID = re.compile(r"(bodies only|signatures only|functions added|signatures:|items:|apply-us|timeline-us|stale-|asked|compil|patch|full|edit-to-binary)")
+SAID = re.compile(r"(bodies only|signatures only|functions added|items|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
 
 
 def git(repo, *args, text=True):
@@ -42,7 +43,7 @@ def write(ws, files):
             f.write(data)
 
 
-def one(name, spec, repo, commit, work, rounds, extra_env):
+def one(name, spec, repo, commit, work, rounds, extra_env, keep):
     sha = git(repo, "rev-parse", commit).strip()
     parent = git(repo, "rev-parse", f"{sha}^").strip()
     subject = git(repo, "log", "-1", "--format=%s", sha).strip()
@@ -85,11 +86,15 @@ def one(name, spec, repo, commit, work, rounds, extra_env):
                 text = daemon.said(1)
                 with open(os.path.join(root, f"said-{n}-{label}.log"), "w") as f:
                     f.write(text)
-                said.append([line[:200] for line in text.splitlines() if SAID.search(line)][:40])
+                said.append([line[:200] for line in text.splitlines() if SAID.match(line)][:40])
         row["walls"], row["said"] = walls, said
         return row
     finally:
         ours.cargo("stop")
+        if not keep:
+            for entry in os.listdir(root):
+                if not entry.startswith("said-"):
+                    shutil.rmtree(os.path.join(root, entry), ignore_errors=True)
 
 
 def main():
@@ -97,12 +102,14 @@ def main():
     work = os.path.realpath(bench.options(argv, "--work", "/tmp/commits")[0])
     rounds = int(bench.options(argv, "--rounds", "2")[0])
     extra_env = dict(it.split("=", 1) for it in bench.options(argv, "--env"))
+    keep = "--keep" in argv
+    argv = [it for it in argv if it != "--keep"]
     name, repo, *commits = argv
     spec = bench.PROJECTS[name]
     os.makedirs(work, exist_ok=True)
     rows = []
     for commit in commits:
-        row = one(name, spec, repo, commit, work, rounds, extra_env)
+        row = one(name, spec, repo, commit, work, rounds, extra_env, keep)
         rows.append(row)
         print(json.dumps(row), flush=True)
         open(os.path.join(work, "commits.json"), "w").write(json.dumps(rows, indent=1))
