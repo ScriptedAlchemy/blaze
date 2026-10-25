@@ -2457,7 +2457,7 @@ impl Base {
         for (root, was, file) in
             handout.each(Look::Unnamed, self.unnamed.len()).map(|it| &self.unnamed[it])
         {
-            let touched = self.touched.reaches_around(root.krate(db))
+            let touched = probe(|| root.krate(db)).is_none_or(|it| self.touched.reaches_around(it))
                 || self.touched.reaches_bodies(Some(&[*file]))
                 || self.touched.roots.contains(root);
             if !touched {
@@ -2475,7 +2475,8 @@ impl Base {
         }
         for homed in handout.each(Look::Closures, self.closures.len()).map(|it| &self.closures[it])
         {
-            let touched = self.touched.reaches_around(homed.root.krate(db))
+            let krate = probe(|| homed.root.krate(db));
+            let touched = krate.is_none_or(|it| self.touched.reaches_around(it))
                 || self.touched.reaches_bodies(Some(&[homed.file]))
                 || self.touched.roots.contains(&homed.root);
             if !touched {
@@ -2583,9 +2584,10 @@ impl Base {
         for i in handout.each(Look::Skipped, self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
             let root = self.skipped[i].0;
-            let touched = self.touched.reaches_around(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]))
-                || self.touched.roots.contains(&root);
+            let at = probe(|| (root.krate(db), body_file(db, root.into())));
+            let touched = at.is_none_or(|(krate, file)| {
+                self.touched.reaches_around(krate) || self.touched.reaches_bodies(Some(&[file]))
+            }) || self.touched.roots.contains(&root);
             if !touched && !check_all {
                 continue;
             }

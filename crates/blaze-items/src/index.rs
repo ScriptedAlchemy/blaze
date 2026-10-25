@@ -49,6 +49,9 @@ pub struct Index {
 #[derive(Clone)]
 struct Entry {
     file: FileId,
+    /// Its crate, which the module of one gone can no longer be asked: the edit took the
+    /// module away, and salsa what it knew of it.
+    krate: Crate,
     /// The module it is written in and those that one is in.
     modules: Box<[ModuleId]>,
     digest: form::Hash,
@@ -307,7 +310,8 @@ impl Index {
             edited.extend(crates);
             // A file taken away is of no crate now, and its items are of the crates they were.
             let was = self.files.get(&file).into_iter().flatten();
-            edited.extend(was.map(|it| it.krate(db)).filter(|it| self.crates.contains(it)));
+            let was = was.filter_map(|it| self.entries.get(it)).map(|it| it.krate);
+            edited.extend(was.filter(|it| self.crates.contains(it)));
         }
         for &krate in &edited {
             if self.attrs.get(&krate) != Some(&attrs(db, krate)) {
@@ -665,6 +669,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     names.dedup();
     Some(Entry {
         file,
+        krate: id.krate(db),
         modules: modules_of(db, id).into(),
         digest: *hasher.finalize().as_bytes(),
         refs: refs.into(),
