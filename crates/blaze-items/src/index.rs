@@ -56,14 +56,19 @@ struct Entry {
     /// Whether it is written with an error, so that it is told changed whenever it is
     /// written again.
     erred: bool,
+    /// What [`changed_kind`], [`method_name`] and [`trait_counterpart`] say of it, kept for
+    /// when it is gone and nothing can be asked of it.
+    kind: Result<(), &'static str>,
+    method: Option<Symbol>,
+    counterpart: Option<ItemId>,
 }
 
 /// The bindings of a crate's modules, each name's by namespace: types and values, and macros.
 #[derive(Clone, Default)]
 struct Scope {
     names: FxHashMap<(ModuleId, Symbol), (u64, u64)>,
-    /// The file each module is written in.
-    modules: FxHashMap<ModuleId, FileId>,
+    /// The file each module is written in, and what a binding in it is a [`Bound`] as.
+    modules: FxHashMap<ModuleId, (FileId, Option<Symbol>, bool)>,
     /// Whether a macro call of the crate's items names no macro, which a macro bound anywhere
     /// can be the one it names.
     unresolved: bool,
@@ -264,14 +269,12 @@ impl Index {
         // The bindings, and the files of the modules added or taken away.
         let mut bound: FxHashMap<Symbol, Vec<Bound>> = FxHashMap::default();
         let mut methods: FxHashSet<Symbol> = FxHashSet::default();
-        let mut rebound = |key: &(ModuleId, Symbol)| {
+        // Of what the scopes kept, as a module taken away has nothing to be asked.
+        let mut rebound = |key: &(ModuleId, Symbol), was: &Scope, now: &Scope| {
             let (module, name) = key;
-            let it = Bound {
-                module: *module,
-                name: module.name(db).map(|it| it.symbol().clone()),
-                root: module.containing_module(db).is_none() && !module.is_block_module(db),
-            };
-            bound.entry(name.clone()).or_default().push(it);
+            let (_, of, root) = now.modules.get(module).or(was.modules.get(module)).cloned()?;
+            bound.entry(name.clone()).or_default().push(Bound { module: *module, name: of, root });
+            Some(())
         };
         took.push(start.elapsed());
         let mut rewritten: Vec<FileId> = files.to_vec();
@@ -301,7 +304,7 @@ impl Index {
                     }
                     Some(&(was_values, _)) if was_values == values => {}
                     None if macros != 0 && !moved(key) => return Err("a name bound to a macro"),
-                    _ => rebound(key),
+                    _ => rebound(key, was, &now).ok_or("a name bound in no module")?,
                 }
             }
             for (key, &(_, macros)) in &was.names {
@@ -309,11 +312,12 @@ impl Index {
                     if macros != 0 && !moved(key) {
                         return Err("a macro's name bound to nothing");
                     }
-                    rebound(key);
+                    rebound(key, was, &now).ok_or("a name bound in no module")?;
                 }
             }
-            for (module, file) in now.modules.iter().chain(&was.modules) {
-                if now.modules.get(module) != was.modules.get(module) && !rewritten.contains(file) {
+            for (module, (file, ..)) in now.modules.iter().chain(&was.modules) {
+                let file_of = |scope: &Scope| scope.modules.get(module).map(|it| it.0);
+                if file_of(&now) != file_of(was) && !rewritten.contains(file) {
                     rewritten.push(*file);
                 }
             }
@@ -324,6 +328,7 @@ impl Index {
         // The files written again, beside their entries.
         let cx = form::Cx::new(db);
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
+        let mut counterparts: FxHashMap<ItemId, ItemId> = FxHashMap::default();
         let mut written = 0;
         for &file in &rewritten {
             let was: FxHashSet<ItemId> =
@@ -334,8 +339,10 @@ impl Index {
             }
             let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
             for &id in was.iter().filter(|it| !now_set.contains(it)) {
-                changed_kind(db, id)?;
-                methods.extend(method_name(db, id));
+                let gone = &self.entries[&id];
+                gone.kind?;
+                methods.extend(gone.method.clone());
+                counterparts.extend(gone.counterpart.map(|it| (id, it)));
                 changed.insert(id);
             }
             for &id in &now {
@@ -350,13 +357,14 @@ impl Index {
                             && !entry.erred
                             && was.digest == entry.digest
                             && was.refs == entry.refs => {}
-                    Some(_) => {
-                        changed_kind(db, id)?;
+                    Some(was) => {
+                        was.kind?;
+                        entry.kind?;
                         changed.insert(id);
                     }
                     None => {
-                        changed_kind(db, id)?;
-                        methods.extend(method_name(db, id));
+                        entry.kind?;
+                        methods.extend(entry.method.clone());
                         changed.insert(id);
                     }
                 }
@@ -397,7 +405,8 @@ impl Index {
             }
             let was = &self.entries[&id];
             if was.erred || entry.erred || was.digest != entry.digest || was.refs != entry.refs {
-                changed_kind(db, id)?;
+                was.kind?;
+                entry.kind?;
                 changed.insert(id);
             }
             self.remove(id);
@@ -415,9 +424,8 @@ impl Index {
                 self.users.get(&id).into_iter().flatten().copied().collect();
             // What a projection through an impl is depends on the impl's associated items: a
             // change to one is a change to the trait's of its name, which the projection names.
-            if let Some(of_trait) = trait_counterpart(db, id) {
-                reached.push(of_trait);
-            }
+            let of_trait = self.entries.get(&id).and_then(|it| it.counterpart);
+            reached.extend(of_trait.or_else(|| counterparts.get(&id).copied()));
             for user in reached {
                 if changed.insert(user) {
                     queue.push(user);
@@ -581,6 +589,9 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
         names: names.into(),
         missed,
         erred,
+        kind: changed_kind(db, id),
+        method: method_name(db, id),
+        counterpart: trait_counterpart(db, id),
     })
 }
 
@@ -728,7 +739,9 @@ fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
         .any(|it| matches!(it.kind, DefDiagnosticKind::UnresolvedMacroCall { .. }));
     for (module, data) in def_map.modules(db) {
         let file = data.definition_source_file_id().original_file(db).file_id(db);
-        scope.modules.insert(module, file);
+        let name = module.name(db).map(|it| it.symbol().clone());
+        let root = module.containing_module(db).is_none() && !module.is_block_module(db);
+        scope.modules.insert(module, (file, name, root));
         for (name, per_ns) in data.scope(db).entries() {
             let hash = |it: &dyn Fn(&mut FxHasher)| {
                 let mut hasher = FxHasher::default();

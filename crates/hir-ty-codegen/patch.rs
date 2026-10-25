@@ -1885,12 +1885,18 @@ impl Base {
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
         self.take_made(db);
         let Some(items) = &mut self.items else { return };
-        hir_ty::attach_db(db, || {
-            if let Some(asked) = self.reitem.take() {
-                items.settle(db, &asked, &self.compiled, &self.instances);
-            }
-            items.index.before_edit(db, files);
+        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
+        let taken = probe(|| {
+            hir_ty::attach_db(db, || {
+                if let Some(asked) = reitem {
+                    items.settle(db, &asked, compiled, instances);
+                }
+                items.index.before_edit(db, files);
+            })
         });
+        if taken.is_none() {
+            self.items = None;
+        }
     }
 
     /// Notes that `files` of `crates` changed in their items: what can have changed is what
@@ -1900,13 +1906,20 @@ impl Base {
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
         let start = std::time::Instant::now();
         let pushed = match &mut self.items {
-            Some(items) if !self.rustc => hir_ty::attach_db(db, || items.index.push(db, files)),
+            Some(items) if !self.rustc => {
+                let push = || hir_ty::attach_db(db, || items.index.push(db, files));
+                probe(push).unwrap_or(Err("a query that panicked"))
+            }
             Some(_) => Err("a base of rustc's"),
             None => Err("no items"),
         };
         let pushed = match pushed {
             Ok(it) => it,
             Err(why) => {
+                // What a panic left of the index is of no revision.
+                if why == "a query that panicked" {
+                    self.items = None;
+                }
                 if stats {
                     eprintln!("items: whole crates: {why}");
                 }
