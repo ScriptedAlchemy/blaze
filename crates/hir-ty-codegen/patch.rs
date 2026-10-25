@@ -2414,7 +2414,8 @@ impl Base {
             match same {
                 Some(Some(true)) => {}
                 _ if !touched => {
-                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    let (crate_of, name) = (self.crates[i], &self.compiled[i].1);
+                    eprintln!("check-all: MISSED root {root:?} `{name}` of {crate_of:?}");
                     continue;
                 }
                 Some(Some(false)) => stale.roots.push(root),
