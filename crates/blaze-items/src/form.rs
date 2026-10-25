@@ -42,16 +42,17 @@ pub(crate) struct Sub {
 }
 
 pub(crate) struct Form {
-    hasher: blake3::Hasher,
+    /// `None` for a form written for what it refers to alone.
+    hasher: Option<blake3::Hasher>,
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
     missed: Option<&'static str>,
 }
 
 impl Form {
-    pub(crate) fn new(tag: &str) -> Form {
+    fn with(tag: &str, hashed: bool) -> Form {
         let mut form = Form {
-            hasher: blake3::Hasher::new(),
+            hasher: hashed.then(blake3::Hasher::new),
             refs: Vec::new(),
             slots: FxHashMap::default(),
             missed: None,
@@ -60,20 +61,26 @@ impl Form {
         form
     }
 
+    fn update(&mut self, bytes: &[u8]) {
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(bytes);
+        }
+    }
+
     fn u8(&mut self, value: u8) {
-        self.hasher.update(&[value]);
+        self.update(&[value]);
     }
 
     fn u32(&mut self, value: u32) {
-        self.hasher.update(&value.to_le_bytes());
+        self.update(&value.to_le_bytes());
     }
 
     fn u64(&mut self, value: u64) {
-        self.hasher.update(&value.to_le_bytes());
+        self.update(&value.to_le_bytes());
     }
 
     fn u128(&mut self, value: u128) {
-        self.hasher.update(&value.to_le_bytes());
+        self.update(&value.to_le_bytes());
     }
 
     fn len(&mut self, len: usize) {
@@ -82,7 +89,7 @@ impl Form {
 
     fn bytes(&mut self, bytes: &[u8]) {
         self.len(bytes.len());
-        self.hasher.update(bytes);
+        self.update(bytes);
     }
 
     fn str(&mut self, text: &str) {
@@ -92,7 +99,9 @@ impl Form {
     /// For what holds no id: what one build of blaze writes of it is the same in every run, and
     /// the store's keys hash what blaze was built from.
     fn debug(&mut self, value: &dyn Debug) {
-        self.str(&format!("{value:?}"));
+        if self.hasher.is_some() {
+            self.str(&format!("{value:?}"));
+        }
     }
 
     /// The slot of `id`: the first item referred to is 0, the next other one 1.
@@ -112,7 +121,7 @@ impl Form {
     }
 
     fn sub(&mut self, sub: &Sub) {
-        self.hasher.update(&sub.digest);
+        self.update(&sub.digest);
         for &id in &sub.refs {
             self.item(id);
         }
@@ -122,7 +131,8 @@ impl Form {
     }
 
     pub(crate) fn finish(self) -> Sub {
-        Sub { digest: *self.hasher.finalize().as_bytes(), refs: self.refs, missed: self.missed }
+        let digest = self.hasher.map_or([0; 32], |it| *it.finalize().as_bytes());
+        Sub { digest, refs: self.refs, missed: self.missed }
     }
 }
 
@@ -135,6 +145,8 @@ pub(crate) struct Node {
 pub(crate) struct Cx<'db> {
     db: &'db dyn HirDatabase,
     tys: RefCell<FxHashMap<Ty<'db>, Rc<Sub>>>,
+    /// Whether forms are hashed, or written for what they refer to alone.
+    hashed: bool,
 }
 
 /// The attributes that change what code is, or how it is linked or called: not the ones of
@@ -168,7 +180,16 @@ fn attrs_that_matter() -> AttrFlags {
 
 impl<'db> Cx<'db> {
     pub(crate) fn new(db: &'db dyn HirDatabase) -> Cx<'db> {
-        Cx { db, tys: RefCell::default() }
+        Cx { db, tys: RefCell::default(), hashed: true }
+    }
+
+    /// A `Cx` whose forms say what they refer to and are not hashed.
+    pub(crate) fn refs_only(db: &'db dyn HirDatabase) -> Cx<'db> {
+        Cx { db, tys: RefCell::default(), hashed: false }
+    }
+
+    fn form(&self, tag: &str) -> Form {
+        Form::with(tag, self.hashed)
     }
 
     pub(crate) fn node(&self, id: ItemId) -> Node {
@@ -179,7 +200,7 @@ impl<'db> Cx<'db> {
     /// its dependents see is all there is of it then.
     pub(crate) fn node_with(&self, id: ItemId, bodies: bool) -> Node {
         let db = self.db;
-        let mut form = Form::new(id.kind());
+        let mut form = self.form(id.kind());
         let f = &mut form;
         let mut body = None;
         match id {
@@ -303,7 +324,7 @@ impl<'db> Cx<'db> {
     }
 
     fn body(&self, def: DefWithBodyId) -> Sub {
-        let mut form = Form::new("body");
+        let mut form = self.form("body");
         match self.db.mir_body(InferBodyId::DefWithBodyId(def)) {
             Ok(body) => self.mir(&mut form, body),
             Err(_) => form.miss("no MIR"),
@@ -315,7 +336,7 @@ impl<'db> Cx<'db> {
     /// all the code it is, which [`Cx::body`] leaves them out of.
     pub(crate) fn code(&self, def: DefWithBodyId) -> Sub {
         let db = self.db;
-        let mut form = Form::new("code");
+        let mut form = self.form("code");
         form.sub(&self.body(def));
         let store = hir_def::expr_store::Body::of(db, def);
         let infer = hir_ty::InferenceResult::of(db, def);
@@ -341,7 +362,7 @@ impl<'db> Cx<'db> {
 
     /// What generic arguments refer to.
     pub(crate) fn of_args(&self, args: GenericArgs<'db>) -> Sub {
-        let mut form = Form::new("args");
+        let mut form = self.form("args");
         self.args(&mut form, args);
         form.finish()
     }
@@ -407,7 +428,7 @@ impl<'db> Cx<'db> {
         let sub = match known {
             Some(it) => it,
             None => {
-                let mut form = Form::new("ty");
+                let mut form = self.form("ty");
                 self.spell_ty(&mut form, ty);
                 let sub = Rc::new(form.finish());
                 self.tys.borrow_mut().insert(ty, sub.clone());
@@ -484,7 +505,7 @@ impl<'db> Cx<'db> {
                 // In an order of their own: the list is sorted by ids of this run.
                 let mut subs = Vec::new();
                 for predicate in predicates.iter() {
-                    let mut g = Form::new("existential");
+                    let mut g = self.form("existential");
                     match predicate.skip_binder() {
                         ExistentialPredicate::Trait(it) => {
                             g.u8(0);
@@ -653,7 +674,7 @@ impl<'db> Cx<'db> {
     fn clauses(&self, f: &mut Form, clauses: impl Iterator<Item = Clause<'db>>) {
         let subs = clauses
             .map(|clause| {
-                let mut g = Form::new("clause");
+                let mut g = self.form("clause");
                 self.clause(&mut g, clause);
                 g.finish()
             })
@@ -702,7 +723,7 @@ impl<'db> Cx<'db> {
     /// number in the order a walk from the start block reaches them.
     pub(crate) fn mir(&self, f: &mut Form, body: &MirBody<'db>) {
         let mut canon = Canon::new(body);
-        self.walk(&mut Form::new(""), &canon);
+        self.walk(&mut self.form(""), &canon);
         canon.collecting = false;
         self.walk(f, &canon);
         // A closure is part of the body it is written in.

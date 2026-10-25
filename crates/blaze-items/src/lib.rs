@@ -42,7 +42,7 @@ pub struct Refs<'db>(form::Cx<'db>);
 
 impl<'db> Refs<'db> {
     pub fn new(db: &'db dyn HirDatabase) -> Refs<'db> {
-        Refs(form::Cx::new(db))
+        Refs(form::Cx::refs_only(db))
     }
 
     /// What an item's interface refers to, and its code, with the coroutines written in it, or
