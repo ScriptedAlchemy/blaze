@@ -11,7 +11,8 @@ module, a function made private so that the glob no longer brings it, an inheren
 takes a call from a trait's, a trait's default method called directly and through `dyn`, and
 a file written again with nothing changed, a module added that imports a macro a module that
 stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call in a file
-that is not edited now names instead of std's. After each step
+that is not edited now names instead of std's, and then not, and the import of a macro taken
+away from a module that is edited. After each step
 the program the daemon built prints what cargo's prints, or both builds fail.
 
 The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
@@ -88,6 +89,8 @@ STEPS = [
         (D_RS, None, lambda _: "macro_rules! line {\n    () => {\n        500\n    };\n}\n"),
         (LIB_RS, "pub fn pick", "#[macro_use]\nmod d;\n\npub fn pick"),
     ]),
+    ("`#[macro_use]` taken off", [(LIB_RS, "#[macro_use]\nmod d;", "mod d;")]),
+    ("a macro's import taken away", [(C_RS, "use crate::a::tag;\n\n", ""), (C_RS, "tag!()", "crate::a::tag!()")]),
 ]
 
 

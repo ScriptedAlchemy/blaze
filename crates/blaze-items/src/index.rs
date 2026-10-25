@@ -17,6 +17,7 @@ use hir_def::{
     hir::{Expr, Pat, type_ref::TypeRef},
     nameres::{crate_def_map, diagnostics::DefDiagnosticKind},
     signatures::FunctionSignature,
+    visibility::Visibility,
 };
 use hir_expand::HirFileId;
 use hir_ty::db::HirDatabase;
@@ -80,6 +81,10 @@ struct Scope {
     /// The modules declared `#[macro_use]`, whose `macro_rules!` the module around sees after
     /// the declaration, by no name of its scope.
     textual: FxHashSet<ModuleId>,
+    /// The module each module is in.
+    parents: FxHashMap<ModuleId, ModuleId>,
+    /// The names bound to a macro that only their module and those in it see.
+    private_macros: FxHashSet<(ModuleId, Symbol)>,
 }
 
 /// What an edit changed, as [`Index::push`] found it.
@@ -345,16 +350,52 @@ impl Index {
             // A macro bound in a module added or taken away is named only through it, where
             // no name could reach one before, and in what is written again or names it: a
             // glob of it binds the name in a module that stays as well. Only a call that named
-            // no macro, or one the module's `macro_rules!` are seen in by `#[macro_use]`, can
-            // be another's now.
+            // no macro, or one the `macro_rules!` of a module declared `#[macro_use]` now or
+            // before are seen in, can be another's now.
             let kept = |module: &ModuleId| {
                 now.modules.contains_key(module) && was.modules.contains_key(module)
             };
-            let textual = now.textual.iter().chain(&was.textual);
-            if textual.into_iter().any(|it| !kept(it)) {
-                return Err("a `#[macro_use]` module added or taken away");
+            if now.textual != was.textual {
+                return Err("a module declared `#[macro_use]` now or before");
+            }
+            for (module, (file, ..)) in now.modules.iter().chain(&was.modules) {
+                let file_of = |scope: &Scope| scope.modules.get(module).map(|it| it.0);
+                if file_of(&now) != file_of(was) && !rewritten.contains(file) {
+                    rewritten.push(*file);
+                }
             }
             let moved = |key: &(ModuleId, Symbol)| !was.unresolved && !kept(&key.0);
+            // A macro bound in a module that stays is seen where the name is written, which is
+            // asked again, and in what a macro wrote around the items: in calls of it among
+            // the items of a module or a block, in a derive or an attribute. Those of a module
+            // written again are written again too. Where only that module and those in it
+            // can see the macro, and all of those are, nothing else can be another's.
+            let within = |module: &ModuleId, of: &ModuleId| {
+                let mut at = Some(*module);
+                while let Some(it) = at {
+                    if it == *of {
+                        return true;
+                    }
+                    at = now.parents.get(&it).or(was.parents.get(&it)).copied();
+                }
+                false
+            };
+            let local = |key: &(ModuleId, Symbol)| {
+                let private = |scope: &Scope| {
+                    scope.names.get(key).is_none_or(|it| it.1 == 0)
+                        || scope.private_macros.contains(key)
+                };
+                let written = |module: &ModuleId| {
+                    !kept(module)
+                        || now.modules.get(module).is_some_and(|it| rewritten.contains(&it.0))
+                };
+                !was.unresolved
+                    && private(was)
+                    && private(&now)
+                    && (now.modules.keys().chain(was.modules.keys()))
+                        .filter(|it| within(it, &key.0))
+                        .all(written)
+            };
             let macro_refused = |why: &'static str, (module, name): &(ModuleId, Symbol)| {
                 if std::env::var_os("RA_JIT_STATS").is_some() {
                     let (kept, unresolved) = (kept(module), was.unresolved);
@@ -367,11 +408,11 @@ impl Index {
             };
             for (key, &(values, macros)) in &now.names {
                 match was.names.get(key) {
-                    Some(&(_, was_macros)) if was_macros != macros => {
+                    Some(&(_, was_macros)) if was_macros != macros && !local(key) => {
                         return Err(macro_refused("a name bound to another macro", key));
                     }
-                    Some(&(was_values, _)) if was_values == values => {}
-                    None if macros != 0 && !moved(key) => {
+                    Some(&it) if it == (values, macros) => {}
+                    None if macros != 0 && !moved(key) && !local(key) => {
                         return Err(macro_refused("a name bound to a macro", key));
                     }
                     _ => rebound(key, was, &now).ok_or("a name bound in no module")?,
@@ -379,16 +420,10 @@ impl Index {
             }
             for (key, &(_, macros)) in &was.names {
                 if !now.names.contains_key(key) {
-                    if macros != 0 && !moved(key) {
+                    if macros != 0 && !moved(key) && !local(key) {
                         return Err(macro_refused("a macro's name bound to nothing", key));
                     }
                     rebound(key, was, &now).ok_or("a name bound in no module")?;
-                }
-            }
-            for (module, (file, ..)) in now.modules.iter().chain(&was.modules) {
-                let file_of = |scope: &Scope| scope.modules.get(module).map(|it| it.0);
-                if file_of(&now) != file_of(was) && !rewritten.contains(file) {
-                    rewritten.push(*file);
                 }
             }
             scopes.push((krate, now));
@@ -841,6 +876,9 @@ fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
         let name = module.name(db).map(|it| it.symbol().clone());
         let root = module.containing_module(db).is_none() && !module.is_block_module(db);
         scope.modules.insert(module, (file, name, root));
+        if let Some(parent) = hir::Module::from(module).parent(db) {
+            scope.parents.insert(module, parent.into());
+        }
         let macro_use =
             |it: syntax::ast::Attr| it.syntax().text().to_string().contains("macro_use");
         if data.declaration_source(db).is_some_and(|it| it.value.attrs().any(macro_use)) {
@@ -862,6 +900,12 @@ fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
                 Some(it) => hash(&|h| (it.def, it.vis).hash(h)) | 1,
                 None => 0,
             };
+            if per_ns
+                .macros
+                .is_some_and(|it| matches!(it.vis, Visibility::Module(m, _) if m == module))
+            {
+                scope.private_macros.insert((module, name.symbol().clone()));
+            }
             scope.names.insert((module, name.symbol().clone()), (values, macros));
         }
     }
