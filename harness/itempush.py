@@ -9,7 +9,9 @@ in the ways that move what a name is bound to: imports reordered, a glob import 
 the shadow taken away, a re-export bound to another function, a function moved to another
 module, a function made private so that the glob no longer brings it, an inherent method that
 takes a call from a trait's, a trait's default method called directly and through `dyn`, and
-a file written again with nothing changed. After each step
+a file written again with nothing changed, a module added that imports a macro a module that
+stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call of the
+module around now names instead of the one it imported. After each step
 the program the daemon built prints what cargo's prints, or both builds fail.
 
 The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
@@ -33,7 +35,7 @@ use a::*;
 pub use b::scale;
 
 pub fn pick() -> u32 {
-    value()
+    value() + tag!()
 }
 
 pub trait Area {
@@ -47,13 +49,14 @@ FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
     "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
     "lib/src/lib.rs": LIB,
-    "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n",
+    "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
     "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
     "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
+C_RS, D_RS = "lib/src/c.rs", "lib/src/d.rs"
 INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
 # (step, edits); an edit is (file, old, new), with `None` for old to write the file whole.
 STEPS = [
@@ -74,6 +77,14 @@ STEPS = [
     ("inherent method taken away", [(SHAPES_RS, INHERENT, "")]),
     ("trait default", [(LIB_RS, "self.area() * 2", "self.area() * 4")]),
     ("written again", [(LIB_RS, None, lambda text: text)]),
+    ("module added importing a macro", [
+        (C_RS, None, lambda _: "use crate::a::tag;\n\npub fn more() -> u32 {\n    tag!() + 40\n}\n"),
+        (LIB_RS, "mod b;\n", "mod b;\nmod c;\n"),
+    ]),
+    ("`#[macro_use]` module added", [
+        (D_RS, None, lambda _: "macro_rules! tag {\n    () => {\n        5\n    };\n}\n"),
+        (LIB_RS, "pub fn pick", "#[macro_use]\nmod d;\n\npub fn pick"),
+    ]),
 ]
 
 
@@ -113,7 +124,7 @@ def steps(check_all):
         for step, edits in STEPS:
             for path, old, new in edits:
                 path = os.path.join(ws, path)
-                text = open(path).read()
+                text = open(path).read() if os.path.exists(path) else ""
                 if old is None:
                     text = new(text)
                 elif old not in text:

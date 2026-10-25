@@ -22,7 +22,7 @@ use hir_expand::HirFileId;
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast::HasAttrs};
 
 use std::sync::OnceLock;
 
@@ -74,6 +74,9 @@ struct Scope {
     /// Whether a macro call of the crate's items names no macro, which a macro bound anywhere
     /// can be the one it names.
     unresolved: bool,
+    /// The modules declared `#[macro_use]`, whose `macro_rules!` the module around sees after
+    /// the declaration, by no name of its scope.
+    textual: FxHashSet<ModuleId>,
 }
 
 /// What an edit changed, as [`Index::push`] found it.
@@ -336,18 +339,18 @@ impl Index {
             let empty = Scope::default();
             let was = was.unwrap_or(&empty);
             // A macro bound in a module added or taken away is named only through it, where
-            // no name could reach one before, and in what is written again or names it: but
-            // where a name of a module that stays is one, it can be another's that it hides.
+            // no name could reach one before, and in what is written again or names it: a
+            // glob of it binds the name in a module that stays as well. Only a call that named
+            // no macro, or one the module's `macro_rules!` are seen in by `#[macro_use]`, can
+            // be another's now.
             let kept = |module: &ModuleId| {
                 now.modules.contains_key(module) && was.modules.contains_key(module)
             };
-            let kept_macros: FxHashSet<&Symbol> = (now.names.iter().chain(&was.names))
-                .filter(|((module, _), (_, macros))| *macros != 0 && kept(module))
-                .map(|((_, name), _)| name)
-                .collect();
-            let moved = |key: &(ModuleId, Symbol)| {
-                !was.unresolved && !kept(&key.0) && !kept_macros.contains(&key.1)
-            };
+            let textual = now.textual.iter().chain(&was.textual);
+            if textual.into_iter().any(|it| !kept(it)) {
+                return Err("a `#[macro_use]` module added or taken away");
+            }
+            let moved = |key: &(ModuleId, Symbol)| !was.unresolved && !kept(&key.0);
             for (key, &(values, macros)) in &now.names {
                 match was.names.get(key) {
                     Some(&(_, was_macros)) if was_macros != macros => {
@@ -821,6 +824,11 @@ fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
         let name = module.name(db).map(|it| it.symbol().clone());
         let root = module.containing_module(db).is_none() && !module.is_block_module(db);
         scope.modules.insert(module, (file, name, root));
+        let macro_use =
+            |it: syntax::ast::Attr| it.syntax().text().to_string().contains("macro_use");
+        if data.declaration_source(db).is_some_and(|it| it.value.attrs().any(macro_use)) {
+            scope.textual.insert(module);
+        }
         for (name, per_ns) in data.scope(db).entries() {
             let hash = |it: &dyn Fn(&mut FxHasher)| {
                 let mut hasher = FxHasher::default();
