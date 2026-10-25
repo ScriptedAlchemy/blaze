@@ -991,6 +991,9 @@ impl Touched {
         *self = Touched::default();
         for stale in found {
             self.roots.extend(&stale.roots);
+            // One taken away differs from the base until an edit brings it back, which a look
+            // tells only by asking again.
+            self.roots.extend(&stale.gone);
             self.instances.extend(stale.instances.iter().cloned());
             self.statics.extend(&stale.statics);
             self.hydrated.extend(stale.hydrated.iter().map(|(at, ..)| *at));
@@ -2427,7 +2430,8 @@ impl Base {
             handout.each(Look::Unnamed, self.unnamed.len()).map(|it| &self.unnamed[it])
         {
             let touched = self.touched.reaches_around(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[*file]));
+                || self.touched.reaches_bodies(Some(&[*file]))
+                || self.touched.roots.contains(root);
             if !touched {
                 continue;
             }
@@ -2444,7 +2448,8 @@ impl Base {
         for homed in handout.each(Look::Closures, self.closures.len()).map(|it| &self.closures[it])
         {
             let touched = self.touched.reaches_around(homed.root.krate(db))
-                || self.touched.reaches_bodies(Some(&[homed.file]));
+                || self.touched.reaches_bodies(Some(&[homed.file]))
+                || self.touched.roots.contains(&homed.root);
             if !touched {
                 continue;
             }
@@ -2551,7 +2556,8 @@ impl Base {
             let Some(was) = &self.left[i] else { continue };
             let root = self.skipped[i].0;
             let touched = self.touched.reaches_around(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]));
+                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]))
+                || self.touched.roots.contains(&root);
             if !touched && !check_all {
                 continue;
             }
