@@ -394,7 +394,7 @@ impl Index {
                             && was.refs == entry.refs => {}
                     Some(was) => {
                         was.kind.map_err(|why| refused(db, id, why, "changed"))?;
-                        entry.kind?;
+                        entry.kind.map_err(|why| refused(db, id, why, "changed"))?;
                         changed.insert(id);
                     }
                     None => {
@@ -440,7 +440,7 @@ impl Index {
             }
             let was = &self.entries[&id];
             if was.erred || entry.erred || was.digest != entry.digest || was.refs != entry.refs {
-                was.kind?;
+                was.kind.map_err(|why| refused(db, id, why, "named"))?;
                 entry.kind?;
                 changed.insert(id);
             }
@@ -810,12 +810,14 @@ fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
                 it(&mut hasher);
                 hasher.finish()
             };
+            // What a name is bound to and who sees it, not the import it comes through: a
+            // reorder of the `use`s of a module gives its imports other ids.
             let values = hash(&|h| {
-                per_ns.types.hash(h);
-                per_ns.values.hash(h);
+                per_ns.types.as_ref().map(|it| (it.def, it.vis)).hash(h);
+                per_ns.values.as_ref().map(|it| (it.def, it.vis)).hash(h);
             });
             let macros = match per_ns.macros {
-                Some(it) => hash(&|h| it.hash(h)) | 1,
+                Some(it) => hash(&|h| (it.def, it.vis).hash(h)) | 1,
                 None => 0,
             };
             scope.names.insert((module, name.symbol().clone()), (values, macros));
