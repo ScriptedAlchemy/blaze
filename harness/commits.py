@@ -6,13 +6,18 @@ For each commit, a checkout of its parent (no `.git`, as leanprof.py copies one)
 are written into it (removed files removed) and `cargo ra-jit build` is timed, then the parent's
 are written back and it is timed again, `--rounds` times (default 2). The project's build
 arguments and environment are bench.py's; REPO is a full clone with the commits. Prints a line
-per commit and writes them as JSON to WORK/commits.json. It measures and checks nothing.
+per commit and writes them as JSON to WORK/commits.json, with the lines of what the daemon said
+of each edit that tell how it took it (all it said is in WORK/<commit>/said-*.log). It measures
+and checks nothing.
 """
-import json, os, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time
 
 import bench, cargo_ra_jit
 from cargo_ra_jit import Side, wait_warm
 from memsplit import wait_own_base
+
+# What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
+SAID = re.compile(r"(bodies only|signatures only|functions added|signatures:|items:|apply-us|timeline-us|stale-|asked|compil|patch|full|edit-to-binary)")
 
 
 def git(repo, *args, text=True):
@@ -70,13 +75,18 @@ def one(name, spec, repo, commit, work, rounds, extra_env):
         wait_warm(ours, ws)
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
-        walls = []
-        for _ in range(rounds):
+        walls, said = [], []
+        daemon.said()
+        for n in range(rounds):
             for label, files in (("commit", after), ("back", before)):
                 write(ws, files)
                 took, ran = ours.cargo("build", *build)
                 walls.append((label, round(took, 3), ran.returncode, bench.how_built(ran.stderr)[:60]))
-        row["walls"] = walls
+                text = daemon.said(1)
+                with open(os.path.join(root, f"said-{n}-{label}.log"), "w") as f:
+                    f.write(text)
+                said.append([line[:200] for line in text.splitlines() if SAID.match(line)][:40])
+        row["walls"], row["said"] = walls, said
         return row
     finally:
         ours.cargo("stop")
