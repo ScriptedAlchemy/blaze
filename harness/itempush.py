@@ -68,7 +68,7 @@ STEPS = [
         (SHAPES_RS, "pub struct Sq", "pub fn value() -> u32 {\n    1\n}\n\npub struct Sq"),
     ]),
     ("made private", [(SHAPES_RS, "pub fn value", "fn value")]),
-    ("made public again", [(SHAPES_RS, "\nfn value", "\npub fn value")]),
+    ("made public again", [(SHAPES_RS, "fn value() -> u32 {\n    1\n}\n\npub struct", "pub fn value() -> u32 {\n    1\n}\n\npub struct")]),
     ("inherent method", [(SHAPES_RS, None, lambda text: text + INHERENT)]),
     ("inherent method taken away", [(SHAPES_RS, INHERENT, "")]),
     ("trait default", [(LIB_RS, "self.area() * 2", "self.area() * 4")]),
