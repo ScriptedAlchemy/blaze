@@ -4327,6 +4327,7 @@ fn build(
     // A thread asks of a database of its own.
     let slots: Vec<_> =
         (0..threads).map(|_| std::sync::Mutex::new(Some((db.clone(), resolver.parts())))).collect();
+    let handout = known.handout(threads);
     let parts = pool::on_all(threads, |part| {
         let (db, parts) = lock(&slots[part]).take().expect("a database for each part");
         let _probing = Probing::new();
@@ -4340,7 +4341,7 @@ fn build(
                 hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
             }
             let impls = start.elapsed();
-            let stale = known.stale(&db, Some(&resolver), part, threads);
+            let stale = handout.as_ref().and_then(|it| known.stale(&db, Some(&resolver), it));
             (stale, Spent { impls, wall: start.elapsed(), cpu: thread_cpu() - cpu })
         })
     });

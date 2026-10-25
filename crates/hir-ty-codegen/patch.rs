@@ -853,11 +853,67 @@ impl Homes {
     }
 }
 
-/// One part in `parts` of `all`, in order and each once.
-fn part_of(mut all: Vec<u32>, part: usize, parts: usize) -> impl Iterator<Item = usize> {
+/// `all` in order, each once.
+fn sorted(mut all: Vec<u32>) -> Vec<usize> {
     all.sort_unstable();
     all.dedup();
-    all.into_iter().skip(part).step_by(parts).map(|it| it as usize)
+    all.into_iter().map(|it| it as usize).collect()
+}
+
+/// What [`Base::stale`] looks at, handed to the threads that look a batch at a time. A
+/// question takes from microseconds to most of an edit, and a thread that is done with its
+/// batch takes the next of what is left rather than wait for the others to finish their share.
+/// A batch is a quarter of a thread's share of what is left: taking one is an atomic add on a
+/// line the others write too, hundreds of nanoseconds across the sockets, against the tens
+/// of microseconds of the question it hands out.
+pub struct Handout<'a> {
+    parts: usize,
+    check_all: bool,
+    roots: Vec<usize>,
+    instances: Vec<usize>,
+    statics: Vec<(&'a StaticId, &'a BaseStatic)>,
+    next: [std::sync::atomic::AtomicUsize; Look::COUNT],
+}
+
+/// The kinds of things [`Base::stale`] looks at, one after another.
+#[derive(Clone, Copy)]
+enum Look {
+    Rejected,
+    Roots,
+    Unnamed,
+    Closures,
+    Instances,
+    Hydrated,
+    Statics,
+    Skipped,
+    TheirInstances,
+    TheirStatics,
+}
+
+impl Look {
+    const COUNT: usize = Look::TheirStatics as usize + 1;
+}
+
+impl Handout<'_> {
+    /// The indices of the `len` things of the kind that this thread takes, as it gets to them.
+    fn each(&self, look: Look, len: usize) -> impl Iterator<Item = usize> + '_ {
+        use std::sync::atomic::Ordering::Relaxed;
+        let next = &self.next[look as usize];
+        let mut taken = 0..0;
+        std::iter::from_fn(move || {
+            if let Some(it) = taken.next() {
+                return Some(it);
+            }
+            let seen = next.load(Relaxed);
+            if seen >= len {
+                return None;
+            }
+            let batch = ((len - seen) / (self.parts * 4)).max(1);
+            let at = next.fetch_add(batch, Relaxed);
+            taken = at..(at + batch).min(len);
+            taken.next()
+        })
+    }
 }
 
 /// What an edit since the base was last looked at can have changed the code of, and what
@@ -1805,16 +1861,24 @@ impl Base {
         first.steps.left += start.elapsed();
     }
 
-    /// The roots an edit can have changed, or all of them, one part in `parts`.
-    fn roots_to_ask(
-        &self,
-        all: bool,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// What of the base an edit can have changed, for `parts` threads to look at together.
+    pub(super) fn handout(&self, parts: usize) -> Handout<'_> {
+        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        Handout {
+            parts: parts.max(1),
+            check_all,
+            roots: self.roots_to_ask(check_all),
+            instances: self.instances_to_ask(check_all),
+            statics: self.statics.iter().collect(),
+            next: Default::default(),
+        }
+    }
+
+    /// The roots an edit can have changed, or all of them.
+    fn roots_to_ask(&self, all: bool) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.compiled.len()).step_by(parts));
+            return (0..self.compiled.len()).collect();
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
@@ -1825,19 +1889,14 @@ impl Base {
         if touched.edited() {
             asked.extend(&self.cached_roots);
         }
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
-    /// The instances an edit can have changed, or all of them, one part in `parts`.
-    fn instances_to_ask(
-        &self,
-        all: bool,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// The instances an edit can have changed, or all of them.
+    fn instances_to_ask(&self, all: bool) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.instances.len()).step_by(parts));
+            return (0..self.instances.len()).collect();
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
@@ -1857,21 +1916,15 @@ impl Base {
                 .filter_map(|it| self.instances.get_index_of(it))
                 .map(|it| it as u32),
         );
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
-    /// The code from the store an edit can have changed, or all of it, one part in `parts`.
-    /// `edited` names the files whose bodies changed, `None` when one has no name.
-    fn hydrated_to_ask(
-        &self,
-        all: bool,
-        edited: Option<&[String]>,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// The code from the store an edit can have changed, or all of it. `edited` names the
+    /// files whose bodies changed, `None` when one has no name.
+    fn hydrated_to_ask(&self, all: bool, edited: Option<&[String]>) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any || edited.is_none() {
-            return Box::new((part..self.hydrated.len()).step_by(parts));
+            return (0..self.hydrated.len()).collect();
         }
         let homes = &self.hydrated_homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.of_crate.get(it));
@@ -1884,20 +1937,20 @@ impl Base {
             asked.extend(&homes.of_any_crate);
         }
         asked.extend(&touched.hydrated);
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
-    /// Looks at one part in `parts` of the code the base has from the store for what an edit
-    /// changed, comparing what it compiles to now with the mark the store had of it.
+    /// Looks at what this thread takes from `handout` of the code the base has from the store,
+    /// for what an edit changed, comparing what it compiles to now with the mark the store had
+    /// of it.
     fn stale_hydrated(
         &self,
         db: &dyn HirDatabase,
         names: &StableNames<'_, '_>,
-        check_all: bool,
-        part: usize,
-        parts: usize,
+        handout: &Handout<'_>,
         stale: &mut Stale,
     ) -> std::result::Result<(), &'static str> {
+        let check_all = handout.check_all;
         if self.hydrated.is_empty() {
             return Ok(());
         }
@@ -1906,7 +1959,8 @@ impl Base {
         let edited_paths: FxHashSet<&str> = edited.iter().flatten().map(String::as_str).collect();
         let mut homes = super::home::Homes::default();
         let mut found = FoundHydrated::default();
-        for i in self.hydrated_to_ask(check_all, edited.as_deref(), part, parts) {
+        let asked = self.hydrated_to_ask(check_all, edited.as_deref());
+        for i in handout.each(Look::Hydrated, asked.len()).map(|it| asked[it]) {
             let was = &self.hydrated[i];
             let in_edited = || {
                 edited.is_none()
@@ -2071,19 +2125,17 @@ impl Base {
         dropped
     }
 
-    /// What one part in `parts` of the base no longer is what it was. Looking is most of the
-    /// work of a patch, and the parts can be looked at on a thread each.
+    /// What of the base this thread takes from `handout` no longer is what it was. Looking is
+    /// most of the work of a patch, and threads look at it together.
     /// `symbols` names what the base has from the store, which nothing else tells an edit of.
     pub(super) fn stale(
         &self,
         db: &dyn HirDatabase,
         symbols: Option<&dyn SymbolResolver>,
-        part: usize,
-        parts: usize,
+        handout: &Handout<'_>,
     ) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
-        let every = |len: usize| (part..len).step_by(parts);
         let names = symbols.filter(|_| !self.ids.is_empty()).map(|symbols| {
             StableNames::new(db, symbols, self.owned.clone(), true).frozen(self.ids.clone())
         });
@@ -2092,15 +2144,15 @@ impl Base {
         }
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
-        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
-        for i in every(self.rejected.len()) {
+        let check_all = handout.check_all;
+        for i in handout.each(Look::Rejected, self.rejected.len()) {
             let (instance, env) = &self.rejected[i];
             let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
             if compiles != Some(false) {
                 return stale.declined("an instance that did not compile is another now");
             }
         }
-        for i in self.roots_to_ask(check_all, part, parts) {
+        for i in handout.each(Look::Roots, handout.roots.len()).map(|it| handout.roots[it]) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
                 || self.touched.reaches_bodies(Some(&[self.files[i]]))
@@ -2131,7 +2183,9 @@ impl Base {
                 None => stale.gone.push(root),
             }
         }
-        for (root, was, file) in self.unnamed.iter().skip(part).step_by(parts) {
+        for (root, was, file) in
+            handout.each(Look::Unnamed, self.unnamed.len()).map(|it| &self.unnamed[it])
+        {
             let touched = self.touched.reaches_around(root.krate(db))
                 || self.touched.reaches_bodies(Some(&[*file]));
             if !touched {
@@ -2147,7 +2201,8 @@ impl Base {
                 return stale.declined("a function that rustc's symbols name no copy of changed");
             }
         }
-        for homed in self.closures.iter().skip(part).step_by(parts) {
+        for homed in handout.each(Look::Closures, self.closures.len()).map(|it| &self.closures[it])
+        {
             let touched = self.touched.reaches_around(homed.root.krate(db))
                 || self.touched.reaches_bodies(Some(&[homed.file]));
             if !touched {
@@ -2180,7 +2235,8 @@ impl Base {
             }
         }
         stale.steps.roots = start.elapsed();
-        for i in self.instances_to_ask(check_all, part, parts) {
+        let instances = &handout.instances;
+        for i in handout.each(Look::Instances, instances.len()).map(|it| instances[it]) {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
             let touched = self.touched.reaches(was.env.krate)
                 || self.touched.reaches_bodies(was.files.as_deref())
@@ -2213,12 +2269,13 @@ impl Base {
             }
         }
         if let Some(names) = &names
-            && let Err(why) = self.stale_hydrated(db, names, check_all, part, parts, &mut stale)
+            && let Err(why) = self.stale_hydrated(db, names, handout, &mut stale)
         {
             return stale.declined(why);
         }
         stale.steps.instances = start.elapsed() - stale.steps.roots;
-        for (&id, was) in self.statics.iter().skip(part).step_by(parts) {
+        let statics = &handout.statics;
+        for (&id, was) in handout.each(Look::Statics, statics.len()).map(|it| statics[it]) {
             let touched = self.touched.reaches_around(was.krate)
                 || self.touched.reaches_bodies(Some(&[was.file]))
                 || self.touched.statics.contains(&id);
@@ -2250,7 +2307,7 @@ impl Base {
             }
         }
         stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
-        for i in every(self.skipped.len()) {
+        for i in handout.each(Look::Skipped, self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
             let root = self.skipped[i].0;
             let touched = self.touched.reaches_around(root.krate(db))
@@ -2271,7 +2328,7 @@ impl Base {
                 return stale.declined("a function left to rustc changed");
             }
         }
-        for i in every(self.their_walk.instances.len()) {
+        for i in handout.each(Look::TheirInstances, self.their_walk.instances.len()) {
             let was = &self.their_walk.instances[i];
             if !self.touched.reaches_around(was.env.krate)
                 && !self.touched.reaches_bodies(was.files.as_deref())
@@ -2287,7 +2344,7 @@ impl Base {
             });
             stale.their_walk_changed |= serial != Some(was.serial);
         }
-        for i in every(self.their_walk.statics.len()) {
+        for i in handout.each(Look::TheirStatics, self.their_walk.statics.len()) {
             let was = &self.their_walk.statics[i];
             if !self.touched.reaches_around(was.krate)
                 && !self.touched.reaches_bodies(Some(&[was.file]))
