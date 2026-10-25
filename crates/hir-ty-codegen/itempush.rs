@@ -4,7 +4,7 @@
 //! that can see the edited files (#344).
 
 use blaze_items::{Index, ItemId, Pushed, Refs};
-use hir_def::{DefWithBodyId, FunctionId};
+use hir_def::{DefWithBodyId, FunctionId, ModuleId};
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -26,13 +26,16 @@ pub(super) struct ItemPush {
 #[derive(Clone)]
 struct Used {
     items: Box<[ItemId]>,
+    /// In the order of their text.
     names: Box<[Symbol]>,
+    /// The modules the code is written in, and those they are in.
+    modules: Box<[ModuleId]>,
 }
 
 impl Used {
     fn touched(&self, pushed: &Pushed) -> bool {
         self.items.iter().any(|it| pushed.changed.contains(it))
-            || self.names.iter().any(|it| pushed.names.contains(it))
+            || pushed.rebinds(&self.modules, &self.names)
     }
 }
 
@@ -110,17 +113,20 @@ fn used_by_instance(
     of_body: &mut dyn FnMut(DefWithBodyId) -> Option<Used>,
 ) -> Option<Used> {
     let mut items = probe(|| refs.of_args(instance.args.as_ref())).flatten()?;
-    let mut names = Vec::new();
+    let (mut names, mut modules) = (Vec::new(), Vec::new());
     for body in probe(|| mentioned_bodies(db, instance)).flatten()? {
         let of = of_body(body)?;
         items.extend(of.items);
         names.extend(of.names);
+        modules.extend(of.modules);
     }
     let mut unique = FxHashSet::default();
     items.retain(|it| unique.insert(*it));
+    let mut unique = FxHashSet::default();
+    modules.retain(|it| unique.insert(*it));
     names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     names.dedup();
-    Some(Used { items: items.into(), names: names.into() })
+    Some(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }
 
 fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Option<Used> {
@@ -133,5 +139,6 @@ fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Option<Us
     let mut items = probe(|| refs.of_code(id, Some(body))).flatten()?;
     items.push(id);
     let names = probe(|| blaze_items::code_names(db, body))?;
-    Some(Used { items: items.into(), names: names.into() })
+    let modules = probe(|| blaze_items::modules_of(db, id))?;
+    Some(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }

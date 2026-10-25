@@ -47,6 +47,8 @@ pub struct Index {
 #[derive(Clone)]
 struct Entry {
     file: FileId,
+    /// The module it is written in and those that one is in.
+    modules: Box<[ModuleId]>,
     digest: form::Hash,
     refs: Box<[ItemId]>,
     names: Box<[Symbol]>,
@@ -66,13 +68,63 @@ pub struct Pushed {
     /// The items added, taken away or seen differently, and those that see one of them through
     /// their interface.
     pub changed: FxHashSet<ItemId>,
-    /// The names bound to something else now or to nothing, and those of methods added or
-    /// taken away: what calls something by one can call another thing now.
-    pub names: FxHashSet<Symbol>,
+    /// The names bound to something else now or to nothing, each with the modules it is bound
+    /// in so.
+    bound: FxHashMap<Symbol, Vec<Bound>>,
+    /// The names of methods added or taken away, which a call resolves through no module.
+    methods: FxHashSet<Symbol>,
     /// The files written again: those edited, and those of modules added or taken away.
     pub files: Vec<FileId>,
     /// How many items were written again.
     pub written: usize,
+}
+
+#[derive(Clone)]
+struct Bound {
+    module: ModuleId,
+    /// The module's name, which a path through it is written with.
+    name: Option<Symbol>,
+    /// Whether it is a crate's root, which a path from anywhere starts at.
+    root: bool,
+}
+
+impl Pushed {
+    /// How many names are bound to something else, or are of methods added or taken away.
+    pub fn names(&self) -> usize {
+        self.bound.len() + self.methods.len()
+    }
+
+    /// Whether code written in `modules` (its module and those that one is in) with `names`
+    /// (in the order of their text) can call something by a name bound to another thing now: it
+    /// names a method added or taken away, or a name bound differently in a crate's root, in
+    /// one of `modules`, or in a module it names.
+    pub fn rebinds(&self, modules: &[ModuleId], names: &[Symbol]) -> bool {
+        let named = |it: &Symbol| names.binary_search_by(|n| n.as_str().cmp(it.as_str())).is_ok();
+        names.iter().any(|name| {
+            self.methods.contains(name)
+                || self.bound.get(name).is_some_and(|bounds| {
+                    bounds.iter().any(|it| {
+                        it.root || modules.contains(&it.module) || it.name.as_ref().is_some_and(named)
+                    })
+                })
+        })
+    }
+}
+
+/// The module `id` is written in, and those that one is in.
+pub fn modules_of(db: &dyn HirDatabase, id: ItemId) -> Vec<ModuleId> {
+    use hir_def::HasModule;
+    let module = match id {
+        ItemId::Function(it) => it.module(db),
+        ItemId::Adt(it) => it.module(db),
+        ItemId::Trait(it) => it.module(db),
+        ItemId::Impl(it) => it.module(db),
+        ItemId::Const(it) => it.module(db),
+        ItemId::Static(it) => it.module(db),
+        ItemId::Alias(it) => it.module(db),
+        ItemId::Macro(it) => it.module(db),
+    };
+    hir::Module::from(module).path_to_root(db).into_iter().map(ModuleId::from).collect()
 }
 
 impl Index {
@@ -152,14 +204,13 @@ impl Index {
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
             let crates = self.crates_of(db, file);
-            if crates.is_empty() && self.files.get(&file).is_none_or(Vec::is_empty) {
-                // A file of no crate, before and after.
-                continue;
-            }
             if crates.is_empty() && base_db::relevant_crates(db, file).iter().next().is_some() {
                 return Err("a file of a crate not looked at");
             }
             edited.extend(crates);
+            // A file taken away is of no crate now, and its items are of the crates they were.
+            let was = self.files.get(&file).into_iter().flatten();
+            edited.extend(was.map(|it| it.krate(db)).filter(|it| self.crates.contains(it)));
         }
         for &krate in &edited {
             if self.attrs.get(&krate) != Some(&attrs(db, krate)) {
@@ -172,7 +223,17 @@ impl Index {
         }
 
         // The bindings, and the files of the modules added or taken away.
-        let mut names: FxHashSet<Symbol> = FxHashSet::default();
+        let mut bound: FxHashMap<Symbol, Vec<Bound>> = FxHashMap::default();
+        let mut methods: FxHashSet<Symbol> = FxHashSet::default();
+        let mut rebound = |key: &(ModuleId, Symbol)| {
+            let (module, name) = key;
+            let it = Bound {
+                module: *module,
+                name: module.name(db).map(|it| it.symbol().clone()),
+                root: module.containing_module(db).is_none() && !module.is_block_module(db),
+            };
+            bound.entry(name.clone()).or_default().push(it);
+        };
         let mut rewritten: Vec<FileId> = files.to_vec();
         let mut scopes = Vec::new();
         for &krate in &around {
@@ -187,7 +248,7 @@ impl Index {
                     }
                     Some(&(was_values, _)) if was_values == values => {}
                     None if macros != 0 => return Err("a name bound to a macro"),
-                    _ => _ = names.insert(key.1.clone()),
+                    _ => rebound(key),
                 }
             }
             for (key, &(_, macros)) in &was.names {
@@ -195,7 +256,7 @@ impl Index {
                     if macros != 0 {
                         return Err("a macro's name bound to nothing");
                     }
-                    names.insert(key.1.clone());
+                    rebound(key);
                 }
             }
             for (module, file) in now.modules.iter().chain(&was.modules) {
@@ -220,9 +281,7 @@ impl Index {
             let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
             for &id in was.iter().filter(|it| !now_set.contains(it)) {
                 changed_kind(db, id)?;
-                if let Some(name) = method_name(db, id) {
-                    names.insert(name);
-                }
+                methods.extend(method_name(db, id));
                 changed.insert(id);
             }
             for &id in &now {
@@ -239,9 +298,7 @@ impl Index {
                     }
                     None => {
                         changed_kind(db, id)?;
-                        if let Some(name) = method_name(db, id) {
-                            names.insert(name);
-                        }
+                        methods.extend(method_name(db, id));
                         changed.insert(id);
                     }
                 }
@@ -255,13 +312,26 @@ impl Index {
         }
 
         // What is written with a name bound to something else now, written again.
+        let pushed = Pushed {
+            changed: FxHashSet::default(),
+            bound,
+            methods,
+            files: Vec::new(),
+            written: 0,
+        };
         let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
-        let mut again: Vec<ItemId> = names
-            .iter()
+        let mut again: Vec<ItemId> = pushed
+            .bound
+            .keys()
+            .chain(&pushed.methods)
             .filter_map(|it| self.named.get(it))
             .flatten()
             .copied()
-            .filter(|it| self.entries.get(it).is_some_and(|it| !rewritten_files.contains(&it.file)))
+            .filter(|it| {
+                self.entries.get(it).is_some_and(|it| {
+                    !rewritten_files.contains(&it.file) && pushed.rebinds(&it.modules, &it.names)
+                })
+            })
             .collect();
         again.sort_unstable_by_key(|it| format!("{it:?}"));
         again.dedup();
@@ -299,7 +369,7 @@ impl Index {
                 }
             }
         }
-        Ok(Pushed { changed, names, files: rewritten, written })
+        Ok(Pushed { changed, files: rewritten, written, ..pushed })
     }
 
     fn crates_of(&self, db: &dyn HirDatabase, file: FileId) -> Vec<Crate> {
@@ -430,6 +500,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     names.dedup();
     Some(Entry {
         file,
+        modules: modules_of(db, id).into(),
         digest: *hasher.finalize().as_bytes(),
         refs: refs.into(),
         names: names.into(),

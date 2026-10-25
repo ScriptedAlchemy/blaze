@@ -1907,7 +1907,7 @@ impl Base {
                 "items: {} written, {} changed, {} names, {} roots and {} instances asked in {} us",
                 pushed.written,
                 pushed.changed.len(),
-                pushed.names.len(),
+                pushed.names(),
                 asked.roots.len(),
                 asked.instances.len(),
                 start.elapsed().as_micros()

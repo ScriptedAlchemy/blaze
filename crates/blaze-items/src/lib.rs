@@ -35,7 +35,7 @@ use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
-pub use index::{Index, Pushed, code_names, file_of};
+pub use index::{Index, Pushed, code_names, file_of, modules_of};
 
 /// What items refer to, for many of them in turn.
 pub struct Refs<'db>(form::Cx<'db>);
