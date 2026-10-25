@@ -36,7 +36,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
 pub use index::{
-    Entries, Index, Pushed, code_names, declared_by, entries, entries_in_bodies, file_of, modules_of,
+    Entries, Index, Pushed, code_names, declared_by, entries, entries_in_bodies, file_of,
+    modules_of,
 };
 
 /// What items refer to, for many of them in turn.

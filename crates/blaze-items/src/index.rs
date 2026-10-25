@@ -53,6 +53,9 @@ struct Entry {
     refs: Box<[ItemId]>,
     names: Box<[Symbol]>,
     missed: Option<&'static str>,
+    /// Whether it is written with an error, so that it is told changed whenever it is
+    /// written again.
+    erred: bool,
 }
 
 /// The bindings of a crate's modules, each name's by namespace: types and values, and macros.
@@ -104,7 +107,9 @@ impl Pushed {
             self.methods.contains(name)
                 || self.bound.get(name).is_some_and(|bounds| {
                     bounds.iter().any(|it| {
-                        it.root || modules.contains(&it.module) || it.name.as_ref().is_some_and(named)
+                        it.root
+                            || modules.contains(&it.module)
+                            || it.name.as_ref().is_some_and(named)
                     })
                 })
         })
@@ -251,7 +256,8 @@ impl Index {
         }
         let mut around: FxHashSet<Crate> = edited.clone();
         for &krate in &edited {
-            around.extend(krate.transitive_rev_deps(db).iter().filter(|it| self.crates.contains(it)));
+            around
+                .extend(krate.transitive_rev_deps(db).iter().filter(|it| self.crates.contains(it)));
         }
 
         // The bindings, and the files of the modules added or taken away.
@@ -323,7 +329,11 @@ impl Index {
                     return Err(why);
                 }
                 match self.entries.get(&id) {
-                    Some(was) if was.digest == entry.digest && was.refs == entry.refs => {}
+                    Some(was)
+                        if !was.erred
+                            && !entry.erred
+                            && was.digest == entry.digest
+                            && was.refs == entry.refs => {}
                     Some(_) => {
                         changed_kind(db, id)?;
                         changed.insert(id);
@@ -344,13 +354,8 @@ impl Index {
         }
 
         // What is written with a name bound to something else now, written again.
-        let pushed = Pushed {
-            changed: FxHashSet::default(),
-            bound,
-            methods,
-            files: Vec::new(),
-            written: 0,
-        };
+        let pushed =
+            Pushed { changed: FxHashSet::default(), bound, methods, files: Vec::new(), written: 0 };
         let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
         let mut again: Vec<ItemId> = pushed
             .bound
@@ -374,7 +379,7 @@ impl Index {
                 return Err(why);
             }
             let was = &self.entries[&id];
-            if was.digest != entry.digest || was.refs != entry.refs {
+            if was.erred || entry.erred || was.digest != entry.digest || was.refs != entry.refs {
                 changed_kind(db, id)?;
                 changed.insert(id);
             }
@@ -516,14 +521,18 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&node.interface.digest);
     let mut refs = node.interface.refs;
-    let mut missed = node.interface.missed;
+    let (mut missed, mut erred) = (node.interface.missed, node.interface.erred);
     let seen = seen_into(db, id, &refs);
     if let (true, ItemId::Function(func)) = (seen, id) {
         let code = cx.code(func.into());
         hasher.update(&code.digest);
         refs.extend(code.refs);
-        missed = missed.or(code.missed);
+        if code.missed.is_some() {
+            erred = (missed.is_none() || erred) && code.erred;
+            missed = missed.or(code.missed);
+        }
     }
+    let missed = missed.filter(|_| !erred);
     let mut unique = FxHashSet::default();
     refs.retain(|it| unique.insert(*it));
     let mut names = Vec::new();
@@ -537,6 +546,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
         refs: refs.into(),
         names: names.into(),
         missed,
+        erred,
     })
 }
 

@@ -39,6 +39,9 @@ pub(crate) struct Sub {
     pub(crate) digest: Hash,
     pub(crate) refs: Vec<ItemId>,
     pub(crate) missed: Option<&'static str>,
+    /// Whether all it missed is a type or constant with an error, which is written again
+    /// with the items the error is of.
+    pub(crate) erred: bool,
 }
 
 pub(crate) struct Form {
@@ -47,6 +50,7 @@ pub(crate) struct Form {
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
     missed: Option<&'static str>,
+    erred: bool,
 }
 
 impl Form {
@@ -56,6 +60,7 @@ impl Form {
             refs: Vec::new(),
             slots: FxHashMap::default(),
             missed: None,
+            erred: true,
         };
         form.str(tag);
         form
@@ -115,6 +120,11 @@ impl Form {
     }
 
     fn miss(&mut self, why: &'static str) {
+        self.error(why);
+        self.erred = false;
+    }
+
+    fn error(&mut self, why: &'static str) {
         self.missed.get_or_insert(why);
         self.u8(0xff);
         self.str(why);
@@ -127,12 +137,18 @@ impl Form {
         }
         if let Some(why) = sub.missed {
             self.missed.get_or_insert(why);
+            self.erred &= sub.erred;
         }
     }
 
     pub(crate) fn finish(self) -> Sub {
         let digest = self.hasher.map_or([0; 32], |it| *it.finalize().as_bytes());
-        Sub { digest, refs: self.refs, missed: self.missed }
+        Sub {
+            digest,
+            refs: self.refs,
+            missed: self.missed,
+            erred: self.missed.is_some() && self.erred,
+        }
     }
 }
 
@@ -558,7 +574,7 @@ impl<'db> Cx<'db> {
                 f.u32(bound.var.as_u32());
             }
             TyKind::Foreign(def_id) => f.item(ItemId::Alias(def_id.0)),
-            TyKind::Error(_) => f.miss("a type with an error"),
+            TyKind::Error(_) => f.error("a type with an error"),
             _ => f.miss("another type"),
         }
     }
@@ -642,7 +658,7 @@ impl<'db> Cx<'db> {
                 }
                 self.args(f, unevaluated.args);
             }
-            ConstKind::Error(_) => f.miss("a constant with an error"),
+            ConstKind::Error(_) => f.error("a constant with an error"),
             _ => f.miss("another constant"),
         }
     }
