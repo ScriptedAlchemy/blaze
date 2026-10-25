@@ -8,7 +8,8 @@ A toy workspace of a library and a program is built and loaded, and then edited 
 in the ways that move what a name is bound to: imports reordered, a glob import shadowed and
 the shadow taken away, a re-export bound to another function, a function moved to another
 module, a function made private so that the glob no longer brings it, an inherent method that
-takes a call from a trait's, and a file written again with nothing changed. After each step
+takes a call from a trait's, a trait's default method called directly and through `dyn`, and
+a file written again with nothing changed. After each step
 the program the daemon built prints what cargo's prints, or both builds fail.
 
 The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
@@ -50,7 +51,7 @@ FILES = {
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
     "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
-    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    println!("{} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice());\n}\n',
+    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
 INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
