@@ -196,6 +196,9 @@ fn used_by_instance(
     Ok(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }
 
+/// Why code its file no longer has can't be told.
+const GONE: &str = "code that is gone";
+
 const PANICKED: &str = "a query that panicked";
 
 fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Told {
@@ -205,9 +208,9 @@ fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Told {
         DefWithBodyId::StaticId(it) => ItemId::Static(it),
         DefWithBodyId::VariantId(_) => return Err("a variant's discriminant"),
     };
+    let names = probe(|| blaze_items::code_names(db, body)).ok_or(PANICKED)?.ok_or(GONE)?;
     let mut items = probe(|| refs.of_code(id, Some(body))).ok_or(PANICKED)??;
     items.push(id);
-    let names = probe(|| blaze_items::code_names(db, body)).ok_or(PANICKED)?;
     let modules = probe(|| blaze_items::modules_of(db, id)).ok_or(PANICKED)?;
     Ok(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }

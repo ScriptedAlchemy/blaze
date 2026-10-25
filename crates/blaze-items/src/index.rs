@@ -549,6 +549,8 @@ fn trait_counterpart(db: &dyn HirDatabase, id: ItemId) -> Option<ItemId> {
 /// The entry of an item, or `None` for one that is not one now.
 fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let file = file_of(db, id)?;
+    // Before anything is asked of one gone, which nothing would find in its file.
+    source(db, id)?;
     let node = cx.node_with(id, false);
     let mut hasher = blake3::Hasher::new();
     hasher.update(&node.interface.digest);
@@ -568,7 +570,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let mut unique = FxHashSet::default();
     refs.retain(|it| unique.insert(*it));
     let mut names = Vec::new();
-    interface_names(db, id, seen, &mut names);
+    interface_names(db, id, seen, &mut names)?;
     names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     names.dedup();
     Some(Entry {
@@ -612,44 +614,53 @@ pub fn file_of(db: &dyn HirDatabase, id: ItemId) -> Option<FileId> {
     Some(file.original_file(db).file_id(db))
 }
 
-/// The syntax an item is written as, with the range of a function's body.
-fn source(db: &dyn HirDatabase, id: ItemId) -> (SyntaxNode, Option<TextRange>) {
-    fn node<N: AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> SyntaxNode {
-        id.to_node(db).syntax().clone()
+/// The node of an item, and of a function's body; `None` for one its file no longer has.
+fn source(db: &dyn HirDatabase, id: ItemId) -> Option<(SyntaxNode, Option<TextRange>)> {
+    fn node<N: AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> Option<SyntaxNode> {
+        let ptr = id.file_id.ast_id_map(db).try_get_erased(id.value.erase())?;
+        Some(ptr.to_node(&id.file_id.parse_or_expand(db)))
     }
-    match id {
+    Some(match id {
         ItemId::Function(it) => {
-            let fun = it.lookup(db).id.to_node(db);
-            let body = fun.body().map(|it| it.syntax().text_range());
-            (fun.syntax().clone(), body)
+            let fun = node(db, it.lookup(db).id)?;
+            let body = syntax::ast::Fn::cast(fun.clone())
+                .and_then(|it| it.body())
+                .map(|it| it.syntax().text_range());
+            (fun, body)
         }
-        ItemId::Adt(AdtId::StructId(it)) => (node(db, it.lookup(db).id), None),
-        ItemId::Adt(AdtId::UnionId(it)) => (node(db, it.lookup(db).id), None),
-        ItemId::Adt(AdtId::EnumId(it)) => (node(db, it.lookup(db).id), None),
-        ItemId::Trait(it) => (node(db, it.lookup(db).id), None),
-        ItemId::Impl(it) => (node(db, it.lookup(db).id), None),
-        ItemId::Const(it) => (node(db, it.lookup(db).id), None),
-        ItemId::Static(it) => (node(db, it.lookup(db).id), None),
-        ItemId::Alias(it) => (node(db, it.lookup(db).id), None),
-        ItemId::Macro(MacroId::Macro2Id(it)) => (node(db, it.lookup(db).id), None),
-        ItemId::Macro(MacroId::MacroRulesId(it)) => (node(db, it.lookup(db).id), None),
-        ItemId::Macro(MacroId::ProcMacroId(it)) => (node(db, it.lookup(db).id), None),
-    }
+        ItemId::Adt(AdtId::StructId(it)) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Adt(AdtId::UnionId(it)) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Adt(AdtId::EnumId(it)) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Trait(it) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Impl(it) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Const(it) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Static(it) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Alias(it) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Macro(MacroId::Macro2Id(it)) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Macro(MacroId::MacroRulesId(it)) => (node(db, it.lookup(db).id)?, None),
+        ItemId::Macro(MacroId::ProcMacroId(it)) => (node(db, it.lookup(db).id)?, None),
+    })
 }
 
 /// The names an item's interface is written with: those of its source, without the body of a
 /// function not seen into.
-fn interface_names(db: &dyn HirDatabase, id: ItemId, seen: bool, out: &mut Vec<Symbol>) {
-    let (node, body) = source(db, id);
+fn interface_names(
+    db: &dyn HirDatabase,
+    id: ItemId,
+    seen: bool,
+    out: &mut Vec<Symbol>,
+) -> Option<()> {
+    let (node, body) = source(db, id)?;
     idents(&node, body.filter(|_| !seen), out);
     if let (true, ItemId::Function(func)) = (seen, id) {
         store_names(&Body::of(db, func.into()), out);
     }
+    Some(())
 }
 
 /// The names a body's code is written with: those of its source, and of the paths and method
-/// calls macros wrote into it.
-pub fn code_names(db: &dyn HirDatabase, body: DefWithBodyId) -> Vec<Symbol> {
+/// calls macros wrote into it; `None` for a body its file no longer has.
+pub fn code_names(db: &dyn HirDatabase, body: DefWithBodyId) -> Option<Vec<Symbol>> {
     let mut out = Vec::new();
     let id = match body {
         DefWithBodyId::FunctionId(it) => Some(ItemId::Function(it)),
@@ -658,12 +669,12 @@ pub fn code_names(db: &dyn HirDatabase, body: DefWithBodyId) -> Vec<Symbol> {
         DefWithBodyId::VariantId(_) => None,
     };
     if let Some(id) = id {
-        idents(&source(db, id).0, None, &mut out);
+        idents(&source(db, id)?.0, None, &mut out);
     }
     store_names(&Body::of(db, body), &mut out);
     out.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     out.dedup();
-    out
+    Some(out)
 }
 
 fn idents(node: &SyntaxNode, skip: Option<TextRange>, out: &mut Vec<Symbol>) {
