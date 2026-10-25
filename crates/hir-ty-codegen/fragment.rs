@@ -240,6 +240,7 @@ pub(super) struct Mark {
 }
 
 /// A function built to be put where it is called, and what it refers to.
+#[derive(PartialEq)]
 pub(super) struct Inlinable {
     pub(super) func: ir::Function,
     pub(super) requests: Requests,
@@ -278,7 +279,7 @@ impl Requests {
 /// The body of a function the function being built calls, which LLVM is shown in a compile
 /// at a level above 1 (see `tier::seen_body`): it builds the body in where it finds that
 /// worth it, and knows what a call it keeps does.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Seen {
     /// The function the calls are of, among the requests.
     pub(super) id: FuncId,

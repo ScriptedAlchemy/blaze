@@ -4164,8 +4164,9 @@ fn build<'db>(
     Ok(ctx)
 }
 
-/// The body of a small function, built to be put where the function is called.
-#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle)]
+/// The body of a small function, built to be put where the function is called. Compared, so
+/// that one built again the same leaves each caller it is put in as it was.
+#[salsa::tracked(returns(ref), cycle_result = inlinable_cycle)]
 fn inlinable(
     db: &dyn HirDatabase,
     instance: Instance,
