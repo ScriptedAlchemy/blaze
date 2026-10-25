@@ -46,7 +46,6 @@ impl std::fmt::Debug for Durability {
         if f.alternate() {
             match self.0 {
                 DurabilityVal::Low => f.write_str("Durability::LOW"),
-                DurabilityVal::Unedited => f.write_str("Durability::UNEDITED"),
                 DurabilityVal::Medium => f.write_str("Durability::MEDIUM"),
                 DurabilityVal::High => f.write_str("Durability::HIGH"),
                 DurabilityVal::NeverChange => f.write_str("Durability::NEVER_CHANGE"),
@@ -63,20 +62,18 @@ impl std::fmt::Debug for Durability {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum DurabilityVal {
     Low = 0,
-    Unedited = 1,
-    Medium = 2,
-    High = 3,
-    NeverChange = 4,
+    Medium = 1,
+    High = 2,
+    NeverChange = 3,
 }
 
 impl From<u8> for DurabilityVal {
     fn from(value: u8) -> Self {
         match value {
             0 => DurabilityVal::Low,
-            1 => DurabilityVal::Unedited,
-            2 => DurabilityVal::Medium,
-            3 => DurabilityVal::High,
-            4 => DurabilityVal::NeverChange,
+            1 => DurabilityVal::Medium,
+            2 => DurabilityVal::High,
+            3 => DurabilityVal::NeverChange,
             _ => panic!("invalid durability"),
         }
     }
@@ -87,13 +84,6 @@ impl Durability {
     ///
     /// Example: part of the crate being edited
     pub const LOW: Durability = Durability(DurabilityVal::Low);
-
-    /// Unedited durability: things that change often once they have changed at all.
-    ///
-    /// Example: a file of the crate being edited that has not been edited yet. Setting it
-    /// at low durability on its first edit has what read it verified, and nothing that
-    /// only read things of medium durability or higher.
-    pub const UNEDITED: Durability = Durability(DurabilityVal::Unedited);
 
     /// Medium durability: things that change sometimes, but rarely.
     ///

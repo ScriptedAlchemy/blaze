@@ -136,12 +136,7 @@ impl Files {
             Entry::Occupied(mut occupied) => {
                 occupied.get_mut().set_text(db).with_durability(durability).to(Arc::from(text));
             }
-            // A file's first text is unedited: an edit then verifies only what read the files
-            // edited since the program was loaded, each of which is set at the durability asked
-            // for from its first edit on. The first edit of a file verifies what read any file
-            // not yet edited, and nothing that read only libraries and the crate graph.
             Entry::Vacant(vacant) => {
-                let durability = durability.max(Durability::UNEDITED);
                 let text =
                     FileText::builder(Arc::from(text), file_id).durability(durability).new(db);
                 vacant.insert(text);
