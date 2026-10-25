@@ -27,8 +27,9 @@ use super::{
     compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
-    instance_serial, is_thread_local, left_to_rustc,
+    instance_serial, is_thread_local,
     itempush::{Asked, ItemPush},
+    left_to_rustc,
     naming::Naming,
     root_serial, row_location, source_location,
     stable::StableNames,
@@ -748,10 +749,16 @@ pub(super) struct Base {
     /// What the roots and instances refer to by item, for an edit that changes items: `None`
     /// for a base of rustc's, and once an edit left it unable to tell.
     items: Option<Box<ItemPush>>,
+    /// Where a thread of its own puts [`Self::items`] once it made them, of the revision the
+    /// base is of: they are taken before the next edit, and none are when they aren't ready.
+    making: Option<Making>,
     /// Those an edit asked about by a name bound to another thing, whose items are to be
     /// taken again before the next edit.
     reitem: Option<Asked>,
 }
+
+/// See [`Base::making`].
+type Making = Arc<std::sync::Mutex<Option<(salsa::Revision, Box<ItemPush>)>>>;
 
 /// A function of the checkout the base has from the store: no build here compiled it, so
 /// nothing but its name says what it is an instance of. A look finds that out from the code
@@ -1446,20 +1453,31 @@ impl Base {
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
             items: None,
+            making: None,
             reitem: None,
         })
         .map(|mut base| {
-            if std::env::var_os("RA_JIT_ITEM_PUSH").is_none_or(|it| it != "0") {
-                let start = std::time::Instant::now();
-                let items = ItemPush::new(db, cg.symbols, &base.compiled, &base.instances);
-                if std::env::var_os("RA_JIT_STATS").is_some() {
-                    eprintln!(
-                        "items-us: {} for {} items",
-                        start.elapsed().as_micros(),
-                        items.index.items()
-                    );
-                }
-                base.items = Some(Box::new(items));
+            if super::do_edits_follow()
+                && std::env::var_os("RA_JIT_ITEM_PUSH").is_none_or(|it| it != "0")
+            {
+                let making = Making::default();
+                let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
+                let (compiled, instances) =
+                    (base.compiled.clone(), base.instances.keys().cloned().collect::<Vec<_>>());
+                let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
+                    let start = std::time::Instant::now();
+                    let items = ItemPush::new(db, fan, &compiled, &instances);
+                    if std::env::var_os("RA_JIT_STATS").is_some() {
+                        eprintln!(
+                            "items-us: {} for {} items",
+                            start.elapsed().as_micros(),
+                            items.index.items()
+                        );
+                    }
+                    *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
+                };
+                cg.symbols.in_background(db, Box::new(work));
+                base.making = Some(making);
             }
             base
         })
@@ -1508,6 +1526,7 @@ impl Base {
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
             items: None,
+            making: None,
             reitem: None,
         }
     }
@@ -1761,7 +1780,7 @@ impl Base {
         self.outdate_rustc("an edit that is more than the bodies of functions");
         match crates {
             Some(_) => self.bindings_edited(),
-            None => self.items = None,
+            None => (self.items, self.making) = (None, None),
         }
         let Some(crates) = crates else {
             self.touched.any = true;
@@ -1843,7 +1862,19 @@ impl Base {
             self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
     }
 
+    /// The items [`Self::making`] has, when they are of the revision the database is at.
+    fn take_made(&mut self, db: &dyn HirDatabase) {
+        let Some(making) = self.making.take() else { return };
+        let made = making.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let now = salsa::plumbing::current_revision(db);
+        self.items = made.filter(|(at, _)| *at == now).map(|(_, items)| items);
+        if self.items.is_none() && std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("items: not made before the edit");
+        }
+    }
+
     fn bindings_edited(&mut self) {
+        self.making = None;
         if let Some(items) = &mut self.items {
             items.index.bindings_edited();
         }
@@ -1852,6 +1883,7 @@ impl Base {
     /// Before an edit of `files`: what the edits before it left of the items is taken in, of
     /// the revision they left.
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+        self.take_made(db);
         let Some(items) = &mut self.items else { return };
         hir_ty::attach_db(db, || {
             if let Some(asked) = self.reitem.take() {
@@ -1891,7 +1923,8 @@ impl Base {
             }
         }
         let around = &self.touched.around;
-        let roots = asked.roots.iter().copied().filter(|&i| around.contains(&self.crates[i as usize]));
+        let roots =
+            asked.roots.iter().copied().filter(|&i| around.contains(&self.crates[i as usize]));
         self.touched.named_roots.extend(roots);
         let instances = asked.instances.iter().copied().filter(|&i| {
             self.instances

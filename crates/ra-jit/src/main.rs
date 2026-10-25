@@ -1303,6 +1303,40 @@ impl SymbolResolver for Resolver<'_> {
         });
     }
 
+    fn in_background(&self, _: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        let db = self.db.clone();
+        let run = move || {
+            let threads = cores();
+            let fan =
+                |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    std::thread::scope(|scope| {
+                        for _ in 0..threads.min(count) {
+                            let (db, next) = (db.clone(), &next);
+                            scope.spawn(move || {
+                                let each = std::panic::AssertUnwindSafe(|| {
+                                    hir::attach_db(&db, || {
+                                        loop {
+                                            let at = next.fetch_add(1, Ordering::Relaxed);
+                                            if at >= count {
+                                                break;
+                                            }
+                                            each(&db, at);
+                                        }
+                                    })
+                                });
+                                // An edit cancels it, and whoever asks next finds out.
+                                _ = std::panic::catch_unwind(each);
+                            });
+                        }
+                    });
+                };
+            let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
+            _ = std::panic::catch_unwind(work);
+        };
+        _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
+    }
+
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
         source_path(self.db, &self.root, self.base.as_deref(), file)
     }
@@ -7958,6 +7992,9 @@ fn run_holding(
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
+    if serving || args.watch {
+        hir_ty_codegen::edits_follow();
+    }
     if let Some(served) = listener {
         let sender = sender.clone();
         // Each connection is read by a thread of its own: one that sends nothing, or

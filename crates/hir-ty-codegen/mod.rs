@@ -386,7 +386,31 @@ pub trait SymbolResolver {
         _ = (count, work);
         beside();
     }
+    /// Runs `work` on a thread of its own, with a database of its own that the next change
+    /// cancels, and a [`Fan`] over databases of their own; here, on this thread over `db`.
+    fn in_background(&self, db: &dyn HirDatabase, work: Background) {
+        work(db, &|count, each| self.in_parallel(count, &|db, _, at| each(db, at)));
+    }
 }
+
+static EDITS_FOLLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says that edits follow the builds of this process, which a base keeps what tells them
+/// apart for: a daemon's.
+pub fn edits_follow() {
+    EDITS_FOLLOW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn do_edits_follow() -> bool {
+    EDITS_FOLLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs the work for each of `0..count`, on as many threads as there are, each with a
+/// database of its own.
+pub type Fan<'a> = dyn Fn(usize, &(dyn Fn(&dyn HirDatabase, usize) + Sync)) + 'a;
+
+/// See [`SymbolResolver::in_background`].
+pub type Background = Box<dyn FnOnce(&dyn HirDatabase, &Fan<'_>) + Send>;
 
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;

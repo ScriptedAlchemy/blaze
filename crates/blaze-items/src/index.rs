@@ -138,33 +138,29 @@ pub fn modules_of(db: &dyn HirDatabase, id: ItemId) -> Vec<ModuleId> {
 /// The entries of some items, written apart from an [`Index`], on any thread.
 pub struct Entries(Vec<(ItemId, Entry)>);
 
-/// The items `crates` declare outside bodies, for [`entries`], and the bodies to give
-/// [`entries_in_bodies`].
-pub fn declared_by(db: &dyn HirDatabase, crates: &[Crate]) -> (Vec<ItemId>, Vec<DefWithBodyId>) {
+/// The modules of `crates`, for [`entries_in`].
+pub fn modules_in(db: &dyn HirDatabase, crates: &[Crate]) -> Vec<ModuleId> {
+    crates
+        .iter()
+        .flat_map(|&krate| crate_def_map(db, krate).modules(db).map(|(id, _)| id))
+        .collect()
+}
+
+/// The entries of the items declared in `modules`, and in the bodies of those.
+pub fn entries_in(db: &dyn HirDatabase, modules: &[ModuleId]) -> Entries {
     let (mut items, mut bodies) = (Vec::new(), Vec::new());
-    for &krate in crates {
-        crate::in_modules(db, krate, &mut items, &mut bodies);
+    for &id in modules {
+        in_scope(db, id.def_map(db).module(db, id).scope(db), &mut items, &mut bodies);
     }
-    (items, bodies)
-}
-
-pub fn entries(db: &dyn HirDatabase, ids: &[ItemId]) -> Entries {
+    crate::in_bodies(db, bodies, &mut items);
     let cx = form::Cx::new(db);
-    Entries(ids.iter().filter_map(|&id| Some((id, entry(db, &cx, id)?))).collect())
-}
-
-/// The entries of the items declared in `bodies`.
-pub fn entries_in_bodies(db: &dyn HirDatabase, bodies: &[DefWithBodyId]) -> Entries {
-    let mut items = Vec::new();
-    crate::in_bodies(db, bodies.to_vec(), &mut items);
-    entries(db, &items)
+    Entries(items.into_iter().filter_map(|id| Some((id, entry(db, &cx, id)?))).collect())
 }
 
 impl Index {
     /// The entries of every item `crates` declare, and their bindings.
     pub fn new(db: &dyn HirDatabase, crates: &[Crate]) -> Index {
-        let (items, bodies) = declared_by(db, crates);
-        Index::of_entries(db, crates, [entries(db, &items), entries_in_bodies(db, &bodies)])
+        Index::of_entries(db, crates, [entries_in(db, &modules_in(db, crates))])
     }
 
     /// The index of `crates` with the entries of the items they declare, and their bindings.

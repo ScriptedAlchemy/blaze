@@ -12,7 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 
 use super::{
-    Instance, SymbolResolver,
+    Fan, Instance,
     home::mentioned_bodies,
     patch::{BaseInstance, FxIndexMap, probe},
 };
@@ -51,13 +51,13 @@ pub(super) struct Asked {
 }
 
 impl ItemPush {
-    /// Made on the threads `symbols` has, each taking a part of the items, the roots and the
+    /// Made on the threads `fan` has, each taking a part of the items, the roots and the
     /// instances in turn.
     pub(super) fn new(
         db: &dyn HirDatabase,
-        symbols: &dyn SymbolResolver,
+        fan: &Fan<'_>,
         compiled: &[(FunctionId, String)],
-        instances: &FxIndexMap<Instance, BaseInstance>,
+        instances: &[Instance],
     ) -> ItemPush {
         const PART: usize = 64;
         let start = std::time::Instant::now();
@@ -66,21 +66,20 @@ impl ItemPush {
             .copied()
             .filter(|it| it.data(db).origin.is_local())
             .collect();
-        let (items, bodies) = blaze_items::declared_by(db, &crates);
+        let modules = blaze_items::modules_in(db, &crates);
         let declared = start.elapsed();
-        let instances: Vec<&Instance> = instances.keys().collect();
         let parts = |n: usize| n.div_ceil(PART);
-        let (of_items, of_bodies, of_roots) =
-            (parts(items.len()), parts(bodies.len()), parts(compiled.len()));
+        const MODULES: usize = 4;
+        let (of_modules, of_roots) = (modules.len().div_ceil(MODULES), parts(compiled.len()));
         fn lock<T>(n: usize) -> Vec<OnceLock<T>> {
             (0..n).map(|_| OnceLock::new()).collect()
         }
-        let entries: Vec<OnceLock<blaze_items::Entries>> = lock(of_items + of_bodies);
+        let entries: Vec<OnceLock<blaze_items::Entries>> = lock(of_modules);
         let roots: Vec<OnceLock<Vec<Told>>> = lock(of_roots);
         let of_instances: Vec<OnceLock<Vec<Told>>> = lock(parts(instances.len()));
         let part = |all: usize, at: usize| at * PART..((at + 1) * PART).min(all);
         let work = |db: &dyn HirDatabase, at: usize| {
-            if let Some(at) = at.checked_sub(of_items + of_bodies + of_roots) {
+            if let Some(at) = at.checked_sub(of_modules + of_roots) {
                 of_instances[at].get_or_init(|| {
                     let refs = Refs::new(db);
                     let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
@@ -88,10 +87,10 @@ impl ItemPush {
                         bodies.entry(body).or_insert_with(|| used(db, &refs, body)).clone()
                     };
                     part(instances.len(), at)
-                        .map(|i| used_by_instance(db, &refs, instances[i], &mut of_body))
+                        .map(|i| used_by_instance(db, &refs, &instances[i], &mut of_body))
                         .collect::<Vec<_>>()
                 });
-            } else if let Some(at) = at.checked_sub(of_items + of_bodies) {
+            } else if let Some(at) = at.checked_sub(of_modules) {
                 roots[at].get_or_init(|| {
                     let refs = Refs::new(db);
                     part(compiled.len(), at)
@@ -99,14 +98,12 @@ impl ItemPush {
                         .collect::<Vec<_>>()
                 });
             } else {
-                entries[at].get_or_init(|| match at.checked_sub(of_items) {
-                    Some(at) => blaze_items::entries_in_bodies(db, &bodies[part(bodies.len(), at)]),
-                    None => blaze_items::entries(db, &items[part(items.len(), at)]),
-                });
+                let of = at * MODULES..((at + 1) * MODULES).min(modules.len());
+                entries[at].get_or_init(|| blaze_items::entries_in(db, &modules[of]));
             }
         };
         let count = entries.len() + of_roots + of_instances.len();
-        symbols.in_parallel(count, &|db, _, at| work(db, at));
+        fan(count, &work);
         (0..count).for_each(|at| work(db, at));
         let made = start.elapsed();
         let index =
@@ -126,7 +123,7 @@ impl ItemPush {
             why.sort_by(|a, b| b.1.cmp(&a.1));
             let unknown = |it: &[Told]| it.iter().filter(|it| it.is_err()).count();
             eprintln!(
-                "items-made: declared {} us, written {} us, indexed {} us; {} of {} roots and {} of {} instances unknown: {:?}",
+                "items-made: modules {} us, written {} us, indexed {} us; {} of {} roots and {} of {} instances unknown: {:?}",
                 declared.as_micros(),
                 (made - declared).as_micros(),
                 (start.elapsed() - made).as_micros(),
