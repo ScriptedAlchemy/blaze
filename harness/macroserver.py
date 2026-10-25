@@ -301,9 +301,8 @@ def wired(work, root, meta, server):
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
         # A store of its own: one the libraries were built into serves code over symbols of
         # the standard library this build, which names its crates, does not link.
-        env = {"RA_JIT_CACHE": os.path.join(work, f"store-wired-{named}")}
-        if named:
-            env["RA_JIT_PROC_MACRO_SERVER"] = server
+        env = {"RA_JIT_CACHE": os.path.join(work, f"store-wired-{named}"),
+               "RA_JIT_PROC_MACRO_SERVER": server if named else "0"}
         ran, took = ra_jit(root, crates, os.path.join(work, "wired.o"), "--own-target",
                            "--exe", program, env=env)
         how = "with the server named" if named else "without it"
@@ -326,13 +325,14 @@ def wired(work, root, meta, server):
 
 
 def app(name, work, server):
-    """A bench app of bench.py built whole by ra-jit into its own target directory, twice,
-    each from an empty store. First with the server named, so the load's cargo has ra-jit link
-    every proc macro and ra-jit's server expands with them; then without it, rustc's libraries
-    expanded by the toolchain's server, and every call expanded again by ra-jit's server with
-    the library ra-jit linked of the same unit (`RA_JIT_PROC_MACRO_COMPARE`). Both programs
-    have to print the same. What each build took and what the comparison found, and the
-    comparison's counts."""
+    """A bench app of bench.py built whole by ra-jit into its own target directory, three
+    times. First from an empty store with the server named, so the load's cargo has ra-jit
+    link every proc macro and ra-jit's server expands with them; then again from that store
+    into an empty target directory, where every library ra-jit linked is the store's; then
+    from an empty store without the server, rustc's libraries expanded by the toolchain's
+    server, and every call expanded again by ra-jit's server with the library ra-jit linked of
+    the same unit (`RA_JIT_PROC_MACRO_COMPARE`). The programs have to print the same. What
+    each build took and what the comparison found, and the comparison's counts."""
     import bench
     spec, (crate, program) = bench.PROJECTS[name], APPS[name]
     root = os.path.join(work, name)
@@ -343,22 +343,30 @@ def app(name, work, server):
     libs = os.path.join(work, f"{name}-libs")
     os.makedirs(libs)
     lines, printed, counts = [], [], None
-    for named in (True, False):
+    for build in ("ours", "again", "theirs"):
+        named = build != "theirs"
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
         store = os.path.join(work, f"{name}-store-{'ours' if named else 'theirs'}")
         env = {**spec.get("env", {}), "RA_JIT_CACHE": store}
         if named:
             env["RA_JIT_PROC_MACRO_SERVER"] = server
         else:
-            env.update(RA_JIT_PROC_MACRO_COMPARE=server, RA_JIT_PROC_MACRO_LIBS=libs)
-        # The same file name in both, which a program's usage line prints.
-        binary = os.path.join(work, f"{name}-{'ours' if named else 'theirs'}", program)
+            env.update(RA_JIT_PROC_MACRO_SERVER="0", RA_JIT_PROC_MACRO_COMPARE=server,
+                       RA_JIT_PROC_MACRO_LIBS=libs)
+        # The same file name in each, which a program's usage line prints.
+        binary = os.path.join(work, f"{name}-{build}", program)
         os.makedirs(os.path.dirname(binary), exist_ok=True)
         ran, took = ra_jit(root, [crate], os.path.join(work, f"{name}.o"), "--own-target",
                            "--exe", binary, env=env)
         left = re.search(r"(\d+) functions in it ra-jit could not compile$", ran.stderr, re.M)
         ours, theirs = built_macros(own)
-        if named:
+        # A library the store had is written with no build of it, which leaves a log.
+        linked_now = {it for it in ours if glob.glob(
+            os.path.join(own, "**", ".ra-jit-units", f"{it}-*", "*", "ra-jit.log"), recursive=True)}
+        if build == "again" and linked_now:
+            raise SystemExit(f"FAIL: {name}: the second build linked {sorted(linked_now)} again, "
+                             "which the store had")
+        if build == "ours":
             # A proc macro rustc compiled again, for a crate of rustc's that links it, left
             # ra-jit's library beside its record.
             for lib in [*glob.glob(os.path.join(own, "**", "deps", "lib*.so"), recursive=True),
@@ -370,9 +378,12 @@ def app(name, work, server):
                               timeout=60, env={**os.environ, **spec.get("env", {})})
         printed.append((said.returncode, said.stdout))
         start = len(lines)
-        lines.append(f"{name}, {'with' if named else 'without'} the server: {took:.1f} s; the "
-                     f"load's cargo built {len(theirs)} proc macros by rustc and {len(ours)} by "
-                     f"ra-jit; {left.group(1) if left else '?'} functions left; `{program} "
+        how = {"ours": "with the server", "again": "with the server and its store",
+               "theirs": "without the server"}[build]
+        lines.append(f"{name}, {how}: {took:.1f} s; the load's cargo built {len(theirs)} proc "
+                     f"macros by rustc and {len(ours)} by ra-jit"
+                     f"{f' ({len(ours) - len(linked_now)} from the store)' if named else ''}; "
+                     f"{left.group(1) if left else '?'} functions left; `{program} "
                      f"{' '.join(spec['run'])}` exited {said.returncode}")
         if named:
             lines += [f"  rustc's: {it}" for it in fallbacks(own, theirs)]
@@ -382,10 +393,11 @@ def app(name, work, server):
             lines += [f"  {it[:600]}" for it in re.findall(r"^proc macros: (`[^`]*`: .*)$",
                                                           ran.stderr, re.M)]
         print("\n".join(lines[start:]), flush=True)
-    if printed[0] != printed[1]:
-        lines.append(f"{name}: the program with ra-jit's proc macros printed otherwise:\n"
-                     f"  ra-jit's: {printed[0]}\n  rustc's:  {printed[1]}")
-        counts["printed otherwise"] = True
+    for at, which in ((0, "ra-jit's proc macros"), (1, "the store's proc macros")):
+        if printed[at] != printed[2]:
+            lines.append(f"{name}: the program with {which} printed otherwise:\n"
+                         f"  ra-jit's: {printed[at]}\n  rustc's:  {printed[2]}")
+            counts["printed otherwise"] = True
     shutil.rmtree(root, ignore_errors=True)
     return lines, counts
 

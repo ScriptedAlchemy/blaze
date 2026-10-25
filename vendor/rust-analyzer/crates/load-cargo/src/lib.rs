@@ -10,7 +10,7 @@ extern crate rustc_driver as _;
 
 mod listed;
 mod wrap;
-pub use listed::{is_listed, serve_listed_with};
+pub use listed::{Own, is_listed, own_libraries_with, serve_listed_with};
 pub use wrap::{Wrap, asked, wrap_expanders};
 
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
@@ -174,9 +174,6 @@ impl Loaded {
         self.workspaces.extend(workspaces);
         let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
-        if self.proc_macro_server.is_none() {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
-        }
         let (sender, receiver) = unbounded();
         let mut loader = Box::new(vfs_notify::NotifyHandle::spawn(sender));
 
@@ -203,6 +200,27 @@ impl Loaded {
             members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
+        // A library rustc compiled is expanded with the one the caller has of it, if any.
+        let unlisted: Vec<AbsPathBuf> = match listed::server() {
+            Some(_) => proc_macros
+                .values()
+                .filter_map(|it| it.as_ref().ok())
+                .map(|(_, path)| path.clone())
+                .filter(|path| !is_listed(path))
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        };
+        let own: FxHashMap<AbsPathBuf, AbsPathBuf> = {
+            let found = listed::own(ws.sysroot.root(), &unlisted);
+            unlisted.into_iter().zip(found).filter_map(|(it, own)| Some((it, own?))).collect()
+        };
+        for (_, path) in proc_macros.values_mut().filter_map(|it| it.as_mut().ok()) {
+            if let Some(own) = own.get(path) {
+                *path = own.clone();
+            }
+        }
         let listed: FxHashSet<AbsPathBuf> = match listed::server() {
             Some(_) => proc_macros
                 .values()
@@ -212,6 +230,15 @@ impl Loaded {
                 .collect(),
             None => FxHashSet::default(),
         };
+        // The toolchain's server is started for the libraries the other does not serve only,
+        // so a load whose proc macros are all listed starts none of the toolchain's.
+        let unlisted = proc_macros.values().any(|it| match it {
+            Ok((_, path)) => !listed.contains(path),
+            Err(_) => false,
+        });
+        if self.proc_macro_server.is_none() && unlisted {
+            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
+        }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {

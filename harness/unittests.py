@@ -11,7 +11,7 @@ fork does differently from upstream that its expectations have not caught up wit
 import os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRATES = ["hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "hir-ty-codegen", "ra-jit-store", "blaze-build-script", "ra-jit"]
+CRATES = ["hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {

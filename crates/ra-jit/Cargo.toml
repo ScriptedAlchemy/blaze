@@ -69,6 +69,7 @@ hir-ty.workspace = true
 hir-ty-codegen.workspace = true
 ra-jit-expand.workspace = true
 ra-jit-store.workspace = true
+blaze-manifest.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true
@@ -100,6 +101,9 @@ getrandom = "0.3"
 url.workspace = true
 tar = "0.4.44"
 zstd = "0.13.3"
+# The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
+# of liblzma's time on rustc's 84 MB.
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
 ra-jit-live = { path = "../ra-jit-live" }
 blaze-core.workspace = true
 blaze-vfs.workspace = true
@@ -117,6 +121,8 @@ tikv-jemalloc-sys = "0.5.4"
 [dev-dependencies]
 object = { version = "0.37", default-features = false, features = ["write", "elf"] }
 test-fixture.workspace = true
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = { version = "0.1.46", default-features = false }

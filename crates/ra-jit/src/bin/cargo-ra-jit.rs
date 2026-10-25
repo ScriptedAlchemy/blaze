@@ -11,5 +11,5 @@ fn main() -> ExitCode {
     if std::io::stderr().is_terminal() {
         eprintln!("note: `cargo ra-jit` is now `cargo blaze`; the old name keeps working for now");
     }
-    blaze::launch("ra-jit")
+    blaze::launch("cargo-ra-jit", Some("ra-jit"))
 }

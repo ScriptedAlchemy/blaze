@@ -2,9 +2,10 @@ name: install
 
 # install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
-# `cargo blaze` in a new project. On a change to the script, on each release once it is
-# published, weekly (a release's assets or GitHub's redirects can change under it) and by hand.
-# Not a check the merge queue requires.
+# `blaze` and `cargo blaze` in a new project. And this commit's build, installed in a Debian
+# container with no Rust at all, which runs `blaze run` in a project written by hand. On a
+# change to the script, on each release once it is published, weekly (a release's assets or
+# GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
 on:
   push:
     branches: [main]
@@ -62,22 +63,108 @@ jobs:
           export PATH="$CARGO_HOME/bin:$PATH"
           for bin in cargo-blaze ra-jit cargo-ra-jit ra-jit-rustc; do test -x "$CARGO_HOME/bin/$bin"; done
           cargo blaze --help | head -n 3
-          rustup run 1.99.0 rustc --version
-          rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
+          # A release from before blaze had its own Rust has rustup install 1.99.0 instead.
+          if [ -x "$CARGO_HOME/bin/blaze" ]; then
+            blaze toolchain | tee /dev/stderr | grep -F "blaze builds with Rust 1.99.0"
+          else
+            rustup run 1.99.0 rustc --version
+            rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
+          fi
       - name: again, which upgrades in place
         run: sh install.sh --verbose
-      - name: cargo blaze in a new project
+      - name: blaze in a new project
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
           cd "$RUNNER_TEMP"
           cargo new --quiet hello
           cd hello
-          rustup override set 1.99.0
-          cargo blaze build
-          cargo blaze run | grep -F "Hello, world!"
-          cargo blaze stop
+          if [ -x "$CARGO_HOME/bin/blaze" ]; then
+            blaze build
+            blaze run | grep -F "Hello, world!"
+            cargo blaze run | grep -F "Hello, world!"
+            blaze stop
+          else
+            rustup override set 1.99.0
+            cargo blaze build
+            cargo blaze run | grep -F "Hello, world!"
+            cargo blaze stop
+          fi
       - name: a release that is not there says so
         run: |
           if sh install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
           cat out.txt
           grep -F "there is no blaze release 0.0.0-none" out.txt
+
+  # This commit's build, as a release lays it out (without the release's PGO profile).
+  archive:
+    name: this commit's build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: install
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - run: cargo build -p ra-jit --release --locked --bins
+        env:
+          RUSTC_WRAPPER: sccache
+      - name: archive
+        run: |
+          name=blaze-commit-x86_64-unknown-linux-gnu
+          mkdir "$name"
+          for bin in target/release/*; do
+            if [ -f "$bin" ] && [ -x "$bin" ]; then cp "$bin" "$name/"; fi
+          done
+          "$name/blaze" --version
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive
+          path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+
+  # A machine with no Rust: blaze brings its own, and the first `blaze run` prints the program's
+  # output. The time is from the start of install.sh to that output.
+  no-rust:
+    name: no Rust installed
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: debian:stable-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: archive
+      - name: no rustup, cargo or rustc
+        run: |
+          for tool in rustup cargo rustc; do
+            if command -v "$tool"; then echo "::error::$tool is on PATH"; exit 1; fi
+          done
+      - name: install, then blaze run in a project written by hand
+        shell: sh
+        run: |
+          set -eu
+          began=$(date +%s.%N)
+          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < install.sh
+          export PATH="$HOME/.cargo/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/hello/src"
+          cd "$RUNNER_TEMP/hello"
+          printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
+          printf 'fn main() {\n    println!("Hello, world!");\n}\n' > src/main.rs
+          blaze run > out.txt
+          ended=$(date +%s.%N)
+          cat out.txt
+          grep -Fx "Hello, world!" out.txt
+          echo "from install.sh to Hello, world!: $(echo "$ended - $began" | awk '{ printf "%.1f s", $1 - $3 }')" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh "$HOME/.blaze/toolchains" "$HOME/.cargo/bin" | tee -a "$GITHUB_STEP_SUMMARY"
+          for tool in rustup cargo rustc; do
+            if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
+          done
+          blaze stop

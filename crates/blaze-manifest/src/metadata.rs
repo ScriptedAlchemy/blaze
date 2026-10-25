@@ -1,0 +1,173 @@
+//! `cargo metadata --no-deps --format-version 1`: the workspace's members as cargo prints them,
+//! in its field order (`src/ops/cargo_metadata.rs` and `src/workspace/package.rs` there).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::bail;
+use cargo_util_schemas::core::PackageIdSpec;
+use cargo_util_schemas::manifest::{Hints, RustVersion};
+use serde::Serialize;
+
+use crate::dependency::SerializedDependency;
+use crate::manifest::{Context, Manifest};
+use crate::paths::{ancestors, normalize_path};
+use crate::source::SourceId;
+use crate::targets::SerializedTarget;
+use crate::workspace::Workspace;
+
+const VERSION: u32 = 1;
+
+#[derive(Serialize)]
+pub struct ExportInfo<'a> {
+    packages: Vec<SerializedPackage<'a>>,
+    workspace_members: Vec<PackageIdSpec>,
+    workspace_default_members: Vec<PackageIdSpec>,
+    resolve: Option<()>,
+    target_directory: PathBuf,
+    build_directory: PathBuf,
+    version: u32,
+    workspace_root: &'a Path,
+    metadata: Option<&'a toml::Value>,
+}
+
+#[derive(Serialize)]
+struct SerializedPackage<'a> {
+    name: &'a str,
+    version: &'a semver::Version,
+    id: PackageIdSpec,
+    license: Option<&'a str>,
+    license_file: Option<&'a str>,
+    description: Option<&'a str>,
+    source: &'a SourceId,
+    dependencies: Vec<SerializedDependency<'a>>,
+    targets: Vec<SerializedTarget<'a>>,
+    features: BTreeMap<&'a str, Vec<String>>,
+    manifest_path: &'a Path,
+    metadata: Option<&'a toml::Value>,
+    publish: Option<&'a [String]>,
+    authors: &'a [String],
+    categories: &'a [String],
+    keywords: &'a [String],
+    readme: Option<&'a str>,
+    repository: Option<&'a str>,
+    homepage: Option<&'a str>,
+    documentation: Option<&'a str>,
+    edition: String,
+    links: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metabuild: Option<&'a [String]>,
+    default_run: Option<&'a str>,
+    rust_version: Option<&'a RustVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hints: Option<&'a Hints>,
+}
+
+fn serialize_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> SerializedPackage<'a> {
+    let meta = &m.metadata;
+    SerializedPackage {
+        name: &m.package_id.name,
+        version: &m.package_id.version,
+        id: m.package_id.to_spec(),
+        license: meta.license.as_deref(),
+        license_file: meta.license_file.as_deref(),
+        description: meta.description.as_deref(),
+        source: &m.package_id.source_id,
+        dependencies: m.dependencies.iter().map(|d| d.serialized()).collect(),
+        targets: m.targets.iter().filter_map(|t| t.serialized()).collect(),
+        features: m
+            .features
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.iter().map(|fv| fv.to_string()).collect()))
+            .collect(),
+        manifest_path,
+        metadata: m.custom_metadata.as_ref(),
+        publish: m.publish.as_deref(),
+        authors: &meta.authors,
+        categories: &meta.categories,
+        keywords: &meta.keywords,
+        readme: meta.readme.as_deref(),
+        repository: meta.repository.as_deref(),
+        homepage: meta.homepage.as_deref(),
+        documentation: meta.documentation.as_deref(),
+        edition: m.edition.to_string(),
+        links: meta.links.as_deref(),
+        metabuild: m.metabuild.as_deref(),
+        default_run: m.default_run.as_deref(),
+        rust_version: meta.rust_version.as_ref(),
+        hints: m.hints.as_ref(),
+    }
+}
+
+/// What `cargo metadata --no-deps` prints for the workspace.
+pub fn export_no_deps<'a>(ws: &'a Workspace<'_>) -> ExportInfo<'a> {
+    ExportInfo {
+        packages: ws.members().map(|(path, m)| serialize_package(path, m)).collect(),
+        workspace_members: ws.members().map(|(_, m)| m.package_id.to_spec()).collect(),
+        workspace_default_members: ws
+            .default_members()
+            .map(|(_, m)| m.package_id.to_spec())
+            .collect(),
+        resolve: None,
+        target_directory: ws.target_dir(),
+        build_directory: ws.build_dir(),
+        version: VERSION,
+        workspace_root: ws.root(),
+        metadata: ws.custom_metadata(),
+    }
+}
+
+/// The manifest `--manifest-path` names, or the nearest `Cargo.toml` from the working
+/// directory up, with cargo's messages for neither.
+pub fn root_manifest(manifest_path: Option<&Path>, ctx: &Context) -> anyhow::Result<PathBuf> {
+    let cwd = ctx.config.cwd();
+    let Some(manifest_path) = manifest_path else {
+        return find_root_manifest_for_wd(cwd);
+    };
+    let path = normalize_path(&cwd.join(manifest_path));
+    if !path.exists() {
+        bail!("manifest path `{}` does not exist", manifest_path.display())
+    } else if path.is_dir() {
+        let child_path = path.join("Cargo.toml");
+        let suggested_path = if child_path.exists() {
+            format!("\nhelp: {} exists", child_path.display())
+        } else {
+            String::new()
+        };
+        bail!(
+            "manifest path `{}` is a directory but expected a file{suggested_path}",
+            manifest_path.display()
+        )
+    } else if !path.ends_with("Cargo.toml") && !is_embedded(&path) {
+        bail!("the manifest-path must be a path to a Cargo.toml file: `{}`", path.display())
+    }
+    if is_embedded(&path) {
+        bail!("embedded manifest `{}` requires `-Zscript`", path.display())
+    }
+    Ok(path)
+}
+
+fn is_embedded(path: &Path) -> bool {
+    let ext = path.extension();
+    ext == Some(std::ffi::OsStr::new("rs")) || ext.is_none()
+}
+
+fn find_root_manifest_for_wd(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let mut invalid_cargo_toml_path_exists = false;
+    for current in ancestors(cwd, None) {
+        let manifest = current.join("Cargo.toml");
+        if manifest.exists() {
+            return Ok(manifest);
+        }
+        if current.join("cargo.toml").exists() {
+            invalid_cargo_toml_path_exists = true;
+        }
+    }
+    if invalid_cargo_toml_path_exists {
+        bail!(
+            "could not find `Cargo.toml` in `{}` or any parent directory, but found cargo.toml please try to rename it to Cargo.toml",
+            cwd.display()
+        )
+    }
+    bail!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display())
+}

@@ -5,10 +5,16 @@
 //! nightly's features, a newer release's) fails with rustc's error and a line saying which
 //! release built it, and never goes to cargo for it ([#269]).
 //!
+//! The release comes from, in order: what `RUSTC` names, or the rustc cargo would run when it
+//! is that release; rustup's copy of it; blaze's own copy (`own.rs`), downloaded the first
+//! time none of those has it.
+//!
 //! [#269]: https://github.com/indexable-inc/blaze/issues/269
 
+mod own;
+
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -22,67 +28,128 @@ pub(crate) const OURS: &str = include_str!("../../../../harness/toolchain");
 /// its place.
 static IN_PLACE_OF: OnceLock<(String, &'static str)> = OnceLock::new();
 
-/// Has the cargo, rustc and daemon of this command be blaze's release: names its toolchain in
-/// `RUSTUP_TOOLCHAIN`, which rustup's proxies take over a toolchain file or an override, and
-/// its cargo in `CARGO`. `Err` is why the command can't be built, said for the user to act on.
-/// Before any thread starts: it sets the environment.
-pub(crate) fn settle() -> Result<(), String> {
+/// Where the Rust a command builds with came from.
+pub(crate) enum Chosen {
+    /// The rustc `RUSTC` names or cargo would run, at its sysroot.
+    Given(PathBuf),
+    Rustup(PathBuf),
+    Own(PathBuf),
+}
+
+impl std::fmt::Display for Chosen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ours = OURS.trim();
+        match self {
+            Chosen::Given(dir) => write!(f, "Rust {ours}, the toolchain at {}", dir.display()),
+            Chosen::Rustup(dir) => write!(f, "Rust {ours} from rustup, at {}", dir.display()),
+            Chosen::Own(dir) => write!(f, "Rust {ours}, blaze's own copy at {}", dir.display()),
+        }
+    }
+}
+
+/// Has the cargo, rustc and daemon of this command be blaze's release. A rustc that is that
+/// release is used as it is; rustup's copy is named in `RUSTUP_TOOLCHAIN`, which rustup's
+/// proxies take over a toolchain file or an override, with its cargo in `CARGO`; blaze's own
+/// is named in `CARGO`, `RUSTC` and `RUSTDOC` and is first on `PATH`, for the processes this one
+/// starts and not the user's shell. `Err` is why the command can't be built, said for the user
+/// to act on. Before any thread starts: it sets the environment.
+pub(crate) fn settle() -> Result<Chosen, String> {
     let ours = OURS.trim();
     let other = super::state::other_toolchain_allowed();
     let rustc = super::state::rustc_path();
     let version = version_of(&rustc);
-    let version = version.as_deref().unwrap_or("of no release it says");
+    let shown = version.as_deref().unwrap_or("of no release it says");
     if other {
-        return with_library(&sysroot_of(&rustc), version);
-    }
-    if version == ours {
         let sysroot = sysroot_of(&rustc);
-        with_library(&sysroot, ours)?;
-        // One name for it however it was named (`1.99.0`, `1.99.0-<host>`, a path), since the
-        // name is part of which build this is.
-        let home = rustup_home().and_then(|it| dunce::canonicalize(it.join("toolchains")).ok());
-        let dir = dunce::canonicalize(&sysroot).ok();
-        let name = dir.filter(|dir| home.is_some_and(|home| dir.parent() == Some(&*home)));
-        if std::env::var_os("RUSTUP_TOOLCHAIN").is_some()
-            && let Some(name) = name.as_ref().and_then(|it| it.file_name())
-        {
-            // SAFETY: before any thread is started.
-            unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", name) };
+        with_library(&sysroot, shown)?;
+        return Ok(Chosen::Given(sysroot));
+    }
+    let named = super::state::rustc_named().is_some();
+    if version.as_deref() == Some(ours) {
+        let sysroot = sysroot_of(&rustc);
+        match with_library(&sysroot, ours) {
+            Ok(()) => {
+                rustup_named(&sysroot);
+                return Ok(Chosen::Given(sysroot));
+            }
+            // What `RUSTC` names is used or refused; a rustc on the path without the library
+            // leaves the release to rustup or blaze.
+            Err(why) if named => return Err(why),
+            Err(_) => {}
         }
-        return Ok(());
-    }
-    let named = named_by();
-    if super::state::rustc_named().is_some() {
+    } else if named {
         return Err(format!(
-            "`RUSTC` names rustc {version}, and blaze builds with Rust {ours}, the release it \
+            "`RUSTC` names rustc {shown}, and blaze builds with Rust {ours}, the release it \
              compiles: without `RUSTC` it builds with {ours} (`BLAZE_OTHER_TOOLCHAIN=1` builds \
-             with {version} anyway, laying its types out as {ours} does)"
+             with {shown} anyway, laying its types out as {ours} does)"
         ));
     }
-    let Some(home) = rustup_home() else {
+    if let Some(version) = version.filter(|it| it != ours) {
+        let _ = IN_PLACE_OF.set((version, named_by()));
+    }
+    let rustup = rustup_home().and_then(|home| installed(&home, ours));
+    if let Some(dir) = rustup.filter(|dir| with_library(dir, ours).is_ok()) {
+        let name = dir.file_name().map_or_else(|| OsString::from(ours), OsStr::to_owned);
+        let cargo = dir.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+        // SAFETY: before any thread is started.
+        unsafe {
+            std::env::set_var("RUSTUP_TOOLCHAIN", name);
+            std::env::set_var("CARGO", cargo);
+        }
+        return Ok(Chosen::Rustup(dir));
+    }
+    let Some(release) = own::Release::ours() else {
         return Err(format!(
-            "blaze builds with Rust {ours}, the release it compiles, and this rustc is {version}, \
-             with no rustup to switch: put Rust {ours} with its `rust-src` first on `PATH` \
-             (`BLAZE_OTHER_TOOLCHAIN=1` builds with {version} anyway, laying its types out as \
-             {ours} does)"
+            "blaze builds with Rust {ours}, which is not installed, and the Rust project \
+             publishes no copy of it for this machine that blaze knows: install Rust {ours} with \
+             its `rust-src` and put it first on `PATH`"
         ));
     };
-    let Some(dir) = installed(&home, ours) else {
+    let Some(dir) = release.dir() else {
         return Err(format!(
-            "blaze builds with Rust {ours}, the release it compiles, which is not installed: \
-             `rustup toolchain install {ours} --component rust-src` installs it"
+            "blaze builds with Rust {ours} and keeps it in .blaze in your home directory, and \
+             there is no home directory: `BLAZE_HOME` names where to keep it"
         ));
     };
-    with_library(&dir, ours)?;
-    let name = dir.file_name().and_then(|it| it.to_str()).unwrap_or(ours).to_owned();
-    let cargo = dir.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    if !own::complete(&dir) {
+        own::fetch(&release, &dir)?;
+    }
+    use_own(&dir);
+    Ok(Chosen::Own(dir))
+}
+
+/// Has every process this one starts run blaze's own toolchain at `dir`: cargo and the daemon
+/// from it, and a rustc, rustdoc or cargo a build script finds on the path, or reaches through a
+/// rustup proxy, from it too.
+fn use_own(dir: &Path) {
+    let bin = dir.join("bin");
+    let exe = |name: &str| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let path = std::env::var_os("PATH");
+    let path = std::iter::once(bin.clone()).chain(path.iter().flat_map(std::env::split_paths));
     // SAFETY: before any thread is started.
     unsafe {
-        std::env::set_var("RUSTUP_TOOLCHAIN", name);
-        std::env::set_var("CARGO", cargo);
+        std::env::set_var("CARGO", exe("cargo"));
+        std::env::set_var("RUSTC", exe("rustc"));
+        std::env::set_var("RUSTDOC", exe("rustdoc"));
+        std::env::set_var("RUSTUP_TOOLCHAIN", dir);
+        if let Ok(path) = std::env::join_paths(path) {
+            std::env::set_var("PATH", path);
+        }
     }
-    let _ = IN_PLACE_OF.set((version.to_owned(), named));
-    Ok(())
+}
+
+/// Names rustup's toolchain at `sysroot` one way however it was named (`1.99.0`,
+/// `1.99.0-<host>`, a path), since the name is part of which build this is.
+fn rustup_named(sysroot: &Path) {
+    let home = rustup_home().and_then(|it| dunce::canonicalize(it.join("toolchains")).ok());
+    let dir = dunce::canonicalize(sysroot).ok();
+    let name = dir.filter(|dir| home.is_some_and(|home| dir.parent() == Some(&*home)));
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some()
+        && let Some(name) = name.as_ref().and_then(|it| it.file_name())
+    {
+        // SAFETY: before any thread is started.
+        unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", name) };
+    }
 }
 
 /// What a build that failed says after its errors: which release built it, when it was not

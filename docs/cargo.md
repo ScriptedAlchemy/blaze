@@ -44,11 +44,25 @@ rustup's default): it runs cargo, rustc and the daemon under 1.99.0 by naming it
 `RUSTUP_TOOLCHAIN` and `CARGO`. Rust 1.99.0 builds what older releases built, so a project on
 an older stable builds as it is. Code only the project's own toolchain builds (a nightly's
 `#![feature]`, a newer release's library) fails with rustc's error and a note naming both
-releases. 1.99.0 has to be installed with its `rust-src`; the error says the `rustup` command
-when it is not. Plain `cargo` still builds with the project's toolchain, in the same target
+releases. Plain `cargo` still builds with the project's toolchain, in the same target
 directory: cargo keys what it builds by the rustc, so neither rebuilds the other's.
 `BLAZE_OTHER_TOOLCHAIN=1` builds with the project's toolchain instead
 ([support.md](support.md#toolchain)).
+
+Where 1.99.0 comes from, in this order: `RUSTC` naming a rustc of 1.99.0 with its library's
+source; rustup's 1.99.0 with `rust-src`, when rustup has it; else blaze's own copy in
+`~/.blaze/toolchains/1.99.0-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
+out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
+stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
+own servers, 97 MB on macOS, 133 MB on Linux x86-64 and 118 MB on Linux ARM64 (530 MB on macOS
+and 690 MB on Linux x86-64 once unpacked). Each file's sha256 is built into blaze, from Rust 1.99.0's published manifest
+(`harness/toolchain_pins.py` writes them), and a file with other bytes is refused. Concurrent
+builds download it once; a download that stopped goes on from where it stopped the next time.
+Building with blaze's copy, blaze names its cargo, rustc and rustdoc in `CARGO`, `RUSTC` and
+`RUSTDOC` and puts its `bin` first on `PATH`, for the commands it runs and not for your shell.
+`RA_JIT_RUST_DIST` names a mirror of `https://static.rust-lang.org/dist` (or a directory with
+the files), for a machine that cannot reach it. `cargo blaze toolchain` (or `blaze toolchain`)
+says which Rust blaze builds with, downloading its copy first when there is none.
 
 Every setting below named `RA_JIT_<NAME>` can be given as `BLAZE_<NAME>` too; when both are
 set, the `BLAZE_` one wins.
@@ -62,6 +76,10 @@ set, the `BLAZE_` one wins.
     cargo blaze status
     cargo blaze stop
     cargo blaze apply [--build] [--memory] [--json] PATH[=FROM]...
+    cargo blaze toolchain
+
+`blaze <command>` is the same as `cargo blaze <command>`, for a machine where blaze brought
+its own Rust and there is no `cargo` on the path.
 
 `build`, `run` and `test` take the flags cargo takes and leave the same files in the same
 places under `target/`. `check` is what the daemon says of the source as it builds the

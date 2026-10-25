@@ -13,8 +13,8 @@ use std::{
 
 use anyhow::Context as _;
 use cargo_metadata::{
-    Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, MetadataCommand, Package,
-    Target, TargetKind,
+    Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, Package, Target,
+    TargetKind,
 };
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -362,7 +362,7 @@ impl Staged {
         if asked.subcommand == Subcommand::Test || asked.flags.selects_targets {
             return Ok(Err("the build picks its targets".to_owned()));
         }
-        let metadata = metadata(asked)?;
+        let metadata = metadata(asked);
         let members: Vec<&Package> = metadata.workspace_packages();
         let needs = |package: &Package, kinds: &[DependencyKind]| -> Vec<usize> {
             let needed = package.dependencies.iter().filter(|it| kinds.contains(&it.kind));
@@ -437,7 +437,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
     if let Some(why) = other_toolchain() {
         anyhow::bail!(why);
     }
-    let metadata = metadata(asked)?;
+    let metadata = metadata(asked);
     let root = metadata.workspace_root.clone().into_std_path_buf();
     let project =
         project(asked, &std::env::current_dir()?, &metadata).map_err(anyhow::Error::msg)?;
@@ -819,7 +819,7 @@ impl State {
         built: Built,
         counts: Counts,
     ) -> anyhow::Result<State> {
-        let metadata = metadata(asked)?;
+        let metadata = metadata(asked);
         // By its real path, as rustc's working directory and so the sources of the units
         // are: a workspace reached through a link is the one it links to.
         let root = metadata.workspace_root.as_std_path();
@@ -1154,13 +1154,8 @@ pub(super) fn rustc_says(rustc: &OsStr, flag: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-pub(super) fn metadata(asked: &Invocation) -> anyhow::Result<Metadata> {
-    let mut command = MetadataCommand::new();
-    command.cargo_path(cargo_path()).no_deps();
-    if let Some(manifest) = &asked.flags.manifest_path {
-        command.manifest_path(manifest);
-    }
-    command.exec().context("running `cargo metadata`")
+pub(super) fn metadata(asked: &Invocation) -> Metadata {
+    super::metadata::no_deps(asked.flags.manifest_path.as_deref(), &asked.flags.config)
 }
 
 fn package_dir(package: &Package) -> PathBuf {

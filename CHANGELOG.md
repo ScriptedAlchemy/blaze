@@ -8,14 +8,28 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `crates/blaze-registry` fetches every kind of source a lock file names, as cargo 1.99
+  does (#298): `[source]` replacement as cargo's `SourceConfigMap` (`replace-with` chains to a
+  registry, a local registry, a directory, a git repository or a `[registries]` name, and
+  cargo's refusals); vendored directories, each file checked against `.cargo-checksum.json`;
+  and git dependencies with the `git` command, a database per repository at
+  `$CARGO_HOME/git/db/<name>-<hash>` and a checkout per commit at
+  `git/checkouts/<name>-<hash>/<short id>`, branch, tag, rev and locked commits, GitHub's fast
+  path, submodules from databases of their own, offline. `harness/fetchdiff.py` holds it to
+  `cargo fetch` and `cargo vendor` on dev-aws-8 over 314 lock files (the bench projects at
+  their pins but bun, the 300 most downloaded crates, git dependencies of every kind of
+  reference, a second sparse registry): 3684/3684 unpacked packages and 38/38 git checkouts
+  the same as cargo's, file by file, with the same directory names; crates.io replaced by a
+  mirror 42/42; ripgrep and zed vendored, 51/51 and 1533/1533 read where cargo vendor put
+  them.
+- `cargo blaze` reads the workspace with `blaze-manifest`, as cargo 1.99.0 reads it, where it
+  ran `cargo metadata --no-deps` for every command (#298): equal to cargo on 385 of 385
+  workspaces of `harness/resolve.py`'s corpus. The command's `--config` arguments now count,
+  and a manifest cargo refuses ends the command with cargo's message and status. The daemon's
+  loads still ask cargo.
 - `ra-jit std` ships the standard library's unit for a `dev` program too, not only a build
   script's: a whole build of a dev program from an empty store (step K, #91) fetches it where
   it compiled the library again: ripgrep from nothing 19.4 s to 9.9 s on dev-aws-8.
-
-- `ra-jit std` ships the standard library's unit for a `dev` program too, not only a build
-  script's: a whole build of a dev program from an empty store (step K, #91) fetches it where
-  it compiled the library again, about 10 s.
-
 - `crates/blaze-build-script`: the environment cargo 1.99.0 gives a build script, computed
   from a plain description of the run with no cargo, ported from cargo's own rules and tests
   (no-rustc step I, #89; #298). Nothing uses it yet; blaze's own runs of scripts come next.
@@ -23,7 +37,61 @@ All notable changes to ra-jit are written here. The format follows
   `cargo:` and `cargo::`, the `rust-version` rule of the latter, every directive and cargo's
   errors for each) and says who receives it: the scripts each unit is linked with, the `-L`,
   `-l`, link arguments, cfgs and variables of each target, and when a script runs again.
-
+- blaze needs no Rust and no rustup installed (#298). With neither, it downloads Rust 1.99.0
+  once into `~/.blaze/toolchains` (rustc, cargo, the standard library and its source: 97 MB on
+  macOS, 133 MB on Linux x86-64), laid out as rustup lays out a toolchain, and builds with it.
+  Each file's sha256 is built into blaze from the release's published manifest, and a file
+  with other bytes is refused. Downloads run together over blaze's own HTTPS client, unpack
+  into a directory beside the toolchain's and are renamed into place, concurrent builds
+  download once, and a download that stopped goes on from where it stopped. rustup's 1.99.0,
+  when installed, is still the one used. `blaze build`, `run`, `test`, `check` and `stop` are
+  `cargo blaze`'s commands without cargo; `blaze toolchain` says which Rust blaze builds with.
+- install.sh installs blaze on a machine with no Rust (#298). It no longer runs rustup: after
+  installing, blaze downloads its own Rust (none when rustup has 1.99.0), `--no-toolchain`
+  leaves that to the first build, it says what to install when there is no C compiler to link
+  with, and its last line is `blaze run`. `BLAZE_ARCHIVE` installs an archive from a file.
+  install.yaml installs this commit's build in a Debian container with no Rust and runs
+  `blaze run` in a project written by hand.
+- `crates/blaze-resolve`, cargo's resolver owned by blaze (#298), starts with cargo 1.99.0's package
+  model, used by nothing yet: `SourceId` (path, git and sparse registries, git at a branch, tag or
+  rev with its commit, directory, local registry) compared by cargo's canonical URL and written as
+  lock files, package ids and messages write it; `PackageId`, `PackageIdSpec` (`-p` and
+  `cargo metadata`'s ids), `Dependency` with renames, kinds, targets and its locked or `--precise`
+  requirement; `Summary` and its feature map, with the implicit features of optional dependencies
+  and cargo's errors for features; and the `Registry` the resolver asks, with yanked and offline
+  versions marked. Its tests include cargo's own for these types.
+- `blaze-resolve`'s `Registry` is cargo 1.99.0's: `query(&self, ..)` is an `async fn` that
+  awaits what it fetches, in place of answering `Poll::Pending` and a `block_until_ready` (#298).
+- `blaze-resolve` reads and writes `Cargo.lock` as cargo 1.99.0 does (#298): every encoding
+  from 1 (checksums in `[metadata]`) to 4 (git references URL-encoded), `[[patch.unused]]` and
+  `[replace]`, the comments above cargo's header kept, and a lock file written back byte for
+  byte. As in cargo, an unchanged lock file keeps its encoding, a changed one is raised to the
+  workspace's default (from its lowest `rust-version`), under `--locked` or `--frozen` a change
+  is an error, and the checksums of the old file must agree with the new resolve. Its tests write
+  back the lock files of ripgrep and fd releases and of git workspaces cargo generated, one of
+  each encoding, and port cargo's `lockfile_compat` tests; `BLAZE_RESOLVE_LOCKFILES=dir` adds a
+  directory of lock files (24 releases of twelve projects, zed's 70 git sources among them,
+  write back byte for byte). A registry read from a lock file before its manifest is now named
+  as cargo names it.
+- `crates/blaze-registry`, registries read and packages fetched as cargo 1.99 does, with no
+  cargo, used by nothing yet (`docs/self-contained.md`, #298). The sparse
+  index (crates.io's and any other's): `config.json` and its `dl` templates, the index paths,
+  each line read as cargo reads it (schema `v`, `features2`, `rust_version`, `pubtime`,
+  `yanked`, `links`, renamed and other-registry dependencies, unknown fields, and the lines
+  cargo skips as invalid or unsupported), with cargo's cache of each file in cargo's format and
+  its `If-None-Match` / `If-Modified-Since` requests, so cargo and blaze share
+  `$CARGO_HOME/registry/index`. A `.crate` file is checked against its sha256, kept in the
+  store by that hash and in cargo's cache, and unpacked where cargo unpacks it
+  (`registry/src/index.crates.io-1949cf8c6b5b557f/<name>-<version>/`, the directory named by
+  cargo's hash of the source), with cargo's checks (entries under `<name>-<version>/` only, no
+  links, the size limit, the umask, `.cargo-ok`), several at once, retried as `net.retry`
+  says, under cargo's package cache lock.
+- `crates/blaze-manifest`, `Cargo.toml` and `.cargo/config.toml` read as cargo 1.99.0 reads
+  them, without running cargo: `cargo metadata --no-deps` computed by blaze (its `metadata`
+  example prints the same JSON, warnings and errors), on cargo's own manifest schema
+  (`cargo-util-schemas` 0.14.3) ([resolve.md](docs/resolve.md)). `harness/resolve.py` compares
+  it with cargo on the bench projects, 300 crates.io crates and 72 workspace repositories at
+  pinned commits: all 385 equal, key order included. Nothing in blaze uses it yet.
 - `cargo ra-jit test` with `RA_JIT_TESTS=affected` runs, on Linux, each test that reaches a
   file, the environment, a process or the network in a sandbox of its own (#257): a process
   in new user, mount, network, IPC and PID namespaces, the machine's files read-only, the
@@ -49,6 +117,10 @@ All notable changes to ra-jit are written here. The format follows
   and rustc's libraries left for what ra-jit did not link (#90). `macroserver.py all` builds
   fd, bat, hyperfine, just, nushell and helix both ways: 3,465 calls the same, 12 of
   `pest_consume_macros` not compared, as ra-jit cannot compile it yet (#327).
+- The Linux release has blaze's proc-macro server, `blaze-proc-macro-srv`, beside `ra-jit`,
+  built whole by the release's ra-jit (`build_release.py --server`);
+  `RA_JIT_PROC_MACRO_SERVER=1` uses it, and says so when it is not there. A load whose proc
+  macros are all ra-jit's starts no toolchain server.
 - The SSE and AVX compares compile (#87): `llvm.x86.sse.cmp.ps` and `.ss`, `sse2.cmp.pd` and
   `.sd` and AVX's 256-bit ones give a lane of all ones where the immediate's predicate holds, as
   rustc's do. glam's `Vec4::cmpeq` and `is_finite_mask`, which bevy calls, were left to rustc;
@@ -284,6 +356,13 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- Proc macros are blaze's by default where its server is beside `ra-jit`: the daemon's
+  loads, `--check` and build scripts expand with libraries ra-jit makes from each crate's
+  record, kept in the store by what they were linked from, so another target directory takes
+  them from there (#90). `RA_JIT_PROC_MACRO_SERVER=0` goes back to rustc's libraries and the
+  toolchain's server. `macroserver.py all` builds each app again over the first store: no
+  library linked again, the same 3,465 calls.
+||||||| 0858e8535d
 - The first `cargo blaze build` of a workspace is blaze's, not cargo's: once cargo's build
   succeeds it waits for the daemon to load the workspace ("Waiting for blaze to load the
   workspace") and build the programs, where it handed back cargo's and the next build was the

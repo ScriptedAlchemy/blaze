@@ -9,6 +9,7 @@ mod ancestor;
 mod cli;
 mod client;
 mod messages;
+pub(crate) mod metadata;
 pub(crate) mod own_macro;
 pub(crate) mod own_script;
 mod package;
@@ -69,6 +70,16 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Stop => stop()?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
+        Asked::Toolchain => match toolchain::settle() {
+            Ok(chosen) => {
+                println!("blaze builds with {chosen}");
+                0
+            }
+            Err(why) => {
+                say::error(&why);
+                FAILED
+            }
+        },
         Asked::Help => {
             println!("{HELP}");
             0
@@ -82,9 +93,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
 }
 
 const HELP: &str = "\
-cargo blaze: cargo's build, run, test and check, from a daemon that keeps the workspace compiled
+blaze: cargo's build, run, test and check, from a daemon that keeps the workspace compiled
 
-usage: cargo blaze <command> [cargo's flags]
+usage: blaze <command> [cargo's flags]    (or cargo blaze <command>)
 
   build, run, test   by the daemon when it has the workspace loaded, by cargo otherwise
   check              what the daemon's build of the same flags says, when it has one loaded;
@@ -95,6 +106,7 @@ usage: cargo blaze <command> [cargo's flags]
                      file FROM is, or deleted (`PATH=`); `--build` builds what has them,
                      `--memory` writes none to disk, `--json` shows the daemon's answer
   enable, disable    plain `cargo build|run|test|check` through blaze, and back
+  toolchain          which Rust blaze builds with, downloaded once if it has none
   cache              what the `#[ra_jit::cache]` functions kept, by function
   cache clear        forgets it; `--stale`, all but what each function's code computed
 
@@ -195,11 +207,7 @@ fn fn_cache_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(match std::env::var_os("RA_JIT_FN_CACHE_DIR") {
         Some(dir) => std::path::PathBuf::from(dir),
         None => {
-            let metadata = cargo_metadata::MetadataCommand::new()
-                .cargo_path(state::cargo_path())
-                .no_deps()
-                .exec()
-                .context("running `cargo metadata`")?;
+            let metadata = metadata::no_deps(None, &[]);
             metadata.target_directory.as_std_path().join("ra-jit").join("fn-cache")
         }
     })
@@ -338,7 +346,7 @@ fn check(asked: &Invocation) -> anyhow::Result<i32> {
         messages::passed(format);
     };
     let turned_down = |said: &[crate::errors::Said]| -> anyhow::Result<i32> {
-        messages::turned_down(format, said, &state::metadata(asked)?);
+        messages::turned_down(format, said, &state::metadata(asked));
         toolchain::note_failed();
         Ok(FAILED)
     };

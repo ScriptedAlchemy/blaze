@@ -23,6 +23,8 @@ you send them, including fixes you find here and want to upstream.
     crates/ra-jit-store/      the disk store of compiled code, which knows nothing about Rust
     crates/ra-jit-fuzz/       made-up and damaged inputs for the tests of what reads the store
     crates/blaze-build-script/ build scripts run as cargo runs them, with no cargo (no-rustc.md, step I)
+    crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
+    crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
     crates/ra-jit-wasm/        experiment: the compiler running in a web page (not in the workspace)
     harness/                  the test harnesses and their fixtures
     demo/                     small projects the harnesses and the scoreboard build

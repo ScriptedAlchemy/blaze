@@ -146,6 +146,8 @@ pub(crate) enum Asked {
     Stop,
     Enable,
     Disable,
+    /// Which Rust blaze builds with, downloaded first when it has none.
+    Toolchain,
     Help,
     Version,
 }
@@ -216,6 +218,7 @@ impl Asked {
             ("stop", _) => Asked::Stop,
             ("enable", _) => Asked::Enable,
             ("disable", _) => Asked::Disable,
+            ("toolchain", _) => Asked::Toolchain,
             _ => Asked::Cargo(args),
         }
     }

@@ -43,7 +43,7 @@ the need for it ([no-rustc.md](no-rustc.md#the-plan)).
 
 | Piece | Size (xz, Linux x86-64) | What uses it | Removed by |
 |---|---|---|---|
-| `cargo` | 11.0 MB | the first build (`cargo/state.rs` `Built::by`); `cargo metadata` for every load (rust-analyzer's project model, `cargo/state.rs` `metadata`); `cargo build --unit-graph` (`plan.rs`); rust-analyzer's `cargo check --compile-time-deps`; fetching crates into `~/.cargo/registry` | blaze's resolver and fetcher ([below](#resolution-and-fetching)), then K and M |
+| `cargo` | 11.0 MB | the first build (`cargo/state.rs` `Built::by`); `cargo metadata` for every load (rust-analyzer's project model; the client's `--no-deps` reading is blaze-manifest's since 2026-10-25, `cargo/metadata.rs`); `cargo build --unit-graph` (`plan.rs`); rust-analyzer's `cargo check --compile-time-deps`; fetching crates into `~/.cargo/registry` | blaze's resolver and fetcher ([below](#resolution-and-fetching)), then K and M |
 | `rustc` (with `librustc_driver`, LLVM) | 84.0 MB, with the next two | the first build of every workspace, proc macros, the build scripts blaze does not compile yet, the functions left to rustc, the rustc base of the first edits | K, J, E, M |
 | `rust-lld` (`lib/rustlib/<host>/bin/gcc-ld`) | in `rustc` | blaze's own link on ELF targets (`link.rs`), as rustc links | blaze shipping its own lld, or the system linker |
 | `rust-analyzer-proc-macro-srv` (`libexec`) | in `rustc` | expanding proc macros with the libraries rustc built | J1 and J2 |
@@ -159,13 +159,15 @@ serde_derive, thiserror-impl, tokio-macros and clap_derive equal to the toolchai
    cargo asks for is linked by blaze, and blaze's server expands with it, behind
    `RA_JIT_PROC_MACRO_SERVER`. macroserver.py compares every macro call of the bench apps
    ([Status](#status)).
-2. The server ships with blaze: built by the release workflow with blaze (`--exe`) beside the
-   standard library's unit, in the archive, so no machine builds it and the toolchain's
-   `libexec/rust-analyzer-proc-macro-srv` is never started. That is blaze's own executable,
-   which the rule allows to be built with rustc (its serde derives); each later release builds
-   its server with the one before.
+2. The server ships with blaze (landed 2026-10-25, Linux): built by the release workflow with
+   blaze (`--exe`) beside the standard library's unit, in the archive as
+   `blaze-proc-macro-srv`, so no machine builds it and the toolchain's
+   `libexec/rust-analyzer-proc-macro-srv` is never started for a library blaze linked. That
+   is blaze's own executable, which the rule allows to be built with rustc (its serde
+   derives); each later release builds its server with the one before.
 3. On by default for the daemon's loads, the checker and the build scripts that link a proc
-   macro (J0); a proc macro's library kept in the store by its content, as any other crate's.
+   macro (J0); a proc macro's library kept in the store by its content, as any other crate's
+   (landed 2026-10-25).
    rustc then compiles no proc macro and none of `syn`, `quote` and `proc-macro2` for one: most
    of what rustc compiles in the cold build of a crate with derives.
 
@@ -212,8 +214,25 @@ with the system's `cc` and an lld it finds, a choice for that step, measured on 
 2026-10-25: this plan. Lanes: the toolchain (2), the manifest and the harness, the registry,
 the resolver, build scripts. Counts and pull requests are added here as they land.
 
+2026-10-25, the registry: `crates/blaze-registry` reads the sparse index and its cache as cargo
+1.99 does, fetches `.crate` files into the store by their sha256 and unpacks them where cargo
+does (#307, landed with #314), and replaces sources, reads vendored directories and checks
+out git dependencies with the `git` command at cargo's paths. `harness/fetchdiff.py` on
+dev-aws-8, against `cargo fetch` and `cargo vendor` over 314 lock files (the bench projects
+at their pins but bun, the 300 most downloaded crates, git dependencies of every kind of
+reference, a second sparse registry): 3684/3684 unpacked packages and 38/38 git checkouts
+equal, file by file, and every directory name; crates.io replaced by a mirror 42/42; ripgrep's
+and zed's vendored packages 51/51 and 1533/1533. Not yet: blaze-resolve's `Registry` over it (#321),
+registries that need credentials (#315), git indexes (#316), cargo's last-use record (#317),
+a path package's file list (#318).
+
 2026-10-25, J (proc macros): with `RA_JIT_PROC_MACRO_SERVER`, a load into ra-jit's own
 target directory has ra-jit link the proc macros and its server expand them; over fd, bat,
 hyperfine, just, nushell and helix, 3,465 calls expanded the same as the toolchain's server
 with rustc's libraries, 12 not compared (`pest_consume_macros`,
-[#327](https://github.com/indexable-inc/blaze/issues/327)).
+[#327](https://github.com/indexable-inc/blaze/issues/327)). The Linux archive has the server
+beside `ra-jit` (built by it in 30 s on dev-aws-8), and `RA_JIT_PROC_MACRO_SERVER=1` takes it
+from there: a load of fd starts no toolchain server. It is the default: the daemon's loads,
+the checker's and build scripts' expand with blaze's libraries, made from each crate's record
+and kept in the store; built again over that store, the six apps link none again and expand
+the same 3,465 calls.

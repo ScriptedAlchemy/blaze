@@ -49,7 +49,7 @@ use rustc_hash::FxHashMap;
 use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;
 
-use https::Https;
+pub(crate) use https::{Https, next as https_next};
 use s3::{S3, Written};
 use signed::{NotRewritten, Trust, Turns, Unremembered};
 use transfer::{Body, Object, TooLong, Version};
