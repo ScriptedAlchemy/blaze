@@ -127,9 +127,35 @@ pub fn modules_of(db: &dyn HirDatabase, id: ItemId) -> Vec<ModuleId> {
     hir::Module::from(module).path_to_root(db).into_iter().map(ModuleId::from).collect()
 }
 
+/// The entries of some items, written apart from an [`Index`], on any thread.
+pub struct Entries(Vec<(ItemId, Entry)>);
+
+/// The items `crates` declare, for [`entries`].
+pub fn declared_by(db: &dyn HirDatabase, crates: &[Crate]) -> Vec<ItemId> {
+    let mut items = Vec::new();
+    for &krate in crates {
+        crate::declared(db, krate, &mut items);
+    }
+    items
+}
+
+pub fn entries(db: &dyn HirDatabase, ids: &[ItemId]) -> Entries {
+    let cx = form::Cx::new(db);
+    Entries(ids.iter().filter_map(|&id| Some((id, entry(db, &cx, id)?))).collect())
+}
+
 impl Index {
     /// The entries of every item `crates` declare, and their bindings.
     pub fn new(db: &dyn HirDatabase, crates: &[Crate]) -> Index {
+        Index::of_entries(db, crates, [entries(db, &declared_by(db, crates))])
+    }
+
+    /// The index of `crates` with the entries of the items they declare, and their bindings.
+    pub fn of_entries(
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        entries: impl IntoIterator<Item = Entries>,
+    ) -> Index {
         let mut index = Index {
             crates: crates.iter().copied().collect(),
             entries: FxHashMap::default(),
@@ -141,15 +167,12 @@ impl Index {
             dirty: FxHashSet::default(),
             scopes_dirty: false,
         };
-        let cx = form::Cx::new(db);
-        for &krate in crates {
-            let mut items = Vec::new();
-            crate::declared(db, krate, &mut items);
-            for id in items {
-                if let Some(entry) = entry(db, &cx, id) {
-                    index.insert(id, entry);
-                }
+        for Entries(part) in entries {
+            for (id, entry) in part {
+                index.insert(id, entry);
             }
+        }
+        for &krate in crates {
             index.scopes.insert(krate, scope(db, krate));
             index.attrs.insert(krate, attrs(db, krate));
         }

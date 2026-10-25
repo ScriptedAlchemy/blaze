@@ -9,8 +9,10 @@ use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use std::sync::OnceLock;
+
 use super::{
-    Instance,
+    Instance, SymbolResolver,
     home::mentioned_bodies,
     patch::{BaseInstance, FxIndexMap, probe},
 };
@@ -49,30 +51,66 @@ pub(super) struct Asked {
 }
 
 impl ItemPush {
+    /// Made on the threads `symbols` has, each taking a part of the items, the roots and the
+    /// instances in turn.
     pub(super) fn new(
         db: &dyn HirDatabase,
+        symbols: &dyn SymbolResolver,
         compiled: &[(FunctionId, String)],
         instances: &FxIndexMap<Instance, BaseInstance>,
     ) -> ItemPush {
+        const PART: usize = 64;
+        let start = std::time::Instant::now();
         let crates: Vec<base_db::Crate> = base_db::all_crates(db)
             .iter()
             .copied()
             .filter(|it| it.data(db).origin.is_local())
             .collect();
-        let start = std::time::Instant::now();
-        let index = Index::new(db, &crates);
-        let indexed = start.elapsed();
-        let refs = Refs::new(db);
-        let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
-        let mut of_body = |body: DefWithBodyId| -> Told {
-            bodies.entry(body).or_insert_with(|| used(db, &refs, body)).clone()
+        let items = blaze_items::declared_by(db, &crates);
+        let declared = start.elapsed();
+        let instances: Vec<&Instance> = instances.keys().collect();
+        let parts = |n: usize| n.div_ceil(PART);
+        let (of_items, of_roots) = (parts(items.len()), parts(compiled.len()));
+        fn lock<T>(n: usize) -> Vec<OnceLock<T>> {
+            (0..n).map(|_| OnceLock::new()).collect()
+        }
+        let entries: Vec<OnceLock<blaze_items::Entries>> = lock(of_items);
+        let roots: Vec<OnceLock<Vec<Told>>> = lock(of_roots);
+        let of_instances: Vec<OnceLock<Vec<Told>>> = lock(parts(instances.len()));
+        let part = |all: usize, at: usize| at * PART..((at + 1) * PART).min(all);
+        let work = |db: &dyn HirDatabase, at: usize| {
+            if let Some(at) = at.checked_sub(of_items + of_roots) {
+                of_instances[at].get_or_init(|| {
+                    let refs = Refs::new(db);
+                    let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
+                    let mut of_body = |body: DefWithBodyId| -> Told {
+                        bodies.entry(body).or_insert_with(|| used(db, &refs, body)).clone()
+                    };
+                    part(instances.len(), at)
+                        .map(|i| used_by_instance(db, &refs, instances[i], &mut of_body))
+                        .collect::<Vec<_>>()
+                });
+            } else if let Some(at) = at.checked_sub(of_items) {
+                roots[at].get_or_init(|| {
+                    let refs = Refs::new(db);
+                    part(compiled.len(), at)
+                        .map(|i| used(db, &refs, compiled[i].0.into()))
+                        .collect::<Vec<_>>()
+                });
+            } else {
+                entries[at].get_or_init(|| blaze_items::entries(db, &items[part(items.len(), at)]));
+            }
         };
-        let roots: Vec<_> = compiled.iter().map(|&(root, _)| of_body(root.into())).collect();
-        let rooted = start.elapsed();
-        let instances: Vec<_> = instances
-            .keys()
-            .map(|instance| used_by_instance(db, &refs, instance, &mut of_body))
-            .collect();
+        let count = of_items + of_roots + of_instances.len();
+        symbols.in_parallel(count, &|db, _, at| work(db, at));
+        (0..count).for_each(|at| work(db, at));
+        let made = start.elapsed();
+        let index =
+            Index::of_entries(db, &crates, entries.into_iter().filter_map(OnceLock::into_inner));
+        let flat = |parts: Vec<OnceLock<Vec<Told>>>| {
+            parts.into_iter().filter_map(OnceLock::into_inner).flatten().collect::<Vec<_>>()
+        };
+        let (roots, instances) = (flat(roots), flat(of_instances));
         if std::env::var_os("RA_JIT_STATS").is_some() {
             let mut why: FxHashMap<&str, usize> = FxHashMap::default();
             for it in roots.iter().chain(&instances) {
@@ -84,10 +122,10 @@ impl ItemPush {
             why.sort_by(|a, b| b.1.cmp(&a.1));
             let unknown = |it: &[Told]| it.iter().filter(|it| it.is_err()).count();
             eprintln!(
-                "items-made: index {} us, roots {} us, instances {} us; {} of {} roots and {} of {} instances unknown: {:?}",
-                indexed.as_micros(),
-                (rooted - indexed).as_micros(),
-                (start.elapsed() - rooted).as_micros(),
+                "items-made: declared {} us, written {} us, indexed {} us; {} of {} roots and {} of {} instances unknown: {:?}",
+                declared.as_micros(),
+                (made - declared).as_micros(),
+                (start.elapsed() - made).as_micros(),
                 unknown(&roots),
                 roots.len(),
                 unknown(&instances),

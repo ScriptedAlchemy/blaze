@@ -1451,7 +1451,7 @@ impl Base {
         .map(|mut base| {
             if std::env::var_os("RA_JIT_ITEM_PUSH").is_none_or(|it| it != "0") {
                 let start = std::time::Instant::now();
-                let items = ItemPush::new(db, &base.compiled, &base.instances);
+                let items = ItemPush::new(db, cg.symbols, &base.compiled, &base.instances);
                 if std::env::var_os("RA_JIT_STATS").is_some() {
                     eprintln!(
                         "items-us: {} for {} items",
