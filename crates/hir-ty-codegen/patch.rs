@@ -28,7 +28,7 @@ use super::{
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
     instance_serial, is_thread_local,
-    itempush::{Asked, ItemPush},
+    itempush::{Asked, ItemPush, Settled},
     left_to_rustc,
     naming::Naming,
     root_serial, row_location, source_location,
@@ -755,10 +755,18 @@ pub(super) struct Base {
     /// Those an edit asked about by a name bound to another thing, whose items are to be
     /// taken again before the next edit.
     reitem: Option<Asked>,
+    /// Where threads of their own put what [`Self::reitem`] refers to once the patch of the
+    /// edit is made: the next edit waits for it, and asks itself when it is of another
+    /// revision or the threads were stopped.
+    settling: Option<Settling>,
 }
 
 /// See [`Base::making`].
 type Making = Arc<std::sync::Mutex<Option<(salsa::Revision, Box<ItemPush>)>>>;
+
+/// See [`Base::settling`].
+type Settling =
+    Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(salsa::Revision, Settled)>>>>;
 
 /// A function of the checkout the base has from the store: no build here compiled it, so
 /// nothing but its name says what it is an instance of. A look finds that out from the code
@@ -1455,6 +1463,7 @@ impl Base {
             items: None,
             making: None,
             reitem: None,
+            settling: None,
         })
         .map(|mut base| {
             if super::do_edits_follow()
@@ -1528,6 +1537,7 @@ impl Base {
             items: None,
             making: None,
             reitem: None,
+            settling: None,
         }
     }
 
@@ -1873,6 +1883,30 @@ impl Base {
         }
     }
 
+    /// Once the patch of an edit is made: what the edit asked about refers to now is asked on
+    /// threads of their own, of the revision the patch is of, for the next edit to take.
+    pub(super) fn settle_later(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        let (Some(_), Some(asked)) = (&self.items, &self.reitem) else { return };
+        let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
+        let (send, settling) = std::sync::mpsc::channel();
+        let at = salsa::plumbing::current_revision(db);
+        let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
+            let start = std::time::Instant::now();
+            let settled = Settled::new(db, fan, &roots, &instances);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-settled: {} roots and {} instances in {} us",
+                    roots.len(),
+                    instances.len(),
+                    start.elapsed().as_micros()
+                );
+            }
+            _ = send.send((at, settled));
+        };
+        symbols.in_background(db, Box::new(work));
+        self.settling = Some(Arc::new(std::sync::Mutex::new(Some(settling))));
+    }
+
     fn bindings_edited(&mut self) {
         self.making = None;
         if let Some(items) = &mut self.items {
@@ -1885,13 +1919,25 @@ impl Base {
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
         let start = std::time::Instant::now();
         self.take_made(db);
+        // Nothing changes: what the last edit asked about is taken before one that does.
+        if files.is_empty() {
+            return;
+        }
+        let settling = self.settling.take();
         let Some(items) = &mut self.items else { return };
         let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
+        let now = salsa::plumbing::current_revision(db);
+        let settled = settling
+            .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .and_then(|it| it.recv().ok())
+            .filter(|(at, _)| *at == now);
         let taken = probe(|| {
             hir_ty::attach_db(db, || {
                 let took = start.elapsed();
-                if let Some(asked) = reitem {
-                    items.settle(db, &asked, compiled, instances);
+                match (reitem, settled) {
+                    (Some(_), Some((_, settled))) => items.take_settled(settled),
+                    (Some(asked), None) => items.settle(db, &asked, compiled, instances),
+                    (None, _) => {}
                 }
                 let settled = start.elapsed();
                 items.index.before_edit(db, files);

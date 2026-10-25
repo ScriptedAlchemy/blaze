@@ -23,7 +23,15 @@ pub(super) struct ItemPush {
     /// By the index of each in the base; `Err` says why one's code can't be told.
     roots: Vec<Told>,
     instances: Vec<Told>,
+    /// Of each item and name, the roots and instances whose code has it, by [`At`]: no fewer
+    /// than have it, as what an edit settles is only added, and each is asked of its own
+    /// [`Used`] when it is found here.
+    by_item: FxHashMap<ItemId, Vec<At>>,
+    by_name: FxHashMap<Symbol, Vec<At>>,
 }
+
+/// A root by its index in the base, and an instance by its index after all of the roots.
+type At = u32;
 
 type Told = Result<Used, &'static str>;
 
@@ -134,19 +142,68 @@ impl ItemPush {
                 &why[..why.len().min(6)]
             );
         }
-        ItemPush { index, roots, instances }
+        let mut items = ItemPush {
+            index,
+            roots,
+            instances,
+            by_item: FxHashMap::default(),
+            by_name: FxHashMap::default(),
+        };
+        for at in 0..(items.roots.len() + items.instances.len()) as At {
+            items.link(at, None);
+        }
+        items
+    }
+
+    fn told(&self, at: At) -> &Told {
+        match (at as usize).checked_sub(self.roots.len()) {
+            None => &self.roots[at as usize],
+            Some(i) => &self.instances[i],
+        }
+    }
+
+    /// Notes what `at` has in [`Self::by_item`] and [`Self::by_name`], past what it had in `was`.
+    fn link(&mut self, at: At, was: Option<&Used>) {
+        let Ok(used) = (match (at as usize).checked_sub(self.roots.len()) {
+            None => &self.roots[at as usize],
+            Some(i) => &self.instances[i],
+        }) else {
+            return;
+        };
+        for item in &used.items {
+            if was.is_none_or(|it| !it.items.contains(item)) {
+                self.by_item.entry(*item).or_default().push(at);
+            }
+        }
+        for name in &used.names {
+            if was.is_none_or(|it| {
+                it.names.binary_search_by(|n| n.as_str().cmp(name.as_str())).is_err()
+            }) {
+                self.by_name.entry(name.clone()).or_default().push(at);
+            }
+        }
     }
 
     /// The roots and instances that refer to what the edit changed, or call something by a
     /// name bound to something else now, and those that can't be told.
     pub(super) fn asked(&self, pushed: &Pushed) -> Asked {
-        let ask = |used: &Told| used.as_ref().ok().is_none_or(|it| it.touched(pushed));
-        Asked {
-            roots: (0..self.roots.len() as u32).filter(|&i| ask(&self.roots[i as usize])).collect(),
-            instances: (0..self.instances.len() as u32)
-                .filter(|&i| ask(&self.instances[i as usize]))
-                .collect(),
+        let unknown = (self.roots.iter().chain(&self.instances).enumerate())
+            .filter(|(_, it)| it.is_err())
+            .map(|(at, _)| at as At);
+        let users = pushed.changed.iter().filter_map(|it| self.by_item.get(it));
+        let named = pushed.rebound().filter_map(|it| self.by_name.get(it));
+        let mut found: Vec<At> = users.chain(named).flatten().copied().chain(unknown).collect();
+        found.sort_unstable();
+        found.dedup();
+        let ask = |at: &At| self.told(*at).as_ref().ok().is_none_or(|it| it.touched(pushed));
+        let (mut roots, mut instances) = (Vec::new(), Vec::new());
+        for at in found.into_iter().filter(ask) {
+            match (at as usize).checked_sub(self.roots.len()) {
+                None => roots.push(at),
+                Some(i) => instances.push(i as u32),
+            }
         }
+        Asked { roots, instances }
     }
 
     /// Notes what the roots and instances asked about refer to now, of the revision after the
@@ -158,15 +215,85 @@ impl ItemPush {
         compiled: &[(FunctionId, String)],
         instances: &FxIndexMap<Instance, BaseInstance>,
     ) {
-        let refs = Refs::new(db);
-        let mut of_body = |body: DefWithBodyId| used(db, &refs, body);
-        for &i in &asked.roots {
-            self.roots[i as usize] = of_body(compiled[i as usize].0.into());
+        let (roots, instances) = Settled::asked(asked, compiled, instances);
+        self.take_settled(Settled::new(db, &|_, _| {}, &roots, &instances));
+    }
+
+    pub(super) fn take_settled(&mut self, settled: Settled) {
+        let roots = self.roots.len() as At;
+        let told = (settled.roots.into_iter())
+            .chain(settled.instances.into_iter().map(|(i, used)| (roots + i, used)));
+        for (at, used) in told {
+            let slot = match (at as usize).checked_sub(self.roots.len()) {
+                None => &mut self.roots[at as usize],
+                Some(i) => &mut self.instances[i],
+            };
+            let was = std::mem::replace(slot, used);
+            self.link(at, was.as_ref().ok());
         }
-        for &i in &asked.instances {
-            let Some((instance, _)) = instances.get_index(i as usize) else { continue };
-            self.instances[i as usize] = used_by_instance(db, &refs, instance, &mut of_body);
-        }
+    }
+}
+
+/// What roots and instances refer to after an edit, by the index of each in the base.
+pub(super) struct Settled {
+    roots: Vec<(u32, Told)>,
+    instances: Vec<(u32, Told)>,
+}
+
+impl Settled {
+    /// The roots and instances of `asked`, by the index of each.
+    pub(super) fn asked(
+        asked: &Asked,
+        compiled: &[(FunctionId, String)],
+        instances: &FxIndexMap<Instance, BaseInstance>,
+    ) -> (Vec<(u32, FunctionId)>, Vec<(u32, Instance)>) {
+        let roots = asked.roots.iter().map(|&i| (i, compiled[i as usize].0)).collect();
+        let instances = asked
+            .instances
+            .iter()
+            .filter_map(|&i| Some((i, instances.get_index(i as usize)?.0.clone())));
+        (roots, instances.collect())
+    }
+
+    /// Asked on the threads `fan` has, each taking a part of the roots and the instances.
+    pub(super) fn new(
+        db: &dyn HirDatabase,
+        fan: &Fan<'_>,
+        roots: &[(u32, FunctionId)],
+        instances: &[(u32, Instance)],
+    ) -> Settled {
+        const PART: usize = 16;
+        let (of_roots, of_instances) = (roots.len().div_ceil(PART), instances.len().div_ceil(PART));
+        let parts: Vec<OnceLock<Vec<(u32, Told)>>> =
+            (0..of_roots + of_instances).map(|_| OnceLock::new()).collect();
+        let work = |db: &dyn HirDatabase, at: usize| {
+            parts[at].get_or_init(|| {
+                let refs = Refs::new(db);
+                let part = |all: usize, at: usize| at * PART..((at + 1) * PART).min(all);
+                match at.checked_sub(of_roots) {
+                    None => part(roots.len(), at)
+                        .map(|i| (roots[i].0, used(db, &refs, roots[i].1.into())))
+                        .collect(),
+                    Some(at) => {
+                        let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
+                        let mut of_body = |body: DefWithBodyId| -> Told {
+                            bodies.entry(body).or_insert_with(|| used(db, &refs, body)).clone()
+                        };
+                        part(instances.len(), at)
+                            .map(|i| {
+                                let (at, instance) = &instances[i];
+                                (*at, used_by_instance(db, &refs, instance, &mut of_body))
+                            })
+                            .collect()
+                    }
+                }
+            });
+        };
+        fan(parts.len(), &work);
+        (0..parts.len()).for_each(|at| work(db, at));
+        let mut parts = parts.into_iter().filter_map(OnceLock::into_inner);
+        let roots = parts.by_ref().take(of_roots).flatten().collect();
+        Settled { roots, instances: parts.flatten().collect() }
     }
 }
 

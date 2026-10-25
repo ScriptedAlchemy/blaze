@@ -105,6 +105,12 @@ impl Pushed {
         self.bound.len() + self.methods.len()
     }
 
+    /// The names [`Self::names`] counts: no code written without one of them is
+    /// [`Self::rebinds`].
+    pub fn rebound(&self) -> impl Iterator<Item = &Symbol> {
+        self.bound.keys().chain(&self.methods)
+    }
+
     /// Whether code written in `modules` (its module and those that one is in) with `names`
     /// (in the order of their text) can call something by a name bound to another thing now: it
     /// names a method added or taken away, or a name bound differently in a crate's root, in

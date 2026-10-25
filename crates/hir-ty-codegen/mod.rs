@@ -695,7 +695,7 @@ impl CodegenUnit {
         let forgot = known.forgot_rustc.take().filter(|_| replaced.is_none());
         let mut declined =
             replaced.as_ref().filter(|it| it.rustc).and_then(|it| it.why_outdated()).or(forgot);
-        if let Some(base) = replaced.take_if(|it| !it.outdated()) {
+        if let Some(mut base) = replaced.take_if(|it| !it.outdated()) {
             let start = stdx::time::Instant::now();
             // Every static is rustc's, which rustc's code reads.
             let own_statics = match base.rustc {
@@ -760,6 +760,7 @@ impl CodegenUnit {
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
                 };
+                base.settle_later(db, symbols);
                 known.put_base(base);
                 return Ok(Some(unit));
             }
