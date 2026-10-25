@@ -10,8 +10,8 @@ the shadow taken away, a re-export bound to another function, a function moved t
 module, a function made private so that the glob no longer brings it, an inherent method that
 takes a call from a trait's, a trait's default method called directly and through `dyn`, and
 a file written again with nothing changed, a module added that imports a macro a module that
-stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call of the
-module around now names instead of the one it imported. After each step
+stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call in a file
+that is not edited now names instead of std's. After each step
 the program the daemon built prints what cargo's prints, or both builds fail.
 
 The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
@@ -35,7 +35,7 @@ use a::*;
 pub use b::scale;
 
 pub fn pick() -> u32 {
-    value() + tag!()
+    value() + tag!() + e::at()
 }
 
 pub trait Area {
@@ -44,12 +44,15 @@ pub trait Area {
         self.area() * 2
     }
 }
+
+mod e;
 """
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
     "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
     "lib/src/lib.rs": LIB,
     "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
+    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n",
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
     "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
@@ -82,7 +85,7 @@ STEPS = [
         (LIB_RS, "mod b;\n", "mod b;\nmod c;\n"),
     ]),
     ("`#[macro_use]` module added", [
-        (D_RS, None, lambda _: "macro_rules! tag {\n    () => {\n        5\n    };\n}\n"),
+        (D_RS, None, lambda _: "macro_rules! line {\n    () => {\n        500\n    };\n}\n"),
         (LIB_RS, "pub fn pick", "#[macro_use]\nmod d;\n\npub fn pick"),
     ]),
 ]
