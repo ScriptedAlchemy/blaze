@@ -18,7 +18,7 @@ from cargo_ra_jit import Side, wait_warm
 from memsplit import wait_own_base
 
 # What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
-SAID = re.compile(r"(bodies only|signatures only|functions added|items|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
+SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
 
 
 def git(repo, *args, text=True):
@@ -77,7 +77,7 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
         walls, said = [], []
-        daemon.said()
+        row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):
             for label, files in (("commit", after), ("back", before)):
                 write(ws, files)
