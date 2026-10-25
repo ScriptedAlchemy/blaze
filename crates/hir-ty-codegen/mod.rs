@@ -109,6 +109,7 @@ mod home;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
+mod itempush;
 #[cfg(feature = "llvm")]
 mod llvm;
 mod naming;
@@ -1503,6 +1504,31 @@ impl Rejections {
         }
         if let Some(rustc) = &mut self.rustc {
             rustc.touch_added(db, crates, files);
+        }
+        self.forget();
+    }
+
+    /// Before an edit of `files`, of the revision before it.
+    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId]) {
+        if let Some(base) = &mut self.base {
+            base.before_edit(db, files);
+        }
+    }
+
+    /// Notes that `files` of `crates` changed in more than the bodies of functions, and what
+    /// changed can be told by the items that did.
+    pub fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[base_db::FileId],
+    ) {
+        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        if let Some(base) = &mut self.base {
+            base.touch_items(db, crates, files);
+        }
+        if let Some(rustc) = &mut self.rustc {
+            rustc.touch(db, Some(crates));
         }
         self.forget();
     }

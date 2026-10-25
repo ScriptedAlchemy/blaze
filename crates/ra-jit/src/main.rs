@@ -8939,6 +8939,7 @@ fn run_holding(
         outlines.before_edit(&db, &listed, &editing);
         for program in &mut programs {
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
+            program.known.before_edit(&db, &editing);
         }
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
@@ -8980,6 +8981,7 @@ fn run_holding(
             outlines.before_edit(&db, &listed, &untouched);
             for program in &mut programs {
                 program.checked.before_edit(&db, &listed, &untouched, &program.unbuilt.edited);
+                program.known.before_edit(&db, &untouched);
             }
             for file in write_harnesses(&mut db, texts) {
                 if !sources.contains(&file) {
@@ -9029,6 +9031,10 @@ fn run_holding(
         let before_outlines = start.elapsed();
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
+        // The files that changed in more than what the outline tells, and their crates: what
+        // changed is told by their items, together, as an item moved from one to another is.
+        let mut by_items: Vec<vfs::FileId> = Vec::new();
+        let mut items_crates: Vec<ide_db::base_db::Crate> = Vec::new();
         for outline::Changed { file, bodies_only, copied, generics, inline, added, signatures } in
             sources
         {
@@ -9074,8 +9080,25 @@ fn run_holding(
                 // they were.
                 continue;
             }
-            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
-            listed.touch(&db, crates);
+            match crates {
+                Some(crates) => {
+                    by_items.push(file);
+                    for &krate in crates {
+                        if !items_crates.contains(&krate) {
+                            items_crates.push(krate);
+                        }
+                    }
+                }
+                None => {
+                    programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+                    listed.touch(&db, None);
+                }
+            }
+        }
+        if !by_items.is_empty() {
+            let crates = &items_crates;
+            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items));
+            listed.touch(&db, Some(crates));
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {

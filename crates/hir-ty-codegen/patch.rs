@@ -28,6 +28,7 @@ use super::{
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
     instance_serial, is_thread_local, left_to_rustc,
+    itempush::{Asked, ItemPush},
     naming::Naming,
     root_serial, row_location, source_location,
     stable::StableNames,
@@ -221,7 +222,7 @@ impl Node {
 /// taken away what the base knew it by, and only looking tells. A build that is interrupted
 /// goes on unwinding: that says nothing about the base. One that waited for a thread whose
 /// own look panicked has found what that thread found.
-fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
+pub(super) fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(found) => Some(found),
         Err(stopped) => match stopped.downcast_ref::<salsa::Cancelled>() {
@@ -744,6 +745,12 @@ pub(super) struct Base {
     /// rustc's copies of those of the name is an instance of the base, which a patch replaces
     /// under rustc's symbol.
     copies_homed: FxHashMap<FileId, FxHashMap<String, bool>>,
+    /// What the roots and instances refer to by item, for an edit that changes items: `None`
+    /// for a base of rustc's, and once an edit left it unable to tell.
+    items: Option<Box<ItemPush>>,
+    /// Those an edit asked about by a name bound to another thing, whose items are to be
+    /// taken again before the next edit.
+    reitem: Option<Asked>,
 }
 
 /// A function of the checkout the base has from the store: no build here compiled it, so
@@ -1438,6 +1445,23 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            reitem: None,
+        })
+        .map(|mut base| {
+            if std::env::var_os("RA_JIT_ITEM_PUSH").is_none_or(|it| it != "0") {
+                let start = std::time::Instant::now();
+                let items = ItemPush::new(db, &base.compiled, &base.instances);
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    eprintln!(
+                        "items-us: {} for {} items",
+                        start.elapsed().as_micros(),
+                        items.index.items()
+                    );
+                }
+                base.items = Some(Box::new(items));
+            }
+            base
         })
     }
 
@@ -1483,6 +1507,8 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            reitem: None,
         }
     }
 
@@ -1733,6 +1759,10 @@ impl Base {
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         // rustc's copies of what sees the file are of before, and nothing here says which.
         self.outdate_rustc("an edit that is more than the bodies of functions");
+        match crates {
+            Some(_) => self.bindings_edited(),
+            None => self.items = None,
+        }
         let Some(crates) = crates else {
             self.touched.any = true;
             self.outdated |= self.untracked;
@@ -1756,6 +1786,7 @@ impl Base {
         if !files.iter().all(|it| self.homed.contains(it)) {
             return self.touch(db, Some(crates));
         }
+        self.bindings_edited();
         self.touched.crates.extend(crates.iter().copied());
         self.outdated |=
             self.untracked && self.crates.iter().any(|it| self.touched.crates.contains(it));
@@ -1776,6 +1807,7 @@ impl Base {
         let Some(reached) = reached.filter(|_| !self.rustc) else {
             return self.touch(db, Some(crates));
         };
+        self.bindings_edited();
         // Its bodies too, as a body edit's.
         self.touched.bodies.insert(file);
         for &krate in crates {
@@ -1807,6 +1839,88 @@ impl Base {
                 self.touched.named_instances.len()
             );
         }
+        self.outdated |=
+            self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
+    }
+
+    fn bindings_edited(&mut self) {
+        if let Some(items) = &mut self.items {
+            items.index.bindings_edited();
+        }
+    }
+
+    /// Before an edit of `files`: what the edits before it left of the items is taken in, of
+    /// the revision they left.
+    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+        let Some(items) = &mut self.items else { return };
+        if let Some(asked) = self.reitem.take() {
+            items.settle(db, &asked, &self.compiled, &self.instances);
+        }
+        items.index.before_edit(db, files);
+    }
+
+    /// Notes that `files` of `crates` changed in their items: what can have changed is what
+    /// refers to an item that changed, through its interface, or calls something by a name
+    /// bound to another thing now. All of what sees the files when that can't be told.
+    pub(super) fn touch_items(&mut self, db: &dyn HirDatabase, crates: &[Crate], files: &[FileId]) {
+        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let start = std::time::Instant::now();
+        let pushed = match &mut self.items {
+            Some(items) if !self.rustc => items.index.push(db, files),
+            Some(_) => Err("a base of rustc's"),
+            None => Err("no items"),
+        };
+        let pushed = match pushed {
+            Ok(it) => it,
+            Err(why) => {
+                if stats {
+                    eprintln!("items: whole crates: {why}");
+                }
+                return self.touch(db, Some(crates));
+            }
+        };
+        let items = self.items.as_ref().expect("pushed through them");
+        let asked = items.asked(&pushed);
+        // Their bodies too, as a body edit's.
+        self.touched.bodies.extend(pushed.files.iter().copied());
+        for &krate in crates {
+            if !self.touched.around.contains(&krate) {
+                self.touched.around.extend(krate.transitive_rev_deps(db));
+            }
+        }
+        let around = &self.touched.around;
+        let roots = asked.roots.iter().copied().filter(|&i| around.contains(&self.crates[i as usize]));
+        self.touched.named_roots.extend(roots);
+        let instances = asked.instances.iter().copied().filter(|&i| {
+            self.instances
+                .get_index(i as usize)
+                .is_some_and(|(_, was)| around.contains(&was.env.krate))
+        });
+        self.touched.named_instances.extend(instances);
+        // What came from the store is not in `items`: all of it that can see them is asked.
+        let hydrated = self.hydrated.iter().enumerate().filter_map(|(i, was)| {
+            was.krate.is_none_or(|it| around.contains(&it)).then_some(i as u32)
+        });
+        self.touched.hydrated.extend(hydrated.collect::<Vec<_>>());
+        if stats {
+            eprintln!(
+                "items: {} written, {} changed, {} names, {} roots and {} instances asked in {} us",
+                pushed.written,
+                pushed.changed.len(),
+                pushed.names.len(),
+                asked.roots.len(),
+                asked.instances.len(),
+                start.elapsed().as_micros()
+            );
+        }
+        self.reitem = Some(match self.reitem.take() {
+            Some(mut was) => {
+                was.roots.extend(asked.roots);
+                was.instances.extend(asked.instances);
+                was
+            }
+            None => asked,
+        });
         self.outdated |=
             self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
     }

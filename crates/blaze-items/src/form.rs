@@ -172,6 +172,12 @@ impl<'db> Cx<'db> {
     }
 
     pub(crate) fn node(&self, id: ItemId) -> Node {
+        self.node_with(id, true)
+    }
+
+    /// [`Cx::node`], and without the body of a function or a static when `bodies` is false: what
+    /// its dependents see is all there is of it then.
+    pub(crate) fn node_with(&self, id: ItemId, bodies: bool) -> Node {
         let db = self.db;
         let mut form = Form::new(id.kind());
         let f = &mut form;
@@ -191,7 +197,7 @@ impl<'db> Cx<'db> {
                 let data = FunctionSignature::of(db, func);
                 f.u64(u64::from(data.flags.bits()));
                 self.attrs(f, func.into());
-                if data.flags.contains(FnFlags::HAS_BODY) {
+                if bodies && data.flags.contains(FnFlags::HAS_BODY) {
                     body = Some(self.body(func.into()));
                 }
             }
@@ -272,7 +278,7 @@ impl<'db> Cx<'db> {
                 f.debug(&data.flags);
                 self.attrs(f, it.into());
                 f.debug(&AttrFlags::export_name(db, it.into()));
-                if data.flags.contains(hir_def::signatures::StaticFlags::HAS_BODY) {
+                if bodies && data.flags.contains(hir_def::signatures::StaticFlags::HAS_BODY) {
                     body = Some(self.body(it.into()));
                 }
             }
@@ -302,6 +308,41 @@ impl<'db> Cx<'db> {
             Ok(body) => self.mir(&mut form, body),
             Err(_) => form.miss("no MIR"),
         }
+        form.finish()
+    }
+
+    /// A body with the coroutines written in it, `async` blocks and the body of an `async fn`:
+    /// all the code it is, which [`Cx::body`] leaves them out of.
+    pub(crate) fn code(&self, def: DefWithBodyId) -> Sub {
+        let db = self.db;
+        let mut form = Form::new("code");
+        form.sub(&self.body(def));
+        let store = hir_def::expr_store::Body::of(db, def);
+        let infer = hir_ty::InferenceResult::of(db, def);
+        for (expr, it) in store.exprs() {
+            if !matches!(it, hir_def::hir::Expr::Closure { .. }) {
+                continue;
+            }
+            let id = match infer.expr_ty(expr).kind() {
+                TyKind::Coroutine(id, _) => id.0,
+                TyKind::Closure(..) | TyKind::CoroutineClosure(..) => continue,
+                _ => {
+                    form.miss("a closure of no closure type");
+                    continue;
+                }
+            };
+            match db.mir_body_for_coroutine(id) {
+                Ok(body) => self.mir(&mut form, body),
+                Err(_) => form.miss("no MIR for a coroutine"),
+            }
+        }
+        form.finish()
+    }
+
+    /// What generic arguments refer to.
+    pub(crate) fn of_args(&self, args: GenericArgs<'db>) -> Sub {
+        let mut form = Form::new("args");
+        self.args(&mut form, args);
         form.finish()
     }
 

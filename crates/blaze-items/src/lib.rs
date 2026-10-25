@@ -22,6 +22,7 @@
 extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 mod form;
+mod index;
 
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,38 @@ use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
+pub use index::{Index, Pushed, code_names, file_of};
+
+/// What items refer to, for many of them in turn.
+pub struct Refs<'db>(form::Cx<'db>);
+
+impl<'db> Refs<'db> {
+    pub fn new(db: &'db dyn HirDatabase) -> Refs<'db> {
+        Refs(form::Cx::new(db))
+    }
+
+    /// What an item's interface refers to, and its code, with the coroutines written in it:
+    /// `None` when part of it could not be written.
+    pub fn of_code(&self, id: ItemId, body: Option<DefWithBodyId>) -> Option<Vec<ItemId>> {
+        let node = self.0.node_with(id, false);
+        node.interface.missed.is_none().then_some(())?;
+        let mut refs = node.interface.refs;
+        if let Some(body) = body {
+            let code = self.0.code(body);
+            code.missed.is_none().then_some(())?;
+            refs.extend(code.refs);
+        }
+        let mut unique = FxHashSet::default();
+        refs.retain(|it| unique.insert(*it));
+        Some(refs)
+    }
+
+    /// What generic arguments refer to, or `None`.
+    pub fn of_args(&self, args: hir_ty::next_solver::GenericArgs<'db>) -> Option<Vec<ItemId>> {
+        let sub = self.0.of_args(args);
+        sub.missed.is_none().then_some(sub.refs)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ItemId {

@@ -1,0 +1,615 @@
+//! The items of the checkout as what refers to them sees them, kept from edit to edit: an edit
+//! that moves, renames or changes items then asks again about what refers to what changed, and
+//! not about all of each crate that can see the files it touched (#344).
+//!
+//! Each item has an entry: its interface form (with the body of a function seen into, `async`,
+//! `const`, `gen` or returning `impl Trait`), what that refers to, and the names its source and
+//! signature are written with. Each crate has the bindings of its modules. An edit's files are
+//! written again and set beside their entries, and the crates that see them beside their
+//! bindings: what changed is the items added, taken away or seen differently, and the names
+//! bound to something else, whose users are written again in turn. What sees a changed item
+//! through its interface changed too.
+
+use base_db::{Crate, FileId};
+use hir_def::{
+    AdtId, DefWithBodyId, ItemContainerId, Lookup, MacroId, ModuleId,
+    expr_store::{Body, ExpressionStore, path::Path},
+    hir::{Expr, Pat, type_ref::TypeRef},
+    nameres::crate_def_map,
+    signatures::FunctionSignature,
+};
+use hir_expand::HirFileId;
+use hir_ty::db::HirDatabase;
+use intern::Symbol;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange};
+
+use crate::{ItemId, form, in_scope};
+
+#[derive(Clone)]
+pub struct Index {
+    crates: FxHashSet<Crate>,
+    entries: FxHashMap<ItemId, Entry>,
+    files: FxHashMap<FileId, Vec<ItemId>>,
+    /// For each item, those whose entries refer to it.
+    users: FxHashMap<ItemId, FxHashSet<ItemId>>,
+    /// For each name, the items whose entries are written with it.
+    named: FxHashMap<Symbol, FxHashSet<ItemId>>,
+    scopes: FxHashMap<Crate, Scope>,
+    /// What each crate's own attributes say, as `DefMap::crate_data_print` writes it.
+    attrs: FxHashMap<Crate, u64>,
+    /// Files edited since their entries were written, by an edit that was not looked at here.
+    dirty: FxHashSet<FileId>,
+    /// Whether an edit since the bindings were taken can have changed them.
+    scopes_dirty: bool,
+}
+
+#[derive(Clone)]
+struct Entry {
+    file: FileId,
+    digest: form::Hash,
+    refs: Box<[ItemId]>,
+    names: Box<[Symbol]>,
+    missed: Option<&'static str>,
+}
+
+/// The bindings of a crate's modules, each name's by namespace: types and values, and macros.
+#[derive(Clone, Default)]
+struct Scope {
+    names: FxHashMap<(ModuleId, Symbol), (u64, u64)>,
+    /// The file each module is written in.
+    modules: FxHashMap<ModuleId, FileId>,
+}
+
+/// What an edit changed, as [`Index::push`] found it.
+pub struct Pushed {
+    /// The items added, taken away or seen differently, and those that see one of them through
+    /// their interface.
+    pub changed: FxHashSet<ItemId>,
+    /// The names bound to something else now or to nothing, and those of methods added or
+    /// taken away: what calls something by one can call another thing now.
+    pub names: FxHashSet<Symbol>,
+    /// The files written again: those edited, and those of modules added or taken away.
+    pub files: Vec<FileId>,
+    /// How many items were written again.
+    pub written: usize,
+}
+
+impl Index {
+    /// The entries of every item `crates` declare, and their bindings.
+    pub fn new(db: &dyn HirDatabase, crates: &[Crate]) -> Index {
+        let mut index = Index {
+            crates: crates.iter().copied().collect(),
+            entries: FxHashMap::default(),
+            files: FxHashMap::default(),
+            users: FxHashMap::default(),
+            named: FxHashMap::default(),
+            scopes: FxHashMap::default(),
+            attrs: FxHashMap::default(),
+            dirty: FxHashSet::default(),
+            scopes_dirty: false,
+        };
+        let cx = form::Cx::new(db);
+        for &krate in crates {
+            let mut items = Vec::new();
+            crate::declared(db, krate, &mut items);
+            for id in items {
+                if let Some(entry) = entry(db, &cx, id) {
+                    index.insert(id, entry);
+                }
+            }
+            index.scopes.insert(krate, scope(db, krate));
+            index.attrs.insert(krate, attrs(db, krate));
+        }
+        index
+    }
+
+    pub fn items(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Before an edit of `files`: what edits before it left out of date is written again, of
+    /// the revision they left, and `files` are noted as edited.
+    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+        let dirty: Vec<FileId> = self.dirty.drain().collect();
+        if !dirty.is_empty() {
+            let cx = form::Cx::new(db);
+            for file in dirty {
+                self.write(db, &cx, file);
+            }
+        }
+        if std::mem::take(&mut self.scopes_dirty) {
+            let crates: Vec<Crate> = self.crates.iter().copied().collect();
+            for krate in crates {
+                self.scopes.insert(krate, scope(db, krate));
+                self.attrs.insert(krate, attrs(db, krate));
+            }
+        }
+        self.dirty.extend(files.iter().copied());
+    }
+
+    /// Notes that an edit since [`Index::before_edit`] can have changed the bindings of modules.
+    pub fn bindings_edited(&mut self) {
+        self.scopes_dirty = true;
+    }
+
+    /// What the edit of `files` changed, of the revision after it; the entries and bindings are
+    /// then those of it. `Err` says why that can't be told here, and the entries are left to be
+    /// written again before the next edit.
+    pub fn push(&mut self, db: &dyn HirDatabase, files: &[FileId]) -> Result<Pushed, &'static str> {
+        let pushed = self.push_inner(db, files);
+        if pushed.is_err() {
+            self.scopes_dirty = true;
+        }
+        pushed
+    }
+
+    fn push_inner(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+    ) -> Result<Pushed, &'static str> {
+        let mut edited: FxHashSet<Crate> = FxHashSet::default();
+        for &file in files {
+            let crates = self.crates_of(db, file);
+            if crates.is_empty() && self.files.get(&file).is_none_or(Vec::is_empty) {
+                // A file of no crate, before and after.
+                continue;
+            }
+            if crates.is_empty() && base_db::relevant_crates(db, file).iter().next().is_some() {
+                return Err("a file of a crate not looked at");
+            }
+            edited.extend(crates);
+        }
+        for &krate in &edited {
+            if self.attrs.get(&krate) != Some(&attrs(db, krate)) {
+                return Err("an edit of a crate's own attributes");
+            }
+        }
+        let mut around: FxHashSet<Crate> = edited.clone();
+        for &krate in &edited {
+            around.extend(krate.transitive_rev_deps(db).iter().filter(|it| self.crates.contains(it)));
+        }
+
+        // The bindings, and the files of the modules added or taken away.
+        let mut names: FxHashSet<Symbol> = FxHashSet::default();
+        let mut rewritten: Vec<FileId> = files.to_vec();
+        let mut scopes = Vec::new();
+        for &krate in &around {
+            let now = scope(db, krate);
+            let was = self.scopes.get(&krate);
+            let empty = Scope::default();
+            let was = was.unwrap_or(&empty);
+            for (key, &(values, macros)) in &now.names {
+                match was.names.get(key) {
+                    Some(&(_, was_macros)) if was_macros != macros => {
+                        return Err("a name bound to another macro");
+                    }
+                    Some(&(was_values, _)) if was_values == values => {}
+                    None if macros != 0 => return Err("a name bound to a macro"),
+                    _ => _ = names.insert(key.1.clone()),
+                }
+            }
+            for (key, &(_, macros)) in &was.names {
+                if !now.names.contains_key(key) {
+                    if macros != 0 {
+                        return Err("a macro's name bound to nothing");
+                    }
+                    names.insert(key.1.clone());
+                }
+            }
+            for (module, file) in now.modules.iter().chain(&was.modules) {
+                if now.modules.get(module) != was.modules.get(module) && !rewritten.contains(file) {
+                    rewritten.push(*file);
+                }
+            }
+            scopes.push((krate, now));
+        }
+
+        // The files written again, beside their entries.
+        let cx = form::Cx::new(db);
+        let mut changed: FxHashSet<ItemId> = FxHashSet::default();
+        let mut written = 0;
+        for &file in &rewritten {
+            let was: FxHashSet<ItemId> =
+                self.files.get(&file).into_iter().flatten().copied().collect();
+            let mut now: Vec<ItemId> = Vec::new();
+            for krate in self.crates_of(db, file) {
+                declared_in(db, krate, file, &mut now);
+            }
+            let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
+            for &id in was.iter().filter(|it| !now_set.contains(it)) {
+                changed_kind(db, id)?;
+                if let Some(name) = method_name(db, id) {
+                    names.insert(name);
+                }
+                changed.insert(id);
+            }
+            for &id in &now {
+                written += 1;
+                let entry = entry(db, &cx, id).ok_or("an item that is not an item now")?;
+                if let Some(why) = entry.missed {
+                    return Err(why);
+                }
+                match self.entries.get(&id) {
+                    Some(was) if was.digest == entry.digest && was.refs == entry.refs => {}
+                    Some(_) => {
+                        changed_kind(db, id)?;
+                        changed.insert(id);
+                    }
+                    None => {
+                        changed_kind(db, id)?;
+                        if let Some(name) = method_name(db, id) {
+                            names.insert(name);
+                        }
+                        changed.insert(id);
+                    }
+                }
+                self.remove(id);
+                self.insert(id, entry);
+            }
+            for id in was.into_iter().filter(|it| !now_set.contains(it)) {
+                self.remove(id);
+            }
+            self.dirty.remove(&file);
+        }
+
+        // What is written with a name bound to something else now, written again.
+        let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
+        let mut again: Vec<ItemId> = names
+            .iter()
+            .filter_map(|it| self.named.get(it))
+            .flatten()
+            .copied()
+            .filter(|it| self.entries.get(it).is_some_and(|it| !rewritten_files.contains(&it.file)))
+            .collect();
+        again.sort_unstable_by_key(|it| format!("{it:?}"));
+        again.dedup();
+        for id in again {
+            written += 1;
+            let entry = entry(db, &cx, id).ok_or("an item gone with no edit of its file")?;
+            if let Some(why) = entry.missed {
+                return Err(why);
+            }
+            let was = &self.entries[&id];
+            if was.digest != entry.digest || was.refs != entry.refs {
+                changed_kind(db, id)?;
+                changed.insert(id);
+            }
+            self.remove(id);
+            self.insert(id, entry);
+        }
+        for (krate, now) in scopes {
+            self.scopes.insert(krate, now);
+        }
+
+        // And what sees one of those through its interface.
+        let mut queue: Vec<ItemId> = changed.iter().copied().collect();
+        while let Some(id) = queue.pop() {
+            let mut reached: Vec<ItemId> =
+                self.users.get(&id).into_iter().flatten().copied().collect();
+            // What a projection through an impl is depends on the impl's associated items: a
+            // change to one is a change to the trait's of its name, which the projection names.
+            if let Some(of_trait) = trait_counterpart(db, id) {
+                reached.push(of_trait);
+            }
+            for user in reached {
+                if changed.insert(user) {
+                    queue.push(user);
+                }
+            }
+        }
+        Ok(Pushed { changed, names, files: rewritten, written })
+    }
+
+    fn crates_of(&self, db: &dyn HirDatabase, file: FileId) -> Vec<Crate> {
+        base_db::relevant_crates(db, file)
+            .iter()
+            .copied()
+            .filter(|it| self.crates.contains(it))
+            .collect()
+    }
+
+    /// Writes the entries of `file` again, of this revision.
+    fn write(&mut self, db: &dyn HirDatabase, cx: &form::Cx<'_>, file: FileId) {
+        for id in self.files.remove(&file).unwrap_or_default() {
+            self.remove(id);
+        }
+        let mut now = Vec::new();
+        for krate in self.crates_of(db, file) {
+            declared_in(db, krate, file, &mut now);
+        }
+        for id in now {
+            if let Some(entry) = entry(db, cx, id) {
+                self.remove(id);
+                self.insert(id, entry);
+            }
+        }
+    }
+
+    fn insert(&mut self, id: ItemId, entry: Entry) {
+        self.files.entry(entry.file).or_default().push(id);
+        for &r in &entry.refs {
+            self.users.entry(r).or_default().insert(id);
+        }
+        for name in &entry.names {
+            self.named.entry(name.clone()).or_default().insert(id);
+        }
+        self.entries.insert(id, entry);
+    }
+
+    fn remove(&mut self, id: ItemId) {
+        let Some(entry) = self.entries.remove(&id) else { return };
+        if let Some(items) = self.files.get_mut(&entry.file) {
+            items.retain(|it| *it != id);
+        }
+        for r in &entry.refs {
+            if let Some(users) = self.users.get_mut(r) {
+                users.remove(&id);
+            }
+        }
+        for name in &entry.names {
+            if let Some(named) = self.named.get_mut(name) {
+                named.remove(&id);
+            }
+        }
+    }
+}
+
+/// Whether a change to `id` is one [`Index::push`] can follow: what an impl or a trait is, or
+/// a macro, changes what code is in more ways than what refers to them shows.
+fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {
+    let container = |container| match container {
+        ItemContainerId::TraitId(_) => Err("an item of a trait"),
+        ItemContainerId::ImplId(imp) if db.impl_trait(imp).is_some() => {
+            Err("an item of an impl of a trait")
+        }
+        _ => Ok(()),
+    };
+    match id {
+        ItemId::Impl(_) => Err("an impl"),
+        ItemId::Trait(_) => Err("a trait"),
+        ItemId::Macro(_) => Err("a macro"),
+        ItemId::Function(it) => container(it.lookup(db).container),
+        ItemId::Const(it) => container(it.lookup(db).container),
+        ItemId::Alias(it) => match it.lookup(db).container {
+            ItemContainerId::ImplId(_) => Err("an associated type"),
+            other => container(other),
+        },
+        ItemId::Adt(_) | ItemId::Static(_) => Ok(()),
+    }
+}
+
+/// The name of a method of an impl: one added or taken away can be what a call of the name
+/// resolves to.
+fn method_name(db: &dyn HirDatabase, id: ItemId) -> Option<Symbol> {
+    let ItemId::Function(func) = id else { return None };
+    let ItemContainerId::ImplId(_) = func.lookup(db).container else { return None };
+    Some(FunctionSignature::of(db, func).name.symbol().clone())
+}
+
+/// The item of a trait an associated item of an impl of it is a value of.
+fn trait_counterpart(db: &dyn HirDatabase, id: ItemId) -> Option<ItemId> {
+    let (container, name) = match id {
+        ItemId::Alias(it) => {
+            let name = hir_def::signatures::TypeAliasSignature::of(db, it).name.clone();
+            (it.lookup(db).container, name)
+        }
+        ItemId::Const(it) => {
+            let name = hir_def::signatures::ConstSignature::of(db, it).name.clone()?;
+            (it.lookup(db).container, name)
+        }
+        _ => return None,
+    };
+    let ItemContainerId::ImplId(imp) = container else { return None };
+    let trait_ref = db.impl_trait(imp)?;
+    let trait_id = trait_ref.skip_binder().def_id.0;
+    trait_id.trait_items(db).items.iter().find(|(it, _)| *it == name).map(|&(_, item)| item.into())
+}
+
+/// The entry of an item, or `None` for one that is not one now.
+fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
+    let file = file_of(db, id)?;
+    let node = cx.node_with(id, false);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&node.interface.digest);
+    let mut refs = node.interface.refs;
+    let mut missed = node.interface.missed;
+    let seen = seen_into(db, id, &refs);
+    if let (true, ItemId::Function(func)) = (seen, id) {
+        let code = cx.code(func.into());
+        hasher.update(&code.digest);
+        refs.extend(code.refs);
+        missed = missed.or(code.missed);
+    }
+    let mut unique = FxHashSet::default();
+    refs.retain(|it| unique.insert(*it));
+    let mut names = Vec::new();
+    interface_names(db, id, seen, &mut names);
+    names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    names.dedup();
+    Some(Entry {
+        file,
+        digest: *hasher.finalize().as_bytes(),
+        refs: refs.into(),
+        names: names.into(),
+        missed,
+    })
+}
+
+/// Whether what refers to the function sees into its body: the future of an `async fn`, the
+/// value of a `const fn` where it is evaluated, the type an `impl Trait` it returns is.
+fn seen_into(db: &dyn HirDatabase, id: ItemId, interface_refs: &[ItemId]) -> bool {
+    let ItemId::Function(func) = id else { return false };
+    let signature = FunctionSignature::of(db, func);
+    signature.is_async()
+        || signature.is_const()
+        || signature.is_gen()
+        || interface_refs.contains(&id)
+}
+
+/// The file an item is written in, or of the macro call that wrote it.
+pub fn file_of(db: &dyn HirDatabase, id: ItemId) -> Option<FileId> {
+    let file: HirFileId = match id {
+        ItemId::Function(it) => it.lookup(db).id.file_id,
+        ItemId::Adt(AdtId::StructId(it)) => it.lookup(db).id.file_id,
+        ItemId::Adt(AdtId::UnionId(it)) => it.lookup(db).id.file_id,
+        ItemId::Adt(AdtId::EnumId(it)) => it.lookup(db).id.file_id,
+        ItemId::Trait(it) => it.lookup(db).id.file_id,
+        ItemId::Impl(it) => it.lookup(db).id.file_id,
+        ItemId::Const(it) => it.lookup(db).id.file_id,
+        ItemId::Static(it) => it.lookup(db).id.file_id,
+        ItemId::Alias(it) => it.lookup(db).id.file_id,
+        ItemId::Macro(MacroId::Macro2Id(it)) => it.lookup(db).id.file_id,
+        ItemId::Macro(MacroId::MacroRulesId(it)) => it.lookup(db).id.file_id,
+        ItemId::Macro(MacroId::ProcMacroId(it)) => it.lookup(db).id.file_id,
+    };
+    Some(file.original_file(db).file_id(db))
+}
+
+/// The syntax an item is written as, with the range of a function's body.
+fn source(db: &dyn HirDatabase, id: ItemId) -> (SyntaxNode, Option<TextRange>) {
+    fn node<N: AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> SyntaxNode {
+        id.to_node(db).syntax().clone()
+    }
+    match id {
+        ItemId::Function(it) => {
+            let fun = it.lookup(db).id.to_node(db);
+            let body = fun.body().map(|it| it.syntax().text_range());
+            (fun.syntax().clone(), body)
+        }
+        ItemId::Adt(AdtId::StructId(it)) => (node(db, it.lookup(db).id), None),
+        ItemId::Adt(AdtId::UnionId(it)) => (node(db, it.lookup(db).id), None),
+        ItemId::Adt(AdtId::EnumId(it)) => (node(db, it.lookup(db).id), None),
+        ItemId::Trait(it) => (node(db, it.lookup(db).id), None),
+        ItemId::Impl(it) => (node(db, it.lookup(db).id), None),
+        ItemId::Const(it) => (node(db, it.lookup(db).id), None),
+        ItemId::Static(it) => (node(db, it.lookup(db).id), None),
+        ItemId::Alias(it) => (node(db, it.lookup(db).id), None),
+        ItemId::Macro(MacroId::Macro2Id(it)) => (node(db, it.lookup(db).id), None),
+        ItemId::Macro(MacroId::MacroRulesId(it)) => (node(db, it.lookup(db).id), None),
+        ItemId::Macro(MacroId::ProcMacroId(it)) => (node(db, it.lookup(db).id), None),
+    }
+}
+
+/// The names an item's interface is written with: those of its source, without the body of a
+/// function not seen into.
+fn interface_names(db: &dyn HirDatabase, id: ItemId, seen: bool, out: &mut Vec<Symbol>) {
+    let (node, body) = source(db, id);
+    idents(&node, body.filter(|_| !seen), out);
+    if let (true, ItemId::Function(func)) = (seen, id) {
+        store_names(&Body::of(db, func.into()), out);
+    }
+}
+
+/// The names a body's code is written with: those of its source, and of the paths and method
+/// calls macros wrote into it.
+pub fn code_names(db: &dyn HirDatabase, body: DefWithBodyId) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    let id = match body {
+        DefWithBodyId::FunctionId(it) => Some(ItemId::Function(it)),
+        DefWithBodyId::ConstId(it) => Some(ItemId::Const(it)),
+        DefWithBodyId::StaticId(it) => Some(ItemId::Static(it)),
+        DefWithBodyId::VariantId(_) => None,
+    };
+    if let Some(id) = id {
+        idents(&source(db, id).0, None, &mut out);
+    }
+    store_names(&Body::of(db, body), &mut out);
+    out.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    out.dedup();
+    out
+}
+
+fn idents(node: &SyntaxNode, skip: Option<TextRange>, out: &mut Vec<Symbol>) {
+    for token in node.descendants_with_tokens().filter_map(|it| it.into_token()) {
+        if token.kind() != SyntaxKind::IDENT
+            || skip.is_some_and(|it| it.contains_range(token.text_range()))
+        {
+            continue;
+        }
+        let text = token.text();
+        out.push(Symbol::intern(text.strip_prefix("r#").unwrap_or(text)));
+    }
+}
+
+fn store_names(store: &ExpressionStore, out: &mut Vec<Symbol>) {
+    fn path(path: &Path, out: &mut Vec<Symbol>) {
+        for segment in path.segments().iter() {
+            out.push(segment.name.symbol().clone());
+        }
+    }
+    for (_, expr) in store.exprs() {
+        match expr {
+            Expr::Path(it) | Expr::RecordLit { path: it, .. } => path(it, out),
+            Expr::MethodCall { method_name, .. } => out.push(method_name.symbol().clone()),
+            _ => {}
+        }
+    }
+    for (_, pat) in store.pats() {
+        match pat {
+            Pat::Path(it) | Pat::Record { path: it, .. } | Pat::TupleStruct { path: it, .. } => {
+                path(it, out)
+            }
+            _ => {}
+        }
+    }
+    for (_, ty) in store.types.iter() {
+        if let TypeRef::Path(it) = ty {
+            path(it, out);
+        }
+    }
+}
+
+/// The bindings of `krate`'s modules.
+fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
+    use std::hash::{Hash, Hasher};
+    let mut scope = Scope::default();
+    for (module, data) in crate_def_map(db, krate).modules(db) {
+        let file = data.definition_source_file_id().original_file(db).file_id(db);
+        scope.modules.insert(module, file);
+        for (name, per_ns) in data.scope(db).entries() {
+            let hash = |it: &dyn Fn(&mut FxHasher)| {
+                let mut hasher = FxHasher::default();
+                it(&mut hasher);
+                hasher.finish()
+            };
+            let values = hash(&|h| {
+                per_ns.types.hash(h);
+                per_ns.values.hash(h);
+            });
+            let macros = match per_ns.macros {
+                Some(it) => hash(&|h| it.hash(h)) | 1,
+                None => 0,
+            };
+            scope.names.insert((module, name.symbol().clone()), (values, macros));
+        }
+    }
+    scope
+}
+
+fn attrs(db: &dyn HirDatabase, krate: Crate) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    crate_def_map(db, krate).crate_data_print().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The items `krate` declares in `file`: in its modules written there, the impls and traits of
+/// those, and the blocks of the bodies of all of them.
+fn declared_in(db: &dyn HirDatabase, krate: Crate, file: FileId, out: &mut Vec<ItemId>) {
+    let def_map = crate_def_map(db, krate);
+    let mut bodies = Vec::new();
+    for (_, data) in def_map.modules(db) {
+        if data.definition_source_file_id().original_file(db).file_id(db) == file {
+            in_scope(db, data.scope(db), out, &mut bodies);
+        }
+    }
+    while let Some(body) = bodies.pop() {
+        for (_, def_map) in Body::of(db, body).blocks(db) {
+            for (_, module) in def_map.modules(db) {
+                in_scope(db, module.scope(db), out, &mut bodies);
+            }
+        }
+    }
+}
