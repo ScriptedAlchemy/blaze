@@ -15,7 +15,7 @@ use hir_def::{
     AdtId, DefWithBodyId, ItemContainerId, Lookup, MacroId, ModuleId,
     expr_store::{Body, ExpressionStore, path::Path},
     hir::{Expr, Pat, type_ref::TypeRef},
-    nameres::crate_def_map,
+    nameres::{crate_def_map, diagnostics::DefDiagnosticKind},
     signatures::FunctionSignature,
 };
 use hir_expand::HirFileId;
@@ -64,6 +64,9 @@ struct Scope {
     names: FxHashMap<(ModuleId, Symbol), (u64, u64)>,
     /// The file each module is written in.
     modules: FxHashMap<ModuleId, FileId>,
+    /// Whether a macro call of the crate's items names no macro, which a macro bound anywhere
+    /// can be the one it names.
+    unresolved: bool,
 }
 
 /// What an edit changed, as [`Index::push`] found it.
@@ -282,19 +285,32 @@ impl Index {
             let was = self.scopes.get(&krate);
             let empty = Scope::default();
             let was = was.unwrap_or(&empty);
+            // A macro bound in a module added or taken away is named only through it, where
+            // no name could reach one before, and in what is written again or names it: but
+            // where a name of a module that stays is one, it can be another's that it hides.
+            let kept = |module: &ModuleId| {
+                now.modules.contains_key(module) && was.modules.contains_key(module)
+            };
+            let kept_macros: FxHashSet<&Symbol> = (now.names.iter().chain(&was.names))
+                .filter(|((module, _), (_, macros))| *macros != 0 && kept(module))
+                .map(|((_, name), _)| name)
+                .collect();
+            let moved = |key: &(ModuleId, Symbol)| {
+                !was.unresolved && !kept(&key.0) && !kept_macros.contains(&key.1)
+            };
             for (key, &(values, macros)) in &now.names {
                 match was.names.get(key) {
                     Some(&(_, was_macros)) if was_macros != macros => {
                         return Err("a name bound to another macro");
                     }
                     Some(&(was_values, _)) if was_values == values => {}
-                    None if macros != 0 => return Err("a name bound to a macro"),
+                    None if macros != 0 && !moved(key) => return Err("a name bound to a macro"),
                     _ => rebound(key),
                 }
             }
             for (key, &(_, macros)) in &was.names {
                 if !now.names.contains_key(key) {
-                    if macros != 0 {
+                    if macros != 0 && !moved(key) {
                         return Err("a macro's name bound to nothing");
                     }
                     rebound(key);
@@ -698,7 +714,12 @@ fn store_names(store: &ExpressionStore, out: &mut Vec<Symbol>) {
 fn scope(db: &dyn HirDatabase, krate: Crate) -> Scope {
     use std::hash::{Hash, Hasher};
     let mut scope = Scope::default();
-    for (module, data) in crate_def_map(db, krate).modules(db) {
+    let def_map = crate_def_map(db, krate);
+    scope.unresolved = def_map
+        .diagnostics()
+        .iter()
+        .any(|it| matches!(it.kind, DefDiagnosticKind::UnresolvedMacroCall { .. }));
+    for (module, data) in def_map.modules(db) {
         let file = data.definition_source_file_id().original_file(db).file_id(db);
         scope.modules.insert(module, file);
         for (name, per_ns) in data.scope(db).entries() {
