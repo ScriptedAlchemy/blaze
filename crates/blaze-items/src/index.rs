@@ -355,20 +355,32 @@ impl Index {
                 return Err("a `#[macro_use]` module added or taken away");
             }
             let moved = |key: &(ModuleId, Symbol)| !was.unresolved && !kept(&key.0);
+            let macro_refused = |why: &'static str, (module, name): &(ModuleId, Symbol)| {
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    let (kept, unresolved) = (kept(module), was.unresolved);
+                    eprintln!(
+                        "items-refused: {why}: `{}` in {module:?}, kept {kept}, unresolved {unresolved}",
+                        name.as_str()
+                    );
+                }
+                why
+            };
             for (key, &(values, macros)) in &now.names {
                 match was.names.get(key) {
                     Some(&(_, was_macros)) if was_macros != macros => {
-                        return Err("a name bound to another macro");
+                        return Err(macro_refused("a name bound to another macro", key));
                     }
                     Some(&(was_values, _)) if was_values == values => {}
-                    None if macros != 0 && !moved(key) => return Err("a name bound to a macro"),
+                    None if macros != 0 && !moved(key) => {
+                        return Err(macro_refused("a name bound to a macro", key));
+                    }
                     _ => rebound(key, was, &now).ok_or("a name bound in no module")?,
                 }
             }
             for (key, &(_, macros)) in &was.names {
                 if !now.names.contains_key(key) {
                     if macros != 0 && !moved(key) {
-                        return Err("a macro's name bound to nothing");
+                        return Err(macro_refused("a macro's name bound to nothing", key));
                     }
                     rebound(key, was, &now).ok_or("a name bound in no module")?;
                 }
