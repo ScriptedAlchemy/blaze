@@ -22,9 +22,9 @@ use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use intern::Symbol;
 
 use super::{
-    CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
-    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance,
-    compiled_root, compiled_static, declaration_location,
+    CodegenError, ContentId, Fan, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases,
+    Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
+    compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
     instance_serial, is_thread_local,
@@ -1484,7 +1484,7 @@ impl Base {
         let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
         let (compiled, instances) =
             (self.compiled.clone(), self.instances.keys().cloned().collect::<Vec<_>>());
-        let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
             let start = std::time::Instant::now();
             let items = ItemPush::new(db, fan, &compiled, &instances);
             if std::env::var_os("RA_JIT_STATS").is_some() {
@@ -1904,7 +1904,7 @@ impl Base {
         let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
         let (send, settling) = std::sync::mpsc::channel();
         let at = salsa::plumbing::current_revision(db);
-        let work = move |db: &dyn HirDatabase, fan: &super::Fan<'_>| {
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
             let start = std::time::Instant::now();
             let settled = Settled::new(db, fan, &roots, &instances);
             if std::env::var_os("RA_JIT_STATS").is_some() {
@@ -1930,7 +1930,7 @@ impl Base {
 
     /// Before an edit of `files`: what the edits before it left of the items is taken in, of
     /// the revision they left.
-    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
         let start = std::time::Instant::now();
         self.take_made(db);
         // Nothing changes: what the last edit asked about is taken before one that does.
@@ -1950,11 +1950,11 @@ impl Base {
                 let took = start.elapsed();
                 match (reitem, settled) {
                     (Some(_), Some((_, settled))) => items.take_settled(settled),
-                    (Some(asked), None) => items.settle(db, &asked, compiled, instances),
+                    (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
                     (None, _) => {}
                 }
                 let settled = start.elapsed();
-                items.index.before_edit(db, files);
+                items.index.before_edit(db, files, fan);
                 if std::env::var_os("RA_JIT_STATS").is_some() {
                     eprintln!(
                         "items-before: taken {} us, settled {} us, written {} us",
@@ -1973,12 +1973,18 @@ impl Base {
     /// Notes that `files` of `crates` changed in their items: what can have changed is what
     /// refers to an item that changed, through its interface, or calls something by a name
     /// bound to another thing now. All of what sees the files when that can't be told.
-    pub(super) fn touch_items(&mut self, db: &dyn HirDatabase, crates: &[Crate], files: &[FileId]) {
+    pub(super) fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[FileId],
+        fan: &Fan<'_>,
+    ) {
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
         let start = std::time::Instant::now();
         let pushed = match &mut self.items {
             Some(items) if !self.rustc => {
-                let push = || hir_ty::attach_db(db, || items.index.push(db, files));
+                let push = || hir_ty::attach_db(db, || items.index.push(db, files, fan));
                 probe(push).unwrap_or(Err("a query that panicked"))
             }
             Some(_) => Err("a base of rustc's"),

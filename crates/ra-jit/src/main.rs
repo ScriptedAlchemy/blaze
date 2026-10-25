@@ -1306,30 +1306,9 @@ impl SymbolResolver for Resolver<'_> {
     fn in_background(&self, _: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
         let db = self.db.clone();
         let run = move || {
-            let threads = cores();
             let fan =
                 |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
-                    let next = std::sync::atomic::AtomicUsize::new(0);
-                    std::thread::scope(|scope| {
-                        for _ in 0..threads.min(count) {
-                            let (db, next) = (db.clone(), &next);
-                            scope.spawn(move || {
-                                let each = std::panic::AssertUnwindSafe(|| {
-                                    hir::attach_db(&db, || {
-                                        loop {
-                                            let at = next.fetch_add(1, Ordering::Relaxed);
-                                            if at >= count {
-                                                break;
-                                            }
-                                            each(&db, at);
-                                        }
-                                    })
-                                });
-                                // An edit cancels it, and whoever asks next finds out.
-                                _ = std::panic::catch_unwind(each);
-                            });
-                        }
-                    });
+                    fan(&db, count, each)
                 };
             let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
             _ = std::panic::catch_unwind(work);
@@ -3717,6 +3696,36 @@ fn start_from_rustc(
 /// Has each program whose edits are patches of what rustc linked take in what rustc compiled
 /// of `files`, which are about to change: the functions written in them and the statics
 /// their bodies declare. A static declared outside a body is no edit of bodies alone.
+/// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
+/// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
+/// caller does it.
+fn fan(
+    db: &RootDatabase,
+    count: usize,
+    each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync),
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..cores().min(count) {
+            let (db, next) = (db.clone(), &next);
+            scope.spawn(move || {
+                let each = std::panic::AssertUnwindSafe(|| {
+                    hir::attach_db(&db, || {
+                        loop {
+                            let at = next.fetch_add(1, Ordering::Relaxed);
+                            if at >= count {
+                                break;
+                            }
+                            each(&db, at);
+                        }
+                    })
+                });
+                _ = std::panic::catch_unwind(each);
+            });
+        }
+    });
+}
+
 fn home_in_rustcs(
     db: &RootDatabase,
     listed: &Listed,
@@ -8982,7 +8991,7 @@ fn run_holding(
             let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
             checked += at.elapsed();
-            program.known.before_edit(&db, &editing);
+            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each));
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
@@ -9034,7 +9043,7 @@ fn run_holding(
             outlines.before_edit(&db, &listed, &untouched);
             for program in &mut programs {
                 program.checked.before_edit(&db, &listed, &untouched, &program.unbuilt.edited);
-                program.known.before_edit(&db, &untouched);
+                program.known.before_edit(&db, &untouched, &|count, each| fan(&db, count, each));
             }
             for file in write_harnesses(&mut db, texts) {
                 if !sources.contains(&file) {
@@ -9150,7 +9159,8 @@ fn run_holding(
         }
         if !by_items.is_empty() {
             let crates = &items_crates;
-            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items));
+            let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
+            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items, fan));
             listed.touch(&db, Some(crates));
         }
         if !moved.is_empty() {

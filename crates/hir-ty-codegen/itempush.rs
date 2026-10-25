@@ -217,12 +217,13 @@ impl ItemPush {
     pub(super) fn settle(
         &mut self,
         db: &dyn HirDatabase,
+        fan: &Fan<'_>,
         asked: &Asked,
         compiled: &[(FunctionId, String)],
         instances: &FxIndexMap<Instance, BaseInstance>,
     ) {
         let (roots, instances) = Settled::asked(asked, compiled, instances);
-        self.take_settled(Settled::new(db, &|_, _| {}, &roots, &instances));
+        self.take_settled(Settled::new(db, fan, &roots, &instances));
     }
 
     pub(super) fn take_settled(&mut self, settled: Settled) {

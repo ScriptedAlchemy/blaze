@@ -24,7 +24,9 @@ use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange};
 
-use crate::{ItemId, form, in_scope};
+use std::sync::OnceLock;
+
+use crate::{Fan, ItemId, form, in_scope};
 
 #[derive(Clone)]
 pub struct Index {
@@ -209,22 +211,44 @@ impl Index {
 
     /// Before an edit of `files`: what edits before it left out of date is written again, of
     /// the revision they left, and `files` are noted as edited.
-    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId]) {
+    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
         let dirty: Vec<FileId> = self.dirty.drain().collect();
         if !dirty.is_empty() {
-            let cx = form::Cx::new(db);
-            for file in dirty {
-                self.write(db, &cx, file);
+            let declared = self.declared(db, &dirty);
+            let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
+            let mut entries = entries_of(db, fan, &ids).into_iter();
+            for (file, now) in declared {
+                for id in self.files.remove(&file).unwrap_or_default() {
+                    self.remove(id);
+                }
+                for id in now {
+                    if let Some(entry) = entries.next().flatten() {
+                        self.remove(id);
+                        self.insert(id, entry);
+                    }
+                }
             }
         }
         if std::mem::take(&mut self.scopes_dirty) {
             let crates: Vec<Crate> = self.crates.iter().copied().collect();
-            for krate in crates {
-                self.scopes.insert(krate, scope(db, krate));
+            for (krate, scope) in crates.iter().copied().zip(scopes_of(db, fan, &crates)) {
+                self.scopes.insert(krate, scope);
                 self.attrs.insert(krate, attrs(db, krate));
             }
         }
         self.dirty.extend(files.iter().copied());
+    }
+
+    /// The items each of `files` declares now.
+    fn declared(&self, db: &dyn HirDatabase, files: &[FileId]) -> Vec<(FileId, Vec<ItemId>)> {
+        let of = |file: FileId| {
+            let mut now = Vec::new();
+            for krate in self.crates_of(db, file) {
+                declared_in(db, krate, file, &mut now);
+            }
+            (file, now)
+        };
+        files.iter().map(|&file| of(file)).collect()
     }
 
     /// Notes that an edit since [`Index::before_edit`] can have changed the bindings of modules.
@@ -235,8 +259,13 @@ impl Index {
     /// What the edit of `files` changed, of the revision after it; the entries and bindings are
     /// then those of it. `Err` says why that can't be told here, and the entries are left to be
     /// written again before the next edit.
-    pub fn push(&mut self, db: &dyn HirDatabase, files: &[FileId]) -> Result<Pushed, &'static str> {
-        let pushed = self.push_inner(db, files);
+    pub fn push(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+        fan: &Fan<'_>,
+    ) -> Result<Pushed, &'static str> {
+        let pushed = self.push_inner(db, files, fan);
         if pushed.is_err() {
             self.scopes_dirty = true;
         }
@@ -247,6 +276,7 @@ impl Index {
         &mut self,
         db: &dyn HirDatabase,
         files: &[FileId],
+        fan: &Fan<'_>,
     ) -> Result<Pushed, &'static str> {
         let start = std::time::Instant::now();
         let mut took = Vec::new();
@@ -285,8 +315,8 @@ impl Index {
         took.push(start.elapsed());
         let mut rewritten: Vec<FileId> = files.to_vec();
         let mut scopes = Vec::new();
-        for &krate in &around {
-            let now = scope(db, krate);
+        let around: Vec<Crate> = around.into_iter().collect();
+        for (&krate, now) in around.iter().zip(scopes_of(db, fan, &around)) {
             let was = self.scopes.get(&krate);
             let empty = Scope::default();
             let was = was.unwrap_or(&empty);
@@ -336,24 +366,23 @@ impl Index {
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
         let mut counterparts: FxHashMap<ItemId, ItemId> = FxHashMap::default();
         let mut written = 0;
-        for &file in &rewritten {
+        let declared = self.declared(db, &rewritten);
+        let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
+        let mut entries = entries_of(db, fan, &ids).into_iter();
+        for (file, now) in declared {
             let was: FxHashSet<ItemId> =
                 self.files.get(&file).into_iter().flatten().copied().collect();
-            let mut now: Vec<ItemId> = Vec::new();
-            for krate in self.crates_of(db, file) {
-                declared_in(db, krate, file, &mut now);
-            }
             let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
             for &id in was.iter().filter(|it| !now_set.contains(it)) {
                 let gone = &self.entries[&id];
-                gone.kind?;
+                gone.kind.map_err(|why| refused(db, id, why, "gone"))?;
                 methods.extend(gone.method.clone());
                 counterparts.extend(gone.counterpart.map(|it| (id, it)));
                 changed.insert(id);
             }
             for &id in &now {
                 written += 1;
-                let entry = entry(db, &cx, id).ok_or("an item that is not an item now")?;
+                let entry = entries.next().flatten().ok_or("an item that is not an item now")?;
                 if let Some(why) = entry.missed {
                     return Err(why);
                 }
@@ -364,12 +393,12 @@ impl Index {
                             && was.digest == entry.digest
                             && was.refs == entry.refs => {}
                     Some(was) => {
-                        was.kind?;
+                        was.kind.map_err(|why| refused(db, id, why, "changed"))?;
                         entry.kind?;
                         changed.insert(id);
                     }
                     None => {
-                        entry.kind?;
+                        entry.kind.map_err(|why| refused(db, id, why, "added"))?;
                         methods.extend(entry.method.clone());
                         changed.insert(id);
                     }
@@ -463,23 +492,6 @@ impl Index {
             .collect()
     }
 
-    /// Writes the entries of `file` again, of this revision.
-    fn write(&mut self, db: &dyn HirDatabase, cx: &form::Cx<'_>, file: FileId) {
-        for id in self.files.remove(&file).unwrap_or_default() {
-            self.remove(id);
-        }
-        let mut now = Vec::new();
-        for krate in self.crates_of(db, file) {
-            declared_in(db, krate, file, &mut now);
-        }
-        for id in now {
-            if let Some(entry) = entry(db, cx, id) {
-                self.remove(id);
-                self.insert(id, entry);
-            }
-        }
-    }
-
     fn insert(&mut self, id: ItemId, entry: Entry) {
         self.files.entry(entry.file).or_default().push(id);
         for &r in &entry.refs {
@@ -511,6 +523,22 @@ impl Index {
 
 /// Whether a change to `id` is one [`Index::push`] can follow: what an impl or a trait is, or
 /// a macro, changes what code is in more ways than what refers to them shows.
+/// `why` an item `how` can't be pushed, said with RA_JIT_STATS.
+fn refused(db: &dyn HirDatabase, id: ItemId, why: &'static str, how: &str) -> &'static str {
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        // Nothing is asked of one gone, whose code the database no longer has.
+        let name = match id {
+            ItemId::Function(it) if how != "gone" => {
+                Some(FunctionSignature::of(db, it).name.symbol().clone())
+            }
+            _ => None,
+        };
+        let file = (how != "gone").then(|| file_of(db, id)).flatten();
+        eprintln!("items-refused: {why}, {how}: {id:?} {name:?} in {file:?}");
+    }
+    why
+}
+
 fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {
     let container = |container| match container {
         ItemContainerId::TraitId(_) => Err("an item of a trait"),
@@ -561,6 +589,34 @@ fn trait_counterpart(db: &dyn HirDatabase, id: ItemId) -> Option<ItemId> {
 }
 
 /// The entry of an item, or `None` for one that is not one now.
+/// The entries of `ids`, on the threads `fan` has.
+fn entries_of(db: &dyn HirDatabase, fan: &Fan<'_>, ids: &[ItemId]) -> Vec<Option<Entry>> {
+    const PART: usize = 8;
+    let parts: Vec<OnceLock<Vec<Option<Entry>>>> =
+        (0..ids.len().div_ceil(PART)).map(|_| OnceLock::new()).collect();
+    let work = |db: &dyn HirDatabase, at: usize| {
+        parts[at].get_or_init(|| {
+            let cx = form::Cx::new(db);
+            let part = &ids[at * PART..((at + 1) * PART).min(ids.len())];
+            part.iter().map(|&id| entry(db, &cx, id)).collect()
+        });
+    };
+    fan(parts.len(), &work);
+    (0..parts.len()).for_each(|at| work(db, at));
+    parts.into_iter().flat_map(|it| it.into_inner().unwrap_or_default()).collect()
+}
+
+/// The bindings of each of `crates`, on the threads `fan` has.
+fn scopes_of(db: &dyn HirDatabase, fan: &Fan<'_>, crates: &[Crate]) -> Vec<Scope> {
+    let scopes: Vec<OnceLock<Scope>> = crates.iter().map(|_| OnceLock::new()).collect();
+    let work = |db: &dyn HirDatabase, at: usize| {
+        scopes[at].get_or_init(|| scope(db, crates[at]));
+    };
+    fan(crates.len(), &work);
+    (0..crates.len()).for_each(|at| work(db, at));
+    scopes.into_iter().filter_map(OnceLock::into_inner).collect()
+}
+
 fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let file = file_of(db, id)?;
     // Before anything is asked of one gone, which nothing would find in its file.

@@ -37,6 +37,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub use form::Hash;
 pub use index::{Entries, Index, Pushed, code_names, entries_in, file_of, modules_in, modules_of};
 
+/// Runs the work for each of `0..count`, on as many threads as there are, each with a
+/// database of its own.
+pub type Fan<'a> = dyn Fn(usize, &(dyn Fn(&dyn HirDatabase, usize) + Sync)) + 'a;
+
 /// What items refer to, for many of them in turn.
 pub struct Refs<'db>(form::Cx<'db>);
 
