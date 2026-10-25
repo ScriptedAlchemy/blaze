@@ -45,26 +45,33 @@ impl<'db> Refs<'db> {
         Refs(form::Cx::new(db))
     }
 
-    /// What an item's interface refers to, and its code, with the coroutines written in it:
-    /// `None` when part of it could not be written.
-    pub fn of_code(&self, id: ItemId, body: Option<DefWithBodyId>) -> Option<Vec<ItemId>> {
+    /// What an item's interface refers to, and its code, with the coroutines written in it, or
+    /// why part of it could not be written.
+    pub fn of_code(
+        &self,
+        id: ItemId,
+        body: Option<DefWithBodyId>,
+    ) -> Result<Vec<ItemId>, &'static str> {
         let node = self.0.node_with(id, false);
-        node.interface.missed.is_none().then_some(())?;
+        node.interface.missed.map_or(Ok(()), Err)?;
         let mut refs = node.interface.refs;
         if let Some(body) = body {
             let code = self.0.code(body);
-            code.missed.is_none().then_some(())?;
+            code.missed.map_or(Ok(()), Err)?;
             refs.extend(code.refs);
         }
         let mut unique = FxHashSet::default();
         refs.retain(|it| unique.insert(*it));
-        Some(refs)
+        Ok(refs)
     }
 
-    /// What generic arguments refer to, or `None`.
-    pub fn of_args(&self, args: hir_ty::next_solver::GenericArgs<'db>) -> Option<Vec<ItemId>> {
+    /// What generic arguments refer to, or why part of them could not be written.
+    pub fn of_args(
+        &self,
+        args: hir_ty::next_solver::GenericArgs<'db>,
+    ) -> Result<Vec<ItemId>, &'static str> {
         let sub = self.0.of_args(args);
-        sub.missed.is_none().then_some(sub.refs)
+        sub.missed.map_or(Ok(sub.refs), Err)
     }
 }
 

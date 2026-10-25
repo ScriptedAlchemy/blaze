@@ -18,10 +18,12 @@ use super::{
 #[derive(Clone)]
 pub(super) struct ItemPush {
     pub(super) index: Index,
-    /// By the index of each in the base; `None` for one whose code can't be told.
-    roots: Vec<Option<Used>>,
-    instances: Vec<Option<Used>>,
+    /// By the index of each in the base; `Err` says why one's code can't be told.
+    roots: Vec<Told>,
+    instances: Vec<Told>,
 }
+
+type Told = Result<Used, &'static str>;
 
 #[derive(Clone)]
 struct Used {
@@ -57,24 +59,49 @@ impl ItemPush {
             .copied()
             .filter(|it| it.data(db).origin.is_local())
             .collect();
+        let start = std::time::Instant::now();
         let index = Index::new(db, &crates);
+        let indexed = start.elapsed();
         let refs = Refs::new(db);
-        let mut bodies: FxHashMap<DefWithBodyId, Option<Used>> = FxHashMap::default();
-        let mut of_body = |body: DefWithBodyId| -> Option<Used> {
+        let mut bodies: FxHashMap<DefWithBodyId, Told> = FxHashMap::default();
+        let mut of_body = |body: DefWithBodyId| -> Told {
             bodies.entry(body).or_insert_with(|| used(db, &refs, body)).clone()
         };
-        let roots = compiled.iter().map(|&(root, _)| of_body(root.into())).collect();
-        let instances = instances
+        let roots: Vec<_> = compiled.iter().map(|&(root, _)| of_body(root.into())).collect();
+        let rooted = start.elapsed();
+        let instances: Vec<_> = instances
             .keys()
             .map(|instance| used_by_instance(db, &refs, instance, &mut of_body))
             .collect();
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let mut why: FxHashMap<&str, usize> = FxHashMap::default();
+            for it in roots.iter().chain(&instances) {
+                if let Err(it) = it {
+                    *why.entry(it).or_default() += 1;
+                }
+            }
+            let mut why: Vec<_> = why.into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            let unknown = |it: &[Told]| it.iter().filter(|it| it.is_err()).count();
+            eprintln!(
+                "items-made: index {} us, roots {} us, instances {} us; {} of {} roots and {} of {} instances unknown: {:?}",
+                indexed.as_micros(),
+                (rooted - indexed).as_micros(),
+                (start.elapsed() - rooted).as_micros(),
+                unknown(&roots),
+                roots.len(),
+                unknown(&instances),
+                instances.len(),
+                &why[..why.len().min(6)]
+            );
+        }
         ItemPush { index, roots, instances }
     }
 
     /// The roots and instances that refer to what the edit changed, or call something by a
     /// name bound to something else now, and those that can't be told.
     pub(super) fn asked(&self, pushed: &Pushed) -> Asked {
-        let ask = |used: &Option<Used>| used.as_ref().is_none_or(|it| it.touched(pushed));
+        let ask = |used: &Told| used.as_ref().ok().is_none_or(|it| it.touched(pushed));
         Asked {
             roots: (0..self.roots.len() as u32).filter(|&i| ask(&self.roots[i as usize])).collect(),
             instances: (0..self.instances.len() as u32)
@@ -110,11 +137,12 @@ fn used_by_instance(
     db: &dyn HirDatabase,
     refs: &Refs<'_>,
     instance: &Instance,
-    of_body: &mut dyn FnMut(DefWithBodyId) -> Option<Used>,
-) -> Option<Used> {
-    let mut items = probe(|| refs.of_args(instance.args.as_ref())).flatten()?;
+    of_body: &mut dyn FnMut(DefWithBodyId) -> Told,
+) -> Told {
+    let mut items = probe(|| refs.of_args(instance.args.as_ref())).ok_or(PANICKED)??;
     let (mut names, mut modules) = (Vec::new(), Vec::new());
-    for body in probe(|| mentioned_bodies(db, instance)).flatten()? {
+    let bodies = probe(|| mentioned_bodies(db, instance)).ok_or(PANICKED)?;
+    for body in bodies.ok_or("an instance whose bodies can't be told")? {
         let of = of_body(body)?;
         items.extend(of.items);
         names.extend(of.names);
@@ -126,19 +154,21 @@ fn used_by_instance(
     modules.retain(|it| unique.insert(*it));
     names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     names.dedup();
-    Some(Used { items: items.into(), names: names.into(), modules: modules.into() })
+    Ok(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }
 
-fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Option<Used> {
+const PANICKED: &str = "a query that panicked";
+
+fn used(db: &dyn HirDatabase, refs: &Refs<'_>, body: DefWithBodyId) -> Told {
     let id = match body {
         DefWithBodyId::FunctionId(it) => ItemId::Function(it),
         DefWithBodyId::ConstId(it) => ItemId::Const(it),
         DefWithBodyId::StaticId(it) => ItemId::Static(it),
-        DefWithBodyId::VariantId(_) => return None,
+        DefWithBodyId::VariantId(_) => return Err("a variant's discriminant"),
     };
-    let mut items = probe(|| refs.of_code(id, Some(body))).flatten()?;
+    let mut items = probe(|| refs.of_code(id, Some(body))).ok_or(PANICKED)??;
     items.push(id);
-    let names = probe(|| blaze_items::code_names(db, body))?;
-    let modules = probe(|| blaze_items::modules_of(db, id))?;
-    Some(Used { items: items.into(), names: names.into(), modules: modules.into() })
+    let names = probe(|| blaze_items::code_names(db, body)).ok_or(PANICKED)?;
+    let modules = probe(|| blaze_items::modules_of(db, id)).ok_or(PANICKED)?;
+    Ok(Used { items: items.into(), names: names.into(), modules: modules.into() })
 }
