@@ -85,7 +85,7 @@ def one(name, spec, repo, commit, work, rounds, extra_env):
                 text = daemon.said(1)
                 with open(os.path.join(root, f"said-{n}-{label}.log"), "w") as f:
                     f.write(text)
-                said.append([line[:200] for line in text.splitlines() if SAID.match(line)][:40])
+                said.append([line[:200] for line in text.splitlines() if SAID.search(line)][:40])
         row["walls"], row["said"] = walls, said
         return row
     finally:
