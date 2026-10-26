@@ -157,12 +157,16 @@ pub(crate) struct Allocator {
 /// What an idle daemon gives back, from `RA_JIT_RECLAIM`: `0` or `off` for nothing, `1` or
 /// `on` for everything, or any of `gc`, `cache` and `purge`, separated by commas, for those
 /// steps alone. Everything is the default.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// The collection of the types is never named without the caches cleared: `gc` clears them,
+/// on every thread, before it collects (a cache entry points at a type the collection frees),
+/// so `gc` alone and `gc,cache` are one step. `cache` alone clears them and collects nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reclaim {
     /// `hir::collect_ty_garbage()`: the types, arguments and clauses interned for builds
     /// that are over.
     pub(crate) types: bool,
-    /// The trait solver's cache on every thread.
+    /// The trait solver's cache on every thread: always when `types` is.
     pub(crate) solver_caches: bool,
     /// `give_back()`: the pages of what was freed.
     pub(crate) pages: bool,
@@ -173,16 +177,21 @@ impl Reclaim {
     /// nothing. Any of `gc`, `cache` and `purge`, separated by commas, asks for those steps
     /// alone, which `harness/memgrowth.py`'s M4 runs one at a time to read what each gives back.
     pub(crate) fn of_env() -> Reclaim {
+        Reclaim::of(std::env::var("RA_JIT_RECLAIM").ok().as_deref())
+    }
+
+    fn of(text: Option<&str>) -> Reclaim {
         let all = Reclaim { types: true, solver_caches: true, pages: true };
-        let Ok(text) = std::env::var("RA_JIT_RECLAIM") else { return all };
+        let Some(text) = text else { return all };
         match text.trim() {
             "" | "1" | "on" | "all" => all,
             "0" | "off" | "none" => Reclaim { types: false, solver_caches: false, pages: false },
             steps => {
                 let named = |it: &str| steps.split(',').any(|step| step.trim() == it);
+                let types = named("gc") || named("types");
                 Reclaim {
-                    types: named("gc") || named("types"),
-                    solver_caches: named("cache") || named("caches") || named("solver"),
+                    types,
+                    solver_caches: types || named("cache") || named("caches") || named("solver"),
                     pages: named("purge") || named("pages"),
                 }
             }
@@ -229,6 +238,8 @@ pub(crate) fn checkpoint(step: &str) {
 pub(crate) struct Own {
     pub(crate) checkouts: usize,
     pub(crate) files_hashed: usize,
+    /// How many executables rustc linked that the daemon holds the symbols of: an entry of
+    /// `RUSTC_SYMBOLS` each, not a symbol each. The row is still named `rustc symbols`.
     pub(crate) rustc_symbols: usize,
     /// The entries of every map a patch keeps of the builds that are over.
     pub(crate) rejections: usize,
@@ -260,8 +271,7 @@ pub(crate) fn set_own(own: Own) {
 pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
-    rayon::broadcast(|_| hir::clear_tls_solver_cache());
-    hir::clear_tls_solver_cache();
+    crate::solving::clear_caller_and_pool();
     std::fs::create_dir_all(&dir)?;
     write_heap_profile(&dir.join(format!("{step}.prof")))?;
     std::fs::write(dir.join(format!("{step}.tsv")), table(db))?;
@@ -404,6 +414,39 @@ mod tests {
         let machine = of_the_machine();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(held.is_some_and(|it| it > 0) && machine.is_some_and(|it| it > held.unwrap()));
+        }
+    }
+
+    #[test]
+    fn reclaim_never_collects_without_clearing() {
+        let steps = ["gc", "types", "gc,purge", "gc, cache", "cache", "purge", "pages,solver", "1"];
+        for text in steps {
+            let reclaim = Reclaim::of(Some(text));
+            assert!(!reclaim.types || reclaim.solver_caches, "{text}: {reclaim:?}");
+        }
+        assert!(Reclaim::of(Some("gc")).solver_caches, "gc alone clears the caches too");
+        assert_eq!(
+            Reclaim::of(Some("gc")),
+            Reclaim { types: true, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("cache")),
+            Reclaim { types: false, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("purge")),
+            Reclaim { types: false, solver_caches: false, pages: true }
+        );
+    }
+
+    #[test]
+    fn reclaim_says_everything_by_default_and_nothing_for_off() {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        for text in [None, Some(""), Some("1"), Some("on"), Some("all")] {
+            assert_eq!(Reclaim::of(text), all);
+        }
+        for text in ["0", "off", "none"] {
+            assert!(!Reclaim::of(Some(text)).any());
         }
     }
 }

@@ -21,7 +21,7 @@ use syntax::{
 };
 use vfs::FileId;
 
-use crate::Listed;
+use crate::{Listed, solving};
 
 /// Attributes that leave the item they are on as it is written.
 const INERT: &[&str] = &[
@@ -383,8 +383,9 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads.min(files.len()))
             .map(|part| {
-                let (db, functions) = (db.clone(), &functions);
+                let (db, functions) = (solving::Handle::of(&db), &functions);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     hir::attach_db(&db, || {
                         let files = files.iter().zip(functions).enumerate();
                         files

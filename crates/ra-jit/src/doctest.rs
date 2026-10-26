@@ -27,7 +27,7 @@ use anyhow::Context as _;
 use ide_db::{RootDatabase, base_db::SourceDatabase};
 use syntax::Edition;
 
-use crate::plan::Selection;
+use crate::{plan::Selection, solving};
 use extract::{Example, Marks};
 use program::{Frame, Program};
 
@@ -1465,10 +1465,11 @@ fn run(
         }
         let compilers: Vec<_> = (0..compilers)
             .map(|_| {
-                let (db, ready, ours) = (db.clone(), ready.clone(), &ours);
+                let (db, ready, ours) = (solving::Handle::of(&db), ready.clone(), &ours);
                 let unit = unit.as_deref();
                 let (tests, counted) = (&tests, &counted);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     let Some(unit) = unit else { return };
                     loop {
                         let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();

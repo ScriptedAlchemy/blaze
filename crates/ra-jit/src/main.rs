@@ -26,6 +26,7 @@ mod remote;
 mod sandbox;
 mod shipped;
 mod socket;
+mod solving;
 mod splice;
 mod splicer;
 mod stub;
@@ -1288,8 +1289,9 @@ impl SymbolResolver for Resolver<'_> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                let (db, next, parts) = (solving::Handle::of(&self.db), &next, self.parts());
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     let resolver = parts.over(&db);
                     hir::attach_db(&db, || {
                         loop {
@@ -3115,8 +3117,9 @@ fn resolve_names(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads.min(crates.len()) {
-            let (db, next) = (db.clone(), &next);
+            let (db, next) = (solving::Handle::of(&db), &next);
             scope.spawn(move || {
+                let (db, _solving) = db.split();
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
@@ -3135,9 +3138,10 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: us
     let helping = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let db = db.clone();
+            let db = solving::Handle::of(&db);
             let (next, helping) = (&next, &helping);
             scope.spawn(move || {
+                let (db, _solving) = db.split();
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
@@ -3211,8 +3215,9 @@ fn verify_impls<'scope>(
     let next = Arc::new(AtomicUsize::new(0));
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     for _ in 0..threads.min(crates.len()) {
-        let (db, crates, next) = (db.clone(), crates.clone(), next.clone());
+        let (db, crates, next) = (solving::Handle::of(&db), crates.clone(), next.clone());
         scope.spawn(move || {
+            let (db, _solving) = db.split();
             // A query that is cancelled unwinds, and those that wait for it see that.
             _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 hir::attach_db(&db, || {
@@ -3276,9 +3281,12 @@ fn on_idle_threads<T: Sync>(
     };
     std::thread::scope(|scope| {
         for _ in 0..helpers {
-            let db = db.clone();
+            let db = solving::Handle::of(&db);
             let each = &each;
-            scope.spawn(move || hir::attach_db(&db, || each(&db)));
+            scope.spawn(move || {
+                let (db, _solving) = db.split();
+                hir::attach_db(&db, || each(&db))
+            });
         }
         each(db);
     });
@@ -3541,8 +3549,11 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
         let parts: Vec<_> = functions
             .chunks(each)
             .map(|part| {
-                let db = db.clone();
-                scope.spawn(move || hir::attach_db(&db, || exported(&db, part)))
+                let db = solving::Handle::of(&db);
+                scope.spawn(move || {
+                    let (db, _solving) = db.split();
+                    hir::attach_db(&db, || exported(&db, part))
+                })
             })
             .collect();
         // A query that is cancelled unwinds, and goes on unwinding here as what it is.
@@ -3596,8 +3607,9 @@ impl Listed {
         std::thread::scope(|scope| {
             let parts: Vec<_> = (0..threads.min(crates.len()))
                 .map(|_| {
-                    let (db, next) = (db.clone(), &next);
+                    let (db, next) = (solving::Handle::of(&db), &next);
                     scope.spawn(move || {
+                        let (db, _solving) = db.split();
                         hir::attach_db(&db, || {
                             let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             while let Some(&krate) = crates.get(at()) {
@@ -3822,8 +3834,9 @@ fn home_in_rustcs(
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..cores().min(written.len()) {
-                let (db, written, next) = (db.clone(), &written, &next);
+                let (db, written, next) = (solving::Handle::of(&db), &written, &next);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     hir::attach_db(&db, || {
                         while let Some(&func) = written.get(next.fetch_add(1, Ordering::Relaxed)) {
                             hir_ty_codegen::compile_written(&db, func);
@@ -4031,8 +4044,9 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
         // ones: each thread takes every nth, so that they are spread over all of them.
         let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
-            let (db, bodies) = (db.clone(), &bodies);
+            let (db, bodies) = (solving::Handle::of(&db), &bodies);
             scope.spawn(move || {
+                let (db, _solving) = db.split();
                 PROBING.set(probing);
                 hir::attach_db(&db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
@@ -4513,9 +4527,10 @@ fn build(
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
+                let (db, known, local, next) = (solving::Handle::of(&db), &*known, &local, &next);
                 let parts = resolver.parts();
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     PROBING.set(true);
                     let resolver = parts.over(&db);
                     hir::attach_db(&db, || {
@@ -5660,8 +5675,9 @@ fn broken_in(
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let (db, config, within) = (db.clone(), &config, &within);
+                let (db, config, within) = (solving::Handle::of(&db), &config, &within);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     let files = edited.iter().skip(part).step_by(threads);
                     hir::attach_db(&db, || {
                         files
@@ -6321,12 +6337,13 @@ fn compile_tiered(
         tier::done(&binary, Vec::new(), counters);
         return;
     }
-    let (db, tiering) = (db.clone(), Tiering::start());
+    let db = solving::Handle::of(&db);
     let asked_of = binary.clone();
     // Each body built in or shown is built inside the one that calls it, up to ten deep, with
     // the frames of a whole function's build each; a thread's default 2 MiB does not hold that.
     let thread = std::thread::Builder::new().name("tier".to_owned()).stack_size(64 << 20);
     let spawned = thread.spawn(move || {
+        let (db, in_scope) = db.split();
         // The IR of every function is built with the database, which is let go of before
         // LLVM runs: a change to the source waits for the database to be let go of, and
         // so for nothing LLVM does.
@@ -6341,7 +6358,9 @@ fn compile_tiered(
                 (symbol, asked.node, asked.level, prepared, start.elapsed())
             })
             .collect();
-        drop((db, tiering));
+        // This thread goes on into LLVM, and its solver cache with it unless it is cleared
+        // here, before the database is dropped: `release` does that.
+        solving::release(db, in_scope);
         let (mut code, mut done) = (Vec::new(), Vec::new());
         for (symbol, node, level, prepared, with_db) in prepared {
             let room = ra_jit_live::format::COUNTERS as u32;
@@ -6391,24 +6410,6 @@ fn compile_tiered(
     }
 }
 
-/// A compile at a higher level that holds the database, which [`let_go`] waits to have none.
-struct Tiering;
-
-static TIERING: AtomicUsize = AtomicUsize::new(0);
-
-impl Tiering {
-    fn start() -> Self {
-        TIERING.fetch_add(1, Ordering::Relaxed);
-        Tiering
-    }
-}
-
-impl Drop for Tiering {
-    fn drop(&mut self) {
-        TIERING.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
@@ -6418,7 +6419,9 @@ impl Drop for Tiering {
 /// cache on every thread, and the pages of what was freed.
 fn let_go(db: &mut RootDatabase, builds: &Builds) {
     use ide_db::base_db::salsa::Database;
-    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 {
+    // A build that has sent its answer has dropped its handle, which a count says; one that
+    // has not sent it is in `running`. A tier compile holds a handle until its IR is built.
+    if builds.running.is_empty() && solving::SCOPES.held() == 0 {
         db.trigger_lru_eviction();
         reclaim(db);
     }
@@ -6428,34 +6431,18 @@ fn let_go(db: &mut RootDatabase, builds: &Builds) {
 /// `docs/research/memory.md`'s item 1 says: the types interned for it, the trait solver's
 /// cache, and the pages the allocator kept. `RA_JIT_RECLAIM` turns it off, or names the steps.
 fn reclaim(db: &mut RootDatabase) {
-    use ide_db::base_db::salsa::Database;
     let reclaim = memory::Reclaim::of_env();
     if !reclaim.any() {
         return;
     }
-    // The solver caches go first, and on every thread before the collection: a cache entry
-    // holds its goals by an `InternedRef`, which does not count as a use of the interned value
-    // (unlike an `Interned`), so a cache left behind while the collection runs would point at
-    // what the collection frees. rust-analyzer's `analysis_stats` clears them before the same
-    // call for this reason. Every thread of the pool is cleared here, and this one with them.
-    if reclaim.solver_caches {
-        rayon::broadcast(|_| hir::clear_tls_solver_cache());
-        hir::clear_tls_solver_cache();
-    }
     if reclaim.types {
-        // A revision of its own, as rust-analyzer's `AnalysisHost::trigger_garbage_collection`
-        // makes: the write cancels every other handle of the database and waits for each to be
-        // dropped, so no query of it is under way and none of its results is held.
-        db.synthetic_write(ide_db::base_db::salsa::Durability::LOW);
-        // SAFETY: The write above drained every other handle of the database: `zalsa_mut`
-        // waits for each to be dropped, and `db`, the only one, is held mutably here for the
-        // length of the call. Every thread that solved has had its cache cleared, and the
-        // daemon's builds run in threads that are over (`builds.running` is empty and no tier
-        // compile runs). What a build made of types is otherwise in salsa values, which the
-        // collection reaches from the memos it keeps, or in a local of a build, which is gone.
-        // What the daemon holds outside the database was checked and holds none: see the list
-        // in this change's pull request.
-        unsafe { hir::collect_ty_garbage() };
+        // Clears the solver caches first, on every thread, and collects only when no thread
+        // solves: see `solving::collect_types`, which is the one way to collect.
+        if let Err(busy) = solving::collect_types(db) {
+            eprintln!("reclaim: the interned types are not collected this time: {busy}");
+        }
+    } else if reclaim.solver_caches {
+        solving::clear_caller_and_pool();
     }
     if reclaim.pages {
         memory::give_back();
@@ -7177,8 +7164,9 @@ fn lower_until(
     std::thread::scope(|scope| {
         let compiling: Vec<_> = (0..threads)
             .map(|_| {
-                let (db, unnamed) = (db.clone(), &unnamed);
+                let (db, unnamed) = (solving::Handle::of(&db), &unnamed);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     let compile = || hir_ty_codegen::compile_unnamed(&db, unnamed, done);
                     let compile = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, compile));
                     let _ = std::panic::catch_unwind(compile);
@@ -7203,8 +7191,9 @@ fn lower_until(
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let (db, next) = (db.clone(), &next);
+                let (db, next) = (solving::Handle::of(&db), &next);
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     hir::attach_db(&db, || {
                         while let Some(&body) = bodies.get(next.fetch_add(1, Ordering::Relaxed))
                             && !done()
@@ -9094,7 +9083,7 @@ fn run_holding(
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
-                    (db.clone(), listed.clone(), paths.clone(), sender.clone());
+                    (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
                 let done = Arc::new(AtomicBool::new(false));
                 if own_base && let Some(budget) = own_base_budget() {
@@ -9120,12 +9109,15 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    let (db, in_scope) = db.split();
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer)
                     }));
                     done.store(true, Ordering::SeqCst);
-                    // The write that interrupts waits for this.
-                    drop(db);
+                    // The write that interrupts waits for this, and the collection of types
+                    // asks that the solver cache of this thread, which outlives its handle
+                    // of the database until the thread ends, is cleared first: it is, here.
+                    solving::release(db, in_scope);
                     let answer = match answer {
                         _ if INTERRUPTING.load(Ordering::SeqCst) => None,
                         Ok(answer) => Some(answer),
@@ -9153,9 +9145,11 @@ fn run_holding(
                         let mut theirs = clients.iter().filter(|it| it.0 == at).peekable();
                         let defer =
                             theirs.peek().is_some() && theirs.all(|it| it.1.0 == Request::Edit);
-                        let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
+                        let (db, listed, paths, edit) =
+                            (solving::Handle::of(&db), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
                         let build = scope.spawn(move || {
+                            let (db, _solving) = db.split();
                             let answer =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     program.sync(&db, listed, paths, edit, wanted, link, defer)
@@ -9674,9 +9668,10 @@ impl Program {
                 verify_impls(scope, db, crates);
             }
             let check = {
-                let (db, edited, root) = (db.clone(), &edited, &args.checkout);
+                let (db, edited, root) = (solving::Handle::of(&db), &edited, &args.checkout);
                 let lints = !args.lints_capped;
                 scope.spawn(move || {
+                    let (db, _solving) = db.split();
                     let start = Instant::now();
                     let broken = broken_in(&db, edited, paths, root, within, lints);
                     if std::env::var_os("RA_JIT_STATS").is_some() {
