@@ -989,7 +989,16 @@ pub fn codes_of(
                     if live.is_some_and(|it| !it.has(db, ItemId::Function(func))) {
                         return None;
                     }
-                    written_code(cx.code(func.into()))
+                    // A function the database can't write the code of is one that isn't moved;
+                    // a write to it stops all of them.
+                    let code = std::panic::AssertUnwindSafe(|| written_code(cx.code(func.into())));
+                    match std::panic::catch_unwind(code) {
+                        Ok(code) => code,
+                        Err(stopped) => match stopped.downcast_ref::<salsa::Cancelled>() {
+                            Some(salsa::Cancelled::PropagatedPanic) | None => None,
+                            Some(_) => std::panic::resume_unwind(stopped),
+                        },
+                    }
                 })
                 .collect()
         });
