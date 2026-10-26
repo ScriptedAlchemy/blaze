@@ -428,6 +428,21 @@ impl Index {
             }
             scopes.push((krate, now));
         }
+        // What a file no module is written in holds is in the items of whoever `include!`s
+        // it, by no file here.
+        let was_scopes = around.iter().filter_map(|it| self.scopes.get(it));
+        let module_files: FxHashSet<FileId> = (scopes.iter().map(|it| &it.1).chain(was_scopes))
+            .flat_map(|it| it.modules.values().map(|it| it.0))
+            .collect();
+        if files.iter().any(|it| !module_files.contains(it)) {
+            return Err("a file no module is written in");
+        }
+        for &krate in &edited {
+            let included = hir_def::include_macro_invoc(db, krate);
+            if included.iter().any(|(_, it)| files.contains(&it.file_id(db))) {
+                return Err("a file a module `include!`s");
+            }
+        }
 
         took.push(start.elapsed());
         // The files written again, beside their entries.
