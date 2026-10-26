@@ -535,9 +535,10 @@ run each (**read**):
 
 | what | result |
 |---|---|
+| `cargo +1.99.0 build --release -p ra-jit` (no features, after the runs) | built, 57.8 s over the build with `heap-profile` |
 | `cargo +1.99.0 test -p ra-jit` | 194 passed, 0 failed (193 on `dist/main`: the one added is the daemon's lone-worker test) |
 | `cargo +1.99.0 test -p hir-ty-codegen budget` | 4 passed (new: the share of threads, the purge, the stop, no budget) |
-| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH; 949 of 951 functions from ra-jit; layouts: 0 of 1,261 differ from rustc's, the futures of a new generic `async fn` case (`async_frames::generic`) among them; the two functions not from ra-jit are the layout of a type error and an `asm!` constant that is not a literal, neither of which this branch touches |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH; 949 of 951 functions from ra-jit; layouts: 0 of 1,261 differ from rustc's, the futures of a new generic `async fn` case (`async_frames::generic`) among them; the two functions not from ra-jit are the layout of a type error and an `asm!` constant that is not a literal, as on `dist/main` (MATCH there too, the same two, 0 of 1,259 layouts differ) |
 | `stress.py` (edits against cargo's builds) | 100 of 100 right, 0 restarts |
 | `storebuilds.py` (the store) | PASS: the first build added 701 functions, another of the same sources found 5 and compiled 0 |
 | `storetracked.py` (the store's tracked entries) | 0 wrong |
