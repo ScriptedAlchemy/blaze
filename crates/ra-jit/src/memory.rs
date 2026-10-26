@@ -173,12 +173,13 @@ pub(crate) fn ticks() {
                 let mb = |bytes: Option<u64>| bytes.map_or(0, |it| it >> 20);
                 let footprint = mb(held_by(std::process::id()));
                 let [live, active, resident, mapped, retained, metadata] = jemalloc_stats();
+                let compiled = hir_ty_codegen::compiled_functions();
                 let line = format!(
-                    "{tick}\t{:.0}\t{footprint}\t{live}\t{active}\t{resident}\t{mapped}\t{retained}\t{metadata}",
+                    "{tick}\t{:.0}\t{footprint}\t{live}\t{active}\t{resident}\t{mapped}\t{retained}\t{metadata}\t{compiled}",
                     start.elapsed().as_secs_f64(),
                 );
                 eprintln!(
-                    "memory tick {tick} at {:.0}s: {footprint} MB footprint, {live} MB live, {active} MB active, {resident} MB resident, {mapped} MB mapped, {retained} MB retained, {metadata} MB metadata",
+                    "memory tick {tick} at {:.0}s: {footprint} MB footprint, {live} MB live, {active} MB active, {resident} MB resident, {mapped} MB mapped, {retained} MB retained, {metadata} MB metadata, {compiled} functions compiled",
                     start.elapsed().as_secs_f64(),
                 );
                 let Some(dir) = &dir else { continue };
@@ -191,7 +192,7 @@ pub(crate) fn ticks() {
                     if new {
                         _ = writeln!(
                             file,
-                            "tick\tseconds\tfootprint_mb\tlive_mb\tactive_mb\tresident_mb\tmapped_mb\tretained_mb\tmetadata_mb"
+                            "tick\tseconds\tfootprint_mb\tlive_mb\tactive_mb\tresident_mb\tmapped_mb\tretained_mb\tmetadata_mb\tcompiled"
                         );
                     }
                     _ = writeln!(file, "{line}");
