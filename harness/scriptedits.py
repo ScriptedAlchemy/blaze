@@ -265,6 +265,68 @@ fn main() {
     step("PROBE_NEW=newer again", 0, env={"PROBE_NEW": "newer"}),
 ])
 
+# 3f. What cargo gives the script besides the process's variables: the flags for rustc, the `[env]`
+# of its configuration, the manifest, and a script that appears and goes.
+case("rustflags", "RUSTFLAGS, which cargo gives every script", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    generated(&format!("flags={:?}", env::var("CARGO_ENCODED_RUSTFLAGS").ok()));
+}
+'''), [
+    step("cold build", 1),
+    step("RUSTFLAGS=--cfg a", 1, env={"RUSTFLAGS": "--cfg a"}),
+    step("RUSTFLAGS=--cfg a again", 0, env={"RUSTFLAGS": "--cfg a"}),
+    step("RUSTFLAGS=--cfg b", 1, env={"RUSTFLAGS": "--cfg b"}),
+    step("unset: the run of the cold build is as it was, in its own directory", 0),
+])
+
+case("config-env", "[env] of cargo's configuration", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PROBE_CONFIG");
+    generated(&format!("config={:?}", env::var("PROBE_CONFIG").ok()));
+}
+''', files={".cargo/config.toml": '[env]\nPROBE_CONFIG = "a"\n'}), [
+    step("cold build", 1),
+    step("[env] changes", 1, write={".cargo/config.toml": '[env]\nPROBE_CONFIG = "b"\n'}),
+    step("[env] is not there", 1, remove=[".cargo/config.toml"]),
+    step("rebuild, nothing changed", 0),
+])
+
+case("manifest", "the manifest's version, which cargo gives every script", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    generated(&format!("version={:?}", env::var("CARGO_PKG_VERSION").ok()));
+}
+'''), [
+    step("cold build", 1),
+    step("version 0.1.1", 1, write={"Cargo.toml": MANIFEST.replace("0.1.0", "0.1.1")}),
+    step("rebuild, nothing changed", 0),
+    step("version 0.1.0: the run of the cold build is as it was, in its own directory", 0, write={"Cargo.toml": MANIFEST}),
+])
+
+APPEARS = ('const EDIT: u32 = 1;\n\nfn main() {\n    println!("edit={} script={:?}", EDIT, '
+           'option_env!("PROBE_SCRIPT"));\n}\n')
+APPEARS_SCRIPT = PRELUDE + r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=PROBE_SCRIPT=yes");
+}
+'''
+case("script-appears", "a build.rs that appears and goes", {
+    "Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n',
+    "src/main.rs": APPEARS,
+}, [
+    step("cold build, no script", 0),
+    step("build.rs appears", 1, write={"build.rs": APPEARS_SCRIPT}),
+    step("rebuild, nothing changed", 0),
+    step("build.rs goes", 0, remove=["build.rs"]),
+])
+
 # 4. A script that stops saying what it reads: cargo then runs it for any file of its package.
 FEW = r'''
 fn main() {

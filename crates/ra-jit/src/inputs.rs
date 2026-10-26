@@ -753,6 +753,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A build asks the worker more than once, and cargo runs a script that names a file that is
+    /// not there, or owes a run, once for each build: not for each ask, and for every other.
+    #[test]
+    fn a_script_cargo_runs_every_build_is_asked_for_once_for_each() {
+        let root = dir("builds");
+        let ran = SystemTime::now() - Duration::from_secs(60);
+        let mut script = script(&root, "cargo:rerun-if-changed=absent.txt\n", ran);
+        script.asked = 7;
+        assert!(!script.changed(7), "cargo has looked at it for this build");
+        assert!(script.changed(8), "another build");
+        assert!(script.changed(0), "a request that says no build is each its own");
+        // A change of the script, of what it is built from or of its package is a change at
+        // once, whichever build asks.
+        std::fs::write(root.join("pkg/build.rs"), "fn main() { changed(); }").unwrap();
+        assert!(script.changed(7));
+        let mut owing = self::script(&root, "cargo:rerun-if-changed=src/main.rs\n", ran);
+        std::fs::write(root.join("pkg/src/main.rs"), "").unwrap();
+        set_time(&root.join("pkg/src/main.rs"), ran - Duration::from_secs(5));
+        owing.files = owing.watched(&[]);
+        owing.asked = 3;
+        assert!(!owing.changed(3) && !owing.changed(4));
+        owing.owes = true;
+        assert!(!owing.changed(3), "owed, and asked for in this build");
+        assert!(owing.changed(4), "owed, and another build asks");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// What cargo compiled the script from is what cargo compiles it again for: the modules
     /// its dep-info names, in either layout of the build directory.
     #[test]
