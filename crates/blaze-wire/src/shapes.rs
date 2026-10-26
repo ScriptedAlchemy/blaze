@@ -6,8 +6,8 @@
 //! [`Set`], sorted by the bytes of each item's encoding and without duplicates.
 
 use crate::cbor::Wire;
-use crate::{wire_enum, wire_struct};
 use crate::{Digest, Named, Set};
+use crate::{wire_enum, wire_struct};
 
 wire_struct! {
     /// What the native side of a build is: everything outside blaze that changes what is linked or
@@ -160,17 +160,61 @@ wire_struct! {
 }
 
 impl CrateRecord {
-    /// The bytes the server signs: fields 0 to 5, which is the record as written with its
-    /// signature field, 6, zeroed. Section 2: the namespace is in the signed bytes, so a `Pr`
-    /// record is not a `Main` record.
+    /// The six-field map the server signs: fields 0 to 5, without the signature field.
+    ///
+    /// Section 2 signs the record without the field the signature goes in, so the signed bytes
+    /// are `{0: namespace, 1: epoch, 2: crate_key, 3: generation, 4: packs, 5: source}`, a map of
+    /// six, and the namespace is in them, so a `Pr` record is not a `Main` record. The whole
+    /// record, signature field 6 included, is still what [`digest_of`](crate::digest_of) hashes.
     pub fn signed_bytes(&self) -> Vec<u8> {
-        crate::encode(&CrateRecord { signature: [0u8; 64], ..self.clone() })
+        let mut e = crate::Encoder::new();
+        e.map(6);
+        e.uint(0);
+        self.namespace.encode(&mut e);
+        e.uint(1);
+        self.epoch.encode(&mut e);
+        e.uint(2);
+        self.crate_key.encode(&mut e);
+        e.uint(3);
+        self.generation.encode(&mut e);
+        e.uint(4);
+        self.packs.encode(&mut e);
+        e.uint(5);
+        self.source.encode(&mut e);
+        e.into_bytes()
     }
 
-    /// Whether `signature` is this record's under `key`, over fields 0 to 5.
+    /// The signature of this record under `key`: Ed25519 over
+    /// `"blaze/sig/CrateRecord/v1" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
+    /// domain separation every other signature of the schema uses.
+    pub fn sign(&self, key: &ed25519_dalek::SigningKey) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        key.sign(&crate::signature_input_encoded::<CrateRecord>(&self.signed_bytes())).to_bytes()
+    }
+
+    /// This record with field 6 set to [`sign`](CrateRecord::sign)'s signature.
+    pub fn signed(&self, key: &ed25519_dalek::SigningKey) -> CrateRecord {
+        CrateRecord { signature: self.sign(key), ..self.clone() }
+    }
+
+    /// Whether `signature` is this record's under `key`, over the six fields the server signs,
+    /// under the `CrateRecord` signature domain.
     pub fn signature_is(&self, key: &ed25519_dalek::VerifyingKey, signature: &[u8; 64]) -> bool {
-        use ed25519_dalek::Signature;
-        key.verify_strict(&self.signed_bytes(), &Signature::from_bytes(signature)).is_ok()
+        crate::verify_encoded_name("CrateRecord", &self.signed_bytes(), key, signature)
+    }
+}
+
+impl crate::vectors::SelfSigned for CrateRecord {
+    fn signed_bytes(&self) -> Vec<u8> {
+        CrateRecord::signed_bytes(self)
+    }
+
+    fn with_signature(self, key: &ed25519_dalek::SigningKey) -> CrateRecord {
+        self.signed(key)
+    }
+
+    fn own_signature(&self) -> Option<[u8; 64]> {
+        Some(self.signature)
     }
 }
 
@@ -800,5 +844,3 @@ impl crate::vectors::Sample for Attempt {
         Attempt(u32::sample(g))
     }
 }
-
-

@@ -28,11 +28,15 @@ that hash.
 
 ## The validator
 
-[`validate`] checks the bytes alone and names the first offence: a non-shortest head, an indefinite
-length, unsorted keys, a duplicate key, a float, a tag, an oversize item, trailing bytes, nesting
-past `MAX_DEPTH`. [`validate_as`] reads the bytes as a type too, so a key the schema does not have,
+[`validate`] checks the bytes alone and names the first offence: a non-shortest head, an
+indefinite length, unsorted keys, a duplicate key, a float, a tag, a reserved simple value (RFC
+8949 section 3.3's `f8` and a byte below 32), an oversize item, trailing bytes, nesting past
+`MAX_DEPTH`. [`validate_as`] reads the bytes as a type too, so a key the schema does not have,
 a missing key, a text string that is not UTF-8, an unsorted or repeated set item and an unknown
-enum discriminant are refused by name as well.
+enum discriminant are refused by name as well. [`decode`] is that same call: it runs the
+validator's pass first, so the ordinary decoder never accepts a message the validator refuses.
+`MAX_DEPTH` counts every item, containers and scalars alike, so a scalar inside 31 arrays is the
+deepest item a message may have.
 
 Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 
@@ -41,7 +45,15 @@ Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 A digest is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
 the type's name; a signature is Ed25519 over the same bytes with `sig/` in front of the name. The
 domain separation means a `WorkKey`'s and a `JobContentInput`'s bytes never collide even when their
-encodings do, and a signature can never be replayed as a digest or as another type's.
+encodings do, and a signature can never be replayed as a digest or as another type's. [`digest_input`]
+and [`signature_input`] return the preimages themselves, so a caller that hashes or signs elsewhere
+gets the same bytes.
+
+One value signs less than its whole encoding: a `CrateRecord`'s signature is over the six-field map
+of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record carries a signature a
+client checks without field 6, which is the signature itself ([`CrateRecord::signed_bytes`],
+[`CrateRecord::sign`], [`CrateRecord::signature_is`]). The whole record, field 6 included, is what
+`digest_of` hashes.
 
 ## Golden vectors
 
@@ -57,13 +69,17 @@ cargo run -p blaze-wire --example write_golden
 ## JSON
 
 [`to_json`] renders a value for people (`Accept: application/json`, `--json`): field numbers as text,
-byte strings as lowercase hex, sets as arrays. It is never the wire and nothing's identity is taken
-from it.
+byte strings as lowercase hex, sets as arrays, and an enum as the wire's two-element array
+(`[discriminant, payload]`, `Namespace::Main` as `[0,null]`). It is never the wire and nothing's
+identity is taken from it.
 
 ## Limits
 
 `Hello` answers them and every message is held to them: 16 MiB a request, 1 MiB an event, 4 GiB a
-blob, 4,096 items in a lookup, 65,536 in a batch, 4 KiB a string.
+blob, 4,096 items in a lookup, 65,536 in a batch, 4 KiB a string. The bytes-only validator cannot
+tell a lookup's array from a batch's, so the schema's decoder holds a lookup's collection to the
+4,096 of [`Limits::lookup_items`] and every other collection to [`Limits::batch_items`]. Exactly the
+limit is accepted and one item more is refused, by name.
 
 ## What is not here
 

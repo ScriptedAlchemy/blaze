@@ -24,22 +24,22 @@
 
 #![deny(missing_docs)]
 
-mod cbor;
 pub mod calls;
+mod cbor;
 pub mod credentials;
 pub mod json;
 pub mod shapes;
 pub mod vectors;
 
-pub use cbor::{
-    Bytes, Encoder, Error, ErrorKind, MAX_DEPTH, Named, Reader, Set, Wire, decode, encode, validate,
-    validate_as,
-};
-pub use cbor::Limits;
 pub use calls::*;
+pub use cbor::Limits;
+pub use cbor::{
+    Appender, Bytes, Encoder, Error, ErrorKind, MAX_DEPTH, Named, Reader, Set, Wire, decode,
+    encode, validate, validate_as,
+};
 pub use json::to_json;
-pub use vectors::{Gen, Sample, Vector, every};
 pub use shapes::*;
+pub use vectors::{Gen, Sample, SelfSigned, Vector, every};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -66,7 +66,10 @@ pub fn digest_input<T: Wire + Named>(value: &T) -> Vec<u8> {
     out.extend_from_slice(T::NAME.as_bytes());
     out.extend_from_slice(DOMAIN_VERSION.as_bytes());
     out.push(0);
-    value.encode(&mut Encoder::new_into(&mut out));
+    {
+        let mut e = Encoder::new_into(&mut out);
+        value.encode(&mut e);
+    }
     out
 }
 
@@ -98,8 +101,7 @@ pub fn verify_encoded_name(
     key: &VerifyingKey,
     signature: &[u8; 64],
 ) -> bool {
-    key.verify_strict(&signature_input_name(name, cbor), &Signature::from_bytes(signature))
-        .is_ok()
+    key.verify_strict(&signature_input_name(name, cbor), &Signature::from_bytes(signature)).is_ok()
 }
 
 /// The SHA-256 of type `name`'s `cbor`, for a name a golden file carries.
@@ -140,11 +142,7 @@ pub fn sign<T: Wire + Named>(key: &SigningKey, value: &T) -> [u8; 64] {
 }
 
 /// Whether `signature` is `value`'s under `key`.
-pub fn verify<T: Wire + Named>(
-    key: &VerifyingKey,
-    value: &T,
-    signature: &[u8; 64],
-) -> bool {
+pub fn verify<T: Wire + Named>(key: &VerifyingKey, value: &T, signature: &[u8; 64]) -> bool {
     key.verify_strict(&signature_input(value), &Signature::from_bytes(signature)).is_ok()
 }
 
@@ -228,15 +226,10 @@ pub fn capability_from_header(header: &str, limits: &Limits) -> Result<SignedCap
 
 /// `bytes` in base64url without padding, RFC 4648 section 5.
 pub fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
@@ -251,6 +244,9 @@ pub fn base64url(bytes: &[u8]) -> String {
 }
 
 /// The bytes of base64url text without padding, or `None` when it is not.
+///
+/// The text must be canonical: the unused low bits of the last character are zero, so one byte
+/// string has one text, and a signature or a capability read from a header has no textual alias.
 pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
     let mut buffer: u32 = 0;
@@ -272,8 +268,9 @@ pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
             buffer &= (1 << bits) - 1;
         }
     }
-    // A leftover of more than four bits would be a byte's worth of text that is not there.
-    if bits >= 6 { None } else { Some(out) }
+    // A leftover of six bits is a byte's worth of text that is not there; a leftover of one to
+    // five bits must be zero, or two texts would name the same bytes.
+    if bits >= 6 || buffer != 0 { None } else { Some(out) }
 }
 
 /// A frame: a four-byte big-endian length and then that many bytes, as the socket and an event

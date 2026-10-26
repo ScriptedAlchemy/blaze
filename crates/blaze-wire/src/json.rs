@@ -1,10 +1,11 @@
 //! A JSON rendering of a wire value, for people: `Accept: application/json`, `--json`.
 //!
 //! This is never the wire and nothing's identity is taken from it. A struct renders as an object
-//! whose keys are its field numbers as text, an enum as `{"<discriminant>": <payload>}`, a set as
-//! an array in the set's order, a byte string or a digest as lowercase hex, and an integer as a
-//! JSON number. The rendering is made by reading the value's canonical CBOR back, so it is a view
-//! of the same bytes the encoder writes and not a second schema.
+//! whose keys are its field numbers as text, an enum as the two-element array the wire carries
+//! (`[discriminant, payload]`, `Namespace::Main` as `[0,null]`), a set as an array in the set's
+//! order, a byte string or a digest as lowercase hex, and an integer as a JSON number. The
+//! rendering is made by reading the value's canonical CBOR back, so it is a view of the same bytes
+//! the encoder writes and not a second schema.
 
 use crate::cbor::{Encoder, Named, Wire};
 
@@ -113,7 +114,9 @@ fn render_at(bytes: &[u8], at: &mut usize, out: &mut String) {
     let (major, arg) = head(bytes, at);
     match major {
         0 => out.push_str(&arg.to_string()),
-        1 => out.push_str(&format!("-{}", arg + 1)),
+        // `-1 - arg` in an `i128`: `-2^64` is a well-formed CBOR item the validator accepts, and
+        // `arg + 1` would overflow a `u64` in debug and render `-0` in release.
+        1 => out.push_str(&(-1 - i128::from(arg)).to_string()),
         2 => {
             let end = *at + arg as usize;
             push_hex(&bytes[*at..end], out);
