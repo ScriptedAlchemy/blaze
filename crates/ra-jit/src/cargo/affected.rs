@@ -21,7 +21,7 @@
 //!   in all, as Bazel's `flaky = True` and `--flaky_test_attempts` do.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -178,11 +178,8 @@ pub(crate) fn pick(
         .map(|(identity, name)| (name, identity))
         .collect();
     let manifest = Manifest::read(&state.root);
-    let programs = format!(
-        "{}{}",
-        programs_run_by(state, test),
-        manifest.given(&state.root, &asked.trailing, command)
-    );
+    let given = manifest.given(&state.root, &asked.trailing, command);
+    let programs = format!("{}{}", programs_run_by(state, test), given.as_deref().unwrap_or(""));
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -193,7 +190,8 @@ pub(crate) fn pick(
             return Pick::Asked;
         }
         total += 1;
-        if let Some(why) = manifest.opts_out(&test.package, name) {
+        let why = manifest.opts_out(&test.package, name).or_else(|| given.as_ref().err().cloned());
+        if let Some(why) = why {
             names.push(name.to_owned());
             always.push(Always { name: name.to_owned(), why, path: None });
             continue;
@@ -332,18 +330,34 @@ impl Manifest {
     /// contents of the files of `data` (and which are not there), and the value of each
     /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
     /// pass was under another runs.
-    fn given(&self, root: &Path, trailing: &[String], command: &Command) -> String {
-        let Ok(declared) = &self.0 else { return "+unreadable".to_owned() };
+    fn given(&self, root: &Path, trailing: &[String], command: &Command) -> Result<String, String> {
+        let declared = self.0.as_ref().map_err(Clone::clone)?;
         let mut hash = Sha256::new();
-        hash.update(b"threads\0");
-        hash.update(test_threads(trailing).unwrap_or_default().as_bytes());
+        hash.update(b"test inputs 2\0threads\0");
+        match test_threads(trailing) {
+            Some(value) => {
+                hash.update(b"set\0");
+                hash.update(value.as_bytes());
+            }
+            None => hash.update(b"unset"),
+        }
         hash.update([0]);
-        hash.update(std::env::var_os("RUST_TEST_THREADS").unwrap_or_default().as_encoded_bytes());
+        match environment(command, "RUST_TEST_THREADS") {
+            Some(value) => {
+                hash.update(b"set\0");
+                hash.update(value.as_encoded_bytes());
+            }
+            None => hash.update(b"unset"),
+        }
         hash.update(b"\0data\0");
         for path in &declared.data {
             hash.update(path.as_bytes());
             hash.update([0]);
-            feed(&mut hash, &root.join(path));
+            let input = root.join(path);
+            let digest = data_hash(&input, &mut BTreeSet::new()).map_err(|error| {
+                format!("declared data `{}` can't be read ({error})", input.display())
+            })?;
+            hash.update(digest);
         }
         let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
         let mut names: Vec<&str> =
@@ -355,10 +369,7 @@ impl Manifest {
         for name in names {
             hash.update(name.as_bytes());
             hash.update([0]);
-            let value = command.get_envs().find(|(key, _)| *key == name);
-            let value = value
-                .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()));
-            match value {
+            match environment(command, name) {
                 Some(value) => {
                     hash.update(b"set\0");
                     hash.update(value.as_encoded_bytes());
@@ -368,7 +379,7 @@ impl Manifest {
             hash.update([0]);
         }
         let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
-        format!("+{hex}")
+        Ok(format!("+{hex}"))
     }
 
     fn marks_flaky(&self, package: &str, name: &str) -> bool {
@@ -406,29 +417,65 @@ fn test_threads(trailing: &[String]) -> Option<&str> {
     None
 }
 
-/// Hashes what is at `path`: nothing, a file's bytes, or a directory's names and what is in them.
-fn feed(hash: &mut Sha256, path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else { return hash.update(b"absent") };
-    if meta.is_dir() {
+/// The value the test receives, including Cargo's configured overrides and removals.
+fn environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == name)
+        .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()))
+}
+
+/// Each child has its own digest: file bytes cannot impersonate the next directory entry.
+/// A path we cannot finish reading is not evidence for reusing a pass. Following symlinks
+/// keeps their target's contents in the key, with cycles rejected instead of recursing forever.
+fn data_hash(path: &Path, visiting: &mut BTreeSet<PathBuf>) -> std::io::Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Sha256::digest(b"absent").into());
+        }
+        Err(error) => return Err(error),
+    };
+    if meta.is_symlink() {
+        hash.update(b"link\0");
+        let target = std::fs::read_link(path)?;
+        let bytes = target.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+        let here =
+            path.parent().unwrap_or(Path::new(".")).canonicalize()?.join(path.file_name().unwrap());
+        if !visiting.insert(here.clone()) {
+            return Err(std::io::Error::other("symlink cycle"));
+        }
+        let target = path.parent().unwrap_or(Path::new(".")).join(target);
+        let result = data_hash(&target, visiting);
+        visiting.remove(&here);
+        hash.update(result?);
+    } else if meta.is_dir() {
         hash.update(b"dir");
-        let mut names: Vec<_> = std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .filter_map(|it| it.ok().map(|it| it.file_name()))
-            .collect();
+        let here = path.canonicalize()?;
+        if !visiting.insert(here.clone()) {
+            return Err(std::io::Error::other("directory cycle"));
+        }
+        let mut names = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|it| it.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
         names.sort();
         for name in names {
+            hash.update((name.as_encoded_bytes().len() as u64).to_le_bytes());
             hash.update(name.as_encoded_bytes());
-            hash.update([0]);
-            feed(hash, &path.join(name));
+            hash.update(data_hash(&path.join(name), visiting)?);
         }
-    } else {
+        visiting.remove(&here);
+    } else if meta.is_file() {
         hash.update(b"file");
-        match std::fs::File::open(path) {
-            Ok(mut file) => _ = std::io::copy(&mut file, hash),
-            Err(_) => hash.update(b"unreadable"),
-        }
+        let mut file = std::fs::File::open(path)?;
+        std::io::copy(&mut file, &mut hash)?;
+    } else {
+        return Err(std::io::Error::other("not a regular file or directory"));
     }
+    Ok(hash.finalize().into())
 }
 
 /// How many attempts each test gets before it fails the run.
@@ -564,7 +611,63 @@ mod tests {
             declared.given(&dir, &[], &command),
             "the effective test environment is keyed"
         );
+        let mut threads = Command::new("test");
+        threads.env("RUST_TEST_THREADS", "1");
+        let one = declared.given(&dir, &[], &threads);
+        threads.env("RUST_TEST_THREADS", "2");
+        assert_ne!(one, declared.given(&dir, &[], &threads), "configured test threads are keyed");
+        threads.env_remove("RUST_TEST_THREADS");
+        let absent = declared.given(&dir, &[], &threads);
+        threads.env("RUST_TEST_THREADS", "");
+        assert_ne!(absent, declared.given(&dir, &[], &threads), "empty is not unset");
+        assert_ne!(before, given(&declared, &["--test-threads="]), "empty is not the default");
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_file_bytes_cannot_impersonate_another_directory_entry() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-framing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"xb\0filey").unwrap();
+        let one = data_hash(&dir, &mut BTreeSet::new()).unwrap();
+        // The previous encoding of these two distinct trees was identical:
+        // `dir` + `a\0file` + `xb\0filey`.
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        std::fs::write(dir.join("b"), b"y").unwrap();
+        let two = data_hash(&dir, &mut BTreeSet::new()).unwrap();
+        assert_ne!(one, two);
+        assert_eq!(two, data_hash(&dir, &mut BTreeSet::new()).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_data_links_track_targets_and_cycles_disable_reuse() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"one").unwrap();
+        symlink("target", dir.join("link")).unwrap();
+        let declared = manifest("data = [\"link\"]\n");
+        let command = Command::new("test");
+        let one = declared.given(&dir, &[], &command).unwrap();
+        std::fs::write(dir.join("target"), b"two").unwrap();
+        assert_ne!(one, declared.given(&dir, &[], &command).unwrap());
+        std::fs::remove_file(dir.join("link")).unwrap();
+        symlink(".", dir.join("link")).unwrap();
+        assert!(declared.given(&dir, &[], &command).unwrap_err().contains("cycle"));
+        std::fs::remove_file(dir.join("link")).unwrap();
+        symlink("other", dir.join("link")).unwrap();
+        symlink("link", dir.join("other")).unwrap();
+        assert!(declared.given(&dir, &[], &command).unwrap_err().contains("cycle"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_file_data_cannot_be_cached_as_empty_or_opened_as_a_stream() {
+        let declared = manifest("data = [\"/dev/null\"]\n");
+        assert!(declared.given(Path::new("."), &[], &Command::new("test")).is_err());
     }
 
     #[test]
