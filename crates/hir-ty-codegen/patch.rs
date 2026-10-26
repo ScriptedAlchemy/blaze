@@ -763,10 +763,42 @@ pub(super) struct Base {
     /// not have, each from one to the next: the edit they are of pushes them, so what was made
     /// of the items at one of them is of the next too.
     went: Vec<(salsa::Revision, salsa::Revision)>,
+    /// Where a thread of its own puts the code of the functions of [`Self::items`] it wrote,
+    /// which moves are found by: taken before the next edit if it is done by then.
+    coding: Option<Coding>,
 }
 
 /// See [`Base::making`].
 type Making = Arc<std::sync::Mutex<Option<(salsa::Revision, Box<ItemPush>)>>>;
+
+/// See [`Base::coding`]: the code of each function, of the index after so many pushes.
+type Coding = Arc<std::sync::Mutex<Option<(u64, Vec<FunctionId>, Vec<blaze_items::Code>)>>>;
+
+/// The code of the functions of `index` without it, on the threads `fan` has, for `coding`.
+fn write_codes(
+    db: &dyn HirDatabase,
+    fan: &Fan<'_>,
+    (pushes, funcs): (u64, Vec<FunctionId>),
+    live: blaze_items::Live,
+    coding: &Coding,
+) {
+    let start = std::time::Instant::now();
+    let stats = std::env::var_os("RA_JIT_STATS").is_some();
+    if stats {
+        eprintln!("items-coding: {} functions", funcs.len());
+    }
+    let codes = blaze_items::codes_of(db, fan, &funcs, Some(&live));
+    drop(live);
+    if stats {
+        let written = codes.iter().filter(|it| it.is_some()).count();
+        eprintln!(
+            "items-codes: {written} of {} functions in {} us",
+            funcs.len(),
+            start.elapsed().as_micros()
+        );
+    }
+    *coding.lock().unwrap_or_else(|e| e.into_inner()) = Some((pushes, funcs, codes));
+}
 
 /// See [`Base::settling`].
 type Settling =
@@ -1472,6 +1504,7 @@ impl Base {
             reitem: None,
             settling: None,
             went: Vec::new(),
+            coding: None,
         })
         .map(|mut base| {
             base.make_items(db, cg.symbols);
@@ -1492,6 +1525,8 @@ impl Base {
         let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
         let (compiled, instances) =
             (self.compiled.clone(), self.instances.keys().cloned().collect::<Vec<_>>());
+        let coding = Coding::default();
+        let codes = coding.clone();
         let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
             let start = std::time::Instant::now();
             let items = ItemPush::new(db, fan, &compiled, &instances);
@@ -1502,10 +1537,13 @@ impl Base {
                     items.index.items()
                 );
             }
+            let (wanting, live) = (items.index.wanting_code(), items.index.live());
             *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
+            write_codes(db, fan, wanting, live, &codes);
         };
         symbols.in_background(db, Box::new(work));
         self.making = Some(making);
+        self.coding = Some(coding);
     }
 
     /// The executable rustc linked as a base, before anything of it is known: `home` takes
@@ -1555,6 +1593,7 @@ impl Base {
             reitem: None,
             settling: None,
             went: Vec::new(),
+            coding: None,
         }
     }
 
@@ -1954,6 +1993,24 @@ impl Base {
         };
         symbols.in_background(db, Box::new(work));
         self.settling = Some(Arc::new(std::sync::Mutex::new(Some(settling))));
+        self.write_codes(db, symbols);
+    }
+
+    /// Writes the code of the functions of the items whose code is not written yet, on
+    /// threads of their own.
+    fn write_codes(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        let Some(items) = &self.items else { return };
+        let wanting = items.index.wanting_code();
+        if wanting.1.is_empty() {
+            return;
+        }
+        let (live, coding) = (items.index.live(), Coding::default());
+        let codes = coding.clone();
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            write_codes(db, fan, wanting, live, &codes);
+        };
+        symbols.in_background(db, Box::new(work));
+        self.coding = Some(coding);
     }
 
     fn bindings_edited(&mut self) {
@@ -1979,6 +2036,11 @@ impl Base {
             .filter(|(at, _)| self.of_now(*at, now));
         self.went.clear();
         let Some(items) = &mut self.items else { return };
+        let coded =
+            self.coding.take().and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some((pushes, funcs, codes)) = coded {
+            items.index.take_codes(pushes, &funcs, codes);
+        }
         let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
         let taken = probe(|| {
             hir_ty::attach_db(db, || {

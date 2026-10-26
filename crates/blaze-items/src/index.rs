@@ -12,7 +12,7 @@
 
 use base_db::{Crate, FileId};
 use hir_def::{
-    AdtId, DefWithBodyId, ItemContainerId, Lookup, MacroId, ModuleId,
+    AdtId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, MacroId, ModuleId,
     expr_store::{Body, ExpressionStore, path::Path},
     hir::{Expr, Pat, type_ref::TypeRef},
     nameres::{crate_def_map, diagnostics::DefDiagnosticKind},
@@ -49,6 +49,8 @@ pub struct Index {
     live: Arc<FxHashSet<ItemId>>,
     /// What the last push found moved: each item gone with the one added in its place.
     moved: FxHashMap<ItemId, ItemId>,
+    /// How many edits were pushed, which an entry is written after.
+    pushes: u64,
 }
 
 /// The items an index has, which a thread of its own can ask of an item without asking salsa
@@ -95,7 +97,9 @@ struct Entry {
     refs: Box<[ItemId]>,
     /// Of a function, the digest of its code and what that refers to, which a move keeps:
     /// `None` for one whose code could not all be written.
-    code: Option<(form::Hash, Box<[ItemId]>)>,
+    code: Code,
+    /// [`Index::pushes`] when it was written.
+    written: u64,
     names: Box<[Symbol]>,
     missed: Option<&'static str>,
     /// Whether it is written with an error, so that it is told changed whenever it is
@@ -244,6 +248,7 @@ impl Index {
             scopes_dirty: false,
             live: Arc::default(),
             moved: FxHashMap::default(),
+            pushes: 0,
         };
         for Entries(part) in entries {
             for (id, entry) in part {
@@ -264,6 +269,32 @@ impl Index {
     /// [`moves`] of the last edit pushed, which a push refused after finding them keeps.
     pub fn moved(&self) -> &FxHashMap<ItemId, ItemId> {
         &self.moved
+    }
+
+    /// The functions whose code is not written yet, and how many edits were pushed before:
+    /// what [`codes_of`] writes of them is for [`Self::take_codes`].
+    pub fn wanting_code(&self) -> (u64, Vec<FunctionId>) {
+        let funcs = (self.entries.iter())
+            .filter(|it| it.1.code.is_none() && !it.1.erred && it.1.missed.is_none())
+            .filter_map(|it| match it.0 {
+                ItemId::Function(func) => Some(*func),
+                _ => None,
+            })
+            .collect();
+        (self.pushes, funcs)
+    }
+
+    /// Takes the code of functions written after `pushes` edits, of those whose entries were
+    /// not written again since.
+    pub fn take_codes(&mut self, pushes: u64, funcs: &[FunctionId], codes: Vec<Code>) {
+        for (&func, code) in funcs.iter().zip(codes) {
+            if let Some(entry) = self.entries.get_mut(&ItemId::Function(func))
+                && entry.written <= pushes
+                && entry.code.is_none()
+            {
+                entry.code = code;
+            }
+        }
     }
 
     pub fn live(&self) -> Live {
@@ -356,6 +387,7 @@ impl Index {
     ) -> Result<Pushed, &'static str> {
         let start = std::time::Instant::now();
         self.moved.clear();
+        self.pushes += 1;
         let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
@@ -504,8 +536,38 @@ impl Index {
         let declared = self.declared(db, fan, &rewritten);
         let declared_at = start.elapsed();
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
-        let entries = entries_of(db, fan, &ids);
+        let mut entries = entries_of(db, fan, &ids);
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
+        // The code of an added function is written when a gone one is written alike, with its
+        // code known from before the edit.
+        let alike: FxHashSet<(form::Hash, &[Symbol])> = (declared.iter())
+            .flat_map(|(file, _)| self.files.get(file).into_iter().flatten())
+            .filter(|it| !now.contains(it))
+            .filter_map(|it| self.entries.get(it))
+            .filter(|it| it.code.is_some())
+            .map(|it| (it.digest, &it.names[..]))
+            .collect();
+        let wanted: Vec<usize> = (0..ids.len())
+            .filter(|&at| {
+                matches!(ids[at], ItemId::Function(_)) && !self.entries.contains_key(&ids[at])
+            })
+            .filter(|&at| {
+                entries[at].as_ref().is_some_and(|it| {
+                    it.code.is_none() && alike.contains(&(it.digest, &it.names[..]))
+                })
+            })
+            .collect();
+        let funcs: Vec<FunctionId> = (wanted.iter())
+            .filter_map(|&at| match ids[at] {
+                ItemId::Function(it) => Some(it),
+                _ => None,
+            })
+            .collect();
+        for (at, code) in wanted.into_iter().zip(codes_of(db, fan, &funcs, None)) {
+            if let Some(entry) = &mut entries[at] {
+                entry.code = code;
+            }
+        }
         let gone: Vec<(ItemId, &Entry)> = (declared.iter())
             .flat_map(|(file, _)| self.files.get(file).into_iter().flatten())
             .filter(|it| !now.contains(it))
@@ -652,7 +714,8 @@ impl Index {
             .collect()
     }
 
-    fn insert(&mut self, id: ItemId, entry: Entry) {
+    fn insert(&mut self, id: ItemId, mut entry: Entry) {
+        entry.written = self.pushes;
         self.files.entry(entry.file).or_default().push(id);
         for &r in &entry.refs {
             self.users.entry(r).or_default().insert(id);
@@ -897,6 +960,39 @@ fn trait_counterpart(db: &dyn HirDatabase, id: ItemId) -> Option<ItemId> {
 
 /// The entry of an item, or `None` for one that is not one now.
 /// The entries of `ids`, on the threads `fan` has.
+/// The digest of a function's code and what it refers to, `None` when it can't all be written.
+pub type Code = Option<(form::Hash, Box<[ItemId]>)>;
+
+/// [`Code`] of each of `ids`, on the threads `fan` has; `None` of one `live` doesn't have.
+pub fn codes_of(
+    db: &dyn HirDatabase,
+    fan: &Fan<'_>,
+    ids: &[FunctionId],
+    live: Option<&Live>,
+) -> Vec<Code> {
+    const PART: usize = 8;
+    let parts: Vec<OnceLock<Vec<Code>>> =
+        (0..ids.len().div_ceil(PART)).map(|_| OnceLock::new()).collect();
+    let work = |db: &dyn HirDatabase, at: usize| {
+        parts[at].get_or_init(|| {
+            let cx = form::Cx::new(db);
+            let part = &ids[at * PART..((at + 1) * PART).min(ids.len())];
+            (part.iter())
+                .map(|&func| {
+                    if live.is_some_and(|it| !it.has(db, ItemId::Function(func))) {
+                        return None;
+                    }
+                    let code = cx.code(func.into());
+                    code.missed.is_none().then(|| (code.digest, code.refs.into()))
+                })
+                .collect()
+        });
+    };
+    fan(parts.len(), &work);
+    (0..parts.len()).for_each(|at| work(db, at));
+    parts.into_iter().filter_map(OnceLock::into_inner).flatten().collect()
+}
+
 fn entries_of(db: &dyn HirDatabase, fan: &Fan<'_>, ids: &[ItemId]) -> Vec<Option<Entry>> {
     const PART: usize = 8;
     let parts: Vec<OnceLock<Vec<Option<Entry>>>> =
@@ -935,15 +1031,13 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let (mut missed, mut erred) = (node.interface.missed, node.interface.erred);
     let seen = seen_into(db, id, &refs);
     let mut whole_code = None;
-    if let ItemId::Function(func) = id {
+    if let (true, ItemId::Function(func)) = (seen, id) {
         let code = cx.code(func.into());
-        if seen {
-            hasher.update(&code.digest);
-            refs.extend(code.refs.iter().copied());
-            if code.missed.is_some() {
-                erred = (missed.is_none() || erred) && code.erred;
-                missed = missed.or(code.missed);
-            }
+        hasher.update(&code.digest);
+        refs.extend(code.refs.iter().copied());
+        if code.missed.is_some() {
+            erred = (missed.is_none() || erred) && code.erred;
+            missed = missed.or(code.missed);
         }
         whole_code = code.missed.is_none().then(|| (code.digest, code.refs.into()));
     }
@@ -961,6 +1055,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
         digest: *hasher.finalize().as_bytes(),
         refs: refs.into(),
         code: whole_code,
+        written: 0,
         names: names.into(),
         missed,
         erred,
