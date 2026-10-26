@@ -745,6 +745,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-spec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blaze-manifest",
+ "blaze-metadata",
+ "blaze-resolve",
+ "blaze-wire",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "blaze-wire"
 version = "0.1.0"
 dependencies = [

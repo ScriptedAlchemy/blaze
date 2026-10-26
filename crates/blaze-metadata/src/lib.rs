@@ -13,6 +13,7 @@
 
 mod graph;
 mod summary;
+pub mod units;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
