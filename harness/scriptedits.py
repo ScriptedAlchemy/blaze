@@ -157,6 +157,56 @@ fn main() {
     step("rebuild, nothing changed", 0),
 ])
 
+# 2e. A path that is not the package's by its spelling: a link, and one that is relative and leaves
+# the package. cargo reads the time of what a link points at.
+case("watched-spelling", "rerun-if-changed names a link, and a path that is relative and outside the package", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=link.txt");
+    println!("cargo:rerun-if-changed=../outside.txt");
+    generated(&format!("link={} outside={}", read("link.txt").trim(), read("../outside.txt").trim()));
+}
+''', files={"target-of-link.txt": "one\n"}), [
+    step("cold build", 1),
+    step("edit the file the link points at", 1, write={"target-of-link.txt": "two\n"}),
+    step("touch the file the link points at", 1, touch=["target-of-link.txt"]),
+    step("edit the file outside, which the script names relatively", 1, write={"@OUTSIDE@": "outside\n"}),
+    step("rebuild, nothing changed", 0),
+], links={"link.txt": "target-of-link.txt"})
+
+# 2f. A script that writes a file it watches, or a file of its package it names nothing of: cargo
+# finds each newer than the run it made, and runs the script again for every build.
+case("writes-what-it-watches", "a script that writes a file it names with rerun-if-changed", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=state.txt");
+    let n: u32 = read("state.txt").trim().parse().unwrap_or(0) + 1;
+    // After the tick the run began in, whose files cargo does not call newer.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fs::write("state.txt", n.to_string()).unwrap();
+    generated(&format!("state={n}"));
+}
+''', files={"state.txt": "0\n"}), [
+    step("cold build", 1),
+    step("rebuild, nothing changed: its own file is newer than its run", 1),
+    step("rebuild, nothing changed", 1),
+    edit(2, runs=1),
+])
+
+case("writes-its-package", "a script that says nothing of what it reads and writes a file of its package", single(r'''
+fn main() {
+    note("probe");
+    let n: u32 = read("written.txt").trim().parse().unwrap_or(0) + 1;
+    fs::write("written.txt", n.to_string()).unwrap();
+    generated(&format!("written={n}"));
+}
+'''), [
+    step("cold build", 1),
+    step("rebuild, nothing changed: a file of its package is newer than its run", 1),
+    step("rebuild, nothing changed", 1),
+    edit(2, runs=1),
+])
+
 # 2b. A watched file that is not there: cargo runs the script again for every build.
 case("missing", "rerun-if-changed names a file that is not there", single(r'''
 fn main() {
@@ -685,6 +735,8 @@ class Side:
         os.makedirs(self.ws, exist_ok=True)
         for name, text in self.case["files"].items():
             self.write(name, text)
+        for name, target in self.case.get("links", {}).items():
+            os.symlink(target, self.path(name))
         open(self.log, "w").close()
         subprocess.run(["cargo", "generate-lockfile"], cwd=self.ws, env=self.env({}), capture_output=True, check=True)
         self.runs_read = 0
@@ -863,6 +915,7 @@ def main():
                 wrong.append(name)
     finally:
         if args.json:
+            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
             with open(args.json, "w") as f:
                 json.dump(everything, f, indent=1)
         if not args.keep:

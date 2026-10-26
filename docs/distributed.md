@@ -20,7 +20,8 @@ settles it, each line tagged with the finding's id. [Appendix A](#appendix-a-rev
 every finding of both re-reviews its status. It also takes in two reports written since revision
 2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
 edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
-under verification).
+parked after four failed verifications; P0.5 does its job in the whole build,
+[reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)).
 
 **Revision 3.1** (this one) applies the fixes of one focused check of revision 3 (`9875c09b`),
 which judged the no-rustc boundary not workable as stated (B1) and the work key and retention
@@ -66,7 +67,7 @@ Three decisions of the program's owner bind this design:
 - **Phase 0 comes first: blaze builds tracedecay.** G0 measured a no-go on macOS arm64: the
   whole build (no cargo) fails on a writable static of the standard library (#255); 18 of 18
   edits went to cargo because blaze reran the CLI's build script in an empty `OUT_DIR` and compared
-  every byte it printed (BUILDSCRIPT.md, fix in PR #5); a loaded tracedecay worker reached 58.3 GB
+  every byte it printed (BUILDSCRIPT.md, fixed by P0.5); a loaded tracedecay worker reached 58.3 GB
   on a 48 GiB Mac, which LOADMEM.md traces to the worker compiling the whole program at load in one
   salsa revision with every memo kept; `RA_JIT_MEMORY_MAX` does not bound a busy or last-asked
   worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure that before any
@@ -235,12 +236,14 @@ true and measures them.
   per-worker ceiling (LOADMEM section 6, fixes 2 and 3). Section 4 makes that batch the unit of
   distribution.
 - **Edits went to cargo because of blaze, not the script** (BUILDSCRIPT.md, PR #5, `dist/u8-buildscript`,
-  **reported** here: one run per case): blaze reran the script into an empty `OUT_DIR`, where
+  **reported** there: one run per case): blaze reran the script into an empty `OUT_DIR`, where
   cargo reruns it in the one it left, and compared every byte of its output, where cargo reads
-  only `cargo:` lines. The fix reruns in a copy of cargo's `OUT_DIR` and compares what cargo reads.
-  Its verification (u8-verify, in progress) has found two blocking bugs in the copy (directory
-  times not kept, symlinks written through) and an invalid-UTF-8 comparison; P0-D stays open until
-  PR #5 lands with those fixed.
+  only `cargo:` lines. PR #5 reran in a copy of cargo's `OUT_DIR`, then in cargo's own, and
+  failed four verifications on ever new interactions with the state cargo keeps in
+  `target/debug`; the coordinator parked it. A worker of this design runs the whole build, which
+  has no such state to agree with, so P0.5 moved there: the daemon asks for a script's run by
+  cargo's own rule, and `harness/scriptedits.py` holds that to cargo 1.99.0
+  ([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)).
 
 ### The store, the keys and the remote
 
@@ -768,11 +771,15 @@ What is decided here, and why:
   refused it if any byte of its output differed (`cargo/script.rs:670-688`); cargo reruns in the
   `OUT_DIR` it left and reads only `cargo:` lines. BUILDSCRIPT.md found that the CLI's script runs
   `pnpm` in an empty `OUT_DIR` and prints 61 lines of its own there, so every edit went to cargo; it
-  is blaze's bug, and tracedecay needs no change. PR #5 reruns in a copy and compares what cargo
-  reads. A script whose cargo-read output differs between two runs on the same inputs is still
-  marked impure, run once per build in the sandbox where there is one, its latest output used, and
-  its run never shared across machines (section 1). Unit P0.5 lands PR #5 with its verifier's
-  findings fixed.
+  is blaze's bug, and tracedecay needs no change. PR #5 (parked, above) tried it beside cargo's
+  builds. In the whole build the daemon decides when to ask for a script's run, by cargo's rule
+  (`blaze_build_script::apply::Rerun`), once for each build and with the variables of the process
+  that asks. The run itself is still the `cargo check` of the daemon's load, in its own
+  `target/rust-analyzer` (docs/cargo.md; no-rustc.md step I): a worker is not yet without cargo,
+  which no unit of this plan removes. A script whose cargo-read output differs between two runs on
+  the same inputs is impure: run once per build in the sandbox where there is one, its latest output
+  used, and its run never shared across machines (section 1). Marking one is C4's, with the
+  sandbox's recorded reads. Unit P0.5.
 - **The standard library's writable statics are blaze's on macOS** (#255): `CLEANUP`,
   `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE` have no rustc symbol in the toolchain's
   `libstd` dylib on macOS (`nm -m`: non-external, #255, **reported**). The whole-program path
@@ -1022,7 +1029,7 @@ that fixes it, before the unit that needs it:
 |---|---|---|---|
 | crate ids from absolute paths outside `CARGO_HOME` (`main.rs:938-951`, `:1676-1689`) | yes | C4 | C5 (cross-machine hits) |
 | registry paths in stored code: panic locations, `file!()`, debug info (`$CARGO_HOME/registry/src/...`) | **unverified** whether a stored function carries machine A's path into B's program | C4 checks, and if so rebinds them symbolically in the stored value (a relocation the linker fills from the machine's paths) rather than normalising the key | C5 |
-| build-script run keys (`cargo/script.rs` `run_key`) | hash the script's executable | C4: hash the package's content, its dependencies' ids, the environment cargo gives and, on Linux, the digests of what the sandbox recorded it reading. Impure scripts (P0.5) are never shared | D2 (a helper not running every script) |
+| build-script run keys (`cargo/script.rs` `run_key`) | hash the script's executable, its directory, arguments and variables, and what `OUT_DIR` held before the run (P0.5) | C4: hash the package's content, its dependencies' ids, the environment cargo gives and, on Linux, the digests of what the sandbox recorded it reading. Impure scripts are never shared | D2 (a helper not running every script) |
 | proc-macro expansion keys (`ra-jit-expand`) | hold cwd and environment | C4: checkout-relative cwd, the environment cargo gives, recorded reads | D2 |
 | per-target-dir test records (`tests-reach`, `tests-passed`, `CARGO_BIN_EXE_*` by size and mtime, `affected.rs:213-228`) | yes | T2 | T2 |
 
@@ -2244,25 +2251,34 @@ harness/tracedecay.py --predicate P0-C --runs 3`.
 Where: Mac. If 16 GB is not reached, the unit lands what it reached and the owner decides between
 the Linux host and a higher bar (open questions).
 
-**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D. Lands PR #5 (unit u8,
-`dist/u8-buildscript`): the rerun in a copy of cargo's `OUT_DIR`, comparing the lines cargo reads,
-with its verifier's findings fixed (directory times kept in the copy, symlinks into the original
-not written through, the baseline digest taken before the rerun, invalid UTF-8 lines ignored as
-cargo ignores them). Then a script whose cargo-read output differs between two runs on the same
-inputs is marked impure instead of refused: run once per build (in the sandbox on Linux, recording
-its reads), its latest output used, as cargo does; never shared across machines. Files:
-`crates/ra-jit/src/cargo/script.rs` (`rerun_into`, `run_key`), `crates/blaze-build-script`,
-`harness/scriptrerun.py`. Depends: P0.1. Acceptance: a fixture script that prints a list of files git
-tracks and runs a tool that prints its own lines into an empty `OUT_DIR`: an edit is the daemon's,
-the list updated; the verifier's regressions pass. From the reviews:
+**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D. Parks PR #5 (unit u8,
+`dist/u8-buildscript`), which failed four verifications on its interactions with the state cargo
+keeps in `target/debug`, and does its job in the whole build, where a worker has no such state to
+agree with. The daemon decides when to ask for a script's run by cargo 1.99's rule
+(`blaze_build_script::apply::Rerun`): a file named by `rerun-if-changed` that is newer than the run
+or not there, a variable whose value changed (unset, empty and set are three), the package's files
+when the script named nothing, the script's own modules and the packages it is built with, and a run
+owed for having said other than the run before. It asks once for each build (a build is several
+requests to a worker, which cargo's every-build scripts must not follow), and a check that ran the
+scripts and found the workspace other has the load take what they said. The scripts run with the
+variables of the process that asks, and a variable the daemon was started with that the client lacks
+is unset for them. The store's kept run is keyed by what `OUT_DIR` held before it. What runs the
+script is still cargo's `cargo check` of the daemon's load (above), so this unit does not make a
+worker cargo-free. Files: `crates/ra-jit/src/inputs.rs`, `crates/blaze-build-script`
+(`output::reads`, `apply::Rerun`), `crates/ra-jit/src/cargo/script.rs` (`run_key`),
+`crates/ra-jit/src/cargo/daemon.rs` (the build a request is for), `harness/scriptedits.py`.
+Depends: P0.1. Acceptance: `scriptedits.py`'s 24 probes, each blaze's whole build against cargo
+1.99.0 on the same project and edits, equal at every step in the build's status, how many times each
+script ran, and the program's exit status, standard output and standard error; each fix has a unit
+test; the tracedecay fixture is P0-D's. From the reviews:
 - [rb-N2] "Specify the number of measured edit and revert builds per run, one consistent
   denominator (for example 30/30), and whether the cold/warm preparation builds are excluded."
   Checked by: `--predicate P0-D --runs 5` counts 30 builds (5 runs × 3 edit kinds × an edit and its
   revert), excludes the one cold and one warm build before them, and passes only at 30 of 30 the
   daemon's, 0 `building with cargo`.
 
-Verify: `python3 -I harness/scriptrerun.py && python3 -I harness/scripts.py --impure && python3 -I
-harness/tracedecay.py --predicate P0-D --runs 5`. Where: Mac.
+Verify: `python3 -I harness/scriptedits.py && python3 -I harness/tracedecay.py --predicate P0-D
+--runs 5`. Where: Linux (Docker on the Mac until P0.6); the P0-D run on the Mac once P0.6 lands.
 
 **P0.6 The whole build on macOS arm64 (#255).** Goal: P0-E. The standard library's writable statics
 without a rustc symbol (`CLEANUP`, `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE`) are

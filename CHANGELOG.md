@@ -791,6 +791,16 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- In the whole build (`RA_JIT_WHOLE_BUILD=1`) a build script runs again exactly when cargo 1.99
+  runs it, which the daemon's own rule did not: a script whose `rerun-if-changed` names a file
+  that is not there runs every build; one that starts to watch a variable, or says other than it
+  did, is run again as cargo does; the script's own modules and a build dependency of the
+  workspace are watched; a build's requests to the worker run a script once, and a load takes
+  what the check ran; and a script sees the variables of the process that asks, not those of the
+  process that started the daemon. `harness/scriptedits.py` holds 24 probes of it to cargo.
+- A build script run the store kept is replayed only for the contents `OUT_DIR` held when it
+  ran, so a script that counts in `OUT_DIR` is run again as cargo runs it.
+
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).
   The jump goes over the `int3`s and `nop`s the linker padded the function with. When there

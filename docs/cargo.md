@@ -143,7 +143,14 @@ nothing is handed to cargo:
       `khalf::halved`: unsupported: f16 and f128
 
 Build scripts and proc macros are still built and run as the daemon's load does
-(`target/rust-analyzer`). A build of libraries alone and `test` are as without the setting.
+(`target/rust-analyzer`). A script runs again when cargo 1.99 would run it: for a file it named
+with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
+every build), for a variable it named whose value is another (unset, empty and set are three), for
+any file of its package when it named nothing, for a change to the script, its modules or a
+package it is built with, and once more for having said other than it did the run before. It is
+run once for a build, with the variables of the process that asks. `harness/scriptedits.py` holds
+that to cargo ([harness.md](harness.md)). A build of libraries alone and `test` are as without the
+setting.
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which builds what was
 edited since on what it loaded and links the programs again; a changed manifest or lock file

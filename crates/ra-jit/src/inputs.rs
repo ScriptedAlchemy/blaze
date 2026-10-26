@@ -135,9 +135,13 @@ struct Script {
     /// what those depend on. Cargo compiles the script again, and so runs it again, when one
     /// has changed.
     built_with: Vec<PathBuf>,
-    /// What cargo compiles the script again for a change to, and a script that says nothing of
-    /// what it reads runs again for: as it was when cargo last read it.
+    /// What cargo compiles the script again for a change to: as it was when cargo last read it.
     files: Vec<Watched>,
+    /// What the files of the package that were no newer than the last run's start were, which a
+    /// script that said nothing of what it reads runs again for any change to: a file written
+    /// since the run began is a change by its time alone, as cargo's fingerprint of the
+    /// package is its newest file's.
+    package_stamp: u64,
     /// What the last run said. `None` when what it wrote is not there to read.
     said: Option<Said>,
     /// Whether cargo runs the script again for it having said other than it did the run
@@ -154,24 +158,37 @@ impl Script {
     /// the run being owed, it runs once for each: the script of the files cargo has looked at
     /// for this build is not asked for again.
     fn changed(&self, build: u64) -> bool {
-        // What it said, when it did not say or cannot be read, is nothing: its package's files.
         let stale = |said: &Said| said.rerun.stale_files(&self.root, said.began);
         let stale = self.said.as_ref().and_then(stale);
         let everyone = matches!(stale, Some(Stale::Missing(_))) || self.owes;
         let asked = build != 0 && self.asked == build;
-        self.files.iter().any(Watched::changed) || (!asked && (everyone || stale.is_some()))
+        self.files.iter().any(Watched::changed)
+            || (!asked && (everyone || stale.is_some() || self.package_changed()))
     }
 
-    /// What cargo compiles the script again for a change to, and a script that said nothing
-    /// of what it reads runs again for, with what each was at `before` where it was then.
+    /// Whether the script, which said nothing of what it reads when it did not say or cannot be
+    /// read, is run again for its package's files.
+    fn package_changed(&self) -> bool {
+        let nothing = self.said.as_ref().is_none_or(|it| it.rerun == Rerun::Package);
+        let began = self.said.as_ref().map(|it| it.began);
+        // A file written in the tick the run began in may have been written by it.
+        nothing
+            && (began.is_some_and(|began| newest(&self.root, true).is_none_or(|it| it >= began))
+                || stamp_upto(&self.root, true, began) != self.package_stamp)
+    }
+
+    /// What the package's files are now, as [`Script::package_changed`] has them.
+    fn package_now(&self) -> u64 {
+        stamp_upto(&self.root, true, self.said.as_ref().map(|it| it.began))
+    }
+
+    /// What cargo compiles the script again for a change to, with what each was at `before`
+    /// where it was then.
     fn watched(&self, before: &[Watched]) -> Vec<Watched> {
         let mut files: Vec<(PathBuf, bool)> = Vec::new();
         files.extend(self.targets.iter().map(|it| (it.clone(), false)));
         files.extend(self.compiled_from().into_iter().map(|it| (it, false)));
         files.extend(self.built_with.iter().map(|it| (it.clone(), true)));
-        if self.said.as_ref().is_none_or(|it| it.rerun == Rerun::Package) {
-            files.push((self.root.clone(), true));
-        }
         files.sort();
         files.dedup();
         let kept = |path: &Path, package: bool| {
@@ -232,7 +249,8 @@ impl Script {
         }
         // `cargo ra-jit` ran it again before it asked for this build, as it does when
         // something it reads changes: that is not done twice.
-        let newest = self.files.iter().map(|it| newest(&it.path, it.package));
+        let package = std::iter::once(newest(&self.root, true));
+        let newest = self.files.iter().map(|it| newest(&it.path, it.package)).chain(package);
         let newest = newest.collect::<Option<Vec<_>>>().and_then(|it| it.into_iter().max());
         if newest.is_some_and(|it| script::checked_after(&out_dir, it))
             && script::same_run(&out_dir, &self.out_dir)
@@ -269,20 +287,25 @@ impl Script {
         })
     }
 
+    /// Whether cargo runs a script again for having said other than it did: `now` is a run
+    /// that began after `was`, and said other than that did. A script cargo did not run, which
+    /// it found as fresh as it was, owes nothing.
+    fn owed(was: &Option<Said>, now: &Option<Said>) -> bool {
+        match (was, now) {
+            (Some(was), Some(now)) => now.began != was.began && was.rerun != now.rerun,
+            _ => false,
+        }
+    }
+
     /// Cargo ran the build scripts again: what this one said, whether it ran, and what it
     /// is now watched for, with the files as they were `before` it, since cargo's fingerprint
     /// is made before the run and what the run wrote is a change at the next.
     fn ran_again(&mut self, before: &[Watched]) {
         let said = Said::read(&self.out_dir, &self.root);
-        let ran = match (&self.said, &said) {
-            (Some(was), Some(now)) => now.began != was.began,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        let said_other = |(was, now): (&Said, &Said)| was.rerun != now.rerun;
-        self.owes = ran && self.said.as_ref().zip(said.as_ref()).is_some_and(said_other);
+        self.owes = Script::owed(&self.said, &said);
         self.said = said;
         self.files = self.watched(before);
+        self.package_stamp = self.package_now();
     }
 }
 
@@ -359,15 +382,14 @@ impl Inputs {
             self.asked_with.extend(std::env::vars().map(|it| it.0));
         }
         let mut scripts = Scripts::of(workspace, config, given, build);
-        // A script that owes a run is owed it still when the checkout is loaded again.
-        let owing = |scripts: &Option<Scripts>, out_dir: &Path| {
-            let scripts = scripts.as_ref();
-            scripts.is_some_and(|it| it.scripts.iter().any(|it| it.out_dir == out_dir && it.owes))
-        };
+        // A checkout loaded again has run its scripts again, where cargo found one to: a script
+        // that said other than it did is owed a run for it, as it is from a check.
         let before = self.checkouts.iter().find(|it| it.root == root);
+        let before = before.and_then(|it| it.scripts.as_ref());
         if let (Some(before), Some(now)) = (before, &mut scripts) {
             for script in &mut now.scripts {
-                script.owes |= owing(&before.scripts, &script.out_dir);
+                let was = before.scripts.iter().find(|it| it.out_dir == script.out_dir);
+                script.owes = was.is_some_and(|it| Script::owed(&it.said, &script.said));
             }
         }
         self.checkouts.retain(|it| it.root != root);
@@ -468,11 +490,13 @@ impl Scripts {
                 targets: targets.map(|it| PathBuf::from(it.root.as_str())).collect(),
                 built_with: built_with(cargo, package),
                 files: Vec::new(),
+                package_stamp: 0,
                 said,
                 owes: false,
                 asked: build,
             };
             script.files = script.watched(&[]);
+            script.package_stamp = script.package_now();
             scripts.push(script);
         }
         variables.sort();
@@ -504,6 +528,7 @@ impl Scripts {
         if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same()) {
             for at in changed {
                 self.scripts[at].files = self.scripts[at].watched(&[]);
+                self.scripts[at].package_stamp = self.scripts[at].package_now();
             }
             return Ok(false);
         }
@@ -599,45 +624,78 @@ fn builds_of(cargo: &project_model::CargoWorkspace, config: &CargoConfig) -> Vec
 /// A number that changes when the file at `path`, or a file below the directory there, is
 /// written, added or removed.
 fn stamp(path: &Path, package: bool) -> u64 {
+    stamp_upto(path, package, None)
+}
+
+/// [`stamp`] of what was written before `limit`, when there is one.
+fn stamp_upto(path: &Path, package: bool, limit: Option<SystemTime>) -> u64 {
     let mut hasher = FxHasher::default();
-    stamp_into(path, package, &mut hasher);
+    stamp_into(path, package, true, limit, &mut hasher);
     hasher.finish()
+}
+
+/// Whether `entry`, below the directory of a package, is no file of it: a build's directory, a
+/// repository's, another package, and at its root what cargo leaves out of the files it lists
+/// (`PathSource`'s walk): `target` and `Cargo.lock`.
+fn outside(entry: &Path, at_root: bool) -> bool {
+    let name = entry.file_name().and_then(|it| it.to_str());
+    entry.join("CACHEDIR.TAG").exists()
+        || entry.ends_with(".git")
+        || entry.join("Cargo.toml").exists()
+        || at_root && matches!(name, Some("target" | "Cargo.lock"))
 }
 
 /// When the file at `path`, or the directory there or anything below it that [`stamp`] looks
 /// at, was last written. Nothing when it is not there.
 fn newest(path: &Path, package: bool) -> Option<std::time::SystemTime> {
+    newest_from(path, package, true)
+}
+
+fn newest_from(path: &Path, package: bool, at_root: bool) -> Option<std::time::SystemTime> {
     let metadata = std::fs::metadata(path).ok()?;
-    let mut newest = metadata.modified().ok()?;
+    // The files of a package, not its directories, which a file added or a build's directory
+    // made writes.
+    let mut newest = match package && metadata.is_dir() {
+        true => SystemTime::UNIX_EPOCH,
+        false => metadata.modified().ok()?,
+    };
     if metadata.is_dir() {
         for entry in std::fs::read_dir(path).ok()? {
             let entry = entry.ok()?.path();
-            let built = entry.join("CACHEDIR.TAG").exists() || entry.ends_with(".git");
-            if package && (built || entry.join("Cargo.toml").exists()) {
+            if package && outside(&entry, at_root) {
                 continue;
             }
-            newest = newest.max(self::newest(&entry, package)?);
+            newest = newest.max(newest_from(&entry, package, false)?);
         }
     }
     Some(newest)
 }
 
-fn stamp_into(path: &Path, package: bool, hasher: &mut FxHasher) {
+fn stamp_into(
+    path: &Path,
+    package: bool,
+    at_root: bool,
+    limit: Option<SystemTime>,
+    hasher: &mut FxHasher,
+) {
     let Ok(metadata) = std::fs::metadata(path) else { return };
     if !metadata.is_dir() {
-        (metadata.len(), metadata.modified().ok()).hash(hasher);
+        let written = metadata.modified().ok();
+        if limit.is_some_and(|limit| written.is_none_or(|it| it >= limit)) {
+            return;
+        }
+        (metadata.len(), written).hash(hasher);
         return;
     }
     let Ok(entries) = std::fs::read_dir(path) else { return };
     let mut entries: Vec<PathBuf> = entries.filter_map(|it| Some(it.ok()?.path())).collect();
     entries.sort();
     for entry in entries {
-        let built = entry.join("CACHEDIR.TAG").exists() || entry.ends_with(".git");
-        if package && (built || entry.join("Cargo.toml").exists()) {
+        if package && outside(&entry, at_root) {
             continue;
         }
         entry.hash(hasher);
-        stamp_into(&entry, package, hasher);
+        stamp_into(&entry, package, false, limit, hasher);
     }
 }
 
@@ -666,6 +724,7 @@ mod tests {
         std::fs::create_dir_all(run.join("out")).unwrap();
         std::fs::create_dir_all(package.join("src")).unwrap();
         std::fs::write(package.join("build.rs"), "fn main() {}").unwrap();
+        set_time(&package.join("build.rs"), at - Duration::from_secs(10));
         std::fs::write(run.join("output"), printed).unwrap();
         set_time(&run.join("output"), at);
         let mut script = Script {
@@ -677,11 +736,13 @@ mod tests {
             targets: vec![package.join("build.rs")],
             built_with: Vec::new(),
             files: Vec::new(),
+            package_stamp: 0,
             said: Said::read(&run.join("out"), &package),
             owes: false,
             asked: 0,
         };
         script.files = script.watched(&[]);
+        script.package_stamp = script.package_now();
         script
     }
 
@@ -713,14 +774,57 @@ mod tests {
         let ran = SystemTime::now() - Duration::from_secs(60);
         let named = script(&root, "cargo:rerun-if-changed=data.txt\n", ran);
         std::fs::write(root.join("pkg/data.txt"), "1").unwrap();
-        set_time(&root.join("pkg/data.txt"), ran);
+        set_time(&root.join("pkg/data.txt"), ran - Duration::from_secs(1));
         let named = Script { files: named.watched(&[]), ..named };
-        std::fs::write(root.join("pkg/src/other.rs"), "").unwrap();
+        let other = root.join("pkg/src/other.rs");
+        std::fs::write(&other, "").unwrap();
         assert!(!named.changed(0), "a file of the package it did not name");
+        set_time(&other, ran - Duration::from_secs(5));
         let nothing = script(&root, "cargo:rustc-cfg=a\n", ran);
         assert!(!nothing.changed(0));
-        std::fs::write(root.join("pkg/src/other.rs"), "changed").unwrap();
-        assert!(nothing.changed(0), "any file of the package");
+        // Written since the run began: newer than it.
+        std::fs::write(&other, "changed").unwrap();
+        assert!(nothing.changed(0), "a file written after the run");
+        // One written no later than it, as another, is a change as well: cargo's fingerprint of
+        // the package is made of its newest file.
+        std::fs::write(&other, "").unwrap();
+        set_time(&other, ran - Duration::from_secs(5));
+        assert!(!nothing.changed(0));
+        std::fs::write(root.join("pkg/src/older.rs"), "").unwrap();
+        set_time(&root.join("pkg/src/older.rs"), ran - Duration::from_secs(9));
+        assert!(nothing.changed(0), "a file that is not one of the files it was");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a script writes into its package it is run again for in the next build, not in the
+    /// build that ran it; and what a build leaves in the package, in `target`, is no file of it.
+    #[test]
+    fn a_script_that_writes_its_package_is_run_again_in_the_next_build() {
+        let root = dir("writes");
+        let began = SystemTime::now() - Duration::from_secs(60);
+        let mut nothing = script(&root, "cargo:rustc-cfg=a\n", began);
+        assert!(!nothing.changed(1));
+        // It wrote a file in the run, a moment after the run began.
+        let written = root.join("pkg/written.txt");
+        std::fs::write(&written, "1").unwrap();
+        set_time(&written, began + Duration::from_millis(5));
+        nothing.asked = 1;
+        assert!(!nothing.changed(1), "the build that ran it has looked at it");
+        assert!(nothing.changed(2), "the next build");
+        assert!(nothing.changed(0));
+        // What cargo leaves out of its list of the package's files.
+        std::fs::remove_file(&written).unwrap();
+        nothing.package_stamp = nothing.package_now();
+        for left in ["pkg/target/debug/probe", "pkg/Cargo.lock"] {
+            let left = root.join(left);
+            std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+            std::fs::write(&left, "x").unwrap();
+            assert!(!nothing.changed(2), "{}", left.display());
+        }
+        // Another `target` is a directory of the package's.
+        std::fs::create_dir_all(root.join("pkg/src/target")).unwrap();
+        std::fs::write(root.join("pkg/src/target/file.rs"), "").unwrap();
+        assert!(nothing.changed(2));
         let _ = std::fs::remove_dir_all(&root);
     }
 
