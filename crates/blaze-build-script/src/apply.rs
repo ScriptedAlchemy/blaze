@@ -13,7 +13,7 @@ use std::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    output::{LibraryPath, LinkArgTarget, Output},
+    output::{LibraryPath, LinkArgTarget, Output, Reads},
     unit::{Dependency, Package, Target},
 };
 
@@ -202,15 +202,24 @@ pub enum Rerun {
 
 impl Output {
     pub fn rerun(&self, package_dir: &Path) -> Rerun {
-        if self.rerun_if_changed.is_empty() && self.rerun_if_env_changed.is_empty() {
+        let reads =
+            Reads { files: self.rerun_if_changed.clone(), env: self.rerun_if_env_changed.clone() };
+        reads.rerun(package_dir)
+    }
+}
+
+impl Reads {
+    /// When the script that said it runs again.
+    pub fn rerun(&self, package_dir: &Path) -> Rerun {
+        if self.files.is_empty() && self.env.is_empty() {
             return Rerun::Package;
         }
         let files = self
-            .rerun_if_changed
+            .files
             .iter()
             .map(|it| it.strip_prefix(package_dir).unwrap_or(it).to_owned())
             .collect();
-        Rerun::Watched { files, env: self.rerun_if_env_changed.clone() }
+        Rerun::Watched { files, env: self.env.clone() }
     }
 }
 
@@ -234,22 +243,40 @@ impl Rerun {
         then: &dyn Fn(&str) -> Option<String>,
         now: &dyn Fn(&str) -> Option<String>,
     ) -> Option<Option<Stale>> {
-        let Rerun::Watched { files, env } = self else { return None };
+        let Rerun::Watched { .. } = self else { return None };
+        Some(self.stale_files(package_dir, ran).or_else(|| self.stale_env(then, now)))
+    }
+
+    /// The first file that has the run that began at `ran` run again: one that is not there,
+    /// which cargo runs a script again for every time, or one newer than `ran`. Not a variable,
+    /// which [`Rerun::stale_env`] looks at, and nothing for [`Rerun::Package`].
+    pub fn stale_files(&self, package_dir: &Path, ran: SystemTime) -> Option<Stale> {
+        let Rerun::Watched { files, .. } = self else { return None };
         for file in files {
             let path = package_dir.join(file);
             match newest(&path) {
-                None => return Some(Some(Stale::Missing(path))),
-                Some(it) if it > ran => return Some(Some(Stale::Newer(path))),
+                None => return Some(Stale::Missing(path)),
+                Some(it) if it > ran => return Some(Stale::Newer(path)),
                 Some(_) => {}
             }
         }
+        None
+    }
+
+    /// The first variable whose value is not what it was at the run.
+    pub fn stale_env(
+        &self,
+        then: &dyn Fn(&str) -> Option<String>,
+        now: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Stale> {
+        let Rerun::Watched { env, .. } = self else { return None };
         for name in env {
             let (then, now) = (then(name), now(name));
             if then != now {
-                return Some(Some(Stale::Env { name: name.clone(), then, now }));
+                return Some(Stale::Env { name: name.clone(), then, now });
             }
         }
-        Some(None)
+        None
     }
 }
 

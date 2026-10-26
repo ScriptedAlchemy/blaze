@@ -685,7 +685,13 @@ impl Worker {
             }
         };
         let mut stream = self.connected()?;
-        let mut env = self.env.clone();
+        // A client says all of its variables (`asking`): one it has not is not one the process
+        // asking has, whatever the daemon, started by another, was started with. A request
+        // that says none has the worker's own.
+        let mut env = match checkout.env.is_empty() {
+            true => self.env.clone(),
+            false => ide_db::base_db::Env::default(),
+        };
         for (name, value) in &checkout.env {
             env.set(name, value);
         }

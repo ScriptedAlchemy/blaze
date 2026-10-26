@@ -2597,7 +2597,7 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            self.inputs.watch(&root, &workspace, &self.cargo_config);
+            self.inputs.watch(&root, &workspace, &self.cargo_config, &FxHashMap::default());
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
@@ -2659,8 +2659,8 @@ impl Checkouts {
         for &at in stale {
             loaded.push(self.loaded_again(at, env)?);
         }
-        for (&at, (workspace, debug, config)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config);
+        for (&at, (workspace, debug, config, given)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config, &given);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2672,8 +2672,8 @@ impl Checkouts {
             let over = self.roots[at].1.clone();
             if !self.builds_alike(&self.roots[base].1, &over) {
                 match self.loaded_again(at, env) {
-                    Ok((workspace, debug, config)) => {
-                        self.place(at, workspace, debug, &config);
+                    Ok((workspace, debug, config, given)) => {
+                        self.place(at, workspace, debug, &config, &given);
                         continue;
                     }
                     Err(error) => failed = Err(error),
@@ -2689,30 +2689,39 @@ impl Checkouts {
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
-    /// variables `env`, what a build of it has a debugger told, and how it was loaded.
+    /// variables `env`, what a build of it has a debugger told, how it was loaded, and the
+    /// variables that process gave it over the daemon's.
     fn loaded_again(
         &self,
         at: usize,
         env: &ide_db::base_db::Env,
-    ) -> anyhow::Result<(ProjectWorkspace, plan::Whole, CargoConfig)> {
+    ) -> anyhow::Result<(
+        ProjectWorkspace,
+        plan::Whole,
+        CargoConfig,
+        FxHashMap<String, Option<String>>,
+    )> {
         let (project, root) = &self.roots[at];
         let mut config = self.cargo_config.clone();
-        config.extra_env.extend(self.inputs.variables(root, env));
+        let given = self.inputs.variables(root, env);
+        config.extra_env.extend(given.clone());
         let (workspace, debug) =
             workspace_at(project, &config, &self.load_config, &self.selection, None, None)?;
-        Ok((workspace, debug, config))
+        Ok((workspace, debug, config, given))
     }
 
-    /// Has the checkout at `at` be `workspace`, loaded in full with `config`.
+    /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
+    /// is what the process it was loaded for added to the daemon's variables.
     fn place(
         &mut self,
         at: usize,
         workspace: ProjectWorkspace,
         debug: plan::Whole,
         config: &CargoConfig,
+        given: &FxHashMap<String, Option<String>>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.inputs.watch(&root, &workspace, config);
+        self.inputs.watch(&root, &workspace, config, given);
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
         self.splits[at] = None;
