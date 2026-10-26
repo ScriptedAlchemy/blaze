@@ -31,7 +31,11 @@ empty and unset, watched only after an edit, or from its second run), a script t
 saying what it watches, a script that fails and is fixed, a `links` dependency whose metadata
 changes or does not, an `OUT_DIR` with hard links, symlinks and extended attributes that a
 rerun finds as it left them, a generated file the crate `include!`s, and a run the store
-kept in another checkout, which must not stand for one cargo would make.
+kept, which must not stand for one cargo would make. Then what the reports hint at: a script
+that writes a file it watches or one of its package, a module of the script and a build
+dependency, a link and a relative path, what a run says to rustc, RUSTFLAGS, `[env]` and the
+manifest, a `build.rs` that appears, the daemon stopped between builds, the release profile, a
+feature, and a script that cargo runs every build, in a package of two programs.
 
 Python 3, stdlib only.
 """
@@ -96,14 +100,15 @@ def single(script, files=None, outside="zero\n"):
     return files
 
 
-def step(label, runs=None, write=None, remove=(), touch=(), env=None, clean=False):
+def step(label, runs=None, write=None, remove=(), touch=(), env=None, clean=False, restart=False, args=()):
     """One step. `runs` is what cargo is expected to run: how many times the script of each
     package, as a dictionary, or a number for `probe`'s. `clean` removes what was built first,
-    as `cargo clean` does, and has blaze's daemon stop."""
+    as `cargo clean` does, and has blaze's daemon stop; `restart` has the daemon stop alone, for
+    the next build to load the workspace again. `args` are given to the build."""
     if isinstance(runs, int):
         runs = {"probe": runs}
     return {"label": label, "runs": runs, "write": write or {}, "remove": list(remove),
-            "touch": list(touch), "env": env or {}, "clean": clean}
+            "touch": list(touch), "env": env or {}, "clean": clean, "restart": restart, "args": list(args)}
 
 
 def edit(n, label=None, runs=None, **kw):
@@ -375,6 +380,85 @@ case("script-appears", "a build.rs that appears and goes", {
     step("build.rs appears", 1, write={"build.rs": APPEARS_SCRIPT}),
     step("rebuild, nothing changed", 0),
     step("build.rs goes", 0, remove=["build.rs"]),
+])
+
+# 3g. What the daemon does that cargo does not: it stops, and the next build loads the workspace again;
+# and what a build asks for, a profile and a feature, which is another run of the script.
+case("restart", "the daemon stops between builds", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=data.txt");
+    let n = bump();
+    generated(&format!("count={n} data={}", read("data.txt").trim()));
+}
+''', files={"data.txt": "one\n"}), [
+    step("cold build", 1),
+    step("the daemon stops, then a build: nothing changed", 0, restart=True),
+    step("the daemon stops, then a build after an edit", 1, restart=True, write={"data.txt": "two\n"}),
+    step("rebuild, nothing changed", 0),
+    edit(2, "edit src/main.rs", runs=0),
+])
+
+case("restart-missing", "the daemon stops between builds of a script that runs every build", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=absent.txt");
+    let n = bump();
+    generated(&format!("count={n}"));
+}
+'''), [
+    step("cold build", 1),
+    step("the daemon stops, then a build", 1, restart=True),
+    step("rebuild", 1),
+])
+
+case("release", "builds in the release profile", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=data.txt");
+    println!("cargo:rerun-if-env-changed=PROBE_VAR");
+    let n = bump();
+    generated(&format!("count={n} data={} var={:?} profile={}", read("data.txt").trim(), env::var("PROBE_VAR").ok(), env::var("PROFILE").unwrap()));
+}
+''', files={"data.txt": "one\n"}), [
+    step("cold build", 1, args=["--release"]),
+    step("edit data.txt", 1, args=["--release"], write={"data.txt": "two\n"}),
+    step("PROBE_VAR=a", 1, args=["--release"], env={"PROBE_VAR": "a"}),
+    step("rebuild, nothing changed", 0, args=["--release"], env={"PROBE_VAR": "a"}),
+    edit(2, "edit src/main.rs", runs=0, args=["--release"], env={"PROBE_VAR": "a"}),
+])
+
+FEATURES = MANIFEST.replace("[workspace]", '[features]\nx = []\n\n[workspace]')
+case("features", "a feature, which cargo gives the script", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    generated(&format!("x={}", env::var("CARGO_FEATURE_X").is_ok()));
+}
+''', files={"Cargo.toml": FEATURES}), [
+    step("cold build", 1),
+    step("--features x: another run of the script", 1, args=["--features", "x"]),
+    step("--features x again", 0, args=["--features", "x"]),
+])
+# Not a step: back without the feature, cargo runs nothing (the cold build's run is fresh) and
+# rebuilds the program, which blaze's whole build does not (two workers, one program path: the
+# program of `--features x` stays), with no script in the project either. Found with this case.
+
+NEW_SYNTAX = ('include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n\nconst EDIT: u32 = 1;\n\n'
+              'fn main() {\n    println!("{} edit={} mode={}", GENERATED, EDIT, env!("PROBE_MODE"));\n}\n')
+case("new-syntax", "cargo:: lines, which cargo reads as cargo: lines", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo::rerun-if-changed=mode.txt");
+    println!("cargo::rerun-if-env-changed=PROBE_VAR");
+    println!("cargo::rustc-env=PROBE_MODE={}", read("mode.txt").trim());
+    generated(&format!("var={:?}", env::var("PROBE_VAR").ok()));
+}
+''', files={"mode.txt": "a\n", "src/main.rs": NEW_SYNTAX}), [
+    step("cold build", 1),
+    step("edit mode.txt", 1, write={"mode.txt": "b\n"}),
+    step("PROBE_VAR=x", 1, env={"PROBE_VAR": "x"}),
+    step("rebuild, nothing changed", 0, env={"PROBE_VAR": "x"}),
 ])
 
 # 4. A script that stops saying what it reads: cargo then runs it for any file of its package.
@@ -743,6 +827,8 @@ class Side:
 
     def apply(self, s):
         time.sleep(TICK)
+        if s["restart"]:
+            self.stop()
         if s["clean"]:
             self.stop()
             built = os.path.join(self.ws, "target") if self.kind == "blaze" else os.path.join(self.root, "target-ref")
@@ -758,16 +844,16 @@ class Side:
         for name in s["touch"]:
             os.utime(self.path(name))
 
-    def build(self, env):
+    def build(self, env, args=()):
         argv = ["cargo", "ra-jit", "build"] if self.kind == "blaze" else ["cargo", "build"]
-        ran = subprocess.run(argv, cwd=self.ws, env=env, capture_output=True, text=True, errors="replace",
+        ran = subprocess.run(argv + list(args), cwd=self.ws, env=env, capture_output=True, text=True, errors="replace",
                              timeout=TIMEOUT, stdin=subprocess.DEVNULL)
         return ran
 
-    def program(self, env):
+    def program(self, env, args=()):
         # cargo's target directory is beside the project, so that nothing of it is in the package.
         target = os.path.join(self.ws, "target") if self.kind == "blaze" else os.path.join(self.root, "target-ref")
-        exe = os.path.join(target, "debug", "probe")
+        exe = os.path.join(target, "release" if "--release" in args else "debug", "probe")
         if not os.path.exists(exe):
             return None
         ran = subprocess.run([exe], cwd=self.ws, env=env, capture_output=True, text=True, errors="replace", timeout=60)
@@ -784,8 +870,8 @@ class Side:
     def step(self, s):
         self.apply(s)
         env = self.env(s["env"])
-        built = self.build(env)
-        result = {"build": built.returncode, "runs": self.runs(), "program": self.program(env)}
+        built = self.build(env, s["args"])
+        result = {"build": built.returncode, "runs": self.runs(), "program": self.program(env, s["args"])}
         say = built.stderr.strip().splitlines()
         result["said"] = say[-1] if say and built.returncode != 0 else ""
         result["by_cargo"] = bool(re.search(r"building with cargo", built.stderr))
