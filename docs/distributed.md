@@ -1,6 +1,6 @@
 # Distributed cache, compile and tests
 
-2026-10-26, revision 3. Status: design, nothing built. Written against the fork's `dist/main` at
+2026-10-26, revision 3.1. Status: design, nothing built. Written against the fork's `dist/main` at
 `f9b5da46` (code as at `c8e5f6a8` plus u5's memory instruments; line numbers are those of
 `f9b5da46`) and tracedecay at `d79de82273`. Each claim is marked **read** (in a source we read,
 or measured by us), **reported** (a document or someone says so, not re-checked here) or
@@ -21,6 +21,17 @@ every finding of both re-reviews its status. It also takes in two reports writte
 2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
 edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
 under verification).
+
+**Revision 3.1** (this one) applies the fixes of one focused check of revision 3 (`9875c09b`),
+which judged the no-rustc boundary not workable as stated (B1) and the work key and retention
+(B2), the exporter (B3) and the first-unit gate (D0) workable with fixes. Its findings carry the
+ids `c3-B1.1` to `c3-D0.4`, tagged where each is fixed and in [appendix
+A](#check-3-the-focused-check-of-revision-3). The boundary now claims only what a kernel
+or a profile can enforce: blaze never delegates Rust compilation, a worker exposes no host
+toolchain, a job executes only approved code, and an in-process compiler is stated out of scope
+(section 0). Work is named by a total key with a stated retention contract (section 4). The
+exporter's context and the accepted closure are specified (section 4). GP is two stages with
+named prerequisites (section 4, D0). No review cycle follows this edit.
 
 Revision 2 took in the measurement of blaze on tracedecay
 ([reports/TRACEDECAY.md](reports/TRACEDECAY.md), G0), the survey of Bazel with NativeLink
@@ -60,12 +71,16 @@ Three decisions of the program's owner bind this design:
   salsa revision with every memo kept; `RA_JIT_MEMORY_MAX` does not bound a busy or last-asked
   worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure that before any
   distributed code depends on it, each closing a measurable predicate.
-- **rustc is kept out by a process-tree boundary, not by a check at one call.** A worker and every
-  process under it (build scripts, proc-macro servers, linkers, native tools, tests) runs inside
-  an OS boundary in which the Rust toolchain's compilers are absent or unreadable and every exec is
-  checked against a compiler identity: a mount namespace and a seccomp exec policy on Linux, a
-  Seatbelt profile on macOS. A worker that cannot install it does not start. blaze's own spawns go
-  through one API as a second layer; negative fixtures try every way around both (section 0).
+- **rustc is kept out by a process-tree boundary, not by a check at one call.** blaze never
+  delegates Rust compilation, a worker exposes no host Rust toolchain to a job, and a job executes
+  only immutable trusted native tools and binaries and libraries blaze built, denied by default.
+  A worker and every process under it (build scripts, proc-macro servers, linkers, native tools,
+  tests) runs inside an OS boundary in which the toolchain is absent or unreadable and the kernel
+  refuses to run or map a file that is not approved: `noexec` mounts, an exec store and a seccomp
+  filter that rejects other ABIs on Linux, a Seatbelt allow-list on macOS. A worker that cannot
+  install it does not start. It does not claim that job code cannot implement or bring its own
+  compiler in-process; that is out of its scope (section 0, c3-B1.1). blaze's own spawns go through
+  one API as a second layer; negative fixtures try every way around both.
 - **Trust has three roles.** Trusted `Main` builders that never run pull-request code and are the
   only principals that publish to `Main`; per-pull-request executors created from trusted
   read-only inputs, isolated by user and sandbox, kept for that pull request's pushes only and
@@ -77,12 +92,14 @@ Three decisions of the program's owner bind this design:
   functions name (`ObjectCodegen::compile_ahead`, `hir-ty-codegen/mod.rs:5479`); LOADMEM shows
   this loop is where a tracedecay build spends its memory, and unit u7 is bounding it in batches
   that release their memos. The distributed batch is that batch. Every executor of an execution
-  loads the same `BuildSpec`, computes the same roots in one canonical order (by stable name) and
-  proves it by digest; roots are leased in ranges; an instance is compiled by an executor that
-  discovered it, after the coordinator grants it the instance's stable name. So no instance
-  crosses the wire, only names and digests (re-review B, B2). A batch ends by exporting what it
+  loads the same `BuildSpec`, computes the same roots in one canonical order (by a total work
+  key: unit, stable name and environment) and posts their digest, which is an admission check;
+  roots are leased in ranges; an instance is compiled by an executor that discovered it and
+  retains it, after the coordinator grants it the instance's work name. So no instance
+  crosses the wire, only names and digests (re-review B, B2; c3-B2). A batch ends by exporting what it
   compiled as linkable store entries through a new exporter, and the lead assembles a
-  store-hydrated full build that compiles nothing an executor exported (B3). The first
+  store-hydrated full build that compiles nothing in the accepted set, the exported entries whose
+  whole closure is reusable (B3; c3-B3). The first
   distributed unit is a two-process prototype on this Mac, and it gates the network layer. A lossless instance
   descriptor, which smaller helpers would need, is a later stage, built only if measurement asks
   for it. No system we read splits one crate's compile across machines (Bazel, NativeLink,
@@ -318,8 +335,11 @@ run each, hybrid.
   `no-rustc` bug. And a check at blaze's own `Command::new` would not be the boundary: processes
   are started from other crates and by raw `execve` (re-review B, B1, lists them), and build
   scripts, proc macros, linker wrappers and tests start their own. So Phase 0 installs a
-  process-tree boundary in which the toolchain's compilers cannot run, with a spawn API as a second
-  layer and an audit with negative fixtures ([the boundary](#the-no-rustc-boundary-p0-as-mechanism)).
+  process-tree boundary in which no host toolchain is reachable and only approved code runs, with a
+  spawn API as a second layer and an audit with negative fixtures ([the
+  boundary](#the-no-rustc-boundary-p0-as-mechanism)). The guarantee is that blaze never delegates
+  Rust compilation and that sanctioned toolchains are unavailable to job code; it is not a claim
+  that a test, build script or proc macro cannot implement its own compiler.
   In worker mode it cannot be turned off, a worker that cannot install it does not start, and a
   refused process fails the job if the job needed it. A job is never turned green by cargo.
   `RA_JIT_RUSTC_BASE=0` does not disable cargo's dispatch (review A B1; it only stops patching a
@@ -518,16 +538,44 @@ struct Capability {                 // 0..=8
 }
 
 /// A function of distributed codegen (section 4), as every executor of an execution names
-/// it: sha256 of its stable name (stable.rs), the name its store entry is kept under. It is
-/// a name for coverage, never a request another database can rebuild (re-review B, B2).
+/// it: the digest of its `WorkKey`. Total (every root and every discovery has a key, or a
+/// terminal `Edge`) and environment-safe (two requests that may compile differently have
+/// different keys). It is a name for coverage and grants, never a request another database
+/// can rebuild (re-review B, B2; c3-B2.1).
 struct WorkName(Digest);
 
-/// What an executor computed from its front end before it may take work: every executor of
-/// an execution must post the same one (section 4).
-struct RootSet {                    // 0..=2
+enum WorkKey {                      // the digest's input
+    Item {                          // 0, a function with a stable name
+        unit: Digest,               // 0, the unit it is compiled in: digest of the canonical CBOR
+                                    //    of its UnitSpec without `deps` (host and target are two)
+        stable: Digest,             // 1, sha256 of its stable name (stable.rs): its store name
+        env: Digest,                // 2, fingerprint of the asking param environment (caller
+                                    //    bounds, opaque types, overflow mode), or the zero digest
+                                    //    where the semantic layer proves the environment irrelevant
+    },
+    Edge { parent: WorkName, ordinal: u32 }, // 1, a request with no stable name (stable.rs:597-607):
+                                    //    terminal `Local`, named by the function that makes it and
+                                    //    its place among that function's requests
+}
+
+/// A name an executor found, and the digest of the complete local request it holds for it.
+struct Found {                      // 0..=1
+    name: WorkName,                 // 0
+    tuple: Digest,                  // 1, the instance, param environment and crate spelled in full,
+                                    //    with no 1,024-byte hash fallback: a digest, not a descriptor
+}
+
+/// What an executor computed from its front end before it may take work (section 4). It is an
+/// admission check on the front ends, not a proof that they agree (c3-B2.3).
+struct RootSet {                    // 0..=4
     spec: Digest,                   // 0, BuildSpec digest
-    roots: Digest,                  // 1, digest of the build's roots' stable names, sorted by bytes
+    roots: Digest,                  // 1, digest of the build's roots as (WorkName, tuple) pairs,
+                                    //    sorted by the bytes of the pair
     count: u64,                     // 2
+    index: Digest,                  // 3, digest of the sorted WorkNames of the pre-index (section 4)
+    inputs: Digest,                 // 4, digest of the content digests of every build-script output
+                                    //    and proc-macro library the front end consumed, and of the
+                                    //    export policy (section 4, "Export and ingestion")
 }
 
 /// An executor's tenure over the work it holds in one execution.
@@ -538,34 +586,46 @@ struct Lease {                      // 0..=3
     generation: u64,                // 3, new at every grant to this holder; fences its results
 }
 
-/// Work given to a holder: a range of the sorted roots, and instance names granted to it.
+/// Work given to a holder: a range of the sorted roots, and names granted to it.
 struct Grant {                      // 0..=2
     lease: Lease,                   // 0
     roots: Vec<(u64, u64)>,         // 1, set: half-open ranges of indexes into the sorted roots
-    names: Vec<WorkName>,           // 2, set: instances granted to the holder, which found them
+    names: Vec<WorkName>,           // 2, set: functions granted to the holder: ones it found, and
+                                    //    on-demand ones its pre-index resolves
 }
 
 enum ItemOutcome {
-    Exported { entry: EntryKey },   // 0, compiled; its entry is in one of the result's packs
+    Exported { entry: EntryKey },   // 0, compiled; its entry is in one of the result's packs. Raw:
+                                    //    whether it is adoptable is decided by its closure (section 4)
     FromStore { entry: EntryKey },  // 1, the execution's pinned packs hold its whole usable closure
     Failed { why: String },         // 2, a CodegenError here; not a verdict on the build
     Local { why: String },          // 3, compiled but not exportable (the exporter's reason);
                                     //    the lead compiles it and what calls it
+    Lost { why: String },           // 4, the holder cannot resolve the name: it no longer holds the
+                                    //    finding (`lost-finding`), or the name is in neither its
+                                    //    findings nor its pre-index (`unknown-name`, also counted as
+                                    //    a conflict). It stops being a finder of the name
 }
 
-struct ItemResult {                 // 0..=2
+struct ItemResult {                 // 0..=3
     name: WorkName,                 // 0
     outcome: ItemOutcome,           // 1
-    found: Vec<WorkName>,           // 2, set: generic instances and on-demand functions its
-                                    //    code names, which the holder can compile
+    found: Vec<Found>,              // 2, set: generic instances and on-demand functions its
+                                    //    code names, which the holder has retained and can compile
+    unnamed: Vec<(u32, String)>,    // 3, set: ordinal and reason of each request of its code that
+                                    //    has no stable name; the coordinator records each as a
+                                    //    terminal `WorkKey::Edge` of this item
 }
 
-/// One batch's results, committed at once: outcomes, discoveries and packs (section 4).
-struct BatchResult {                // 0..=3
+/// One batch's results, committed at once: outcomes, discoveries, packs and what it did not
+/// get to (section 4).
+struct BatchResult {                // 0..=5
     lease: Lease,                   // 0
     seq: u64,                       // 1, the holder's batch number; a replay of one is idempotent
     items: Vec<ItemResult>,         // 2
     packs: Vec<PackRef>,            // 3, sealed and uploaded before this is sent
+    returned_roots: Vec<(u64, u64)>, // 4, set: granted ranges the batch did not process (budget)
+    returned_names: Vec<WorkName>,  // 5, set: granted names the batch did not process
 }
 
 /// A test before it runs (section 6): what a fresh machine can compute without the read set.
@@ -678,7 +738,7 @@ result is written into [reports/TRACEDECAY.md](reports/TRACEDECAY.md) by the uni
 
 | Predicate | Measured as | Bar | Where |
 |---|---|---|---|
-| **P0-A, no rustc** | the process-tree boundary's audit (every exec in the worker's tree, allowed or denied, with its parent chain), the stand-ins of `harness/norustc.py`, and the provenance record of every Rust code artifact the build links or loads; cold isolated target, store and daemon home | **positive:** `tracedecay-cli` cold build, first edit, test-binary build and run, macro expansion and a doctest succeed with 0 compiler execs in the tree and every Rust artifact of blaze's origin, on both platforms; **negative:** each fixture of the boundary's list (below) ends with 0 compiler execs, a named refusal, and the build failing only where it needed the refused process | this Mac; Linux at scale |
+| **P0-A, no rustc** | the process-tree boundary's audit (every exec in the worker's tree, allowed or denied, with its parent chain), the stand-ins of `harness/norustc.py`, and the provenance record of every Rust code artifact the build links or loads; cold isolated target, store and daemon home | **positive:** `tracedecay-cli` cold build, first edit, test-binary build and run, macro expansion and a doctest succeed with 0 compiler execs in the tree and every Rust artifact of blaze's origin, on both platforms; **negative:** each fixture of the boundary's list (below) ends with the outcome that list states: refused with a named refusal and the build failing only where it needed the refused file, or, for an in-process compiler, run and recorded as out of scope (c3-B1.1) | this Mac; Linux at scale |
 | **P0-B, memory bounded** | footprint (macOS) or `RssAnon` plus `RssFile` (Linux) of every worker and of each executor's whole process tree, 1 s samples; the daemon's log | with `RA_JIT_MEMORY_MAX=M`, the workers together hold at most 1.05 M for no more than 2 s in any state (loading, busy, last asked), and no single worker passes it; a worker stopped by the bound fails its build with the bound's message, and the build does not go to cargo; the harness watchdog never fires. Measured on `tracedecay-cli` at the guard's 16G, the case G0 failed | this Mac |
 | **P0-C, tracedecay fits** | the same samples through a cold load, then 20 edit/undo pairs (memory.md M1) | a loaded `tracedecay-cli` worker holds at most 16 GB footprint on macOS arm64 at ready and after 20 pairs, so a guarded run completes; Linux's number recorded beside it | this Mac; Linux at scale |
 | **P0-D, edits are the daemon's** | `blaze status` and the build logs: 5 runs, each of the three edit kinds of TRACEDECAY.md and its revert, after one cold and one warm build that are not counted | 30 of 30 counted builds (5 × 3 × an edit and its revert) `Finished ... [ra-jit]`, 0 `building with cargo`; the CLI's build script rerun when its watched inputs change and its new output used (G0's 18 failures are background, not this denominator; re-review B N2) | this Mac |
@@ -737,32 +797,126 @@ configured helpers; `whole.rs:322-331` runs the built program; `main.rs` links t
 macros, linker wrappers, tests) start what they like. The boundary is therefore the process tree,
 in three layers.
 
-1. **The tree cannot run a compiler** (the boundary itself). It is in place before the worker
-   loads anything: on a fleet machine the agent sets it up as it starts the executor (on Linux the
-   agent, which creates the executor's user, creates its namespaces, E1); locally the daemon
-   installs it on itself. Every descendant inherits it and cannot drop it.
+1. **The tree reaches no Rust toolchain and runs only code blaze approved** (the boundary
+   itself). It is in place before the worker loads anything: on a fleet machine the agent sets it
+   up as it starts the executor (on Linux the agent, which creates the executor's user, creates its
+   namespaces, E1); locally the daemon installs it on itself. Every descendant inherits it and
+   cannot drop it.
+
+   **What it guarantees, and what it does not (c3-B1.1).** The guarantee is the three statements
+   below. Revision 3 claimed more: that a denylist of compiler names, digests and
+   `librustc_driver` linkage stops any compiler a job supplies. It does not, and the claim is
+   withdrawn. A compiler of another build, a rebuilt or statically linked one, or a
+   driver renamed with its dependency edited has no known name, digest or needed library; a
+   compiler inside a test, build script or proc macro has no exec at all.
+
+   - **blaze never delegates Rust compilation.** No path of blaze hands a function, crate, build
+     script, proc macro, check, test, doctest or link to rustc, rustdoc or a cargo that runs them.
+     Layers 2 and 3, the audit and `harness/spawnsites.py` enforce it.
+   - **A worker exposes no host Rust toolchain to a job.** No mount, mapping, file descriptor or
+     path of `$RUSTUP_HOME/toolchains/*`, `$CARGO_HOME/bin`, the sysroot's `bin`, the rustc-built
+     libraries of `lib/rustlib/<triple>/lib` or any `librustc_driver*` reaches the job's tree.
+     rust-src and blaze's shipped standard library are mounted read-only; they are sources and
+     blaze's own artifacts, not a toolchain.
+   - **A job executes and maps only approved code; everything else is denied by default.**
+     Approved is: an immutable trusted native tool (the programs of the `BuildSpec`'s native
+     toolchain digest and of a `RuntimeBundle`, by digest), or a binary or library blaze built or
+     promoted (below), with its origin and digest recorded. The test is on the file the kernel
+     runs or maps, never on its name.
+
+   **Out of the boundary's scope, stated plainly.** Arbitrary job code can implement a Rust
+   compiler in its own process, or bring one in its own bytes (in a fixture, constructed at run
+   time, or fetched through a content channel the job is allowed). A test, build script or proc
+   macro that does so is a program blaze built, and the superset rule says it behaves as under
+   cargo. No OS mechanism tells it from any other program; preventing it would need semantic
+   mediation of the job's code, which this design does not do and no owner decision asks for.
+   Tests that run rustc or cargo themselves are the owner's `rustc-tests` gate (section 6). So
+   "0 compiler execs" is not an oracle that no compilation happened: P0-A's oracle is the
+   refusals the fixtures name and the provenance record of every Rust code artifact linked or
+   loaded (below). The old checks, a compiler's name, a digest in the toolchain manifest, an ELF
+   needing `librustc_driver-*`, stay as a diagnostic only: they give a job that runs a known
+   host compiler a named error, and a declaration check refuses to approve such a file for a
+   bundle. They are not the boundary.
    - **Linux:** the worker runs in its own mount namespace (`sandbox.rs`'s user and mount
      namespaces, extended from one test to the worker's whole tree; E1 later makes it the job
-     sandbox). The Rust toolchain's executables and `librustc_driver` are not mounted:
-     `$RUSTUP_HOME/toolchains/*/bin`, `$CARGO_HOME/bin`, the sysroot's `bin` and the rustc-built
-     libraries of `lib/rustlib/<triple>/lib`; rust-src and blaze's shipped standard library are
-     mounted read-only. The seccomp user-notification supervisor, which today records an exec and
-     lets it continue (`sandbox.rs:810-829`), decides instead: it denies, with `EACCES` and an audit
-     line naming the process chain, an exec whose file's last component is `rustc`, `rustdoc`,
-     `cargo`, `cargo-*`, `rustup`, `clippy-driver` or `miri` (other than blaze's own shims, by
-     digest), whose digest is in the toolchain manifest of the pinned toolchain and of any toolchain
-     installed on the host, or whose ELF needs `librustc_driver-*`. Where Landlock is available,
-     execution is also limited to the mounted directories.
+     sandbox). The host toolchain is not mounted. Exec is authorised by the kernel over objects the
+     job cannot change, never by the supervisor (c3-B1.2):
+     1. **Mutable storage cannot run code.** Every mount the job can write (worktree, target
+        directory, `OUT_DIR`, overlay, temporary directories, `/dev/shm`) is `noexec,nosuid,nodev`.
+        The kernel then refuses `execve` of a file there, `execveat` of an fd of one, and
+        `mmap(PROT_EXEC)` of one, which stops an explicit dynamic loader run on a job's binary
+        (`ld.so ./prog`) and a `dlopen` or `LD_PRELOAD` of a job's library. Approved code lives only
+        on read-only mounts: the trusted native tools, the shipped standard library and the exec
+        store. Where the kernel has Landlock, `LANDLOCK_ACCESS_FS_EXECUTE` is granted to those
+        hierarchies alone, as a second kernel check.
+     2. **Promotion is the one way in, and it is outside the job.** The exec store holds
+        content-addressed files, mode 0555, owned by the control user, on a mount the job sees
+        read-only and executable, and only the supervisor side writes it, recording each file's
+        origin and digest. It takes two kinds of file. *What blaze built*: test and build-script
+        programs, the program itself, proc-macro libraries; a path the job knows
+        (`CARGO_BIN_EXE_*`, `target/debug/<name>`) resolves into the store. *What a trusted native
+        tool produced for the job*: scripts and tools reach the C toolchain through blaze's `cc`,
+        `c++`, `ld` and `ar` wrappers (`CC`, `CXX`, `LD`, `AR` and the front of `PATH`); a wrapper
+        asked for an executable or a shared library sends its command line to the supervisor over
+        a descriptor that authorises only that request, the supervisor runs the real tool outside
+        the job's tree on the job's inputs and publishes the output, and the wrapper leaves a
+        symlink to it at the output path, so `./probe` and a `protoc` built by `cmake`
+        (`protobuf-src`) still run. A job cannot promote a file it wrote: the store takes only what
+        the supervisor itself produced. A compliant program that executes a native file by another
+        route (a Rust-written ELF, a download, a checked-in binary) is refused with a named error
+        and the file's digest, and runs once its bundle declares that digest. P0.2 measures which
+        of tracedecay's 107 build scripts and of the popular `-sys` crates need which route; a
+        compliant program the routes do not cover is a bug of the promotion path, or the sandbox
+        difference [#147](https://github.com/indexable-inc/blaze/issues/147) already allows, and is
+        never refused to strengthen the claim.
+     3. **No exec-able anonymous file.** `memfd_create` is allowed only with `MFD_NOEXEC_SEAL`
+        (the filter rejects the call otherwise, and the sandbox sets `vm.memfd_noexec=2` in its
+        pid namespace where the kernel has it); `execveat(fd, "", AT_EMPTY_PATH)` and `fexecve` on
+        an fd of a memfd, of a file on a `noexec` mount or of a deleted file are refused by the
+        kernel, and on an fd of an approved file are the approved inode and allowed. The worker
+        closes every inherited descriptor above 2 (`close_range`) before any job code, so no
+        descriptor of the host toolchain survives into the tree.
+     4. **Scripts and interpreters are explicit.** A `#!` script needs execute permission on an
+        exec mount, and so does the interpreter its first line names, so a script a job wrote
+        cannot be run by name. `sh script`, `python3 script` and `perl script` read the script as
+        data: the interpreter is an approved tool and what it runs is the job's code, which is the
+        out-of-scope case above, not a new exec. A script on an approved mount names only an
+        approved interpreter.
+     5. **The supervisor audits and fails closed; it does not decide by continuing.** The seccomp
+        user-notification supervisor records every exec with its process chain, and reads
+        `/proc/<pid>/exe` and `maps` after the exec for what ran. `CONTINUE` after reading a path
+        is never a security decision: the pathname bytes are the job's memory, another thread can
+        replace them or a symlink between the supervisor's read and the kernel's open, and an
+        fd-based exec has no last component to read. A target the supervisor cannot read (an
+        unreadable pointer, an over-long path) or an audit it cannot write is denied with `EACCES`.
+     6. **Unknown ABIs are rejected.** The filter kills the process (`SECCOMP_RET_KILL_PROCESS`) on
+        any `seccomp_data.arch` other than the native one, including 32-bit compat and, on x86-64,
+        an `x32` number (`nr & 0x40000000`). Today a non-matching architecture is allowed
+        (`sandbox.rs:695-705`), and `execveat` is listed but its empty pathname is skipped
+        (`:835-858`).
+     7. **Before any untrusted work** the sandbox sets `PR_SET_NO_NEW_PRIVS`, drops the capabilities
+        that remount, enter or create namespaces, trace or change roots (`CAP_SYS_ADMIN`,
+        `CAP_SYS_PTRACE`, `CAP_SYS_CHROOT`, `CAP_SETPCAP`) from the bounding set, and the filter
+        denies `mount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `fsopen`, `fsmount`,
+        `unshare`, `setns`, `ptrace`, `process_vm_writev` and `clone`/`clone3` with a `CLONE_NEW*`
+        flag, so a job cannot remount a writable mount `exec` or enter a namespace in which it can.
    - **macOS:** the worker applies a Seatbelt profile to itself (`sandbox_init`, inherited by every
-     descendant): `process-exec` denied for the toolchain's `bin` directories and for any path whose
-     last component is one of the names above; `file-read-data` and `file-map-executable` denied for
-     those directories, the rustc-built libraries of `lib/rustlib/<triple>/lib` and any file named
-     `librustc_driver*`, so no copy of a compiler can be made from the host's toolchain and no copy
-     can load its driver. rust-src stays readable. Denials are reported with
-     Seatbelt's `report` action into the audit. The C toolchain, git and other tools stay allowed:
-     tracedecay's CLI build script runs `pnpm`.
-   - **Fails closed on workers.** An executor whose boundary cannot be set up (no user namespaces
-     or seccomp user notification on Linux, `sandbox_init` failing on macOS) does not start, naming
+     descendant). It is a deny-by-default allow-list, not a denylist: `process-exec` and
+     `file-map-executable` are allowed only for subpaths the job cannot write and that another
+     user owns (the trusted native tools, the shipped standard library, the exec store of
+     step 2), so a file a job wrote, a copy of a compiler included, cannot be executed or mapped;
+     `file-read-data` is denied for the host toolchain's directories and any `librustc_driver*`;
+     rust-src stays readable. Seatbelt is path-based, with no per-inode rule; the allow-list
+     stands because the job cannot create or replace a file inside an allowed subpath
+     (**unverified**: P0.2's probe tries a hard link, a rename and a symlink into one). Denials are
+     reported with Seatbelt's `report` action into the audit. The C toolchain, git and other
+     tools stay allowed: tracedecay's CLI build script runs `pnpm`. There is no
+     `no_new_privs` or capability set to drop on macOS: the executor is an unprivileged user per
+     executor (E2) and the profile denies the task-port and debugger operations on other
+     processes (the operation names are fixed by P0.2's probe, **unverified**).
+   - **Fails closed on workers.** An executor whose boundary cannot be set up (no user namespaces,
+     no seccomp user notification, a kernel that cannot make a mount `noexec`, or an ABI filter
+     that does not load, on Linux; `sandbox_init` failing on macOS) does not start, naming
      why. Locally, the daemon installs the same boundary over build-time descendants (build
      scripts, proc-macro servers, linkers, blaze's own children) where it can; where it cannot (a
      Linux that forbids unprivileged user namespaces, as Ubuntu's AppArmor setting can, **unverified**
@@ -773,11 +927,9 @@ in three layers.
      it runs rustc at run time, that is the program's behaviour, not blaze compiling with rustc, and
      the superset rule says it must behave as under cargo; the audit reports it. This is why
      tracedecay's tests that run rustc or cargo need the owner's `rustc-tests` gate (section 6).
-   - **Out of the boundary's threat model:** a compiler the job brings itself under another name and
-     with its driver renamed. It is caught on Linux by the linkage and digest checks, not on macOS;
-     the security of what a pull request runs is section 2's isolation, not this boundary's.
+     The security of what a pull request runs is section 2's isolation, not this boundary's.
 2. **Blaze's own spawns go through one API**, `crates/blaze-spawn` (new, small): it resolves the
-   executable, applies the same compiler identity, refuses cargo subcommands that compile (`build`,
+   executable against the approved set, gives a named error for a known compiler, refuses cargo subcommands that compile (`build`,
    `check`, `test`, `run`, `rustc`, `doc`, `bench`, `install`, `fix`, `clippy`, `miri`), `cargo
    metadata` without `--no-deps`, a cargo alias that expands to one of those (read from cargo's
    config), an external `cargo-*` subcommand, and a `RUSTC`, `RUSTC_WRAPPER` or
@@ -805,16 +957,41 @@ a shipped one is absent) and `:86-119` (the rustc-built macro library after a fa
 the symbol files `main.rs:7739-7746` loads, and `whole.rs:37-47`, which makes Build and Run whole
 but not Test and Check.
 
-**Negative fixtures** (`harness/dist/fixtures/norustc/`, both platforms): a build script that runs
-rustc by absolute path; a renamed copy of rustc (Linux: denied by digest and linkage; macOS: the
-copy cannot be made); `sh -c 'rustc ...'`; a linker wrapper (`-C linker=./cc-wrapper`) that runs
-rustc; a build script that runs `cargo build`; a proc macro that runs `rustc -` on source; a test
-that runs `cargo metadata`, `cargo build` and `rustc`; a cargo alias `b = "build"` and `cargo b`; a
-`cargo-foo` plugin on `PATH` that runs rustc; `RUSTC_WRAPPER` pointing at rustc; project-model's
-compile-time dependencies; git with a credential helper that runs rustc. Each ends with 0 compiler
-execs, a named refusal in the audit, and the build failing only where it needed what was refused.
+**Negative fixtures** (`harness/dist/fixtures/norustc/`, both platforms). Two kinds, with the
+outcome each is expected to have under the guarantee above (c3-B1.1).
+
+*Host toolchain and delegation, refused:* a build script that runs rustc by absolute path; a copy
+of the host's rustc (the copy cannot be read on macOS, and is not mounted on Linux); `sh -c 'rustc
+...'`; a linker wrapper (`-C linker=./cc-wrapper`) that runs rustc; a build script that runs
+`cargo build`; a proc macro that runs `rustc -` on source; a test that runs `cargo metadata`,
+`cargo build` and `rustc`; a cargo alias `b = "build"` and `cargo b`; a `cargo-foo` plugin on
+`PATH` that runs rustc; `RUSTC_WRAPPER` pointing at rustc; project-model's compile-time
+dependencies; git with a credential helper that runs rustc. Each ends with 0 compiler execs, a
+named refusal in the audit, and the build failing only where it needed what was refused.
+
+*Compilers the job brings, and the outcome the narrowed guarantee gives each.* The oracle is the
+named kernel or profile refusal (the errno and the audit line naming the file) and the provenance
+record, not a count of execs: a library mapped into an approved process has no exec at all.
+
+| Fixture | Linux | macOS |
+|---|---|---|
+| a **pre-staged non-host toolchain**: an unmodified rustc and `librustc_driver` of another version, in the fixture's tree or in a bundle directory not declared | refused: not on an approved read-only mount, `EACCES` from the `noexec` mount | refused: `process-exec` outside the allow-list |
+| the same toolchain **declared** in a bundle | refused at admission by the declaration check (a diagnostic, not the boundary); if the check does not recognise it, it is approved: a bundle is the owner's act, not a job's | same |
+| a **renamed compiler plus driver**: rustc copied to `cc1`, `librustc_driver` renamed and its `RUNPATH` and needed name edited, so name, digest and linkage all differ | refused, for the reason above, not because it looks like a compiler | refused, for the reason above |
+| an **explicit dynamic loader**: `ld-linux-<arch>.so.2 ./renamed-driver` | refused: `mmap(PROT_EXEC)` of the job's file fails on the `noexec` mount | n/a (`dyld` does not load a standalone binary by argument); its equivalent is the next row |
+| **library loading**: an approved process `dlopen`s, or runs with `LD_PRELOAD` or `LD_LIBRARY_PATH` naming, a job-written library or a renamed `librustc_driver` | refused: the mapping fails | refused: `file-map-executable` outside the allow-list |
+| an **interpreter**: `python3 drive.py` where the script execs the pre-staged compiler; and `./drive.sh` with a `#!` line | the exec the script makes is refused as in row 1; `./drive.sh` is refused by name (a `noexec` mount); `sh drive.sh` reads the script as data and runs | the same |
+| an **interpreter implementing the compiler**: a toy compiler written in the script | runs, **out of scope** and recorded: no exec, no foreign artifact | same |
+| an **in-process compiler**: a test, a build script and a proc macro, each blaze-built, containing a toy Rust compiler that parses source and writes an object file | runs, **out of scope**: it is a blaze-built program, its provenance says so, and the fixture asserts the harness records "out of scope: in-process compilation" and does not count it as a boundary failure | same |
+| **bytes brought in**: a non-host compiler's bytes in a fixture, loaded by the job's own in-process loader (anonymous memory, no file mapping, no exec) | runs, **out of scope**, recorded | same |
+| **inherited descriptor**: the parent opens the host's rustc and starts the worker | the worker's `close_range` leaves no such descriptor; `fexecve` of its number fails with `EBADF` | the descriptor is closed by the same step; `file-map-executable` is denied if it is not |
+
 **Positive fixtures:** the CLI's build script running `pnpm`; `autocfg`, `version_check` and
-`rustversion` probes answered by blaze; a C dependency built with `cc`.
+`rustversion` probes answered by blaze; a C dependency built with `cc`; a blaze-built test
+program run through `CARGO_BIN_EXE_*` from the exec store; a blaze-built proc-macro library
+mapped from it; a build script that compiles a C probe and runs it, and one that builds and
+runs a `protoc`, each passing through the promotion path, which is a bug of the path if one does
+not.
 
 ## 1. Identity
 
@@ -912,7 +1089,8 @@ How, by platform:
   unprivileged user per executor and a Seatbelt profile (`sandbox-exec`) that denies reads of the
   control plane's and other executors' paths, denies writes outside the executor's directories,
   and denies network but the agent's socket. Seatbelt is deprecated by Apple and still enforced
-  (**unverified** on macOS 26). Until E2 lands, the Mac Studio runs trusted builders only, and a
+  (**read** for one narrow probe on macOS 26.6.2, section "Not checked"; the production profile is
+  **unverified**). Until E2 lands, the Mac Studio runs trusted builders only, and a
   pull request's macOS leg runs on a hosted macOS runner (section 5).
 - **Stronger, the owner's choice:** a microVM per executor restored from a trusted snapshot, as
   [ci-runner.md](ci-runner.md) designs with ix (Firecracker on Linux, Virtualization.framework on
@@ -1096,29 +1274,87 @@ be turned back into one. So the question is how an executor comes to hold an ins
 |---|---|---|---|
 | **(a) a lossless instance descriptor**: a versioned encoding in a new crate under `vendor/rust-analyzer` of source, unit, item, closure and coroutine identities, generic and const arguments encoded recursively, the asking param environment's caller bounds and the overflow mode, with rebinding into a helper's database under the exact `BuildSpec`; a type spelled past 1,024 bytes travels as a content-addressed blob, never as its hashed name | a descriptor per work item | an encoding of every type-system construct blaze compiles, kept in step with the front end; a wrong rebinding miscompiles silently unless entry digests are compared; round-trip and compile tests across interning orders, long nested types, closures, coroutines, const generics, caller bounds and repeated units. It is what would let a helper hold less than the whole front end, and re-review B's M2 limits that: an instance homed in a workspace crate needs that crate's closure, often most of the program, and how much of tracedecay's work homes in small closures is not measured | **second stage** (unit D2), built only if D4 names helpers' front ends as the limiter and D2's home inventory shows useful work that fits smaller helpers |
 | (b) static shards over identical front ends: every executor computes the whole work set in one canonical order and compiles shard i of N | names, for coverage | every executor holds the whole front end (G0: 120 to 210 s cold; LOADMEM: 11.0 to 13.1 GB live at the resolution peak; warm executors amortise both). And in blaze an instance is found only by compiling its caller (`requests.funcs` comes out of codegen), so to know its shard each executor would compile the whole program | rejected as stated |
-| **(b′) claimed discovery over identical front ends** | a root-set digest, and the digest of each found instance's stable name | the whole front end per executor, as (b); a canonical root order that does not depend on interning; a test that two processes name everything alike; one claim per found instance, carried in batch results | **chosen, first stage** (units D0, D1) |
+| **(b′) claimed discovery over identical front ends** | a root-set digest (with an index digest and an inputs digest), and for each found function the digest of its `WorkKey` and of the request behind it | the whole front end per executor, as (b); a total work key; a canonical root order that does not depend on interning; a pre-index of every function a grant can name; retained findings with a stated lifetime; a test that two processes name everything alike; one claim per found function, carried in batch results | **chosen, first stage** (units D0, D1) |
 
 How (b′) works. Every executor of an execution loads the same `BuildSpec` and source and computes
-the build's roots and their stable names. Sorted by the bytes of their stable names, the roots are
-one list on every executor, whatever order its interner gave them; the executor posts that list's
-digest and length (`RootSet`), and one whose `RootSet` differs from the execution's is refused.
-Roots are granted in ranges of the list: any executor can compile any root. An instance is
-compiled only by an executor that found it: when a function it compiled names a generic instance,
-that executor holds the instance in its own database, reports the digest of its stable name, and
-the coordinator grants the name to the first executor that reported it and records the others as
-finders. An on-demand function (non-generic, compiled when something calls it) is found by name
-(`stable.rs:291`), so it is granted like a root, to anyone. Nothing about an instance crosses the
-wire but its name's digest.
+three things from its front end.
 
-This leans on what the store already leans on: one stable name, one compiled function. An
-instance asked under two param environments (`home.rs:275-283` keeps the asking environment where
-caller bounds or opaque types need it) must have two names or the same code; D0 checks it by
-comparing every name's entry digest across executors and against the one-process build.
+- **The roots, as total keys (c3-B2.1).** Each root is a `WorkKey::Item`: the unit it is compiled
+  in, the digest of its stable name, and a fingerprint of the asking param environment (the zero
+  digest where the semantic layer proves the environment irrelevant), together with a `tuple`
+  digest of the complete local request behind it. The stable name alone is not a work identity: it
+  names the instance, its arguments and `checked` and not the environment (`stable.rs:228-260`),
+  gives no name to some const arguments (`:597-607`), and the listing keeps several functions,
+  of several crate builds, under one spelling (`:289-354`). Sorted by the bytes of the pair
+  (`WorkName`, `tuple`), the roots are one list on every executor, whatever order its interner
+  gave them. Two roots with the same stable name in different units, or asked under different
+  environments, have different names. Two with the same `WorkKey` and different `tuple`s are
+  distinct and sort by `tuple`, so an executor holding a tied pair swapped posts a different
+  `RootSet`. Roots are deduplicated only when name and `tuple` are both equal, as the one-process
+  build deduplicates the full request (`mod.rs:5500-5511`).
+- **The pre-index (B2 refinement).** At join the executor builds a table from `WorkName` to local
+  function for every function a grant can name without a caller's help: all eligible non-generic
+  entries and all on-demand functions (`stable.rs:291` finds them by spelling), under the pinned
+  `BuildSpec`, ties between units resolved by the key above. It is built from the stable listing
+  the daemon keeps for the store (nushell: listing 4.7 s, n not stated) and posted as a digest.
+  So an on-demand function is granted by `WorkName` to any executor, and the holder resolves it
+  through the table; the full stable name never needs to cross the wire (sending it would also be
+  no instance, but it makes every grant longer and the table makes it unnecessary).
+- **The inputs (c3-B2.3).** A digest of the content digests of every build-script output and
+  proc-macro library the front end consumed. A script or macro that is impure (section 1) runs
+  once, on the lead, and its output is published as a blob; a helper uses that output by digest
+  and does not run it again.
+
+An instance is compiled only by an executor that found it. When a function the executor compiled
+names a generic instance, the executor holds the instance's local request (retained, below),
+reports `Found { name, tuple }`, and the coordinator grants the name to the first executor that
+reported it and records the others, whose `tuple` equals the first's, as finders. A request with
+no stable name cannot be reported by name: it is listed in the item's `unnamed`, the coordinator
+records a terminal `WorkKey::Edge { parent, ordinal }` for it, and the item is `Local` (its entry
+could not name the callee). The lead rediscovers the request by compiling that Local parent, in its
+tail; nothing needs claiming first, so an unnameable discovery cannot be lost (c3-B2.1).
+
+**Same name, different request (c3-B2.1).** Two finders that report one `WorkName` with
+different `tuple`s hold requests the key does not tell apart. The coordinator does not pick one,
+and does not merge them: merging requests by name before compiling would suppress the second
+compilation that could show they differ. The name becomes a `Conflict`, which is terminal
+`Local { identity conflict }`: no grant is made, none of its finders compiles it, and the
+exported callers that name it are not adoptable (the closure rule, below). If a winner had
+already exported an entry under the name, that entry is export-invalidated and the lead bans the
+name, so the entry is never read from an imported pack (below). The lead compiles it, and the
+conflict is counted as a determinism bug with both `tuple`s. Whether equal `tuple`s always mean equal code is not
+assumed: D0's verification arm compiles the colliding cases independently and compares
+(acceptance below). The same distinction applies to store keys: an entry kept under a stable
+name alone is the one-process build's key (cache.md); C5 checks that the entry key tells apart
+what `WorkKey` does, and where it does not and equivalence is not proved, adds the unit and
+environment to it.
 
 The price is the front end on every executor: hence warm executors (section 2's trusted builders
 on `master`, a pull request's executors across its pushes) and D3's image. What it buys: no
 instance transport in the first stage, D2's descriptor only if measurement asks for it, and warm
 helpers that start before a cold lead is loaded.
+
+**Finder retention (c3-B2.2).** The scheme needs each finder to keep, after its batch ends and
+its memos are released, the owned local request of every name it reported: the instance and the
+`StoredParamEnvAndCrate`, whose generic arguments and clauses are owning interned slices that the
+type GC marks and traverses, not raw type values, which the GC's precondition forbids holding
+unrecorded (`collect_ty_garbage`). The contract is:
+
+- **Lifetime.** A finding is kept from the batch that found it until the coordinator reports the
+  name terminal or releases the execution, or until the executor reports it `Lost`. Memo eviction,
+  the type GC and the allocator's purge between batches run with findings held, and never
+  destroy them.
+- **Identity.** The executor's source and database identity (the salsa revision, with the body,
+  closure and coroutine ids the findings point into) is pinned to the execution. A source change
+  is a new execution, not a reload under findings held.
+- **Lease.** A finder is eligible for a name only while it holds its finding. The coordinator
+  records alternate finders (equal `tuple`) as well as the winner, because the recovery rows
+  below grant a name to one of them. A granted name the holder cannot resolve through its findings
+  or its pre-index is answered `Lost { lost-finding }` (or `unknown-name`, which is also counted
+  as a conflict), and that holder stops being a finder of it: the name goes to another finder, or
+  becomes terminal `Local` for the lead's tail. A missing name is never silently dropped.
+- **Cost.** The registry's size (names and request sizes) is part of the executor's reservation
+  (section 5) and of D0's recorded peak.
 
 ### The protocol
 
@@ -1129,15 +1365,37 @@ a sans-IO state machine in `crates/blaze-dist`.
 
 1. **Join.** An executor fetches the packs the execution's cache lookup answered (pinned to the
    execution), loads its front end, and posts `POST /v1/work/join {0: execution,
-   1: attempt, 2: RootSet, 3: rejected}`. The first join fixes the execution's `RootSet` and opens
-   its root ranges; a join with another `RootSet` is refused (conflict: "the executor's front end
-   differs") and counted, as a determinism bug. `rejected` is the names the lead's daemon already
+   1: attempt, 2: RootSet, 3: rejected}`. `rejected` is the names the lead's daemon already
    rejects (`Rejections`); every executor skips them, as `compile_ahead` does. No executor waits
    for the lead to seed: a warm helper joins and compiles while a cold lead is still loading
-   (re-review A N6, re-review B M4).
+   (re-review A N6, re-review B M4). **What a join establishes (c3-B2.3).** Three different
+   agreements are named here, and only the first two are a join's to check:
+   1. *Root-list equality*: `spec`, `roots`, `count` and `index` equal.
+   2. *Semantic-input agreement*: `inputs` equal, so the executors consumed the same expansion
+      and build-script artifacts, not merely the same nominal `BuildSpec`.
+   3. *Accepted-entry equivalence*: an entry a helper exports is the entry the lead would
+      compile. No join proves it: equal sorted roots do not prove equal expanded bodies, request
+      edges or param environments (an impure macro can change a body without adding or removing a
+      root). It is checked by D0's verification arm on fixtures, by the closure check and the lead's
+      import, and in production by section 3's audit rebuilds. A `RootSet` is an admission check
+      and not a proof that the front ends agree.
+
+   **Who is authoritative.** The lead's `RootSet` is. A helper that joins first is provisional: it
+   is granted ranges and compiles speculatively. When the lead joins, a provisional `RootSet` equal
+   to the lead's becomes the execution's; one that differs is fenced: its leases die, its
+   uncommitted results are refused, its packs stay unnamed, and the difference is counted as a
+   determinism bug with both digests. If no helper agrees, the execution restarts with the lead's
+   inputs alone, serially, a one-executor build, and says so. The only executor the execution
+   cannot do without is never refused. After the lead has joined, a join with another `RootSet`
+   is refused (conflict: "the executor's front end differs") and counted.
 2. **Grant.** An executor asks `POST /v1/work/lease` and gets a `Grant`: root ranges and the names
    granted to it, under a `Lease` with a new `generation`. Names come before roots, so a finder
-   compiles what it found while its database holds it.
+   compiles what it found while its database holds it. A new generation for a holder is issued
+   only after the old lease's remainder is accounted for: the batch's `BatchResult` returns every
+   range and name it did not process (`returned_roots`, `returned_names`) in the same transition
+   that commits its items, and the coordinator puts them back in the pool before replacing the
+   generation. Work stopped at u7's budget is therefore never silently invalidated by the next
+   grant (c3-B2.2).
 3. **Compile a batch.** The executor runs its `compile_ahead` threads over the grant, as the local
    build does (u7's batch, the same code), with two differences: an instance its code names is not
    pushed onto the local queue but held until the name is granted, and a function the store has
@@ -1145,17 +1403,20 @@ a sans-IO state machine in `crates/blaze-dist`.
    pinned packs is `FromStore`, neither compiled nor followed. A function that fails is `Failed`,
    with its error; a failure here is speculative, as in the local loop.
 4. **Export, upload, report.** At the batch's end (its grant done, or u7's budget reached) the
-   executor runs the exporter over what the batch compiled (below), seals the entries into a pack
-   (`seal_open`), uploads it (`PUT /v1/blob`, pinned to the execution from the upload), and only
-   then posts its `BatchResult`. Then it releases the batch's memos.
+   executor runs the exporter over what the batch compiled (below), finishes the sink (below),
+   seals the entries into a pack, uploads it (`PUT /v1/blob`, pinned to the execution from the
+   upload), and only then posts its `BatchResult`. Then it releases the batch's memos, holding its
+   findings.
 5. **Commit.** The coordinator commits a `BatchResult` in one transition: each item's outcome; each
    item's `found` names (a name not seen before is granted to this holder, a name seen before adds
-   this holder as a finder); the packs. Found names are registered in the transition that makes
-   their finder terminal, so coverage never counts an item done before what it found is known
-   (re-review B, M1). A replay of the same `seq` gets the same answer.
-6. **Done.** The compile phase is done when every root range and every granted name is terminal
-   and no lease holds work. The root list's length is fixed at the first join, so an empty work set
-   before the roots are in cannot signal done.
+   this holder as a finder if its `tuple` is equal and makes the name a `Conflict` if it is not);
+   each item's `unnamed` requests as terminal `Edge` keys; the packs; and the returned ranges and
+   names. Found names are registered in the transition that makes their finder terminal, so
+   coverage never counts an item done before what it found is known (re-review B, M1). A replay of
+   the same `seq` gets the same answer.
+6. **Done.** The compile phase is done when every root range, every granted name and every `Edge`
+   is terminal and no lease holds work. The root list's length is fixed when the lead's `RootSet`
+   is, so an empty work set before the roots are in cannot signal done.
 7. **Assemble.** The lead imports every accepted pack, synchronously, and builds the program as a
    store-hydrated full build (below), compiling only what nobody could export.
 8. **Outcomes are not verdicts.** No outcome of a batch fails the job. A `Failed` function matters
@@ -1164,55 +1425,131 @@ a sans-IO state machine in `crates/blaze-dist`.
    fails on a stand-in the program reaches), with no rustc. So an unused function blaze cannot
    compile fails neither build (re-review B, M7). A `Local` item, and every exported item whose
    usable closure reaches it, is compiled by the lead: the lead's tail, counted by reason.
-9. **Leases and fencing** (re-review B, M3; re-review A N5). Compute is at least once; terminal
-   accounting is exactly once.
+9. **Leases and fencing** (re-review B, M3; re-review A N5). **Compute is at least once after a
+   holder dies; terminal accounting is exactly once.** With no fault and no verification arm,
+   the coordinator's one owner per work key gives one compile per key. After a holder is lost, a
+   lease is revoked or a name goes to the lead's tail, another executor or the lead may compile the
+   function again, and neither fencing nor name grants can prevent it: a dead holder may have
+   compiled and uploaded before it died. So no gate asks for exactly-once compute after a fault;
+   duplicate compiles are reported as a diagnostic (D0, D4), and the verification arm duplicates
+   deliberately. Exactly-once is of the accounting: each work key ends terminal once, from
+   one holder's committed result.
 
    | Event | Transition |
    |---|---|
    | a heartbeat (every 5 s, on `/v1/workers/events`) | the holder's lease end moves to now + 60 s |
-   | no batch committed for 10 times the execution's median batch time, at least 120 s, though heartbeats arrive | the lease is revoked, as for a lost helper (a hung helper) |
-   | a helper lost: its lease end passed, or revoked | the lease's generation is dead; its open root ranges return to the pool; each name it held goes to another finder of it if there is one, else to the lead's tail |
-   | a `BatchResult` whose `Lease.generation` is not the holder's current one | refused whole (conflict); its packs stay unnamed and are collected after the execution; the items are another holder's or the lead's |
+   | no batch committed within the progress timeout though heartbeats arrive: 300 s from the grant until the execution has a median batch time, then 10 times the median, at least 120 s (starting values, replaced by D1's measurement, **unverified**) | the lease is revoked, as for a lost helper (a hung helper) |
+   | a helper lost: its lease end passed, or revoked | the lease's generation is dead; its open root ranges return to the pool; each name it held goes to another finder of it that still holds its finding, else becomes terminal `Local` for the lead's tail; a root or name whose lease has been revoked 3 times goes to the lead's tail too |
+   | a `BatchResult` whose `Lease.generation` is not the holder's current one | refused whole (conflict), `found` and `unnamed` included, so a root-only result from a dead generation registers no names; its packs stay unnamed and are collected after the execution; the items are another holder's or the lead's |
    | a result committed whose answer was lost | the holder replays the same `seq` and gets the same answer |
    | an upload that fails | the holder retries it under its lease; if the lease ends first, the batch's items go back with it |
    | the lead's import of a pack fails | that pack's items join the lead's tail, named in the report |
-   | the lead lost | the execution's `Attempt` goes up; every lease of the old attempt is dead; outcomes committed under it stay (their entries are content, their packs pinned to the execution) and the new lead imports them |
-   | cancellation or the deadline | the agents kill each executor's process group (section 2, rule 4); the coordinator drops the work set; the pins end |
+   | the lead lost | the execution's `Attempt` goes up; every lease of the old attempt is dead and its late results are refused; every outstanding root returns to the pool; every outstanding name goes to a finder of the new attempt that still holds its finding, else to the new lead's tail, where the lead gets the request by its normal required-reachability assembly, never by decoding a digest; findings registered by the dead attempt's executors are invalid; outcomes committed under the old attempt stay (their entries are content, their packs pinned to the execution) and the new lead imports them |
+   | the deadline, or no compatible lead | the execution ends `Cancelled` (deadline) or `Failed` (no lead after the reassignment of "Warm remote jobs"), named; the agents kill each executor's process group (section 2, rule 4); the coordinator drops the work set; the pins end; committed entries stay content, and no coverage is claimed |
 
-10. **Liveness.** No executor waits on another to compile. The lead waits for Done, and Done
-    comes: every lease ends (by heartbeat, progress or deadline), and the work of an ended lease
-    goes back to the pool, to a finder or to the lead. Helper reservation is non-blocking: a lead
-    that finds no helper free compiles alone, and two leads never hold helpers waiting for each
+10. **Liveness (c3-B2.3).** No executor waits on another to compile. The property is: **every
+    finite execution ends, with `Done` and required-work coverage complete, or with a named
+    `Failed` or `Cancelled`**. A lease always ends, by a result, by a lost heartbeat, by the
+    progress timeout (which runs from the grant, before any median exists) or by the deadline;
+    the work of an ended lease goes back to the pool, to a finder or to the lead, with a retry
+    bound after which the lead takes it. The deadline is an end, not a `Done`: an execution that
+    reaches it did not complete its coverage, and says so. Helper reservation is non-blocking: a
+    lead that finds no helper free compiles alone, and two leads never hold helpers waiting for each
     other.
 
 ### Export and ingestion (re-review B, B3)
 
-- **The exporter** (`hir-ty-codegen/export.rs`, new). From a `CompiledFunction`, its instance and
-  home, and an `ExportContext` (the stable names, the build's symbol resolver, type-id hashes,
-  debug type sets) it writes the `cached::Entry` that `later.rs` writes today, without an object: a
-  callee is `Named` or `Root` by stable name, `Import` only for a symbol the `BuildSpec`'s link
-  provides (an `extern` item, a symbol of the shipped standard library), `TypeId` by the hash of the
-  type, `Asm` by its text; data by its blob, with C4's symbolic rebinding of paths; `tracked`
-  (patch tracking) as `later.rs::tracked` makes it. What it cannot name is `Local { why }`, with
-  `later.rs`'s `unkept` reasons. `later.rs`'s `entry` and `keep` become calls of the exporter
-  whose `ExportContext` answers from the object, so a local and a distributed entry come from one
-  code path, and an executor's entry digest equals the one-process build's (D0 checks it). A helper
-  needs no symbol of a callee it did not compile: requests stay symbolic.
+**What a batch end lacks today.** A batch ends holding `CompiledFunction`s, which are salsa memos
+and not store entries. Three things are missing from that moment, and each has a unit that supplies
+it (check 3, B3):
+
+| Missing at a batch's end | Why an object-free helper cannot take it from the batch | Supplied by |
+|---|---|---|
+| the **final build's ownership and import policy**: which symbols are native, owned, shipped, TLS or foreign, which crates the build owns, the runtime shim policy | today `later.rs` classifies a callee by what the object around it has defined (`Later.ids`, import booleans, `later.rs:23-30,48-55`); a helper's batch has defined whatever callees it happened to compile, so its classification could differ from the lead's | D0: `ExportContext` below, built from the `BuildSpec` and posted as a digest |
+| **request-level derived metadata**: `TypeId` hashes, `FunctionDebug` (variables, scopes, rows), patch tracking, vtable and drop-glue data | today each comes from an object-side map (`FuncId` to `TypeId` only after a shim is generated, `mod.rs:6902-6945`) or from a query over the request's environment and source | D0: the exporter derives each from the request itself |
+| **durable writer and type-set completion**: every entry and every debug type blob it references written, flushed and sealed | the compiler's `cached::Writer` has its own queue and threads (`cached.rs:680-753`); the store's `settled` and `seal_open` do not wait for them | P0.3 supplies the sink seam at the batch end (its hand-on step takes a sink); D0 implements the sink's durable finish, below |
+
+- **The exporter and its `ExportContext` (c3-B3.1).** The exporter (`hir-ty-codegen/export.rs`,
+  new) writes the `cached::Entry` that `later.rs` writes today, from a `CompiledFunction`, its
+  instance and home, without an object. It cannot be handed an object's already-resolved maps, so
+  `ExportContext` resolves *every request*. It has two parts:
+  - an **immutable per-build policy**, the same on every executor and the lead (its digest is
+    part of `RootSet.inputs`): the complete unit and source identity; the root and on-demand
+    registry (the pre-index of section 4); the actual native, owned and shipped link declarations
+    (symbol names, TLS, the runtime shim policy); the target, backend, debug and key settings;
+    and the own-crate set. It is derived from the `BuildSpec` and the shipped standard library,
+    never from whichever callees a batch defined, so a helper and the lead classify one request
+    alike.
+  - a **pure per-request classification**, with no callee compiled and no object mutated: it
+    returns `Named` or `Root` by stable name, `Import` only for a symbol the policy's link
+    provides (an `extern` item, a symbol of the shipped standard library), `TypeId` by the hash of
+    the type, `Asm` by its text, data by its blob and symbolic request-index relocations (C4's
+    symbolic rebinding of paths), and `tracked` as `later.rs::tracked` makes it. It never calls
+    `ObjectCodegen::resolve`, which emits shims and statics and schedules more code (`mod.rs:6236-6302`).
+    The `TypeId` of a request comes from the request's type and instance, as `type_id.rs:132-170`
+    hashes it, not from a `FuncId`. Debug and tracking need the preserved asking environment,
+    source spans, rows and slots and the debug settings, kept until `FunctionDebug` and tracking
+    are made; their recursive type sets are written before the batch's memos are released.
+  - **Unknown is `Local`.** A request the classifier cannot place is `Local { why }`, never an
+    assumed `Import`. `later.rs`'s `entry` and `keep` call the same classifier, answering from the
+    object, so a local and a distributed entry come from one code path and an executor's entry
+    digest equals the one-process build's (D0 checks it); the object-backed callers keep the
+    mixed and rustc-copy behaviour they have today where it is needed, and a distributed no-rustc
+    build does not enable it. No instance descriptor crosses the wire: every identity is consumed
+    locally into the existing portable `Entry`.
+- **The sink's durable finish, and seal and import as a barrier (c3-B3.3).** The sink's finish at a
+  batch's end returns the final keys of every entry and type set it wrote, after it has
+  flushed the compiler's `cached::Writer` (its queue and threads), settled the store, sealed the
+  open pack and validated that the pack holds every key listed. The `BatchResult` is posted only
+  after that. Seal is therefore a **writer barrier**: nothing of the batch is written after it.
+  Import is a **cache generation boundary** on the lead: `Entries` memoises a missing read and a
+  false `usable` (`cached.rs:801-852`), and `Store::refresh` only adds sealed pack indexes
+  (`ra-jit-store/src/lib.rs:1457-1481`), so a lead that looked an entry up before import and found
+  it absent would keep that answer. The lead's import installs all accepted packs at once,
+  refreshes the store, and builds a **fresh `Entries` view and a fresh full `ObjectCodegen`** with
+  no old patch base (`mod.rs:4980-4992` and `:5206-5212` make a new `Entries` and `roots_from_store`
+  only when `base` is `None`), then records the store-backed base and its tracked marks.
 - **The lead's assembly is a store-hydrated full build.** Today the checkout's code comes from the
   store only in a daemon's first full build (`hydrate`, `mod.rs:671`), and a patch neither compiles
   ahead nor keeps entries. A distributed execution's lead builds with `hydrate` and
-  `roots_from_store` set whatever its daemon built before, so every root and instance whose usable
-  closure is in the imported packs comes from the store; and it keeps the imported entries'
-  `tracked`, so that its next edit can be a patch of this build. A body edit stays a local patch
-  (it compiles a few functions and leases nothing, by GD's batch-size rule). A signature edit or an
-  identity change renames what is downstream; it is a distributed execution, and the lead
-  assembles it hydrated again.
-- **Zero compile queries for imported work.** After import, the lead counts by stable name every
-  run of `compiled_root` and `compiled_instance` (a query executed, not a memo hit), each with its
-  reason: a `Local` item, an item whose usable closure reaches a `Local` or missing one, a `Failed`
-  item the program needs, or a lead-only function. "The store had it" is never a reason. The number
-  of names an executor exported that the lead then compiled is reported, and is 0 in D0's runs, on
-  a cold build and on a warm signature edit.
+  `roots_from_store` set whatever its daemon built before (a fresh object, as above), so every root
+  and instance whose accepted closure is in the imported packs comes from the store; and it keeps
+  the imported entries' `tracked`, so that its next edit can be a patch of this build
+  (`patch.rs:1142-1181` keeps hydrated tracked generic code; `:1246-1272` reads stored root marks).
+  A body edit stays a local patch (it compiles a few functions and leases nothing, by GD's
+  batch-size rule). A signature edit or an identity change renames what is downstream; it is a
+  distributed execution, and the lead assembles it hydrated again.
+- **What is adoptable: raw, accepted and export-invalidated (c3-B3.2).** `Exported` is a raw
+  outcome: a batch wrote the entry. Whether the lead can adopt it depends on its *closure*, and the
+  existing `Entries::usable` is not that test: it walks `Named` callees only (`cached.rs:493-501`),
+  while a `Root` edge means "want this root and import its symbol" at stitch time (`mod.rs:6033-6038`).
+  So at Done the coordinator computes, from the results and the pinned packs, three sets:
+  - **raw**: every entry any batch wrote;
+  - **accepted**: a raw entry (or a `FromStore` one) every `Named` and `Root` edge of which reaches
+    an accepted or `FromStore` entry, with its debug type sets present. This is a new
+    closure test, `accepted_closure`, in `cached.rs`, not a call of `usable`;
+  - **export-invalidated**: a raw entry whose closure reaches a `Local`, `Lost`, conflict or
+    needed-`Failed` item, a missing entry or a cycle through one, with the reason and the item
+    reached. An exportable parent of a `Local` generic lands here: the lead has no descriptor for
+    the generic, so it rediscovers it by compiling the parent. The lead **bans** each
+    export-invalidated name in its `Entries` (the banned set `Entries::get` already consults,
+    `cached.rs`), so an entry of it that sits in an imported pack is never read, and its pack
+    is not partly adopted by a side door.
+  Local and missing outcomes thus propagate to ancestors before `Done`, Root edges included; only
+  the accepted set is imported as reusable. (Partial adoption, with a way to recover a missing
+  local instance without compiling its exported parent, would need a descriptor; it is D2's, if
+  ever.)
+- **Zero compile queries, with the counted set stated (c3-B3.2).** After import, the lead counts by
+  stable name every run of `compiled_root` and `compiled_instance` (a query executed, not a memo
+  hit), each with its reason. The lead may run a query for: a `Local` item; an
+  export-invalidated name (named with the item it reaches); a `Failed` item the program needs; a
+  conflict; a rejected function; or a lead-only function (statics, the allocator and runtime
+  shims). "The store had it" is never a reason, and neither is "it was exported". **The number that
+  must be 0 is the number of queries for names in the accepted set**, in the lead's assembly phase
+  and, separately, in its granted phase, on a cold build and on a warm signature edit. It is
+  reported next to the sizes of the raw, accepted and export-invalidated sets and each executor's
+  accepted share: 0 is no evidence if the accepted set is empty or one executor's share is trivial,
+  so GP's bar also requires both.
 
 ### What stays the lead's
 
@@ -1224,23 +1561,108 @@ measured by reason in D0 and D4, not assumed small.
 
 Before any network code, unit D0 proves the mechanism on this Mac: a lead and one helper, two blaze
 processes with their own stores and daemon homes, the coordinator in the lead's process speaking
-section 8's work calls over a Unix socket, splitting one build:
+section 8's work calls over a Unix socket, splitting one build. The calls are CBOR from
+`blaze-wire` (C1) and the build is a `BuildSpec` from C2: D0 does not make a second
+implementation of either. GP has two stages with different prerequisites and different
+statuses (c3-D0.1):
 
-1. `demo/mid` (regex-syntax, serde_json and memchr: generic-heavy) and `demo/real`, with
-   `BLAZE_WHOLE_BUILD=1`. Until P0.6 makes the whole build work on macOS (#255), this stage runs in
-   Docker's Linux VM on this Mac, where it works.
-2. The `tracedecay` crate's library test program (`-p tracedecay --lib`; the crate that is one
-   200.846 s rustc action under Bazel), under the guard: the two processes together stay under the
-   watchdog's 24 GB. If their front ends' peaks overlap past it, the helper loads first and the
-   lead starts after the helper's resolution peak; if the sum still passes, this stage waits for
-   P0-C, which is P0.4's work, not a reason to skip the stage.
+| Stage | Where | Builds | Needs | Can be |
+|---|---|---|---|---|
+| **GP-fixtures** | Docker's Linux VM on this Mac until P0.6; the Mac itself after | `demo/mid` (regex-syntax, serde_json and memchr: generic-heavy), `demo/real`, the fixtures of D0's acceptance, with `BLAZE_WHOLE_BUILD=1` | P0.2, P0.3, C1, C2; P0.6 for the Mac arm; the preflight below | closed on Docker before P0.6 |
+| **GP-full** | the Mac, native | `-p tracedecay --lib`, the crate that is one 200.846 s rustc action under Bazel | P0-H on macOS (so P0-E, P0-B and the rest of Phase 0), and the capacity preflight below | not closable before native P0-E and the capacity preflight; **pending** until then, never skipped and never reported passed |
 
-**GP's bar**, in every run: the program's output equals a one-process build's (the demo programs'
-output; for tracedecay, the list of tests and the verdicts of a pure subset); every entry digest
-the helper exported equals the one-process build's for that key; both executors compiled a share
-of the functions; the lead compiled 0 names an executor exported; the lead's tail is reported by
-reason; 0 compiler execs (P0-A's boundary on both processes). No network layer (D1) is built before
-GP passes.
+D1 needs both closed, three recorded runs of each required arm and of the full stage, not a
+successful demo-only invocation. This resolves D0's tracedecay stage: it is not an independent
+early prototype, it is the part of the gate that needs P0-H, as every unit after Phase 0 whose
+acceptance runs tracedecay does; D0 lands on GP-fixtures with GP-full recorded `pending` and
+its prerequisites named (c3-D0 prerequisites).
+
+**Two platform builds and a preflight (c3-D0.1).** A Mac `BIN` is a Mach-O arm64 binary and
+cannot run in Docker. `proto.py --platform macos|linux-docker --stage fixtures|tracedecay|all`
+names its binary: `BIN_MAC`, built natively as the phase plan's `BIN`, and `BIN_LINUX_AARCH64`,
+built inside a pinned Docker image with its own target directory, with rust-src, the shipped
+standard library and the native linker inputs in the image. Both builds run under the heavy-lock
+wrapper, one at a time and never beside a tracedecay build. Mac blaze processes get the three
+standing variables and one aggregate watchdog. Docker processes get an explicit cgroup budget
+(`memory.max` per executor and for the coordinator and harness) set from the VM's `MemTotal`
+that the preflight reads (8,317,267,968 bytes, 18 CPUs, Docker Desktop 29.9.2, aarch64: **read**
+by u2-check3, one reading, no container started), not from a guess. "Linux, where the whole build
+works" is broader than the evidence: Linux AArch64 has CI for Cranelift, LLVM and full link
+(support.md), and `cargo blaze` there is unverified, so a whole-build success in Docker is
+**unverified** until the preflight has passed. `proto.py --preflight` runs the exact path D0
+needs, on the platform it names: a hello-world whole build with the standard library linked, a
+two-process export and import of one function, and the boundary's own probe; it fails closed,
+naming what is missing (user namespaces, `noexec` mounts, seccomp user notification, the
+filter's ABI check), because Docker being installed proves none of them.
+
+**Capacity of two front ends (c3-D0.2).** P0-C's bar is one worker at 16 GB footprint; two
+residents of that size would need 32 GB before any child, so "wait for P0-C" is not a
+sufficient prerequisite for a gate whose guard is 24 GB summed. LOADMEM's one profiled run
+shows why it matters: 14,000 MB footprint at the peak of resolution and 13,054 MB after it
+(**read**, one run, no spread; limiter: the retained front end and the allocator). A helper
+that stays resident at 13.1 GB beside a lead at its 14.0 GB resolution peak sums to 27.1 GB.
+That is illustrative capacity arithmetic, not a measurement of two processes, and no run has
+measured `-p tracedecay --lib` as two. So GP-full starts with an **aggregate-capacity
+preflight** for that exact `BuildSpec`: both executors to readiness (front end only), then
+bounded batches, with their retained findings, export queues, store mappings and the linker and
+test children, the harness, the coordinator and both executor trees under **one** watchdog and
+one heavy-lock lifetime, every standing `RA_JIT_*` setting on, recording the simultaneous
+aggregate footprint and the swap series at 1 s, not each process's peak. Staggering the helper
+first is one tried mechanism. If the preflight fails, GP stays pending and the split is
+implemented differently: a measured stronger P0.4 target, reclaiming or sharing front-end
+state (D3's image), or another mechanism whose combined reservation fits. The guard is not
+raised or lowered to make it fit, and a capacity failure is never recorded as a skip or a pass.
+
+**GP's bar**, in every run of every required arm:
+
+1. *Output.* The program's output equals a one-process build's (the demo programs' output; for
+   tracedecay, the list of tests and the verdicts of a pure subset).
+2. *An isolated, independent baseline (c3-D0.3).* The one-process baseline is built from a cold,
+   empty private store, database and daemon home, with recomputation and encoding forced for
+   every compared key, and archived immutably (entries, debug type sets, program bytes). No arm
+   is seeded from another's store. Two store hits, or an export compared with itself, are not a
+   differential check.
+3. *Per-key equality.* Every entry key an executor exported equals the baseline's bytes, debug
+   type-set closure included. A contested instance is compiled only by its winner in the sharing
+   arm, so "every name's digest across executors" is checked in a separate **verification arm**,
+   which compiles duplicates, the colliding unit and environment cases and a sample of the
+   rest independently under different interning and resolution orders. Duplicates stay out of
+   the sharing arm, which is the one whose shares and tail are reported.
+4. *Counted from before load.* The per-name compile-query trace starts before the front end
+   loads and covers every path that compiles: `lower_until`'s `compile_unnamed` (`main.rs:7904-7910`;
+   `mod.rs:7092-7109`, `:2592-2601`), the whole build's root pre-pass (`mod.rs:872-881`) and
+   `compile_ahead`. A distributed run forbids an ungranted compile query: those paths take their
+   work from the grant source or do not run. Three numbers are reported apart: the lead's
+   granted-phase queries, the helper's, and the assembly, rejection and base-record queries
+   after import. The zero bars (c3-B3.2): assembly-phase queries for names in the accepted set are
+   0, and the lead's queries, in either phase, for accepted names a *helper* exported are 0. Names
+   the lead itself exported in its granted phase are its own share and are not counted against it;
+   an export-invalidated name is compiled by the lead with its reason and is not counted against
+   it either.
+5. *Not vacuous.* The accepted set is nonempty and printed beside the raw and export-invalidated
+   sets. The final stitched program's entries each carry an origin (lead-compiled, a helper's
+   pack, the store), and the helper's share is nonempty and holds roots *and* discovered generic
+   instances. Each executor's share is at least 5% of the accepted entries (a starting value,
+   **unverified**, to be replaced by D0's measurement). A run in which the helper's results were
+   refused, lost or unused and the lead compiled the rest fails with "serial fallback", whatever
+   the output and digests say.
+6. *No rustc.* 0 compiler execs and a provenance record with no rustc-built artifact, in both
+   trees (P0-A's boundary on both processes).
+7. *Reported.* The lead's tail by reason; each process's peak footprint and, on the Mac, the
+   aggregate series.
+
+Any wrong digest, coverage hole, lost finding, ungranted compile or masked serial fallback fails
+GP. No network layer (D1) is built before both stages have passed.
+
+**What a failed GP falsifies (c3-D0.4).** It falsifies this mechanism (claimed discovery, the
+exporter and the ingestion) on the fixture that failed, not distributed compile as a deliverable:
+the program's owner requires it, and a gate that fails changes how it is done. A failure blocks D1
+and sends the work back to a corrected work key, exporter, recovery strategy or, if the
+failure is that helpers cannot name what they find, D2's descriptor. A pass is not a proof for all
+Rust, all platforms or all front-end states: a sample cannot settle that two front ends agree, so
+the work key's contract is implemented with differential and fuzz coverage of interning and
+resolution orders beyond D0's fixtures (D0 lands the first corpus). GP has no network and so
+establishes no cross-machine speedup and makes no timing claim; D4 measures.
 
 ### Where each executor's front end comes from
 
@@ -1304,8 +1726,8 @@ work set's counters (items, batches, grants, leases revoked, duplicate compiles,
 front-end load per executor, the lead's tail by reason).
 
 **Correctness bar** (every run): the program's tests give the same verdicts as the one-executor
-build; every entry key present in both has the same digest; the lead compiled 0 names an executor
-exported; 0 compiler execs.
+build; every entry key present in both has the same digest; the lead ran 0 compile queries for
+accepted names an executor exported (GP's counted set, section 4); 0 compiler execs.
 
 **Speed bar** (re-review B, M4): end to end. On the identity-change and signature-edit scenarios,
 the job's time from `Queued` to `Done`, with its critical path named from the stage timestamps
@@ -1480,7 +1902,7 @@ owner's: the `rustc-tests` gate, open, with three options.
   that are blaze: `cargo` is `cargo-blaze`, `rustc` is blaze's answerer extended to a
   diagnostics front end that checks a file and prints rustc-compatible diagnostics, built from
   blaze's own front end. The tests then run on blaze executors inside the boundary (whose
-  identity check allows blaze's own shims by digest). Whether the tests' asserted output is
+  approved set holds blaze's own shims, by digest). Whether the tests' asserted output is
   matched is measured per test; a test whose output blaze cannot match stays on Bazel by name.
   This is a unit the owner can ask for (S4 below), not part of the default plan.
 - **Change the tests**: the owner's repository, the owner's call.
@@ -1549,9 +1971,9 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   | `DELETE /v1/jobs/<execution>/subscribers/<id>` | | `{}`; the execution is cancelled when its last subscriber leaves |
   | `POST /v1/workers/hello` | `{0: agent name, 1: capacity, 2: list of ExecutorState}` | `{0: accepted}` |
   | `POST /v1/workers/next` (long poll) | `{0: free reservations, 1: FrontEndKeys held}` | an assignment `{0: ExecutionId, 1: Attempt, 2: BuildSpec, 3: Capability, 4: role, lead or helper}`, or nothing |
-  | `POST /v1/work/join` | `{0: ExecutionId, 1: Attempt, 2: RootSet, 3: set of WorkName rejected}` | `{0: the execution's RootSet}` or error 6 (a different one) |
+  | `POST /v1/work/join` | `{0: ExecutionId, 1: Attempt, 2: RootSet, 3: set of WorkName rejected}` | `{0: the execution's RootSet, 1: whether the lead's has fixed it}`; error 6 (a different `RootSet` after the lead joined); a helper's provisional `RootSet` that differs from the lead's is fenced (section 4) |
   | `POST /v1/work/lease` | `{0: ExecutionId, 1: Attempt}` | a `Grant`, or nothing when the work set has none for this holder |
-  | `POST /v1/work/result` | `BatchResult` | `{0: set of WorkName granted to the holder from its found names}` or error 6 (a dead lease generation) |
+  | `POST /v1/work/result` | `BatchResult` | `{0: set of WorkName granted to the holder from its found names, 1: set of WorkName that became a conflict}` or error 6 (a dead lease generation) |
   | `POST /v1/workers/events` | `{0: ExecutionId, 1: Attempt, 2: list of events}` | `{0: continue or cancel}`; heartbeats ride on it |
 
 - **Joining from a hosted runner.** The Tailscale action with an OIDC client whose only scope is
@@ -1617,7 +2039,7 @@ tooling and the report form, the owner runs it and the report unit records it).
 | Gate | Before | Measurement | Bar | Where |
 |---|---|---|---|---|
 | **P0-A to P0-H** | every unit after Phase 0 that names them; never the Phase 0 unit that remediates the predicate | section 0 | section 0 | Mac; P0-G Linux |
-| **GP, the two-process prototype** | D1 (no network layer before it) | section 4, "The first unit" | section 4 | Mac (Docker on the Mac for the demo stage until P0.6) |
+| **GP, the two-process prototype** | D1 (no network layer before it; both stages) | section 4, "The first unit": GP-fixtures, then GP-full after its preflights | section 4 | GP-fixtures: Docker on the Mac until P0.6, then the Mac; GP-full: the Mac, native, after P0-H |
 | **G1, cross-machine hits** | C5's switch to per-crate records | `harness/dist/crossmachine.py`: machine B (other `HOME`, `CARGO_HOME`, checkout path, target and store) builds A's commit from A's published records | ripgrep and nushell: 0 functions compiled on B; tracedecay: at least 99% of functions from the store on B, every miss listed with its cause; programs print on B what cargo's builds print there, panic paths included | Mac (two machines on one host); Linux |
 | **G2, the cache in CI** | S1's blocking step | hosted runner, tracedecay test programs from nothing: no remote, warm `Main`, and Bazel's fleet build of the same commit | warm `Main` no slower than Bazel's fleet build; functions compiled only in the affected closure of the commit's changes (the edited crates and the checkout crates downstream, cache.md), until #344 | fleet |
 | **G3, one job** | E3's switch | a warm lead against Bazel's fleet job, same commits: body edit in a leaf crate, body edit in the `tracedecay` crate, signature edit in a crate many depend on | push to verdicts faster than Bazel's fleet job for each, 5 runs each | fleet |
@@ -1643,6 +2065,10 @@ export CARGO_TARGET_DIR=/Users/bytedance/dev/blaze-targets/<unit>
 cargo +1.99.0 build -p ra-jit --release
 export BIN="$CARGO_TARGET_DIR/release/ra-jit"
 ```
+
+A unit with a Docker stage also builds `BIN_LINUX_AARCH64` inside Docker, from its own pinned
+image and its own target directory, under the same wrapper and never beside another heavy build
+(D0 names the form); a Mach-O `BIN` does not run in a container.
 
 Fixture repositories and commits are pinned in `harness/dist/fixtures.toml` and fetched by
 `python3 harness/dist/fetch.py` (unit P0.1), into `~/work/<name>` at the pinned commit. Paths
@@ -1678,25 +2104,29 @@ Verify: `python3 -I harness/tracedecay.py --td ~/work/hello --predicate P0-A --e
 python3 -I harness/tracedecay.py --self-test`. Where: Mac.
 
 **P0.2 The no-rustc boundary.** Goal: P0-A's mechanism, as section 0 specifies it: the process-tree
-boundary (Linux mount namespace and seccomp exec policy, macOS Seatbelt profile), installed by the
-worker on itself and failing closed; `crates/blaze-spawn` for every spawn site of `crates/` and the
-vendored launchers; blaze's answerer for compiler probes, with `answers.rs`'s fallback removed;
-provenance records. Files: `crates/blaze-spawn` (new), `crates/ra-jit/src/sandbox.rs` (deny instead
-of continue at `:810-829`; the tree-wide namespace), a new `crates/ra-jit/src/sandbox/macos.rs`,
+boundary (Linux mount namespace with `noexec` mutable mounts, the exec store and a seccomp filter
+that rejects other ABIs; macOS Seatbelt allow-list), installed by the worker on itself and failing
+closed; `crates/blaze-spawn` for every spawn site of `crates/` and the vendored launchers; blaze's
+answerer for compiler probes, with `answers.rs`'s fallback removed; provenance records. Files:
+`crates/blaze-spawn` (new), `crates/ra-jit/src/sandbox.rs` (exec authorised by the kernel, not by
+`CONTINUE` at `:810-829`; the ABI check at `:695-705`; `execveat` with an empty path at `:835-858`;
+no_new_privs and the dropped capabilities; the tree-wide namespace; the exec store), a new
+`crates/ra-jit/src/sandbox/macos.rs`,
 `crates/ra-jit/src/{main,answers,link,splice,shipped,stub,socket,doctest,test_harness}.rs`,
 `crates/ra-jit/src/cargo/{mod,state,wrapper,script,daemon,run,whole,own_script,own_macro,client}.rs`,
 `crates/ra-jit/src/bin/{ra-jit-rustc,cargo-blaze}.rs`, `crates/blaze-build-script/src/{main,run}.rs`,
 `crates/hir-ty-codegen/{asm,fncache}.rs`, `crates/ra-jit-store/src/lib.rs`,
 `crates/blaze-registry/src/git.rs`, one hook each in `vendor/rust-analyzer/crates/stdx/src/process.rs`
 and `proc-macro-api/src/process.rs`, `harness/spawnsites.py`, `harness/dist/spawn-allow.toml`,
-`harness/dist/fixtures/norustc/`. Depends: P0.1. Acceptance: with deny, a project blaze cannot build
+`harness/dist/execrace.py`, `harness/dist/fixtures/norustc/`. Depends: P0.1. Acceptance: with deny, a project blaze cannot build
 without cargo fails before any spawn, naming the reason; `spawnsites.py` passes; the audit counts
 0 compiler execs on hello-world on Linux (Docker), where the whole build works. From the reviews:
 - [rb-B1] "Audit actual descendant execution with absolute-path compiler, renamed executable,
   shell/linker wrapper, script/proc-macro/test spawning cargo, and cargo aliases/plugins. Gate P0-A
   on those negative fixtures and fail closed where enforcement cannot be provided." Checked by:
-  every negative fixture of section 0 on Linux (Docker) and macOS ends with 0 compiler execs and a
-  named refusal; a worker started where the boundary cannot be installed (a Docker container
+  every negative fixture of section 0 on Linux (Docker) and macOS ends with the outcome section 0
+  states for it (a named refusal and 0 compiler execs, or, for the in-process fixtures, run and
+  recorded as out of scope); a worker started where the boundary cannot be installed (a Docker container
   without user namespaces; `sandbox_init` made to fail) exits naming why; the positive fixtures
   (`pnpm` from a build script, `autocfg`, `version_check` and `rustversion` probes, a `cc` build)
   pass.
@@ -1712,10 +2142,65 @@ without cargo fails before any spawn, naming the reason; `spawnsites.py` passes;
   hello-world and ripgrep here, and on `tracedecay-cli` in P0.8; `own_macro.rs`'s two fallbacks and
   the loaded symbol files are gone in worker mode, and `whole.rs` makes Test and Check whole as it
   does Build and Run, each with a test.
+- [c3-B1.1] "The denylist knowingly admits compilers that are not in the host manifest ... Add
+  pre-staged non-host toolchain, modified/renamed compiler+driver, explicit dynamic-loader,
+  library-loading and interpreter fixtures; zero execs alone is not an oracle for library
+  compilation." Checked by: the fixtures of section 0's table, each with its stated outcome on
+  Linux (Docker) and macOS. Refused rows: the file is not executed or mapped, the audit names the
+  refusal (errno, file, process chain), the provenance record holds no foreign artifact, and the
+  build fails only where it needed the file. For the library-loading fixture the oracle is the
+  failed mapping, and a fixture whose audit shows 0 execs but whose library mapped fails the
+  unit. Out-of-scope rows (an in-process compiler in a test, a build script and a proc macro; an
+  interpreter implementing one; bytes brought in): the job runs, the harness records "out of
+  scope: in-process compilation", and the unit fails if the docs or the harness report a
+  guarantee the table does not give. The declared-toolchain row is refused by the declaration
+  check; a bundle that declares a compiler the check does not recognise is approved, and the
+  fixture records that as the row's stated outcome, since a bundle is the owner's act and not a
+  job's. The positive fixtures pass,
+  including the C probe and the `protoc` through the promotion path; the list of tracedecay's
+  107 build scripts and of the `-sys` crates that execute a file they wrote is recorded, each with
+  the promotion route it takes.
+- [c3-B1.2] "Linux must not approve mutable exec arguments and then CONTINUE ... Negative tests
+  need a racing path/buffer replacement, fd-based exec and compat-ABI bypass." Checked by, on
+  Linux (Docker's aarch64 VM here; the live x86-64 compat call needs a Linux x86-64 host, the
+  owner's `linux-host` gate), with the supervisor's `CONTINUE` for an exec removed from the code
+  (`spawnsites.py` fails on a `CONTINUE` reply in an exec path):
+  1. *racing replacement*: one thread rewrites an `execve` pathname buffer between an approved
+     binary and a pre-staged compiler while another loops the call, and a second variant swaps a
+     symlink; 100,000 iterations per variant (a starting value, **unverified**), 3 runs: 0 executions of unapproved bytes (counted by
+     a marker the compiler writes on start), every attempt on the compiler refused by the kernel;
+  2. *fd-based exec*: `execveat(fd, "", AT_EMPTY_PATH)` and `fexecve` on an fd opened on a job's
+     compiler (refused, `EACCES`), on a memfd with and without `MFD_NOEXEC_SEAL` (refused; the
+     call without the flag is rejected by the filter), on a deleted file (refused), on an
+     approved tool (runs), and on a descriptor of the host toolchain inherited from the parent
+     (`EBADF`, as `close_range` left none);
+  3. *compat ABI*: a static binary that issues `execve` through `int 0x80` and through an `x32`
+     number (`nr | 0x40000000`) on x86-64 is killed with the arch named; the filter program is also
+     run in a BPF interpreter over `seccomp_data` for every `AUDIT_ARCH_*` value and the x32 bit,
+     and only the native arch with a native number is allowed. That interpreter run is the test
+     wherever the live call cannot run: Apple cores have no AArch32, so on the Docker VM here the
+     live row is reported `unsupported: no compat ABI`, not passed, until a host that has the ABI
+     runs it;
+  4. *unresolvable target*: an unreadable pointer, a path over `PATH_MAX` and an exec while the
+     audit sink is full are each denied with `EACCES`, never continued;
+  5. *privilege and storage*: a job that tries to remount its worktree `exec`, `unshare` a user
+     namespace, `ptrace` a sibling or call `pivot_root` is refused with the capability or
+     syscall named, `/proc/self/status` shows `NoNewPrivs: 1` and an empty effective
+     capability set before the first job instruction, and a script and an interpreter case
+     (`./drive.sh` refused, `sh drive.sh` run) behave as section 0, step 4, says.
+  The macOS counterparts (a rename, a hard link and a symlink into an allowed subpath; a pre-opened
+  descriptor and an already mapped image of a forbidden file; an unsandboxed service the job
+  asks over XPC to run a file; a failed second `sandbox_init`) are in the same unit, and
+  **verified for the narrow case only**: on this Mac (macOS 26.6.2, arm64) a self-applied profile
+  denying `process-exec` and `file-read-data` was inherited by a `/bin/sh` child and its
+  grandchild, and a second `sandbox_init` could not remove it (**read**, u2-check3, one run). The
+  production profile, the `file-map-executable` rule, the audit's delivery and the future
+  releases are P0.2's to check (c3-B1.3).
 
 Verify: `cargo test -p blaze-spawn -p ra-jit spawn && python3 -I harness/spawnsites.py && python3 -I
 harness/tracedecay.py --td ~/work/hello --predicate P0-A --linux-docker && python3 -I
-harness/tracedecay.py --predicate P0-A --fixtures norustc`. Where: Mac, Docker.
+harness/tracedecay.py --predicate P0-A --fixtures norustc && python3 -I harness/dist/execrace.py
+--linux-docker`. Where: Mac, Docker.
 
 **P0.3 A loading worker is bounded.** Goal: P0-B. The worker checks its own footprint during
 load and its build, and past `RA_JIT_MEMORY_MAX` stops with "the worker holds N MB, over the N MB
@@ -1889,6 +2374,13 @@ answered without it. From the reviews:
   fixture where it does; crossmachine with machine B in a Docker container of another libc
   version: function entries are shared where no such field differs, programs and test verdicts are
   not (their `ExecPlatform` differs).
+- [c3-B2.1] "Include canonical UnitSpec identity and semantic environment fingerprint where
+  equivalence is not proved; apply the same distinction to store keys." Checked by: two requests
+  that section 4's `WorkKey` tells apart (an instance asked under two param environments; a
+  function present in two units) get two entry keys, or the exporter marks the pair `Local`
+  rather than let one overwrite the other; on a fixture where the stable name alone would have
+  merged them, a cross-machine build gives the right program and no entry of one request is read
+  for the other.
 
 Verify: `python3 -I harness/dist/crossmachine.py --all --remote server && python3 -I
 harness/dist/crossmachine.py --remote server --b-docker`. Where: Mac, Docker.
@@ -2002,27 +2494,37 @@ Mac, Docker.
 ### Phase 3: distributed compile
 
 **D0 Two processes on one Mac (gate GP).** Goal: section 4's mechanism without a network: the
-exporter, claimed discovery, the lead's store-hydrated assembly and the compile-query count,
-proven by a lead and one helper splitting one build. `compile_ahead`'s batch (P0.3) gets a work
+work key and pre-index, claimed discovery with retained findings, the exporter and its
+`ExportContext`, the lead's store-hydrated assembly and the compile-query count, proven by a lead
+and one helper splitting one build. `compile_ahead`'s batch (P0.3) gets a work
 source and a sink behind two traits in `hir-ty-codegen`: locally the queue and the object, in D0
 the coordinator and the exporter. The work set is the sans-IO state machine of section 4 in
-`crates/blaze-dist` (join, grant, commit, done, the fencing table), driven in the lead's process
-over a Unix socket with section 8's `work` calls as CBOR. Files: `crates/hir-ty-codegen/export.rs`
-(new), `later.rs` (`entry`, `keep` and `tracked` through the exporter), `mod.rs` (`compile_ahead`'s
-source and sink, `hydrate` and `roots_from_store` for a distributed lead, the compile-query
-counter), `cached.rs`, `stable.rs` (the root list in canonical order), `crates/blaze-dist` (new),
+`crates/blaze-dist` (join, grant, commit, done, the fencing table, conflicts, returned work),
+driven in the lead's process over a Unix socket with section 8's `work` calls as CBOR. Its
+transitions are tested sans-IO, with no sockets, in this unit; D1 adds only the HTTP layer and
+its fault injection. Files: `crates/hir-ty-codegen/export.rs`
+(new; the `ExportContext`), `later.rs` (`entry`, `keep` and `tracked` through the exporter),
+`mod.rs` (`compile_ahead`'s source and sink, `hydrate` and `roots_from_store` for a distributed
+lead, the compile-query counter from before load), `cached.rs` (`accepted_closure`, the sink's
+durable finish), `stable.rs` (the work key, the `tuple` digest, the pre-index and the root list in
+canonical order), `crates/blaze-dist` (new),
 `crates/ra-jit/src/worker.rs` (new; the local driver), `crates/ra-jit/src/main.rs`,
-`crates/ra-jit-store/src/lib.rs` (import of a pack), `harness/dist/proto.py`. Depends: P0.3 (u7's
-batch), P0.2 (the boundary on both processes); P0.6 for the Mac's demo stage (Docker until then);
-P0-E and P0-B for the tracedecay stage. Acceptance: GP's bar (section 4) on `demo/mid` and
-`demo/real`, 3 runs each, then on `-p tracedecay --lib` under the guard, 3 runs; every run records
-both executors' shares, grants, duplicate compiles, the lead's tail by reason and each process's
-peak footprint. From the reviews:
+`crates/ra-jit-store/src/lib.rs` (import of a pack), `harness/dist/proto.py` (`--platform`,
+`--stage`, `--preflight`, `--capacity`), `harness/dist/fixtures/dist/`. Depends: P0.3 (u7's
+batch), P0.2 (the boundary on both processes), C1 and C2 (the wire types and the `BuildSpec` the
+work calls carry); P0.6 for the Mac arm of GP-fixtures (Docker until then); for GP-full, P0-H on
+macOS (so P0-E and P0-B with it) and the capacity preflight (c3-D0 prerequisites). Acceptance:
+GP-fixtures: GP's bar (section 4) on `demo/mid` and `demo/real`, 3 recorded runs each; GP-full:
+the same bar on `-p tracedecay --lib` under the guard, 3 recorded runs, when its prerequisites are
+met, and `pending` with them named until then; every run records both executors' shares, grants,
+duplicate compiles, the lead's tail by reason, the raw, accepted and export-invalidated sets and
+each process's peak footprint. From the reviews:
 - [rb-B3] "Make D1 test that lead compile-query invocations are zero for successfully imported
   work on both cold and warm signature edits, not just that the program is correct (which serial
   recompilation can also satisfy)." Checked by: on a cold build and on a signature edit of
-  `demo/mid`'s workspace crate made after a warm build, the lead's counter shows 0 compile queries
-  for names the helper exported, and every compile query it does run carries a reason.
+  `demo/mid`'s workspace crate made after a warm build, the lead's counters, taken from before the
+  front end loads, show 0 assembly-phase compile queries for accepted names and 0 queries for
+  accepted names a helper exported, and every compile query it does run carries a reason.
 - [a-M7] "normal assembly still disables checkout store hydration on warm patch builds and D1
   assigns no patch/base integration." Checked by: after the distributed signature edit, a body
   edit is a local patch of the hydrated build (its `tracked` kept), and its program equals a
@@ -2032,8 +2534,8 @@ peak footprint. From the reviews:
   before D1 is declared implementable." Checked, for the first stage, by: two processes that load
   the same fixture with the crates resolved in different orders (so their interners differ) post
   the same `RootSet`, and name every root and instance with long nested types, closures, async
-  functions, const generics, caller bounds and a unit present twice (host and target) alike; a
-  helper whose `RootSet` differs is refused. The descriptor's own round trip is D2's.
+  functions, const generics, caller bounds and a unit present twice (host and target) alike. The
+  descriptor's own round trip is D2's.
 - [rb-M1] "Add tests with a cached root but evicted callee, cached generic but missing descendant,
   cyclic cache entries, missing debug type set and GC during upload/import. Measure lead fallback
   work and forbid false complete-coverage claims." Checked by: each of those five cases is a
@@ -2047,16 +2549,114 @@ peak footprint. From the reviews:
 - [b-M7] "there is no terminal lead-only outcome for an uncacheable fragment" Checked by: a fixture
   function the exporter cannot export (data holding the checkout's path, before C4) is `Local`, the
   lead compiles it and its callers, and the program is right.
+- [c3-B2.1] "A name is not yet a total, environment-safe work identity." Checked by: (1) a fixture
+  asked under two param environments (caller bounds, an opaque type) and one present in two units
+  (host and target) get four distinct `WorkName`s and four entries, none overwriting another, and
+  the entry key tells them apart or the colliding pair is `Local`; (2) a request with no stable
+  name (a const argument `stable.rs:597-607` cannot name) is an `unnamed` entry of its parent, a
+  terminal `Edge`, the parent is `Local`, and the lead rediscovers the request by compiling the
+  parent, with the program right; (3) two finders reporting one name with different `tuple`s make
+  a `Conflict`: nothing is granted or exported for it, its exported callers are not accepted, the
+  lead compiles it and the conflict is counted; (4) a root list with a tied pair (same
+  `WorkKey`, different `tuple`) swapped on one executor posts a different `RootSet`; (5) the
+  **verification arm** compiles every colliding environment and unit case independently on both
+  executors under different interning orders and compares code, requests, debug and tracking
+  bytes; on any disagreement GP fails or the work routes `Local`, name equality alone not
+  sufficing.
+- [c3-B2.2] "Finder retention must be an explicit lifetime and lease contract." Checked by: a run
+  with at least three real batch evictions and type GCs between a finding and its grant, over
+  closures, coroutines, caller bounds and types past 1,024 bytes, in which every grant resolves;
+  a holder whose finding was dropped (fault-injected) answers `Lost { lost-finding }`, stops being
+  a finder, and the name goes to another finder or becomes terminal `Local`; a batch stopped at
+  the budget returns its unprocessed ranges and names with its items, and no next generation is
+  issued before they are back in the pool; on lead loss, stale attempt results are refused,
+  outstanding roots and names are reassigned, dead attempts' findings are invalid, and a name with
+  no finder left reaches the new lead's tail and is compiled by required-reachability, never by
+  decoding a digest; a root-only result from a dead generation installs no names.
+- [c3-B2.3] "Root agreement is an admission check, not full front-end agreement or a liveness
+  proof." Checked by: (1) a helper joining first, then a lead whose `RootSet` differs, fences the
+  helper and the execution restarts serially on the lead's inputs, with the determinism bug
+  reported and the lead never refused; (2) two executors with equal sorted roots and an impure
+  macro that changes a body (and a build script whose output changes a body) without changing the
+  roots: they differ in `inputs`, or share the lead's published output, and the program equals a
+  one-process build's; (3) a heartbeating helper that commits nothing is revoked by the
+  progress timeout before any median exists; a root lost three times goes to the lead's tail; an
+  execution with no compatible lead ends `Failed`, and one at its deadline `Cancelled`, each
+  named and neither reporting `Done`; (4) the sans-IO tests also cover multiple finders, holder
+  loss, partial batches, and a replay before and after a generation change.
+- [c3-B2 pre-index] "The lead/helper must pre-index all eligible non-generic entries and on-demand
+  functions into digest-to-local-root mappings ... An unknown digest must be a conflict/local
+  outcome, never silently missing work." Checked by: an on-demand non-generic function reached
+  only through a call (not a root) is granted by digest to either executor and compiled; a
+  grant naming a digest in neither the holder's index nor its findings is `Lost { unknown-name }`,
+  counted as a conflict, and the function ends compiled by the lead; two units sharing one
+  spelling resolve to two index entries.
+- [c3-B3.1] "ExportContext must resolve every request, not receive an object's already-resolved id
+  maps." Checked by: a test per `FuncTarget` and `DataRequest` variant, each classified
+  identically by the object-backed and the batch-backed caller: native, owned and shipped
+  symbols, TLS, foreign and own statics, `TypeId` in a call *and* in a blob, a vtable and drop
+  glue, `asm`, line-only and full debug, and a tracked checkout entry; a request outside the
+  classifier's table is `Local`, never `Import`; a counter shows the classifier compiled nothing
+  and mutated no object; the entry an object-free helper writes equals the one the object-backed
+  `later.rs` writes for the same request; the policy digest of two executors and the lead is equal.
+- [c3-B3.2] "'0 exported names compiled by the lead' conflicts with the Local closure rule."
+  Checked by: a fixture whose exportable parent calls a generic the exporter marks `Local`: the
+  parent is raw and export-invalidated with that reason, the lead compiles it (counted with the
+  reason), and the program is right; a `Root` edge to a `Local` item invalidates its caller; the
+  harness prints raw, accepted and export-invalidated sets apart and asserts 0 for the counted
+  set of section 4 (accepted names), with a nonempty accepted set and both executors' accepted
+  shares nonempty. Labelling all useful work `Local` passes nothing.
+- [c3-B3.3] "Seal/import is a compiler-writer barrier and a cache generation boundary." Checked by:
+  a lead that looked an entry up before import and found it absent finds it after (a fresh
+  `Entries`); a batch whose last entry and last type set are written asynchronously is complete at
+  the sink's finish and sealed with every key it lists, or the finish fails; after a signature
+  edit rebuilt warm, an immediate body edit is a local patch of the fresh store-backed base with
+  its tracked marks, and its program equals a one-process build's.
+- [c3-D0.1] "Specify two platform builds, an actual Docker preflight and honest stage readiness."
+  Checked by: `proto.py --platform macos|linux-docker --stage fixtures|tracedecay|all` builds and
+  names `BIN_MAC` and `BIN_LINUX_AARCH64` as section 4 says; `--preflight` runs hello-world, a
+  whole build with the standard library, and a two-process export and import on the platform, and
+  on a Docker run with the namespaces or seccomp removed it exits non-zero naming them; the
+  stage statuses print as `closed`, `pending (needs ...)` or `failed`, and `--stage all` never
+  reports `closed` for `tracedecay` while a prerequisite is unmet; three runs of each required
+  arm are recorded, and D1's verify refuses to start without a report holding both stages
+  `closed`.
+- [c3-D0.2] "P0-C's one-worker 16 GB target does not guarantee the two-process 24 GB gate."
+  Checked by: `proto.py --capacity` runs the aggregate preflight of section 4 for
+  `-p tracedecay --lib`, with the harness, coordinator and both trees under one watchdog and one
+  heavy-lock lifetime and every standing `RA_JIT_*` setting on, and writes the simultaneous
+  aggregate footprint and swap series (1 s), 3 runs; a run over the guard is `failed: capacity`
+  and leaves GP-full `pending`, never `closed` or skipped; the guard's values appear unchanged in
+  the report.
+- [c3-D0.3] "Count from before load, isolate the baseline, and make the oracle non-vacuous."
+  Checked by: the trace starts before the front end loads and an injected ungranted compile query
+  (a `lower_until` or root pre-pass compile) fails the run; the three phase counts are reported
+  apart; the baseline is built cold and private, archived, and compared against, and a run seeded
+  from the other arm's store is refused by the harness; the verification arm is separate from the
+  sharing arm; the final program's origin table has a nonempty helper share with roots and
+  discovered generic instances; the cases of section 4's bar (exportable parent of a `Local`
+  child, multiple batch evictions before grants, duplicate finders, dead-lease recovery, a
+  same-`RootSet` different-body conflict, zero-read and no-rustc provenance) are each a fixture.
+- [c3-D0.4] "The gate falsifies this mechanism, not distributed compilation as a deliverable."
+  Checked by: five injected faults each make `proto.py` exit non-zero with a named cause: a
+  flipped byte in an exported entry; a dropped helper pack (a serial fallback); an ungranted
+  compile query; a swapped tied root pair; an empty helper share. A failed GP prints that it
+  falsifies the mechanism on that fixture and that D1 is blocked, and names the next step
+  (work key, exporter, recovery strategy or D2's descriptor).
 
 Verify: `cargo test -p blaze-dist work && cargo test -p hir-ty-codegen export && python3 -I
-harness/dist/proto.py --demo && python3 -I harness/dist/proto.py --tracedecay`. Where: Mac (Docker for
-the demo stage until P0.6).
+harness/dist/proto.py --platform linux-docker --preflight && python3 -I harness/dist/proto.py
+--platform linux-docker --stage fixtures` (and `--platform macos --stage fixtures` once P0.6 has
+landed); GP-full is closed by `python3 -I harness/dist/proto.py --platform macos --stage tracedecay
+--capacity`, which prints `pending` with the unmet prerequisites until they are met. Where: Mac,
+Docker.
 
 **D1 The work set over the network.** Goal: section 4's protocol between machines: the work calls
 of section 8 over HTTP, leases with heartbeats and progress timeouts, the fencing table, pins of
 uploaded packs, several helpers and several leads. Files: `crates/blaze-dist`,
 `crates/blaze-serve/src/work.rs`, `crates/ra-jit/src/worker.rs`, `harness/dist/shards.py`. Depends: D0
-(GP passed), E3, C5, P0-A, P0-B. Acceptance (`shards.py`, a lead and two helpers on one host, each
+(both stages of GP closed, c3-D0.1), E3, C5, P0-A, P0-B. The sans-IO transitions of the work set are
+D0's; D1 adds the HTTP transport and its fault injection. Acceptance (`shards.py`, a lead and two helpers on one host, each
 with the whole front end, then two in Docker): GP's bar holds with two helpers; fixtures with
 mutually recursive functions across crates, generics, trait objects, drop glue and statics; two
 leads at once (neither waits on the other). From the reviews:
@@ -2287,15 +2887,29 @@ they stay in Docker (this design's default)?
 - Whether blaze's codegen gives byte-identical entries for the same key on two machines (C5), and
   whether two processes with different interning orders name every root and instance alike (D0).
   Section 4's first stage rests on the second.
-- Whether a Seatbelt profile a process applies to itself holds for all its descendants on macOS
-  26, and whether denying `file-map-executable` of `librustc_driver` stops a copied rustc (P0.2);
-  whether the fleet's Linux kernels allow unprivileged user namespaces, seccomp user notification
-  and Landlock (P0.2 fails closed where they do not).
-- Whether two tracedecay front ends fit under the guard's 24 GB at once (D0's second stage), and
-  how many functions tracedecay's whole build compiles (LOADMEM stopped at 640,000).
+- Seatbelt on macOS 26 (c3-B1.3): **verified for one narrow probe** (u2-check3, macOS 26.6.2,
+  arm64, one run): a profile a process applied to itself with `sandbox_init` was inherited by a
+  child and a grandchild for `process-exec` and `file-read-data`, and a second `sandbox_init`
+  could not remove it. **Not verified:** the production allow-list, `file-map-executable`, the
+  audit's delivery, an already mapped image or pre-opened descriptor of a forbidden file, an
+  unsandboxed service the job asks to run a file (launchd, XPC), sandbox extensions, and later
+  releases; P0.2 tests each, installs the profile before the job can acquire a forbidden resource
+  (Seatbelt enforces at acquisition), and fails closed;
+  whether the fleet's Linux kernels allow unprivileged user namespaces, `noexec` mounts in them,
+  seccomp user notification, `memfd_noexec` and Landlock (P0.2 fails closed where they do not).
+- Whether two tracedecay front ends fit under the guard's 24 GB at once (GP-full's capacity
+  preflight, D0), and how many functions tracedecay's whole build compiles (LOADMEM stopped at
+  640,000). No run has measured `-p tracedecay --lib` as two processes, and nothing has measured
+  the retained findings, export queues or test children (c3-D0.2); LOADMEM's single-run numbers
+  give illustrative arithmetic, not a bound.
+- Whether Linux AArch64 runs the whole build and `cargo blaze` (support.md: `cargo blaze` there is
+  unverified); D0's preflight settles it for the Docker VM here, and until it passes a Docker
+  success is **unverified** (c3-D0.1).
 - How many functions the exporter leaves `Local` in a whole build, and so how long the lead's tail
-  is (D0); and whether the instance ids a helper keeps for names it found survive the revision
-  change with which u7's batch releases its memos (salsa's interned values), or must be found again.
+  is, and how many raw entries are export-invalidated by a `Local` callee (D0); and whether the
+  owned requests a helper retains for names it found survive the revision change with which
+  u7's batch releases its memos (salsa's interned values), as section 4's retention contract
+  needs, or must be found again (D0 tests it, c3-B2.2).
 - tracedecay was read at `d79de82273`; its CI may have moved since.
 
 ## Appendix A: review findings
@@ -2303,7 +2917,8 @@ they stay in Docker (this design's default)?
 Revision 3 answers the two re-reviews of revision 2 (`2fd75c16`), both of 2026-10-26. Re-review A
 gave each of the 25 findings of the first reviews a verdict and found seven new problems (here
 `ra-N1` to `ra-N7`); re-review B reviewed the design anew (`rb-`). Revision 2's own mapping of the
-first reviews is in `2fd75c16`'s appendix A.
+first reviews is in `2fd75c16`'s appendix A. Revision 3.1 answers one further check, of revision 3
+itself ([Check 3](#check-3-the-focused-check-of-revision-3), below).
 
 Statuses: **resolved** (re-review A found it resolved at revision 2; nothing changed); **fixed in
 doc** (this revision changes the design; where); **moved to acceptance** (the unit's acceptance
@@ -2358,9 +2973,9 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 
 | Finding | Severity | Revision 3 | Where |
 |---|---|---|---|
-| rb-B1, the no-rustc boundary is not a process tree | blocker | **fixed in doc**: the boundary (Linux mount namespace and seccomp exec policy, macOS Seatbelt, fail closed), the spawn API, the answerer, negative fixtures; **moved to acceptance**: P0.2 [rb-B1] | section 0; "The rules this design keeps"; P0.2 |
-| rb-B2, a work item cannot rebuild an instance | blocker | **fixed in doc**: claimed discovery over identical front ends, nothing of an instance on the wire; the lossless descriptor as a second stage; **moved to acceptance**: D0 [rb-B2] (names alike across interning orders), D2 [rb-B2] (the descriptor's round trip) | section 4, "Moving work between processes"; D0; D2 |
-| rb-B3, no portable entries; warm assembly does not consume them | blocker | **fixed in doc**: the exporter, the store-hydrated lead, the compile-query count; **moved to acceptance**: D0 [rb-B3] | section 4, "Export and ingestion"; D0 |
+| rb-B1, the no-rustc boundary is not a process tree | blocker | **fixed in doc**: the boundary (Linux mount namespace and kernel-enforced exec, macOS Seatbelt allow-list, fail closed), the spawn API, the answerer, negative fixtures; **narrowed in revision 3.1** (c3-B1.1): it claims no more than blaze never delegating Rust compilation, no host toolchain exposed and only approved code run, and no longer that a compiler denylist stops job-supplied compilers; **moved to acceptance**: P0.2 [rb-B1], [c3-B1.1], [c3-B1.2] | section 0; "The rules this design keeps"; P0.2 |
+| rb-B2, a work item cannot rebuild an instance | blocker | **fixed in doc**: claimed discovery over identical front ends, nothing of an instance on the wire; the lossless descriptor as a second stage; **moved to acceptance**: D0 [rb-B2] (names alike across interning orders), D2 [rb-B2] (the descriptor's round trip); refined in revision 3.1 (c3-B2.1 to c3-B2.3) | section 4, "Moving work between processes"; D0; D2 |
+| rb-B3, no portable entries; warm assembly does not consume them | blocker | **fixed in doc**: the exporter, the store-hydrated lead, the compile-query count; **moved to acceptance**: D0 [rb-B3]; refined in revision 3.1 (c3-B3.1 to c3-B3.3) | section 4, "Export and ingestion"; D0 |
 | rb-M1, cache hits do not expand coverage | major | **fixed in doc**: `FromStore` is a usable closure in pinned packs; found names commit with their finder; **moved to acceptance**: D0 [rb-M1] | section 4, "The protocol"; D0 |
 | rb-M2, dependency-only helpers | major | **fixed in doc**: home is not the defining crate; the first stage holds whole front ends; GD's memory step; **moved to acceptance**: D2 [rb-M2] | "What blaze has today"; section 4; D2 |
 | rb-M3, lease expiry and fencing | major | **fixed in doc**: the fencing table, a progress timeout, at-least-once compute with exactly-once accounting, pins from upload; **moved to acceptance**: D1 [rb-M3] | section 4, "The protocol"; section 3; D1 |
@@ -2370,6 +2985,35 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 | rb-M7, eager refusals fail the job | major | **fixed in doc**: the seam is the build's own loop; a failure is speculative and the lead decides; **moved to acceptance**: D0 [rb-M7] | section 4; D0 |
 | rb-N1, the 20% headroom not used | minor | **fixed in doc**: 70 GB, two executors at B = 64 GB | section 4, "Memory per machine" |
 | rb-N2, three denominators for P0-D | minor | **fixed in doc**: 30 of 30; **moved to acceptance**: P0.5 [rb-N2] | section 0; P0.5 |
+
+### Check 3: the focused check of revision 3
+
+One check of revision 3 (`9875c09b`) by GPT 6.1, `u2-check3`, of 2026-10-26, limited to B1, B2, B3
+and D0. Verdicts: B1 not workable as stated; B2, B3 and D0 workable with fixes. This is the last
+edit pass before the design is accepted, so each fix is concrete and testable; there is no review
+cycle after it. Statuses: **fixed in doc** (revision 3.1 changes the design or its statement;
+where), **moved to unit acceptance** (the unit's acceptance line, tagged with the id, checks it).
+A row can be both.
+
+| Finding | Check 3 | Revision 3.1 | Unit | Where |
+|---|---|---|---|---|
+| c3-B1.1, the denylist admits compilers not in the host manifest | B1, not workable | **fixed in doc**: the claim narrowed to what is enforceable (blaze never delegates Rust compilation; no host toolchain exposed; approved code only, deny by default); in-process and brought-in compilers stated out of scope; the denylist kept as a diagnostic; **moved to unit acceptance**: the fixture table with expected outcomes | P0.2 [c3-B1.1] | section 0; P0-A; P0.2 |
+| c3-B1.2, approve then `CONTINUE` | B1 | **fixed in doc**: exec authorised by the kernel over `noexec` mutable mounts, an exec store, Landlock, no exec-able memfd; `execveat`/`fexecve`, scripts and interpreters explicit; unknown ABIs killed, unresolvable targets denied; `no_new_privs` and dropped capabilities; **moved to unit acceptance**: racing replacement, fd-based exec, compat-ABI, unresolvable target, mutable-storage tests | P0.2 [c3-B1.2] | section 0, Linux steps 1 to 7; P0.2 |
+| c3-B1.3, Seatbelt inheritance on macOS 26 | B1, not the blocker | **fixed in doc**: marked verified for one narrow probe only; the production profile, `file-map-executable`, audit delivery, pre-opened descriptors, mapped images, service delegation and later releases stay to test, the profile installed before acquisition, fail closed; **moved to unit acceptance** | P0.2 [c3-B1.2] (macOS counterparts), [c3-B1.1] | section 0 macOS; section 2; "Not checked"; P0.2 |
+| c3-B2.1, a name is not a total, environment-safe identity | B2 | **fixed in doc**: `WorkKey` (unit, stable name, environment fingerprint) and `Edge` for unnameable requests, `tuple` digests, a conflict rule, a total root order, the same distinction for store keys; **moved to unit acceptance** | D0 [c3-B2.1]; C5 [c3-B2.1] | "Data shapes"; section 4, "Moving work between processes"; D0; C5 |
+| c3-B2.2, finder retention | B2 | **fixed in doc**: lifetime, identity-pinning and lease contract; `Lost`; returned ranges and names; lead-loss row; **moved to unit acceptance** | D0 [c3-B2.2] | section 4, "Finder retention", "The protocol" steps 2, 5, 9; D0 |
+| c3-B2.3, root agreement is an admission check, not a liveness proof | B2 | **fixed in doc**: three agreements distinguished; `inputs` digest and shared impure outputs; the lead's `RootSet` authoritative, a disagreeing early helper fenced; progress timeout from the grant and retry bound; liveness stated as termination with a result or a named failure, the deadline not a `Done`; **moved to unit acceptance**: sans-IO transition tests in D0, HTTP faults stay D1 | D0 [c3-B2.3]; D1 [rb-M3] | section 4, "The protocol" steps 1, 9, 10; D0 |
+| c3-B2, digest-only on-demand grants (refinement) | B2 | **fixed in doc**: a pre-index of every eligible non-generic and on-demand function under the pinned `BuildSpec`; an unknown digest is `Lost { unknown-name }`, a conflict and a lead-compiled item, never missing work | D0 [c3-B2 pre-index] | section 4, "How (b′) works"; D0 |
+| c3-B2, exactly-once (refinement) | B2 | **fixed in doc**: compute is at least once after a holder dies, accounting exactly once; no gate asks for exactly-once compute | D0, D4 (duplicate compiles as a diagnostic) | section 4, step 9 |
+| c3-B3.1, `ExportContext` must resolve every request | B3 | **fixed in doc**: an immutable per-build policy and a pure per-request classification, `TypeId` from the request, debug and tracking made before memos drop, unknown is `Local`, one classifier for object-backed and batch-backed callers; **moved to unit acceptance** | D0 [c3-B3.1] | section 4, "Export and ingestion"; D0 |
+| c3-B3.2, "0 exported names compiled" against the Local closure rule | B3 | **fixed in doc**: raw, accepted and export-invalidated sets; `accepted_closure` walks `Named` and `Root` edges; Local and missing outcomes propagate to ancestors before `Done`; the counted set stated; **moved to unit acceptance** | D0 [c3-B3.2] | section 4, "Export and ingestion"; GP's bar; D0 |
+| c3-B3.3, seal and import | B3 | **fixed in doc**: seal a writer barrier with a durable finish result; import a cache generation boundary with a fresh `Entries` and a fresh full object; **moved to unit acceptance** | D0 [c3-B3.3] | section 4, "Export and ingestion"; D0 |
+| c3-B3, what a batch end lacks (refinement) | B3 | **fixed in doc**: the three missing things (final-build policy, request-level metadata, durable writer completion) and the unit supplying each | P0.3 (sink seam), D0 | section 4, "Export and ingestion" |
+| c3-D0.1, platform builds, Docker preflight, stage readiness | D0 | **fixed in doc**: `BIN_MAC` and `BIN_LINUX_AARCH64`, `proto.py --platform --stage`, the preflight failing closed, Docker as small-fixture only, GP-fixtures and GP-full with named statuses, C1 and C2 as dependencies, three recorded runs; **moved to unit acceptance** | D0 [c3-D0.1] | section 4, "The first unit"; phase plan; section 11; D0 |
+| c3-D0.2, two-process capacity against the 24 GB guard | D0 | **fixed in doc**: an aggregate-capacity preflight for the exact BuildSpec under one watchdog and lock; illustrative arithmetic labelled; capacity failure keeps GP pending and changes the mechanism, never the guard; **moved to unit acceptance** | D0 [c3-D0.2] | section 4, "The first unit"; D0; "Not checked" |
+| c3-D0.3, count from before load; isolated baseline; non-vacuous oracle | D0 | **fixed in doc**: trace from before load across every compile path, ungranted queries forbidden, phase counts apart, a cold private archived baseline, a separate verification arm, an origin table with a nonempty helper share; **moved to unit acceptance** | D0 [c3-D0.3] | section 4, "GP's bar"; D0 |
+| c3-D0.4, the gate falsifies the mechanism, not the deliverable | D0 | **fixed in doc**: a failed GP blocks D1 and changes how (standing order 13); no claim for all Rust, platforms or in-process compilers; no timing claim; **moved to unit acceptance**: five injected faults fail the gate | D0 [c3-D0.4] | section 4, "What a failed GP falsifies"; D0 |
+| c3-D0 prerequisites (refinement) | D0 | **fixed in doc**: D0's tracedecay stage is GP-full and needs P0-H on macOS plus the capacity preflight; D0 lands on GP-fixtures with GP-full `pending`; D1 needs both | D0; D1 | section 4, "The first unit"; D0; D1 |
 
 ### Counts
 
@@ -2382,6 +3026,12 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
   N1).
 - In all, 44 findings: 10 resolved earlier, 28 fixed in the doc, 5 moved to acceptance only, 1
   owner gate; 36 tagged acceptance lines in 20 units.
+- Check 3's 13 findings (B1.1 to B1.3, B2.1 to B2.3, B3.1 to B3.3, D0.1 to D0.4) and its 4
+  refinements (digest-only grants, exactly-once, what a batch end lacks, D0's prerequisites) are 17
+  rows, all fixed in the doc. 14 tagged acceptance lines in 3 units (P0.2: 2, D0: 11, C5: 1) check
+  14 of the rows; the other three (exactly-once, what a batch end lacks, D0's prerequisites) are
+  statements this document settles, each exercised by a line above. B1.3 is a verification note,
+  not a defect: its probe is recorded and the rest is P0.2's.
 
 ## Appendix B: the research edits
 
