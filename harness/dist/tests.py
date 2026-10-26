@@ -213,7 +213,14 @@ class Harness:
                 self.write("blaze-tests.toml", manifest)
             says = SAYS.get(at, [])
             run = self.cargo("affected", "cache", args, verbose=bool(says), extra=extra)
-            self.check(what, self.verdict(run, expected, passes, says))
+            if what == "configured declared environment" and "[ra-jit]" not in run.out:
+                # Cargo configuration invalidates the whole build state. The cold build
+                # must rerun every test; warm its replacement state before checking reuse.
+                verdict = "ok" if run.ran == expected and run.code == 0 else "COLD CONFIGURATION BUILD DID NOT RERUN"
+                self.check(what, verdict)
+                self.warm("cache")
+            else:
+                self.check(what, self.verdict(run, expected, passes, says))
         self.flaky()
 
     def flaky(self):
