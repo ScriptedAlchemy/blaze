@@ -100,7 +100,8 @@ sets the stores against each other. `ra-jit cache digests` lists a line for each
 sealed packs, `KEY LENGTH SHA256`, and two machines agree when those lines are the same.
 `RA_JIT_KEYS_LOG=FILE` lists the entries a build adds with their stable names, and the proc-macro
 calls with the part of their key that differs (library, input, environment, current directory),
-so that a difference says what it is.
+so that a difference says what it is. Environment diagnostics name variables and fingerprint
+their values; raw values are not written to the log.
 
 What names a place of the machine, and what stands for it in the store:
 

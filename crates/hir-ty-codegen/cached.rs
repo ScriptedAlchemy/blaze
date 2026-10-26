@@ -518,10 +518,6 @@ impl Entry {
         named.chain(self.debug.iter_mut().flat_map(|it| &mut it.files))
     }
 
-    fn of_cargo(&mut self) -> bool {
-        self.files().any(|it| super::moved(it, super::CARGO_HOME, "").is_some())
-    }
-
     /// Names the files under `cargo_home` and the standard library's as every machine does,
     /// on the way to the store, and those below the checkout or beside it. Not to be kept when a
     /// file is already named as one that cargo fetched, or as one of the checkout, and is not:
@@ -533,32 +529,11 @@ impl Entry {
         checkout: Option<&str>,
     ) -> bool {
         for file in self.files() {
-            if let Some(there) = library.and_then(|it| it.stored(file)) {
-                *file = there;
-            }
-        }
-        if cargo_home != Some(super::CARGO_HOME) {
-            if self.of_cargo() {
-                return false;
-            }
-            if let Some(home) = cargo_home {
-                for file in self.files() {
-                    if let Some(there) = super::moved(file, home, super::CARGO_HOME) {
-                        *file = there;
-                    }
-                }
-            }
-        }
-        // After cargo's directory: it can be beside the checkout, and is named by what it is.
-        if checkout != Some(super::CHECKOUT) && self.files().any(|it| super::names_checkout(it)) {
-            return false;
-        }
-        if let Some(root) = checkout.filter(|it| *it != super::CHECKOUT) {
-            for file in self.files() {
-                if let Some(there) = super::stored_as(file, root) {
-                    *file = there;
-                }
-            }
+            let there = library
+                .and_then(|it| it.stored(file))
+                .or_else(|| super::relocate::stored_path(file, cargo_home, checkout));
+            let Some(there) = there else { return false };
+            *file = there;
         }
         true
     }
@@ -574,23 +549,9 @@ impl Entry {
         checkout: Option<&str>,
     ) -> Option<Entry> {
         for file in self.files() {
-            if let Some(here) = library.and_then(|it| it.local(file)) {
-                *file = here;
-            }
-        }
-        for file in self.files() {
-            if super::names_checkout(file) && checkout != Some(super::CHECKOUT) {
-                *file = super::read_as(file, checkout?)?;
-            }
-        }
-        if cargo_home == Some(super::CARGO_HOME) || !self.of_cargo() {
-            return Some(self);
-        }
-        let home = cargo_home?;
-        for file in self.files() {
-            if let Some(here) = super::moved(file, super::CARGO_HOME, home) {
-                *file = here;
-            }
+            *file = library
+                .and_then(|it| it.local(file))
+                .or_else(|| super::relocate::local_path(file, cargo_home, checkout))?;
         }
         Some(self)
     }
@@ -1244,6 +1205,34 @@ mod tests {
             let expected = written_at(&format!("/Users/b/repo/shared/src/lib.rs{suffix}"));
             assert_eq!(arrived.encode().unwrap(), expected.encode().unwrap());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebound_names_are_not_interpreted_as_another_stored_namespace() {
+        let mut source = written_at("/home/a/repo/src/lib.rs");
+        assert!(source.leave(None, None, Some("/home/a/repo")));
+        let arrived = source.arrived(Some("/home/b/.cargo"), None, Some("/cargo/repo")).unwrap();
+        assert_eq!(
+            arrived.encode().unwrap(),
+            written_at("/cargo/repo/src/lib.rs").encode().unwrap()
+        );
+
+        let there = super::super::LibrarySources {
+            here: "/old/rust".to_owned(),
+            built_in: "/rustc/0123".to_owned(),
+        };
+        let here = super::super::LibrarySources {
+            here: "/checkout/toolchain".to_owned(),
+            built_in: there.built_in.clone(),
+        };
+        let mut source = written_at("/old/rust/library/core/src/lib.rs");
+        assert!(source.leave(None, Some(&there), None));
+        let arrived = source.arrived(None, Some(&here), Some("/home/b/repo")).unwrap();
+        assert_eq!(
+            arrived.encode().unwrap(),
+            written_at("/checkout/toolchain/library/core/src/lib.rs").encode().unwrap()
+        );
     }
 
     #[cfg(unix)]
