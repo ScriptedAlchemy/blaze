@@ -33,7 +33,8 @@ pub(crate) struct Contents {
 
 impl Contents {
     pub(crate) fn source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
-        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+        {
             return *hash;
         }
         let hash = library_source_hash(db, krate);
