@@ -58,9 +58,9 @@ for path in (HARNESS, HERE):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-# Where the unit's binaries are kept (the shared builds directory moved from ~/dev to ~/code on 2026-10-26).
-DEFAULT_BIN = next((it for it in ("/Users/bytedance/code/blaze-targets/c4-keys/bin",
-                                  "/Users/bytedance/dev/blaze-targets/c4-keys/bin") if os.path.isdir(it)),
+# Where the unit's binaries are kept: the builds directory of the shared Mac (it moved from ~/dev to ~/code
+# on 2026-10-26), else a release build of this tree.
+DEFAULT_BIN = next((it for it in ("/Users/bytedance/code/blaze-targets/c4-keys/bin",) if os.path.isdir(it)),
                    os.path.join(ROOT, "target", "release"))
 DEFAULT_WORK = "/tmp/c4xm"
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "paths")

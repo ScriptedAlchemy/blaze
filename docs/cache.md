@@ -90,6 +90,33 @@ from the store, and why the rest were not kept. rustc's own cache, `-Zcache-proc
 keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)).
 `harness/expansions.py` tests it.
 
+### Two machines and one commit
+
+A store is shared between machines only if each key in it is a function of what it is the key of,
+and the bytes under it do not name the machine that made them. `harness/dist/crossmachine.py`
+(unit C4 of [distributed.md](distributed.md)) builds one commit on two machines made on one
+host, each with its own `HOME`, cargo home, checkout path, target directory, store and daemon, and
+sets the stores against each other. `ra-jit cache digests` lists a line for each value in the
+sealed packs, `KEY LENGTH SHA256`, and two machines agree when those lines are the same.
+`RA_JIT_KEYS_LOG=FILE` lists the entries a build adds with their stable names, and the proc-macro
+calls with the part of their key that differs (library, input, environment, current directory),
+so that a difference says what it is.
+
+What names a place of the machine, and what stands for it in the store:
+
+| Place | In a key and in a stored value | Where |
+|---|---|---|
+| the cargo home (`registry/src/...`, `git/checkouts/...`) | `/cargo` | `hir-ty-codegen` `moved`, `Entry::leave` and `arrived` |
+| the standard library's sources | `/rustc/<commit>` | `LibrarySources` |
+| the checkout, a file below it that is not a workspace member's | `/checkout/<path>` | `hir-ty-codegen/relocate.rs` |
+| a crate or a file beside the checkout (`path = "../shared"`) | `/checkout/../shared/...`, if the two share two directories | `relocate.rs`, `crate_place`, `Contents::library` |
+| `CARGO_MANIFEST_DIR`, `OUT_DIR` and the macro's current directory, in a proc-macro key | `$PACKAGE`, `$TARGET`, `$CWD` | `ra-jit-expand/src/places.rs` |
+
+A file of a workspace member is named by its place in the workspace, as rustc names it, which is the
+same on every machine. A path that is neither below the checkout nor beside it is kept as it is: no
+other machine has it, so no other machine finds an entry that names it. A proc macro whose output
+has one of its call's places in it is not kept, as code with the checkout's place in its data is not.
+
 ## The disk store
 
 The store is `ra-jit/store` in the user's cache directory (`$XDG_CACHE_HOME`, else
