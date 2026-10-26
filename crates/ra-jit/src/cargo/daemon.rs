@@ -426,6 +426,7 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    unknown_held: AtomicBool,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -543,6 +544,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            unknown_held: AtomicBool::new(false),
         })
     }
 
@@ -752,8 +754,13 @@ impl Worker {
 
     /// What it holds now, and how much it is in use.
     fn held(&self) -> Held {
+        let pid = lock(&self.child).id();
+        let bytes = crate::memory::held_by(pid);
+        if bytes.is_none() && !self.unknown_held.swap(true, Relaxed) {
+            eprintln!("worker {pid} footprint unavailable: aggregate memory usage is unknown");
+        }
         Held {
-            bytes: crate::memory::held_by(lock(&self.child).id()).unwrap_or(0),
+            bytes: bytes.unwrap_or(0),
             asked: *lock(&self.asked),
             busy: self.answering.load(Relaxed) != 0 || self.loads(),
         }

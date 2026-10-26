@@ -803,6 +803,7 @@ fn build_body(
 /// Compiles the function `asked` names at the level it asks for: [`prepare`], then
 /// [`Prepared::finish`] with no counters to count in.
 pub fn compile(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Tiered, String> {
+    let _permit = super::budget::enter().map_err(|why| why.to_string())?;
     prepare(db, asked)?.finish(None)
 }
 

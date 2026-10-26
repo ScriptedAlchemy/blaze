@@ -45,6 +45,7 @@ struct State {
     told_held: bool,
     paused: bool,
     active: usize,
+    completed: usize,
 }
 impl Default for State {
     fn default() -> Self {
@@ -58,6 +59,7 @@ impl Default for State {
             told_held: false,
             paused: false,
             active: 0,
+            completed: 0,
         }
     }
 }
@@ -154,14 +156,8 @@ pub fn monitor(
                 purged = Some(now);
             }
             let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.sample(
-                pressure,
-                held,
-                now,
-                super::compiled_functions(),
-                monitor.grace,
-                monitor.budget.is_some(),
-            );
+            let progress = super::compiled_functions().saturating_add(state.completed);
+            state.sample(pressure, held, now, progress, monitor.grace, monitor.budget.is_some());
             monitor.changed.notify_all();
             drop(state);
             std::thread::sleep(Duration::from_millis(100));
@@ -205,7 +201,7 @@ impl Monitor {
         {
             if state.pressure == Pressure::Critical && !state.paused {
                 eprintln!(
-                    "host memory pressure: compile admission paused; {} functions completed",
+                    "host memory pressure: compile admission paused; {} compile steps completed",
                     state.progress
                 );
                 state.paused = true;
@@ -239,6 +235,7 @@ impl Drop for Permit {
         if let Some(monitor) = self.0 {
             let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active -= 1;
+            state.completed = state.completed.saturating_add(1);
             monitor.changed.notify_all();
         }
     }
