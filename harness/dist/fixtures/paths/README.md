@@ -15,6 +15,9 @@ Each directory is one repository, copied whole to a machine's checkout path.
 
 The harness generates `vendored/vendor/` from the locked registry archive in scratch space.
 It is not a checked-in copy or an input taken from the implementer's ignored files.
+The `vendor-edit` arm changes a vendored body and updates its checksum on B. B's
+fed build must print the changed value, not A's cached value. The sibling fixture
+also prints concatenated file paths with literal dot and repeated-slash suffixes.
 
 Lock files are checked in, so no machine resolves anything; the registry crate comes from each
 machine's own cargo home.

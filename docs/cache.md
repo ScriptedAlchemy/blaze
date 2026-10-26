@@ -120,6 +120,13 @@ Proc-macro keys are not yet content-only. Removing a path from a key is unsafe e
 output does not contain it: a macro can branch on the path's length or read a file below it.
 The harness diagnoses this gap rather than allowing it as a pending success.
 
+Registry source replacements are not assumed immutable. Library identities also hash loaded
+source bytes and their dependency closure, so a changed vendored body cannot reuse the old
+code just because its package name, version and relative path are unchanged. The
+`vendor-edit` negative arm changes a body and its cargo checksum on B and compares B's fed
+program with B's changed oracle. Literal suffixes in `concat!(file!(), ...)` are text: only
+the relocation's leading traversal is interpreted, never dots or slashes in that suffix.
+
 ## The disk store
 
 The store is `ra-jit/store` in the user's cache directory (`$XDG_CACHE_HOME`, else
