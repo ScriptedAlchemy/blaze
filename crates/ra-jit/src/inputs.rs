@@ -19,9 +19,12 @@ use std::{
     time::SystemTime,
 };
 
-use blaze_build_script::{apply::Rerun, output};
+use blaze_build_script::{
+    apply::{Rerun, Stale},
+    output,
+};
 use ide_db::base_db::{Env, TargetKind};
-use project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind};
+use project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 /// The variables cargo takes flags for rustc from.
@@ -83,6 +86,9 @@ struct Scripts {
     scripts: Vec<Script>,
     /// The variables it runs one again for a change of, as they were when they last ran.
     variables: Vec<(String, Option<String>)>,
+    /// What the scripts said when the last check ran them and found the workspace another:
+    /// the load that follows takes it and does not run them again.
+    ready: Option<WorkspaceBuildScripts>,
 }
 
 /// What a script said it reads when it ran, and when that run began.
@@ -137,15 +143,23 @@ struct Script {
     /// Whether cargo runs the script again for it having said other than it did the run
     /// before: its fingerprint of that run is of what the one before said.
     owes: bool,
+    /// The build of the daemon's cargo last ran the scripts for, or looked at them: a build
+    /// asks the worker more than once, and a script cargo runs every build is run once.
+    asked: u64,
 }
 
 impl Script {
-    fn changed(&self) -> bool {
+    /// Whether cargo runs the script again for the `build` of the daemon's that asks, or `0`
+    /// when none is said. What it runs it again for in every build, a file that is not there or
+    /// the run being owed, it runs once for each: the script of the files cargo has looked at
+    /// for this build is not asked for again.
+    fn changed(&self, build: u64) -> bool {
         // What it said, when it did not say or cannot be read, is nothing: its package's files.
-        let stale = |said: &Said| said.rerun.stale_files(&self.root, said.began).is_some();
-        self.owes
-            || self.files.iter().any(Watched::changed)
-            || self.said.as_ref().is_some_and(stale)
+        let stale = |said: &Said| said.rerun.stale_files(&self.root, said.began);
+        let stale = self.said.as_ref().and_then(stale);
+        let everyone = matches!(stale, Some(Stale::Missing(_))) || self.owes;
+        let asked = build != 0 && self.asked == build;
+        self.files.iter().any(Watched::changed) || (!asked && (everyone || stale.is_some()))
     }
 
     /// What cargo compiles the script again for a change to, and a script that said nothing
@@ -310,13 +324,16 @@ fn run_env<'a>(
 
 impl Inputs {
     /// Has the workspace at `root`, loaded with `config`, be one whose inputs are watched. The
-    /// variables the process it was loaded for gave it over the daemon's are `given`.
+    /// variables the process it was loaded for gave it over the daemon's are `given`, and
+    /// `build` is the build of the daemon's whose request loaded it, or `0`: its scripts ran
+    /// for it.
     pub(crate) fn watch(
         &mut self,
         root: &Path,
         workspace: &ProjectWorkspace,
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
+        build: u64,
     ) {
         let mut files = Vec::new();
         for dir in root.ancestors() {
@@ -341,7 +358,7 @@ impl Inputs {
         if self.asked_with.is_empty() {
             self.asked_with.extend(std::env::vars().map(|it| it.0));
         }
-        let mut scripts = Scripts::of(workspace, config, given);
+        let mut scripts = Scripts::of(workspace, config, given, build);
         // A script that owes a run is owed it still when the checkout is loaded again.
         let owing = |scripts: &Option<Scripts>, out_dir: &Path| {
             let scripts = scripts.as_ref();
@@ -360,7 +377,12 @@ impl Inputs {
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
     /// a process with the variables `env`, or with `None` for whoever it was loaded for.
     /// An error is why its build scripts can't say.
-    pub(crate) fn stale(&mut self, root: &Path, env: Option<&Env>) -> anyhow::Result<bool> {
+    pub(crate) fn stale(
+        &mut self,
+        root: &Path,
+        env: Option<&Env>,
+        build: u64,
+    ) -> anyhow::Result<bool> {
         if let Some(env) = env {
             self.asked_with.extend(env.iter().map(|(name, _)| name.to_owned()));
         }
@@ -377,9 +399,18 @@ impl Inputs {
             return Ok(true);
         }
         match &mut checkout.scripts {
-            Some(scripts) => scripts.changed(env, asked_with),
+            Some(scripts) => {
+                scripts.ready = None;
+                scripts.changed(env, asked_with, build)
+            }
             None => Ok(false),
         }
+    }
+
+    /// What the scripts of the checkout at `root` said when the last check ran them, once.
+    pub(crate) fn take_ready(&mut self, root: &Path) -> Option<WorkspaceBuildScripts> {
+        let checkout = self.checkouts.iter_mut().find(|it| it.root == root)?;
+        checkout.scripts.as_mut()?.ready.take()
     }
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
@@ -398,6 +429,7 @@ impl Scripts {
         workspace: &ProjectWorkspace,
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
+        build: u64,
     ) -> Option<Scripts> {
         let ProjectWorkspaceKind::Cargo { cargo, build_scripts, .. } = &workspace.kind else {
             return None;
@@ -438,6 +470,7 @@ impl Scripts {
                 files: Vec::new(),
                 said,
                 owes: false,
+                asked: build,
             };
             script.files = script.watched(&[]);
             scripts.push(script);
@@ -447,7 +480,7 @@ impl Scripts {
         if scripts.is_empty() && variables.is_empty() {
             return None;
         }
-        Some(Scripts { workspace: workspace.clone(), config, scripts, variables })
+        Some(Scripts { workspace: workspace.clone(), config, scripts, variables, ready: None })
     }
 
     /// Runs the scripts again where cargo would for a process with `env`, or with `None`
@@ -457,9 +490,10 @@ impl Scripts {
         &mut self,
         env: Option<&Env>,
         asked_with: &FxHashSet<String>,
+        build: u64,
     ) -> anyhow::Result<bool> {
         let changed: Vec<usize> =
-            (0..self.scripts.len()).filter(|&at| self.scripts[at].changed()).collect();
+            (0..self.scripts.len()).filter(|&at| self.scripts[at].changed(build)).collect();
         let variables =
             env.is_some_and(|env| self.variables.iter().any(|(name, was)| env.get(name) != *was));
         if changed.is_empty() && !variables {
@@ -495,6 +529,7 @@ impl Scripts {
         }
         for (script, before) in self.scripts.iter_mut().zip(&before) {
             script.ran_again(before);
+            script.asked = build;
         }
         // What each said it reads now, and the value of each as the run had it.
         let mut variables: Vec<(String, Option<String>)> = Vec::new();
@@ -510,7 +545,11 @@ impl Scripts {
         variables.sort();
         variables.dedup();
         self.variables = variables;
-        Ok(said != *loaded)
+        let other = said != *loaded;
+        if other {
+            self.ready = Some(said);
+        }
+        Ok(other)
     }
 }
 
@@ -640,6 +679,7 @@ mod tests {
             files: Vec::new(),
             said: Said::read(&run.join("out"), &package),
             owes: false,
+            asked: 0,
         };
         script.files = script.watched(&[]);
         script
@@ -653,15 +693,15 @@ mod tests {
         let ran = SystemTime::now() - Duration::from_secs(60);
         let script = script(&root, "cargo:rerun-if-changed=data.txt\n", ran);
         let data = root.join("pkg/data.txt");
-        assert!(script.changed(), "a file that is not there, which is a change every build");
+        assert!(script.changed(0), "a file that is not there, which is a change every build");
         std::fs::write(&data, "1").unwrap();
         set_time(&data, ran - Duration::from_secs(1));
         let script = self::script(&root, "cargo:rerun-if-changed=data.txt\n", ran);
-        assert!(!script.changed(), "a file as old as the run");
+        assert!(!script.changed(0), "a file as old as the run");
         set_time(&data, ran + Duration::from_secs(1));
-        assert!(script.changed(), "a file newer than the run");
+        assert!(script.changed(0), "a file newer than the run");
         std::fs::remove_file(&data).unwrap();
-        assert!(script.changed(), "a file that went");
+        assert!(script.changed(0), "a file that went");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -676,11 +716,11 @@ mod tests {
         set_time(&root.join("pkg/data.txt"), ran);
         let named = Script { files: named.watched(&[]), ..named };
         std::fs::write(root.join("pkg/src/other.rs"), "").unwrap();
-        assert!(!named.changed(), "a file of the package it did not name");
+        assert!(!named.changed(0), "a file of the package it did not name");
         let nothing = script(&root, "cargo:rustc-cfg=a\n", ran);
-        assert!(!nothing.changed());
+        assert!(!nothing.changed(0));
         std::fs::write(root.join("pkg/src/other.rs"), "changed").unwrap();
-        assert!(nothing.changed(), "any file of the package");
+        assert!(nothing.changed(0), "any file of the package");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -694,14 +734,14 @@ mod tests {
         std::fs::write(root.join("pkg/src/main.rs"), "").unwrap();
         set_time(&root.join("pkg/src/main.rs"), began - Duration::from_secs(5));
         script.files = script.watched(&[]);
-        assert!(!script.changed());
+        assert!(!script.changed(0));
         // It ran again and stopped saying what it reads.
         let output = root.join("target/debug/build/pkg-1/output");
         std::fs::write(&output, "cargo:rustc-cfg=a\n").unwrap();
         set_time(&output, began + Duration::from_secs(30));
         script.ran_again(&[]);
         assert!(script.owes);
-        assert!(script.changed(), "cargo runs it once more");
+        assert!(script.changed(0), "cargo runs it once more");
         // That run said the same, and is not owed another.
         set_time(&output, began + Duration::from_secs(40));
         script.ran_again(&[]);

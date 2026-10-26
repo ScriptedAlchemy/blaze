@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -127,6 +127,14 @@ const LAST_LINES: usize = 12;
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
 pub(crate) const ENDS_WITH_INPUT: &str = "RA_JIT_ENDS_WITH_INPUT";
+
+/// The variable of a request that says which build of the daemon's it is for: a client's build
+/// is one request to the daemon and several to its worker, which runs a build script that
+/// cargo runs every build once for all of them.
+pub(crate) const BUILD: &str = "RA_JIT_BUILD";
+
+/// The variable that tells a worker which build started it, whose load runs the scripts for it.
+pub(crate) const LOAD_BUILD: &str = "RA_JIT_LOAD_BUILD";
 
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
 /// loaded the workspace, in JSON, before it ends.
@@ -421,6 +429,9 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    /// The build of the daemon's that asked it last, or `0` for none: what its requests say
+    /// of what they are for ([`BUILD`]).
+    build: AtomicU64,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -443,7 +454,12 @@ impl Drop for Answering<'_> {
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     /// `spare` is a process that waits to be told a build, and is told this one.
-    fn start(checkout: &Checkout, dir: PathBuf, spare: Option<Spare>) -> anyhow::Result<Worker> {
+    fn start(
+        checkout: &Checkout,
+        dir: PathBuf,
+        spare: Option<Spare>,
+        build: u64,
+    ) -> anyhow::Result<Worker> {
         let first = checkout.programs.first().context("a checkout without programs")?;
         private_dir(&dir)?;
         let (socket, mut log) = (dir.join("sock"), dir.join("log"));
@@ -516,6 +532,7 @@ impl Worker {
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.env(LOAD_BUILD, build.to_string());
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -537,6 +554,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            build: AtomicU64::new(build),
         })
     }
 
@@ -694,6 +712,10 @@ impl Worker {
         };
         for (name, value) in &checkout.env {
             env.set(name, value);
+        }
+        match self.build.load(Relaxed) {
+            0 => {}
+            build => env.set(BUILD, build.to_string()),
         }
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream
@@ -982,6 +1004,8 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+    /// How many builds clients have asked for: each is one for its worker's requests.
+    builds: AtomicU64,
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1073,6 +1097,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
+        builds: AtomicU64::new(0),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1169,7 +1194,7 @@ impl Daemon {
         *lock(&self.asked) = Instant::now();
         match request {
             Request::Sync(checkout) => self.sync(&checkout),
-            Request::Warm(checkout) => match self.warm(checkout) {
+            Request::Warm(checkout) => match self.warm(checkout, 0) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
@@ -1189,7 +1214,7 @@ impl Daemon {
                 }
                 Reply::Warming
             }
-            Request::Build(checkout) => match self.warm(checkout.clone()) {
+            Request::Build(checkout) => match self.warm(checkout.clone(), self.next_build()) {
                 Ok(()) => self.built(&checkout),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
@@ -1258,9 +1283,14 @@ impl Daemon {
         })
     }
 
+    /// The number of a build a client asks for now.
+    fn next_build(&self) -> u64 {
+        self.builds.fetch_add(1, Relaxed) + 1
+    }
+
     /// Has a worker load `checkout`: the one of its configuration when that has not loaded
     /// another build of the same checkout, and a new one otherwise.
-    fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
+    fn warm(&self, checkout: Checkout, build: u64) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
         // What a worker could not load once it can't load again, until cargo builds anew or
@@ -1288,6 +1318,7 @@ impl Daemon {
         }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
+            worker.build.store(build, Relaxed);
             let mut checkouts = lock(&worker.checkouts);
             match checkouts.get(&checkout.key) {
                 Some(loaded) if loaded.generation == checkout.generation => return Ok(()),
@@ -1317,7 +1348,7 @@ impl Daemon {
             false => ahead.or_else(|| lock(&self.spare).take()),
         };
         let worker =
-            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
+            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare, build)?);
         eprintln!(
             "worker {id} of pid {} for {}",
             lock(&worker.child).id(),

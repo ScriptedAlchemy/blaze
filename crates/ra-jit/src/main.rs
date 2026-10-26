@@ -2579,6 +2579,7 @@ impl Checkouts {
                 &self.selection,
                 beside,
                 said,
+                None,
             )?;
             debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
@@ -2597,7 +2598,10 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            self.inputs.watch(&root, &workspace, &self.cargo_config, &FxHashMap::default());
+            // Loaded for the build that started the worker, whose scripts the load ran.
+            let build = std::env::var(cargo::daemon::LOAD_BUILD).ok();
+            let build = build.and_then(|it| it.parse().ok()).unwrap_or(0);
+            self.inputs.watch(&root, &workspace, &self.cargo_config, &FxHashMap::default(), build);
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
@@ -2613,7 +2617,12 @@ impl Checkouts {
     /// when its manifests, cargo's configuration or what its build scripts say changed, and
     /// when the build is of it and the process has other flags for rustc. One that shares
     /// packages with another is one when the build is of it and the two no longer build alike.
-    fn stale(&mut self, project: &Path, env: &ide_db::base_db::Env) -> anyhow::Result<Vec<usize>> {
+    fn stale(
+        &mut self,
+        project: &Path,
+        env: &ide_db::base_db::Env,
+        build: u64,
+    ) -> anyhow::Result<Vec<usize>> {
         let project = dunce::canonicalize(project).ok();
         let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
         // The checkout whose variables are those of the build: any, when it is not loaded.
@@ -2630,7 +2639,7 @@ impl Checkouts {
                     Some(&changed) => changed,
                     None => {
                         let env = (asked.is_none() || built == Some(root)).then_some(env);
-                        let changed = self.inputs.stale(root, env)?;
+                        let changed = self.inputs.stale(root, env, build)?;
                         known.insert(root, changed);
                         changed
                     }
@@ -2652,6 +2661,7 @@ impl Checkouts {
         &mut self,
         stale: &[usize],
         env: &ide_db::base_db::Env,
+        build: u64,
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
     ) -> anyhow::Result<()> {
@@ -2660,7 +2670,7 @@ impl Checkouts {
             loaded.push(self.loaded_again(at, env)?);
         }
         for (&at, (workspace, debug, config, given)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config, &given);
+            self.place(at, workspace, debug, &config, &given, build);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2673,7 +2683,7 @@ impl Checkouts {
             if !self.builds_alike(&self.roots[base].1, &over) {
                 match self.loaded_again(at, env) {
                     Ok((workspace, debug, config, given)) => {
-                        self.place(at, workspace, debug, &config, &given);
+                        self.place(at, workspace, debug, &config, &given, build);
                         continue;
                     }
                     Err(error) => failed = Err(error),
@@ -2692,7 +2702,7 @@ impl Checkouts {
     /// variables `env`, what a build of it has a debugger told, how it was loaded, and the
     /// variables that process gave it over the daemon's.
     fn loaded_again(
-        &self,
+        &mut self,
         at: usize,
         env: &ide_db::base_db::Env,
     ) -> anyhow::Result<(
@@ -2701,12 +2711,14 @@ impl Checkouts {
         CargoConfig,
         FxHashMap<String, Option<String>>,
     )> {
-        let (project, root) = &self.roots[at];
+        let (project, root) = self.roots[at].clone();
         let mut config = self.cargo_config.clone();
-        let given = self.inputs.variables(root, env);
+        let given = self.inputs.variables(&root, env);
         config.extra_env.extend(given.clone());
+        // The scripts the check for this build ran are not run again for the load.
+        let ready = self.inputs.take_ready(&root);
         let (workspace, debug) =
-            workspace_at(project, &config, &self.load_config, &self.selection, None, None)?;
+            workspace_at(&project, &config, &self.load_config, &self.selection, None, None, ready)?;
         Ok((workspace, debug, config, given))
     }
 
@@ -2719,9 +2731,10 @@ impl Checkouts {
         debug: plan::Whole,
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
+        build: u64,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.inputs.watch(&root, &workspace, config, given);
+        self.inputs.watch(&root, &workspace, config, given, build);
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
         self.splits[at] = None;
@@ -2903,6 +2916,7 @@ fn workspace_at(
     selection: &plan::Selection,
     beside: Option<&mut Beside>,
     said: Option<Vec<String>>,
+    ready: Option<WorkspaceBuildScripts>,
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
@@ -2965,13 +2979,15 @@ fn workspace_at(
     if let Some(scripts) = scripts {
         workspace.set_build_scripts(scripts);
     } else if load_config.load_out_dirs_from_check {
-        let build_scripts = match (&workspace.kind, said) {
+        let build_scripts = match (ready, &workspace.kind, said) {
+            // The scripts the daemon ran for this build said what they did.
+            (Some(ready), _, _) => ready,
             // Cargo's build that is over said it all: the scripts it ran said what they did,
             // and it built the proc macros where they are.
-            (ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
+            (None, ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
                 WorkspaceBuildScripts::of_messages(cargo, said.iter().map(String::as_str))
             }
-            (kind, _) => {
+            (None, kind, _) => {
                 if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
                     && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
                 {
@@ -6308,6 +6324,9 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    /// The build of the daemon's the request is for, `0` when it says none: a build is one
+    /// request to the daemon and may be several to a worker.
+    build: u64,
 }
 
 impl Client {
@@ -6315,7 +6334,7 @@ impl Client {
     #[cfg(unix)]
     fn nobody() -> Option<Client> {
         let (stream, _) = UnixStream::pair().ok()?;
-        Some(Client { stream, env: ide_db::base_db::Env::default() })
+        Some(Client { stream, env: ide_db::base_db::Env::default(), build: 0 })
     }
 
     #[cfg(not(unix))]
@@ -6931,7 +6950,8 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let client = Client { stream, env: process::decode(&env) };
+        let (env, build) = process::decode_request(&env);
+        let client = Client { stream, env, build };
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
@@ -6939,7 +6959,8 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let client = Client { stream, env: process::decode(&env) };
+        let (env, build) = process::decode_request(&env);
+        let client = Client { stream, env, build };
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -8369,7 +8390,7 @@ fn run_holding(
                     // taken for this turn are of the checkout as it was.
                     let project = target.as_ref().and_then(|it| it.project.as_ref());
                     let project = project.unwrap_or(&programs[0].args.project);
-                    match checkouts.stale(project, &stream.env) {
+                    match checkouts.stale(project, &stream.env, stream.build) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
                             later.push((request, asked, stream));
@@ -8380,8 +8401,13 @@ fn run_holding(
                             let start = Instant::now();
                             let before = CratesAsLoaded::of(&db);
                             let read_from = SystemTime::now();
-                            let reloaded =
-                                checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
+                            let reloaded = checkouts.reload(
+                                &stale,
+                                &stream.env,
+                                stream.build,
+                                &mut db,
+                                tree.vfs(),
+                            );
                             watch_loaded(&mut db, &mut tree, &mut files, read_from);
                             let new = before.changed(&db);
                             eprintln!(
@@ -8724,7 +8750,8 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client { stream, env: edited.client.env.clone() };
+                            let client =
+                                Client { stream, env: edited.client.env.clone(), build: 0 };
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }

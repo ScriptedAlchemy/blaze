@@ -112,8 +112,14 @@ pub(crate) fn run_as_cargo_does(
     let args: Vec<OsString> = args.collect();
     let cwd = std::env::current_dir()?;
     let places = Places::of(&env);
+    // What a run reads includes what the last one left in `OUT_DIR`, where cargo runs it: a run
+    // kept from other contents stands for none of this one.
+    let state = out_dir.as_deref().and_then(out_dir_state);
     let key = |places: Option<&Places>| {
-        out_dir.as_ref().and_then(|_| run_key(&real, &cwd, &args, &env, places))
+        out_dir
+            .as_ref()
+            .zip(state)
+            .and_then(|(_, state)| run_key(&real, &cwd, &args, &env, places, &state))
     };
     let (shared, here) = (key(Some(&places)), key(None));
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
@@ -174,16 +180,63 @@ const UNREAD: [&str; 6] = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "NUM_JOBS",
 /// The most a run may leave for the store to keep it.
 const MOST_KEPT: usize = 256 << 20;
 
-/// The key of a run of the script `real` in `cwd` with `args` and `env`. With `places`, what
-/// names the checkout and the target directory names them by what stands for them, so a run
-/// in another checkout or target directory has the same key. `None` when the script cannot
-/// be read.
+/// A digest of what is in `out_dir` before a run: the names and kinds of what is below it, the
+/// bytes of its files, whether they run, and where its links point. `None` when there is more
+/// than a run is kept with, or it cannot be read: there is then no run of it to keep or to
+/// stand for one.
+fn out_dir_state(out_dir: &Path) -> Option<[u8; 32]> {
+    out_dir_state_within(out_dir, MOST_KEPT)
+}
+
+fn out_dir_state_within(out_dir: &Path, most: usize) -> Option<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let mut field = |tag: &[u8], bytes: &[u8]| {
+        hash.update(tag);
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    let mut size = 0;
+    let mut pending = vec![out_dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let mut entries = std::fs::read_dir(&dir).ok()?.collect::<Result<Vec<_>, _>>().ok()?;
+        entries.sort_by_key(|it| it.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = path.strip_prefix(out_dir).ok()?;
+            let kind = entry.file_type().ok()?;
+            field(b"name", name.as_os_str().as_encoded_bytes());
+            if kind.is_symlink() {
+                field(b"link", std::fs::read_link(&path).ok()?.as_os_str().as_encoded_bytes());
+            } else if kind.is_dir() {
+                field(b"dir", b"");
+                pending.push(path);
+            } else if kind.is_file() {
+                let bytes = std::fs::read(&path).ok()?;
+                size += bytes.len();
+                if size > most {
+                    return None;
+                }
+                field(b"file", &bytes);
+                field(b"exec", &[u8::from(is_executable(&entry.metadata().ok()?))]);
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(hash.finalize().into())
+}
+
+/// The key of a run of the script `real` in `cwd` with `args` and `env`, over an `OUT_DIR`
+/// that held what `state` ([`out_dir_state`]) says. With `places`, what names the checkout and
+/// the target directory names them by what stands for them, so a run in another checkout or
+/// target directory has the same key. `None` when the script cannot be read.
 fn run_key(
     real: &Path,
     cwd: &Path,
     args: &[OsString],
     env: &[(String, String)],
     places: Option<&Places>,
+    state: &[u8; 32],
 ) -> Option<[u8; 32]> {
     let mut hash = Sha256::new();
     let mut field = |bytes: &[u8]| {
@@ -199,6 +252,7 @@ fn run_key(
         field(b"places apart");
     }
     field(&Sha256::digest(std::fs::read(real).ok()?));
+    field(state);
     field(&text(cwd.as_os_str().as_encoded_bytes()));
     for arg in args {
         field(&text(arg.as_encoded_bytes()));
@@ -827,8 +881,10 @@ mod tests {
         let (package, out, env) = checkout("one");
         let (other_package, other_out, other_env) = checkout("other");
         let (places, other_places) = (Places::of(&env), Places::of(&other_env));
+        let state = out_dir_state(&out).unwrap();
+        assert_eq!(Some(state), out_dir_state(&other_out), "empty, as a first run has it");
         let key = |cwd: &Path, env: &[(String, String)], places: Option<&Places>| {
-            run_key(&real, cwd, &[], env, places)
+            run_key(&real, cwd, &[], env, places, &state)
         };
         assert_eq!(
             key(&package, &env, Some(&places)),
@@ -950,5 +1006,52 @@ mod tests {
         std::fs::write(out_dir.join("made.rs"), "fn made_before() {}").unwrap();
         assert_eq!(rerun_is_same(&out_dir), Err("wrote something else".to_owned()));
         assert_eq!(std::fs::read(out_dir.join("made.rs")).unwrap(), b"fn made_before() {}");
+    }
+
+    /// A run kept from one `OUT_DIR` stands for a run in another that holds the same, and for
+    /// none that holds other: a script that counts in `OUT_DIR` makes another of it each run, as
+    /// cargo runs it again in the directory it left.
+    #[test]
+    fn a_run_is_kept_for_the_contents_of_the_directory_it_ran_in() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("ra-jit-script-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let state = |out: &Path| out_dir_state(out).unwrap();
+        let empty = state(&out);
+        std::fs::write(out.join("count"), "1").unwrap();
+        let one = state(&out);
+        assert_ne!(empty, one, "a file");
+        std::fs::write(out.join("count"), "2").unwrap();
+        assert_ne!(one, state(&out), "other bytes");
+        std::fs::write(out.join("count"), "1").unwrap();
+        assert_eq!(one, state(&out), "the same again");
+        std::fs::create_dir_all(out.join("sub")).unwrap();
+        let with_dir = state(&out);
+        assert_ne!(one, with_dir, "an empty directory");
+        symlink("count", out.join("link")).unwrap();
+        let with_link = state(&out);
+        assert_ne!(with_dir, with_link, "a link");
+        std::fs::remove_file(out.join("link")).unwrap();
+        symlink("sub", out.join("link")).unwrap();
+        assert_ne!(with_link, state(&out), "a link that points elsewhere");
+        std::fs::remove_file(out.join("link")).unwrap();
+        std::fs::remove_dir(out.join("sub")).unwrap();
+        // How much a run may leave is how much a state is taken of.
+        assert!(out_dir_state_within(&out, 1).is_some());
+        assert!(out_dir_state_within(&out, 0).is_none());
+        std::fs::write(out.join("big"), "12345").unwrap();
+        assert!(out_dir_state_within(&out, 6).is_some());
+        assert!(out_dir_state_within(&out, 5).is_none());
+        assert!(out_dir_state(&root.join("not-there")).is_none());
+        // The key has it: a script of one state and a script of another are two runs.
+        let real = root.join("script");
+        std::fs::write(&real, "a script").unwrap();
+        let env = vec![("A".to_owned(), "1".to_owned())];
+        let key = |state: &[u8; 32]| run_key(&real, &root, &[], &env, None, state);
+        assert_eq!(key(&empty), key(&empty));
+        assert_ne!(key(&empty), key(&one));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

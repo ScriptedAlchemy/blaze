@@ -174,6 +174,39 @@ fn main() {
     step("rebuild, nothing changed", 1),
 ])
 
+# 2c. The same, for a script whose output is another each run, which has the daemon load the
+# workspace again: cargo runs it once a build, and so does blaze.
+COUNTED = ('const EDIT: u32 = 1;\n\nfn main() {\n    println!("edit={} count={}", EDIT, env!("PROBE_COUNT"));\n}\n')
+case("missing-env", "a script that runs every build and says another rustc-env each time", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=absent.txt");
+    let n = bump();
+    println!("cargo:rustc-env=PROBE_COUNT={n}");
+    generated("unused");
+}
+''', files={"src/main.rs": COUNTED}), [
+    step("cold build", 1),
+    step("rebuild, nothing changed", 1),
+    step("rebuild, nothing changed", 1),
+    step("edit src/main.rs", 1, write={"src/main.rs": COUNTED.replace("EDIT: u32 = 1", "EDIT: u32 = 2")}),
+])
+
+# 2d. A build of two programs asks the daemon's worker for each: the script cargo runs every build
+# is run once.
+case("two-programs", "a script that runs every build, in a package of two programs", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=absent.txt");
+    let n = bump();
+    generated(&format!("count={n}"));
+}
+''', files={"src/bin/other.rs": MAIN}), [
+    step("cold build", 1),
+    step("rebuild, nothing changed", 1),
+    edit(2, runs=1),
+])
+
 # 3. rerun-if-env-changed: set, changed, empty and unset are four values.
 case("env", "rerun-if-env-changed: set, changed, empty, unset", single(r'''
 fn main() {
@@ -311,6 +344,53 @@ fn main() {
     edit(3, "edit src/main.rs: the script fails", runs=1),
     step("rebuild, nothing changed: it runs again", 1),
     step("rebuild, nothing changed", 0),
+])
+
+# 3d. What a script says to rustc, which a run changes: cfgs and variables of the crates, which the
+# daemon loads the workspace again for. The script runs once, not once more for the load.
+CFG = ('include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n\nconst EDIT: u32 = 1;\n\n'
+       'fn main() {\n    println!("{} edit={} env={} a={} b={}", GENERATED, EDIT, env!("PROBE_MODE"), '
+       'cfg!(mode_a), cfg!(mode_b));\n}\n')
+case("cfg-env", "rustc-cfg and rustc-env that an edit of what the script reads changes", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=mode.txt");
+    let mode = read("mode.txt");
+    let mode = mode.trim();
+    println!("cargo:rustc-cfg=mode_{mode}");
+    println!("cargo:rustc-check-cfg=cfg(mode_a, mode_b)");
+    println!("cargo:rustc-env=PROBE_MODE={mode}");
+    generated(&format!("mode={mode}"));
+}
+''', files={"mode.txt": "a\n", "src/main.rs": CFG}), [
+    step("cold build", 1),
+    step("mode b", 1, write={"mode.txt": "b\n"}),
+    step("mode a", 1, write={"mode.txt": "a\n"}),
+    step("edit src/main.rs", 0, write={"src/main.rs": CFG.replace("EDIT: u32 = 1", "EDIT: u32 = 2")}),
+    step("rebuild, nothing changed", 0),
+])
+
+# 3e. A line a script prints that is not UTF-8 is none of cargo's: cargo leaves it out whole, and
+# the variable it set is not one.
+UTF8 = ('const EDIT: u32 = 1;\n\nfn main() {\n    println!("edit={} a={:?} b={:?}", EDIT, '
+        'option_env!("PROBE_A"), option_env!("PROBE_B"));\n}\n')
+case("utf8", "a line a script prints that is not UTF-8", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=mode.txt");
+    let mut out = std::io::stdout();
+    out.write_all(b"cargo:rustc-env=PROBE_A=a\n").unwrap();
+    if read("mode.txt").trim() == "bad" {
+        out.write_all(b"cargo:rustc-env=PROBE_B=\xff\n").unwrap();
+    } else {
+        out.write_all(b"cargo:rustc-env=PROBE_B=b\n").unwrap();
+    }
+    generated("unused");
+}
+''', files={"mode.txt": "ok\n", "src/main.rs": UTF8}), [
+    step("cold build", 1),
+    step("the line is not UTF-8", 1, write={"mode.txt": "bad\n"}),
+    step("the line is UTF-8 again", 1, write={"mode.txt": "ok\n"}),
 ])
 
 # 6. A dependency with `links`: its script's metadata is the dependent script's environment, and
