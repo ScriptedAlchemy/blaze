@@ -159,8 +159,8 @@ pub enum CodegenError {
     /// rustc built the function under a symbol private to its object, so its copy stays the
     /// one that code of that object calls, and goes on using rustc's statics.
     Private,
-    /// Not of a function: the build held more memory than the process may, and was stopped
-    /// ([`budget`]).
+    /// Not of a function: admission failed after persistent critical host memory pressure
+    /// without compile progress ([`budget`]). Soft footprint targets never cause this.
     OverBudget(String),
 }
 

@@ -386,10 +386,11 @@ larger of 2 GiB and 5% of available machine/container memory; `RA_JIT_MEMORY_RES
 it. Unreadable signals and footprint are each logged once, and treated as unknown.
 
 Warning purges and reduces concurrency. Critical pressure pauses admission of new compile
-jobs, including foreground work on one CPU and LLVM unit jobs. Already-running jobs finish.
+jobs, including foreground work on one CPU, LLVM unit jobs and tier compilation. Already-running jobs finish.
 Admission resumes when pressure recovers. A build fails only after it has paused for
 `RA_JIT_PRESSURE_GRACE_SECS` (default 60), with critical pressure and no completed compile
-progress for that grace period. Pressure errors are returned outside salsa queries, so they
+progress for that grace period. Finished top-level jobs count as progress as well as emitted
+functions, including cache hits and LLVM tier work. Pressure errors are returned outside salsa queries, so they
 do not become cached query failures. State changes and failure name host memory pressure.
 The sampler interval is not an allocation ceiling: one in-flight function can allocate
 arbitrarily much before it finishes.
@@ -399,7 +400,9 @@ pressure persisting for the grace permits stopping an oversized idle worker. A b
 owns its pause and failure so daemon eviction cannot bypass its compile-progress grace. Pressure
 stops retain tombstones by worker configuration, checkout and build generation plus budget;
 identical requests cannot restart the same load. A changed source, build configuration,
-generation or budget retries; restarting the daemon explicitly retries as well. Idle LRU
+generation or budget retries; restarting the daemon explicitly retries as well. Worker policy
+settings are forwarded in the configuration identity; unset settings cannot inherit a stale
+daemon budget at worker/spare/checker startup. Idle LRU
 cache eviction at the aggregate target remains.
 
 ### Historical hard-budget experiment
