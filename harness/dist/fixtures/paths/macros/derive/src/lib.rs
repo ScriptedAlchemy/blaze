@@ -43,3 +43,12 @@ pub fn embedded(input: TokenStream) -> TokenStream {
     let text = text.trim().replace('"', "");
     format!("impl {name} {{ pub fn embedded() -> &'static str {{ \"{text}\" }} }}").parse().unwrap()
 }
+
+/// Observes a machine path without putting the path itself in the expansion. Normalizing
+/// CARGO_MANIFEST_DIR in a lookup key would incorrectly reuse another machine's length.
+#[proc_macro_derive(ManifestLength)]
+pub fn manifest_length(input: TokenStream) -> TokenStream {
+    let name = name_of(&input);
+    let length = std::env::var("CARGO_MANIFEST_DIR").unwrap().len();
+    format!("impl {name} {{ pub fn manifest_length() -> usize {{ {length} }} }}").parse().unwrap()
+}
