@@ -59,11 +59,12 @@ pub struct Live {
 
 impl Live {
     /// Whether `id` is of a crate the index doesn't look at, or one it has now. Only what
-    /// salsa interned is asked of `id`.
+    /// salsa interned is asked of `id`; one of a file no crate has now is gone.
     pub fn has(&self, db: &dyn HirDatabase, id: ItemId) -> bool {
         self.items.contains(&id)
             || file_of(db, id).is_some_and(|file| {
-                !base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it))
+                let crates = base_db::relevant_crates(db, file);
+                !crates.is_empty() && !crates.iter().any(|it| self.crates.contains(it))
             })
     }
 
