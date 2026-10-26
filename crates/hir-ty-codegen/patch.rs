@@ -3189,9 +3189,25 @@ impl Base {
         // What a moved function's instance is called by is the base's symbol, which the patch
         // defines again when the code under it is other code or tells of other places.
         let mut relocated = 0;
+        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        let compiling: Vec<(&Instance, &StoredParamEnvAndCrate)> = (self.relocated.iter())
+            .filter(|(_, it)| it.code.is_none() || check_all)
+            .map(|(key, it)| (&it.now, &self.instances[key].env))
+            .collect();
+        symbols.in_parallel(compiling.len(), &|db, _, at| {
+            let (now, env) = compiling[at];
+            probe(|| compiled_instance(db, now.clone(), env.clone()).is_ok());
+        });
         for (key, it) in &self.relocated {
             let was = &self.instances[key];
             let compiled = || compiled_instance(db, it.now.clone(), was.env.clone()).as_ref();
+            // A check of the items: what the code from before is taken for is what compiles.
+            if check_all
+                && let Some(code) = &it.code
+                && probe(compiled).is_some_and(|now| !matches!(now, Ok(now) if now == &**code))
+            {
+                eprintln!("check-all: MISSED relocated {:?} as {:?}", key, it.now);
+            }
             let code: &CompiledFunction = match &it.code {
                 Some(code) => code,
                 None => match probe(compiled) {
