@@ -9,9 +9,10 @@
 //! (unset, empty and set are three values), to any file of its package when it named nothing,
 //! to the script itself or a package it is built with, and once more for having named other
 //! than it did the run before, as cargo's fingerprint of that run was made of what the run
-//! before it said. What is asked is always cargo's own run in its own target directory, so the
-//! daemon is never the one that decides a script's output is the same: it only does not ask
-//! while nothing cargo reads has changed.
+//! before it said. What is asked is cargo's own run in its own target directory, so in the whole
+//! build the daemon never decides that a script's output is the same: it only does not ask while
+//! nothing cargo reads has changed. (Beside a build of cargo's, `Script::reruns_the_same` still
+//! runs the script itself and compares what it printed.)
 
 use std::{
     hash::{Hash as _, Hasher as _},
@@ -86,8 +87,9 @@ struct Scripts {
     scripts: Vec<Script>,
     /// The variables it runs one again for a change of, as they were when they last ran.
     variables: Vec<(String, Option<String>)>,
-    /// What the scripts said when the last check ran them and found the workspace another:
-    /// the load that follows takes it and does not run them again.
+    /// What the scripts said when the last check ran them and found the workspace another: the
+    /// workspace is stale until it is loaded again, and that load takes what they said and does
+    /// not run them again.
     ready: Option<WorkspaceBuildScripts>,
 }
 
@@ -102,11 +104,11 @@ struct Said {
 impl Said {
     /// What the run that wrote `out_dir` said, from the output cargo keeps beside it. `None`
     /// when there is none, or when it is one cargo fails the build for.
-    fn read(out_dir: &Path, package: &Path) -> Option<Said> {
+    fn read(out_dir: &Path, root: &Path) -> Option<Said> {
         let printed = crate::cargo::script::printed(out_dir)?;
         let began = std::fs::metadata(&printed).and_then(|it| it.modified()).ok()?;
         let reads = output::reads(&std::fs::read(&printed).ok()?).ok()?;
-        Some(Said { rerun: reads.rerun(package), began })
+        Some(Said { rerun: reads.rerun(root), began })
     }
 
     /// The variables it said.
@@ -412,27 +414,25 @@ impl Inputs {
         let Some(checkout) = self.checkouts.iter_mut().find(|it| it.root == root) else {
             return Ok(false);
         };
-        if checkout.files.iter().any(Watched::changed) {
-            return Ok(true);
-        }
-        if let Some(env) = env
-            && checkout.flags.iter().any(|(name, was)| env.get(name) != *was)
-        {
+        let flags = env.is_some_and(|env| checkout.flags.iter().any(|(n, was)| env.get(n) != *was));
+        if flags || checkout.files.iter().any(Watched::changed) {
+            // The workspace is read again whole, and the scripts run for it.
+            if let Some(scripts) = &mut checkout.scripts {
+                scripts.ready = None;
+            }
             return Ok(true);
         }
         match &mut checkout.scripts {
-            Some(scripts) => {
-                scripts.ready = None;
-                scripts.changed(env, asked_with, build)
-            }
+            Some(scripts) => scripts.changed(env, asked_with, build),
             None => Ok(false),
         }
     }
 
-    /// What the scripts of the checkout at `root` said when the last check ran them, once.
-    pub(crate) fn take_ready(&mut self, root: &Path) -> Option<WorkspaceBuildScripts> {
-        let checkout = self.checkouts.iter_mut().find(|it| it.root == root)?;
-        checkout.scripts.as_mut()?.ready.take()
+    /// What the scripts of the checkout at `root` said when the last check ran them, when the
+    /// workspace loaded is not what they said.
+    pub(crate) fn ready(&self, root: &Path) -> Option<WorkspaceBuildScripts> {
+        let checkout = self.checkouts.iter().find(|it| it.root == root)?;
+        checkout.scripts.as_ref()?.ready.clone()
     }
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
@@ -516,6 +516,10 @@ impl Scripts {
         asked_with: &FxHashSet<String>,
         build: u64,
     ) -> anyhow::Result<bool> {
+        // Until the workspace is loaded again it is not what the scripts said.
+        if self.ready.is_some() {
+            return Ok(true);
+        }
         let changed: Vec<usize> =
             (0..self.scripts.len()).filter(|&at| self.scripts[at].changed(build)).collect();
         let variables =

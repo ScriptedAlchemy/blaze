@@ -789,6 +789,9 @@ class Side:
         say = built.stderr.strip().splitlines()
         result["said"] = say[-1] if say and built.returncode != 0 else ""
         result["by_cargo"] = bool(re.search(r"building with cargo", built.stderr))
+        # `[ra-jit]` is what a build the daemon made says it is: a build that ended well and does
+        # not say so was cargo's, and says nothing of the whole build.
+        result["daemon"] = "[ra-jit]" in built.stderr
         return result
 
     def stop(self):
@@ -799,6 +802,8 @@ class Side:
 def differences(blaze, cargo):
     """Why blaze's step is not cargo's, as a list of sentences: empty when they are the same."""
     problems = []
+    if blaze["build"] == 0 and blaze.get("daemon") is False:
+        problems.append("the build that succeeded was not the daemon's whole build")
     if blaze["build"] != cargo["build"]:
         problems.append(f"the build exited {blaze['build']}, cargo's {cargo['build']}")
     if blaze["runs"] != cargo["runs"]:
@@ -869,6 +874,7 @@ def selftest():
         ("another program", other(program=program("2 edit=2\n")), ["stdout"], False),
         ("another status", other(program=program("1 edit=2\n", 1)), ["status"], False),
         ("no program", other(program=None), ["missing"], False),
+        ("a build that was cargo's", other(daemon=False), ["not the daemon's"], False),
     ]
     wrong = 0
     for what, ours, words, same in cases:

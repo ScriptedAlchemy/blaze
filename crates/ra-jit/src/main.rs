@@ -2716,7 +2716,7 @@ impl Checkouts {
         let given = self.inputs.variables(&root, env);
         config.extra_env.extend(given.clone());
         // The scripts the check for this build ran are not run again for the load.
-        let ready = self.inputs.take_ready(&root);
+        let ready = self.inputs.ready(&root);
         let (workspace, debug) =
             workspace_at(&project, &config, &self.load_config, &self.selection, None, None, ready)?;
         Ok((workspace, debug, config, given))
