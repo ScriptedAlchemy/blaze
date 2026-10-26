@@ -7720,6 +7720,7 @@ fn run_holding(
         eprintln!("backend: {backend}");
     }
     process_wide();
+    memory::ticks();
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -7965,6 +7966,23 @@ fn run_holding(
     }
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
+    if memory::report_dir().is_some() {
+        // Which condition of `rustcs_to_patch` a build in full comes of.
+        eprintln!(
+            "first build: rustc_binary {:?} (a file: {}), splice {}, patch {}, link_cmd {}, socket {}, isolate {}, splicing {}, RA_JIT_RUSTC_BASE=0 {}, files written since rustc built {}, harnessed {}",
+            args.rustc_binary,
+            args.rustc_binary.as_ref().is_some_and(|it| it.is_file()),
+            args.splice.is_some(),
+            args.patch.is_some(),
+            args.link_cmd.is_some(),
+            args.socket.is_some(),
+            args.isolate.is_some(),
+            *SPLICING,
+            std::env::var_os("RA_JIT_RUSTC_BASE").is_some_and(|it| it == "0"),
+            written.len(),
+            harnessed,
+        );
+    }
     let cold = match rustcs_to_patch(&args, written.is_empty() && !harnessed) {
         Some(rustcs) => {
             let start = Instant::now();
