@@ -584,11 +584,11 @@ pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> b
         })
 }
 
-/// Runs the script that wrote `out_dir` again, as cargo ran it but into a directory of its
-/// own: what cargo's holds is read by the compilers of a build under way, and cargo
-/// compiles the package again when a file there is newer than it was. `Ok` when the script
-/// printed and wrote what it did then; `Err` is what is different, which a script that
-/// writes the name of its directory into a file always is.
+/// Runs the script that wrote `out_dir` again, as cargo ran it but in a copy of the directory:
+/// what cargo's holds is read by the compilers of a build under way, and cargo compiles the
+/// package again when a file there is newer than it was. `Ok` when the script printed (the
+/// lines cargo reads) and wrote what it did then; `Err` is what is different, which a script
+/// that writes the name of its directory into a file always is.
 pub(crate) fn rerun_is_same(out_dir: &Path) -> Result<(), String> {
     // A file written as the script reads it can have a time a little before now: the
     // kernel stamps files with a clock that lags by up to a tick.
@@ -640,13 +640,23 @@ pub(crate) fn same_run(out_dir: &Path, other: &Path) -> bool {
     let printed = |dir: &Path| std::fs::read(printed(dir)?).ok();
     let (Some(ours), Some(theirs)) = (printed(out_dir), printed(other)) else { return false };
     let (Some(named), Some(names)) = (other.to_str(), out_dir.to_str()) else { return false };
-    String::from_utf8_lossy(&ours).replace(names, named).as_bytes() == theirs
-        && digest_of(out_dir) == digest_of(other)
+    let ours = String::from_utf8_lossy(&ours).replace(names, named);
+    directives(ours.as_bytes()) == directives(&theirs) && digest_of(out_dir) == digest_of(other)
 }
 
-/// Runs the script that wrote `out_dir` again as [`rerun_is_same`] does, and compares what
-/// it prints and writes with what a run of the same script left in `other`: another build of
-/// the package, which ran it with the same source and inputs.
+/// The lines of what a script printed that cargo reads: the ones, as text, that start with
+/// `cargo:` or `cargo::` once trimmed. Cargo does nothing with the rest. It keeps them in the
+/// file beside the script's `OUT_DIR`, but a script prints them when it runs a tool, such as the
+/// build of a frontend, which says how long it took, and a rerun never prints the same.
+fn directives(printed: &[u8]) -> Vec<&str> {
+    let lines = printed.split(|byte| *byte == b'\n');
+    let lines = lines.filter_map(|line| std::str::from_utf8(line).ok()).map(str::trim);
+    lines.filter(|line| line.starts_with("cargo:")).collect()
+}
+
+/// Runs the script that wrote `out_dir` again as [`rerun_is_same`] does, in a copy of `other`,
+/// and compares what it prints and writes with what the run of the same script that left
+/// `other` did: another build of the package, which ran it with the same source and inputs.
 pub(crate) fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> {
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
     let other_dir = other.parent().ok_or("a build script without a directory")?;
@@ -661,10 +671,58 @@ pub(crate) fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> 
     })?;
     let again_dir = run_dir.join(format!("ra-jit-out-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&again_dir);
-    std::fs::create_dir(&again_dir).map_err(|it| it.to_string())?;
-    let same = rerun_into(&ran, &again_dir, other, &printed);
+    // Cargo runs a script again in the directory it ran it in, with what that run left there,
+    // and a script that keeps what it built there, as a tool's output or a record of what it
+    // was built from, finds it and does not build it again.
+    let copied = copy_tree(other, &again_dir, other, &again_dir);
+    let same = copied
+        .map_err(|it| format!("{}: {it}", other.display()))
+        .and_then(|()| rerun_into(&ran, &again_dir, other, &printed));
     let _ = std::fs::remove_dir_all(&again_dir);
     same
+}
+
+/// Copies the directory `from` to `to`, which is not there yet: files with their times and
+/// permissions, and links as links. A link that points below `root` points below `to_root` in
+/// the copy, so that a script that writes through it writes in the copy.
+fn copy_tree(from: &Path, to: &Path, root: &Path, to_root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&source, &target, root, to_root)?;
+        } else if kind.is_symlink() {
+            let link = std::fs::read_link(&source)?;
+            let link = match link.strip_prefix(root) {
+                Ok(inside) => to_root.join(inside),
+                Err(_) => link,
+            };
+            copy_link(&link, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+            // A copy has the time of the copy, except on macOS; a script, or a tool it runs, may
+            // read when a file was written.
+            let written = entry.metadata().and_then(|it| it.modified())?;
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(&target)
+                .and_then(|it| it.set_modified(written));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_link(link: &Path, at: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(link, at)
+}
+
+/// Links need a privilege on Windows: the run is the one cargo is left to make.
+#[cfg(not(unix))]
+fn copy_link(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("a link in a build script's directory"))
 }
 
 fn rerun_into(ran: &Ran, again_dir: &Path, out_dir: &Path, printed: &[u8]) -> Result<(), String> {
@@ -678,7 +736,8 @@ fn rerun_into(ran: &Ran, again_dir: &Path, out_dir: &Path, printed: &[u8]) -> Re
     let (Some(named), Some(names)) = (out_dir.to_str(), again_dir.to_str()) else {
         return Err("has a directory whose name is not text".to_owned());
     };
-    if String::from_utf8_lossy(&again.stdout).replace(names, named).as_bytes() != printed {
+    let again = String::from_utf8_lossy(&again.stdout).replace(names, named);
+    if directives(again.as_bytes()) != directives(printed) {
         return Err("printed something else".to_owned());
     }
     if digest_of(again_dir) != digest_of(out_dir) {
@@ -714,14 +773,19 @@ mod tests {
     /// A run directory as cargo and `ra-jit build-script` leave one, for a script that
     /// writes `wrote` and prints where.
     fn ran(name: &str, wrote: &str) -> PathBuf {
+        let lines =
+            "#!/bin/sh\nprintf %s \"$WROTE\" > \"$OUT_DIR/made.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
+        ran_script(name, lines, wrote)
+    }
+
+    /// A run directory as [`ran`] leaves one, for the script `lines`.
+    fn ran_script(name: &str, lines: &str, wrote: &str) -> PathBuf {
         let run_dir =
             std::env::temp_dir().join(format!("ra-jit-script-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&run_dir);
         let out_dir = run_dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let real = run_dir.join("script");
-        let lines =
-            "#!/bin/sh\nprintf %s \"$WROTE\" > \"$OUT_DIR/made.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
         // A process a test thread starts while this one has the script open to write holds it
         // open too until that process execs, and the script is refused meanwhile ("text file
         // busy"): another process writes it.
@@ -942,6 +1006,111 @@ mod tests {
         assert!(in_out_dir(Path::new("/t/debug/build/app/0123/out/made.rs")));
         assert!(in_out_dir(Path::new("/t/debug/build/app-0123/out/made.rs")));
         assert!(!in_out_dir(Path::new("/t/debug/deps/app-0123.d")));
+    }
+
+    /// A script that builds into its `OUT_DIR` once, as one that runs a frontend's build does,
+    /// and says so on the way: the tool's lines have the time it took and the name of the
+    /// directory it wrote in, and a run that finds what the first built does not run it.
+    const BUILDS_ONCE: &str = "#!/bin/sh
+if [ ! -f \"$OUT_DIR/built\" ]; then
+  echo \"built in $SECONDS s by process $$, into $OUT_DIR\"
+  echo built > \"$OUT_DIR/built\"
+fi
+echo \"cargo:rerun-if-changed=input.txt\"
+echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
+";
+
+    /// Has `out_dir`'s script run as cargo runs it: in its directory, which it fills, and again
+    /// in the same directory, which the second run finds as the first left it.
+    fn run_as_cargo_does(out_dir: &Path, times: usize) {
+        let run_dir = out_dir.parent().unwrap();
+        let ran: Ran = serde_json::from_slice(&std::fs::read(run_dir.join(RAN)).unwrap()).unwrap();
+        for _ in 0..times {
+            let mut script = Command::new(&ran.real);
+            script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
+            let printed = script.current_dir(&ran.cwd).output().unwrap();
+            assert!(printed.status.success());
+            std::fs::write(run_dir.join("output"), printed.stdout).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_rerun_finds_in_its_directory_what_the_last_run_left_as_cargos_does() {
+        let out_dir = ran_script("builds-once", BUILDS_ONCE, "");
+        let run_dir = out_dir.parent().unwrap();
+        std::fs::write(run_dir.join("input.txt"), "one").unwrap();
+        // The first run built, and said so; cargo runs the script again in the same directory
+        // for a change, and the second run found what the first had built and said nothing.
+        run_as_cargo_does(&out_dir, 1);
+        let cold = std::fs::read_to_string(run_dir.join("output")).unwrap();
+        assert!(cold.starts_with("built in "), "{cold}");
+        run_as_cargo_does(&out_dir, 1);
+        let rerun = std::fs::read_to_string(run_dir.join("output")).unwrap();
+        assert_eq!(rerun, "cargo:rerun-if-changed=input.txt\ncargo:rustc-env=INPUT=one\n");
+        // A run into a directory with nothing in it would build again and say so, but a run
+        // in a copy of cargo's is the same.
+        assert_eq!(rerun_is_same(&out_dir), Ok(()));
+        let left: Vec<_> = std::fs::read_dir(run_dir).unwrap().flatten().collect();
+        assert_eq!(left.len(), 6, "{left:?}");
+        // What cargo's directory has is what it had: the run was in a copy.
+        assert_eq!(std::fs::read_to_string(out_dir.join("built")).unwrap(), "built\n");
+        // What the script prints for cargo is another matter.
+        std::fs::write(run_dir.join("input.txt"), "two").unwrap();
+        assert_eq!(rerun_is_same(&out_dir), Err("printed something else".to_owned()));
+    }
+
+    #[test]
+    fn what_a_script_says_that_cargo_does_not_read_is_not_compared() {
+        let out_dir = ran_script("says-more", BUILDS_ONCE, "");
+        let run_dir = out_dir.parent().unwrap();
+        std::fs::write(run_dir.join("input.txt"), "one").unwrap();
+        // The output cargo kept is of the first run, which said how long it took.
+        run_as_cargo_does(&out_dir, 1);
+        assert_eq!(rerun_is_same(&out_dir), Ok(()));
+        let other = ran_script("says-more-other", BUILDS_ONCE, "");
+        std::fs::write(other.parent().unwrap().join("input.txt"), "one").unwrap();
+        run_as_cargo_does(&other, 2);
+        assert!(same_run(&out_dir, &other));
+        assert_eq!(rerun_matches(&out_dir, &other), Ok(()));
+    }
+
+    #[test]
+    fn only_the_lines_cargo_reads_are_directives() {
+        let printed =
+            b"  cargo:a=1 \nbuilt in 3 s\ncargo::b=2\r\n\xff\xfecargo:c=3\n cargo\ncargo:d=4";
+        assert_eq!(directives(printed), ["cargo:a=1", "cargo::b=2", "cargo:d=4"]);
+        assert!(directives(b"").is_empty());
+    }
+
+    #[test]
+    fn a_copy_of_a_directory_keeps_its_times_permissions_and_links_inside_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let from = std::env::temp_dir().join(format!("ra-jit-copy-from-{}", std::process::id()));
+        let to = std::env::temp_dir().join(format!("ra-jit-copy-to-{}", std::process::id()));
+        for dir in [&from, &to] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::fs::create_dir_all(from.join("deep/er")).unwrap();
+        let tool = from.join("deep/er/tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(from.join("deep/er/tool"), from.join("inside")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", from.join("outside")).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let file = std::fs::File::options().write(true).open(&tool).unwrap();
+        file.set_modified(old).unwrap();
+        copy_tree(&from, &to, &from, &to).unwrap();
+        let copied = to.join("deep/er/tool");
+        let metadata = std::fs::metadata(&copied).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        let (was, is) = (std::fs::metadata(&tool).unwrap(), metadata);
+        assert_eq!(was.modified().unwrap(), is.modified().unwrap());
+        assert_eq!(std::fs::read_link(to.join("inside")).unwrap(), copied);
+        assert_eq!(std::fs::read_link(to.join("outside")).unwrap(), Path::new("/bin/sh"));
+        assert!(copy_tree(&from, &to, &from, &to).is_err(), "the destination is not there yet");
+        for dir in [&from, &to] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

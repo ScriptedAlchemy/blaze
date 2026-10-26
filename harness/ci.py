@@ -68,6 +68,9 @@ HARNESSES = [
     ("core", ["includes.py"], {}, EVERYWHERE, 1),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["aheadready.py"], {}, on("linux", "macos"), 1),
+    # A build script that keeps its bundle in OUT_DIR and talks while it builds: an edit that has
+    # cargo run it again is still the daemon's.
+    ("core", ["scriptrerun.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
