@@ -7,7 +7,7 @@ use intern::{Interned, InternedRef, InternedSliceRef, impl_internable};
 use macros::GenericTypeVisitable;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
-pub use tls_cache::clear_tls_solver_cache;
+pub use tls_cache::{clear_tls_solver_cache, live_solver_cache_on_this_thread, live_solver_caches};
 pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
 
 use base_db::Crate;
@@ -2573,7 +2573,7 @@ mod tls_cache {
     use salsa::Revision;
     use std::{
         cell::RefCell,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
     /// Names the cache of one interner. A solved goal is only good for where it was solved:
@@ -2596,19 +2596,33 @@ mod tls_cache {
     /// query that solves makes one and asks other queries that make theirs.
     const KEPT: usize = 32;
 
+    /// How many threads have a cache that may hold goals: see [`live_solver_caches`].
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
     struct Cache {
         /// The last to be used is the last.
         caches: Vec<(Solved, GlobalCache<DbInterner<'static>>)>,
         revision: Revision,
         db_nonce: Nonce,
+        /// Whether this cache counts in [`LIVE`], which it does from when it is first used
+        /// until it is dropped: cleared, replaced for another revision, or its thread ended.
+        live: bool,
     }
 
     impl Cache {
         fn default() -> Cache {
-            Cache { caches: Vec::new(), revision: Revision::max(), db_nonce: Nonce::invalid() }
+            Cache::of_revision(Revision::max(), Nonce::invalid())
+        }
+
+        fn of_revision(revision: Revision, db_nonce: Nonce) -> Cache {
+            Cache { caches: Vec::new(), revision, db_nonce, live: false }
         }
 
         fn of(&mut self, solved: Solved) -> &mut GlobalCache<DbInterner<'static>> {
+            if !self.live {
+                self.live = true;
+                LIVE.fetch_add(1, Ordering::AcqRel);
+            }
             match self.caches.iter().rposition(|it| it.0 == solved) {
                 Some(at) => {
                     let found = self.caches.remove(at);
@@ -2625,6 +2639,14 @@ mod tls_cache {
         }
     }
 
+    impl Drop for Cache {
+        fn drop(&mut self) {
+            if self.live {
+                LIVE.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     thread_local! {
         static GLOBAL_CACHE: RefCell<Cache> = RefCell::new(Cache::default());
     }
@@ -2633,7 +2655,7 @@ mod tls_cache {
         GLOBAL_CACHE.with_borrow_mut(|handle| {
             let (db_nonce, revision) = db.nonce_and_revision();
             if handle.revision != revision || db_nonce != handle.db_nonce {
-                *handle = Cache { caches: Vec::new(), revision, db_nonce };
+                *handle = Cache::of_revision(revision, db_nonce);
             }
         })
     }
@@ -2671,6 +2693,20 @@ mod tls_cache {
     pub fn clear_tls_solver_cache() {
         GLOBAL_CACHE.with_borrow_mut(|handle| *handle = Cache::default());
     }
+
+    /// How many threads have a trait solver cache that may hold goals. The goals hold their
+    /// types by `InternedRef`s, which do not count as uses, so [`super::collect_ty_garbage`]
+    /// must not run while any thread but those it clears has one. A thread's cache counts
+    /// from when it is first used until [`clear_tls_solver_cache`] is called on the thread,
+    /// a new revision replaces it, or the thread ends.
+    pub fn live_solver_caches() -> usize {
+        LIVE.load(Ordering::Acquire)
+    }
+
+    /// Whether the cache of this thread counts in [`live_solver_caches`].
+    pub fn live_solver_cache_on_this_thread() -> bool {
+        GLOBAL_CACHE.with_borrow(|handle| handle.live)
+    }
 }
 
 impl WorldExposer for intern::GarbageCollector {
@@ -2693,7 +2729,9 @@ impl WorldExposer for intern::GarbageCollector {
 ///
 /// This cannot be called if there are some not-yet-recorded type values. Generally, if you have a mutable
 /// reference to the database, and there are no other database - then you can call this safely, but you
-/// also need to make sure to maintain the mutable reference while this is running.
+/// also need to make sure to maintain the mutable reference while this is running. The trait solver's
+/// caches hold types unrecorded too: one that a thread kept after it dropped its database is one that
+/// [`live_solver_caches`] counts, until that thread clears it or ends.
 pub unsafe fn collect_ty_garbage() {
     let mut gc = intern::GarbageCollector::default();
 
