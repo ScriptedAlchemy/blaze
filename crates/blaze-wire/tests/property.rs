@@ -59,8 +59,6 @@ fn bytes_the_validator_accepts_are_canonical() {
     assert!(accepted > 0, "no change was accepted, so the test never reached the property");
 }
 
-
-
 /// The property over bytes written from scratch: a random sequence of heads, which is what a
 /// client that encodes wrong would send.
 #[test]

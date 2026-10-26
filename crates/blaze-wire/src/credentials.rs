@@ -37,11 +37,7 @@ pub fn capability() -> Capability {
         principal: "builder:mac-studio".into(),
         role: 2,
         namespace: Namespace::Main,
-        source: SourceRef::Git(GitRef {
-            repo_id: 1261602522,
-            commit: [7u8; 20],
-            tree: [8u8; 20],
-        }),
+        source: SourceRef::Git(GitRef { repo_id: 1261602522, commit: [7u8; 20], tree: [8u8; 20] }),
         execution: Some(ExecutionId(4_294_967_296)),
         attempt: Some(Attempt(1)),
         ops: (Op::Lookup as u32)
@@ -56,10 +52,7 @@ pub fn capability() -> Capability {
 
 /// The `JobContent` vector: one build spec's digest on `Main`.
 pub fn job_content() -> JobContentInput {
-    JobContentInput {
-        spec: [0x42; 32],
-        namespace: Namespace::Main,
-    }
+    JobContentInput { spec: [0x42; 32], namespace: Namespace::Main }
 }
 
 /// The text of the credentials' golden file.
@@ -67,10 +60,7 @@ pub fn golden_text() -> String {
     let key = key();
     let request = agent_request();
     let capability = capability();
-    let signed = SignedCapability {
-        signature: sign(&key, &capability),
-        capability,
-    };
+    let signed = SignedCapability { signature: sign(&key, &capability), capability };
     let content = job_content();
 
     let mut out = String::new();
@@ -141,12 +131,7 @@ pub fn golden_text() -> String {
 
 /// The names of the `ops` bits set in `ops`, in bit order.
 pub fn ops_names(ops: u32) -> String {
-    Op::ALL
-        .iter()
-        .filter(|op| op.in_bits(ops))
-        .map(|op| op_name(*op))
-        .collect::<Vec<_>>()
-        .join(",")
+    Op::ALL.iter().filter(|op| op.in_bits(ops)).map(|op| op_name(*op)).collect::<Vec<_>>().join(",")
 }
 
 fn op_name(op: Op) -> &'static str {
@@ -161,4 +146,3 @@ fn op_name(op: Op) -> &'static str {
         Op::Work => "work",
     }
 }
-

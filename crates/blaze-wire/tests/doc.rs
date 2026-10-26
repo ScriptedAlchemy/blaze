@@ -25,7 +25,8 @@ fn names_in(text: &str) -> BTreeSet<String> {
             .or_else(|| line.strip_prefix("struct "))
             .or_else(|| line.strip_prefix("enum "));
         if let Some(rest) = rest {
-            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let name: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
             if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
                 names.insert(name);
             }
