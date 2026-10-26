@@ -1,8 +1,8 @@
 //! Cargo's flags read strictly: the table of them, both spellings of a value, the commands that
 //! take each flag, what follows `--`, and the combinations cargo rejects.
 
-use blaze_spec::flags::{Class, FLAGS, Request, Subcommand, Takes};
 use blaze_spec::Refusal;
+use blaze_spec::flags::{Class, FLAGS, Request, Subcommand, Takes};
 
 const COMMANDS: [Subcommand; 4] =
     [Subcommand::Check, Subcommand::Build, Subcommand::Run, Subcommand::Test];
@@ -54,13 +54,15 @@ fn every_flag_of_the_table_is_read_in_its_class() {
             }
             match flag.class {
                 Class::Honoured => {
-                    let read = read.unwrap_or_else(|e| panic!("{} for {command:?}: {e}", flag.spelled()));
+                    let read =
+                        read.unwrap_or_else(|e| panic!("{} for {command:?}: {e}", flag.spelled()));
                     // --offline, --locked and --frozen change whether a spec can be made, but
                     // each is still read into the request.
                     assert_ne!(read, baseline(command), "{} changes nothing", flag.spelled());
                 }
                 Class::Ignored => {
-                    let read = read.unwrap_or_else(|e| panic!("{} for {command:?}: {e}", flag.spelled()));
+                    let read =
+                        read.unwrap_or_else(|e| panic!("{} for {command:?}: {e}", flag.spelled()));
                     assert_eq!(read, baseline(command), "{} changes the request", flag.spelled());
                 }
                 Class::Refused(reason) => {
@@ -94,10 +96,33 @@ fn the_honoured_flags_the_task_names_are_in_the_table_as_honoured() {
     let honoured: Vec<&str> =
         FLAGS.iter().filter(|it| it.class == Class::Honoured).map(|it| it.long).collect();
     for name in [
-        "package", "workspace", "all", "exclude", "features", "all-features", "no-default-features",
-        "profile", "release", "lib", "bin", "bins", "example", "examples", "test", "tests", "bench",
-        "benches", "all-targets", "doc", "manifest-path", "config", "offline", "locked", "frozen",
-        "no-run", "no-fail-fast",
+        "package",
+        "workspace",
+        "all",
+        "exclude",
+        "features",
+        "all-features",
+        "no-default-features",
+        "profile",
+        "release",
+        "lib",
+        "bin",
+        "bins",
+        "example",
+        "examples",
+        "test",
+        "tests",
+        "bench",
+        "benches",
+        "all-targets",
+        "doc",
+        "manifest-path",
+        "config",
+        "offline",
+        "locked",
+        "frozen",
+        "no-run",
+        "no-fail-fast",
     ] {
         assert!(honoured.contains(&name), "--{name} is not honoured");
     }
@@ -106,13 +131,7 @@ fn the_honoured_flags_the_task_names_are_in_the_table_as_honoured() {
 #[test]
 fn a_value_is_read_in_every_spelling() {
     for command in [Subcommand::Build, Subcommand::Test] {
-        for args in [
-            &["-p", "a"][..],
-            &["-pa"],
-            &["--package", "a"],
-            &["--package=a"],
-            &["-p=a"],
-        ] {
+        for args in [&["-p", "a"][..], &["-pa"], &["--package", "a"], &["--package=a"], &["-p=a"]] {
             assert_eq!(parse(command, args).unwrap().packages, ["a"], "{args:?}");
         }
         assert_eq!(parse(command, &["-p", "a", "-p", "b"]).unwrap().packages, ["a", "b"]);
@@ -158,7 +177,10 @@ fn switches_cluster() {
     let read = parse(Subcommand::Build, &["-rq"]).unwrap();
     assert_eq!(read.profile.as_deref(), Some("release"));
     let read = parse(Subcommand::Build, &["-rj4", "-pa"]).unwrap();
-    assert_eq!((read.profile.as_deref(), &*read.packages), (Some("release"), &["a".to_owned()][..]));
+    assert_eq!(
+        (read.profile.as_deref(), &*read.packages),
+        (Some("release"), &["a".to_owned()][..])
+    );
 }
 
 #[test]
@@ -204,7 +226,11 @@ fn targets_are_chosen_as_cargo_chooses_them() {
 
 #[test]
 fn what_is_cargos_and_what_is_the_programs() {
-    let test = parse(Subcommand::Test, &["--no-fail-fast", "-p", "a", "filter", "--no-run", "--", "--nocapture", "x"]).unwrap();
+    let test = parse(
+        Subcommand::Test,
+        &["--no-fail-fast", "-p", "a", "filter", "--no-run", "--", "--nocapture", "x"],
+    )
+    .unwrap();
     assert_eq!(test.positional, ["filter"]);
     assert_eq!(test.trailing, ["--nocapture", "x"]);
     assert!(test.no_fail_fast && test.no_run);
@@ -216,14 +242,19 @@ fn what_is_cargos_and_what_is_the_programs() {
     let run = parse(Subcommand::Run, &["--bin", "a", "one", "two"]).unwrap();
     assert_eq!(run.positional, ["one", "two"]);
     let run = parse(Subcommand::Run, &["--bin", "a", "--", "--one", "-x"]).unwrap();
-    assert_eq!((run.positional.len(), &*run.trailing), (0, &["--one".to_owned(), "-x".to_owned()][..]));
+    assert_eq!(
+        (run.positional.len(), &*run.trailing),
+        (0, &["--one".to_owned(), "-x".to_owned()][..])
+    );
     let run = parse(Subcommand::Run, &["-r", "--", "x"]).unwrap();
     assert_eq!(run.trailing, ["x"]);
 }
 
 #[test]
 fn cargo_run_passes_every_word_after_its_first_argument_to_the_program() {
-    for args in [&["a", "--release"][..], &["a", "-r"], &["a", "--"], &["a", "b", "--", "c"], &["a", "-j8"]] {
+    for args in
+        [&["a", "--release"][..], &["a", "-r"], &["a", "--"], &["a", "b", "--", "c"], &["a", "-j8"]]
+    {
         let error = refused(Subcommand::Run, args);
         assert_eq!(id(&error), "RunArgsAfterFirst", "{args:?}");
     }
@@ -259,7 +290,16 @@ fn cargo_rejects_what_it_has_no_place_for() {
 
 #[test]
 fn a_libtest_flag_before_the_dashes_is_cargos_to_reject() {
-    for flag in ["--exact", "--ignored", "--include-ignored", "--nocapture", "--show-output", "--test-threads=1", "--skip", "--list"] {
+    for flag in [
+        "--exact",
+        "--ignored",
+        "--include-ignored",
+        "--nocapture",
+        "--show-output",
+        "--test-threads=1",
+        "--skip",
+        "--list",
+    ] {
         let error = refused(Subcommand::Test, &[flag]);
         assert_eq!(id(&error), "LibtestFlag", "{flag}");
         assert_eq!(error.what, flag);
@@ -270,7 +310,9 @@ fn a_libtest_flag_before_the_dashes_is_cargos_to_reject() {
 
 #[test]
 fn a_flag_without_its_value_is_refused() {
-    for flag in ["-p", "--package", "--features", "-F", "--profile", "--bin", "--manifest-path", "--config"] {
+    for flag in
+        ["-p", "--package", "--features", "-F", "--profile", "--bin", "--manifest-path", "--config"]
+    {
         let error = refused(Subcommand::Build, &[flag]);
         assert_eq!(id(&error), "MissingValue", "{flag}");
         // The next word being a flag is no value.
@@ -301,7 +343,9 @@ fn values_cargo_rejects_are_refused() {
 
 #[test]
 fn config_arguments_are_kept_and_an_unstable_key_is_refused() {
-    let read = parse(Subcommand::Build, &["--config", "build.jobs=1", "--config=profile.dev.opt-level=1"]).unwrap();
+    let read =
+        parse(Subcommand::Build, &["--config", "build.jobs=1", "--config=profile.dev.opt-level=1"])
+            .unwrap();
     assert_eq!(read.config, ["build.jobs=1", "profile.dev.opt-level=1"]);
     for config in ["unstable.build-std=[\"core\"]", "unstable.x = 1", "unstable"] {
         let error = refused(Subcommand::Build, &["--config", config]);
@@ -341,7 +385,8 @@ fn the_flags_blaze_refuses_are_named_with_their_value() {
 
 #[test]
 fn what_is_read_is_the_same_whichever_the_order() {
-    let a = parse(Subcommand::Test, &["-p", "a", "--features", "x", "--release", "t", "--", "q"]).unwrap();
+    let a = parse(Subcommand::Test, &["-p", "a", "--features", "x", "--release", "t", "--", "q"])
+        .unwrap();
     let b = parse(Subcommand::Test, &["--release", "t", "--features=x", "-pa", "--", "q"]).unwrap();
     assert_eq!(a, b);
 }

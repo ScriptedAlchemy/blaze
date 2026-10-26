@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 
 use blaze_manifest::profiles::Profile;
 use blaze_metadata::units::{Mode, TargetKind, UnitGraph};
+use blaze_spec::Refusal;
 use blaze_spec::assemble::{Spec, canonical_key};
 use blaze_spec::flags::Subcommand;
-use blaze_spec::Refusal;
 use blaze_wire::{Command, Namespace, UnitSpec, digest_of, encode};
 use sha2::{Digest as _, Sha256};
 
@@ -35,7 +35,8 @@ fn permuted(units: &[Make], roots: &[usize], order: &[usize]) -> (Vec<Make>, Vec
         .iter()
         .map(|&old| {
             let mut unit = units[old].clone();
-            unit.deps = unit.deps.iter().map(|(index, name)| (new_index(*index), name.clone())).collect();
+            unit.deps =
+                unit.deps.iter().map(|(index, name)| (new_index(*index), name.clone())).collect();
             unit
         })
         .collect();
@@ -47,17 +48,25 @@ fn graph_of(units: Vec<Make>, roots: Vec<usize>) -> impl Fn(&Profile) -> UnitGra
 }
 
 fn index_of(spec: &Spec, name: &str) -> u32 {
-    let found: Vec<usize> = (0..spec.build.units.len()).filter(|&at| spec.build.units[at].package.0 == name).collect();
+    let found: Vec<usize> =
+        (0..spec.build.units.len()).filter(|&at| spec.build.units[at].package.0 == name).collect();
     assert_eq!(found.len(), 1, "{name}");
     found[0] as u32
 }
 
-fn build(fixture: &Fixture, command: Subcommand, args: &[&str], units: Vec<Make>, roots: Vec<usize>) -> Result<Spec, Refusal> {
+fn build(
+    fixture: &Fixture,
+    command: Subcommand,
+    args: &[&str],
+    units: Vec<Make>,
+    roots: Vec<usize>,
+) -> Result<Spec, Refusal> {
     spec(fixture, &fixture.env(), command, args, Some(&graph_of(units, roots)))
 }
 
 fn app(command: Subcommand, args: &[&str]) -> Spec {
-    build(&Fixture::new(), command, args, units(), vec![0]).unwrap_or_else(|e| panic!("{command:?} {args:?}: {e}"))
+    build(&Fixture::new(), command, args, units(), vec![0])
+        .unwrap_or_else(|e| panic!("{command:?} {args:?}: {e}"))
 }
 
 #[test]
@@ -65,8 +74,10 @@ fn dependencies_and_asked_units_are_indexes_in_the_canonical_order() {
     let spec = app(Subcommand::Build, &[]);
     let units = &spec.build.units;
     assert_eq!(units.len(), 3);
-    let (app, lib_a, serde) = (index_of(&spec, "app"), index_of(&spec, "lib_a"), index_of(&spec, "serde"));
-    let deps = |at: u32| -> Vec<(u32, String)> { units[at as usize].deps.iter().cloned().collect() };
+    let (app, lib_a, serde) =
+        (index_of(&spec, "app"), index_of(&spec, "lib_a"), index_of(&spec, "serde"));
+    let deps =
+        |at: u32| -> Vec<(u32, String)> { units[at as usize].deps.iter().cloned().collect() };
     let mut want = vec![(lib_a, "lib_a".to_owned()), (serde, "serde".to_owned())];
     want.sort_by_key(|it| encode(it));
     assert_eq!(deps(app), want);
@@ -101,11 +112,13 @@ fn two_units_alike_in_everything_but_their_dependencies_are_refused_naming_both(
     assert_eq!(error.id, "UnitOrder");
     assert_eq!(error.what, "unit `a 0.1.0` (a) and unit `a 0.1.0` (a)");
     // A difference in any one field makes the order total.
-    let features = vec![Make::new("a", TargetKind::Lib), Make::new("a", TargetKind::Lib).features(&["x"])];
+    let features =
+        vec![Make::new("a", TargetKind::Lib), Make::new("a", TargetKind::Lib).features(&["x"])];
     assert!(build(&Fixture::new(), Subcommand::Build, &[], features, vec![0]).is_ok());
     let host = vec![Make::new("a", TargetKind::Lib), Make::new("a", TargetKind::Lib).host()];
     assert!(build(&Fixture::new(), Subcommand::Build, &[], host, vec![0]).is_ok());
-    let mode = vec![Make::new("a", TargetKind::Lib), Make::new("a", TargetKind::Lib).mode(Mode::Test)];
+    let mode =
+        vec![Make::new("a", TargetKind::Lib), Make::new("a", TargetKind::Lib).mode(Mode::Test)];
     assert!(build(&Fixture::new(), Subcommand::Build, &[], mode, vec![0]).is_ok());
 }
 
@@ -114,7 +127,10 @@ fn a_run_of_a_build_script_is_the_unit_that_compiles_it() {
     let fixture = Fixture::new();
     let units = vec![
         Make::new("a", TargetKind::Lib).dep(1, "build_script_build"),
-        Make::new("a", TargetKind::CustomBuild).mode(Mode::RunCustomBuild).host().dep(2, "build_script_build"),
+        Make::new("a", TargetKind::CustomBuild)
+            .mode(Mode::RunCustomBuild)
+            .host()
+            .dep(2, "build_script_build"),
         Make::new("a", TargetKind::CustomBuild).host(),
     ];
     let spec = build(&fixture, Subcommand::Build, &[], units, vec![0]).unwrap();
@@ -150,22 +166,46 @@ fn a_unit_is_what_the_graph_says_it_is() {
     ];
     let spec = build(&fixture, Subcommand::Test, &[], units, vec![0, 1, 2]).unwrap();
     let unit = |name: &str| -> &UnitSpec { &spec.build.units[index_of(&spec, name) as usize] };
-    for (name, kind) in [("lib", 0), ("bin", 1), ("itest", 2), ("custom", 2), ("example", 3), ("bench", 4), ("script", 5), ("macro", 6), ("dep", 0)] {
+    for (name, kind) in [
+        ("lib", 0),
+        ("bin", 1),
+        ("itest", 2),
+        ("custom", 2),
+        ("example", 3),
+        ("bench", 4),
+        ("script", 5),
+        ("macro", 6),
+        ("dep", 0),
+    ] {
         assert_eq!(unit(name).target, (kind, name.to_owned()), "{name}");
     }
     let has = |name: &str, cfg: &str| unit(name).cfg.iter().any(|it| it == cfg);
     // Features, as a set, and as cfgs.
     assert_eq!(unit("lib").features.as_slice(), ["x", "y"]);
-    assert!(has("lib", "feature=\"x\"") && has("lib", "feature=\"y\"") && !has("lib", "feature=\"z\""));
+    assert!(
+        has("lib", "feature=\"x\"") && has("lib", "feature=\"y\"") && !has("lib", "feature=\"z\"")
+    );
     // `test` is a unit compiled with `--test`, a check of a test target too; a custom harness is not.
-    for (name, test) in [("lib", false), ("itest", true), ("custom", false), ("custom_test_mode", false), ("bench", true), ("bin", false)] {
+    for (name, test) in [
+        ("lib", false),
+        ("itest", true),
+        ("custom", false),
+        ("custom_test_mode", false),
+        ("bench", true),
+        ("bin", false),
+    ] {
         assert_eq!((unit(name).test, has(name, "test")), (test, test), "{name}");
     }
     assert!(unit("script").host && unit("macro").host && !unit("lib").host);
     assert!(has("macro", "proc_macro") && !has("lib", "proc_macro"));
     // The profile of a test is `test`'s: debug assertions and unwinding.
     for name in ["lib", "itest", "dep"] {
-        assert!(has(name, "debug_assertions") && has(name, "overflow_checks") && has(name, "panic=\"unwind\""), "{name}");
+        assert!(
+            has(name, "debug_assertions")
+                && has(name, "overflow_checks")
+                && has(name, "panic=\"unwind\""),
+            "{name}"
+        );
     }
     assert_eq!(unit("lib").edition, 2021);
     assert_eq!(unit("dep").package.0, "dep");
@@ -183,7 +223,8 @@ fn the_cfgs_follow_the_profile_and_the_rustflags() {
         if !flags.is_empty() {
             env.insert("RUSTFLAGS".to_owned(), flags.to_owned());
         }
-        let spec = spec(&fixture, &env, Subcommand::Build, args, Some(&graph_of(units, vec![0]))).unwrap();
+        let spec =
+            spec(&fixture, &env, Subcommand::Build, args, Some(&graph_of(units, vec![0]))).unwrap();
         spec.build.units[index_of(&spec, "a") as usize].cfg.iter().cloned().collect()
     };
     let one = || vec![Make::new("a", TargetKind::Lib)];
@@ -194,8 +235,17 @@ fn the_cfgs_follow_the_profile_and_the_rustflags() {
     let release = cfgs(&["--release"], "", one());
     assert_eq!(release, ["panic=\"unwind\""]);
     // A flag that sets a cfg is in every unit's; one that moves a check moves the cfg.
-    let flagged = cfgs(&["--release"], "--cfg foo --cfg bar=\"xy\" -C debug-assertions=yes -C panic=abort", one());
-    let mut want = vec!["foo".to_owned(), "bar=\"xy\"".to_owned(), "debug_assertions".to_owned(), "panic=\"abort\"".to_owned()];
+    let flagged = cfgs(
+        &["--release"],
+        "--cfg foo --cfg bar=\"xy\" -C debug-assertions=yes -C panic=abort",
+        one(),
+    );
+    let mut want = vec![
+        "foo".to_owned(),
+        "bar=\"xy\"".to_owned(),
+        "debug_assertions".to_owned(),
+        "panic=\"abort\"".to_owned(),
+    ];
     want.sort_by_key(|it| encode(it));
     assert_eq!(flagged, want);
     // Host units and dependencies get them too: no target is asked for.
@@ -212,10 +262,14 @@ fn spec_with_flags(fixture: &Fixture, flags: &str, units: Vec<Make>) -> Spec {
 
 #[test]
 fn the_profile_of_the_command_is_the_profile_without_an_override_and_each_unit_has_its_own() {
-    let fixture = Fixture::with_manifest("[profile.dev.package.lib_a]\nopt-level = 1\n\n[profile.dev.build-override]\nopt-level = 3\n");
+    let fixture = Fixture::with_manifest(
+        "[profile.dev.package.lib_a]\nopt-level = 1\n\n[profile.dev.build-override]\nopt-level = 3\n",
+    );
     let env = fixture.env();
     let root = fixture.root();
-    let profile = |name: &str, member: bool, host: bool| profile_of(&fixture, &env, "dev", &Package::member(&root, name), member, host);
+    let profile = |name: &str, member: bool, host: bool| {
+        profile_of(&fixture, &env, "dev", &Package::member(&root, name), member, host)
+    };
     let units = vec![
         Make::new("app", TargetKind::Bin).dep(1, "lib_a").profile(profile("app", true, false)),
         Make::new("lib_a", TargetKind::Lib).profile(profile("lib_a", true, false)),
@@ -227,8 +281,22 @@ fn the_profile_of_the_command_is_the_profile_without_an_override_and_each_unit_h
     assert_eq!(spec.build.profile.opt_level, 0);
     assert_eq!(spec.build.profile.name, "dev");
     // The package override is in the keys of what is asked, and so is its absence.
-    let plain = build(&Fixture::new(), Subcommand::Build, &[], vec![Make::new("lib_a", TargetKind::Lib)], vec![0]).unwrap();
-    let overridden = build(&fixture, Subcommand::Build, &[], vec![Make::new("lib_a", TargetKind::Lib).profile(profile("lib_a", true, false))], vec![0]).unwrap();
+    let plain = build(
+        &Fixture::new(),
+        Subcommand::Build,
+        &[],
+        vec![Make::new("lib_a", TargetKind::Lib)],
+        vec![0],
+    )
+    .unwrap();
+    let overridden = build(
+        &fixture,
+        Subcommand::Build,
+        &[],
+        vec![Make::new("lib_a", TargetKind::Lib).profile(profile("lib_a", true, false))],
+        vec![0],
+    )
+    .unwrap();
     assert_ne!(plain.digest, overridden.digest);
     assert_ne!(plain.config, overridden.config);
     assert_ne!(plain.front_end, overridden.front_end);
@@ -242,8 +310,18 @@ fn blazes_backend_and_mir_level_are_carried_on_every_unit_and_none_is_refused() 
     env.insert("RA_JIT_OPT".to_owned(), "3".to_owned());
     env.insert("RA_JIT_EMIT".to_owned(), "fast".to_owned());
     env.insert("RA_JIT_MIR_OPT".to_owned(), "2".to_owned());
-    let spec = spec_on(&common::host(true), &fixture, &env, Subcommand::Build, &[], Some(&graph_of(units(), vec![0]))).unwrap();
-    let carried = |profile: &blaze_wire::ProfileSpec| (profile.backend, profile.backend_opt, profile.backend_emit, profile.mir_opt);
+    let spec = spec_on(
+        &common::host(true),
+        &fixture,
+        &env,
+        Subcommand::Build,
+        &[],
+        Some(&graph_of(units(), vec![0])),
+    )
+    .unwrap();
+    let carried = |profile: &blaze_wire::ProfileSpec| {
+        (profile.backend, profile.backend_opt, profile.backend_emit, profile.mir_opt)
+    };
     assert_eq!(carried(&spec.build.profile), (1, 3, 1, 2));
     assert!(spec.build.units.iter().all(|it| carried(&it.profile) == (1, 3, 1, 2)));
     let plain = app(Subcommand::Build, &[]);
@@ -252,7 +330,8 @@ fn blazes_backend_and_mir_level_are_carried_on_every_unit_and_none_is_refused() 
     assert_ne!(spec.front_end, plain.front_end);
     assert_ne!(spec.config, plain.config);
     // Without the llvm backend the same environment is refused, and a malformed value is.
-    let error = spec_on(&common::host(false), &fixture, &env, Subcommand::Build, &[], None).unwrap_err();
+    let error =
+        spec_on(&common::host(false), &fixture, &env, Subcommand::Build, &[], None).unwrap_err();
     assert_eq!(error.id, "EnvLlvm");
 }
 
@@ -266,7 +345,14 @@ fn the_same_inputs_make_the_same_bytes_wherever_they_are() {
     assert_eq!(first.platform_digest, digest_of(&first.platform));
     assert_eq!(first.build.platform, first.platform_digest);
     // Another checkout of the same workspace is the same spec: no path of the machine is in it.
-    let elsewhere = build(&Fixture::new(), Subcommand::Test, &["--no-fail-fast", "x", "--", "--exact"], units(), vec![0]).unwrap();
+    let elsewhere = build(
+        &Fixture::new(),
+        Subcommand::Test,
+        &["--no-fail-fast", "x", "--", "--exact"],
+        units(),
+        vec![0],
+    )
+    .unwrap();
     assert_eq!(elsewhere, first);
     assert_eq!(first.job_content(Namespace::Main), again.job_content(Namespace::Main));
 }
@@ -302,13 +388,26 @@ fn each_honoured_input_changes_the_spec_and_each_ignored_one_does_not() {
     let mut seen = vec![mark(&base)];
     for (label, spec) in honoured {
         let marked = mark(spec);
-        assert!(!seen.iter().any(|it| it.0 == marked.0), "{label} is the spec of an input already seen");
+        assert!(
+            !seen.iter().any(|it| it.0 == marked.0),
+            "{label} is the spec of an input already seen"
+        );
         seen.push(marked);
     }
     let ignored: &[&[&str]] = &[
-        &["-j4"], &["-v"], &["-vv"], &["-q"], &["--color", "never"], &["--message-format", "short"],
-        &["--timings"], &["--future-incompat-report"], &["--ignore-rust-version"], &["--target-dir", "t"],
-        &["--offline"], &["--locked"], &["--frozen"],
+        &["-j4"],
+        &["-v"],
+        &["-vv"],
+        &["-q"],
+        &["--color", "never"],
+        &["--message-format", "short"],
+        &["--timings"],
+        &["--future-incompat-report"],
+        &["--ignore-rust-version"],
+        &["--target-dir", "t"],
+        &["--offline"],
+        &["--locked"],
+        &["--frozen"],
     ];
     for args in ignored {
         assert_eq!(test(args), base, "{args:?}");
@@ -318,7 +417,10 @@ fn each_honoured_input_changes_the_spec_and_each_ignored_one_does_not() {
     assert!(!seen.iter().any(|it| it.0 == run.digest));
     assert_ne!(app(Subcommand::Run, &["x"]).digest, run.digest);
     assert_ne!(app(Subcommand::Run, &["--", "x"]).digest, run.digest);
-    assert_eq!(app(Subcommand::Run, &["x"]).build.command, app(Subcommand::Run, &["--", "x"]).build.command);
+    assert_eq!(
+        app(Subcommand::Run, &["x"]).build.command,
+        app(Subcommand::Run, &["--", "x"]).build.command
+    );
 }
 
 /// The spec of a build in an environment with `variables` over a requester's own.
@@ -361,7 +463,11 @@ fn the_environment_changes_the_spec_where_a_build_reads_it_and_not_where_it_does
         ("CARGO_INCREMENTAL", &[("CARGO_INCREMENTAL", "0")][..], ""),
         ("CARGO_TARGET_DIR", &[("CARGO_TARGET_DIR", "/t")], ""),
         ("backtrace", &[("RUST_BACKTRACE", "1")], ""),
-        ("blaze's home", &[("RA_JIT_HOME", "/h"), ("RA_JIT_CACHE", "/c"), ("RA_JIT_STATS", "1")], ""),
+        (
+            "blaze's home",
+            &[("RA_JIT_HOME", "/h"), ("RA_JIT_CACHE", "/c"), ("RA_JIT_STATS", "1")],
+            "",
+        ),
         ("lints", &[("RUSTFLAGS", "-D warnings -A unused --check-cfg cfg(x)")], ""),
         ("codegen units", &[("RUSTFLAGS", "-C codegen-units=1 -C incremental=/x")], ""),
         ("a variable the scripts do not read", &[("OPENSSL_DIR", "/o")], ""),
@@ -382,7 +488,10 @@ fn the_script_environment_is_what_a_build_script_may_read_and_the_config_env_is_
     env.insert("HOME".to_owned(), "/home/x".to_owned());
     let spec = spec(&fixture, &env, Subcommand::Build, &[], None).unwrap();
     let script: Vec<(String, String)> = spec.build.script_env.iter().cloned().collect();
-    let mut want = vec![("CC".to_owned(), "clang".to_owned()), ("CFLAGS_aarch64_apple_darwin".to_owned(), "-g".to_owned())];
+    let mut want = vec![
+        ("CC".to_owned(), "clang".to_owned()),
+        ("CFLAGS_aarch64_apple_darwin".to_owned(), "-g".to_owned()),
+    ];
     want.sort_by_key(|it| encode(it));
     assert_eq!(script, want);
     assert_eq!(spec.build.config_env.as_slice(), [("FROM_CONFIG".to_owned(), "1".to_owned())]);
@@ -390,13 +499,44 @@ fn the_script_environment_is_what_a_build_script_may_read_and_the_config_env_is_
 
 #[test]
 fn the_run_is_read_out_of_what_cargo_test_is_given() {
-    let spec = app(Subcommand::Test, &["--no-run", "--no-fail-fast", "filter", "--", "--exact", "--skip", "a", "--skip=b", "--ignored", "--test-threads=2", "--nocapture", "other"]);
+    let spec = app(
+        Subcommand::Test,
+        &[
+            "--no-run",
+            "--no-fail-fast",
+            "filter",
+            "--",
+            "--exact",
+            "--skip",
+            "a",
+            "--skip=b",
+            "--ignored",
+            "--test-threads=2",
+            "--nocapture",
+            "other",
+        ],
+    );
     let Command::Test(run) = &spec.build.command else { panic!("a test") };
     assert_eq!(run.filters, ["filter"]);
     assert!(run.exact && run.no_run && run.no_fail_fast);
-    assert_eq!((&*run.skip, run.ignored, run.test_threads), (&["a".to_owned(), "b".to_owned()][..], 1, Some(2)));
+    assert_eq!(
+        (&*run.skip, run.ignored, run.test_threads),
+        (&["a".to_owned(), "b".to_owned()][..], 1, Some(2))
+    );
     // Every word after `--`, as typed, so that a custom harness gets exactly these.
-    assert_eq!(run.harness_args, ["--exact", "--skip", "a", "--skip=b", "--ignored", "--test-threads=2", "--nocapture", "other"]);
+    assert_eq!(
+        run.harness_args,
+        [
+            "--exact",
+            "--skip",
+            "a",
+            "--skip=b",
+            "--ignored",
+            "--test-threads=2",
+            "--nocapture",
+            "other"
+        ]
+    );
     assert!(run.env.is_empty());
     assert_eq!(run.doc, 1);
 
@@ -407,13 +547,24 @@ fn the_run_is_read_out_of_what_cargo_test_is_given() {
         Command::Test(run) => run.doc,
         other => panic!("{other:?}"),
     };
-    assert_eq!((doc(&[]), doc(&["--doc"]), doc(&["--lib"]), doc(&["--tests"]), doc(&["--no-run"])), (1, 2, 0, 0, 1));
+    assert_eq!(
+        (doc(&[]), doc(&["--doc"]), doc(&["--lib"]), doc(&["--tests"]), doc(&["--no-run"])),
+        (1, 2, 0, 0, 1)
+    );
 
     // `run` has the program's arguments, positional first, and reads none of them.
-    let Command::Run(run) = app(Subcommand::Run, &["--bin", "app", "one", "two"]).build.command else { panic!("a run") };
+    let Command::Run(run) = app(Subcommand::Run, &["--bin", "app", "one", "two"]).build.command
+    else {
+        panic!("a run")
+    };
     assert_eq!(run.harness_args, ["one", "two"]);
-    let Command::Run(run) = app(Subcommand::Run, &["--", "--exact", "x"]).build.command else { panic!("a run") };
-    assert_eq!((&*run.harness_args, run.exact, run.doc, run.no_run), (&["--exact".to_owned(), "x".to_owned()][..], false, 0, false));
+    let Command::Run(run) = app(Subcommand::Run, &["--", "--exact", "x"]).build.command else {
+        panic!("a run")
+    };
+    assert_eq!(
+        (&*run.harness_args, run.exact, run.doc, run.no_run),
+        (&["--exact".to_owned(), "x".to_owned()][..], false, 0, false)
+    );
     assert!(matches!(app(Subcommand::Check, &[]).build.command, Command::Check));
     assert!(matches!(app(Subcommand::Build, &[]).build.command, Command::Build));
 }
@@ -428,7 +579,8 @@ fn cargo_run_needs_one_program() {
     let none = vec![Make::new("lib", TargetKind::Lib)];
     assert_eq!(build(&fixture, Subcommand::Run, &[], none, vec![0]).unwrap_err().id, "RunTarget");
     // The program among a library and an example is the one asked.
-    let mixed = vec![Make::new("lib", TargetKind::Lib), Make::new("prog", TargetKind::Bin).dep(0, "lib")];
+    let mixed =
+        vec![Make::new("lib", TargetKind::Lib), Make::new("prog", TargetKind::Bin).dep(0, "lib")];
     let spec = build(&fixture, Subcommand::Run, &[], mixed, vec![0, 1]).unwrap();
     assert_eq!(spec.build.asked.as_slice(), [index_of(&spec, "prog")]);
 }
@@ -444,11 +596,17 @@ fn the_doc_tests_are_of_the_libraries_of_the_members() {
         Make::new("macro", TargetKind::ProcMacro).host(),
     ];
     let spec = build(&fixture, Subcommand::Test, &["--doc"], units.clone(), vec![0]).unwrap();
-    let asked: Vec<&str> = spec.build.asked.iter().map(|&it| spec.build.units[it as usize].package.0.as_str()).collect();
+    let asked: Vec<&str> = spec
+        .build
+        .asked
+        .iter()
+        .map(|&it| spec.build.units[it as usize].package.0.as_str())
+        .collect();
     assert_eq!(asked, ["a", "b"]);
     assert!(spec.build.asked.iter().all(|&it| !spec.build.units[it as usize].test));
     let only_unit_tests = vec![Make::new("a", TargetKind::Lib).mode(Mode::Test)];
-    let error = build(&fixture, Subcommand::Test, &["--doc"], only_unit_tests, vec![0]).unwrap_err();
+    let error =
+        build(&fixture, Subcommand::Test, &["--doc"], only_unit_tests, vec![0]).unwrap_err();
     assert_eq!(error.id, "DocLibrary");
     // Without `--doc` the roots of the graph are what is asked.
     let spec = build(&fixture, Subcommand::Test, &[], units, vec![0]).unwrap();
@@ -485,7 +643,10 @@ fn the_keys_are_the_parts_of_the_spec_they_are_of() {
     // The source and the namespace change what a job is, not what a front end or a retention is.
     let job = |spec: &Spec, ns: Namespace| spec.job_content(ns);
     assert_ne!(job(&base, Namespace::Main), job(&base, Namespace::Std));
-    assert_ne!(job(&base, Namespace::Pr(blaze_wire::PrNamespace { n: 1 })), job(&base, Namespace::Pr(blaze_wire::PrNamespace { n: 2 })));
+    assert_ne!(
+        job(&base, Namespace::Pr(blaze_wire::PrNamespace { n: 1 })),
+        job(&base, Namespace::Pr(blaze_wire::PrNamespace { n: 2 }))
+    );
     assert_ne!(job(&base, Namespace::Main), job(&other_lock, Namespace::Main));
 }
 
@@ -515,7 +676,9 @@ fn the_front_end_does_not_depend_on_the_command_but_the_config_does() {
 #[test]
 fn a_spec_of_one_unit_has_its_platform_and_its_asked_unit() {
     let fixture = Fixture::new();
-    let spec = build(&fixture, Subcommand::Check, &[], vec![Make::new("a", TargetKind::Lib)], vec![0]).unwrap();
+    let spec =
+        build(&fixture, Subcommand::Check, &[], vec![Make::new("a", TargetKind::Lib)], vec![0])
+            .unwrap();
     assert_eq!(spec.build.units.len(), 1);
     assert_eq!(spec.build.asked.as_slice(), [0]);
     assert_eq!(spec.build.cwd, ".");

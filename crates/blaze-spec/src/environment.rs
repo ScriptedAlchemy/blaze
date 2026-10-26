@@ -66,6 +66,7 @@ pub const RA_JIT_NEUTRAL: &[(&str, &str)] = &[
     ("RA_JIT_FN_CACHE_", "the cache of `#[ra_jit::cache]` results, which a program runs with"),
     ("RA_JIT_MEMORY", "the daemon's memory budget and its sampling"),
     ("RA_JIT_MEMORY_", "the daemon's memory budget and its sampling"),
+    ("RA_JIT_OWN_BASE_MEMORY", "the daemon's soft base memory budget"),
     ("RA_JIT_RECLAIM", "how the daemon gives memory back"),
     ("RA_JIT_IDLE_SECS", "how long a daemon waits before it ends"),
     ("RA_JIT_SPARE", "whether the daemon keeps a spare worker"),
@@ -77,9 +78,11 @@ pub const RA_JIT_NEUTRAL: &[(&str, &str)] = &[
 ];
 
 fn is_neutral(name: &str) -> bool {
-    RA_JIT_NEUTRAL.iter().any(|(it, _)| {
-        if it.ends_with('_') { name.starts_with(it) } else { name == *it }
-    }) || (name.starts_with("RA_JIT_") && name.ends_with("_PAUSE_MS"))
+    RA_JIT_NEUTRAL.iter().any(
+        |(it, _)| {
+            if it.ends_with('_') { name.starts_with(it) } else { name == *it }
+        },
+    ) || (name.starts_with("RA_JIT_") && name.ends_with("_PAUSE_MS"))
 }
 
 /// Refuses the first variable of `env` that changes what blaze builds and that a spec does not

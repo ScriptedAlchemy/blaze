@@ -44,29 +44,93 @@ const IGNORED: Class = Class::Ignored;
 
 /// The `-C` options blaze knows. Any other is refused as [`Reason::FlagCodegen`].
 pub const CODEGEN: &[Rule] = &[
-    rule("opt-level", HONOURED, "plan.rs `Flags::parse` reads it over the profile's level; `s` and `z` are refused"),
+    rule(
+        "opt-level",
+        HONOURED,
+        "plan.rs `Flags::parse` reads it over the profile's level; `s` and `z` are refused",
+    ),
     rule("debug-assertions", HONOURED, "plan.rs reads it over the profile's, and it sets the cfg"),
     rule("overflow-checks", HONOURED, "plan.rs reads it over the profile's, and it sets the cfg"),
-    rule("panic", HONOURED, "plan.rs reads `unwind` and `abort` over the profile's strategy, and it sets the cfg"),
+    rule(
+        "panic",
+        HONOURED,
+        "plan.rs reads `unwind` and `abort` over the profile's strategy, and it sets the cfg",
+    ),
     rule("debuginfo", HONOURED, "plan.rs reads it over the profile's level of debug info"),
-    rule("split-debuginfo", HONOURED, "plan.rs reads it over the profile's, which says where debug info is kept"),
-    rule("strip", HONOURED, "plan.rs reads it over the profile's, which says whether debug info is taken out"),
-    rule("force-frame-pointers", HONOURED, "plan.rs keeps every function's frame pointer when it is on, and no profile field names it"),
-    rule("codegen-units", IGNORED, "blaze compiles one function at a time; no option of it reads units of a crate"),
-    rule("incremental", IGNORED, "blaze keeps its own state; plan.rs and the code generators read no such option"),
+    rule(
+        "split-debuginfo",
+        HONOURED,
+        "plan.rs reads it over the profile's, which says where debug info is kept",
+    ),
+    rule(
+        "strip",
+        HONOURED,
+        "plan.rs reads it over the profile's, which says whether debug info is taken out",
+    ),
+    rule(
+        "force-frame-pointers",
+        HONOURED,
+        "plan.rs keeps every function's frame pointer when it is on, and no profile field names it",
+    ),
+    rule(
+        "codegen-units",
+        IGNORED,
+        "blaze compiles one function at a time; no option of it reads units of a crate",
+    ),
+    rule(
+        "incremental",
+        IGNORED,
+        "blaze keeps its own state; plan.rs and the code generators read no such option",
+    ),
     rule("embed-bitcode", IGNORED, "blaze writes no bitcode into the libraries it builds"),
-    rule("save-temps", IGNORED, "only keeps rustc's intermediate files, which blaze does not write"),
-    rule("lto", Class::Refused(Reason::FlagLto), "plan.rs refuses `-C lto` as the whole program would be compiled again at link time"),
+    rule(
+        "save-temps",
+        IGNORED,
+        "only keeps rustc's intermediate files, which blaze does not write",
+    ),
+    rule(
+        "lto",
+        Class::Refused(Reason::FlagLto),
+        "plan.rs refuses `-C lto` as the whole program would be compiled again at link time",
+    ),
     rule("linker-plugin-lto", Class::Refused(Reason::FlagLto), "plan.rs refuses it as `-C lto`"),
-    rule("target-cpu", Class::Refused(Reason::FlagCpu), "the code generators assume the platform's CPU (`ExecPlatform.cpu`) and read no such option"),
-    rule("target-feature", Class::Refused(Reason::FlagCpu), "the code generators read no target feature flag"),
-    rule("link-arg", Class::Refused(Reason::FlagLink), "link.rs builds the link line from `#[link]` and the scripts' output only"),
-    rule("link-args", Class::Refused(Reason::FlagLink), "link.rs builds the link line from `#[link]` and the scripts' output only"),
+    rule(
+        "target-cpu",
+        Class::Refused(Reason::FlagCpu),
+        "the code generators assume the platform's CPU (`ExecPlatform.cpu`) and read no such option",
+    ),
+    rule(
+        "target-feature",
+        Class::Refused(Reason::FlagCpu),
+        "the code generators read no target feature flag",
+    ),
+    rule(
+        "link-arg",
+        Class::Refused(Reason::FlagLink),
+        "link.rs builds the link line from `#[link]` and the scripts' output only",
+    ),
+    rule(
+        "link-args",
+        Class::Refused(Reason::FlagLink),
+        "link.rs builds the link line from `#[link]` and the scripts' output only",
+    ),
     rule("linker", Class::Refused(Reason::FlagLink), "link.rs runs the system's `cc`"),
     rule("linker-flavor", Class::Refused(Reason::FlagLink), "link.rs runs the system's `cc`"),
-    rule("link-self-contained", Class::Refused(Reason::FlagLink), "link.rs links against the system's libraries only"),
-    rule("link-dead-code", Class::Refused(Reason::FlagLink), "link.rs always links with `--gc-sections` or `-dead_strip`"),
-    rule("prefer-dynamic", Class::Refused(Reason::FlagLink), "link.rs links the standard library statically"),
+    rule(
+        "link-self-contained",
+        Class::Refused(Reason::FlagLink),
+        "link.rs links against the system's libraries only",
+    ),
+    rule(
+        "link-dead-code",
+        Class::Refused(Reason::FlagLink),
+        "link.rs always links with `--gc-sections` or `-dead_strip`",
+    ),
+    rule(
+        "prefer-dynamic",
+        Class::Refused(Reason::FlagLink),
+        "link.rs links the standard library statically",
+    ),
     rule("rpath", Class::Refused(Reason::FlagLink), "link.rs adds no run-path"),
 ];
 
@@ -74,12 +138,32 @@ pub const CODEGEN: &[Rule] = &[
 /// as [`Reason::FlagUnknown`], and a word that does not as [`Reason::FlagInput`].
 pub const OTHER: &[Rule] = &[
     rule("--cfg", HONOURED, "it sets a cfg of every unit, and blaze compiles the source with it"),
-    rule("--cap-lints", HONOURED, "check.rs lets the lints the source denies fail a check unless it is given"),
+    rule(
+        "--cap-lints",
+        HONOURED,
+        "check.rs lets the lints the source denies fail a check unless it is given",
+    ),
     rule("--force-warn", HONOURED, "plan.rs reads it as `--cap-lints` does"),
-    rule("-A", IGNORED, "a lint level, which changes no code; blaze applies the levels the source gives"),
-    rule("-W", IGNORED, "a lint level, which changes no code; blaze applies the levels the source gives"),
-    rule("-D", IGNORED, "a lint level, which changes no code; blaze applies the levels the source gives"),
-    rule("-F", IGNORED, "a lint level, which changes no code; blaze applies the levels the source gives"),
+    rule(
+        "-A",
+        IGNORED,
+        "a lint level, which changes no code; blaze applies the levels the source gives",
+    ),
+    rule(
+        "-W",
+        IGNORED,
+        "a lint level, which changes no code; blaze applies the levels the source gives",
+    ),
+    rule(
+        "-D",
+        IGNORED,
+        "a lint level, which changes no code; blaze applies the levels the source gives",
+    ),
+    rule(
+        "-F",
+        IGNORED,
+        "a lint level, which changes no code; blaze applies the levels the source gives",
+    ),
     rule("--allow", IGNORED, "a lint level, which changes no code"),
     rule("--warn", IGNORED, "a lint level, which changes no code"),
     rule("--deny", IGNORED, "a lint level, which changes no code"),
@@ -87,21 +171,65 @@ pub const OTHER: &[Rule] = &[
     rule("--check-cfg", IGNORED, "only names the cfgs the `unexpected_cfgs` lint expects"),
     rule("--color", IGNORED, "changes only whether messages are in colour"),
     rule("--diagnostic-width", IGNORED, "changes only how wide messages are written"),
-    rule("-L", Class::Refused(Reason::FlagLink), "link.rs searches only where a script's output says"),
-    rule("-l", Class::Refused(Reason::FlagLink), "link.rs links only what `#[link]` and the scripts name"),
-    rule("--remap-path-prefix", Class::Refused(Reason::FlagRemap), "blaze embeds the source paths it was given and remaps none"),
-    rule("-Z", Class::Refused(Reason::FlagUnstable), "no unstable option reaches blaze's code generators"),
+    rule(
+        "-L",
+        Class::Refused(Reason::FlagLink),
+        "link.rs searches only where a script's output says",
+    ),
+    rule(
+        "-l",
+        Class::Refused(Reason::FlagLink),
+        "link.rs links only what `#[link]` and the scripts name",
+    ),
+    rule(
+        "--remap-path-prefix",
+        Class::Refused(Reason::FlagRemap),
+        "blaze embeds the source paths it was given and remaps none",
+    ),
+    rule(
+        "-Z",
+        Class::Refused(Reason::FlagUnstable),
+        "no unstable option reaches blaze's code generators",
+    ),
     rule("--target", Class::Refused(Reason::FlagCargoOwns), "blaze builds for its own host only"),
-    rule("--crate-type", Class::Refused(Reason::FlagCargoOwns), "cargo names the crate types of each unit"),
+    rule(
+        "--crate-type",
+        Class::Refused(Reason::FlagCargoOwns),
+        "cargo names the crate types of each unit",
+    ),
     rule("--crate-name", Class::Refused(Reason::FlagCargoOwns), "cargo names each unit's crate"),
     rule("--emit", Class::Refused(Reason::FlagCargoOwns), "cargo names what each unit writes"),
     rule("--out-dir", Class::Refused(Reason::FlagCargoOwns), "cargo names where each unit writes"),
-    rule("--edition", Class::Refused(Reason::FlagCargoOwns), "each unit has the edition of its target"),
-    rule("--extern", Class::Refused(Reason::FlagCargoOwns), "the units' dependencies are the spec's"),
-    rule("--sysroot", Class::Refused(Reason::FlagCargoOwns), "the standard library is the toolchain's"),
-    rule("--print", Class::Refused(Reason::FlagCargoOwns), "it makes rustc print instead of compile"),
-    rule("--error-format", Class::Refused(Reason::FlagCargoOwns), "cargo reads rustc's messages in the format it asks for"),
-    rule("--json", Class::Refused(Reason::FlagCargoOwns), "cargo reads rustc's messages in the format it asks for"),
+    rule(
+        "--edition",
+        Class::Refused(Reason::FlagCargoOwns),
+        "each unit has the edition of its target",
+    ),
+    rule(
+        "--extern",
+        Class::Refused(Reason::FlagCargoOwns),
+        "the units' dependencies are the spec's",
+    ),
+    rule(
+        "--sysroot",
+        Class::Refused(Reason::FlagCargoOwns),
+        "the standard library is the toolchain's",
+    ),
+    rule(
+        "--print",
+        Class::Refused(Reason::FlagCargoOwns),
+        "it makes rustc print instead of compile",
+    ),
+    rule(
+        "--error-format",
+        Class::Refused(Reason::FlagCargoOwns),
+        "cargo reads rustc's messages in the format it asks for",
+    ),
+    rule(
+        "--json",
+        Class::Refused(Reason::FlagCargoOwns),
+        "cargo reads rustc's messages in the format it asks for",
+    ),
     rule("--test", Class::Refused(Reason::FlagCargoOwns), "cargo says which units are tests"),
 ];
 
@@ -152,15 +280,29 @@ impl Rustflags {
 /// environment and configuration `config` has.
 pub fn words(config: &Config, host: &Host) -> Result<Vec<String>, Refusal> {
     config
-        .extra_args(&[CompileKind::Host], &host.triple, Some(&host.cfg), &CompileKind::Host, Flags::Rust)
+        .extra_args(
+            &[CompileKind::Host],
+            &host.triple,
+            Some(&host.cfg),
+            &CompileKind::Host,
+            Flags::Rust,
+        )
         .map_err(|error| Refusal::with(Reason::ConfigRejected, "rustflags", format!("{error:#}")))
 }
 
 /// The words cargo gives rustdoc: what a doc test would run with.
 pub fn doc_words(config: &Config, host: &Host) -> Result<Vec<String>, Refusal> {
     config
-        .extra_args(&[CompileKind::Host], &host.triple, Some(&host.cfg), &CompileKind::Host, Flags::Rustdoc)
-        .map_err(|error| Refusal::with(Reason::ConfigRejected, "rustdocflags", format!("{error:#}")))
+        .extra_args(
+            &[CompileKind::Host],
+            &host.triple,
+            Some(&host.cfg),
+            &CompileKind::Host,
+            Flags::Rustdoc,
+        )
+        .map_err(|error| {
+            Refusal::with(Reason::ConfigRejected, "rustdocflags", format!("{error:#}"))
+        })
 }
 
 /// What a flag of `words` is read as: a long flag by its `=` or a short one by its first two
@@ -215,7 +357,11 @@ pub fn read(words: &[String]) -> Result<Rustflags, Refusal> {
             "--cap-lints" => {
                 let level = value(&mut words)?;
                 if !matches!(level.as_str(), "allow" | "warn" | "deny" | "forbid") {
-                    return Err(Refusal::with(Reason::FlagValue, word.clone(), "no such lint level"));
+                    return Err(Refusal::with(
+                        Reason::FlagValue,
+                        word.clone(),
+                        "no such lint level",
+                    ));
                 }
                 out.flags.push(format!("--cap-lints={level}"));
             }
@@ -297,7 +443,11 @@ fn codegen(out: &mut Rustflags, option: &str, word: &str) -> Result<(), Refusal>
                 Some("0" | "none") => 0,
                 Some("1" | "limited" | "line-tables-only" | "line-directives-only") => 1,
                 Some("2" | "full") => 2,
-                _ => return Err(bad("expected 0, 1, 2, none, limited, line-tables-only, line-directives-only or full")),
+                _ => {
+                    return Err(bad(
+                        "expected 0, 1, 2, none, limited, line-tables-only, line-directives-only or full",
+                    ));
+                }
             };
             out.overrides.debug = Some(level);
             format!("debuginfo={}", value.unwrap_or_default())
@@ -317,7 +467,9 @@ fn codegen(out: &mut Rustflags, option: &str, word: &str) -> Result<(), Refusal>
             _ => return Err(bad("expected none, debuginfo or symbols")),
         },
         "force-frame-pointers" => match value {
-            Some("always" | "non-leaf" | "may-omit") => format!("{name}={}", value.unwrap_or_default()),
+            Some("always" | "non-leaf" | "may-omit") => {
+                format!("{name}={}", value.unwrap_or_default())
+            }
             other => match on(other) {
                 Some(on) => format!("{name}={}", if on { "yes" } else { "no" }),
                 None => return Err(bad("expected yes, no, always, non-leaf or may-omit")),

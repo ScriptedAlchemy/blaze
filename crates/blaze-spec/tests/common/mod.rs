@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use blaze_manifest::profiles::{Profile, Profiles, UnitFor};
 use blaze_metadata::units::{Mode, TargetKind, Unit, UnitDep, UnitGraph, UnitPackage, UnitTarget};
+use blaze_spec::Refusal;
 use blaze_spec::assemble::{Context, Host, Spec, assemble};
 use blaze_spec::flags::{Request, Subcommand};
 use blaze_spec::platform::Probe;
-use blaze_spec::Refusal;
 use blaze_wire::{SourceRef, StoreIdentity};
 
 /// A workspace of one member `a`, in a temporary directory that `.cargo/config.toml` and the
@@ -85,7 +85,14 @@ impl Probe for FakeMachine {
         Some(PathBuf::from("/usr/bin").join(name))
     }
 
-    fn run(&self, program: &Path, _args: &[&str]) -> Option<String> {
+    fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        if program == Path::new("/usr/bin/env") {
+            return match args.last().copied() {
+                Some("--show-sdk-path") => Some("/sdk/MacOSX.sdk".to_owned()),
+                Some("--show-sdk-version") => Some("26.0".to_owned()),
+                _ => None,
+            };
+        }
         Some(format!("{} 1.0.0\n", program.display()))
     }
 
@@ -291,6 +298,7 @@ pub fn graph(units: Vec<Make>, roots: &[usize], profile: &Profile) -> UnitGraph 
         .into_iter()
         .map(|make| Unit {
             package: UnitPackage {
+                id: format!("{}#{}@0.1.0", make.source, make.name),
                 name: make.name.clone(),
                 version: "0.1.0".to_owned(),
                 source: make.source.clone(),
@@ -304,8 +312,13 @@ pub fn graph(units: Vec<Make>, roots: &[usize], profile: &Profile) -> UnitGraph 
                 src_path: PathBuf::from(format!("{}/src/lib.rs", make.name)),
                 edition: 2021,
                 harness: make.harness,
+                required_features: None,
+                doc: true,
+                doctest: make.kind == TargetKind::Lib,
+                tested: true,
             },
             mode: make.mode,
+            test: make.mode == Mode::Test,
             profile: make.profile.unwrap_or_else(|| profile.clone()),
             features: make.features,
             for_host: make.for_host,
@@ -317,11 +330,18 @@ pub fn graph(units: Vec<Make>, roots: &[usize], profile: &Profile) -> UnitGraph 
                     extern_crate_name: name,
                     public: false,
                     noprelude: false,
+                    nounused: false,
                 })
                 .collect(),
         })
         .collect();
-    UnitGraph { units, roots: roots.to_vec(), root: PathBuf::new(), lock: b"lock".to_vec() }
+    UnitGraph {
+        units,
+        roots: roots.to_vec(),
+        root: PathBuf::new(),
+        lock: b"lock".to_vec(),
+        warnings: Vec::new(),
+    }
 }
 
 /// The graph of a member `a` as a library, built for the target.
@@ -356,8 +376,9 @@ pub fn spec_on(
     let default = if command == Subcommand::Test { "test" } else { "dev" };
     let requested = request.profile.clone().unwrap_or_else(|| default.to_owned());
     // A configuration cargo rejects has no profile to make, and the spec refuses it first.
-    let profile = try_profile_of(fixture, env, &requested, &Package::member(&root, "a"), true, false)
-        .unwrap_or_default();
+    let profile =
+        try_profile_of(fixture, env, &requested, &Package::member(&root, "a"), true, false)
+            .unwrap_or_default();
     let units = match graph {
         Some(graph) => graph(&profile),
         None => simple_graph(&profile),

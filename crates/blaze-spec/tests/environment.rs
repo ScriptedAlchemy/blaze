@@ -21,7 +21,14 @@ fn each_refused_variable_is_named() {
     }
     // The ones the task names, among them.
     let names: Vec<&str> = REFUSED.iter().map(|it| it.0).collect();
-    for name in ["RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTDOC", "RUSTUP_TOOLCHAIN", "RA_JIT_OTHER_TOOLCHAIN"] {
+    for name in [
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTUP_TOOLCHAIN",
+        "RA_JIT_OTHER_TOOLCHAIN",
+    ] {
         assert!(names.contains(&name), "{name}");
     }
 }
@@ -66,10 +73,25 @@ fn a_ra_jit_variable_is_carried_ignored_or_refused() {
         let name = if name.ends_with('_') { format!("{name}ANY") } else { (*name).to_owned() };
         assert!(environment::check(&env(&[(&name, "x")])).is_ok(), "{name} changes nothing");
     }
-    for name in ["RA_JIT_REMOTE_PUSH_EVERY", "RA_JIT_FN_CACHE_DIR", "RA_JIT_MEMORY_MAX", "RA_JIT_DUMP_MIR", "RA_JIT_AHEAD_PAUSE_MS", "RA_JIT_LOAD_PAUSE_MS"] {
+    for name in [
+        "RA_JIT_REMOTE_PUSH_EVERY",
+        "RA_JIT_FN_CACHE_DIR",
+        "RA_JIT_MEMORY_MAX",
+        "RA_JIT_DUMP_MIR",
+        "RA_JIT_AHEAD_PAUSE_MS",
+        "RA_JIT_LOAD_PAUSE_MS",
+    ] {
         assert!(environment::check(&env(&[(name, "1")])).is_ok(), "{name}");
     }
-    for name in ["RA_JIT_TIER", "RA_JIT_INLINE", "RA_JIT_WHOLE_BUILD", "RA_JIT_STD_FROM", "RA_JIT_SANDBOX", "RA_JIT_UNKNOWN", "RA_JIT_"] {
+    for name in [
+        "RA_JIT_TIER",
+        "RA_JIT_INLINE",
+        "RA_JIT_WHOLE_BUILD",
+        "RA_JIT_STD_FROM",
+        "RA_JIT_SANDBOX",
+        "RA_JIT_UNKNOWN",
+        "RA_JIT_",
+    ] {
         let error = environment::check(&env(&[(name, "1")])).expect_err(name);
         assert_eq!((error.id, error.what.as_str()), ("EnvRaJit", name));
     }

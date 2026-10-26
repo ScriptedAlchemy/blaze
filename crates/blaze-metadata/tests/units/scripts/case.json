@@ -1,0 +1,199 @@
+{
+ "runs": [
+  {
+   "args": [
+    "build",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "pm"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "native"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "consumer"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "helper"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "pm"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "native"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "consumer"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "helper"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "pm"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "native"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "consumer"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "helper"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "pm",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "pm",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "pm",
+    "--tests"
+   ]
+  }
+ ]
+}

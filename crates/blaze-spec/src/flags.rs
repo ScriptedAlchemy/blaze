@@ -104,7 +104,8 @@ impl Flag {
     }
 }
 
-const ALL: &[Subcommand] = &[Subcommand::Check, Subcommand::Build, Subcommand::Run, Subcommand::Test];
+const ALL: &[Subcommand] =
+    &[Subcommand::Check, Subcommand::Build, Subcommand::Run, Subcommand::Test];
 const NOT_RUN: &[Subcommand] = &[Subcommand::Check, Subcommand::Build, Subcommand::Test];
 const TEST: &[Subcommand] = &[Subcommand::Test];
 
@@ -127,52 +128,268 @@ const fn checked(flag: Flag, check: fn(&str) -> Option<Reason>) -> Flag {
 /// Every flag of `cargo check`, `build`, `run` and `test` that blaze knows, in its class.
 pub const FLAGS: &[Flag] = &[
     // Honoured: each changes the spec.
-    flag("package", Some('p'), Takes::Value, Class::Honoured, ALL, "a", "selects the members built"),
+    flag(
+        "package",
+        Some('p'),
+        Takes::Value,
+        Class::Honoured,
+        ALL,
+        "a",
+        "selects the members built",
+    ),
     flag("workspace", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every member"),
-    flag("all", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "cargo's deprecated spelling of --workspace"),
-    flag("exclude", None, Takes::Value, Class::Honoured, NOT_RUN, "a", "leaves members out of --workspace"),
-    flag("features", Some('F'), Takes::Value, Class::Honoured, ALL, "a", "turns features on, which changes the units' features and cfgs"),
-    flag("all-features", None, Takes::Nothing, Class::Honoured, ALL, "", "turns every feature of the members on"),
-    flag("no-default-features", None, Takes::Nothing, Class::Honoured, ALL, "", "turns the default features off"),
-    flag("release", Some('r'), Takes::Nothing, Class::Honoured, ALL, "", "builds with the release profile"),
-    flag("profile", None, Takes::Value, Class::Honoured, ALL, "release", "builds with the named profile"),
-    flag("lib", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects the members' libraries"),
+    flag(
+        "all",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        NOT_RUN,
+        "",
+        "cargo's deprecated spelling of --workspace",
+    ),
+    flag(
+        "exclude",
+        None,
+        Takes::Value,
+        Class::Honoured,
+        NOT_RUN,
+        "a",
+        "leaves members out of --workspace",
+    ),
+    flag(
+        "features",
+        Some('F'),
+        Takes::Value,
+        Class::Honoured,
+        ALL,
+        "a",
+        "turns features on, which changes the units' features and cfgs",
+    ),
+    flag(
+        "all-features",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        ALL,
+        "",
+        "turns every feature of the members on",
+    ),
+    flag(
+        "no-default-features",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        ALL,
+        "",
+        "turns the default features off",
+    ),
+    flag(
+        "release",
+        Some('r'),
+        Takes::Nothing,
+        Class::Honoured,
+        ALL,
+        "",
+        "builds with the release profile",
+    ),
+    flag(
+        "profile",
+        None,
+        Takes::Value,
+        Class::Honoured,
+        ALL,
+        "release",
+        "builds with the named profile",
+    ),
+    flag(
+        "lib",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        NOT_RUN,
+        "",
+        "selects the members' libraries",
+    ),
     flag("bin", None, Takes::Value, Class::Honoured, ALL, "a", "selects the named binary"),
     flag("bins", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every binary"),
     flag("example", None, Takes::Value, Class::Honoured, ALL, "a", "selects the named example"),
     flag("examples", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every example"),
-    flag("test", None, Takes::Value, Class::Honoured, NOT_RUN, "a", "selects the named integration test"),
+    flag(
+        "test",
+        None,
+        Takes::Value,
+        Class::Honoured,
+        NOT_RUN,
+        "a",
+        "selects the named integration test",
+    ),
     flag("tests", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every test target"),
     flag("bench", None, Takes::Value, Class::Honoured, NOT_RUN, "a", "selects the named benchmark"),
     flag("benches", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every benchmark"),
-    flag("all-targets", None, Takes::Nothing, Class::Honoured, NOT_RUN, "", "selects every target of every kind"),
-    flag("doc", None, Takes::Nothing, Class::Honoured, TEST, "", "runs only the doc tests, of the libraries"),
-    flag("manifest-path", None, Takes::Value, Class::Honoured, ALL, "a/Cargo.toml", "names the manifest the workspace is found from"),
-    flag("config", None, Takes::Value, Class::Honoured, ALL, "build.jobs=1", "adds configuration, which can change a profile or what is built"),
-    flag("offline", None, Takes::Nothing, Class::Honoured, ALL, "", "keeps resolution off the network; changes whether a spec can be made, not what it is"),
-    flag("locked", None, Takes::Nothing, Class::Honoured, ALL, "", "fails on a lock file the manifests no longer agree with, as blaze's resolution always does"),
+    flag(
+        "all-targets",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        NOT_RUN,
+        "",
+        "selects every target of every kind",
+    ),
+    flag(
+        "doc",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        TEST,
+        "",
+        "runs only the doc tests, of the libraries",
+    ),
+    flag(
+        "manifest-path",
+        None,
+        Takes::Value,
+        Class::Honoured,
+        ALL,
+        "a/Cargo.toml",
+        "names the manifest the workspace is found from",
+    ),
+    flag(
+        "config",
+        None,
+        Takes::Value,
+        Class::Honoured,
+        ALL,
+        "build.jobs=1",
+        "adds configuration, which can change a profile or what is built",
+    ),
+    flag(
+        "offline",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        ALL,
+        "",
+        "keeps resolution off the network; changes whether a spec can be made, not what it is",
+    ),
+    flag(
+        "locked",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        ALL,
+        "",
+        "fails on a lock file the manifests no longer agree with, as blaze's resolution always does",
+    ),
     flag("frozen", None, Takes::Nothing, Class::Honoured, ALL, "", "is --offline and --locked"),
-    flag("no-run", None, Takes::Nothing, Class::Honoured, TEST, "", "builds the tests and runs none"),
-    flag("no-fail-fast", None, Takes::Nothing, Class::Honoured, TEST, "", "runs the remaining tests after one fails"),
+    flag(
+        "no-run",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        TEST,
+        "",
+        "builds the tests and runs none",
+    ),
+    flag(
+        "no-fail-fast",
+        None,
+        Takes::Nothing,
+        Class::Honoured,
+        TEST,
+        "",
+        "runs the remaining tests after one fails",
+    ),
     // Ignored: each changes only what is printed or how fast the build is.
     checked(
-        flag("color", None, Takes::Value, Class::Ignored, ALL, "never", "changes only whether messages are in colour"),
+        flag(
+            "color",
+            None,
+            Takes::Value,
+            Class::Ignored,
+            ALL,
+            "never",
+            "changes only whether messages are in colour",
+        ),
         color,
     ),
     checked(
-        flag("message-format", None, Takes::Value, Class::Ignored, ALL, "short", "changes only how human messages are written; a JSON stream is refused"),
+        flag(
+            "message-format",
+            None,
+            Takes::Value,
+            Class::Ignored,
+            ALL,
+            "short",
+            "changes only how human messages are written; a JSON stream is refused",
+        ),
         message_format,
     ),
-    flag("verbose", Some('v'), Takes::Nothing, Class::Ignored, ALL, "", "changes only what is printed"),
-    flag("quiet", Some('q'), Takes::Nothing, Class::Ignored, ALL, "", "changes only what is printed"),
-    flag("jobs", Some('j'), Takes::Value, Class::Ignored, ALL, "1", "changes only how many units build at once"),
+    flag(
+        "verbose",
+        Some('v'),
+        Takes::Nothing,
+        Class::Ignored,
+        ALL,
+        "",
+        "changes only what is printed",
+    ),
+    flag(
+        "quiet",
+        Some('q'),
+        Takes::Nothing,
+        Class::Ignored,
+        ALL,
+        "",
+        "changes only what is printed",
+    ),
+    flag(
+        "jobs",
+        Some('j'),
+        Takes::Value,
+        Class::Ignored,
+        ALL,
+        "1",
+        "changes only how many units build at once",
+    ),
     checked(
-        flag("timings", None, Takes::ValueAfterEquals, Class::Ignored, ALL, "html", "writes a report beside the build and changes nothing in it"),
+        flag(
+            "timings",
+            None,
+            Takes::ValueAfterEquals,
+            Class::Ignored,
+            ALL,
+            "html",
+            "writes a report beside the build and changes nothing in it",
+        ),
         timings,
     ),
-    flag("future-incompat-report", None, Takes::Nothing, Class::Ignored, ALL, "", "changes only what is printed at the end"),
-    flag("ignore-rust-version", None, Takes::Nothing, Class::Ignored, ALL, "", "skips a rust-version check that fails a build and changes no unit"),
-    flag("target-dir", None, Takes::Value, Class::Ignored, ALL, "a", "changes where cargo writes, and a worker writes where it has room"),
+    flag(
+        "future-incompat-report",
+        None,
+        Takes::Nothing,
+        Class::Ignored,
+        ALL,
+        "",
+        "changes only what is printed at the end",
+    ),
+    flag(
+        "ignore-rust-version",
+        None,
+        Takes::Nothing,
+        Class::Ignored,
+        ALL,
+        "",
+        "skips a rust-version check that fails a build and changes no unit",
+    ),
+    flag(
+        "target-dir",
+        None,
+        Takes::Value,
+        Class::Ignored,
+        ALL,
+        "a",
+        "changes where cargo writes, and a worker writes where it has room",
+    ),
     // Refused: blaze cannot honour each.
     flag("target", None, Takes::Value, Class::Refused(Reason::Target), ALL, "a", ""),
     flag("", Some('Z'), Takes::Value, Class::Refused(Reason::UnstableFlag), ALL, "a", ""),
@@ -372,7 +589,8 @@ impl Request {
                         continue;
                     }
                     let rest = &word[1 + at + short.len_utf8()..];
-                    let attached = (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
+                    let attached =
+                        (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
                     let value = take(flag, word, attached, &mut words)?;
                     request.read(command, flag, value.as_deref(), &mut seen)?;
                     break;
@@ -503,7 +721,10 @@ impl Request {
             (true, None) => Some("release".to_owned()),
             (true, Some(named)) if named == "release" => Some(named),
             (true, Some(named)) => {
-                return Err(Refusal::of(Reason::ProfileConflict, format!("--release --profile {named}")));
+                return Err(Refusal::of(
+                    Reason::ProfileConflict,
+                    format!("--release --profile {named}"),
+                ));
             }
             (false, Some(named)) if named == "doc" => {
                 let detail = "profile `doc` is reserved and not allowed to be explicitly specified";
@@ -511,7 +732,11 @@ impl Request {
             }
             (false, Some(named)) => {
                 if let Err(error) = cargo_util_schemas::manifest::ProfileName::new(&named) {
-                    return Err(Refusal::with(Reason::BadValue, format!("--profile {named}"), error));
+                    return Err(Refusal::with(
+                        Reason::BadValue,
+                        format!("--profile {named}"),
+                        error,
+                    ));
                 }
                 Some(named)
             }

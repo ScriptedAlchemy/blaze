@@ -1,0 +1,53 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+gated = []
+other = []
+
+[dependencies]
+dep = { path = "dep" }
+
+[dev-dependencies]
+devdep = { path = "devdep" }
+
+[lib]
+harness = false
+
+[[bin]]
+name = "gated"
+path = "src/bin/gated.rs"
+required-features = ["gated"]
+
+[[bin]]
+name = "plain-bin"
+path = "src/bin/plain.rs"
+test = false
+
+[[test]]
+name = "custom"
+harness = false
+
+[[test]]
+name = "plain"
+
+[[test]]
+name = "needs"
+required-features = ["gated", "dep/feat"]
+
+[[example]]
+name = "ex-gated"
+required-features = ["gated"]
+
+[[example]]
+name = "ex-plain"
+
+[[bench]]
+name = "b1"
+harness = false
+
+[[bench]]
+name = "b2"
+required-features = ["other"]

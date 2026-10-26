@@ -9,14 +9,16 @@
 //!
 //! A `[target.<triple>.runner]` is refused for `test` and `run` only, the commands that start a
 //! program through it: a spec carries no runner, and an executor that ran a test directly would
-//! not do what the command does. `target.<triple>.linker` is refused for the commands that link.
+//! not do what the command does. `target.<triple>.linker` is refused for the commands that link,
+//! which is every one but `check`, and `build.rustdocflags` (or `RUSTDOCFLAGS`) for the commands
+//! that run doc tests, which blaze runs with no rustdoc flags.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use blaze_manifest::config::{
-    CargoBuildConfig, CargoResolverConfig, ConfigKey, ConfigRelativePath,
-    ConfigValue, Definition, FeatureUnification, WarningHandling,
+    CargoBuildConfig, CargoResolverConfig, ConfigKey, ConfigRelativePath, ConfigValue, Definition,
+    FeatureUnification, WarningHandling,
 };
 use blaze_manifest::{Config, paths};
 use blaze_resolve::Platform;
@@ -47,26 +49,46 @@ const fn key(key: &'static str, class: Class, because: &'static str) -> Key {
 /// and is not read; where packages come from changes no unit, because the lock file pins their
 /// content by checksum.
 pub const KEYS: &[Key] = &[
-    key("build.rustflags", Class::Honoured, "rustflags, by cargo's precedence, in `rustflags` and the profiles"),
+    key(
+        "build.rustflags",
+        Class::Honoured,
+        "rustflags, by cargo's precedence, in `rustflags` and the profiles",
+    ),
     key("target.<triple>.rustflags", Class::Honoured, "rustflags, by cargo's precedence"),
     key("target.'cfg(..)'.rustflags", Class::Honoured, "rustflags, by cargo's precedence"),
-    key("profile.*", Class::Honoured, "merged over the manifest's profiles by blaze-manifest and carried in each unit's profile"),
+    key(
+        "profile.*",
+        Class::Honoured,
+        "merged over the manifest's profiles by blaze-manifest and carried in each unit's profile",
+    ),
     key("env", Class::Honoured, "resolved into `config_env`"),
     key("net.offline", Class::Honoured, "keeps resolution off the network"),
-    key("build.target-dir", Class::Ignored, "where cargo writes; a worker writes where it has room"),
+    key(
+        "build.target-dir",
+        Class::Ignored,
+        "where cargo writes; a worker writes where it has room",
+    ),
     key("build.build-dir", Class::Ignored, "where cargo writes intermediate files"),
     key("build.jobs", Class::Ignored, "how many units build at once"),
     key("build.incremental", Class::Ignored, "blaze keeps its own state"),
     key("build.pipelining", Class::Ignored, "cargo's scheduling only"),
-    key("build.rustdocflags", Class::Ignored, "rustdoc runs only for doc tests, and refused there"),
-    key("target.<triple>.ar", Class::Ignored, "cargo ignores it, and build scripts find `ar` by the `cc` crate's rules"),
-    key("resolver.incompatible-rust-versions", Class::Ignored, "chooses versions when the lock file is made, and a spec has one"),
+    key(
+        "target.<triple>.ar",
+        Class::Ignored,
+        "cargo ignores it, and build scripts find `ar` by the `cc` crate's rules",
+    ),
+    key(
+        "resolver.incompatible-rust-versions",
+        Class::Ignored,
+        "chooses versions when the lock file is made, and a spec has one",
+    ),
     key("build.target", Class::Refused(Reason::BuildTarget), ""),
     key("build.rustc", Class::Refused(Reason::BuildRustc), ""),
     key("build.rustc-wrapper", Class::Refused(Reason::BuildRustcWrapper), ""),
     key("build.rustc-workspace-wrapper", Class::Refused(Reason::BuildRustcWrapper), ""),
     key("build.rustdoc", Class::Refused(Reason::BuildRustdoc), ""),
     key("build.artifact-dir", Class::Refused(Reason::BuildArtifactDir), ""),
+    key("build.rustdocflags", Class::Refused(Reason::RustdocFlags), ""),
     key("build.warnings", Class::Refused(Reason::BuildWarnings), ""),
     key("build.sbom", Class::Refused(Reason::BuildUnstable), ""),
     key("build.analysis", Class::Refused(Reason::BuildUnstable), ""),
@@ -116,7 +138,12 @@ fn named(definition: &Definition, key: &str) -> String {
     }
 }
 
-fn path_setting(refusals: &mut Vec<Refusal>, path: &Option<ConfigRelativePath>, key: &str, reason: Reason) {
+fn path_setting(
+    refusals: &mut Vec<Refusal>,
+    path: &Option<ConfigRelativePath>,
+    key: &str,
+    reason: Reason,
+) {
     if let Some(path) = path {
         refusals.push(Refusal::of(reason, named(&path.value().definition, key)));
     }
@@ -142,7 +169,12 @@ pub fn check(
         refusals.push(Refusal::of(Reason::BuildTarget, target_name(config)));
     }
     path_setting(&mut refusals, &build.rustc, "build.rustc", Reason::BuildRustc);
-    path_setting(&mut refusals, &build.rustc_wrapper, "build.rustc-wrapper", Reason::BuildRustcWrapper);
+    path_setting(
+        &mut refusals,
+        &build.rustc_wrapper,
+        "build.rustc-wrapper",
+        Reason::BuildRustcWrapper,
+    );
     path_setting(
         &mut refusals,
         &build.rustc_workspace_wrapper,
@@ -150,8 +182,18 @@ pub fn check(
         Reason::BuildRustcWrapper,
     );
     path_setting(&mut refusals, &build.rustdoc, "build.rustdoc", Reason::BuildRustdoc);
-    path_setting(&mut refusals, &build.artifact_dir, "build.artifact-dir", Reason::BuildArtifactDir);
-    path_setting(&mut refusals, &build.dep_info_basedir, "build.dep-info-basedir", Reason::BuildUnstable);
+    path_setting(
+        &mut refusals,
+        &build.artifact_dir,
+        "build.artifact-dir",
+        Reason::BuildArtifactDir,
+    );
+    path_setting(
+        &mut refusals,
+        &build.dep_info_basedir,
+        "build.dep-info-basedir",
+        Reason::BuildUnstable,
+    );
     if let Some(warnings @ (WarningHandling::Allow | WarningHandling::Deny)) = build.warnings {
         let what = format!("build.warnings = {:?}", format!("{warnings:?}").to_lowercase());
         refusals.push(Refusal::of(Reason::BuildWarnings, what));
@@ -168,12 +210,18 @@ pub fn check(
         let what = named(value.definition(), "build.target-applies-to-host");
         refusals.push(Refusal::of(Reason::HostConfig, what));
     }
-    for (table, reason) in [("host", Reason::HostConfig), ("unstable", Reason::UnstableTable), ("patch", Reason::ConfigPatch)] {
+    for (table, reason) in [
+        ("host", Reason::HostConfig),
+        ("unstable", Reason::UnstableTable),
+        ("patch", Reason::ConfigPatch),
+    ] {
         match top(table)? {
             Some(ConfigValue::Table(entries, _)) => {
                 let mut keys: Vec<&String> = entries.keys().collect();
                 keys.sort();
-                refusals.extend(keys.first().map(|first| Refusal::of(reason, format!("{table}.{first}"))));
+                refusals.extend(
+                    keys.first().map(|first| Refusal::of(reason, format!("{table}.{first}"))),
+                );
             }
             Some(other) => refusals.push(Refusal::of(reason, named(other.definition(), table))),
             None => {}
@@ -186,10 +234,18 @@ pub fn check(
         if let Some(unification) = resolver.feature_unification
             && !matches!(unification, FeatureUnification::Selected)
         {
-            let what = format!("resolver.feature-unification = {:?}", format!("{unification:?}").to_lowercase());
+            let what = format!(
+                "resolver.feature-unification = {:?}",
+                format!("{unification:?}").to_lowercase()
+            );
             refusals.push(Refusal::of(Reason::FeatureUnification, what));
         }
-        path_setting(&mut refusals, &resolver.lockfile_path, "resolver.lockfile-path", Reason::LockfilePath);
+        path_setting(
+            &mut refusals,
+            &resolver.lockfile_path,
+            "resolver.lockfile-path",
+            Reason::LockfilePath,
+        );
     }
 
     target_tables(config, host, command, &mut refusals)?;
@@ -203,7 +259,9 @@ pub fn check(
     if doc_tests {
         let words = crate::rustflags::doc_words(config, host)?;
         if !words.is_empty() {
-            let from = ["CARGO_ENCODED_RUSTDOCFLAGS", "RUSTDOCFLAGS"].into_iter().find(|it| env.contains_key(*it));
+            let from = ["CARGO_ENCODED_RUSTDOCFLAGS", "RUSTDOCFLAGS"]
+                .into_iter()
+                .find(|it| env.contains_key(*it));
             let what = from.unwrap_or("build.rustdocflags");
             return Err(Refusal::of(Reason::RustdocFlags, what));
         }
@@ -301,7 +359,9 @@ fn resolve_env(
         }
         let what = format!("env.{name}");
         let (value, definition, force, relative) = match &entries[name] {
-            ConfigValue::String(value, definition) => (value.clone(), definition.clone(), false, false),
+            ConfigValue::String(value, definition) => {
+                (value.clone(), definition.clone(), false, false)
+            }
             ConfigValue::Table(fields, _) => {
                 let Some(ConfigValue::String(value, definition)) = fields.get("value") else {
                     return Err(rejected(&what, "expected a string `value`"));
@@ -331,7 +391,8 @@ fn resolve_env(
                 format!("it is of {definition}, and the workspace root is {}", root.display()),
             ));
         };
-        let parts: Vec<String> = inside.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
+        let parts: Vec<String> =
+            inside.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
         let rel = if parts.is_empty() { ".".to_owned() } else { parts.join("/") };
         rebased.push(name.clone());
         resolved.push((name.clone(), rel));

@@ -3,9 +3,9 @@
 
 mod common;
 
+use blaze_spec::Refusal;
 use blaze_spec::flags::Class;
 use blaze_spec::rustflags::{self, CODEGEN, OTHER, Rustflags};
-use blaze_spec::Refusal;
 
 use common::{Fixture, host};
 
@@ -86,7 +86,10 @@ fn a_codegen_option_is_read_in_every_spelling_and_kept_in_one() {
     assert_eq!(read(&["-Cdebug_assertions=off"]).unwrap().flags, ["-Cdebug-assertions=no"]);
     assert_eq!(read(&["-Coverflow-checks=true"]).unwrap().overrides.overflow_checks, Some(true));
     assert_eq!(read(&["-Cforce-frame-pointers"]).unwrap().flags, ["-Cforce-frame-pointers=yes"]);
-    assert_eq!(read(&["-Cforce-frame-pointers=non-leaf"]).unwrap().flags, ["-Cforce-frame-pointers=non-leaf"]);
+    assert_eq!(
+        read(&["-Cforce-frame-pointers=non-leaf"]).unwrap().flags,
+        ["-Cforce-frame-pointers=non-leaf"]
+    );
     for (flag, level) in [
         ("none", 0),
         ("0", 0),
@@ -132,7 +135,14 @@ fn a_cfg_is_a_name_or_a_name_and_a_quoted_value() {
         assert_eq!(refused(&["--cfg", bad]).id, "FlagCfg", "{bad}");
     }
     // The cfgs rustc sets itself, which it refuses as a flag.
-    for builtin in ["debug_assertions", "unix", "target_os=\"linux\"", "panic=\"abort\"", "test", "sanitizer_cfi"] {
+    for builtin in [
+        "debug_assertions",
+        "unix",
+        "target_os=\"linux\"",
+        "panic=\"abort\"",
+        "test",
+        "sanitizer_cfi",
+    ] {
         assert_eq!(refused(&["--cfg", builtin]).id, "FlagCfg", "{builtin}");
     }
 }
@@ -254,6 +264,9 @@ fn flags_come_from_where_cargo_takes_them_from() {
     );
     // `build.rustflags` is last.
     assert_eq!(words("[build]\nrustflags = \"--cfg x\"\n", &[]), ["--cfg", "x"]);
-    assert_eq!(words("[build]\nrustflags = []\n", &[("CARGO_BUILD_RUSTFLAGS", "--cfg y")]), ["--cfg", "y"]);
+    assert_eq!(
+        words("[build]\nrustflags = []\n", &[("CARGO_BUILD_RUSTFLAGS", "--cfg y")]),
+        ["--cfg", "y"]
+    );
     assert!(words("", &[]).is_empty());
 }

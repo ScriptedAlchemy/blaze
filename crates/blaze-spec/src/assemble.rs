@@ -31,16 +31,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::metadata::root_manifest;
+use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::{Config, Workspace};
 use blaze_metadata::units::{self, Mode, TargetFilter, TargetKind, Unit, UnitGraph, UnitsAsked};
 use blaze_metadata::{Asked, Build, TargetPlatform};
 use blaze_resolve::Cfg;
 use blaze_wire::{
     BuildSpec, Command, ConfigKey, ConfigKeyInput, Digest, Encoder, ExecPlatform, FrontEndKey,
-    FrontEndKeyInput, FrontEndUnit, JobContent, JobContentInput, Namespace, RunSpec,
-    Set, SourceRef, StoreIdentity, UnitSpec, Wire, digest_of,
+    FrontEndKeyInput, FrontEndUnit, JobContent, JobContentInput, Namespace, RunSpec, Set,
+    SourceRef, StoreIdentity, UnitSpec, Wire, digest_of,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -151,8 +151,9 @@ pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal>
         targets,
         profile: request.profile.as_deref(),
     };
-    let graph = units::unit_graph(&wanted)
-        .map_err(|error| Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}")))?;
+    let graph = units::unit_graph(&wanted).map_err(|error| {
+        Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
+    })?;
     assemble(request, ctx, &graph)
 }
 
@@ -261,7 +262,9 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             &requested,
             &host.triple,
         )
-        .map_err(|error| Refusal::with(Reason::ConfigRejected, "the profiles", format!("{error:#}")))?;
+        .map_err(|error| {
+            Refusal::with(Reason::ConfigRejected, "the profiles", format!("{error:#}"))
+        })?;
         let mut base = profiles.base_profile();
         base.name = requested;
         let top = profile::spec(&base, &flags.overrides, &settings, "the command")?;
@@ -271,7 +274,8 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
 
         let mut machine_env = ctx.env.clone();
         machine_env.extend(opened.resolved.config_env.iter().cloned());
-        let machine = Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
+        let machine =
+            Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
         let platform_digest = digest_of(&platform);
 
@@ -362,7 +366,11 @@ pub fn canonical_key(unit: &UnitSpec) -> Vec<u8> {
 /// script the unit that compiles the script.
 fn stands_for(graph: &UnitGraph, index: usize) -> Result<usize, Refusal> {
     let Some(unit) = graph.units.get(index) else {
-        return Err(Refusal::with(Reason::UnitEdge, format!("unit {index}"), "it is not in the graph"));
+        return Err(Refusal::with(
+            Reason::UnitEdge,
+            format!("unit {index}"),
+            "it is not in the graph",
+        ));
     };
     if unit.mode != Mode::RunCustomBuild {
         return Ok(index);
@@ -371,12 +379,17 @@ fn stands_for(graph: &UnitGraph, index: usize) -> Result<usize, Refusal> {
         .iter()
         .map(|dep| dep.index)
         .find(|&dep| {
-            graph
-                .units
-                .get(dep)
-                .is_some_and(|it| it.target.kind == TargetKind::CustomBuild && it.mode != Mode::RunCustomBuild)
+            graph.units.get(dep).is_some_and(|it| {
+                it.target.kind == TargetKind::CustomBuild && it.mode != Mode::RunCustomBuild
+            })
         })
-        .ok_or_else(|| Refusal::with(Reason::UnitEdge, describe(unit), "it depends on no compile of the script"))
+        .ok_or_else(|| {
+            Refusal::with(
+                Reason::UnitEdge,
+                describe(unit),
+                "it depends on no compile of the script",
+            )
+        })
 }
 
 fn unit_specs(
@@ -394,7 +407,8 @@ fn unit_specs(
         let kind = unit.target.kind;
         let test = (unit.mode == Mode::Test && unit.target.harness)
             || (unit.mode == Mode::Check && matches!(kind, TargetKind::Test | TargetKind::Bench));
-        let mut cfg: Vec<String> = unit.features.iter().map(|it| format!("feature=\"{it}\"")).collect();
+        let mut cfg: Vec<String> =
+            unit.features.iter().map(|it| format!("feature=\"{it}\"")).collect();
         if test {
             cfg.push("test".to_owned());
         }
@@ -448,7 +462,11 @@ fn unit_specs(
         for dep in &graph.units[index].dependencies {
             let at = stands_for(graph, dep.index)?;
             let canonical = of_graph[at].ok_or_else(|| {
-                Refusal::with(Reason::UnitEdge, describe(&graph.units[index]), "it depends on a unit that is not one")
+                Refusal::with(
+                    Reason::UnitEdge,
+                    describe(&graph.units[index]),
+                    "it depends on a unit that is not one",
+                )
             })?;
             deps.push((canonical, dep.extern_crate_name.clone()));
         }
@@ -486,20 +504,30 @@ fn asked_units(
         }
     }
     if command == Subcommand::Run {
-        asked.retain(|&it| matches!(graph.units[it].target.kind, TargetKind::Bin | TargetKind::Example));
+        asked.retain(|&it| {
+            matches!(graph.units[it].target.kind, TargetKind::Bin | TargetKind::Example)
+        });
         if asked.len() != 1 {
             let what = format!("cargo run: {} programs", asked.len());
             return Err(Refusal::with(Reason::RunTarget, what, "name one with --bin or --example"));
         }
     }
     if asked.is_empty() {
-        return Err(Refusal::with(Reason::UnitGraphFailed, "the unit graph", "it has no unit to build"));
+        return Err(Refusal::with(
+            Reason::UnitGraphFailed,
+            "the unit graph",
+            "it has no unit to build",
+        ));
     }
     let mut at: Vec<u32> = Vec::new();
     for index in asked {
         let canonical = units.of_graph.get(index).copied().flatten();
         at.push(canonical.ok_or_else(|| {
-            Refusal::with(Reason::UnitEdge, format!("unit {index}"), "it is asked for and is not one")
+            Refusal::with(
+                Reason::UnitEdge,
+                format!("unit {index}"),
+                "it is asked for and is not one",
+            )
         })?);
     }
     at.sort_unstable();
@@ -597,7 +625,9 @@ fn config_key(build: &BuildSpec, kind: u8) -> ConfigKey {
     let asked = || build.asked.iter().map(|&it| &build.units[it as usize]);
     ConfigKey::of(&ConfigKeyInput {
         kind,
-        asked: Set::new(asked().map(|unit| (unit.package.0.clone(), unit.target.1.clone())).collect()),
+        asked: Set::new(
+            asked().map(|unit| (unit.package.0.clone(), unit.target.1.clone())).collect(),
+        ),
         profiles: asked().map(|unit| unit.profile.clone()).collect(),
         platform: build.platform,
         rustflags: Set::new(build.rustflags.clone()),

@@ -191,83 +191,12 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
 
 /// The metadata of `asked`, and the ids of the members its build selects.
 fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
-    let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
-    config.start("metadata", asked.config)?;
-    let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
-    let ctx = Context::new(config);
+    let (ctx, offline) = open(asked, "metadata")?;
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
-    let root = ws.root().to_owned();
-    if summary::has_replace(&root)? {
-        bail!("`[replace]` is not read by blaze yet");
-    }
-    let lock_path = root.join("Cargo.lock");
-    let lock_text = std::fs::read_to_string(&lock_path)
-        .with_context(|| format!("no lock file at {}", lock_path.display()))?;
+    let locked = Locked::read(&ws, &ctx, offline, asked.store.clone())?;
+    let world = World::new(&ws, &locked)?;
 
-    let path_packages = path_packages(&ws, &root, &ctx)?;
-    let mut path_deps = PathDeps::default();
-    let members = ws.members().map(|(_, m)| m);
-    for m in members.chain(path_packages.iter().map(|it| &*it.manifest)) {
-        let dir = m.package_id.source_id.local_path().context("a path package's directory")?;
-        let entry = path_deps.entry(m.package_id.name.clone()).or_default();
-        entry.insert(m.package_id.version.clone(), SourceId::for_path(&dir)?);
-    }
-    let lock = lockfile::into_resolve(lockfile::parse(&lock_text)?, &lock_text, &path_deps)?;
-    let fetched = fetch(&lock, &ctx, offline, asked.store.clone())?;
-
-    let mut serialized: Vec<SerializedPackage<'_>> =
-        ws.members().map(|(path, m)| export_package(path, m)).collect();
-    let member_count = serialized.len();
-    for package in path_packages.iter().chain(&fetched) {
-        let mut it = export_package(&package.manifest_path, &package.manifest);
-        if let Some(source) = &package.locked_source {
-            it.set_source(source.clone());
-        }
-        serialized.push(it);
-    }
-    let mut reads = FxHashMap::default();
-    let mut ids = Vec::with_capacity(serialized.len());
-    for package in &serialized {
-        let mut read = summary::read(&serde_json::to_value(package)?)?;
-        let id = read.summary.package_id();
-        if let Some(Some(checksum)) = lock.checksums().get(&id) {
-            read.summary.set_checksum(checksum.clone());
-        }
-        ids.push(id);
-        reads.insert(id, read);
-    }
-
-    let mut registry = MemRegistry::new();
-    for read in reads.values() {
-        registry.add(IndexSummary::Candidate(read.summary.clone()));
-    }
-    let patch = summary::patch_tables(&root, &registry)?;
-    let by_path: FxHashMap<SourceId, Summary> = reads
-        .values()
-        .filter(|it| it.summary.source_id().is_path())
-        .map(|it| (it.summary.source_id(), it.summary.clone()))
-        .collect();
-    let member_ids = &ids[..member_count];
-    let members: Vec<&Summary> = member_ids.iter().map(|id| &reads[id].summary).collect();
-    let current =
-        ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
-    let behavior = match ws.resolve_behavior() {
-        blaze_manifest::features::ResolveBehavior::V1 => ResolveBehavior::V1,
-        blaze_manifest::features::ResolveBehavior::V2 => ResolveBehavior::V2,
-        blaze_manifest::features::ResolveBehavior::V3 => ResolveBehavior::V3,
-    };
-    let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
-    let members_of = || Members { members: &members, current, new_cli_feature_behavior };
-    let resolving = blaze_resolve::workspace_resolve::Workspace {
-        members: members_of(),
-        path_packages: &by_path,
-        patch: &patch,
-        replace: &[],
-        require_optional_deps: true,
-        version_ordering: VersionOrdering::MaximumVersionsFirst,
-        rust_versions: None,
-        resolve_version: ResolveVersion::default(),
-    };
+    let member_ids = world.member_ids();
     let specs: Vec<PackageIdSpec> = match &asked.build {
         None => member_ids.iter().map(|id| id.to_spec()).collect(),
         Some(build) => selected(&ws, member_ids, build)?,
@@ -281,29 +210,21 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let (mut whole, targeted) = resolve_ws(
-        &mut PackageRegistry::new(registry),
-        &resolving,
-        Some(&lock),
-        &cli_features,
-        &specs,
-        has_dev_units,
-    )?;
-    if lockfile::lockfile_to_write(&mut whole, Some(&lock_text), None, None)?.is_some() {
-        bail!("{} would change: the manifests no longer agree with it", lock_path.display());
-    }
+    let targeted = world.resolve(&ws, &specs, &cli_features, has_dev_units)?.targeted;
 
     let kinds = match &asked.platform {
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
         None => vec![CompileKind::Host],
     };
-    let packages = Packages { reads: &reads, platform: asked.platform.as_ref() };
+    let packages = Packages { reads: &world.reads, platform: asked.platform.as_ref() };
     let mut roots = Vec::new();
     let resolve = match &asked.build {
-        None => resolve_graph(&targeted, member_ids, current, &packages, &kinds)?,
+        None => resolve_graph(&targeted, member_ids, world.current, &packages, &kinds)?,
         Some(build) => {
-            let member_features = members_with_features(&members_of(), &specs, &cli_features)?;
-            let opts = FeatureOpts::new(behavior, has_dev_units, ForceAllTargets::No);
+            let summaries = world.member_summaries();
+            let member_features =
+                members_with_features(&world.members(&summaries), &specs, &cli_features)?;
+            let opts = FeatureOpts::new(world.behavior, has_dev_units, ForceAllTargets::No);
             let features =
                 FeatureResolver::resolve(&packages, &targeted, &member_features, &kinds, opts)?;
             roots = member_features.iter().map(|(it, _)| it.package_id()).collect();
@@ -313,28 +234,227 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
                 &features,
                 &roots,
                 build.dev_units,
-                &reads,
+                &world.reads,
                 &activated,
-                current,
+                world.current,
             )?
         }
     };
 
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
     let reached: FxHashMap<PackageId, usize> =
-        ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
+        world.ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
-        let id = ids.iter().find(|id| id.to_spec() == node.id).copied();
+        let id = world.ids.iter().find(|id| id.to_spec() == node.id).copied();
         let id = id.with_context(|| format!("no package {} was read", node.id))?;
         listed.push((id, reached[&id]));
     }
     listed.sort();
-    let mut slots: Vec<Option<SerializedPackage<'_>>> = serialized.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<SerializedPackage<'_>>> =
+        world.serialized.into_iter().map(Some).collect();
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
     let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
     Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect()))
+}
+
+/// The configuration `asked` is read with, for the command cargo would be run as, and whether
+/// the run is offline.
+fn open(asked: &Asked<'_>, command: &str) -> Result<(Context, bool)> {
+    let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
+    config.start(command, asked.config)?;
+    let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
+    Ok((Context::new(config), offline))
+}
+
+/// What is read before anything is resolved: the lock file, the path packages that are not
+/// members, and every package the lock file locks, fetched.
+struct Locked {
+    lock_path: PathBuf,
+    lock_text: String,
+    lock: blaze_resolve::Resolve,
+    path_packages: Vec<Package>,
+    fetched: Vec<Package>,
+}
+
+impl Locked {
+    fn read(
+        ws: &Workspace<'_>,
+        ctx: &Context,
+        offline: bool,
+        store: Option<Arc<dyn blaze_registry::Blobs>>,
+    ) -> Result<Locked> {
+        let root = ws.root().to_owned();
+        if summary::has_replace(&root)? {
+            bail!("`[replace]` is not read by blaze yet");
+        }
+        let lock_path = root.join("Cargo.lock");
+        let lock_text = std::fs::read_to_string(&lock_path)
+            .with_context(|| format!("no lock file at {}", lock_path.display()))?;
+
+        let path_packages = path_packages(ws, &root, ctx)?;
+        let mut path_deps = PathDeps::default();
+        let members = ws.members().map(|(_, m)| m);
+        for m in members.chain(path_packages.iter().map(|it| &*it.manifest)) {
+            let dir = m.package_id.source_id.local_path().context("a path package's directory")?;
+            let entry = path_deps.entry(m.package_id.name.clone()).or_default();
+            entry.insert(m.package_id.version.clone(), SourceId::for_path(&dir)?);
+        }
+        let lock = lockfile::into_resolve(lockfile::parse(&lock_text)?, &lock_text, &path_deps)?;
+        let fetched = fetch(&lock, ctx, offline, store)?;
+        Ok(Locked { lock_path, lock_text, lock, path_packages, fetched })
+    }
+}
+
+/// The packages of a build as the resolve and the graphs built on it read them: the members,
+/// then the path packages that are not and the fetched ones.
+struct World<'a> {
+    /// Each package as `cargo metadata` prints it.
+    serialized: Vec<SerializedPackage<'a>>,
+    /// The manifest of each package, in the order of `serialized`, and where it is.
+    manifests: Vec<&'a Manifest>,
+    manifest_paths: Vec<&'a Path>,
+    /// Where the lock file says each package is from, none for a path package.
+    locked_sources: Vec<Option<&'a str>>,
+    reads: FxHashMap<PackageId, Read>,
+    /// The id of each package, in the order of `serialized`.
+    ids: Vec<PackageId>,
+    member_count: usize,
+    /// The member whose manifest is in the current directory.
+    current: Option<PackageId>,
+    behavior: ResolveBehavior,
+    /// `resolver = "2"` or later, or a virtual workspace (cargo's
+    /// `allows_new_cli_feature_behavior`).
+    new_cli_feature_behavior: bool,
+    lock: &'a Locked,
+}
+
+impl<'a> World<'a> {
+    fn new(ws: &'a Workspace<'_>, locked: &'a Locked) -> Result<World<'a>> {
+        let mut serialized: Vec<SerializedPackage<'a>> =
+            ws.members().map(|(path, m)| export_package(path, m)).collect();
+        let mut manifests: Vec<&'a Manifest> = ws.members().map(|(_, m)| m).collect();
+        let mut manifest_paths: Vec<&'a Path> = ws.members().map(|(path, _)| path).collect();
+        let mut locked_sources: Vec<Option<&'a str>> = vec![None; serialized.len()];
+        let member_count = serialized.len();
+        for package in locked.path_packages.iter().chain(&locked.fetched) {
+            let mut it = export_package(&package.manifest_path, &package.manifest);
+            if let Some(source) = &package.locked_source {
+                it.set_source(source.clone());
+            }
+            serialized.push(it);
+            manifests.push(&package.manifest);
+            manifest_paths.push(&package.manifest_path);
+            locked_sources.push(package.locked_source.as_deref());
+        }
+        let mut reads = FxHashMap::default();
+        let mut ids = Vec::with_capacity(serialized.len());
+        for package in &serialized {
+            let mut read = summary::read(&serde_json::to_value(package)?)?;
+            let id = read.summary.package_id();
+            if let Some(Some(checksum)) = locked.lock.checksums().get(&id) {
+                read.summary.set_checksum(checksum.clone());
+            }
+            ids.push(id);
+            reads.insert(id, read);
+        }
+        let current =
+            ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| ids[at]);
+        let behavior = match ws.resolve_behavior() {
+            blaze_manifest::features::ResolveBehavior::V1 => ResolveBehavior::V1,
+            blaze_manifest::features::ResolveBehavior::V2 => ResolveBehavior::V2,
+            blaze_manifest::features::ResolveBehavior::V3 => ResolveBehavior::V3,
+        };
+        let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
+        Ok(World {
+            serialized,
+            manifests,
+            manifest_paths,
+            locked_sources,
+            reads,
+            ids,
+            member_count,
+            current,
+            behavior,
+            new_cli_feature_behavior,
+            lock: locked,
+        })
+    }
+
+    fn member_ids(&self) -> &[PackageId] {
+        &self.ids[..self.member_count]
+    }
+
+    fn member_summaries(&self) -> Vec<&Summary> {
+        self.member_ids().iter().map(|id| &self.reads[id].summary).collect()
+    }
+
+    fn members<'m>(&self, summaries: &'m [&'m Summary]) -> Members<'m> {
+        Members {
+            members: summaries,
+            current: self.current,
+            new_cli_feature_behavior: self.new_cli_feature_behavior,
+        }
+    }
+
+    /// The resolve of the packages `specs` select with `cli_features`, as cargo's
+    /// `resolve_ws_with_opts` makes it from the lock file: the lock file has to be what the
+    /// manifests make of it.
+    fn resolve(
+        &self,
+        ws: &Workspace<'_>,
+        specs: &[PackageIdSpec],
+        cli_features: &CliFeatures,
+        has_dev_units: HasDevUnits,
+    ) -> Result<Resolved> {
+        let mut registry = MemRegistry::new();
+        for read in self.reads.values() {
+            registry.add(IndexSummary::Candidate(read.summary.clone()));
+        }
+        let patch = summary::patch_tables(ws.root(), &registry)?;
+        let by_path: FxHashMap<SourceId, Summary> = self
+            .reads
+            .values()
+            .filter(|it| it.summary.source_id().is_path())
+            .map(|it| (it.summary.source_id(), it.summary.clone()))
+            .collect();
+        let summaries = self.member_summaries();
+        let resolving = blaze_resolve::workspace_resolve::Workspace {
+            members: self.members(&summaries),
+            path_packages: &by_path,
+            patch: &patch,
+            replace: &[],
+            require_optional_deps: true,
+            version_ordering: VersionOrdering::MaximumVersionsFirst,
+            rust_versions: None,
+            resolve_version: ResolveVersion::default(),
+        };
+        let (mut whole, targeted) = resolve_ws(
+            &mut PackageRegistry::new(registry),
+            &resolving,
+            Some(&self.lock.lock),
+            cli_features,
+            specs,
+            has_dev_units,
+        )?;
+        if lockfile::lockfile_to_write(&mut whole, Some(&self.lock.lock_text), None, None)?
+            .is_some()
+        {
+            let path = self.lock.lock_path.display();
+            bail!("{path} would change: the manifests no longer agree with it");
+        }
+        Ok(Resolved { whole, targeted })
+    }
+}
+
+/// The two resolves of cargo's `resolve_ws_with_opts`.
+struct Resolved {
+    /// Of the whole workspace, as the lock file has it: what package overrides in profiles are
+    /// checked against.
+    whole: blaze_resolve::Resolve,
+    /// Of what the build selects: the graph of its units.
+    targeted: blaze_resolve::Resolve,
 }
 
 /// What the resolve graph and the feature resolver read of the packages.

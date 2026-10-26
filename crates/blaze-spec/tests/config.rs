@@ -3,10 +3,10 @@
 
 mod common;
 
+use blaze_spec::Refusal;
 use blaze_spec::assemble::Spec;
 use blaze_spec::config::KEYS;
 use blaze_spec::flags::{Class, Subcommand};
-use blaze_spec::Refusal;
 
 use common::{Fixture, spec};
 
@@ -19,7 +19,8 @@ fn refused(config: &str, command: Subcommand, args: &[&str]) -> Refusal {
 }
 
 fn accepted(config: &str) -> Spec {
-    of(&Fixture::with_config(config), Subcommand::Build, &[]).unwrap_or_else(|e| panic!("{config:?}: {e}"))
+    of(&Fixture::with_config(config), Subcommand::Build, &[])
+        .unwrap_or_else(|e| panic!("{config:?}: {e}"))
 }
 
 fn plain() -> Spec {
@@ -37,8 +38,15 @@ fn the_table_of_keys_has_a_reason_for_each() {
     let refused: Vec<&str> =
         KEYS.iter().filter(|it| matches!(it.class, Class::Refused(_))).map(|it| it.key).collect();
     for key in [
-        "build.target", "build.rustc", "build.rustc-wrapper", "build.rustc-workspace-wrapper",
-        "build.rustdoc", "build.target-applies-to-host", "host.*", "unstable.*", "target.<triple>.runner",
+        "build.target",
+        "build.rustc",
+        "build.rustc-wrapper",
+        "build.rustc-workspace-wrapper",
+        "build.rustdoc",
+        "build.target-applies-to-host",
+        "host.*",
+        "unstable.*",
+        "target.<triple>.runner",
     ] {
         assert!(refused.contains(&key), "{key} is not refused");
     }
@@ -46,7 +54,11 @@ fn the_table_of_keys_has_a_reason_for_each() {
 
 #[test]
 fn a_target_is_refused_by_the_key_or_the_variable_that_set_it() {
-    for config in ["[build]\ntarget = \"x86_64-unknown-linux-gnu\"\n", "[build]\ntarget = \"aarch64-apple-darwin\"\n", "[build]\ntarget = [\"a\", \"b\"]\n"] {
+    for config in [
+        "[build]\ntarget = \"x86_64-unknown-linux-gnu\"\n",
+        "[build]\ntarget = \"aarch64-apple-darwin\"\n",
+        "[build]\ntarget = [\"a\", \"b\"]\n",
+    ] {
         let error = refused(config, Subcommand::Build, &[]);
         assert_eq!((error.id, error.what.as_str()), ("BuildTarget", "build.target"), "{config}");
     }
@@ -55,7 +67,8 @@ fn a_target_is_refused_by_the_key_or_the_variable_that_set_it() {
     env.insert("CARGO_BUILD_TARGET".to_owned(), "aarch64-apple-darwin".to_owned());
     let error = spec(&fixture, &env, Subcommand::Build, &[], None).unwrap_err();
     assert_eq!((error.id, error.what.as_str()), ("BuildTarget", "CARGO_BUILD_TARGET"));
-    let error = of(&Fixture::new(), Subcommand::Build, &["--config", "build.target=\"x\""]).unwrap_err();
+    let error =
+        of(&Fixture::new(), Subcommand::Build, &["--config", "build.target=\"x\""]).unwrap_err();
     assert_eq!(error.id, "BuildTarget");
     // No target is the host.
     assert!(of(&Fixture::with_config("[build]\ntarget = []\n"), Subcommand::Build, &[]).is_ok());
@@ -66,7 +79,11 @@ fn a_compiler_a_wrapper_or_an_artifact_directory_is_refused_by_name() {
     for (config, id, what) in [
         ("[build]\nrustc = \"/x/rustc\"\n", "BuildRustc", "build.rustc"),
         ("[build]\nrustc-wrapper = \"sccache\"\n", "BuildRustcWrapper", "build.rustc-wrapper"),
-        ("[build]\nrustc-workspace-wrapper = \"w\"\n", "BuildRustcWrapper", "build.rustc-workspace-wrapper"),
+        (
+            "[build]\nrustc-workspace-wrapper = \"w\"\n",
+            "BuildRustcWrapper",
+            "build.rustc-workspace-wrapper",
+        ),
         ("[build]\nrustdoc = \"/x/rustdoc\"\n", "BuildRustdoc", "build.rustdoc"),
         ("[build]\nartifact-dir = \"out\"\n", "BuildArtifactDir", "build.artifact-dir"),
         ("[build]\nwarnings = \"deny\"\n", "BuildWarnings", "build.warnings = \"deny\""),
@@ -83,7 +100,10 @@ fn a_compiler_a_wrapper_or_an_artifact_directory_is_refused_by_name() {
         assert!(!error.why.is_empty());
     }
     let fixture = Fixture::new();
-    for (variable, what) in [("CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC"), ("CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER")] {
+    for (variable, what) in [
+        ("CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC"),
+        ("CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"),
+    ] {
         let mut env = fixture.env();
         env.insert(variable.to_owned(), "x".to_owned());
         let error = spec(&fixture, &env, Subcommand::Build, &[], None).unwrap_err();
@@ -120,7 +140,10 @@ fn what_is_near_a_refused_key_and_harmless_is_accepted() {
 fn a_runner_is_refused_for_the_commands_that_start_programs_through_it() {
     let host = "[target.aarch64-apple-darwin]\nrunner = [\"echo\", \"x\"]\n";
     let cfg = "[target.'cfg(target_os = \"macos\")']\nrunner = \"echo\"\n";
-    for (config, what) in [(host, "target.aarch64-apple-darwin.runner"), (cfg, "target.cfg(target_os = \"macos\").runner")] {
+    for (config, what) in [
+        (host, "target.aarch64-apple-darwin.runner"),
+        (cfg, "target.cfg(target_os = \"macos\").runner"),
+    ] {
         for command in [Subcommand::Test, Subcommand::Run] {
             let error = refused(config, command, &[]);
             assert_eq!((error.id, error.what.as_str()), ("TargetRunner", what), "{command:?}");
@@ -141,17 +164,28 @@ fn a_linker_is_refused_for_the_commands_that_link() {
     let config = "[target.aarch64-apple-darwin]\nlinker = \"clang\"\n";
     for command in [Subcommand::Build, Subcommand::Test, Subcommand::Run] {
         let error = refused(config, command, &[]);
-        assert_eq!((error.id, error.what.as_str()), ("TargetLinker", "target.aarch64-apple-darwin.linker"));
+        assert_eq!(
+            (error.id, error.what.as_str()),
+            ("TargetLinker", "target.aarch64-apple-darwin.linker")
+        );
     }
     assert!(of(&Fixture::with_config(config), Subcommand::Check, &[]).is_ok());
-    let error = refused("[target.aarch64-apple-darwin.foo]\nrustc-link-lib = [\"z\"]\n", Subcommand::Check, &[]);
+    let error = refused(
+        "[target.aarch64-apple-darwin.foo]\nrustc-link-lib = [\"z\"]\n",
+        Subcommand::Check,
+        &[],
+    );
     assert_eq!((error.id, error.what.as_str()), ("TargetLinks", "target.aarch64-apple-darwin.foo"));
 }
 
 #[test]
 fn another_way_of_unifying_features_and_a_config_patch_are_refused() {
     for unification in ["package", "workspace"] {
-        let error = refused(&format!("[resolver]\nfeature-unification = \"{unification}\"\n"), Subcommand::Build, &[]);
+        let error = refused(
+            &format!("[resolver]\nfeature-unification = \"{unification}\"\n"),
+            Subcommand::Build,
+            &[],
+        );
         assert_eq!(error.id, "FeatureUnification");
         assert_eq!(error.what, format!("resolver.feature-unification = \"{unification}\""));
     }
@@ -282,10 +316,23 @@ fn the_directory_is_named_from_the_workspace_root() {
     let below = root.join("a").join("src");
     std::fs::create_dir_all(&below).unwrap();
     let context = common::context(&fixture, &env, &host, &below);
-    let profile = common::profile_of(&fixture, &env, "dev", &common::Package::member(&root, "a"), true, false);
+    let profile = common::profile_of(
+        &fixture,
+        &env,
+        "dev",
+        &common::Package::member(&root, "a"),
+        true,
+        false,
+    );
     let request = blaze_spec::flags::Request::parse(Subcommand::Build, &[]).unwrap();
-    let spec = blaze_spec::assemble::assemble(&request, &context, &common::simple_graph(&profile)).unwrap();
+    let spec = blaze_spec::assemble::assemble(&request, &context, &common::simple_graph(&profile))
+        .unwrap();
     assert_eq!(spec.build.cwd, "a/src");
+    // The same command from another directory of the workspace is another spec.
+    let at_root = of(&fixture, Subcommand::Build, &[]).unwrap();
+    assert_ne!(at_root.digest, spec.digest);
+    assert_eq!(at_root.front_end, spec.front_end);
+    assert_eq!(at_root.config, spec.config);
     // Outside the workspace of the manifest it names.
     let elsewhere = tempfile::tempdir().unwrap();
     let cwd = elsewhere.path().canonicalize().unwrap();
@@ -293,7 +340,12 @@ fn the_directory_is_named_from_the_workspace_root() {
     env.insert("__CARGO_TEST_ROOT".to_owned(), cwd.display().to_string());
     let context = common::context(&fixture, &env, &host, &cwd);
     let manifest = root.join("Cargo.toml").display().to_string();
-    let request = blaze_spec::flags::Request::parse(Subcommand::Build, &["--manifest-path".to_owned(), manifest]).unwrap();
-    let error = blaze_spec::assemble::assemble(&request, &context, &common::simple_graph(&profile)).unwrap_err();
+    let request = blaze_spec::flags::Request::parse(
+        Subcommand::Build,
+        &["--manifest-path".to_owned(), manifest],
+    )
+    .unwrap();
+    let error = blaze_spec::assemble::assemble(&request, &context, &common::simple_graph(&profile))
+        .unwrap_err();
     assert_eq!(error.id, "Cwd");
 }

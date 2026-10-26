@@ -25,8 +25,14 @@ use crate::rustflags::Overrides;
 
 /// The profile settings blaze ignores, and why.
 pub const IGNORED: &[(&str, &str)] = &[
-    ("codegen-units", "blaze compiles one function at a time and reads no count of units of a crate"),
-    ("incremental", "blaze keeps its own state and reads no setting of cargo's incremental compilation"),
+    (
+        "codegen-units",
+        "blaze compiles one function at a time and reads no count of units of a crate",
+    ),
+    (
+        "incremental",
+        "blaze keeps its own state and reads no setting of cargo's incremental compilation",
+    ),
     ("hint-mostly-unused", "a hint to rustc about build speed, which changes no code"),
 ];
 
@@ -55,7 +61,11 @@ impl Settings {
     /// was built with the llvm backend.
     pub fn of(env: &BTreeMap<String, String>, llvm: bool) -> Result<Settings, Refusal> {
         let bad = |name: &str, value: &str, expected: &str| {
-            Refusal::with(Reason::EnvRaJitValue, format!("{name}={value}"), format!("expected {expected}"))
+            Refusal::with(
+                Reason::EnvRaJitValue,
+                format!("{name}={value}"),
+                format!("expected {expected}"),
+            )
         };
         let passes = match env.get(OPTIMIZATION).map(String::as_str) {
             Some("0") => 0,
@@ -144,8 +154,10 @@ pub fn spec(
     // level by itself, so a level among the flags moves the ones cargo left unnamed
     // (`plan.rs`, `Profile::with`).
     let unoptimized = profile.opt_level == "0";
-    let named_assertions = (profile.debug_assertions != unoptimized).then_some(profile.debug_assertions);
-    let named_overflow = (profile.overflow_checks != profile.debug_assertions).then_some(profile.overflow_checks);
+    let named_assertions =
+        (profile.debug_assertions != unoptimized).then_some(profile.debug_assertions);
+    let named_overflow =
+        (profile.overflow_checks != profile.debug_assertions).then_some(profile.overflow_checks);
     let unoptimized = flags.opt_level.as_ref().map_or(unoptimized, |it| it == "0");
     let debug_assertions = flags.debug_assertions.or(named_assertions).unwrap_or(unoptimized);
     let overflow_checks = flags.overflow_checks.or(named_overflow).unwrap_or(debug_assertions);
@@ -155,7 +167,11 @@ pub fn spec(
         (None, PanicStrategy::Unwind) => 0,
         (None, PanicStrategy::Abort) => 1,
         (None, PanicStrategy::ImmediateAbort) => {
-            return Err(Refusal::with(Reason::PanicImmediateAbort, setting("panic", "\"immediate-abort\""), here()));
+            return Err(Refusal::with(
+                Reason::PanicImmediateAbort,
+                setting("panic", "\"immediate-abort\""),
+                here(),
+            ));
         }
     };
 
@@ -164,10 +180,16 @@ pub fn spec(
         None => match &profile.debuginfo {
             // The unit graph weakens a host unit's debug info to none unless it is shared with
             // the target's, which it finalizes.
-            DebugInfo::Deferred(_) => 0,
+            DebugInfo::Deferred(info) => match info {
+                TomlDebugInfo::None => 0,
+                TomlDebugInfo::Full => 2,
+                _ => 1,
+            },
             DebugInfo::Resolved(TomlDebugInfo::None) => 0,
             DebugInfo::Resolved(
-                TomlDebugInfo::LineDirectivesOnly | TomlDebugInfo::LineTablesOnly | TomlDebugInfo::Limited,
+                TomlDebugInfo::LineDirectivesOnly
+                | TomlDebugInfo::LineTablesOnly
+                | TomlDebugInfo::Limited,
             ) => 1,
             DebugInfo::Resolved(TomlDebugInfo::Full) => 2,
         },
