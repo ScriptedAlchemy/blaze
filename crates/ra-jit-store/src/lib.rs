@@ -1048,8 +1048,8 @@ impl StoreDir {
             if !is_pack(&name) {
                 continue;
             }
-            let Ok(pack) = self.read(&name) else { continue };
-            let Ok(index) = Pack::verify(&name, &pack) else { continue };
+            let pack = self.read(&name)?;
+            let index = Pack::verify(&name, &pack).map_err(io::Error::other)?;
             let blocks = index.unpack_all(&pack).map_err(io::Error::other)?;
             for entry in &index.entries {
                 let value = entry.value(&blocks);
@@ -2027,6 +2027,25 @@ mod tests {
         assert!(files(&dir, Kind::Open).is_empty());
         assert!(files(&dir, Kind::Temporary).is_empty());
         assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn digests_name_values_and_refuse_corrupt_packs() {
+        let dir = scratch("digests");
+        let store = open(&dir, EAGER);
+        store.insert(&[1; KEY], b"one");
+        store.insert(&[2; KEY], b"two");
+        store.flush();
+        let mut expected = vec![
+            (store.disk_key(&[1; KEY]), 3, Sha256::digest(b"one").into()),
+            (store.disk_key(&[2; KEY]), 3, Sha256::digest(b"two").into()),
+        ];
+        expected.sort_unstable();
+        assert_eq!(StoreDir::at(&dir).digests().unwrap(), expected);
+        let pack = files(&dir, Kind::Pack).remove(0);
+        change(&pack, |bytes| bytes[0] ^= 1);
+        assert!(StoreDir::at(&dir).digests().is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

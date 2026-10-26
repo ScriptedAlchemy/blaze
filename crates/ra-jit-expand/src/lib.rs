@@ -31,7 +31,6 @@
 //! [`compare`] holds the toolchain's server against ra-jit's, and keeps nothing while it does.
 
 mod compare;
-mod places;
 
 use std::{
     any::Any,
@@ -56,7 +55,7 @@ use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
 /// What the key of an expansion starts with: another number when the key or the value is
 /// made otherwise.
-const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 3";
+const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 4";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -150,8 +149,6 @@ struct Kept {
 struct Call {
     key: [u8; KEY],
     spans: Spans,
-    /// The places of this machine the key does not have, and the output may not.
-    places: places::Places,
     /// What each part of the key comes to, when `RA_JIT_KEYS_LOG` is set.
     parts: Option<Parts>,
 }
@@ -228,7 +225,6 @@ impl Kept {
             attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
         let mut spans = Spans::default();
         let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
-        let places = places::Places::of(env, current_dir);
         let mut env: Vec<_> = env.iter().collect();
         env.sort_unstable();
         let mut hasher = Sha256::new();
@@ -249,26 +245,29 @@ impl Kept {
         ];
         input.iter().for_each(|it| field(it));
         field(&(env.len() as u64).to_le_bytes());
-        // What the key says of the machine is what stands for its places, not the places.
-        let env: Vec<(&str, std::borrow::Cow<'_, str>)> =
-            env.into_iter().map(|(name, value)| (name, places.unplace(value))).collect();
+        // A macro can branch on a path's length or read a file beneath it without putting
+        // that path in its output. Until observed reads/environment accesses are available,
+        // raw paths must remain in the lookup key and in the diagnostic hashes.
         for (name, value) in &env {
             field(name.as_bytes());
             field(value.as_bytes());
         }
-        let cwd = places.unplace(current_dir);
-        field(cwd.as_bytes());
+        field(current_dir.as_bytes());
         let key = hasher.finalize().into();
+        let env: Vec<(&str, std::borrow::Cow<'_, str>)> = env
+            .into_iter()
+            .map(|(name, value)| (name, std::borrow::Cow::Borrowed(value)))
+            .collect();
         let parts = keys_logged().then(|| Parts {
             dylib: short(dylib),
             input: short(&input.concat()),
             env: short(env_text(&env).as_bytes()),
-            cwd: short(cwd.as_bytes()),
+            cwd: short(current_dir.as_bytes()),
         });
         if parts.is_some() {
             log_env(&env);
         }
-        Some(Call { key, spans, places, parts })
+        Some(Call { key, spans, parts })
     }
 }
 
@@ -458,12 +457,6 @@ impl ProcMacroExpander for Kept {
             call.log(self, store, "output has spans the call has not");
             return expanded;
         };
-        // A path of this machine in the output would be the next machine's.
-        if call.places.names(&bytes) {
-            COUNTS.placed.add(Duration::ZERO);
-            call.log(self, store, "output names a place of this machine");
-            return expanded;
-        }
         match found {
             Some(kept) if kept != bytes => {
                 COUNTS.differed.add(Duration::ZERO);
@@ -519,8 +512,6 @@ struct Counts {
     kept: Count,
     asked: Count,
     unspanned: Count,
-    /// Output with a place of the machine in it.
-    placed: Count,
     failed: Count,
     differed: Count,
 }
@@ -533,7 +524,6 @@ static COUNTS: Counts = Counts {
     kept: Count::new(),
     asked: Count::new(),
     unspanned: Count::new(),
-    placed: Count::new(),
     failed: Count::new(),
     differed: Count::new(),
 };
@@ -572,7 +562,6 @@ pub fn report() -> Option<String> {
         ("kept", &COUNTS.kept),
         ("not kept, as they asked the database", &COUNTS.asked),
         ("not kept, as their output has spans the call has not", &COUNTS.unspanned),
-        ("not kept, as their output names a place of this machine", &COUNTS.placed),
         ("failed", &COUNTS.failed),
         ("expanded otherwise than kept", &COUNTS.differed),
     ];

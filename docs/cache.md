@@ -110,12 +110,15 @@ What names a place of the machine, and what stands for it in the store:
 | the standard library's sources | `/rustc/<commit>` | `LibrarySources` |
 | the checkout, a file below it that is not a workspace member's | `/checkout/<path>` | `hir-ty-codegen/relocate.rs` |
 | a crate or a file beside the checkout (`path = "../shared"`) | `/checkout/../shared/...`, if the two share two directories | `relocate.rs`, `crate_place`, `Contents::library` |
-| `CARGO_MANIFEST_DIR`, `OUT_DIR` and the macro's current directory, in a proc-macro key | `$PACKAGE`, `$TARGET`, `$CWD` | `ra-jit-expand/src/places.rs` |
+| `CARGO_MANIFEST_DIR`, `OUT_DIR` and the macro's current directory | raw paths remain in keys and diagnostic hashes | `ra-jit-expand/src/lib.rs` |
 
 A file of a workspace member is named by its place in the workspace, as rustc names it, which is the
 same on every machine. A path that is neither below the checkout nor beside it is kept as it is: no
-other machine has it, so no other machine finds an entry that names it. A proc macro whose output
-has one of its call's places in it is not kept, as code with the checkout's place in its data is not.
+other machine has it, so no other machine finds an entry that names it. Code with the checkout's
+place in its data is not shared.
+Proc-macro keys are not yet content-only. Removing a path from a key is unsafe even when the
+output does not contain it: a macro can branch on the path's length or read a file below it.
+The harness diagnoses this gap rather than allowing it as a pending success.
 
 ## The disk store
 

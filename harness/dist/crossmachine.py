@@ -95,10 +95,6 @@ ALL = ["hello", "paths", "vendored", "macros", "ripgrep"]
 # A difference whose fix is another unit's, or that waits on a thing no unit here owns. A kind is
 # the `kind` of a Difference; the value is why it is not failing this run. Nothing else passes.
 PENDING = {
-    "expansion-library": "the macro library is built by rustc on each machine, and its bytes hold that machine's paths "
-                         "and signature; a key by the library's content needs the crate's content identity "
-                         "(own proc-macro server, no-rustc.md step J1, where the library is restored from the store "
-                         "by key) or recorded reads (#147)",
     "script-run": "build-script run keys hash the script's executable (cargo/script.rs run_key); "
                   "unit p05r owns script.rs and own_script.rs (docs/distributed.md, P0.5), and the key is "
                   "fixed after it lands",
@@ -234,6 +230,10 @@ def compare_stores(fixture, a_digests, b_digests, a_names, b_names):
                                         "expansions, build-script runs and type sets carry no name in the log, so the "
                                         "cause is read from the fed build's counts below",
                                         len(a_k ^ b_k)))
+            if different:
+                diffs.append(Difference(fixture, "other-value", "non-function records with unequal bytes",
+                                        "the same key holds different record bytes on the two machines",
+                                        len(different), sorted(different)))
             continue
         # Functions that only one machine made: the same function under another id is a key that
         # holds something of the machine; a function on one side alone is another thing.
@@ -328,6 +328,9 @@ class Machine:
             RA_JIT_CACHE_SEAL_AT="1", RA_JIT_REMOTE_UNSIGNED="1",
             RUST_BACKTRACE="0", CARGO_TERM_COLOR="never", CARGO_NET_OFFLINE="true", CARGO_INCREMENTAL="0")
         env.update(GUARD_ENV)
+        # The watchdog selects this run by id even though each machine has its own home.
+        if "RA_JIT_RUN_ID" in os.environ:
+            env["RA_JIT_RUN_ID"] = os.environ["RA_JIT_RUN_ID"]
         env.update(extra or {})
         return env
 
@@ -354,9 +357,26 @@ def seed_cargo_home(work, fixtures, sources, online):
     for name in fixtures:
         spec = FIXTURES[name]
         ws = os.path.join(sources[name], spec["workspace"])
-        ran = sh(["cargo", "fetch", "--locked"], cwd=ws, env=env)
-        if ran.returncode:
-            raise SystemExit(f"{name}: cargo fetch --locked in {ws} failed (use --online to download):\n{ran.stdout[-1500:]}")
+        config = None
+        if name == "vendored":
+            dest = os.path.join(work, "source-vendored")
+            shutil.copytree(sources[name], dest, ignore=shutil.ignore_patterns("vendor", "target"))
+            sources[name] = dest
+            ws = os.path.join(dest, spec["workspace"])
+            config = os.path.join(ws, ".cargo", "config.toml")
+            os.rename(config, config + ".saved")
+        try:
+            ran = sh(["cargo", "fetch", "--locked"], cwd=ws, env=env)
+            if ran.returncode:
+                raise RuntimeError(f"{name}: cargo fetch --locked in {ws} failed (use --online to download):\n{ran.stdout[-1500:]}")
+            if config:
+                # Generate ignored vendor/ in scratch space, never in the lane's checkout.
+                ran = sh(["cargo", "vendor", "--locked", "--offline", "vendor"], cwd=ws, env=env)
+                if ran.returncode:
+                    raise RuntimeError(f"cargo vendor failed: {ran.stdout[-1500:]}")
+        finally:
+            if config:
+                os.rename(config + ".saved", config)
     return seed
 
 
@@ -446,7 +466,7 @@ def workers_log(side):
 def build_and_run(machine, bin_dir, ws, spec, label, store, ra_home, keys_log, extra_env, progress):
     """`cargo ra-jit build`, the program, the daemon stopped (so the store is whole). A `Run`."""
     import cargo_ra_jit
-    from cargo_ra_jit import Side, program_output, wait_warm
+    from cargo_ra_jit import Side, program_output, wait_warm, how_built
     run = Run(label)
     env = machine.env(bin_dir, store, ra_home, dict(extra_env, RA_JIT_KEYS_LOG=keys_log))
     side = Side(ws, env, True)
@@ -459,7 +479,13 @@ def build_and_run(machine, bin_dir, ws, spec, label, store, ra_home, keys_log, e
         if built.returncode:
             run.error = f"cargo ra-jit build failed ({built.returncode}): {built.stderr[-1500:]}"
             return run
-        wait_warm(side, ws)
+        if how_built(built.stderr) != "daemon":
+            run.error = f"build was not compiled by blaze: {built.stderr[-1500:]}"
+            return run
+        _, states = wait_warm(side, ws)
+        if states == ["not loaded in time"] or any(s.startswith("left to cargo:") for s in states):
+            run.error = f"daemon did not load the workspace: {states}"
+            return run
         _, ran = side.cargo("run", *package, "--", *args, timeout=600)
         run.out = program_output(ran)
         run.said += workers_log(side)
@@ -528,6 +554,8 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     runs["a"].expected = expected["a"]
     env_a = a.env(bin_dir, stores["a"], homes["a"])
     pushed = sh([os.path.join(bin_dir, "ra-jit"), "cache", "push", remote], env=env_a)
+    if pushed.returncode:
+        raise RuntimeError(f"cache push failed: {pushed.stdout[-1500:]}")
     result["pushed"] = pushed.stdout.strip()[-200:]
 
     progress(f"  {name}: B (own store, no remote)")
@@ -538,6 +566,8 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     progress(f"  {name}: B (store pulled from A's remote)")
     env_b = b.env(bin_dir, stores["b-fed"], homes["b-fed"])
     pulled = sh([os.path.join(bin_dir, "ra-jit"), "cache", "pull", remote], env=env_b)
+    if pulled.returncode:
+        raise RuntimeError(f"cache pull failed: {pulled.stdout[-1500:]}")
     result["pulled"] = pulled.stdout.strip()[-200:]
     runs["b-fed"] = build_and_run(b, bin_dir, wss["b"], spec, "B-fed", stores["b-fed"], homes["b-fed"],
                                   os.path.join(top, "keys-b-fed.log"), dict(extra, RA_JIT_REMOTE=remote, RA_JIT_REMOTE_READONLY="1"),
@@ -562,6 +592,9 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     d_a = digests_of(bin_dir, stores["a"], env_a)
     d_solo = digests_of(bin_dir, stores["b-solo"], b.env(bin_dir, stores["b-solo"], homes["b-solo"]))
     numbers, diffs = compare_stores(name, d_a, d_solo, a_names, solo_names)
+    if not a_names or not solo_names:
+        diffs.append(Difference(name, "no-function-evidence", "empty function key log",
+                                "equal empty stores do not prove cross-machine key reuse"))
     result["numbers"] = numbers
     for d in diffs:
         result["differences"].append(d.row())
@@ -778,6 +811,9 @@ def self_test():
     other_a = {h("frozen 1"): {(5, h("x"))}}
     n, d = compare_stores("t", {**same(), **other_a}, same(), names(id_a), names(id_a))
     check("a record that is not a function is counted apart", n["other"]["only_a"] == 1 and any(x.kind == "other-record" for x in d))
+    other_b = {h("frozen 1"): {(5, h("different"))}}
+    n, d = compare_stores("t", other_a, other_b, {}, {})
+    check("unequal bytes of non-function records fail", [x.kind for x in d] == ["other-value"] and bool(failing([{"differences": [x.row() for x in d]}])))
 
     text = f"{h('k')} 12 {h('v')}\n{h('k2')} 3 {h('v2')}\n"
     check("digest lines are read", set(read_digests(text)) == {h('k'), h('k2')})
@@ -825,6 +861,8 @@ def main():
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
     p.add_argument("--watchdog-mb", type=int, default=24 * 1024)
+    p.add_argument("--warmup-secs", type=int, default=1800,
+                   help="maximum wait for a daemon load; timeout fails the fixture")
     a = p.parse_args()
     if a.self_test:
         return self_test()
@@ -846,6 +884,8 @@ def main():
         if not os.path.exists(os.path.join(bin_dir, tool)):
             sys.exit(f"{bin_dir} has no {tool}: build it (under the heavy lock), or name the directory with --blaze-bin")
     os.environ["RA_JIT_BIN"] = os.path.join(bin_dir, "ra-jit")
+    import cargo_ra_jit
+    cargo_ra_jit.WARMUP_SECS = a.warmup_secs
     work = os.path.realpath(a.work)
     run_id = "xm%s-%d" % (time.strftime("%m%d%H%M%S"), os.getpid())
     os.environ["RA_JIT_RUN_ID"] = run_id
@@ -866,7 +906,7 @@ def main():
 
     results = []
     try:
-        sources = {n: source_of(n, work) for n in names}
+        sources = {n: source_of(n, work, offline=not a.online) for n in names}
         seed = seed_cargo_home(work, names, sources, a.online)
         rust_home = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
         a_m = Machine(os.path.join(work, "m"), "a", ["alice", "src", "co"], seed, rust_home)

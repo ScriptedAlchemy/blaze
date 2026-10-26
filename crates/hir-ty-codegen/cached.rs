@@ -550,10 +550,10 @@ impl Entry {
             }
         }
         // After cargo's directory: it can be beside the checkout, and is named by what it is.
+        if checkout != Some(super::CHECKOUT) && self.files().any(|it| super::names_checkout(it)) {
+            return false;
+        }
         if let Some(root) = checkout.filter(|it| *it != super::CHECKOUT) {
-            if self.files().any(|it| super::names_checkout(it)) {
-                return false;
-            }
             for file in self.files() {
                 if let Some(there) = super::stored_as(file, root) {
                     *file = there;
@@ -578,11 +578,9 @@ impl Entry {
                 *file = here;
             }
         }
-        if let Some(root) = checkout.filter(|it| *it != super::CHECKOUT) {
-            for file in self.files() {
-                if super::names_checkout(file) {
-                    *file = super::read_as(file, root)?;
-                }
+        for file in self.files() {
+            if super::names_checkout(file) && checkout != Some(super::CHECKOUT) {
+                *file = super::read_as(file, checkout?)?;
             }
         }
         if cargo_home == Some(super::CARGO_HOME) || !self.of_cargo() {
@@ -1241,8 +1239,10 @@ mod tests {
         assert!(holds(&bytes, "/checkout/../../../shared/lib.rs"));
         // The checkout of another machine is at the top of its disk: no `..` reaches `shared`.
         assert!(Entry::decode(&bytes).unwrap().arrived(None, None, Some("/ws")).is_none());
+        assert!(Entry::decode(&bytes).unwrap().arrived(None, None, None).is_none());
         // A file that goes by the name of the checkout's place is not stored as one.
         assert!(!written_at("/checkout/src/lib.rs").leave(None, None, Some("/home/one/repo/ws")));
+        assert!(!written_at("/checkout/src/lib.rs").leave(None, None, None));
         // A directory that is not shared is left as it is, with the cargo home before it.
         let mut far = written_at("/opt/other/lib.rs");
         assert!(far.leave(None, None, Some("/home/one/repo/ws")));
