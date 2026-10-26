@@ -33,7 +33,8 @@ pub(crate) struct Contents {
 
 impl Contents {
     pub(crate) fn source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
-        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+        {
             return *hash;
         }
         let hash = library_source_hash(db, krate);
@@ -362,6 +363,9 @@ pub(crate) fn library_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
 }
 
 fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
+    // Body lowering expands include_bytes!/include_str! and populates included_by.
+    // Discover those inputs before the compilation-scoped identity is memoized.
+    _ = crate::declared_in(db, krate.into());
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     let sources = db.source_root(root).source_root(db);
     let mut files: Vec<_> = sources
@@ -372,12 +376,19 @@ fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
         })
         .collect();
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    hash_source_files(
-        &files
-            .iter()
-            .map(|(path, file)| (path.clone(), file_hash(db, *file, Path::new(path))))
-            .collect::<Vec<_>>(),
-    )
+    let mut hashed: Vec<_> = files
+        .iter()
+        .map(|(path, file)| (path.clone(), file_hash(db, *file, Path::new(path))))
+        .collect();
+    hashed.extend(db.included_by(krate).into_iter().map(|(path, bytes)| {
+        let mut hash = Sha256::new();
+        // Missing input differs from an existing empty file.
+        hash.update([u8::from(bytes.is_some())]);
+        hash.update(bytes.as_deref().unwrap_or_default());
+        (path.as_str().to_owned(), hash.finalize().into())
+    }));
+    hashed.sort_unstable();
+    hash_source_files(&hashed)
 }
 
 fn hash_source_files(files: &[(String, Hash)]) -> Hash {
@@ -446,6 +457,48 @@ impl FileHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_out_of_vfs_payload_invalidates_its_library_and_dependent_caller() {
+        use test_fixture::WithFixture;
+        let top = std::env::temp_dir().join(format!("c4-payload-{}", std::process::id()));
+        std::fs::create_dir_all(top.join("vendor/dep/src")).unwrap();
+        let payload = top.join("vendor/dep/src/payload.bin");
+        let fixture = format!(
+            "//- {}/app.rs crate:app deps:dep\nfn caller() -> u8 {{ dep::value() + 10 }}\n\
+             //- {}/vendor/dep/src/lib.rs crate:dep\n\
+             #[rustc_builtin_macro]\nmacro_rules! include_bytes {{ () => {{}} }}\n\
+             pub fn value() -> u8 {{ include_bytes!(\"payload.bin\")[0] }}\n",
+            top.display(),
+            top.display(),
+        );
+        let hash = |byte: u8| {
+            std::fs::write(&payload, [byte]).unwrap();
+            let (db, _) = RootDatabase::with_many_files(&fixture);
+            hir::attach_db(&db, || {
+                let crates = ide_db::base_db::all_crates(&db);
+                let find = |name: &str| {
+                    *crates
+                        .iter()
+                        .find(|krate| {
+                            krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                        })
+                        .unwrap()
+                };
+                let (dep, app) = (find("dep"), find("app"));
+                assert!(db.included_by(dep).is_empty());
+                let contents = Contents::default();
+                let dep_hash = contents.source_hash(&db, dep);
+                assert_eq!(db.included_by(dep)[0].1.as_deref(), Some(&[byte][..]));
+                (dep_hash, contents.source_hash(&db, app))
+            })
+        };
+        let one = hash(1);
+        let other = hash(2);
+        assert_ne!(one.0, other.0);
+        assert_ne!(one.1, other.1);
+        std::fs::remove_dir_all(top).unwrap();
+    }
 
     #[test]
     fn equal_vendor_places_share_only_equal_source_bytes() {

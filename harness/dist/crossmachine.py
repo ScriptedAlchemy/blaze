@@ -81,6 +81,8 @@ FIXTURES = {
                      about="a vendored crate (source replacement, as `cargo vendor` lays it out)"),
     "vendor-edit": dict(source="dir", workspace="vendored", package="app", run=[], vendor_edit=True,
                         about="negative invalidation: B changes a vendored function body and checksum"),
+    "vendor-payload": dict(source="dir", workspace="vendored", package="app", run=[], payload_edit=True,
+                           about="negative invalidation: B changes only an included binary payload"),
     "macros": dict(source="dir", workspace="macros", package="app", run=[],
                    env={"RA_JIT_PROC_MACRO_CACHE_SKIP": "Embedded"},
                    about="a proc-macro crate: two pure macros and a derive that reads a file while it expands"),
@@ -92,7 +94,7 @@ FIXTURES = {
                     about="the scale arm: 165,752 functions; asked for by name, not in --all"),
 }
 # `--all` runs these in this order: the small ones first, so a break shows early.
-ALL = ["hello", "paths", "vendored", "vendor-edit", "macros", "ripgrep"]
+ALL = ["hello", "paths", "vendored", "vendor-edit", "vendor-payload", "macros", "ripgrep"]
 
 # A difference whose fix is another unit's, or that waits on a thing no unit here owns. A kind is
 # the `kind` of a Difference; the value is why it is not failing this run. Nothing else passes.
@@ -381,6 +383,7 @@ def seed_cargo_home(work, fixtures, sources, online):
                 if ran.returncode:
                     raise RuntimeError(f"cargo vendor failed: {ran.stdout[-1500:]}")
                 vendor_body(ws, 1, append=True)
+                vendor_payload(ws, 1)
         finally:
             if config:
                 os.rename(config + ".saved", config)
@@ -393,7 +396,7 @@ def vendor_body(ws, value, append=False):
     source = os.path.join(vendor, "src", "lib.rs")
     text = open(source).read()
     if append:
-        text += "\npub fn c4_identity() -> u32 { 1 }\n"
+        text += '\npub fn c4_identity() -> u32 { 1 }\npub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }\n'
     else:
         old = "pub fn c4_identity() -> u32 { 1 }"
         if old not in text:
@@ -404,6 +407,18 @@ def vendor_body(ws, value, append=False):
     checksum = os.path.join(vendor, ".cargo-checksum.json")
     checks = json.load(open(checksum))
     checks["files"]["src/lib.rs"] = hashlib.sha256(text.encode()).hexdigest()
+    with open(checksum, "w") as output:
+        json.dump(checks, output, sort_keys=True)
+
+
+def vendor_payload(ws, value):
+    vendor = os.path.join(ws, "vendor", "fastrand")
+    path = os.path.join(vendor, "src", "payload.bin")
+    with open(path, "wb") as output:
+        output.write(bytes([value]))
+    checksum = os.path.join(vendor, ".cargo-checksum.json")
+    checks = json.load(open(checksum))
+    checks["files"]["src/payload.bin"] = hashlib.sha256(bytes([value])).hexdigest()
     with open(checksum, "w") as output:
         json.dump(checks, output, sort_keys=True)
 
@@ -489,7 +504,14 @@ def fed_coverage(fixture, said, names, log_exists):
     if not log_exists:
         diffs.append(Difference(fixture, "fed-coverage", "missing B-fed key log",
                                 "zero named additions is not evidence of zero compilation"))
-    if not re.search(r"^entries: ", said, re.M) or not re.search(r"^store: ", said, re.M):
+    store_lines = re.findall(r"^store:.*$", said, re.M)
+    entry_lines = re.findall(r"^entries:.*$", said, re.M)
+    store_pattern = r"store: \d+ functions found, \d+ compiled and added"
+    entry_pattern = (r"entries: \d+ found, \d+ added, \d+ as stored, \d+ not as stored, "
+                     r"\d+ instances and \d+ requests without a stable name")
+    if (not store_lines or not entry_lines
+            or any(not re.fullmatch(store_pattern, line) for line in store_lines)
+            or any(not re.fullmatch(entry_pattern, line) for line in entry_lines)):
         diffs.append(Difference(fixture, "fed-coverage", "missing compute counters",
                                 "complete entry and store counters are required"))
     if totals["compiled"] or entries["added"] or entries["unnamed"] or entries["unnamed_requests"]:
@@ -590,6 +612,9 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
         wss[m.name] = os.path.join(m.checkout(name, sources[name]), spec["workspace"])
     if spec.get("vendor_edit"):
         vendor_body(wss["b"], 2)
+    if spec.get("payload_edit"):
+        vendor_payload(wss["b"], 2)
+    negative = spec.get("vendor_edit") or spec.get("payload_edit")
     stores = {"a": os.path.join(a.top, "store-" + name), "b-solo": os.path.join(b.top, "store-solo-" + name),
               "b-fed": os.path.join(b.top, "store-fed-" + name)}
     # Short: a daemon's socket lives below its directory, and a socket path has 104 bytes on macOS.
@@ -647,7 +672,7 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
         diffs.append(Difference(name, "no-function-evidence", "empty function key log",
                                 "equal empty stores do not prove cross-machine key reuse"))
     result["numbers"] = numbers
-    if spec.get("vendor_edit"):
+    if negative:
         # Different source inputs should produce different keys. Correctness is checked
         # against B's changed oracle on the fed leg, not equal A/B digest sets.
         diffs = [d for d in diffs if d.kind not in
@@ -663,7 +688,7 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     c = counts(fed.said)
     coverage = fed_coverage(name, fed.said, fed_names, os.path.exists(os.path.join(top, "keys-b-fed.log")))
     for d in coverage:
-        if spec.get("vendor_edit") and d.kind == "fed-compute":
+        if negative and d.kind == "fed-compute":
             continue  # Recompilation is required for this negative invalidation arm.
         result["differences"].append(d.row())
     a_by_name = {n: k for k, (_, n) in a_names.items()}
@@ -687,7 +712,7 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
         result["differences"].append(Difference(name, "not-kept", why, "compiled on every machine, by design or "
                                                 "until a rebinding exists for it", n).row())
     for why, ns in kinds.items():
-        if spec.get("vendor_edit"):
+        if negative:
             continue  # Invalidated names are expected; B must print B's oracle output.
         kind = {"key equal, entry refused": "entry-refused", "crate id differs": "crate-id-fed",
                 "no such function on A": "function-alone"}[why]
@@ -877,6 +902,9 @@ def self_test():
     check("complete zero-compute counters pass coverage", not fed_coverage("t", zero, {}, True))
     check("missing B-fed log fails coverage", bool(fed_coverage("t", zero, {}, False)))
     check("missing counters fail coverage", bool(fed_coverage("t", "", {}, True)))
+    check("truncated counters fail coverage", bool(fed_coverage("t", "store: 0 functions found, 7 compiled and\nentries: 0 found, 7 added,\n", {}, True)))
+    check("unavailable counters fail coverage", bool(fed_coverage("t", "store: unavailable\nentries: unavailable\n", {}, True)))
+    check("a malformed record beside valid counters fails", bool(fed_coverage("t", zero + "store: broken\n", {}, True)))
     check("unnamed compute fails coverage", bool(fed_coverage("t", zero.replace("0 instances", "1 instances"), {}, True)))
     check("unnamed requests fail coverage", bool(fed_coverage("t", zero.replace("0 requests", "1 requests"), {}, True)))
     check("compiled functions fail despite empty log", bool(fed_coverage("t", zero.replace("0 compiled", "1 compiled"), {}, True)))
