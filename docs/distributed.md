@@ -2267,7 +2267,7 @@ script is still cargo's `cargo check` of the daemon's load (above), so this unit
 worker cargo-free. Files: `crates/ra-jit/src/inputs.rs`, `crates/blaze-build-script`
 (`output::reads`, `apply::Rerun`), `crates/ra-jit/src/cargo/script.rs` (`run_key`),
 `crates/ra-jit/src/cargo/daemon.rs` (the build a request is for), `harness/scriptedits.py`.
-Depends: P0.1. Acceptance: `scriptedits.py`'s 32 probes, each blaze's whole build against cargo
+Depends: P0.1. Acceptance: `scriptedits.py`'s 34 probes, each blaze's whole build against cargo
 1.99.0 on the same project and edits, equal at every step in the build's status, how many times each
 script ran, and the program's exit status, standard output and standard error; each fix has a unit
 test; the tracedecay fixture is P0-D's. From the reviews:
