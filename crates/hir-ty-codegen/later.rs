@@ -329,7 +329,8 @@ impl<'db> Keeper<'_, 'db> {
         }
         let mut entry = Box::new(entry);
         let Some(check) = check else {
-            return Some(cached::Kept::Entry { key, entry });
+            let name = cached::keys_logged().then(|| Box::<str>::from(&*name));
+            return Some(cached::Kept::Entry { key, entry, name });
         };
         // The entry as it would be written is set against the one that is there.
         let stored = store.get(&key);

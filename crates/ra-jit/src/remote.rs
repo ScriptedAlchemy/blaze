@@ -938,6 +938,7 @@ const USAGE: &str = "usage: ra-jit cache push|pull REMOTE [PROJECT]\n       \
                      ra-jit cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
                      [--dry-run]\n       \
                      ra-jit cache verify\n       \
+                     ra-jit cache digests\n       \
                      ra-jit cache keygen FILE\n       \
                      ra-jit cache forget REMOTE";
 
@@ -956,6 +957,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         "stats" => stats(&store),
         "gc" => collect(&store, args),
         "verify" => verify(&store),
+        "digests" => digests(&store),
         "push" | "pull" => transfer_command(&store, &verb, args),
         "forget" => forget(&store, args),
         _ => bail!(USAGE),
@@ -1110,6 +1112,18 @@ fn verify(store: &Path) -> anyhow::Result<()> {
     }
     if !verified.corrupt.is_empty() {
         bail!("{} packs are not what was written", verified.corrupt.len());
+    }
+    Ok(())
+}
+
+/// `ra-jit cache digests`: a line for each value in the sealed packs, `KEY LENGTH SHA256`, the
+/// key as it is on disk. Two machines that built one commit have equal outputs when they hold
+/// the same entries (`harness/dist/crossmachine.py`).
+fn digests(store: &Path) -> anyhow::Result<()> {
+    let hex = |bytes: &[u8]| bytes.iter().map(|it| format!("{it:02x}")).collect::<String>();
+    let all = StoreDir::at(store).digests().with_context(|| store.display().to_string())?;
+    for (key, len, digest) in all {
+        println!("{} {len} {}", hex(&key), hex(&digest));
     }
     Ok(())
 }

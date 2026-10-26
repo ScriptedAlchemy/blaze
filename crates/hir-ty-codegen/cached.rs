@@ -630,9 +630,44 @@ pub(super) enum Kept {
     Entry {
         key: [u8; KEY],
         entry: Box<Entry>,
+        /// The stable name the key is of, when [`keys_logged`].
+        name: Option<Box<str>>,
     },
     /// The sets of an entry the store has: they may have been dropped from under it.
     Types(Vec<TypeSet>),
+}
+
+/// Where `RA_JIT_KEYS_LOG` says to list the entries this process adds to the store, if it does.
+fn keys_log() -> Option<&'static Mutex<std::fs::File>> {
+    static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let open = || {
+        let path = std::env::var_os("RA_JIT_KEYS_LOG").filter(|it| !it.is_empty())?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    };
+    LOG.get_or_init(open).as_ref()
+}
+
+/// Whether the entries added are listed (`RA_JIT_KEYS_LOG`), so that [`Kept::Entry`] has the
+/// name its key is of: what `harness/dist/crossmachine.py` says a key differs by.
+pub(super) fn keys_logged() -> bool {
+    keys_log().is_some()
+}
+
+/// One line for an entry added: the key it has on disk, the digest of its value and its stable
+/// name, tab separated. Two machines that agree on the first two columns for a name agree on
+/// everything the entry says; a name on one machine that is on no other is a key that differs.
+fn log_key(store: &Store, key: &[u8; KEY], value: &[u8], name: &str) {
+    use std::io::Write as _;
+    let Some(log) = keys_log() else { return };
+    let hex = |bytes: &[u8]| bytes.iter().map(|it| format!("{it:02x}")).collect::<String>();
+    let line = format!(
+        "{}\t{}\t{}\n",
+        hex(&store.disk_key(key)),
+        hex(&Sha256::digest(value)),
+        name.replace(['\t', '\n'], " ")
+    );
+    _ = log.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
 }
 
 /// How many entries a [`Writer`] added, and how many it did not for a file of theirs
@@ -713,8 +748,8 @@ impl Writer {
     }
 
     fn write(&mut self, kept: Kept) {
-        let (key, mut entry) = match kept {
-            Kept::Entry { key, entry } => (key, entry),
+        let (key, mut entry, name) = match kept {
+            Kept::Entry { key, entry, name } => (key, entry, name),
             Kept::Types(types) => {
                 types.iter().for_each(|it| _ = self.types.keep(self.store, it));
                 return;
@@ -724,6 +759,9 @@ impl Writer {
             Some(bytes) => {
                 self.store.insert(&key, &bytes);
                 self.written.added += 1;
+                if let Some(name) = name {
+                    log_key(self.store, &key, &bytes, &name);
+                }
             }
             None => self.written.of_cargo += 1,
         }

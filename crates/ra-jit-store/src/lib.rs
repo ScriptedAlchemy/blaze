@@ -1038,6 +1038,29 @@ impl StoreDir {
         Ok(verified)
     }
 
+    /// The digest of every value of every sealed pack, with its key on disk and its length, in
+    /// the order of the keys: what two stores are compared by. A key two stores both hold with
+    /// one digest holds the same entry in both; a key in one only is a key the other's build
+    /// did not make; a key with two digests is code that is not the same. Changes nothing.
+    pub fn digests(&self) -> io::Result<Vec<([u8; KEY], u32, [u8; 32])>> {
+        let mut all = Vec::new();
+        for name in self.names()? {
+            if !is_pack(&name) {
+                continue;
+            }
+            let Ok(pack) = self.read(&name) else { continue };
+            let Ok(index) = Pack::verify(&name, &pack) else { continue };
+            let blocks = index.unpack_all(&pack).map_err(io::Error::other)?;
+            for entry in &index.entries {
+                let value = entry.value(&blocks);
+                all.push((entry.key, entry.len, Sha256::digest(value).into()));
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        Ok(all)
+    }
+
     /// Collects garbage: seals what ended daemons left open, removes what never got its
     /// name, makes one pack of the many small ones, and removes the packs that have gone
     /// unused the longest until the rest take no more than `limit` bytes.
@@ -1709,6 +1732,12 @@ impl Store {
                 writer.stop(e);
             }
         }
+    }
+
+    /// The key `key` is kept under on disk: the one `insert` and `get` use, with this store's
+    /// identity in it. Two machines of one build agree on it exactly when they agree on `key`.
+    pub fn disk_key(&self, key: &[u8; KEY]) -> [u8; KEY] {
+        self.identity.key(key)
     }
 
     /// How many functions were found, and how many were not, since the last call.
