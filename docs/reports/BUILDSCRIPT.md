@@ -28,10 +28,12 @@ it follows from what was read. Nothing is extrapolated.
   The script's output depends on the state of its `OUT_DIR`, which cargo leaves as it was between runs
   (**read**: the first rerun found the bundle and did not run pnpm).
 - **Fix: in blaze** (`crates/ra-jit/src/cargo/script.rs`). The daemon runs the script in the
-  `OUT_DIR` cargo left, under cargo's lock on its build directory, as cargo runs it again, and
-  compares the lines cargo reads, as cargo reads them, and what it wrote with the run the build had.
+  `OUT_DIR` cargo left, under cargo's lock on its build directory, when cargo's own records say
+  cargo would run it again, records the run as cargo records its own (`records.rs`), and compares
+  the lines cargo reads, as cargo reads them, and what it wrote with the run the build had.
   (The first two versions ran it in a copy of the directory, which two reviews failed on what a
-  copy does not keep; "Round 3" is why it is now cargo's own directory.) With the
+  copy does not keep; "Round 3" is why it is now cargo's own directory, and "Round 4" why the run
+  is cargo's run, so that a script runs once for a change, as under cargo.) With the
   fix the scratch project that has tracedecay's own `build.rs` goes from 0 of 3 edit builds the
   daemon's to 3 of 3 (read, 1 run each of `blaze build`), and the harness case that has the script in
   miniature from 0 of 3 to 3 of 3. tracedecay needs no edit; an optional patch that keeps pnpm's lines off the
@@ -438,6 +440,9 @@ which is what has cargo run the script again.
 
 ### In place is cargo's own sequence, under two conditions
 
+(This premise was wrong for a script that is not idempotent: blaze's run, then cargo's, is two runs
+where cargo alone makes one. "Round 4" records blaze's run as cargo's instead.)
+
 Cargo 1.99 runs a script so (`src/cargo/core/compiler/custom_build.rs` `build_work`, the verifier's copy
 of `5f94df478`, **read**): it creates `OUT_DIR` if it is not there and never empties it, stamps
 `invoked.timestamp` before it starts the script, and after the script exits writes `output` with the
@@ -585,6 +590,199 @@ Not run here: the gate's other parts (the LLVM build, `cargo test --release` of 
 enable` (the wrapper's side, B, is covered by the unit test of the lock and not by a harness run), and
 tracedecay itself (this Mac, as above).
 
+## Round 4: blaze's run is cargo's run (unit u8-records)
+
+A third verifier run (GPT 6.1) failed `6c62adc3` on two findings, both reproduced against cargo
+1.99 (**read** from its report and its evidence):
+
+1. **A script that is not idempotent ran twice for one edit.** A script that counts its runs in
+   what it generates printed `3 8` under `cargo ra-jit` after one edit, and `2 8` under cargo
+   alone. Blaze's check ran it, found it wrote something else, and sent the build to cargo, which
+   ran it again: blaze wrote none of cargo's records of a run, so cargo's own rule still found it
+   out of date. The same extra run came later after a check that found the run the same: cargo's
+   next build ran the script, which cargo alone would not have.
+2. **The wrong lock with `build.build-dir`.** Cargo 1.99 holds `.cargo-build-lock` in the build
+   directory while it runs a script; `.cargo-lock` is in the other directory, shared. The check
+   looked for `.cargo-lock` above `OUT_DIR`, found none, took that for NFS and ran the script
+   while cargo's own run of it was under way.
+
+"Round 3" said blaze's run, then cargo's, is what cargo does for an edit, a touch and a build. That
+holds for a script whose second run changes nothing, and not for one that counts or appends. The
+root cause of both halves of the first finding is one thing: **blaze's run was not recorded as
+cargo's run.** The fix records it.
+
+### What cargo keeps of a run, and what blaze now writes
+
+Read from cargo at `5f94df478` (cargo 1.99.0, `cargo +1.99.0 -V` names that commit), fetched
+read-only and not built or run. A run of a build script is a unit of its own (`RunCustomBuild`),
+and cargo runs it when its fingerprint says it is out of date. For a dirty unit cargo does, in
+this order:
+
+| Step | Cargo 1.99 source | What blaze writes, in `records.rs` |
+|---|---|---|
+| Empties the fingerprint's hash, so a run that does not end is run again | `src/compiler/fingerprint/mod.rs:549` (`prepare_target`) | `Unit::begin`: `.fingerprint/<package>-<hash>/run-build-script-<target>` written empty |
+| Makes `OUT_DIR` if it is not there | `src/compiler/custom_build.rs:523`, `552` | `Unit::begin`: `create_dir_all` |
+| Writes `invoked.timestamp`, whose time is when the run began | `custom_build.rs:598`, `crates/cargo-util/src/paths.rs:381` (`set_invocation_time`) | `Unit::begin`: the same text, the time read back from the file |
+| Runs the script, stdin closed, and fails it on a `cargo::error=` line | `custom_build.rs:598-672`, `crates/cargo-util/src/process_builder.rs:346` (`exec_with_streaming`) | `current`: the same; a failed run writes nothing more |
+| Writes `output` (standard output) and gives it the time the run began, then `stderr`, then `root-output` (the name of `OUT_DIR`) | `custom_build.rs:683-688`, `paths.rs:186` (`write`), `706` (`set_file_time_no_err`) | `Unit::ran`: the same, with `std::fs::write`, as `paths::write` is |
+| Reads what the script printed; a line cargo does not take fails the build | `custom_build.rs:797` (`BuildOutput::parse`) | `blaze_build_script::parse`, the existing port of that function; on an error nothing more is written |
+| Writes the fingerprint: the hash in hex, then the fingerprint as JSON | `fingerprint/mod.rs:552-585` (the run's `local` recomputed after it), `1953` (`write_fingerprint`) | `Unit::record`: the fingerprint cargo wrote last, with `local` recomputed as cargo does |
+
+Every write is a plain write of the whole file, as cargo's are; none is atomic in cargo either. The
+second layout of the build directory (`build/<package>/<hash>/run/stdout`) is nightly's
+(`-Zbuild-dir-new-layout`); a stable cargo 1.99 cannot use it, and a run there is not made.
+
+**The fingerprint is written exactly.** A fingerprint's hash is cargo's `util::hash_u64`: its
+`Hash` (`fingerprint/mod.rs:1378`) through `rustc-stable-hash` 0.1.2's `StableSipHasher128`
+(`src/util/hasher.rs`), written as the bytes of the `u64`, least significant first, in hex
+(`src/util/hex.rs`). Blaze has the fields cargo serializes, in cargo's order (`mod.rs:638`), the
+dependencies as cargo's 4-tuples (`mod.rs:760`), and `LocalFingerprint` with its variants in
+cargo's order (`mod.rs:815`), whose derived `Hash` depends on that order. The same crate and version
+are in blaze's lock file already (by `hir-ty-codegen`), with the checksum cargo 1.99's lock has.
+What changes in a run's fingerprint is `local`, which cargo recomputes from what the run printed
+(`local_fingerprints_deps`, `mod.rs:1916`): the `rerun-if-changed` paths, from the package's
+directory where they are below it, beside `output` as named from the build directory, and each
+`rerun-if-env-changed` variable with the value cargo has for it (`from_env`, `mod.rs:909`: the
+`[env]` of cargo's configuration, else its environment). A run that prints neither keeps what cargo
+reckoned before it (`gen_local` returns `None`, `mod.rs:579`). Everything else (`rustc`, the
+dependencies' hashes, `rustflags`, `config`) is the fingerprint cargo wrote last, as cargo
+computes it again unchanged.
+
+Two checks make "exactly" a property of each run and not of the port alone:
+
+- **A golden fingerprint.** `records::tests` reads a run's fingerprint and a program's fingerprint
+  that cargo 1.99.0 wrote (`crates/ra-jit/src/cargo/records/`, from `cargo +1.99.0 build` of a
+  scratch package whose script watches `build.rs` and `data/./in.txt` and two variables, one set
+  and one not), writes each again byte for byte, and hashes each to what cargo wrote beside it.
+  The program's fingerprint names the run's hash among its dependencies, and it is the hash blaze
+  computes (**read**: the test passes).
+- **Each record before a run.** Before it runs anything, blaze reads cargo's last fingerprint of
+  the run, writes it again and requires the bytes cargo wrote, hashes it and requires cargo's hash,
+  and requires that what cargo would reckon of the last run now is what the record has. A record
+  that is not cargo 1.99's, a variable that has another value now (cargo runs the script again,
+  with that value), or a record of a run that did not end (an empty hash) leaves the build to
+  cargo with nothing run.
+
+### When cargo would run the script, and the one field blaze does not reckon
+
+Blaze runs a script only when cargo 1.99 would, by cargo's own rule, read from its records
+(`check_filesystem`, `mod.rs:1246`, and `find_stale_file`, `mod.rs:2083`): `output` is not there,
+the script was compiled after it, or a path it watches (a directory by everything below it,
+following links, `paths::mtime_recursive`) was written after the run began. A time equal to it is
+not after it, as in cargo, and what is below cargo's home in `git` and `registry` is never newer.
+When cargo would not run it, the run cargo has is read. This takes the place of the daemon's own
+rule (`newest` in `inputs.rs`, deleted) and of `ra-jit-checked`, the record of blaze's runs beside
+the directory (deleted): blaze's run is now in `output`, as cargo's is.
+
+One field cannot be written exactly, and blaze does not write it: **`LocalFingerprint::Precalculated`
+of a script that prints no `rerun-if-changed` or `rerun-if-env-changed`.** Cargo then fingerprints
+the whole package (`build_script_local_fingerprints`, `mod.rs:1813`, calling `pkg_fingerprint`,
+`mod.rs:2072`): the time of the newest file in cargo's list of the package's files and its path,
+as text. The list is `PathSource::list_files` (`src/sources/path.rs`), which reads git's index and
+`.gitignore`, the manifest's `include` and `exclude`, and leaves out nested packages and the target
+directory. Blaze has no port of it, and an approximation would make cargo run the script again or,
+worse, not run it when it should. So such a script is not run in place; its build is cargo's, with
+nothing run, as before this branch for a change of its package. The script of tracedecay's CLI and
+the verifier's scripts print `rerun-if-changed`. The recommended way to close it is a port of
+`list_files` and `fingerprint` with a differential test against cargo on real packages
+(follow-up below).
+
+### The lock
+
+`records::Unit::lock` takes what cargo 1.99's `Layout::new` takes (`src/compiler/layout.rs:262-292`):
+`.cargo-build-lock` in the profile's directory of the build directory, exclusively, and
+`.cargo-lock` there shared when it is there (the default layout, where the build directory is the
+target directory; cargo takes it shared for an older cargo). Neither is waited for. The file is
+found from `OUT_DIR` (`<build-dir>/[<target>/]<profile>/build/<package>-<hash>/out`, three
+directories up), so `build.build-dir` needs nothing else. Cargo takes `.cargo-build-lock`
+exclusively in every stable build, and shared only under nightly's `-Zfine-grain-locking`;
+an exclusive try fails against either. It is taken before cargo's records are read, so a cargo
+that ran the script meanwhile has written them when it lets go. While a cargo holds it, the run
+cargo has is read when cargo's rule says it would not run the script; otherwise the build is
+cargo's. Where there is no `.cargo-build-lock` (NFS, where cargo takes none, or a directory a
+cargo 1.99 did not build in), nothing is run: nothing keeps a cargo out.
+
+**read**, live, `cargo +1.99.0 build` of a scratch package whose script waits for a file (1 run per
+layout, `/tmp/u8r/live-lock.py`): with `build.build-dir = "build-cache"`, `OUT_DIR` is
+`build-cache/debug/build/lockprobe-<hash>/out`; while the script waits, an exclusive try of
+`build-cache/debug/.cargo-build-lock` fails, and there is no `.cargo-lock` in `build-cache/debug`.
+In the default layout, `target/debug/.cargo-build-lock` is held exclusively and `.cargo-lock`
+there is shared (a shared try succeeds). An exclusive try of `.cargo-build-lock` fails in both,
+which is what `Unit::lock` does.
+
+### The verifier's cases, and the tests
+
+| Case | Before (`6c62adc3`) | Now | Test |
+|---|---|---|---|
+| A script that counts its runs in what it generates, one edit | `3 8`, cargo alone `2 8` | `2 8`, 2 runs | `a_script_that_counts_its_runs_runs_once_for_a_change`; `harness/scriptrerun.py`, `counter` |
+| The same, two edits | `5 9`, cargo alone `3 9` | `3 9`, 3 runs | the same |
+| The same, then plain cargo (`ra-jit enable`) | `5 9`, no script run | `3 9`, no script run | `harness/scriptrerun.py`, `counter` |
+| A script that counts its runs beside `OUT_DIR` (the check finds it the same), two edits, then plain cargo | 4 runs, and plain cargo ran it; cargo alone 3, and not | 3 runs, no script run | `harness/scriptrerun.py`, `logger` |
+| A cargo holds `.cargo-build-lock` in a build directory set apart, with no `.cargo-lock` there | the script ran | not run, `Err` | `a_run_while_a_cargo_builds_in_a_build_directory_set_apart_is_cargos` |
+| No `.cargo-build-lock` at all | the script ran | not run | the same test |
+
+The harness rows are **read** from `harness/scriptrerun.py` on this branch's release build and on a
+release build of `6c62adc3` (1 run each, the store off for these two cases: a run the store kept
+stands for the script's, which is another matter, below). Plain cargo here is cargo in a cargo home
+in which `ra-jit enable` was run. A cargo without blaze's wrapper has units of its own for the
+workspace's packages, because cargo mixes `RUSTC_WORKSPACE_WRAPPER` into their hash
+(`src/compiler/build_runner/compilation_files.rs:800`): it runs their scripts in another `OUT_DIR`,
+for the first time (**read**: `1 9` in the first run of this case, from a fresh `OUT_DIR`). That is
+so before this branch too.
+
+Other new tests: a run is recorded as cargo records its own (the bytes and time of `output`,
+`stderr`, `root-output`, and a fingerprint cargo's rule finds current:
+`a_run_is_recorded_as_cargo_records_its_own`); a run that fails, logs `cargo::error=` or prints a
+line cargo does not take leaves cargo's records of a run that did not end
+(`a_script_that_fails_…`, `a_script_that_logs_an_error_…`); a variable that changed is cargo's to
+run the script for (`a_variable_the_script_reads_that_changed_is_cargos_to_run_it_for`); a script
+that says nothing of what it reads is cargo's (`a_script_that_says_nothing_of_what_it_reads_is_cargos`);
+and the three of `records::tests` (the golden fingerprint, `local`, the hex). The tests of rounds 1
+to 3 run on cargo's layout now, with cargo's records, and pass; three changed what they assert:
+the record of blaze's run is cargo's (was `ra-jit-checked`), a missing `OUT_DIR` is made as cargo
+makes it (was an error), and a run in the second layout is not made (was made).
+
+The guards of `cargo ra-jit` are checked in another order: a build script is run last, when no
+other guard sends the build to cargo (a manifest, cargo's configuration, a variable, a file a build
+script or proc macro was built from). A run is cargo's now, so the order changes no result, only
+whether a script is run that cargo was going to run anyway.
+
+### What is not the same as cargo, still
+
+- **A run that fails runs again under cargo.** Blaze's run fails or logs an error, cargo's records
+  say the run did not end, the build goes to cargo, and cargo runs the script again and reports the
+  failure: two runs where cargo alone has one. Making it one means blaze failing the build itself,
+  with cargo's message (follow-up).
+- **A newly watched variable that cargo sets itself.** A run that starts to watch a variable is
+  recorded with the value the cargo that builds next has (its configuration's `[env]`, else its
+  environment). For a variable cargo sets for the script itself (`TARGET`, `OUT_DIR`, `CARGO_*`),
+  the value cargo's process has is not one blaze sees in the script's environment; blaze takes it
+  from its own process, which `cargo ra-jit` runs cargo from (**inferred** to be the same; not
+  tested). A variable the record already has is checked against cargo's value before any run.
+- **Scripts that depend on another package's script** (`links`): cargo runs a script again when a
+  script it depends on ran again; blaze's check of one script does not look at the others. Not
+  introduced here, and not tested.
+- **The store.** `ra-jit build-script`, which cargo runs in place of a script, gives cargo a run the
+  store kept for the same key and inputs instead of running the script (`Kept`). For a script that
+  counts its runs that is a run less. It is older than this unit and outside it; the harness's two
+  counting cases turn the store off (follow-up).
+- **The baseline** (`Run::of`, the run a build had) is still read from `output` and the directory
+  as they are when the build is recorded, not under the lock (the verifier's third finding, P2).
+
+### Numbers (round 4)
+
+| | Count |
+|---|---|
+| `cargo +1.99.0 test -p ra-jit` on `6c62adc3` | 218 passed, 0 failed, 1 ignored (the round 3 verifier's run, **read** from its report) |
+| the same on this branch | **226 passed, 0 failed, 1 ignored** (1 run, debug; the other targets have no tests) |
+| `cargo::script` and `cargo::records` | 39 and 3 passed, 1 ignored (the measurement) |
+| `harness/scriptrerun.py --selftest` | ok, 9 cases |
+| `harness/scriptrerun.py`, this branch's release build | exit 0 (1 run): the four steps of before as before (three the daemon's, the fourth cargo's with "wrote something else", the program as cargo's), and the two counting cases as in the table; peak 2.6 GB top MEM, no swap growth |
+| the same harness, `6c62adc3`'s release build | exit 1 (1 run): the four steps pass; `counter` wrong at all three steps (`3 8`, `5 9`, `5 9`), `logger` wrong at the plain build (4 runs, a script ran) |
+| the verifier's plain-cargo scenario (`plain.py`: `ra-jit enable`, plain `cargo build`, cold and four edits of `scriptrerun.py`'s project) | every step's program byte for byte cargo's reference program's; three edits the daemon's, the bundle edit through the wrapper's existing path ("wrote something else") (1 run) |
+
+No timing here is a comparison; nothing was measured for speed.
+
 ## Commands
 
 All in this checkout unless a path says otherwise. `H` is the heavy lock of standing order 15 (taken
@@ -618,6 +816,28 @@ RA_JIT_BIN=.../u8p/release/ra-jit python3 harness/scriptrerun.py --selftest
 RA_JIT_BIN=.../u8p/release/ra-jit python3 harness/scriptrerun.py
 cargo +1.99.0 test --release -p ra-jit --bin ra-jit -- --ignored --nocapture the_cost
 cargo +1.99.0 fmt --all -- --check; git diff --check                  # not under H
+```
+
+Round 4, `CARGO_TARGET_DIR=/Users/bytedance/dev/blaze-targets/u8r` (`cp -c -R` of `u8p`), each line under
+H and G, in this checkout unless it says otherwise:
+
+```
+# cargo 1.99's sources, read-only, never built or run: src/compiler/{custom_build.rs,fingerprint/mod.rs,
+#   layout.rs,build_runner/compilation_files.rs,...}, src/util/{hex.rs,hasher.rs}, crates/cargo-util/src/
+#   {paths.rs,process_builder.rs} at 5f94df478, with curl into /tmp/u8-records-cargo-src
+# the golden fingerprints: a scratch package (build.rs watching build.rs, data/./in.txt, U8R_GOLDEN=on, U8R_UNSET)
+U8R_GOLDEN=on cargo +1.99.0 build --offline       # in u8r-scratch/golden, CARGO_TARGET_DIR=its target
+cargo +1.99.0 test -p ra-jit --bin ra-jit -- cargo::script cargo::records   # 42 passed, 1 ignored
+cargo +1.99.0 test -p ra-jit                                               # 226 passed, 1 ignored
+cargo +1.99.0 build -p ra-jit --release
+python3 harness/scriptrerun.py --selftest                                   # not under H
+RA_JIT_BIN=.../u8r/release/ra-jit python3 harness/scriptrerun.py            # exit 0
+# 6c62adc3 in a detached worktree, CARGO_TARGET_DIR=.../u8r-r3 (cp -c -R of u8r)
+cargo +1.99.0 build -p ra-jit --release
+RA_JIT_BIN=.../u8r-r3/release/ra-jit python3 harness/scriptrerun.py         # this branch's harness: exit 1
+RA_JIT_BIN=.../u8r/release/ra-jit python3 /tmp/u8r/plain.py                 # the verifier's plain.py
+python3 -I /tmp/u8r/live-lock.py separate; python3 -I /tmp/u8r/live-lock.py default   # under H
+cargo +1.99.0 fmt --all -- --check; git diff --check                       # not under H
 ```
 
 The scripts and raw outputs of E1 to E4 are in `/Users/bytedance/dev/blaze-targets/u8-work` (`exp1.py`,

@@ -185,20 +185,23 @@ enum Guard {
         reruns_for: Vec<Guard>,
         checked_at: u128,
         built: script::Run,
+        /// The package's targets, which what cargo takes of what the script prints depends on.
+        #[serde(default)]
+        targets: Vec<blaze_build_script::unit::Target>,
     },
 }
 
 impl Guard {
-    /// What changed, when something did.
-    fn broken(&mut self, built_at: u128) -> Option<String> {
+    /// What changed, when something did. `configured` is the `[env]` of cargo's configuration.
+    fn broken(&mut self, built_at: u128, configured: &[Configured]) -> Option<String> {
         match self {
-            Guard::Script { package, out_dir, reruns_for, checked_at, built } => {
+            Guard::Script { package, out_dir, reruns_for, checked_at, built, targets } => {
                 let since = built_at.max(*checked_at);
-                reruns_for.iter_mut().find_map(|it| it.broken(since))?;
+                reruns_for.iter_mut().find_map(|it| it.broken(since, configured))?;
                 let now = stamp_now();
-                let unchanged =
-                    |at| reruns_for.iter_mut().all(|it| it.broken(stamp_of(at)).is_none());
-                match script::current(out_dir, unchanged).and_then(|it| it.same_as(built)) {
+                let env = |name: &str| as_cargo_has(name, configured);
+                let cargo = script::Cargo { env: &env, targets };
+                match script::current(out_dir, &cargo).and_then(|it| it.same_as(built)) {
                     Ok(()) => {
                         *checked_at = now;
                         None
@@ -658,7 +661,12 @@ impl State {
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
     pub(crate) fn broken_guard(&mut self) -> Option<String> {
-        self.guards.iter_mut().find_map(|it| it.broken(self.built_at))
+        let (built_at, configured) = (self.built_at, &self.configured);
+        // A build script is run last, when nothing else sends the build to cargo: a run is
+        // recorded as cargo's, and cargo's build would make it then.
+        let (scripts, others): (Vec<_>, Vec<_>) =
+            self.guards.iter_mut().partition(|it| matches!(it, Guard::Script { .. }));
+        others.into_iter().chain(scripts).find_map(|it| it.broken(built_at, configured))
     }
 
     /// Why the next build is cargo's: a program the daemon is never asked for has new
@@ -1342,6 +1350,16 @@ pub(super) fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String
     env
 }
 
+/// The variable `name` as a cargo has it with `configured`, the `[env]` of its configuration:
+/// a value there that is `force`d or that the environment has none for, or else the
+/// environment's (`GlobalContext::env_config`, then `std::env::var`).
+fn as_cargo_has(name: &str, configured: &[Configured]) -> Option<String> {
+    match configured.iter().find(|it| it.name == name) {
+        Some(it) if it.force || std::env::var_os(name).is_none() => Some(it.value.clone()),
+        _ => std::env::var(name).ok(),
+    }
+}
+
 /// The `[env]` of cargo's configuration as cargo reads it in `cwd`: from the `.cargo`
 /// directory of each directory up from it, the nearest first, then from cargo's home. Of two
 /// files in one directory cargo reads `config`, not `config.toml`. A `relative` value is a
@@ -1518,8 +1536,21 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
     if script::can_rerun(&out_dir)
         && let Ok(built) = script::Run::of(&out_dir)
     {
+        let targets = package.targets.iter().map(|it| blaze_build_script::unit::Target {
+            name: it.name.clone(),
+            kind: it.kind.iter().map(ToString::to_string).collect(),
+            crate_types: it.crate_types.iter().map(ToString::to_string).collect(),
+        });
+        let targets = targets.collect();
         let package = package.name.to_string();
-        files = vec![Guard::Script { package, out_dir, reruns_for: files, checked_at: 0, built }];
+        files = vec![Guard::Script {
+            package,
+            out_dir,
+            reruns_for: files,
+            checked_at: 0,
+            built,
+            targets,
+        }];
     }
     files.extend(variables);
     files

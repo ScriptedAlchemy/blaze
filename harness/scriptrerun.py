@@ -25,6 +25,16 @@ the same to its standard output and standard error, and the reference build has 
 succeeded. A fourth, to an input the script bundles,
 changes what the script writes: the program has to print the new bundle, whoever builds it.
 
+Then two scripts that count their runs (the verifier's cases of round 3,
+docs/reports/BUILDSCRIPT.md). Each watches the program's source, so each edit has cargo run it
+once. One generates the count, so each run is another build, which is cargo's; the other keeps
+it beside its `OUT_DIR`, where nothing compiled reads it, so the build stays the daemon's. The
+daemon runs a script in cargo's `OUT_DIR` and records the run as cargo's, so it runs once for an
+edit under `cargo ra-jit` too, whoever builds what it wrote, and a plain cargo build after the
+edits (in a cargo home in which `ra-jit enable` was run) runs it no more than one after cargo
+alone does: after one edit, after two, and after that plain build, the program prints what cargo's
+reference program prints and the script ran as many times as under cargo alone.
+
 usage: scriptrerun.py --selftest    (the comparison alone, without a build)
 
 Python 3, stdlib only.
@@ -167,6 +177,126 @@ def build(side, step, home):
     return ran.stdout + ran.stderr
 
 
+# A script that counts its runs in what it generates: each run is another build.
+COUNTER = {
+    "Cargo.toml": '[package]\nname = "counter"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n[workspace]\n',
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo::rerun-if-changed=src/main.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let count = out.join("count");
+    let runs = fs::read_to_string(&count).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&count, runs.to_string()).unwrap();
+    fs::write(out.join("generated.rs"), format!("pub const RUNS: u32 = {runs};\n")).unwrap();
+    fs::write(out.join("../runs"), runs.to_string()).unwrap();
+}
+""",
+    "src/main.rs": 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n\nfn number() -> u32 {\n    7\n}\n\n'
+                   'fn main() {\n    println!("{} {}", RUNS, number());\n}\n',
+}
+
+# A script that counts its runs beside its `OUT_DIR`, where nothing compiled reads it: every run
+# writes the same, and the build stays the daemon's.
+LOGGER = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "logger"),
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo::rerun-if-changed=src/main.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let log = out.join("../runs");
+    let runs = fs::read_to_string(&log).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&log, runs.to_string()).unwrap();
+    fs::write(out.join("generated.rs"), "pub const RUNS: u32 = 0;\n").unwrap();
+}
+""",
+    "src/main.rs": COUNTER["src/main.rs"],
+}
+
+
+def ran_a_script(out):
+    """Whether `cargo build -v` said it ran a build script."""
+    return re.search(r"Running `[^`]*build-script-build", out) is not None
+
+
+def runs(target):
+    """How many times the script ran in `target`, by what it counts beside its `OUT_DIR`."""
+    return sum(int(open(p).read() or 0) for p in glob.glob(os.path.join(target, "debug", "build", "*", "runs")))
+
+
+def counted(bin_dir, name, files, daemon):
+    """A script that counts its runs, built with `cargo ra-jit`, cold and with two edits, then with
+    plain cargo: (step, what is wrong) for each step it is wrong in. `daemon` is whether the edits
+    are the daemon's to build."""
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-sc-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        open(os.path.join(ws, path), "w").write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    # A run the store kept would stand for the script's: what is counted here is its runs.
+    env["RA_JIT_CACHE"] = "off"
+    for variable in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
+        env.pop(variable, None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    program = os.path.join(ws, "target", "debug", name)
+    reference_program = os.path.join(ws, "target-ref", "debug", name)
+    wrong = []
+
+    def compare(step, how):
+        ran = subprocess.run([program], capture_output=True, timeout=60)
+        theirs = subprocess.run([reference_program], capture_output=True, timeout=60)
+        problems = differences(ran, theirs)
+        ours, cargos = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
+        if ours != cargos:
+            problems.append(f"the script ran {ours} times, under cargo alone {cargos}")
+        wrong.extend((f"{name}: {step}", why) for why in problems)
+        said = ran.stdout.decode(errors="replace").strip()
+        print(f"{name + ': ' + step:36} {'ok' if not problems else 'WRONG':8} {said!r}, {ours} runs, {how}")
+
+    try:
+        build(side, f"{name}: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode != 0:
+            raise SystemExit(f"cargo's reference build failed: {built.stderr[-1500:]}")
+        compare("cold", "")
+        took, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"the daemon did not get ready: {states}{tails(home)}")
+        for step, old, new in [("an edit", "    7\n", "    8\n"), ("another edit", "    8\n", "    9\n")]:
+            cargo_ra_jit.rewrite(os.path.join(ws, "src/main.rs"), old, new)
+            out = build(side, f"{name}: {step}", home)
+            _, built = reference.cargo("build", "-q")
+            if built.returncode != 0:
+                raise SystemExit(f"{step}: cargo's reference build failed: {built.stderr[-1500:]}")
+            how = how_built(out)
+            if daemon and how != "daemon":
+                wrong.append((f"{name}: {step}", f"built by {how}, not the daemon"))
+            compare(step, how)
+        # Plain cargo in the directory `cargo ra-jit` built in, once `ra-jit enable` was run:
+        # cargo's units of the package are the ones `cargo ra-jit`'s cargo built, since the
+        # workspace wrapper is part of their hash, and the script ran for both edits. Cargo finds
+        # it run, as cargo alone does in its own directory. (A cargo without the wrapper has units
+        # of its own, which it builds and runs the script for the first time in.)
+        plain_env = cargo_ra_jit.enabled_home(root, env)
+        plain = subprocess.run(["cargo", "build", "-v"], cwd=ws, env=plain_env, capture_output=True, text=True, timeout=7200)
+        _, built = reference.cargo("build", "-v")
+        if plain.returncode != 0 or built.returncode != 0:
+            raise SystemExit(f"a plain cargo build failed: {plain.stderr[-1500:]}{built.stderr[-1500:]}")
+        if ran_a_script(plain.stderr) != ran_a_script(built.stderr):
+            wrong.append((f"{name}: a plain cargo build", f"ran a build script: {ran_a_script(plain.stderr)}, under cargo alone {ran_a_script(built.stderr)}"))
+        compare("a plain cargo build", "a script ran" if ran_a_script(plain.stderr) else "no script ran")
+    finally:
+        side.cargo("stop")
+    if not wrong:
+        shutil.rmtree(root, ignore_errors=True)
+    else:
+        print(f"under {root}{tails(home)}")
+    return wrong
+
+
 def main():
     selftest()
     if sys.argv[1:] == ["--selftest"]:
@@ -225,12 +355,16 @@ def main():
             print(f"{step:36} {'ok' if not problems else 'WRONG':8} {how}")
     finally:
         side.cargo("stop")
+    if wrong:
+        print(f"under {root}{tails(home)}")
+    else:
+        shutil.rmtree(root, ignore_errors=True)
+    for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True)]:
+        wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     for why in wrong:
         print(f"  {why}")
     if wrong:
-        print(f"under {root}{tails(home)}")
         sys.exit(1)
-    shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

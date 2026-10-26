@@ -78,6 +78,8 @@ struct Script {
     /// What the run the daemon loaded printed and wrote, which a run after it is compared
     /// with: `None` when it could not be read.
     loaded: Option<crate::cargo::script::Run>,
+    /// The package's targets, which what cargo takes of what the script prints depends on.
+    targets: Vec<blaze_build_script::unit::Target>,
 }
 
 impl Script {
@@ -88,18 +90,17 @@ impl Script {
     /// Whether the script, run again as cargo ran it, prints and writes what it did for the
     /// load: what cargo would find when it ran it, without asking cargo. Not when the script
     /// itself is older than its source, or was compiled reading a variable cargo does not
-    /// set; cargo compiles it again.
-    fn reruns_the_same(&self) -> bool {
+    /// set; cargo compiles it again. `env` is a variable as the cargo that builds next has it.
+    fn reruns_the_same(&self, env: &dyn Fn(&str) -> Option<String>) -> bool {
         use crate::cargo::script;
         let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return false };
         if !script::compiled_from_what_is_there(&out_dir, &self.workspace) {
             return false;
         }
         // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
-        // it asked for this build, is the one cargo has: it is not made twice.
-        let newest = self.files.iter().map(|it| newest(&it.path, it.package));
-        let newest = newest.collect::<Option<Vec<_>>>().and_then(|it| it.into_iter().max());
-        let run = script::current(&out_dir, |at| newest.is_some_and(|it| it < at));
+        // it asked for this build, is the one cargo has, by cargo's records: it is not made
+        // twice.
+        let run = script::current(&out_dir, &script::Cargo { env, targets: &self.targets });
         run.and_then(|it| it.named(&out_dir, &self.out_dir))
             .and_then(|it| it.same_as(loaded))
             .is_ok()
@@ -246,6 +247,7 @@ impl Scripts {
                 workspace: workspace.to_owned(),
                 files,
                 loaded: crate::cargo::script::Run::of(out_dir).ok(),
+                targets: cargo[package].targets.iter().map(|&it| target(&cargo[it])).collect(),
             });
         }
         variables.sort();
@@ -269,7 +271,11 @@ impl Scripts {
         }
         // Cargo would run only the scripts whose files changed: each is run again here as
         // cargo ran it, which costs the script and not a cargo that resolves the workspace.
-        if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same()) {
+        let cargo_has = |name: &str| match env {
+            Some(env) => env.get(name),
+            None => run_with(&self.config, name),
+        };
+        if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same(&cargo_has)) {
             changed.into_iter().for_each(|at| self.scripts[at].stamp_again());
             return Ok(false);
         }
@@ -294,6 +300,25 @@ impl Scripts {
         }
         self.config = config;
         Ok(false)
+    }
+}
+
+/// `target` as `cargo metadata` lists it, which is what [`blaze_build_script`] reads.
+fn target(target: &project_model::TargetData) -> blaze_build_script::unit::Target {
+    let kind = match target.kind {
+        TargetKind::Bin => "bin",
+        TargetKind::Lib { is_proc_macro: true } => "proc-macro",
+        TargetKind::Lib { is_proc_macro: false } => "lib",
+        TargetKind::Example => "example",
+        TargetKind::Test => "test",
+        TargetKind::Bench => "bench",
+        TargetKind::BuildScript => "custom-build",
+        TargetKind::Other => "other",
+    };
+    blaze_build_script::unit::Target {
+        name: target.name.clone(),
+        kind: vec![kind.to_owned()],
+        crate_types: Vec::new(),
     }
 }
 
@@ -352,24 +377,6 @@ fn stamp(path: &Path, package: bool) -> u64 {
     let mut hasher = FxHasher::default();
     stamp_into(path, package, &mut hasher);
     hasher.finish()
-}
-
-/// When the file at `path`, or the directory there or anything below it that [`stamp`] looks
-/// at, was last written. Nothing when it is not there.
-fn newest(path: &Path, package: bool) -> Option<std::time::SystemTime> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let mut newest = metadata.modified().ok()?;
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path).ok()? {
-            let entry = entry.ok()?.path();
-            let built = entry.join("CACHEDIR.TAG").exists() || entry.ends_with(".git");
-            if package && (built || entry.join("Cargo.toml").exists()) {
-                continue;
-            }
-            newest = newest.max(self::newest(&entry, package)?);
-        }
-    }
-    Some(newest)
 }
 
 fn stamp_into(path: &Path, package: bool, hasher: &mut FxHasher) {

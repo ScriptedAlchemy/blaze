@@ -1,8 +1,9 @@
 //! Build scripts of the workspace. Cargo runs one again when what it said it reads has
 //! changed, or when anything in its package has if it said nothing, and then compiles the
 //! package again whatever the script printed. The daemon runs the script the same way, in the
-//! same directory, and looks at what it printed and wrote: when that is what the build had, the
-//! crates compiled with it are still right, and the build stays the daemon's.
+//! same directory, records the run as cargo records its own, and looks at what it printed and
+//! wrote: when that is what the build had, the crates compiled with it are still right, and the
+//! build stays the daemon's.
 //!
 //! To run a script as cargo does, the wrapper puts a few lines of shell where rustc linked
 //! it. Cargo runs those, and they run `ra-jit build-script`, which writes down the
@@ -13,22 +14,19 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, SystemTime},
 };
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use super::records;
+
 /// The variable that names the script itself to `ra-jit build-script`.
 const REAL: &str = "RA_JIT_BUILD_SCRIPT";
 
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "ra-jit-ran.json";
-
-/// The file next to a script's `OUT_DIR` in which [`current`] keeps what the script printed
-/// when it last ran it there, with the time the run began as the time it was written.
-const CHECKED: &str = "ra-jit-checked";
 
 /// How cargo ran a build script.
 #[derive(Serialize, Deserialize)]
@@ -595,14 +593,12 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    /// The last run of the script that wrote `out_dir`: what cargo, or ra-jit when it ran the
-    /// script later ([`current`]), kept of what it printed, and what the directory has now.
+    /// The last run of the script that wrote `out_dir`: what cargo kept of what it printed (a run
+    /// ra-jit made there is recorded as cargo's, [`current`]), and what the directory has now.
     pub(crate) fn of(out_dir: &Path) -> Result<Run, String> {
-        let (cargos, ours) = kept_runs(out_dir);
-        let (_, printed) =
-            cargos.into_iter().chain(ours).max_by_key(|it| it.0).ok_or_else(|| {
-                format!("{}: no record of what the script printed", out_dir.display())
-            })?;
+        let printed = printed(out_dir).and_then(|it| std::fs::read(it).ok()).ok_or_else(|| {
+            format!("{}: no record of what the script printed", out_dir.display())
+        })?;
         Run::left(&printed, out_dir)
     }
 
@@ -636,134 +632,161 @@ impl Run {
     }
 }
 
-/// What cargo and ra-jit kept of the runs of the script that wrote `out_dir`, each with when it
-/// began: cargo's last ([`printed`], which cargo stamps with the time it started the script),
-/// and ra-jit's last ([`CHECKED`], stamped the same way).
-type Printed = Option<(SystemTime, Vec<u8>)>;
-
-fn kept_runs(out_dir: &Path) -> (Printed, Printed) {
-    let kept = |path: PathBuf| {
-        let began = std::fs::metadata(&path).and_then(|it| it.modified()).ok()?;
-        Some((began, std::fs::read(&path).ok()?))
-    };
-    let ours = out_dir.parent().map(|it| it.join(CHECKED)).and_then(kept);
-    (printed(out_dir).and_then(kept), ours)
+/// What the cargo that builds next has that a run of a build script is reckoned from, besides
+/// its directories.
+pub(crate) struct Cargo<'a> {
+    /// A variable as that cargo has it: from the `[env]` of its configuration, or else its
+    /// environment. Cargo's record of a run keeps the value of each variable the script said it
+    /// reads, and runs the script again when one is another.
+    pub(crate) env: &'a dyn Fn(&str) -> Option<String>,
+    /// The targets of the script's package, as `cargo metadata` lists them: cargo takes a
+    /// `rustc-link-arg-bins` line and its like only from the script of a package that has one.
+    pub(crate) targets: &'a [blaze_build_script::unit::Target],
 }
 
-/// The run of the script that wrote `out_dir` that cargo's next build has, by whether nothing
-/// the script reads was written after a time (`unchanged_since`): the last run, cargo's or
-/// ra-jit's, when nothing changed after it began, which cargo would not make again, and else a
+/// The run of the script that wrote `out_dir` that cargo's next build has, by cargo's own records
+/// of its last run ([`records`]): that run, when cargo would not run the script again, and else a
 /// run made now.
 ///
-/// A run made now is cargo's next. It is made in `out_dir` itself, which the script finds as the
-/// last run left it, with the environment and directory cargo ran it with, and under cargo's lock
-/// on the build directory, which cargo holds while it runs build scripts and has rustc read what
-/// they wrote. No copy of the directory is run in: a script can read more of a directory than a
-/// copy keeps (the times, links, hard links, extended attributes and inodes of what is in it), and
-/// one that finds a copy other than cargo's directory does other than it would there
-/// (docs/reports/BUILDSCRIPT.md, "Round 3"). What cargo keeps of a run is not written, so its next
-/// build runs the script again, as it does after a build that stopped once the script had run;
-/// what this run printed is kept in [`CHECKED`].
+/// A run made now is cargo's next, and is recorded as cargo's: it is made in `out_dir` itself, with
+/// the environment and directory cargo ran the script with, under cargo's locks on the build
+/// directory, and cargo's hash of the run is emptied before it and written after it with what the
+/// run printed, as cargo does (`build_work`, `write_fingerprint`). Cargo's next build finds the
+/// script run, as after a run of its own, and does not run it again, whether that build is the one
+/// a difference sends to cargo or one after the daemon's: the script runs once for a change, as
+/// under cargo. No copy of the directory is run in: a script can read more of a directory than a
+/// copy keeps, and one that finds a copy does other than it would in cargo's
+/// (docs/reports/BUILDSCRIPT.md, "Round 3" and "Round 4").
 ///
-/// While a cargo holds the lock, only a run of cargo's that its own rule says it would not make
-/// again is read: cargo may be running the script, or compiling what it wrote. Else it is `Err`,
-/// and the build is cargo's.
-pub(crate) fn current(
-    out_dir: &Path,
-    mut unchanged_since: impl FnMut(SystemTime) -> bool,
-) -> Result<Run, String> {
+/// It is `Err`, the build cargo's, and nothing is run: when cargo's records are not ones cargo
+/// 1.99 wrote, or of a run that did not end; when they do not hold what cargo would reckon now (a
+/// variable the script reads has another value, and cargo runs it again with that one); when the
+/// script says nothing of what it reads, and cargo reckons from every file of its package; when a
+/// cargo holds the lock and would run the script, which it may be doing; and when there is no
+/// lock to take. A run that fails, or that printed what cargo does not take, is `Err` too, and
+/// cargo, which finds its records of a run that did not end, runs the script again.
+pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> {
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
-    let lock = cargo_lock(out_dir);
-    let (cargos, ours) = kept_runs(out_dir);
-    let busy = "was not run again: a cargo is building in its directory";
-    if matches!(lock, Lock::Busy) && !cargos.as_ref().is_some_and(|it| unchanged_since(it.0)) {
-        return Err(busy.to_owned());
+    let ran: Ran = std::fs::read(run_dir.join(RAN))
+        .map_err(|it| format!("{RAN}: {it}"))
+        .and_then(|it| serde_json::from_slice(&it).map_err(|it| it.to_string()))?;
+    let var = |name: &str| ran.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
+    // The directory as cargo names it, which its records have.
+    let cargos = var("OUT_DIR")
+        .map(Path::new)
+        .filter(|it| *it == out_dir || same_file::is_same_file(it, out_dir).unwrap_or(false));
+    let out_dir = cargos.ok_or("ran in another directory than cargo's")?;
+    let package = var("CARGO_MANIFEST_DIR").map(Path::new).ok_or("ran without a package")?;
+    let unit = records::Unit::of(out_dir)?;
+    // Before cargo's records are read: a cargo that ran the script meanwhile has written them
+    // by the time it lets go.
+    let lock = unit.lock();
+    let recorded = unit.recorded()?;
+    let output = unit.output();
+    let printed = std::fs::read(&output).map_err(|it| format!("{}: {it}", output.display()))?;
+    let said = |printed: &[u8], generated: &Path| {
+        said_to_cargo(printed, generated, out_dir, &ran, cargo)
+            .map_err(|it| format!("printed what cargo does not take: {it}"))
+    };
+    // Cargo reads the last run with the paths it printed in the directory it ran in.
+    let generated = std::fs::read(unit.output().with_file_name("root-output")).ok();
+    let generated = generated.and_then(|it| String::from_utf8(it).ok()).map(PathBuf::from);
+    let last = said(&printed, generated.as_deref().unwrap_or(out_dir))?;
+    let nothing = "says nothing of what it reads, and cargo reckons from every file of its package";
+    if last.rerun_if_changed.is_empty() && last.rerun_if_env_changed.is_empty() {
+        return Err(nothing.to_owned());
     }
-    if let Some((began, printed)) = cargos.into_iter().chain(ours).max_by_key(|it| it.0)
-        && unchanged_since(began)
-    {
+    let named = unit.output_named(&recorded)?;
+    let reckoned = |said: &blaze_build_script::Output| {
+        let (files, variables) = (&said.rerun_if_changed, &said.rerun_if_env_changed);
+        records::local(files, variables, &named, package, cargo.env)
+    };
+    let now = reckoned(&last).ok_or(nothing)?;
+    if now != recorded.local {
+        return Err(changed(&now, &recorded.local));
+    }
+    let compiled = ran.real.to_str().and_then(|it| it.strip_suffix(".real")).map(PathBuf::from);
+    let compiled = compiled.unwrap_or_else(|| ran.real.clone());
+    let home = (cargo.env)("CARGO_HOME")
+        .map(|it| ran.cwd.join(it))
+        .or_else(|| (cargo.env)("HOME").map(|it| Path::new(&it).join(".cargo")));
+    if unit.stale(&now, package, &compiled, home).is_none() {
         return Run::left(&printed, out_dir);
     }
-    if matches!(lock, Lock::Busy) {
-        return Err(busy.to_owned());
-    }
-    let read = |name: &str| std::fs::read(run_dir.join(name)).map_err(|it| format!("{name}: {it}"));
-    let ran: Ran = serde_json::from_slice(&read(RAN)?).map_err(|it| it.to_string())?;
-    if !out_dir.is_dir() {
-        return Err(format!("{}: not there", out_dir.display()));
-    }
-    // A run that is under way, or failed, is not one the directory was left by.
-    let checked = run_dir.join(CHECKED);
-    match std::fs::remove_file(&checked) {
-        Err(it) if it.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("{CHECKED}: {it}"));
+    let _held = match lock {
+        records::Lock::Held(held) => held,
+        records::Lock::Busy => {
+            return Err("was not run again: a cargo is building in its directory".to_owned());
         }
-        _ => {}
-    }
-    // A file written as the script reads it can have a time a little before now: the kernel
-    // stamps files with a clock that lags by up to a tick.
-    let began = SystemTime::now() - 2 * file_clock_tick();
+        records::Lock::Absent => {
+            return Err("was not run again: its directory has no lock of cargo's".to_owned());
+        }
+    };
+    let began = unit.begin()?;
     let mut script = Command::new(&ran.real);
     script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
-    script.env("OUT_DIR", out_dir).current_dir(&ran.cwd).stdin(Stdio::null());
+    script.current_dir(&ran.cwd).stdin(Stdio::null());
     let again = script.output().map_err(|it| it.to_string())?;
     if !again.status.success() {
         return Err(format!("failed ({})", again.status));
     }
-    let kept = std::fs::File::create(&checked).and_then(|mut it| {
-        it.write_all(&again.stdout)?;
-        it.set_modified(began)
-    });
-    kept.map_err(|it| format!("{CHECKED}: {it}"))?;
+    // Cargo reads each line as the script prints it, and a run that logged an error is a failed
+    // one, of which it writes nothing.
+    if String::from_utf8_lossy(&again.stdout).lines().any(|it| it.starts_with("cargo::error=")) {
+        return Err("logged an error".to_owned());
+    }
+    unit.ran(began, &again.stdout, &again.stderr)?;
+    let said = said(&again.stdout, out_dir)?;
+    // A run that says nothing of what it reads leaves what cargo reckoned before it.
+    unit.record(&recorded.with_local(reckoned(&said).unwrap_or(now)))?;
     Run::left(&again.stdout, out_dir)
 }
 
-/// Cargo's lock on the build directory a script's `OUT_DIR` is in, which cargo holds while it
-/// builds there.
-enum Lock {
-    Held {
-        _file: std::fs::File,
-    },
-    /// The directory has no lock to take: cargo keeps none on NFS.
-    Absent,
-    Busy,
-}
-
-/// Takes the lock on the build directory `out_dir` is in, when no cargo has it (as
-/// [`super::state::State::hold`] does, but without waiting: a cargo that waits for what asked for
-/// this would wait for ever).
-fn cargo_lock(out_dir: &Path) -> Lock {
-    // `debug/build/<unit>/out` in cargo's first layout, `debug/build/<package>/<hash>/out` in
-    // its second.
-    let lock = out_dir.ancestors().skip(1).take(4).map(|it| it.join(".cargo-lock"));
-    let Some(lock) = lock.into_iter().find(|it| it.is_file()) else { return Lock::Absent };
-    match std::fs::File::open(lock) {
-        Ok(file) if file.try_lock().is_ok() => Lock::Held { _file: file },
-        _ => Lock::Busy,
+/// Why cargo's record of a run, `recorded`, is not what cargo reckons of it now, `now`.
+fn changed(now: &[records::Local], recorded: &[records::Local]) -> String {
+    use records::Local::RerunIfEnvChanged as Var;
+    let var = now.iter().zip(recorded).find_map(|it| match it {
+        (Var { var, val }, Var { var: was, val: then }) if var == was && val != then => Some(var),
+        _ => None,
+    });
+    match var {
+        Some(var) => format!("reads the variable {var}, which changed: cargo runs it again"),
+        None => {
+            "has a record of cargo's that is not of what it printed: cargo runs it again".to_owned()
+        }
     }
 }
 
-/// How far behind the clock the kernel stamps a file it writes can be: Linux takes the time
-/// of the last tick.
-#[cfg(target_os = "linux")]
-fn file_clock_tick() -> Duration {
-    let mut tick = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `tick` is a timespec to write to.
-    match unsafe { libc::clock_getres(libc::CLOCK_REALTIME_COARSE, &mut tick) } {
-        0 => Duration::new(tick.tv_sec as u64, tick.tv_nsec as u32).max(Duration::from_millis(1)),
-        _ => Duration::from_millis(20),
-    }
-}
-
-/// Windows stamps files with the system time, which moves in steps of about 16 ms.
-#[cfg(windows)]
-fn file_clock_tick() -> Duration {
-    Duration::from_millis(16)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn file_clock_tick() -> Duration {
-    Duration::from_millis(1)
+/// What a script printed, `printed`, as cargo reads it (`BuildOutput::parse`), for a package with
+/// `ran`'s variables and `cargo`'s targets. `Err` is what cargo fails the build with.
+fn said_to_cargo(
+    printed: &[u8],
+    generated: &Path,
+    out_dir: &Path,
+    ran: &Ran,
+    cargo: &Cargo<'_>,
+) -> Result<blaze_build_script::Output, blaze_build_script::Error> {
+    let var = |name: &str| ran.env.iter().find(|it| it.0 == name).map(|it| it.1.clone());
+    let package = blaze_build_script::unit::Package {
+        name: var("CARGO_PKG_NAME").unwrap_or_default(),
+        version: var("CARGO_PKG_VERSION").unwrap_or_default(),
+        manifest_dir: var("CARGO_MANIFEST_DIR").map(PathBuf::from).unwrap_or_default(),
+        rust_version: var("CARGO_PKG_RUST_VERSION").filter(|it| !it.is_empty()),
+        targets: cargo.targets.to_vec(),
+        ..Default::default()
+    };
+    // A stable cargo allows nightly features when it is told it is another (`features::channel`).
+    let channel = (cargo.env)("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS").or_else(|| {
+        ((cargo.env)("RUSTC_BOOTSTRAP").as_deref() == Some("1")).then(|| "dev".to_owned())
+    });
+    let context = blaze_build_script::output::Context {
+        package: &package,
+        out_dir_when_generated: generated,
+        out_dir,
+        nightly_features_allowed: matches!(channel.as_deref(), Some("nightly" | "dev")),
+        rustc_bootstrap: (cargo.env)("RUSTC_BOOTSTRAP"),
+    };
+    blaze_build_script::parse(printed, &context)
 }
 
 /// The lines of what a script printed that cargo reads, as its `BuildOutput::parse` reads them:
@@ -873,6 +896,8 @@ fn digest_of(dir: &Path) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
 
     /// A run directory as cargo and `ra-jit build-script` leave one, for a script that
@@ -883,34 +908,88 @@ mod tests {
         ran_script(name, lines, wrote)
     }
 
-    /// A run directory as [`ran`] leaves one, for the script `lines`.
+    /// The variables of the cargo that builds next, for a test: the test's.
+    fn cargo_env(name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    /// What the cargo that builds next has, for a test: its variables, and a package with no
+    /// targets.
+    const CARGO: Cargo<'static> = Cargo { env: &cargo_env, targets: &[] };
+
+    /// The lines of shell a test's script is run through: the script, then what it reads.
+    const WATCHES: &str =
+        "#!/bin/sh\n\"$0.inner\" \"$@\" || exit $?\necho cargo:rerun-if-changed=watched\n";
+
+    /// A run of the script `lines`, which is given `wrote` as `WROTE`, as cargo and `ra-jit
+    /// build-script` leave one: in cargo's build directory, `target/debug/build/<name>-0123`,
+    /// which is the package's directory too and the one the script ran in, with cargo's records
+    /// of a run that printed where it ran and that it reads `watched` beside it, made after
+    /// `watched` was last written. The script is run through [`WATCHES`].
     fn ran_script(name: &str, lines: &str, wrote: &str) -> PathBuf {
-        let run_dir =
+        let root =
             std::env::temp_dir().join(format!("ra-jit-script-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&run_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("target/debug");
+        let run_dir = dest.join(format!("build/{name}-0123"));
         let out_dir = run_dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
+        for lock in [".cargo-build-lock", ".cargo-lock"] {
+            std::fs::write(dest.join(lock), "").unwrap();
+        }
         let real = run_dir.join("script");
         // A process a test thread starts while this one has the script open to write holds it
         // open too until that process execs, and the script is refused meanwhile ("text file
         // busy"): another process writes it.
-        let written = Command::new("sh")
-            .args(["-c", "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\""])
-            .arg(&real)
-            .arg(lines)
-            .status()
-            .unwrap();
-        assert!(written.success());
+        for (path, lines) in [(run_dir.join("script.inner"), lines), (real.clone(), WATCHES)] {
+            let written = Command::new("sh")
+                .args(["-c", "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\""])
+                .arg(&path)
+                .arg(lines)
+                .status()
+                .unwrap();
+            assert!(written.success());
+        }
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
         let env = vec![
-            ("OUT_DIR".to_owned(), out_dir.to_str().unwrap().to_owned()),
+            ("OUT_DIR".to_owned(), text(&out_dir)),
+            ("CARGO_MANIFEST_DIR".to_owned(), text(&run_dir)),
             ("WROTE".to_owned(), wrote.to_owned()),
             ("PATH".to_owned(), std::env::var("PATH").unwrap()),
         ];
         let ran = Ran { real, cwd: run_dir.clone(), env };
         std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
-        std::fs::write(run_dir.join("output"), format!("cargo:in={}\n", out_dir.display()))
-            .unwrap();
+        std::fs::write(run_dir.join("watched"), "").unwrap();
+        let printed = format!("cargo:in={}\ncargo:rerun-if-changed=watched\n", out_dir.display());
+        recorded(&out_dir, printed.as_bytes());
         out_dir
+    }
+
+    /// Has cargo's records be of a run of `out_dir`'s script that printed `printed`, made an
+    /// hour ago and after `watched` was last written.
+    fn recorded(out_dir: &Path, printed: &[u8]) {
+        let run_dir = out_dir.parent().unwrap();
+        std::fs::write(run_dir.join("output"), printed).unwrap();
+        std::fs::write(run_dir.join("root-output"), out_dir.as_os_str().as_encoded_bytes())
+            .unwrap();
+        records::tests::recorded_as_cargo_would(out_dir, run_dir, printed);
+        made_at(out_dir, 3600, 7200);
+    }
+
+    /// Has cargo's last run of `out_dir`'s script be `run` seconds ago, and `watched`, which it
+    /// says it reads, be written `watched` seconds ago, and the script compiled before both.
+    fn made_at(out_dir: &Path, run: u64, watched: u64) {
+        let run_dir = out_dir.parent().unwrap();
+        let ago = |seconds| SystemTime::now() - Duration::from_secs(seconds);
+        set_written(&run_dir.join("output"), ago(run));
+        set_written(&run_dir.join("watched"), ago(watched));
+        set_written(&ran_of(out_dir).real, ago(run.max(watched) + 1));
+    }
+
+    /// Has what the script of `out_dir` reads be written after cargo's last run of it, which
+    /// cargo then runs again.
+    fn changed(out_dir: &Path) {
+        made_at(out_dir, 3600, 1800);
     }
 
     /// What the daemon finds of the script of `out_dir` once something it reads has changed: a
@@ -918,29 +997,76 @@ mod tests {
     /// which is what the directory and the record beside it have before it.
     fn rerun_is_same(out_dir: &Path) -> Result<(), String> {
         let built = Run::of(out_dir)?;
-        current(out_dir, |_| false)?.same_as(&built)
+        changed(out_dir);
+        current(out_dir, &CARGO)?.same_as(&built)
+    }
+
+    /// The hash of cargo's fingerprint of the run of `out_dir`'s script.
+    fn hash_of(out_dir: &Path) -> PathBuf {
+        let run_dir = out_dir.parent().unwrap();
+        let dest = run_dir.parent().unwrap().parent().unwrap();
+        let dir = dest.join(".fingerprint").join(run_dir.file_name().unwrap());
+        dir.join("run-build-script-build-script-build")
+    }
+
+    /// Whether cargo would run the script of `out_dir` again, by its records, read as cargo
+    /// reads them.
+    fn cargo_would_run(out_dir: &Path) -> bool {
+        let unit = records::Unit::of(out_dir).unwrap();
+        let Ok(recorded) = unit.recorded() else { return true };
+        let run_dir = out_dir.parent().unwrap();
+        let output = std::fs::read(unit.output()).unwrap();
+        let said = said_to_cargo(&output, out_dir, out_dir, &ran_of(out_dir), &CARGO).unwrap();
+        let named = unit.output_named(&recorded).unwrap();
+        let local = records::local(
+            &said.rerun_if_changed,
+            &said.rerun_if_env_changed,
+            &named,
+            run_dir,
+            &cargo_env,
+        );
+        local.as_ref() != Some(&recorded.local)
+            || unit.stale(&recorded.local, run_dir, Path::new("/nowhere"), None).is_some()
+    }
+
+    fn ran_of(out_dir: &Path) -> Ran {
+        serde_json::from_slice(&std::fs::read(out_dir.parent().unwrap().join(RAN)).unwrap())
+            .unwrap()
     }
 
     #[test]
-    fn a_rerun_leaves_what_cargo_keeps_of_its_run_alone() {
+    fn a_run_is_recorded_as_cargo_records_its_own() {
         let out_dir = ran("same", "fn made() {}");
         let run_dir = out_dir.parent().unwrap();
         std::fs::write(out_dir.join("made.rs"), "fn made() {}").unwrap();
-        let output = run_dir.join("output");
-        let kept = std::fs::read(&output).unwrap();
-        let written = std::fs::metadata(&output).unwrap().modified().unwrap();
-        // Taken before the check, which a machine that is busy can take more than a second over.
-        let before = SystemTime::now() - Duration::from_secs(1);
+        assert!(!cargo_would_run(&out_dir));
+        changed(&out_dir);
+        assert!(cargo_would_run(&out_dir));
+        let fingerprint = std::fs::read(hash_of(&out_dir)).unwrap();
         assert_eq!(rerun_is_same(&out_dir), Ok(()));
-        // What cargo kept of its run is as it was, so its next build runs the script again.
-        assert_eq!(std::fs::read(&output).unwrap(), kept);
-        assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), written);
-        let left: Vec<_> = std::fs::read_dir(run_dir).unwrap().flatten().collect();
-        assert_eq!(left.len(), 5, "{left:?}");
-        // What this run printed is kept, as of when it began.
-        let checked = run_dir.join(CHECKED);
-        assert_eq!(std::fs::read(&checked).unwrap(), kept);
-        assert!(std::fs::metadata(&checked).unwrap().modified().unwrap() > before);
+        // Cargo's records are of this run: what it printed, as of when it began, which
+        // `invoked.timestamp` says; its stderr and directory; and a fingerprint that says it read
+        // what the run said it read, which cargo finds current.
+        let output = std::fs::read(run_dir.join("output")).unwrap();
+        assert_eq!(
+            directives(&output),
+            [
+                format!("cargo:in={}", out_dir.display()),
+                "cargo:rerun-if-changed=watched".to_owned()
+            ]
+        );
+        let written =
+            |name: &str| std::fs::metadata(run_dir.join(name)).unwrap().modified().unwrap();
+        assert_eq!(written("output"), written("invoked.timestamp"));
+        assert!(written("output") > SystemTime::now() - Duration::from_secs(60));
+        assert_eq!(std::fs::read(run_dir.join("stderr")).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(run_dir.join("root-output")).unwrap(),
+            out_dir.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), fingerprint, "it read the same");
+        assert!(!cargo_would_run(&out_dir));
+        assert!(!run_dir.join("ra-jit-checked").exists());
     }
 
     /// A script that says beside its directory each time it runs.
@@ -956,33 +1082,53 @@ mod tests {
     #[test]
     fn the_last_run_since_what_the_script_reads_changed_is_not_made_again() {
         let out_dir = ran_script("current", COUNTS, "");
-        let output = out_dir.parent().unwrap().join("output");
-        set_written(&output, SystemTime::now() - Duration::from_secs(3600));
         let built = Run::of(&out_dir).unwrap();
         // Cargo's run is after the last change: cargo would not run it again, and it is the one.
-        assert_eq!(current(&out_dir, |_| true), Ok(built.clone()));
+        assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
         assert_eq!(runs(&out_dir), 0);
-        // A change after cargo's run: a run now, which is the one until the next change.
-        let changed = SystemTime::now() - Duration::from_secs(1800);
-        assert_eq!(current(&out_dir, |at| at > changed), Ok(built.clone()));
+        // A change after cargo's run: a run now, which is cargo's, and the one until the next
+        // change.
+        changed(&out_dir);
+        assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
         assert_eq!(runs(&out_dir), 1);
-        assert_eq!(current(&out_dir, |at| at > changed), Ok(built.clone()));
+        assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
         assert_eq!(runs(&out_dir), 1);
-        assert_eq!(current(&out_dir, |_| false), Ok(built));
+        assert!(!cargo_would_run(&out_dir));
+        changed(&out_dir);
+        assert_eq!(current(&out_dir, &CARGO), Ok(built));
         assert_eq!(runs(&out_dir), 2);
     }
 
+    /// The verifier's case of round 3: a script that counts its runs in what it generates. It
+    /// runs once for one change, as under cargo, and cargo's next build finds it run.
     #[test]
-    fn a_run_while_a_cargo_builds_in_the_directory_is_cargos() {
-        let out_dir = ran_script("busy", COUNTS, "");
-        let lock = out_dir.parent().unwrap().join(".cargo-lock");
-        std::fs::write(&lock, "").unwrap();
-        // A cargo, which is another process: a lock this one held would be held as well by a
-        // process another test starts meanwhile, until it runs what it was started for.
+    fn a_script_that_counts_its_runs_runs_once_for_a_change() {
+        let lines = "#!/bin/sh\ncount=$(cat \"$OUT_DIR/count\" 2>/dev/null || echo 0)\ncount=$((count + 1))\necho $count > \"$OUT_DIR/count\"\necho \"pub const RUNS: u32 = $count;\" > \"$OUT_DIR/generated.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
+        let out_dir = ran_script("counter", lines, "");
+        let count = || std::fs::read_to_string(out_dir.join("count")).unwrap();
+        std::fs::write(out_dir.join("count"), "1\n").unwrap();
+        let built = Run::of(&out_dir).unwrap();
+        for edit in 2..4 {
+            changed(&out_dir);
+            let check = current(&out_dir, &CARGO).and_then(|it| it.same_as(&built));
+            assert_eq!(check, Err("wrote something else".to_owned()));
+            assert_eq!(count(), format!("{edit}\n"));
+            // Cargo, which builds what the run wrote, finds it run, and so does the next check.
+            assert!(!cargo_would_run(&out_dir));
+            let again = current(&out_dir, &CARGO).and_then(|it| it.same_as(&built));
+            assert_eq!(again, Err("wrote something else".to_owned()));
+            assert_eq!(count(), format!("{edit}\n"));
+        }
+    }
+
+    /// Has another process hold `lock` exclusively until the returned one is done with, as a
+    /// cargo holds its lock on a build directory. A lock this process held would be held as
+    /// well by a process another test starts meanwhile, until it runs what it was started for.
+    fn held(lock: &Path) -> std::process::Child {
         let holds = "open(my $f, '<', shift) or die; flock($f, LOCK_EX) or die; $| = 1; print qq(held\n); <STDIN>;";
         let mut cargo = Command::new("perl")
             .args(["-MFcntl=:flock", "-e", holds])
-            .arg(&lock)
+            .arg(lock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -994,16 +1140,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(held, "held\n");
+        cargo
+    }
+
+    #[test]
+    fn a_run_while_a_cargo_builds_in_the_directory_is_cargos() {
+        let out_dir = ran_script("busy", COUNTS, "");
+        let dest = out_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        let mut cargo = held(&dest.join(".cargo-build-lock"));
         // Cargo's own run is after the last change, so cargo does not run the script again in
         // this build, and its run is read.
-        assert_eq!(current(&out_dir, |_| true), Run::of(&out_dir));
+        assert_eq!(current(&out_dir, &CARGO), Run::of(&out_dir));
         // It is not, and cargo may be running the script now.
-        let result = current(&out_dir, |_| false);
+        changed(&out_dir);
+        let result = current(&out_dir, &CARGO);
         assert!(result.as_ref().is_err_and(|it| it.contains("a cargo is building")), "{result:?}");
         assert_eq!(runs(&out_dir), 0, "the script did not run");
         drop(cargo.stdin.take());
         assert!(cargo.wait().unwrap().success());
-        assert_eq!(current(&out_dir, |_| false), Run::of(&out_dir));
+        assert_eq!(current(&out_dir, &CARGO), Run::of(&out_dir));
+        assert_eq!(runs(&out_dir), 1);
+        // An older cargo, which holds `.cargo-lock` alone, is building too.
+        let mut cargo = held(&dest.join(".cargo-lock"));
+        changed(&out_dir);
+        let result = current(&out_dir, &CARGO);
+        assert!(result.as_ref().is_err_and(|it| it.contains("a cargo is building")), "{result:?}");
+        drop(cargo.stdin.take());
+        assert!(cargo.wait().unwrap().success());
+        assert_eq!(runs(&out_dir), 1);
+    }
+
+    /// The verifier's case of round 3: with `build.build-dir`, cargo 1.99 holds
+    /// `.cargo-build-lock` in the build directory while it runs a script there, and its
+    /// `.cargo-lock` is in the other directory, the one of what it builds.
+    #[test]
+    fn a_run_while_a_cargo_builds_in_a_build_directory_set_apart_is_cargos() {
+        let out_dir = ran_script("build-dir", COUNTS, "");
+        let dest = out_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        std::fs::remove_file(dest.join(".cargo-lock")).unwrap();
+        let mut cargo = held(&dest.join(".cargo-build-lock"));
+        changed(&out_dir);
+        let result = current(&out_dir, &CARGO);
+        assert!(result.as_ref().is_err_and(|it| it.contains("a cargo is building")), "{result:?}");
+        assert_eq!(runs(&out_dir), 0, "the script did not run");
+        drop(cargo.stdin.take());
+        assert!(cargo.wait().unwrap().success());
+        assert_eq!(current(&out_dir, &CARGO), Run::of(&out_dir));
+        assert_eq!(runs(&out_dir), 1);
+        // Where cargo keeps no lock, nothing keeps a cargo out, and nothing is run.
+        std::fs::remove_file(dest.join(".cargo-build-lock")).unwrap();
+        changed(&out_dir);
+        let result = current(&out_dir, &CARGO);
+        assert!(result.as_ref().is_err_and(|it| it.contains("no lock")), "{result:?}");
         assert_eq!(runs(&out_dir), 1);
     }
 
@@ -1013,7 +1201,12 @@ mod tests {
         let made = out_dir.join("made.rs");
         std::fs::write(&made, "fn made_before() {}").unwrap();
         let built = Run::of(&out_dir).unwrap();
-        let check = |unchanged| current(&out_dir, |_| unchanged).and_then(|it| it.same_as(&built));
+        let check = |unchanged: bool| {
+            if !unchanged {
+                changed(&out_dir);
+            }
+            current(&out_dir, &CARGO).and_then(|it| it.same_as(&built))
+        };
         assert_eq!(check(false), Err("wrote something else".to_owned()));
         // The directory is as the run left it, as it is after cargo's.
         assert_eq!(std::fs::read_to_string(&made).unwrap(), "fn made() {}");
@@ -1039,7 +1232,8 @@ mod tests {
         let out_dir = ran("matches", "fn made() {}");
         let other = ran("matches-other", "fn made() {}");
         let rerun = |loaded: &Run| {
-            let run = current(&out_dir, |_| false)?.named(&out_dir, &other)?;
+            changed(&out_dir);
+            let run = current(&out_dir, &CARGO)?.named(&out_dir, &other)?;
             run.same_as(loaded)
         };
         std::fs::write(other.join("made.rs"), "fn made() {}").unwrap();
@@ -1192,7 +1386,8 @@ mod tests {
     }
 
     /// cargo's second layout of its build directory keeps what a script printed in
-    /// `run/stdout`, not in `output`.
+    /// `run/stdout`, not in `output`. It is nightly's, and a run there is not made: cargo's
+    /// records of it are not read.
     #[test]
     fn a_run_in_the_second_layout_is_read_from_run_stdout() {
         let out_dir = ran("second", "fn made() {}");
@@ -1201,7 +1396,7 @@ mod tests {
         std::fs::rename(run_dir.join("output"), run_dir.join("run/stdout")).unwrap();
         std::fs::write(out_dir.join("made.rs"), "fn made() {}").unwrap();
         assert_eq!(printed(&out_dir), Some(run_dir.join("run/stdout")));
-        assert_eq!(rerun_is_same(&out_dir), Ok(()));
+        assert!(current(&out_dir, &CARGO).is_err());
         let other = ran("second-other", "fn made() {}");
         std::fs::write(other.join("made.rs"), "fn made() {}").unwrap();
         assert_eq!(Run::of(&out_dir).and_then(|it| it.named(&out_dir, &other)), Run::of(&other));
@@ -1225,14 +1420,13 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     /// Has `out_dir`'s script run as cargo runs it: in its directory, which it fills, and again
     /// in the same directory, which the second run finds as the first left it.
     fn run_as_cargo_does(out_dir: &Path, times: usize) {
-        let run_dir = out_dir.parent().unwrap();
-        let ran: Ran = serde_json::from_slice(&std::fs::read(run_dir.join(RAN)).unwrap()).unwrap();
+        let ran = ran_of(out_dir);
         for _ in 0..times {
             let mut script = Command::new(&ran.real);
             script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
             let printed = script.current_dir(&ran.cwd).output().unwrap();
             assert!(printed.status.success());
-            std::fs::write(run_dir.join("output"), printed.stdout).unwrap();
+            recorded(out_dir, &printed.stdout);
         }
     }
 
@@ -1248,12 +1442,15 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(cold.starts_with("built in "), "{cold}");
         run_as_cargo_does(&out_dir, 1);
         let rerun = std::fs::read_to_string(run_dir.join("output")).unwrap();
-        assert_eq!(rerun, "cargo:rerun-if-changed=input.txt\ncargo:rustc-env=INPUT=one\n");
+        assert_eq!(
+            rerun,
+            "cargo:rerun-if-changed=input.txt\ncargo:rustc-env=INPUT=one\ncargo:rerun-if-changed=watched\n"
+        );
         // A run into a directory with nothing in it would build again and say so; one in
         // cargo's own finds what the last run built, as cargo's does.
         assert_eq!(rerun_is_same(&out_dir), Ok(()));
-        let left: Vec<_> = std::fs::read_dir(run_dir).unwrap().flatten().collect();
-        assert_eq!(left.len(), 6, "{left:?}");
+        let left: Vec<_> = std::fs::read_dir(&out_dir).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(std::fs::read_to_string(out_dir.join("built")).unwrap(), "built\n");
         // What the script prints for cargo is another matter.
         std::fs::write(run_dir.join("input.txt"), "two").unwrap();
@@ -1575,8 +1772,10 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     #[test]
     fn a_line_that_is_not_text_is_not_a_line_cargo_reads_in_either_run() {
         let out_dir = ran_script("utf8", "#!/bin/sh\nprintf 'cargo:rustc-env=KEY=\\377\\n'\n", "");
-        std::fs::write(out_dir.parent().unwrap().join("output"), "cargo:rustc-env=KEY=\u{fffd}\n")
-            .unwrap();
+        recorded(
+            &out_dir,
+            "cargo:rustc-env=KEY=\u{fffd}\ncargo:rerun-if-changed=watched\n".as_bytes(),
+        );
         let result = rerun_is_same(&out_dir);
         assert_eq!(result, Err("printed something else".to_owned()), "cargo has no KEY now");
         // The same of two runs that are compared.
@@ -1595,19 +1794,75 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     }
 
     #[test]
-    fn a_directory_that_is_missing_is_an_error() {
+    fn a_directory_that_is_missing_is_made_as_cargo_makes_it() {
         let out_dir = ran("missing", "");
         let built = Run::of(&out_dir).unwrap();
         std::fs::remove_dir(&out_dir).unwrap();
-        assert!(current(&out_dir, |_| false).and_then(|it| it.same_as(&built)).is_err());
-        assert!(rerun_is_same(&out_dir).is_err());
+        changed(&out_dir);
+        let check = current(&out_dir, &CARGO).and_then(|it| it.same_as(&built));
+        assert_eq!(check, Err("wrote something else".to_owned()));
+        assert_eq!(std::fs::read_to_string(out_dir.join("made.rs")).unwrap(), "");
     }
 
     #[test]
-    fn a_script_that_fails_is_an_error_and_leaves_no_record_of_a_run() {
+    fn a_script_that_fails_is_an_error_and_leaves_a_record_of_a_run_that_did_not_end() {
         let out_dir = ran_script("failed", "#!/bin/sh\nexit 42\n", "");
+        let output = std::fs::read(out_dir.parent().unwrap().join("output")).unwrap();
         assert!(rerun_is_same(&out_dir).is_err());
-        assert!(!out_dir.parent().unwrap().join(CHECKED).exists());
+        // As cargo leaves it: an empty hash, so the next build runs it again, and what the run
+        // before printed.
+        assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
+        assert_eq!(std::fs::read(out_dir.parent().unwrap().join("output")).unwrap(), output);
+        assert!(cargo_would_run(&out_dir));
+        let again = current(&out_dir, &CARGO);
+        assert!(
+            again.as_ref().is_err_and(|it| it.contains("no record of a run that ended")),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_logs_an_error_or_prints_what_cargo_does_not_take_has_no_record_of_a_run() {
+        let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::error=broken\n";
+        let out_dir = ran_script("logs-error", lines, "");
+        let output = std::fs::read(out_dir.parent().unwrap().join("output")).unwrap();
+        assert_eq!(rerun_is_same(&out_dir), Err("logged an error".to_owned()));
+        assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
+        assert_eq!(std::fs::read(out_dir.parent().unwrap().join("output")).unwrap(), output);
+        // A key cargo does not know: cargo writes what it printed, and no fingerprint.
+        let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::unknown-key=1\n";
+        let out_dir = ran_script("not-taken", lines, "");
+        let result = rerun_is_same(&out_dir);
+        assert!(result.as_ref().is_err_and(|it| it.contains("does not take")), "{result:?}");
+        assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
+        let output = std::fs::read_to_string(out_dir.parent().unwrap().join("output")).unwrap();
+        assert!(output.contains("cargo::unknown-key=1"), "{output}");
+    }
+
+    #[test]
+    fn a_variable_the_script_reads_that_changed_is_cargos_to_run_it_for() {
+        let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo:rerun-if-env-changed=RA_JIT_TEST_UNSET_VARIABLE\n";
+        let out_dir = ran_script("variable", lines, "");
+        run_as_cargo_does(&out_dir, 1);
+        assert_eq!(rerun_is_same(&out_dir), Ok(()));
+        // The cargo that builds next has another value than the one cargo's record has.
+        let set = |name: &str| (name == "RA_JIT_TEST_UNSET_VARIABLE").then(|| "1".to_owned());
+        let cargo = Cargo { env: &set, targets: &[] };
+        changed(&out_dir);
+        let result = current(&out_dir, &cargo);
+        assert!(
+            result.as_ref().is_err_and(|it| it.contains("RA_JIT_TEST_UNSET_VARIABLE")),
+            "{result:?}"
+        );
+        assert!(cargo_would_run(&out_dir), "nothing was run, and cargo runs it");
+    }
+
+    #[test]
+    fn a_script_that_says_nothing_of_what_it_reads_is_cargos() {
+        let out_dir = ran_script("says-nothing", "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\n", "");
+        recorded(&out_dir, format!("cargo:in={}\n", out_dir.display()).as_bytes());
+        let result = rerun_is_same(&out_dir);
+        assert!(result.as_ref().is_err_and(|it| it.contains("says nothing")), "{result:?}");
     }
 
     #[test]
@@ -1664,7 +1919,8 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             let began = Instant::now();
             let built = Run::of(&out_dir).unwrap();
             let checking = Instant::now();
-            current(&out_dir, |_| false).unwrap().same_as(&built).unwrap();
+            changed(&out_dir);
+            current(&out_dir, &CARGO).unwrap().same_as(&built).unwrap();
             let done = Instant::now();
             times[0].push((checking - began).as_secs_f64() * 1000.0);
             times[1].push((done - checking).as_secs_f64() * 1000.0);
