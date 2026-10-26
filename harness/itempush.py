@@ -70,6 +70,8 @@ pub fn named() -> &'static str {
     std::any::type_name_of_val(&named)
 }
 """
+# A trait's impl, which a call through `dyn` takes too, moved to another file and back.
+AREA = "impl crate::Area for crate::shapes::Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n"
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
     "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -77,7 +79,7 @@ FILES = {
     "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
     "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n" + MOVED,
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
-    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
+    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\n" + AREA,
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
     "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n    println!("{} {}", lib::here(), lib::named());\n}\n',
 }
@@ -135,6 +137,8 @@ STEPS = [
         (SHAPES_RS, None, lambda t: t + MOVED.replace("    5\n", "    6\n")),
         TO_SHAPES,
     ]),
+    ("a trait's impl moved to another file", [(SHAPES_RS, AREA, ""), (E_RS, None, lambda t: t + AREA)]),
+    ("it moved back", [(E_RS, AREA, ""), (SHAPES_RS, None, lambda t: t + AREA)]),
 ]
 # Steps whose moved functions keep their code from before the edit, which items find.
 RELOCATES = {"functions moved to another file"}

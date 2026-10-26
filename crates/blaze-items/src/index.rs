@@ -616,6 +616,17 @@ impl Index {
                 added.len()
             );
         }
+        // An impl of a trait written as it was elsewhere selects what it did: what called its
+        // items calls those where they are now, and its trait's items are asked about.
+        let of_moves: FxHashSet<ItemId> = moved.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        let kind = |id: ItemId, kind: Result<(), &'static str>| match kind {
+            Err("an impl of a trait" | "an item of an impl of a trait")
+                if of_moves.contains(&id) =>
+            {
+                Ok(())
+            }
+            other => other,
+        };
         self.moved = moved;
         let mut entries = entries.into_iter();
         for (file, now) in declared {
@@ -624,7 +635,7 @@ impl Index {
             let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
             for &id in was.iter().filter(|it| !now_set.contains(it)) {
                 let gone = &self.entries[&id];
-                gone.kind.map_err(|why| refused(db, id, why, "gone"))?;
+                kind(id, gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
                 methods.extend(gone.method.clone());
                 counterparts.extend(gone.counterpart.map(|it| (id, it)));
                 changed.insert(id);
@@ -648,7 +659,7 @@ impl Index {
                         changed.insert(id);
                     }
                     None => {
-                        entry.kind.map_err(|why| refused(db, id, why, "added"))?;
+                        kind(id, entry.kind).map_err(|why| refused(db, id, why, "added"))?;
                         methods.extend(entry.method.clone());
                         changed.insert(id);
                     }
