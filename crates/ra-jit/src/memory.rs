@@ -314,10 +314,9 @@ fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bytes the process may hold while it builds, from `RA_JIT_WORKER_MEMORY`: a size, or `off` for
-/// no bound. Without it, what a daemon lets its workers hold together (`RA_JIT_MEMORY_MAX`, half of
-/// the machine's memory when that does not say): one worker alone is never let hold more than all
-/// of them may.
+/// Soft footprint target from `RA_JIT_WORKER_MEMORY`: a size, or `off`. The default is
+/// `RA_JIT_MEMORY_MAX`, or half the machine memory when neither is set. Exceeding this
+/// target reduces concurrency; it never fails a build.
 pub(crate) fn build_budget() -> Result<Option<u64>, String> {
     match std::env::var("RA_JIT_WORKER_MEMORY") {
         Ok(text) if text == "off" => Ok(None),
@@ -328,18 +327,119 @@ pub(crate) fn build_budget() -> Result<Option<u64>, String> {
     }
 }
 
-/// Holds every build of the process to [`build_budget`]: fewer threads compile as it nears it,
-/// and a build that passes it is stopped (`hir_ty_codegen::budget`).
+/// Starts the independent OS-pressure monitor even with the soft budget disabled.
 pub(crate) fn bound_builds() -> anyhow::Result<()> {
-    let Some(most) = build_budget().map_err(anyhow::Error::msg)? else { return Ok(()) };
-    let held = || held_by(std::process::id());
-    hir_ty_codegen::budget::set_budget(hir_ty_codegen::budget::Budget { most, held, give_back });
+    let most = build_budget().map_err(anyhow::Error::msg)?;
+    // Validate configuration before starting the monitor.
+    let _ = pressure_reserve()?;
+    let grace = pressure_grace()?;
+    let budget = most.map(|most| hir_ty_codegen::budget::Budget {
+        most,
+        held: || held_by(std::process::id()),
+        give_back,
+    });
+    hir_ty_codegen::budget::monitor(budget, host_pressure, give_back, grace);
     Ok(())
+}
+
+pub(crate) fn pressure_grace() -> anyhow::Result<std::time::Duration> {
+    let seconds = match std::env::var("RA_JIT_PRESSURE_GRACE_SECS") {
+        Ok(text) => text.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("RA_JIT_PRESSURE_GRACE_SECS must be a number of seconds")
+        })?,
+        Err(_) => 60,
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn pressure_reserve() -> anyhow::Result<u64> {
+    match std::env::var("RA_JIT_MEMORY_RESERVE") {
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .ok_or_else(|| anyhow::anyhow!("RA_JIT_MEMORY_RESERVE must be a size")),
+        Err(_) => Ok((of_the_machine().unwrap_or(0) / 20).max(2 << 30)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let mut level: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    // SAFETY: the sysctl writes an integer into an integer-sized buffer.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 {
+        return None;
+    }
+    match level {
+        1 => Some(Pressure::Normal),
+        2 => Some(Pressure::Warning),
+        4 => Some(Pressure::Critical),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    linux_pressure(
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
+        &std::fs::read_to_string("/proc/pressure/memory").ok()?,
+        pressure_reserve().ok()?,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    None
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_pressure(
+    meminfo: &str,
+    psi: &str,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let available = kilobytes(meminfo, "MemAvailable:")?;
+    let avg = |name: &str| -> Option<f64> {
+        let row = psi.lines().find(|line| line.starts_with(name))?;
+        let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
+        value.parse::<f64>().ok().filter(|it| it.is_finite() && *it >= 0.0)
+    };
+    let (some, full) = (avg("some ")?, avg("full ")?);
+    Some(if available <= reserve || full >= 10.0 {
+        Pressure::Critical
+    } else if available <= reserve.saturating_mul(2) || some >= 10.0 {
+        Pressure::Warning
+    } else {
+        Pressure::Normal
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_pressure_uses_available_reserve_and_both_psi_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let psi = |some, full| {
+            format!("some avg10={some} avg60=0 total=0\nfull avg10={full} avg60=0 total=0\n")
+        };
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 0), 1 << 20), Some(Normal));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", &psi(0, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", &psi(0, 0), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(10, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 10), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", "unreadable", 1 << 20), None);
+    }
 
     #[test]
     fn a_line_of_proc_is_read_as_bytes() {

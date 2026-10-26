@@ -319,6 +319,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let idle = Condvar::new();
             self.everywhere(threads, &|db, symbols, _| ctx.work(&round, &idle, db, symbols));
             let mut round = round.into_inner().unwrap_or_else(|e| e.into_inner());
+            if round.stopped {
+                self.shed = Some("host memory pressure remained critical without compile progress after pausing new work".into());
+                return;
+            }
             if stats && round.functions != 0 {
                 eprintln!(
                     "units: {} functions found in {} waves and compiled in {} units of {} \
@@ -411,6 +415,7 @@ struct Round {
     waves: usize,
     units: usize,
     size: usize,
+    stopped: bool,
 }
 
 impl Round {
@@ -431,6 +436,7 @@ impl Round {
             waves: 0,
             units: 0,
             size: 0,
+            stopped: false,
         }
     }
 
@@ -553,14 +559,35 @@ impl Context<'_> {
         let lock = || round.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = lock();
         loop {
+            drop(state);
+            let failed = super::budget::admit().is_err();
+            state = lock();
+            if failed {
+                state.stopped = true;
+                idle.notify_all();
+            }
+            if state.stopped {
+                return;
+            }
             if state.taken < state.wave.len() {
                 let at = state.taken;
                 let kind = state.wave[at].clone();
                 (state.taken, state.building) = (at + 1, state.building + 1);
                 drop(state);
+                let permit = match super::budget::enter() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let mut state = lock();
+                        state.stopped = true;
+                        idle.notify_all();
+                        return;
+                    }
+                };
                 let built = self.built(db, symbols, &names, &mut homes, &kind);
+                drop(permit);
                 state = lock();
                 (state.built[at], state.building) = (Some(built), state.building - 1);
+                idle.notify_all();
                 if state.taken == state.wave.len() && state.building == 0 {
                     state.found(symbols);
                     idle.notify_all();
@@ -569,9 +596,20 @@ impl Context<'_> {
             }
             if let Some(Queued { place, job, .. }) = state.jobs.pop() {
                 drop(state);
+                let permit = match super::budget::enter() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let mut state = lock();
+                        state.stopped = true;
+                        idle.notify_all();
+                        return;
+                    }
+                };
                 let (outcomes, found) = self.compiled(db, symbols, &names, &mut homes, job);
+                drop(permit);
                 state = lock();
                 state.done.push((place, outcomes, found));
+                idle.notify_all();
                 continue;
             }
             // Every function is found and every job taken.

@@ -1,234 +1,445 @@
-//! The memory a build may hold while every core compiles ahead of the object.
+//! Soft process budgets and admission under host memory pressure.
 //!
-//! Inside one revision of the database nothing a build computed can be let go of: every memo
-//! stays until the next revision, and the build holds references into them until the object is
-//! made. So what a build holds grows with every function it compiles (23 KB of live heap for each
-//! in a cold build of tracedecay, docs/reports/LOADMEM.md), and the only bound that holds is one
-//! that stops the build. Before it does, [`Governor`] gives back to the system the pages the
-//! allocator keeps free, and lets fewer threads compile as the build nears the bound: less is in
-//! flight and the bound comes later, though no less surely, as each function compiled still adds
-//! what it adds. At the bound it sheds the build: the threads stop, and the build fails with
-//! [`super::CodegenError::OverBudget`] rather than the machine running out of memory. Nothing is
-//! handed to rustc or to cargo instead.
-//!
-//! The process sets the bound once with [`set_budget`], with how to read what it holds and how to
-//! give back what is freed: those are ra-jit's (`memory.rs`), which this crate does not see.
-
+//! One monitor samples independently of compile jobs. Budgets reduce concurrency and purge
+//! freed pages; only persistent critical host pressure can fail admission. In-flight jobs
+//! finish: this is not a bound on the allocation of a single function.
 use std::{
     sync::{
-        LazyLock, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
+        Condvar, LazyLock, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering::Relaxed},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-/// The most a process may hold while it builds, and how it tells.
 #[derive(Clone, Copy)]
 pub struct Budget {
-    /// Bytes.
     pub most: u64,
-    /// The bytes the process holds now, as its bound counts them.
     pub held: fn() -> Option<u64>,
-    /// Gives the system back the pages of what was freed.
     pub give_back: fn(),
 }
 
-static BUDGET: OnceLock<Budget> = OnceLock::new();
-
-/// Bounds every build of the process from now on. Only the first call counts.
-pub fn set_budget(budget: Budget) {
-    _ = BUDGET.set(budget);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pressure {
+    Normal,
+    Warning,
+    Critical,
 }
 
-/// The bound [`set_budget`] set, if any.
-pub(super) fn budget() -> Option<Budget> {
-    BUDGET.get().copied()
+struct Monitor {
+    budget: Option<Budget>,
+    pressure: fn() -> Option<Pressure>,
+    grace: Duration,
+    threads: usize,
+    state: Mutex<State>,
+    changed: Condvar,
 }
 
-/// How often the threads look at what the process holds.
-const LOOK_EVERY: Duration = Duration::from_millis(100);
-
-/// How often the allocator is asked to give back what it keeps: a purge walks every arena.
-const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
-
-/// The share of the bound past which fewer threads compile: one part in this many is left.
-const MARGIN: u64 = 4;
-
-/// Whether what the threads are let do is told in the log: with `RA_JIT_MEMORY`, as the other
-/// lines about memory are.
+/// A fake clock and signal exercise the same transitions as the monitor thread.
+struct State {
+    pressure: Pressure,
+    held: Option<u64>,
+    stalled: Duration,
+    progress: usize,
+    failed: bool,
+    told_pressure: bool,
+    told_held: bool,
+    paused: bool,
+    active: usize,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            pressure: Pressure::Normal,
+            held: None,
+            stalled: Duration::ZERO,
+            progress: 0,
+            failed: false,
+            told_pressure: false,
+            told_held: false,
+            paused: false,
+            active: 0,
+        }
+    }
+}
+impl State {
+    fn sample(
+        &mut self,
+        pressure: Option<Pressure>,
+        held: Option<u64>,
+        now: Duration,
+        progress: usize,
+        grace: Duration,
+        has_budget: bool,
+    ) {
+        if pressure.is_none() && !self.told_pressure {
+            eprintln!("host memory pressure unavailable: continuing with no pressure known");
+            self.told_pressure = true;
+        }
+        if has_budget && held.is_none() && !self.told_held {
+            eprintln!("build footprint unavailable: continuing without soft budget adaptation");
+            self.told_held = true;
+        }
+        let pressure = pressure.unwrap_or(Pressure::Normal);
+        if pressure != self.pressure {
+            eprintln!(
+                "host memory pressure: {pressure:?}{}",
+                if pressure == Pressure::Critical {
+                    "; pausing new compile work"
+                } else {
+                    "; compile admission resumed"
+                }
+            );
+        }
+        if pressure != Pressure::Critical
+            || self.pressure != Pressure::Critical
+            || progress != self.progress
+        {
+            self.stalled = now;
+        }
+        self.failed = pressure == Pressure::Critical && now.saturating_sub(self.stalled) >= grace;
+        if pressure != Pressure::Critical {
+            self.paused = false;
+        }
+        self.pressure = pressure;
+        self.progress = progress;
+        self.held = held;
+    }
+}
+static MONITOR: OnceLock<Monitor> = OnceLock::new();
 static TOLD: LazyLock<bool> = LazyLock::new(|| std::env::var_os("RA_JIT_MEMORY").is_some());
 
-/// How many of `threads` may compile while the process holds `held` of `most` bytes: all of
-/// them up to three quarters of the bound, then fewer in proportion to what is left of it, and
-/// always one, which the thread that puts the functions in the object waits for.
+/// Starts at most one monitor per process, including when the soft budget is disabled.
+pub fn monitor(
+    budget: Option<Budget>,
+    pressure: fn() -> Option<Pressure>,
+    give_back: fn(),
+    grace: Duration,
+) {
+    if MONITOR
+        .set(Monitor {
+            budget,
+            pressure,
+            grace,
+            threads: std::thread::available_parallelism().map_or(1, |it| it.get()),
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        })
+        .is_err()
+    {
+        return;
+    }
+    let run = move || {
+        let monitor = MONITOR.get().unwrap();
+        let start = Instant::now();
+        let mut purged = None;
+        loop {
+            let now = start.elapsed();
+            let pressure = (monitor.pressure)();
+            let held = monitor.budget.and_then(|it| (it.held)());
+            let warn = pressure.is_some_and(|it| it != Pressure::Normal);
+            if let Some(budget) = monitor.budget {
+                if (warn || held.is_some_and(|it| it > budget.most - budget.most / 4))
+                    && purged.is_none_or(|at| now.saturating_sub(at) >= Duration::from_secs(1))
+                {
+                    (budget.give_back)();
+                    purged = Some(now);
+                    if *TOLD {
+                        eprintln!("build budget: purged freed pages");
+                    }
+                }
+            } else if warn
+                && purged.is_none_or(|at| now.saturating_sub(at) >= Duration::from_secs(1))
+            {
+                give_back();
+                purged = Some(now);
+            }
+            let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.sample(
+                pressure,
+                held,
+                now,
+                super::compiled_functions(),
+                monitor.grace,
+                monitor.budget.is_some(),
+            );
+            monitor.changed.notify_all();
+            drop(state);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    if let Err(why) = std::thread::Builder::new().name("memory-pressure".into()).spawn(run) {
+        eprintln!("host memory pressure monitor could not start: {why}");
+    }
+}
+
+pub(super) fn budget() -> Option<Budget> {
+    MONITOR.get().and_then(|it| it.budget)
+}
+
+/// A transient failure is returned outside salsa queries so recovery can retry the build.
+pub(super) fn admit() -> super::Result<()> {
+    let Some(monitor) = MONITOR.get() else { return Ok(()) };
+    monitor.admit()
+}
+
+impl Monitor {
+    fn admit(&self) -> super::Result<()> {
+        self.wait(false)
+    }
+
+    fn limit(&self, state: &State) -> usize {
+        if state.pressure != Pressure::Normal {
+            return 1;
+        }
+        match (self.budget, state.held) {
+            (Some(budget), Some(held)) => allowed(held, budget.most, self.threads),
+            _ => self.threads,
+        }
+    }
+
+    fn wait(&self, acquire: bool) -> super::Result<()> {
+        let entered = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.pressure == Pressure::Critical
+            || (acquire && state.active >= self.limit(&state))
+        {
+            if state.pressure == Pressure::Critical && !state.paused {
+                eprintln!(
+                    "host memory pressure: compile admission paused; {} functions completed",
+                    state.progress
+                );
+                state.paused = true;
+            }
+            if state.pressure == Pressure::Critical
+                && state.failed
+                && entered.elapsed() >= self.grace
+            {
+                return Err(super::CodegenError::OverBudget(format!(
+                    "host memory pressure remained critical for {} seconds without compile progress after pausing new work",
+                    self.grace.as_secs()
+                )));
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if acquire {
+            state.active += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Counts top-level jobs only: recursive salsa computations do not acquire another slot.
+pub(super) struct Permit(Option<&'static Monitor>);
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if let Some(monitor) = self.0 {
+            let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active -= 1;
+            monitor.changed.notify_all();
+        }
+    }
+}
+pub(super) fn enter() -> super::Result<Permit> {
+    let monitor = MONITOR.get();
+    if let Some(monitor) = monitor {
+        monitor.wait(true)?;
+    }
+    Ok(Permit(monitor))
+}
+
 pub(super) fn allowed(held: u64, most: u64, threads: usize) -> usize {
-    let soft = most - most / MARGIN;
+    let threads = threads.max(1);
+    let soft = most - most / 4;
     if held <= soft {
         return threads;
     }
-    let left = most.saturating_sub(held) as u128;
-    let share = (threads as u128 * left / (most - soft).max(1) as u128) as usize;
-    share.clamp(1, threads)
+    ((threads as u128 * most.saturating_sub(held) as u128 / (most - soft).max(1) as u128) as usize)
+        .clamp(1, threads)
 }
 
-/// What the threads of one build that compile ahead look at before each function.
 pub(super) struct Governor {
     budget: Option<Budget>,
     threads: usize,
-    allowed: AtomicUsize,
-    start: std::time::Instant,
-    /// Milliseconds since `start` of the next look, and of the last purge.
-    next_look: AtomicU64,
-    gave_back: AtomicU64,
-    /// Set once the process held more than the bound after a purge: the build is shed.
     shed: AtomicBool,
-    /// What it held then.
-    held: AtomicU64,
 }
-
 impl Governor {
     pub(super) fn new(budget: Option<Budget>, threads: usize) -> Self {
-        Governor {
-            budget,
-            threads,
-            allowed: AtomicUsize::new(threads),
-            start: std::time::Instant::now(),
-            next_look: AtomicU64::new(0),
-            gave_back: AtomicU64::new(0),
-            shed: AtomicBool::new(false),
-            held: AtomicU64::new(0),
+        Self { budget, threads, shed: AtomicBool::new(false) }
+    }
+    pub(super) fn allowed(&self) -> usize {
+        let Some(monitor) = MONITOR.get() else { return self.threads.max(1) };
+        let state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pressure != Pressure::Normal {
+            return 1;
+        }
+        match (self.budget, state.held) {
+            (Some(budget), Some(held)) => allowed(held, budget.most, self.threads),
+            _ => self.threads.max(1),
         }
     }
-
-    /// How many threads may compile at once now.
-    pub(super) fn allowed(&self) -> usize {
-        self.allowed.load(Relaxed)
-    }
-
-    /// Whether the build is shed.
     pub(super) fn shed(&self) -> bool {
         self.shed.load(Relaxed)
     }
-
-    /// Why it was shed, for the error.
     pub(super) fn why(&self) -> String {
-        let most = self.budget.map_or(0, |it| it.most);
-        format!(
-            "the build held {} MB, more than the {} MB the process may (RA_JIT_WORKER_MEMORY, \
-             else RA_JIT_MEMORY_MAX): it was stopped before it held more",
-            self.held.load(Relaxed) >> 20,
-            most >> 20,
-        )
+        "host memory pressure remained critical without compile progress after pausing new work"
+            .into()
     }
-
-    /// Looks at what the process holds, when it is time to: one thread at a time, every
-    /// [`LOOK_EVERY`]. Returns whether that shed the build.
     pub(super) fn look(&self) -> bool {
-        let Some(budget) = self.budget else { return false };
-        let now = self.start.elapsed().as_millis() as u64;
-        let next = self.next_look.load(Relaxed);
-        if now < next
-            || self
-                .next_look
-                .compare_exchange(next, now + LOOK_EVERY.as_millis() as u64, Relaxed, Relaxed)
-                .is_err()
-        {
-            return false;
-        }
-        let Some(mut held) = (budget.held)() else { return false };
-        let soft = budget.most - budget.most / MARGIN;
-        let last = self.gave_back.load(Relaxed);
-        if held > soft && (last == 0 || now >= last + GIVE_BACK_EVERY.as_millis() as u64) {
-            self.gave_back.store(now.max(1), Relaxed);
-            (budget.give_back)();
-            let before = held;
-            held = (budget.held)().unwrap_or(held);
-            if *TOLD {
-                eprintln!("build budget: gave back {} MB to {} MB", before >> 20, held >> 20);
-            }
-        }
-        let allowed = allowed(held, budget.most, self.threads);
-        if self.allowed.swap(allowed, Relaxed) != allowed && *TOLD {
-            eprintln!(
-                "build budget: {allowed} of {} threads compile, the process holds {} of {} MB",
-                self.threads,
-                held >> 20,
-                budget.most >> 20,
-            );
-        }
-        if held > budget.most && !self.shed.swap(true, Relaxed) {
-            self.held.store(held, Relaxed);
+        if self.shed() {
             return true;
         }
-        false
+        if admit().is_err() {
+            self.shed.store(true, Relaxed);
+        }
+        self.shed()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     const GB: u64 = 1 << 30;
-
     #[test]
-    fn all_threads_up_to_three_quarters() {
-        assert_eq!(allowed(0, 16 * GB, 18), 18);
-        assert_eq!(allowed(12 * GB, 16 * GB, 18), 18);
-    }
-
-    #[test]
-    fn fewer_threads_nearer_the_bound_and_never_none() {
+    fn soft_budget_always_allows_progress_even_on_one_core() {
+        for threads in [1, 18] {
+            assert_eq!(allowed(12 * GB, 16 * GB, threads), threads);
+            assert_eq!(allowed(40 * GB, 16 * GB, threads), 1);
+        }
         assert_eq!(allowed(14 * GB, 16 * GB, 18), 9);
-        assert_eq!(allowed(15 * GB, 16 * GB, 18), 4);
-        assert_eq!(allowed(16 * GB, 16 * GB, 18), 1);
-        assert_eq!(allowed(40 * GB, 16 * GB, 18), 1);
-        assert_eq!(allowed(15 * GB, 16 * GB, 1), 1);
     }
-
-    static HELD: AtomicU64 = AtomicU64::new(0);
-    static PURGED: AtomicUsize = AtomicUsize::new(0);
-
-    fn held() -> Option<u64> {
-        Some(HELD.load(Relaxed))
-    }
-
-    fn give_back() {
-        PURGED.fetch_add(1, Relaxed);
-        // What the allocator kept goes back: a gigabyte.
-        HELD.fetch_sub(GB, Relaxed);
-    }
-
     #[test]
-    fn purges_then_narrows_then_sheds() {
-        let budget = Budget { most: 16 * GB, held, give_back };
-        let governor = Governor::new(Some(budget), 18);
-        let look = || {
-            // Every look is due: the clock is not what is tested.
-            governor.next_look.store(0, Relaxed);
-            governor.gave_back.store(0, Relaxed);
-            governor.look()
+    fn warning_critical_progress_failure_and_recovery() {
+        let mut state = State::default();
+        let mut tick = |pressure, seconds, progress| {
+            state.sample(
+                Some(pressure),
+                Some(100 * GB),
+                Duration::from_secs(seconds),
+                progress,
+                Duration::from_secs(60),
+                true,
+            );
+            (state.pressure, state.failed)
         };
-        HELD.store(8 * GB, Relaxed);
-        assert!(!look());
-        assert_eq!((governor.allowed(), PURGED.load(Relaxed)), (18, 0));
-        // Over three quarters, a purge brings it to 14 GB: half the threads.
-        HELD.store(15 * GB, Relaxed);
-        assert!(!look());
-        assert_eq!((governor.allowed(), PURGED.load(Relaxed)), (9, 1));
-        // Over the bound after a purge: shed, once.
-        HELD.store(18 * GB, Relaxed);
-        assert!(look());
-        assert!(governor.shed());
-        assert_eq!(governor.allowed(), 1);
-        assert!(!look());
-        assert!(governor.why().contains("17408 MB, more than the 16384 MB"), "{}", governor.why());
+        assert_eq!(tick(Pressure::Warning, 0, 0), (Pressure::Warning, false));
+        assert_eq!(tick(Pressure::Critical, 1, 0), (Pressure::Critical, false));
+        assert_eq!(tick(Pressure::Critical, 59, 1), (Pressure::Critical, false));
+        assert_eq!(tick(Pressure::Critical, 118, 1), (Pressure::Critical, false));
+        assert_eq!(tick(Pressure::Critical, 119, 1), (Pressure::Critical, true));
+        assert_eq!(tick(Pressure::Normal, 120, 1), (Pressure::Normal, false));
+    }
+    #[test]
+    fn unavailable_signals_are_observable_once_and_unknown() {
+        let mut state = State::default();
+        for _ in 0..2 {
+            state.sample(None, None, Duration::ZERO, 0, Duration::from_secs(60), true);
+            assert!(state.told_pressure && state.told_held);
+            assert_eq!(state.pressure, Pressure::Normal);
+            assert!(!state.failed);
+        }
+    }
+    #[test]
+    fn foreground_one_core_waits_for_independent_signal_and_recovers() {
+        use std::sync::{Arc, mpsc};
+        let monitor = Arc::new(Monitor {
+            budget: None,
+            pressure: || Some(Pressure::Critical),
+            grace: Duration::from_secs(60),
+            threads: 1,
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        });
+        monitor.state.lock().unwrap().sample(
+            Some(Pressure::Critical),
+            None,
+            Duration::ZERO,
+            0,
+            monitor.grace,
+            false,
+        );
+        let (sent, received) = mpsc::channel();
+        let worker = monitor.clone();
+        // Exactly one foreground compiler, with no parallel callbacks to drive sampling.
+        let thread = std::thread::spawn(move || {
+            sent.send(worker.admit()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        monitor.state.lock().unwrap().sample(
+            Some(Pressure::Normal),
+            None,
+            Duration::from_secs(1),
+            0,
+            monitor.grace,
+            false,
+        );
+        monitor.changed.notify_all();
+        assert!(received.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        thread.join().unwrap();
     }
 
     #[test]
-    fn without_a_budget_nothing_is_looked_at() {
-        let governor = Governor::new(None, 4);
+    fn persistent_critical_fails_admission_but_recovery_retries() {
+        let monitor = Monitor {
+            budget: None,
+            pressure: || None,
+            grace: Duration::ZERO,
+            threads: 1,
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        };
+        let sample = |pressure| {
+            monitor.state.lock().unwrap().sample(
+                Some(pressure),
+                None,
+                Duration::ZERO,
+                0,
+                Duration::ZERO,
+                false,
+            )
+        };
+        sample(Pressure::Critical);
+        assert!(monitor.admit().unwrap_err().to_string().contains("host memory pressure"));
+        sample(Pressure::Normal);
+        assert!(monitor.admit().is_ok());
+    }
+
+    #[test]
+    fn soft_limit_blocks_extra_jobs_and_recovers_without_failure() {
+        use std::sync::{Arc, mpsc};
+        let monitor = Arc::new(Monitor {
+            budget: Some(Budget { most: 16 * GB, held: || Some(32 * GB), give_back: || () }),
+            pressure: || Some(Pressure::Normal),
+            grace: Duration::from_secs(60),
+            threads: 18,
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        });
+        monitor.state.lock().unwrap().held = Some(32 * GB);
+        monitor.wait(true).unwrap(); // One job can always progress above the soft target.
+        let worker = monitor.clone();
+        let (sent, received) = mpsc::channel();
+        let thread = std::thread::spawn(move || sent.send(worker.wait(true)).unwrap());
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        {
+            let mut state = monitor.state.lock().unwrap();
+            assert!(!state.failed);
+            state.held = Some(8 * GB);
+        }
+        monitor.changed.notify_all();
+        assert!(received.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        thread.join().unwrap();
+        assert_eq!(monitor.state.lock().unwrap().active, 2);
+    }
+
+    #[test]
+    fn one_core_governor_has_an_admission_gate_without_parallel_callbacks() {
+        let governor = Governor::new(None, 1);
         assert!(!governor.look());
-        assert_eq!(governor.allowed(), 4);
+        assert_eq!(governor.allowed(), 1);
         assert!(!governor.shed());
     }
 }

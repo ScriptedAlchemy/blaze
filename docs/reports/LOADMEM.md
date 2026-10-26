@@ -368,7 +368,46 @@ In the order that removes the most for the least. None is made here, and none is
 - **The time the unbounded build takes in full.** u1's completed cold run took 1,094 s and the spare
   worker was 59.6 GB at its end (**reported**).
 
-## 8. After: the build held to a budget
+## 8. After: soft budgets and host pressure
+
+### Current policy (u7-soft)
+
+**Read in the implementation; validation below.** `RA_JIT_WORKER_MEMORY` is a soft target,
+by default `RA_JIT_MEMORY_MAX`; `off` disables footprint adaptation, not host-pressure
+monitoring. Passing three quarters of the target purges freed pages at most once a second
+and reduces compile concurrency, never below one. Exceeding the target never fails a build.
+The held-frame, small-body inlinable and post-resolution give-back changes remain.
+
+One process-wide thread samples every 100 ms independently of compile jobs. macOS reads
+`kern.memorystatus_vm_pressure_level` (normal, warning, critical). Linux reads memory PSI
+`some` and `full` avg10 plus `MemAvailable`: warning means some >=10% or available <= twice
+reserve; critical means full >=10% or available <= reserve. The default reserve is the
+larger of 2 GiB and 5% of available machine/container memory; `RA_JIT_MEMORY_RESERVE` changes
+it. Unreadable signals and footprint are each logged once, and treated as unknown.
+
+Warning purges and reduces concurrency. Critical pressure pauses admission of new compile
+jobs, including foreground work on one CPU and LLVM unit jobs. Already-running jobs finish.
+Admission resumes when pressure recovers. A build fails only after it has paused for
+`RA_JIT_PRESSURE_GRACE_SECS` (default 60), with critical pressure and no completed compile
+progress for that grace period. Pressure errors are returned outside salsa queries, so they
+do not become cached query failures. State changes and failure name host memory pressure.
+The sampler interval is not an allocation ceiling: one in-flight function can allocate
+arbitrarily much before it finishes.
+
+The daemon keeps its active worker above the soft aggregate target. Only critical host
+pressure persisting for the grace permits stopping an oversized idle worker. A busy worker
+owns its pause and failure so daemon eviction cannot bypass its compile-progress grace. Pressure
+stops retain tombstones by worker configuration, checkout and build generation plus budget;
+identical requests cannot restart the same load. A changed source, build configuration,
+generation or budget retries; restarting the daemon explicitly retries as well. Idle LRU
+cache eviction at the aggregate target remains.
+
+### Historical hard-budget experiment
+
+The measurements below describe the earlier u7-bound implementation, **not the current
+soft policy**. In particular A1/A2 stopping at 16 GiB and the claimed 100 ms ceiling are
+superseded: the old sampler ran only between jobs and had no time bound. No speed or
+peak-memory guarantee for the current policy is inferred from these historical runs.
 
 2026-10-26, unit u7-bound, on `dist/main` at `f9b5da46` with the changes of its pull request
 (`dist/u7-bound`). The same Mac, the same tracedecay commit with the `recursion_limit` line (a
@@ -379,7 +418,7 @@ unit held the heavy lock from 01:23 to 03:36, another session ran 54 `yes` proce
 from 01:55 to about 02:45, and the load average was 16 to 38 during the runs here. Byte counts do
 not depend on that; rates and durations do, and are named with it.
 
-### What was decided
+### What the earlier experiment decided
 
 The brief offered three routes and the code decided between them (**read**, in the code):
 
@@ -402,7 +441,7 @@ The brief offered three routes and the code decided between them (**read**, in t
    (`inlinable`'s values and edges were 1,304 MB at the cap). No `lru` was added: an `lru` on a query
    with cycle handling needs the salsa patch of `docs/upstream/daemon-memory/`, which is not applied
    ([memory.md](../research/memory.md), section 4, item 8).
-3. **A ceiling that holds: slow down, then stop.** `hir_ty_codegen::budget`, set once a process by
+3. **The earlier hard budget: slow down, then stop (superseded).** `hir_ty_codegen::budget`, set once a process by
    `memory::bound_builds` to `RA_JIT_WORKER_MEMORY`, by default what `RA_JIT_MEMORY_MAX` lets all
    the workers hold. Every 100 ms one thread of `compile_ahead`, and of the eager compile of the roots
    before it, reads the footprint. Past three quarters of the bound it purges jemalloc's free pages
@@ -440,11 +479,11 @@ linear between 5 s ticks):
   the pages resolution freed are given back before the build (12,969 MB after resolve before,
   10,183 to 10,273 after), and the allocator's gap over the live bytes stays smaller (1,980 MB at
   208k against 3,495). (**read**; which part of the footprint saving is which is **unverified**.)
-- **The bound holds, and is all that holds.** A2's worker passed three quarters of 16 GiB within
+- **The earlier build stopped at its budget in this run.** A2's worker passed three quarters of 16 GiB within
   5 s of the build's start (12,089 MB at the first tick of it), let fewer threads compile from then
   on (17 of 18 at 12,336 MB, 1 of 18 at 15,934 MB), purged each second, and stopped itself at
   16,387 MB; the client's build then ended as one the daemon could not load (below). The peak is
-  40 MB over the bound: the footprint is looked at every 100 ms (**read**).
+  40 MB over the bound in this run. The old between-job sampler does not establish a maximum overshoot (**read**).
 - **Fewer threads do not change what each function leaves behind.** A2's live heap grew 21.2 and
   17.8 KB a function between ticks at 18 threads, and 27.8 and 23.1 KB a function at 1 to 9 (n=1,
   5 s ticks). Slowing down changes how fast the build reaches the bound, not the bound it reaches:

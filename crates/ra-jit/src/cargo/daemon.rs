@@ -47,8 +47,8 @@ const CHECKERS: usize = 4;
 /// say: one part in this many.
 const MEMORY_SHARE: u64 = 2;
 
-/// The most the workers may hold together, from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
-/// limit. Half of the machine's memory when it does not say, and no limit where the system
+/// Soft aggregate footprint target from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
+/// target. Half of the machine's memory when it does not say, and no limit where the system
 /// does not tell how much that is.
 pub(crate) fn memory_max() -> Result<Option<u64>, String> {
     match std::env::var("RA_JIT_MEMORY_MAX") {
@@ -94,12 +94,10 @@ struct Held {
     busy: bool,
 }
 
-/// The workers to stop for the rest to hold no more than `most`: the ones asked longest ago
-/// first. One that is busy is left, and so is the one asked last, which would only be
-/// started again, unless it alone holds more than `most`: nothing else making way brings it
-/// under, and a worker that builds a whole program grows on until it is done (a cold
-/// tracedecay worker passed 30 GB, docs/reports/LOADMEM.md).
-fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
+/// Idle workers asked longest ago make room at the soft aggregate target. The active
+/// worker keeps its cache even above that target. Persistent host critical pressure is
+/// the only reason to stop it; the caller first allows the admission pause its grace.
+fn over(holding: &[(String, Held)], most: u64, critical: bool) -> Vec<String> {
     let mut all: u64 = holding.iter().map(|it| it.1.bytes).sum();
     let last = holding.iter().map(|it| it.1.asked).max();
     let mut idle: Vec<&(String, Held)> =
@@ -114,7 +112,7 @@ fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
         stopped.push(id.clone());
     }
     for (id, held) in holding {
-        if held.bytes > most && !stopped.contains(id) {
+        if critical && !held.busy && held.bytes > most && !stopped.contains(id) {
             stopped.push(id.clone());
         }
     }
@@ -241,7 +239,7 @@ pub(crate) struct Status {
     pub(crate) pid: u32,
     pub(crate) version: String,
     pub(crate) idle_secs: Option<u64>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     #[serde(default)]
     pub(crate) memory_max: Option<u64>,
     pub(crate) workers: Vec<WorkerStatus>,
@@ -969,9 +967,12 @@ struct Daemon {
     version: String,
     home: PathBuf,
     idle: Option<Duration>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     memory_max: Option<u64>,
     workers: Mutex<FxHashMap<String, Arc<Worker>>>,
+    /// Critical-pressure evictions survive removal of a worker. Source/config/build/budget
+    /// changes retry; an identical request cannot repeatedly reload the same workspace.
+    pressure_stops: Mutex<FxHashMap<(String, String), PressureStop>>,
     /// The worker the next workspace is loaded by, when there is one.
     spare: Mutex<Option<Spare>>,
     spare_when: Spares,
@@ -983,6 +984,17 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+}
+
+struct PressureStop {
+    generation: u128,
+    most: u64,
+    at: SystemTime,
+}
+impl PressureStop {
+    fn blocks(&self, generation: u128, most: u64, source_changed: bool) -> bool {
+        self.generation == generation && self.most == most && !source_changed
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1068,6 +1080,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         idle,
         memory_max,
         workers: Mutex::default(),
+        pressure_stops: Mutex::default(),
         spare: Mutex::default(),
         spare_when,
         ahead: Mutex::default(),
@@ -1264,6 +1277,21 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
+        let key = (id.clone(), checkout.key.clone());
+        let mut stops = lock(&self.pressure_stops);
+        if stops.get(&key).is_some_and(|stop| {
+            stop.blocks(
+                checkout.generation,
+                self.memory_max.unwrap_or(u64::MAX),
+                checkout.written_since(stop.at),
+            )
+        }) {
+            anyhow::bail!(
+                "host memory pressure stopped this load; change the source, build configuration or memory budget, or restart the daemon to retry"
+            );
+        }
+        stops.remove(&key);
+        drop(stops);
         // What a worker could not load once it can't load again, until cargo builds anew or
         // a source is written: the failure may be an error in the source.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
@@ -1332,6 +1360,9 @@ impl Daemon {
     /// Stops the workers asked longest ago while together they hold more than they may, and
     /// those nobody has asked for the idle time; and the daemon when nobody has asked it.
     fn reap(&self) {
+        let mut critical_since = None;
+        let grace = crate::memory::pressure_grace().unwrap_or(Duration::from_secs(60));
+        let mut told_unavailable = false;
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // A worker that ended by itself is in the daemon's log when it ends, not when a
@@ -1350,7 +1381,21 @@ impl Daemon {
             // a worker started again would link it again on the next one.
             let live = crate::live::any_running();
             if let Some(most) = self.memory_max.filter(|_| !live) {
-                self.fit(most);
+                let pressure = crate::memory::host_pressure();
+                if pressure.is_none() && !told_unavailable {
+                    eprintln!(
+                        "daemon host memory pressure unavailable: retaining the active worker"
+                    );
+                    told_unavailable = true;
+                }
+                let critical = pressure == Some(hir_ty_codegen::budget::Pressure::Critical);
+                let persisted = if critical {
+                    critical_since.get_or_insert_with(Instant::now).elapsed() >= grace
+                } else {
+                    critical_since = None;
+                    false
+                };
+                self.fit(most, persisted);
             }
             let Some(idle) = self.idle else { continue };
             if live {
@@ -1391,18 +1436,30 @@ impl Daemon {
     }
 
     /// Stops the workers asked longest ago until the rest hold no more than `most` bytes. The
-    /// next build of a workspace whose worker was stopped is cargo's while a worker loads it
-    /// again.
-    fn fit(&self, most: u64) {
+    /// active build governs its own pause and failure. Idle caches stopped under critical
+    /// pressure leave tombstones, so the same load is not restarted until it changes.
+    fn fit(&self, most: u64, critical: bool) {
         let mut workers = lock(&self.workers);
         let holding: Vec<(String, Held)> =
             workers.iter().map(|(id, worker)| (id.clone(), worker.held())).collect();
         let all: u64 = holding.iter().map(|it| it.1.bytes).sum();
-        for id in over(&holding, most) {
+        for id in over(&holding, most, critical) {
             let Some(worker) = workers.remove(&id) else { continue };
+            if critical {
+                let mut stops = lock(&self.pressure_stops);
+                for (key, loaded) in lock(&worker.checkouts).iter() {
+                    stops.insert(
+                        (id.clone(), key.clone()),
+                        PressureStop { generation: loaded.generation, most, at: SystemTime::now() },
+                    );
+                }
+            }
             let alone = holding.iter().find(|it| it.0 == id).map_or(0, |it| it.1.bytes);
             let why = match alone > most {
-                true => format!("it alone holds {} MB", alone >> 20),
+                true => format!(
+                    "host memory pressure stayed critical after the grace period; it alone holds {} MB",
+                    alone >> 20
+                ),
                 false => "it was asked longest ago".to_owned(),
             };
             eprintln!(
@@ -1616,20 +1673,39 @@ mod tests {
             ("answering".to_owned(), held(4, 40, true)),
             ("last".to_owned(), held(4, 0, false)),
         ];
-        assert_eq!(over(&holding, 16), Vec::<String>::new());
-        assert_eq!(over(&holding, 12), ["oldest"]);
-        assert_eq!(over(&holding, 8), ["oldest", "old"]);
+        assert_eq!(over(&holding, 16, false), Vec::<String>::new());
+        assert_eq!(over(&holding, 12, false), ["oldest"]);
+        assert_eq!(over(&holding, 8, false), ["oldest", "old"]);
         // The busy one and the one asked last stay while neither alone holds more than all may.
-        assert_eq!(over(&holding, 4), ["oldest", "old"]);
-        assert_eq!(over(&holding, 3), ["oldest", "old", "answering", "last"]);
+        assert_eq!(over(&holding, 4, false), ["oldest", "old"]);
+        assert_eq!(over(&holding, 3, true), ["oldest", "old", "last"]);
     }
 
     #[test]
-    fn a_worker_alone_over_the_bound_is_stopped_though_it_is_busy() {
+    fn a_lone_worker_keeps_its_cache_past_the_soft_target() {
+        let holding = [("loading".into(), Held { bytes: 30, asked: Instant::now(), busy: false })];
+        assert!(over(&holding, 16, false).is_empty());
+        assert_eq!(over(&holding, 16, true), ["loading"]);
+    }
+
+    #[test]
+    fn pressure_stop_retries_only_changed_source_build_or_budget() {
+        let stop = PressureStop { generation: 42, most: 16, at: SystemTime::now() };
+        assert!(stop.blocks(42, 16, false));
+        assert!(stop.blocks(42, 16, false));
+        assert!(!stop.blocks(43, 16, false));
+        assert!(!stop.blocks(42, 32, false));
+        assert!(!stop.blocks(42, 16, true));
+    }
+
+    #[test]
+    fn busy_worker_owns_its_pause_and_failure_while_idle_cache_can_be_reclaimed() {
         let now = Instant::now();
         let loading = Held { bytes: 30, asked: now, busy: true };
-        assert_eq!(over(&[("loading".to_owned(), loading)], 16), ["loading"]);
+        assert!(over(&[("loading".to_owned(), loading)], 16, true).is_empty());
+        let idle = Held { bytes: 30, asked: now, busy: false };
+        assert_eq!(over(&[("idle".to_owned(), idle)], 16, true), ["idle"]);
         let under = Held { bytes: 16, asked: now, busy: true };
-        assert_eq!(over(&[("loading".to_owned(), under)], 16), Vec::<String>::new());
+        assert_eq!(over(&[("loading".to_owned(), under)], 16, true), Vec::<String>::new());
     }
 }

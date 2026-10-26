@@ -180,7 +180,7 @@ impl fmt::Display for CodegenError {
             CodegenError::NoSymbol | CodegenError::Private => {
                 write!(f, "unsupported: no rustc symbol for function")
             }
-            CodegenError::OverBudget(it) => write!(f, "out of memory to build in: {it}"),
+            CodegenError::OverBudget(it) => write!(f, "cannot admit compile work: {it}"),
         }
     }
 }
@@ -879,7 +879,10 @@ impl CodegenUnit {
                     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
                     let governor = budget::Governor::new(budget::budget(), threads);
                     symbols.in_parallel(ours.len(), &|db, symbols, at| {
-                        governor.look();
+                        if governor.look() {
+                            return;
+                        }
+                        let Ok(_permit) = budget::enter() else { return };
                         if governor.allowed() < threads {
                         } else if symbols.function(ours[at]).is_none() {
                             _ = db.mir_body(ours[at].into());
@@ -898,7 +901,7 @@ impl CodegenUnit {
                     // A root still being compiled waits for those compiled after it.
                     let mut held = std::collections::VecDeque::new();
                     loop {
-                        if ahead.as_ref().is_some_and(|it| it.shed()) {
+                        if cg.shed.is_some() || ahead.as_ref().is_some_and(|it| it.shed()) {
                             break;
                         }
                         let root = match (queue.get(next), &ahead) {
@@ -932,6 +935,9 @@ impl CodegenUnit {
                         match result {
                             Ok(symbol) => compiled.push((root, symbol)),
                             Err(e) => {
+                                if matches!(e, CodegenError::OverBudget(_)) {
+                                    break;
+                                }
                                 // rustc's copy calls what ours would have, when it has one.
                                 if !on_demand.is_empty()
                                     && !e.no_symbol()
@@ -2574,6 +2580,7 @@ pub fn copied_by_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// one after another, so that threads share that work. One rustc copies into its callers,
 /// which `home` passes over, is not compiled.
 pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
+    let Ok(_permit) = budget::enter() else { return };
     if !patch::copied_by_rustc(db, func) {
         let compile = || compiled_root(db, func).is_ok();
         // One that panics does again as `home` compiles it, which says so.
@@ -2589,6 +2596,7 @@ pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
 pub fn compile_unnamed(db: &dyn HirDatabase, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
     let mut homes = home::Homes::default();
     loop {
+        let Ok(_permit) = budget::enter() else { return };
         let job = {
             let mut state = unnamed.state.lock().unwrap_or_else(|e| e.into_inner());
             let job = match state.roots.pop() {
@@ -3803,6 +3811,9 @@ impl Ready<'_> {
         &mut self,
         pending: &mut Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
+        if self.governor.look() {
+            return Vec::new();
+        }
         let mut ready = Vec::new();
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
         let mut queued = false;
@@ -3872,7 +3883,7 @@ impl Ready<'_> {
     /// Whether the build was stopped for the memory the process holds: nothing more is to be
     /// put in the object.
     fn shed(&self) -> bool {
-        self.governor.shed()
+        self.governor.look()
     }
 
     /// Has the threads compile `roots` too, which putting the others in the object found.
@@ -5158,6 +5169,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Puts a non-generic function in the object, exported under its rustc symbol name.
     fn define_function(&mut self, func: FunctionId) -> Result<String> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let db = self.db;
         let stored = match self.stored_roots.get(&func) {
             Some(name) => name.clone(),
@@ -5452,8 +5466,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_waves(&mut self, mut ahead: Option<&mut Ready<'_>>) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
         loop {
+            if let Err(why) = budget::admit() {
+                self.shed = Some(why.to_string());
+                break;
+            }
             // What the threads did not compile is not compiled here either.
-            if ahead.as_ref().is_some_and(|it| it.shed()) {
+            if self.shed.is_some() || ahead.as_ref().is_some_and(|it| it.shed()) {
                 break;
             }
             let wave = match &mut ahead {
@@ -5473,6 +5491,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let start = stdx::time::Instant::now();
                     let told = self.tells_variables().then_some(&self.told);
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
+                        let Ok(_permit) = budget::enter() else { return };
                         let (instance, env, _) = &wave[at];
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
@@ -5492,6 +5511,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             for (instance, env, id) in wave {
                 let defined = self.define_instance(&instance, &env, id);
                 if let Err(e) = defined {
+                    if matches!(e, CodegenError::OverBudget(_)) {
+                        break;
+                    }
                     if self.forward_to_rustc(&instance, id).is_some() {
                         self.forwarded.insert(instance);
                     } else {
@@ -5518,8 +5540,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// function. What this compiles that the object has no use for is only wasted. `beside`
     /// runs on this thread meanwhile, and is told whether anything is compiled ahead of it.
     ///
-    /// Fewer threads compile as the process nears the memory it may hold ([`budget`]), and
-    /// past it they stop, `shed` says why, and the build is not to be finished.
+    /// The soft footprint target reduces concurrency ([`budget`]). Critical host pressure
+    /// pauses admission; only persistent pressure without progress sheds the build.
     fn compile_ahead(
         &mut self,
         roots: Vec<FunctionId>,
@@ -5591,6 +5613,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut homes = home::Homes::default();
             let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                // Admission must not hold Ahead: in-flight jobs need it to finish.
+                drop(state);
+                let failed = governor.look();
+                state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                if failed {
+                    state.stopped = true;
+                    idle.notify_all();
+                }
                 if state.stopped {
                     return;
                 }
@@ -5618,6 +5648,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 state.working += 1;
                 drop(state);
+                let _permit = match budget::enter() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                        state.working -= 1;
+                        state.stopped = true;
+                        idle.notify_all();
+                        return;
+                    }
+                };
                 let working = Working(&ahead, &idle);
                 let (mut found, mut called) = (Vec::new(), Vec::new());
                 let compiled = match &job {
@@ -5664,6 +5704,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
                 drop(working);
+                drop(_permit);
                 let shed = governor.look();
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
@@ -5726,6 +5767,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: &StoredParamEnvAndCrate,
         id: FuncId,
     ) -> Result<()> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let start = stdx::time::Instant::now();
         let tiers = self.tiers;
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
