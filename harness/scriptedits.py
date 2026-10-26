@@ -35,11 +35,15 @@ kept, which must not stand for one cargo would make. Then what the reports hint 
 that writes a file it watches or one of its package, a module of the script and a build
 dependency, a link and a relative path, what a run says to rustc, RUSTFLAGS, `[env]` and the
 manifest, a `build.rs` that appears, the daemon stopped between builds, the release profile, a
-feature, and a script that cargo runs every build, in a package of two programs.
+feature, and a script that cargo runs every build, in a package of two programs. And the six
+findings of p05w-verify (PR #12): two builds at once, `option_env!` in the script and in a build
+dependency, a package's files as cargo's `PathSource` lists them (a `CACHEDIR.TAG`, `include`,
+git), the output of the last run deleted, an extended attribute in `OUT_DIR`, and no rustc and no
+compiling cargo in blaze's build (`strace`, Linux; cargo's queries are counted and shown).
 
 Python 3, stdlib only.
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -100,15 +104,21 @@ def single(script, files=None, outside="zero\n"):
     return files
 
 
-def step(label, runs=None, write=None, remove=(), touch=(), env=None, clean=False, restart=False, args=()):
+def step(label, runs=None, write=None, remove=(), touch=(), env=None, clean=False, restart=False, args=(),
+         concurrent=None, remove_output=False, xattr=None):
     """One step. `runs` is what cargo is expected to run: how many times the script of each
     package, as a dictionary, or a number for `probe`'s. `clean` removes what was built first,
     as `cargo clean` does, and has blaze's daemon stop; `restart` has the daemon stop alone, for
-    the next build to load the workspace again. `args` are given to the build."""
+    the next build to load the workspace again. `args` are given to the build. `concurrent` is
+    a list of variables, a build with each started at once (two clients of one daemon);
+    `remove_output` removes the output each build keeps of `probe`'s last run, cargo's in its
+    target directory and blaze's in its own; `xattr` is (a file in `probe`'s `OUT_DIR`, a name,
+    a value): an extended attribute set on that file of each before the build."""
     if isinstance(runs, int):
         runs = {"probe": runs}
     return {"label": label, "runs": runs, "write": write or {}, "remove": list(remove),
-            "touch": list(touch), "env": env or {}, "clean": clean, "restart": restart, "args": list(args)}
+            "touch": list(touch), "env": env or {}, "clean": clean, "restart": restart, "args": list(args),
+            "concurrent": concurrent, "remove_output": remove_output, "xattr": xattr}
 
 
 def edit(n, label=None, runs=None, **kw):
@@ -796,6 +806,138 @@ fn main() {
 ])
 
 
+# 9. The six findings of p05w-verify, each a probe. (1) Two clients of one daemon at once are two
+# builds: a script cargo runs every build (it names a file that is not there) runs for each.
+case("two-clients", "two builds at once, of a script that runs every build", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=not-there.txt");
+    let n = bump();
+    generated(&format!("count={n}"));
+}
+'''), [
+    step("cold build", 1),
+    step("two builds at once", 2, concurrent=[{"PROBE_CLIENT": "a"}, {"PROBE_CLIENT": "b"}]),
+    step("two more at once", 2, concurrent=[{"PROBE_CLIENT": "b"}, {"PROBE_CLIENT": "a"}]),
+])
+
+# (2) What the compiler read of the environment: `option_env!` in the script and in a build
+# dependency, which cargo compiles the script again for, and so runs it.
+COMPILER_ENV = dict(BUILD_DEP)
+COMPILER_ENV["helper/src/lib.rs"] = 'pub fn value() -> &\'static str { option_env!("PROBE_DEP").unwrap_or("none") }\n'
+COMPILER_ENV["probe/build.rs"] = PRELUDE + r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    let n = bump();
+    generated(&format!("count={n} compiled={:?} helper={}", option_env!("PROBE_COMPILED"), helper::value()));
+}
+'''
+case("compiler-env", "option_env! read by the script and by its build dependency", COMPILER_ENV, [
+    step("cold build", 1),
+    step("PROBE_COMPILED=new", 1, env={"PROBE_COMPILED": "new"}),
+    step("PROBE_COMPILED=new again", 0, env={"PROBE_COMPILED": "new"}),
+    step("PROBE_DEP=x as well", 1, env={"PROBE_COMPILED": "new", "PROBE_DEP": "x"}),
+    step("both unset", 1),
+    step("rebuild, nothing changed", 0),
+])
+
+# (3) The files of a package as cargo's PathSource lists them: a directory with a CACHEDIR.TAG is
+# not left out, with or without `include`, and in git a tracked file in `target` is listed.
+DATA_SCRIPT = r'''
+fn main() {
+    note("probe");
+    let n = bump();
+    generated(&format!("count={n} data={}", read("assets/data.txt").trim()));
+}
+'''
+case("package-cachedir", "a script that names nothing, and a data file beside a CACHEDIR.TAG", single(DATA_SCRIPT, files={
+    "assets/CACHEDIR.TAG": "Signature: not cargo's\n", "assets/data.txt": "one\n"}), [
+    step("cold build", 1),
+    step("edit assets/data.txt", 1, write={"assets/data.txt": "two\n"}),
+    step("rebuild, nothing changed", 0),
+])
+case("package-include", "package.include names the directory with a CACHEDIR.TAG", single(DATA_SCRIPT, files={
+    "Cargo.toml": MANIFEST.replace('build = "build.rs"\n', 'build = "build.rs"\ninclude = ["src/**", "build.rs", "assets/**"]\n'),
+    "assets/CACHEDIR.TAG": "Signature: not cargo's\n", "assets/data.txt": "one\n", "notes.txt": "one\n"}), [
+    step("cold build", 1),
+    step("edit notes.txt, which include leaves out", 0, write={"notes.txt": "two\n"}),
+    step("edit assets/data.txt", 1, write={"assets/data.txt": "two\n"}),
+    step("rebuild, nothing changed", 0),
+])
+TRACKED_SCRIPT = r'''
+fn main() {
+    note("probe");
+    let n = bump();
+    generated(&format!("count={n} data={}", read("target/input.txt").trim()));
+}
+'''
+case("package-git", "git lists the package: a tracked file in target, an ignored one, a hidden one", single(TRACKED_SCRIPT, files={
+    "target/input.txt": "one\n", ".gitignore": "/target\nignored.txt\n", "ignored.txt": "one\n", ".hidden": "one\n"}), [
+    step("cold build", 1),
+    step("edit target/input.txt, which git tracks", 1, write={"target/input.txt": "two\n"}),
+    step("edit ignored.txt, which git ignores", 0, write={"ignored.txt": "two\n"}),
+    step("edit .hidden, which git lists", 1, write={".hidden": "two\n"}),
+    step("rebuild, nothing changed", 0),
+], git=["target/input.txt"])
+
+# (4) The output kept of the script's last run is gone: cargo runs the script again.
+case("output-gone", "the saved output of the script's last run is deleted", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=build.rs");
+    let n = bump();
+    generated(&format!("count={n}"));
+}
+'''), [
+    step("cold build", 1),
+    step("delete the output of the run", 1, remove_output=True),
+    step("rebuild, nothing changed", 0),
+])
+
+# (5) No run stands for another that differs only in what the key of a kept run leaves out: an
+# extended attribute of a file in OUT_DIR, set between two runs of inputs of the same bytes.
+case("out-dir-xattr", "an extended attribute in OUT_DIR changes between two runs of the same inputs", single(r'''
+mod xattr {
+    use std::{ffi::CString, os::raw::{c_char, c_void}, path::Path};
+
+    extern "C" {
+        fn getxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize;
+    }
+
+    pub fn get(path: &Path, name: &str) -> String {
+        let (path, name) = (CString::new(path.to_str().unwrap()).unwrap(), CString::new(name).unwrap());
+        let mut buf = [0u8; 64];
+        let n = unsafe { getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 { "none".to_owned() } else { String::from_utf8_lossy(&buf[..n as usize]).into_owned() }
+    }
+}
+
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=trigger.txt");
+    let input = out().join("input");
+    if !input.exists() {
+        fs::write(&input, "same").unwrap();
+    }
+    generated(&format!("attr={}", xattr::get(&input, "user.probe")));
+}
+''', files={"trigger.txt": "1\n"}), [
+    step("cold build", 1),
+    step("set user.probe=two, touch trigger.txt", 1, touch=["trigger.txt"], xattr=("input", "user.probe", "two")),
+    step("rebuild, nothing changed", 0),
+])
+
+# (6) blaze's build compiles the script and its build dependency itself, and starts no rustc,
+# rustdoc or cargo: strace sees every program it starts.
+case("no-compiler", "a script and a build dependency, and no rustc or cargo in blaze's build", BUILD_DEP, [
+    step("cold build", 1),
+    step("edit helper/src/lib.rs, a build dependency", 1, write={"helper/src/lib.rs": "pub fn value() -> &'static str { \"two\" }\n"}),
+    step("edit probe/src/main.rs", 1, write={"probe/src/main.rs": main_with(2)}),
+    step("rebuild, nothing changed", 0),
+], trace=True)
+
+
 # ---------------------------------------------------------------------------------------------
 
 
@@ -852,6 +994,15 @@ class Side:
             os.symlink(target, self.path(name))
         open(self.log, "w").close()
         subprocess.run(["cargo", "generate-lockfile"], cwd=self.ws, env=self.env({}), capture_output=True, check=True)
+        if self.case.get("git") is not None:
+            def git(*args):
+                subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", *args],
+                               cwd=self.ws, capture_output=True, check=True)
+            git("init", "-q")
+            git("add", "-A")
+            for name in self.case["git"]:
+                git("add", "-f", name)
+            git("commit", "-qm", "probe")
         self.runs_read = 0
 
     def apply(self, s):
@@ -872,12 +1023,81 @@ class Side:
                 os.remove(path)
         for name in s["touch"]:
             os.utime(self.path(name))
+        if s.get("remove_output"):
+            found = self.run_files("output")
+            assert found, f"{self.kind} kept no output of probe's run"
+            for path in found:
+                os.remove(path)
+        if s.get("xattr"):
+            name, attr, value = s["xattr"]
+            found = self.run_files(os.path.join("out", name))
+            assert found, f"{self.kind} has no {name} in probe's OUT_DIR"
+            for path in found:
+                os.setxattr(path, attr, value.encode())
+
+    def run_files(self, name):
+        """`name` in the directories of `probe`'s runs: cargo's in its target directory, and
+        blaze's in its own, below the whole build's."""
+        if self.kind == "blaze":
+            pattern = os.path.join(self.ws, "target", "ra-jit", "build-scripts", "debug", "build", "probe-*", name)
+        else:
+            pattern = os.path.join(self.root, "target-ref", "debug", "build", "probe-*", name)
+        return glob.glob(pattern)
+
+    def argv(self, args=()):
+        argv = ["cargo", "ra-jit", "build"] if self.kind == "blaze" else ["cargo", "build"]
+        return argv + list(args)
 
     def build(self, env, args=()):
-        argv = ["cargo", "ra-jit", "build"] if self.kind == "blaze" else ["cargo", "build"]
-        ran = subprocess.run(argv + list(args), cwd=self.ws, env=env, capture_output=True, text=True, errors="replace",
-                             timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+        if self.kind == "blaze" and self.case.get("trace"):
+            return self.traced(env, args)
+        ran = subprocess.run(self.argv(args), cwd=self.ws, env=env, capture_output=True, text=True,
+                             errors="replace", timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+        ran.execs = None
         return ran
+
+    def traced(self, env, args=()):
+        """The build under `strace -f`, with what blaze started in it. The daemon the first
+        build starts stays traced by that build's strace for as long as it runs, so a build
+        is over when its client has said its status, and what the daemon started for it is what
+        the earlier traces gained meanwhile."""
+        traces = self.__dict__.setdefault("traces", [])
+        n = len(traces)
+        trace, status = os.path.join(self.root, f"trace.{n}"), os.path.join(self.root, f"status.{n}")
+        before = [(path, os.path.getsize(path)) for path in traces if os.path.exists(path)]
+        argv = ["strace", "-f", "-qq", "-z", "-s", "4096", "-e", "trace=execve", "-o", trace,
+                "sh", "-c", '"$@"; echo $? > "$0.part" && mv "$0.part" "$0"', status] + self.argv(args)
+        out, err = open(trace + ".out", "w"), open(trace + ".err", "w")
+        subprocess.Popen(argv, cwd=self.ws, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+        deadline = time.monotonic() + TIMEOUT
+        while not os.path.exists(status):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"the traced build of {self.case['name']} did not end")
+            time.sleep(0.2)
+        out.close()
+        err.close()
+        time.sleep(1)  # what the daemon still writes of the build
+        found = []
+        for path, offset in before:
+            found += execs(path, offset, began=True)
+        found += execs(trace)
+        traces.append(trace)
+        ran = subprocess.CompletedProcess(argv, int(open(status).read()), open(trace + ".out").read(),
+                                          open(trace + ".err", errors="replace").read())
+        ran.execs = found
+        return ran
+
+    def builds(self, envs, args=()):
+        """Builds with each of `envs` at once: each, once it ends."""
+        started = [subprocess.Popen(self.argv(args), cwd=self.ws, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, errors="replace", stdin=subprocess.DEVNULL)
+                   for env in envs]
+        done = []
+        for p in started:
+            out, err = p.communicate(timeout=TIMEOUT)
+            done.append(subprocess.CompletedProcess(p.args, p.returncode, out, err))
+        return done
 
     def program(self, env, args=()):
         # cargo's target directory is beside the project, so that nothing of it is in the package.
@@ -899,8 +1119,19 @@ class Side:
     def step(self, s):
         self.apply(s)
         env = self.env(s["env"])
-        built = self.build(env, s["args"])
+        if s.get("concurrent"):
+            each = self.builds([self.env(dict(s["env"], **it)) for it in s["concurrent"]], s["args"])
+            # The step's status is the worse of the two, and it is the daemon's when both are.
+            built = subprocess.CompletedProcess([], max(it.returncode for it in each), "",
+                                                "\n".join(it.stderr for it in each))
+            if not all("[ra-jit]" in it.stderr for it in each):
+                built.stderr = built.stderr.replace("[ra-jit]", "")
+            built.execs = None
+        else:
+            built = self.build(env, s["args"])
         result = {"build": built.returncode, "runs": self.runs(), "program": self.program(env, s["args"])}
+        if built.execs is not None:
+            result["execs"] = built.execs
         say = built.stderr.strip().splitlines()
         result["said"] = say[-1] if say and built.returncode != 0 else ""
         result["by_cargo"] = bool(re.search(r"building with cargo", built.stderr))
@@ -914,9 +1145,54 @@ class Side:
             subprocess.run(["cargo", "ra-jit", "stop"], cwd=self.ws, env=self.env({}), capture_output=True, timeout=120)
 
 
+def execs(trace, offset=0, began=False):
+    """What `strace -e trace=execve` saw started after blaze's own command began, from `offset`
+    of `trace` on: each run of rustc, rustdoc or cargo (docs/no-rustc.md). The `cargo` the build
+    was typed as, and rustup's proxies of it, start `cargo-ra-jit`; what starts after that is
+    blaze's, and all of a trace that `began` there."""
+    found = []
+    with open(trace, errors="replace") as f:
+        f.seek(offset)
+        lines = f.read().splitlines()
+    for line in lines:
+        m = re.search(r'execve\("([^"]+)", \[(.*?)\]', line)
+        if not m or "= -1" in line:
+            continue
+        name = os.path.basename(m.group(1))
+        if name == "cargo-ra-jit":
+            began = True
+            continue
+        if began and name in ("rustc", "rustdoc", "cargo"):
+            found.append(f"{name} {m.group(2)[:300]}")
+    return found
+
+
+# What a cargo run does when its first word is one of these: it compiles (`rustc` and `fix`
+# compile unless they only `--print`).
+COMPILES = ("build", "b", "check", "c", "test", "t", "bench", "run", "r", "rustc", "doc", "fix", "install")
+
+
+def compiles(run):
+    """Whether a run `execs` found compiles: any rustc or rustdoc, a cargo that builds or
+    checks. A cargo that only asks (`metadata`, `config get`, `--version`, `rustc --print`) does
+    not, and is counted apart."""
+    name, _, argv = run.partition(" ")
+    if name != "cargo":
+        return True
+    words = [w.strip('"') for w in argv.split('", "')][1:]
+    words = [w for w in words if not w.startswith("+")]
+    while words and words[0] in ("-Z", "unstable-options", "-Zunstable-options"):
+        words = words[1:]
+    first = words[0] if words else ""
+    return first in COMPILES and not (first == "rustc" and "--print" in words)
+
+
 def differences(blaze, cargo):
     """Why blaze's step is not cargo's, as a list of sentences: empty when they are the same."""
     problems = []
+    compiling = [run for run in blaze.get("execs") or [] if compiles(run)]
+    if compiling:
+        problems.append(f"blaze's build compiled with {len(compiling)} rustc, rustdoc or cargo: {compiling[0]}")
     if blaze["build"] == 0 and blaze.get("daemon") is False:
         problems.append("the build that succeeded was not the daemon's whole build")
     if blaze["build"] != cargo["build"]:
@@ -971,6 +1247,10 @@ def show(case, results):
             print(f"        {problem}", flush=True)
         if ours["by_cargo"]:
             print("        blaze said it built with cargo", flush=True)
+        asking = [run for run in ours.get("execs") or [] if not compiles(run)]
+        if asking:
+            print(f"        blaze's build asked cargo {len(asking)} times, compiling nothing: "
+                  + "; ".join(sorted({run[:90] for run in asking})), flush=True)
     return not wrong
 
 
@@ -990,6 +1270,9 @@ def selftest():
         ("another status", other(program=program("1 edit=2\n", 1)), ["status"], False),
         ("no program", other(program=None), ["missing"], False),
         ("a build that was cargo's", other(daemon=False), ["not the daemon's"], False),
+        ("a rustc blaze ran", other(execs=["rustc --crate-name build_script_build"]), ["rustc, rustdoc or cargo"], False),
+        ("a cargo check blaze ran", other(execs=['cargo "/c/cargo", "check", "--compile-time-deps"']), ["rustc, rustdoc or cargo"], False),
+        ("a cargo blaze only asked", other(execs=['cargo "/c/cargo", "metadata", "--no-deps"']), [], True),
     ]
     wrong = 0
     for what, ours, words, same in cases:
