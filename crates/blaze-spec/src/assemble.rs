@@ -122,7 +122,7 @@ impl Spec {
 pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let offline = Opened::with(request, ctx, |opened| Ok(opened.resolved.offline))?;
-    let (build, targets) = (&build_of(request, command), &targets_of(request, command));
+    let (build, targets) = (&build_of(request), &targets_of(request, command));
     let asked = Asked {
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
@@ -165,17 +165,12 @@ struct Selected {
     dev_units: bool,
 }
 
-fn build_of(request: &Request, command: Subcommand) -> Selected {
-    let targets = &request.targets;
-    let dev_targets = targets.tests.is_some()
-        || targets.examples.is_some()
-        || targets.benches.is_some()
-        || targets.all_targets;
+fn build_of(request: &Request) -> Selected {
     Selected {
         packages: request.packages.clone(),
         workspace: request.workspace,
         excludes: request.excludes.clone(),
-        dev_units: command == Subcommand::Test || dev_targets,
+        dev_units: request.needs_dev_dependencies(),
     }
 }
 

@@ -539,6 +539,16 @@ impl Names {
 }
 
 impl Request {
+    /// Whether the command selects targets whose resolution includes dev-dependencies.
+    /// Explicitly selecting a library or binary alone does not enable them.
+    pub fn needs_dev_dependencies(&self) -> bool {
+        self.command == Some(Subcommand::Test)
+            || self.targets.tests.is_some()
+            || self.targets.examples.is_some()
+            || self.targets.benches.is_some()
+            || self.targets.all_targets
+    }
+
     /// Reads the arguments after the subcommand. A flag blaze does not honour is a
     /// [`Refusal`] naming it; one that changes nothing about the build or the run is
     /// accepted and left out.

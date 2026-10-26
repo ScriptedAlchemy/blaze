@@ -23,6 +23,25 @@ fn id(refusal: &Refusal) -> &'static str {
     refusal.id
 }
 
+#[test]
+fn only_commands_and_targets_that_need_dev_dependencies_enable_them() {
+    for (command, args, expected) in [
+        (Subcommand::Build, vec![], false),
+        (Subcommand::Build, vec!["--lib"], false),
+        (Subcommand::Check, vec!["--bins"], false),
+        (Subcommand::Build, vec!["--bin", "app"], false),
+        (Subcommand::Build, vec!["--example", "sample"], true),
+        (Subcommand::Check, vec!["--tests"], true),
+        (Subcommand::Build, vec!["--benches"], true),
+        (Subcommand::Check, vec!["--all-targets"], true),
+        (Subcommand::Test, vec!["--lib"], true),
+        (Subcommand::Test, vec!["--doc"], true),
+    ] {
+        let request = parse(command, &args).unwrap();
+        assert_eq!(request.needs_dev_dependencies(), expected, "{command:?} {args:?}");
+    }
+}
+
 /// The arguments that read `flag` with its sample value, spelled as `--long value`.
 fn typed(flag: &blaze_spec::flags::Flag) -> Vec<String> {
     let mut args = vec![flag.spelled()];
