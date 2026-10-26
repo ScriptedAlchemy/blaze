@@ -2912,6 +2912,17 @@ impl Base {
                 return Ok(Err("a function now shares an `async` block with one left to rustc"));
             }
         }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let known: FxHashSet<FunctionId> = known_roots().collect();
+            let new = queue.iter().filter(|it| !known.contains(it)).count();
+            eprintln!(
+                "patch-made: {} roots changed and {new} new, {} gone; {} instances, {} of them of the base",
+                queue.len() - new,
+                cg.replaced.gone.len(),
+                cg.instances.len(),
+                changed_instances.len()
+            );
+        }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
         let start = stdx::time::Instant::now();
         let (object, _) = cg.finish()?;
