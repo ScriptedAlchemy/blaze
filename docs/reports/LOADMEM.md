@@ -50,7 +50,9 @@ measurement, named) or **unverified** (our inference). No fix is made here; the 
   workspace units are compiled at `opt-level=1` (`tracedecay-{code-extraction,code-index,
   code-index-runtime,domain,graph-db,runtime-core,rusqlite-runtime,store,tokenizer}`; the other 44
   have a `[profile.dev.package.X] opt-level = 0`). Blaze patches rustc's executable only where no
-  call is inlined, so for this workspace the first build is the daemon's own, whole. For a
+  call is inlined, so for this workspace the first build is the daemon's own, whole. (The line
+  and the units' records are **read**; that `calls_by_symbol` is what made it `None`, and not
+  `link.output()`, is read in the code and not separately checked.) For a
   distributed compile that build *is* the work to split; what it needs is a bound
   ([section 6](#6-fixes-each-names-a-function)).
 - **The second run (n=2, no profiling, the corrected watchdog)** has the same curve: 23.6 GB live
