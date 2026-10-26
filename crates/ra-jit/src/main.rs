@@ -7720,6 +7720,7 @@ fn run_holding(
         eprintln!("backend: {backend}");
     }
     process_wide();
+    memory::ticks();
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
