@@ -670,11 +670,15 @@ fn headerpad_at_least(binary: &Path, asked: Option<u64>) -> std::io::Result<Path
 /// What the line of a whole build (`link::command`), which the daemon writes itself, is told
 /// besides what the program links, as the daemon's links of the lines rustc gave it are: on
 /// Apple fixups in tables and the room after the load commands, which a splice reads and
-/// makes way in; on ELF that the first definition of a name stays, the patch's, which the line
-/// has ahead of the object it patches.
+/// makes way in; on ELF nothing. The patch the line has ahead of the object it patches
+/// defines names the object does too, and on Apple the object's definitions are weak, which
+/// gives way to a patch's. On ELF the daemon makes the object's definitions of what the patch
+/// defines weak before each link ([`crate::weaken::replaced`]), rather than tell the linker
+/// to keep the first definition of any name: that would take two definitions in a library
+/// of the program, which rustc's link refuses, for one.
 pub(crate) fn whole_link_args(apple: bool, binary: &Path) -> std::io::Result<Vec<String>> {
     if !apple {
-        return Ok(vec![FIRST_DEFINITION_STAYS.to_owned()]);
+        return Ok(Vec::new());
     }
     let file = headerpad_at_least(binary, None)?;
     Ok(vec![NO_FIXUP_CHAINS.to_owned(), format!("@{}", file.display())])
@@ -877,6 +881,21 @@ mod tests {
         write_headerpad(&binary, 0x8000).unwrap();
         assert_eq!(pad(&line(r#""-Wl,-headerpad,0x0""#)), Some(0x8000));
         assert_eq!(pad(&line("")), Some(HEADERPAD));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The line of a whole build asks Apple's linker for what the splice needs, and an ELF
+    /// linker for nothing: it is not told to keep the first of two definitions of any name,
+    /// which would take two definitions in a library of the program that rustc's link refuses.
+    #[test]
+    fn a_whole_builds_line_tells_an_elf_linker_nothing_of_duplicates() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-plan-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("bin");
+        assert_eq!(whole_link_args(false, &binary).unwrap(), Vec::<String>::new());
+        let apple = whole_link_args(true, &binary).unwrap();
+        assert_eq!(apple[0], NO_FIXUP_CHAINS);
+        assert!(apple.iter().all(|it| !it.contains("multiple-definition")), "{apple:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

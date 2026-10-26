@@ -1081,9 +1081,13 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
 - Done (2026-10-26): the same on macOS (#255). The line asks Apple's linker for fixups in
   tables and the room after the load commands, as the daemon's links of cargo's builds do,
   where the splice had refused every edit (an executable "fixed up in chains"); and it has the
-  patch ahead of the object, on ELF with the first definition kept, so that a link the splice
-  declines has the edit too: it had linked the program as it was before the edit and said it
-  was built. On a Mac (arm64, 1 run): `harness/coldbuild.py` all right, and two edits to
+  patch ahead of the object, so that a link the splice declines has the edit too: it had
+  linked the program as it was before the edit and said it was built. On ELF the daemon makes
+  the object's definitions of what the patch defines weak before each such link
+  (`weaken::replaced`), the way Mach-O's are, and tells the linker nothing of duplicates: two
+  definitions of any other name, in a library of the program, stay the linker's error, as they
+  are in rustc's link (a first version of the line passed `--allow-multiple-definition`, and
+  a verifier showed it linking two C objects that both define `clash()` with exit 0). On a Mac (arm64, 1 run): `harness/coldbuild.py` all right, and two edits to
   hello's body spliced in 31 ms and 20 ms, or linked in 67 ms and 65 ms with
   `RA_JIT_SPLICE=0`, each printing the edit. On Linux AArch64 (Docker's VM, 1 run) the same
   two edits linked with `RA_JIT_SPLICE=0` had printed `hello` both times, and print the edit

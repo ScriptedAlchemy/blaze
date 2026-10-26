@@ -796,8 +796,11 @@ All notable changes to ra-jit are written here. The format follows
   back to left the patch out: the build said it was done and the program ran the code from
   before the edit, on Linux too wherever a splice is declined. The whole build's line now
   asks Apple's linker for fixups in tables and the room the splice needs, as the daemon's
-  other links do, and has the patch ahead of the object. `harness/coldbuild.py` passes on
-  macOS and runs there in CI.
+  other links do, and has the patch ahead of the object. On ELF the daemon makes the object's
+  definitions of what the patch defines weak before it links and tells the linker nothing of
+  duplicates, so two definitions of any other name stay the linker's error, as in rustc's link
+  (the line had `--allow-multiple-definition`, which linked two C objects that both define
+  one name with exit 0). `harness/coldbuild.py` passes on macOS and runs there in CI.
 - On macOS a build with nothing of rustc's finds what the standard library's unit defines, so
   a whole build (`RA_JIT_WHOLE_BUILD=1`), a doctest and a build script blaze compiles are
   blaze's: each stopped at the first writable static of std it reached, ``writable static

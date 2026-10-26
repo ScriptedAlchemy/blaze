@@ -8,6 +8,13 @@
 //! and private to the program as well, which keeps the loader from looking for the name in
 //! the libraries it loads. Nothing else of a file changes, and a file that is no Mach-O
 //! object is copied as it is.
+//!
+//! A whole build's line (`link::command`) tells an ELF linker no such thing, as it would
+//! accept any two definitions of a name, a C library's among them. Its patch redefines
+//! what the object of the build defines, and [`replaced`] makes just those definitions of the
+//! object weak, the way Mach-O's are: a strong definition stays over a weak one wherever it
+//! is on the line, and any other two strong ones are the linker's error as they are in
+//! rustc's link.
 
 use std::{
     ops::Range,
@@ -17,13 +24,16 @@ use std::{
 use anyhow::Context as _;
 use object::{
     LittleEndian as LE,
+    elf::{FileHeader64, SHN_COMMON, SHN_UNDEF, SHT_SYMTAB, STB_GLOBAL, STB_WEAK, Sym64},
     macho::{LC_SYMTAB, MachHeader64, N_EXT, N_PEXT, N_SECT, N_STAB, N_TYPE, N_WEAK_DEF, Nlist64},
     pod,
     read::{
         archive::ArchiveFile,
+        elf::{FileHeader as _, SectionHeader as _, Sym as _},
         macho::{MachHeader as _, Nlist as _},
     },
 };
+use rustc_hash::FxHashSet;
 
 /// The directory of the copies, in the one the files are in.
 pub(crate) const DIR: &str = "ra-jit-weak";
@@ -197,6 +207,87 @@ fn symbol_table(data: &[u8]) -> Option<(Range<usize>, Range<usize>)> {
     None
 }
 
+/// Makes weak the definitions of the ELF object at `base` of the names the ELF object at
+/// `patch` defines too, in place, and says how many. The object is linked after the patch
+/// with nothing said of duplicates ([`crate::cargo::plan::whole_link_args`]): the patch's
+/// definition is the strong one and stays wherever it is on the line, and a name the patch
+/// does not define stays as the object has it, so that a second definition of it from a
+/// library is the linker's error. Only the bindings of those symbols change; a file that is
+/// no ELF object, or a patch that defines nothing, is not touched.
+///
+/// The object is the daemon's own, written whole when it is built and read by the links
+/// that follow; this runs where a link starts, with the object inflated and nothing writing
+/// it ([`crate::whole`]). The packed copy of it keeps the bindings it was packed with, which
+/// this makes again at every link.
+pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<usize> {
+    use std::io::Read as _;
+    let is_elf = |path: &Path| -> std::io::Result<bool> {
+        let mut head = [0; 4];
+        let read = std::fs::File::open(path)?.read(&mut head)?;
+        Ok(read == head.len() && head == *b"\x7fELF")
+    };
+    if !is_elf(patch)? || !is_elf(base)? {
+        return Ok(0);
+    }
+    let patch = std::fs::read(patch)?;
+    let names = elf_defined(&patch);
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let file = std::fs::File::options().read(true).write(true).open(base)?;
+    // SAFETY: the daemon writes the object whole before it is linked and does not write it
+    // again while a link of it runs; the bindings changed here are read as either by what
+    // reads it meanwhile (a splice reads definitions, weak or not).
+    let mut object = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    Ok(weaken_elf(&mut object, &names))
+}
+
+/// The names a 64-bit little-endian ELF object defines with global binding: the ones another
+/// object's definition conflicts with. A definition is a symbol in a section, or an absolute
+/// one; undefined and common symbols are not.
+fn elf_defined(data: &[u8]) -> FxHashSet<&[u8]> {
+    let mut names = FxHashSet::default();
+    let Some(symbols) = elf_symbols(data) else { return names };
+    for symbol in symbols.table.iter().filter(|it| is_global_definition(it)) {
+        names.extend(symbols.table.symbol_name(LE, symbol).ok());
+    }
+    names
+}
+
+/// Makes weak the global definitions of the ELF object `data` of `names`, and says how many.
+fn weaken_elf(data: &mut [u8], names: &FxHashSet<&[u8]>) -> usize {
+    let Some(symbols) = elf_symbols(data) else { return 0 };
+    let size = size_of::<Sym64<LE>>();
+    let info = std::mem::offset_of!(Sym64<LE>, st_info);
+    let at: Vec<usize> = (symbols.table.iter().enumerate())
+        .filter(|(_, it)| is_global_definition(it))
+        .filter(|(_, it)| symbols.table.symbol_name(LE, it).is_ok_and(|it| names.contains(it)))
+        .map(|(index, _)| symbols.offset + index * size + info)
+        .collect();
+    for &at in &at {
+        data[at] = (STB_WEAK << 4) | (data[at] & 0xf);
+    }
+    at.len()
+}
+
+fn is_global_definition(symbol: &Sym64<LE>) -> bool {
+    symbol.st_bind() == STB_GLOBAL && !matches!(symbol.st_shndx(LE), SHN_UNDEF | SHN_COMMON)
+}
+
+/// The symbol table of a 64-bit little-endian ELF object, and where in the file it is.
+struct ElfSymbols<'data> {
+    table: object::read::elf::SymbolTable<'data, FileHeader64<LE>>,
+    offset: usize,
+}
+
+fn elf_symbols(data: &[u8]) -> Option<ElfSymbols<'_>> {
+    let header = FileHeader64::<LE>::parse(data).ok()?;
+    let sections = header.sections(LE, data).ok()?;
+    let table = sections.symbols(LE, data, SHT_SYMTAB).ok()?;
+    let section = sections.iter().find(|it| it.sh_type(LE) == SHT_SYMTAB)?;
+    Some(ElfSymbols { table, offset: usize::try_from(section.sh_offset(LE)).ok()? })
+}
+
 #[cfg(test)]
 mod tests {
     use object::write::{Mangling, Object, Symbol, SymbolSection};
@@ -250,6 +341,155 @@ mod tests {
             (symbol.n_type & N_PEXT != 0, symbol.n_desc(LE) & N_WEAK_DEF != 0)
         };
         NAMES.iter().map(|it| named(it)).collect()
+    }
+
+    /// A 64-bit ELF object that defines each of `functions` (a name and its bytes) in a section
+    /// of its own, with global binding.
+    fn elf(functions: &[(&str, &[u8; 4])]) -> Vec<u8> {
+        let mut object = Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+        for (name, bytes) in functions {
+            let section = object.add_section(
+                Vec::new(),
+                format!(".text.{name}").into_bytes(),
+                SectionKind::Text,
+            );
+            let offset = object.append_section_data(section, *bytes, 4);
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: offset,
+                size: 4,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            });
+        }
+        object.write().unwrap()
+    }
+
+    /// The bindings of the names an ELF object defines, in the order of its symbol table.
+    fn bindings(data: &[u8]) -> Vec<(String, bool)> {
+        use object::{Object as _, ObjectSymbol as _};
+        let file = object::File::parse(data).unwrap();
+        let defined = file.symbols().filter(|it| !it.is_undefined() && !it.is_local());
+        defined.map(|it| (it.name().unwrap().to_owned(), it.is_weak())).collect()
+    }
+
+    #[test]
+    fn only_the_definitions_a_patch_makes_again_become_weak() {
+        let base = elf(&[("entry", b"ENTR"), ("edited", b"BASE"), ("other", b"OTHR")]);
+        let patch = elf(&[("edited", b"PTCH"), ("added", b"ADDD")]);
+        let names = elf_defined(&patch);
+        assert_eq!(names.len(), 2);
+        let mut object = base.clone();
+        assert_eq!(weaken_elf(&mut object, &names), 1);
+        let mut weak: Vec<_> = bindings(&object).into_iter().filter(|it| it.1).collect();
+        weak.sort();
+        assert_eq!(weak, [("edited".to_owned(), true)]);
+        // The rest of the file is as it was.
+        let changed = base.iter().zip(&object).filter(|(a, b)| a != b).count();
+        assert_eq!(changed, 1);
+        // Again, nothing is left to make weak.
+        assert_eq!(weaken_elf(&mut object, &names), 0);
+        // A patch that defines nothing, and one that is no ELF object, leave an object alone.
+        assert!(elf_defined(&elf(&[])).is_empty());
+        assert!(elf_defined(b"not an object").is_empty());
+        assert_eq!(weaken_elf(&mut Vec::from(&b"not an object"[..]), &names), 0);
+    }
+
+    /// `ld.lld`, which links the ELF objects of a test on any host: the toolchain's, which
+    /// the cargo running the test is of, or one on the path. Nothing in the test runs rustc.
+    fn lld() -> Option<std::process::Command> {
+        let from_cargo = std::env::var_os("CARGO").map(PathBuf::from).and_then(|cargo| {
+            let sysroot = cargo.canonicalize().ok()?.parent()?.parent()?.to_owned();
+            let lld = crate::link::lld_dir(&sysroot)?.join("ld.lld");
+            Some((lld, Some(sysroot)))
+        });
+        let on_path = || {
+            Some((PathBuf::from("ld.lld"), None))
+                .filter(|_| std::process::Command::new("ld.lld").arg("--version").output().is_ok())
+        };
+        let (lld, sysroot) = from_cargo.or_else(on_path)?;
+        let mut command = std::process::Command::new(lld);
+        // The toolchain's lld on macOS finds LLVM beside it.
+        if let Some(sysroot) = sysroot {
+            command.env("DYLD_LIBRARY_PATH", sysroot.join("lib"));
+        }
+        Some(command)
+    }
+
+    /// What lld says of linking `objects` in this order into an executable that starts at
+    /// `entry`, with nothing said of duplicate definitions, and the executable if it linked.
+    fn linked(objects: &[&Path], out: &Path) -> Result<Vec<u8>, String> {
+        let ran = lld()
+            .expect("an ld.lld")
+            .args(["-e", "entry"])
+            .args(objects)
+            .arg("-o")
+            .arg(out)
+            .output()
+            .unwrap();
+        match ran.status.success() {
+            true => Ok(std::fs::read(out).unwrap()),
+            false => Err(String::from_utf8_lossy(&ran.stderr).into_owned()),
+        }
+    }
+
+    /// The four bytes the executable has for the function `name`.
+    fn code_of(executable: &[u8], name: &str) -> Vec<u8> {
+        use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
+        let file = object::File::parse(executable).unwrap();
+        let symbol = file.symbols().find(|it| it.name() == Ok(name)).unwrap();
+        let section = file.section_by_index(symbol.section_index().unwrap()).unwrap();
+        let at = (symbol.address() - section.address()) as usize;
+        section.data().unwrap()[at..at + 4].to_vec()
+    }
+
+    #[test]
+    fn a_whole_builds_link_keeps_the_patch_and_the_linkers_other_errors() {
+        if lld().is_none() {
+            eprintln!("skipped: no ld.lld to link with");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, data: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            path
+        };
+        let base = write("base.o", &elf(&[("entry", b"ENTR"), ("edited", b"BASE")]));
+        // What a build over native libraries has: two of them define one name.
+        let first = write("first.o", &elf(&[("clash", b"ONE.")]));
+        let second = write("second.o", &elf(&[("clash", b"TWO.")]));
+        let out = dir.path().join("exe");
+        let duplicate = |said: &str, name: &str| {
+            assert!(said.contains(&format!("duplicate symbol: {name}")), "{said}");
+        };
+
+        // The line is the patch, the object, and the libraries, with nothing said of duplicates.
+        // The object defines what the patch does: the linker refuses, until they are made weak.
+        let patch = write("patch.o", &elf(&[("edited", b"PTCH")]));
+        let said = linked(&[&patch, &base, &first], &out).unwrap_err();
+        duplicate(&said, "edited");
+        assert_eq!(replaced(&base, &patch).unwrap(), 1);
+        let with_patch = linked(&[&patch, &base, &first], &out).unwrap();
+        assert_eq!(code_of(&with_patch, "edited"), b"PTCH");
+        // The patch stays wherever it is on the line.
+        assert_eq!(code_of(&linked(&[&base, &patch], &out).unwrap(), "edited"), b"PTCH");
+
+        // Two libraries that both define a name are an error with a patch ...
+        let said = linked(&[&patch, &base, &first, &second], &out).unwrap_err();
+        duplicate(&said, "clash");
+        assert!(!said.contains("duplicate symbol: edited"), "{said}");
+        // ... and without one, a patch that defines nothing, as the first build has.
+        let empty = write("empty.o", &elf(&[]));
+        let base = write("whole.o", &elf(&[("entry", b"ENTR"), ("edited", b"BASE")]));
+        assert_eq!(replaced(&base, &empty).unwrap(), 0);
+        let said = linked(&[&empty, &base, &first, &second], &out).unwrap_err();
+        duplicate(&said, "clash");
+        // With either library alone it links, so the error is theirs.
+        assert!(linked(&[&empty, &base, &second], &out).is_ok());
     }
 
     #[test]

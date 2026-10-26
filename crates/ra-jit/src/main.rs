@@ -4329,8 +4329,16 @@ fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(Strin
         .collect();
     let sysroot = SYSROOT.get().and_then(Option::as_deref);
     let cmd = link::command(db, &program, &objects, sysroot, exe)?;
+    lock(&OWN_LINES).insert(cmd.clone());
     Ok(Some((cmd, exe.clone())))
 }
+
+/// The link lines of whole builds ([`own_link_line`]), which the daemon writes itself. They
+/// have the patch ahead of the object it patches and tell the linker nothing of duplicate
+/// definitions: the daemon makes the object's definitions of what the patch defines weak
+/// before it links ([`weaken::replaced`]).
+static OWN_LINES: std::sync::LazyLock<std::sync::Mutex<FxHashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
 /// one rule naming the files of its modules, the root first, and a rule of no files for each.
@@ -5027,6 +5035,15 @@ fn link(
         return Err(RustcLinkedLost { why: declined, onto: true }.into());
     }
     let reading = whole::read(object)?;
+    if let Some(patch) = patch.filter(|_| lock(&OWN_LINES).contains(cmd)) {
+        weaken::replaced(object, patch).with_context(|| {
+            format!(
+                "making the definitions of {} that {} replaces weak",
+                object.display(),
+                patch.display()
+            )
+        })?;
+    }
     if let Some(binary) = splice {
         headerpad_ahead(binary)?;
     }
