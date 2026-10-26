@@ -448,7 +448,7 @@ fn census(db: &ide_db::RootDatabase, served: &Served) {
         for krate in ide_db::base_db::all_crates(db).iter().copied() {
             let class = if served.keys.contains_key(&krate) {
                 0
-            } else if crate::crate_root_file(db, krate)
+            } else if crate::crate_root_file(db, krate.into())
                 .as_deref()
                 .and_then(|it| it.to_str())
                 .is_some_and(|it| immutable(it).is_some())
