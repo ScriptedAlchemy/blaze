@@ -8,6 +8,16 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `crates/blaze-dist`: distributed compile's work set (claimed discovery, docs/distributed.md
+  section 4), an executor's side of it, executions of jobs with subscribers and attempts, and
+  section 5's admission, as sans-IO state machines over `blaze-wire`'s messages, with no IO,
+  thread or clock of their own. A deterministic simulation drives them through message loss,
+  duplication, reordering, partitions, executor deaths at any step, clock skew, differing front
+  ends and dropped findings, and checks the protocol's invariants (exclusive leases, fencing,
+  exactly-once accounting with every item terminal or `Local`, unknown names never dropped,
+  progress, `Main` first, reservations within capacity) over 10,000 seeds each; a failure prints
+  the seed that replays it.
+
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no

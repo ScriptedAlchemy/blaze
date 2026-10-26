@@ -1464,6 +1464,67 @@ a sans-IO state machine in `crates/blaze-dist`.
     lead that finds no helper free compiles alone, and two leads never hold helpers waiting for each
     other.
 
+### The protocol in `crates/blaze-dist`
+
+The work set, an executor's side of it, executions and admission are sans-IO state machines in
+`crates/blaze-dist` (unit dsm). Each call takes `now` and a `blaze-wire` request, answers with a
+`blaze-wire` answer or a refusal, and appends what it did to a log; nothing in the crate does IO,
+starts a thread or reads a clock. D0 drives them in the lead's process, D1 over HTTP, E3 and E4 in
+`ra-jit serve`. Where each rule of this section and section 5 lives:
+
+| Rule | Where |
+|---|---|
+| Join: the lead's `RootSet` authoritative, a first helper's provisional, a differing one fenced and refused, the work set restarted on the lead's list (step 1, c3-B2.3) | `work::WorkSet::join`, `join_lead`, `reset` |
+| Grant: names before roots, the first finder first; a holder's live lease asked for again is the same grant (step 2) | `WorkSet::lease`, `grant` |
+| Commit in one transition: outcomes, found names with their finder, conflicts, `Edge`s, packs, returned work back in the pool before the next generation, a replay answered as before (step 5, c3-B2.1) | `WorkSet::result`, `commit_name`, `register`, `shape` |
+| Done once the lead's root set is fixed, every root, name and edge terminal and no lease live (step 6) | `WorkSet::check_done` |
+| The fencing table: heartbeats, the progress timeout, a lost helper, a dead generation, the lead lost, the deadline (step 9, rb-M3) | `WorkSet::heartbeat`, `tick`, `lose`, `fence`, `new_attempt`, `end` |
+| Finder retention and `Lost` answers (c3-B2.2); an unknown name a conflict and `Local` (c3-B2 pre-index) | `holder::Holder::plan`, `committed`; `WorkSet::commit_name` |
+| A lead that misses three heartbeats, one reassignment, a dead attempt's calls refused, a second loss `Lost` ("Warm remote jobs") | `jobs::Execution::tick`, `assign`, `worker_events` |
+| One execution per `JobContent`, subscribers' own deadlines and policies, cancellation when the last leaves, a pull request's new push (E3, a-M6) | `jobs::Jobs::submit`, `Execution::unsubscribe`, `tick`, `jobs::local_action` |
+| Capacity and reservations, `Main` first, `Q`, trust matching, rebuild by drain (section 5, E4) | `admission::Admission` |
+
+What the crate fixes that this section leaves open, one line each:
+
+- A batch's items are its processed roots' in ascending index order, then its processed names'
+  in the grant's set order, one each. A result of another shape is refused `malformed` and its
+  lease revoked.
+- A holder's lease ends with the holder: 60 s with nothing heard from it (a heartbeat or any
+  work call) drops it and its findings, and it joins again as new. A lease revoked by the progress
+  timeout drops its holder the same way.
+- `Lost { lost-finding }` sends the name to another finder; `Lost { unknown-name }`, and a `Lost`
+  with any other reason, makes it terminal `Local` and counts a conflict.
+- An item reported `Exported` or `FromStore` with an `unnamed` request is committed `Local`.
+- A join with the same root set, and a lease asked for while one is live, are answered as before,
+  so a repeated message changes nothing.
+- Before the lead has joined, a helper whose root set differs from the provisional one is refused
+  `not-yet` with a retry time; after, `front-end-differs` for the attempt. A new lead whose root
+  set differs from the fixed one, after a reassignment, is authoritative too.
+- A lead that is loading its front end heartbeats; only a lead that stops heartbeating is lost.
+- Refusals keep section 8's codes, and each message starts with a stable token (`dead-lease`,
+  `attempt-moved`, `not-joined`, `not-yet`, ...) that an executor reads back.
+- Admission is strict per platform: the head of `Main`'s queue first, a pull request's job only
+  while no `Main` job waits, and a head that cannot run blocks its class. An idle executor takes a
+  job only if its reservation covers the job's measured need.
+
+**The simulation.** `blaze_dist::sim` runs the machines on one thread over a seeded scheduler and a
+virtual clock, as roadmap.md's simulation backend describes. The work simulation puts the
+coordinator (inside an `Execution`) and two to four executors over a network that, until a fault
+horizon, loses up to 25% of messages, duplicates up to 15%, delays them up to 3 s (and so reorders
+them) and partitions executors; executors die before or after any effect, clocks run at 0.8 to
+1.25 times (one at 0.05 to 0.2), one helper may have another front end (a swapped tie, another
+root, impure inputs), one may hang, findings are dropped and call sites disagree on tuples. One
+executor never dies. The checker holds, from the coordinator's log and the calls it sees: no root
+or name in two live leases; no result committed for a fenced or expired lease (expiry by the
+checker's own clock), of another attempt, or after Done; at Done every root, found name and edge
+terminal, from exactly one accepted result whose item is the lead's front end's, or in the lead's
+tail; an unknown name a conflict or `Local`; Done reached unless the lead was lost twice or no
+lead was left; a correct holder never told it is malformed. The jobs simulation checks capacity,
+`Main` first and first in first out, `Q`, trust matching, attempts, subscribers, stage order and
+that every execution ends. `cargo test -p blaze-dist` runs 10,000 seeds of each and prints the
+seed of a failure with the command that replays it; timings and the mutation check are in the
+unit's report.
+
 ### Export and ingestion (re-review B, B3)
 
 **What a batch end lacks today.** A batch ends holding `CompiledFunction`s, which are salsa memos
