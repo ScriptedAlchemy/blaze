@@ -1862,9 +1862,10 @@ inferred from what an action holds). Unit T1 holds blaze to that:
    that failed do. A test has one attempt, or three when the manifest lists it under `flaky`
    (Bazel's `--flaky_test_attempts=default`, **read**, research 7.10), or the number
    `RA_JIT_FLAKY_TEST_ATTEMPTS` says for all. One that passes on a later attempt is reported
-   `Flaky`, and the run passes by it. blaze does not keep such a pass, so the test runs at the next
-   run (**unverified** against Bazel, which marks the test FLAKY; kept conservative until the owner
-   says).
+   `Flaky`, and the run passes by it. The successful result is cached. Bazel keeps
+   `testPassed=true` and `cachable=true` when changing PASSED to FLAKY (**read**,
+   `StandaloneTestStrategy.java:228-239,678`); auto caching accepts that result
+   (`TestRunnerAction.java:576-588`).
 5. **Where blaze is stricter than Bazel already, and stays.** A test that reaches files or the
    environment runs every time where nothing records what it read (macOS), and on Linux runs in the
    sandbox, which records every path and reruns the test when one changed. When the manifest
@@ -3068,7 +3069,7 @@ harness says so (pending). Acceptance: a fixture workspace in which an unchanged
 on a second run; a changed test, a changed declared data file, a changed declared variable and a
 changed `--test-threads` each rerun; a test opted out with `no_cache` and with `external` runs
 every time; a test that fails is not skipped at the next run, nor after its code goes back to what
-passed; a test that fails once is retried, reported `Flaky`, and not kept, and with one attempt it
+passed; a test that fails once is retried, reported `Flaky`, and cached, and with one attempt it
 fails the run. From the reviews:
 - [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
   unknown effects instead of assuming libc is closed." Closed by the owner's decision, not by

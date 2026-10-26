@@ -190,7 +190,7 @@ pub(crate) fn tests(
         let mut command = test_command(state, test)?;
         let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
         let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
-        let pick = affected::pick(asked, state, test, identity.as_deref());
+        let pick = affected::pick(asked, state, test, identity.as_deref(), &command);
         if let Pick::Some { names: Some(names), total, .. } = &pick {
             left += total - names.len();
             if names.is_empty() {
@@ -240,28 +240,46 @@ pub(crate) fn tests(
         // A test that fails runs again while it has attempts left (Bazel's
         // `flaky_test_attempts`), and only the tests that failed do.
         let (mut attempt, mut retried) = (1, Vec::new());
-        while let (false, Some(failed)) = (status.success(), failures.clone())
-            && failed.iter().all(|it| attempts.of(&test.package, it) > attempt)
-        {
+        let mut exhausted = Vec::new();
+        while !status.success() {
+            let Some(failed) = failures.take() else { break };
+            let (retry, done) = retryable(&attempts, &test.package, failed, attempt);
+            exhausted.extend(done);
+            if retry.is_empty() {
+                failures = Some(exhausted.clone());
+                break;
+            }
             attempt += 1;
             say::status(
                 asked.flags.quiet,
                 "Retrying",
-                &format!("{running}: {} (attempt {attempt})", counted(failed.len())),
+                &format!("{running}: {} (attempt {attempt})", counted(retry.len())),
             );
-            retried.extend(failed.iter().cloned());
+            retried.extend(retry.iter().cloned());
             let mut again = test_command(state, test)?;
             if let Some(list) = &sandbox_list {
                 again.env(crate::test_harness::SANDBOXED, list);
             }
-            again.args(&asked.trailing).arg("--exact").args(&failed);
+            again.args(&asked.trailing).arg("--exact").args(&retry);
             (status, failures) = listing_failures(&mut again, None, state)
                 .with_context(|| format!("could not execute {shown}"))?;
         }
-        // Those that passed on a later attempt are flaky: the run passes by them, and what
-        // took more than one attempt is not kept as a pass.
+        if status.success() && !exhausted.is_empty() {
+            failures = Some(exhausted);
+        } else if let Some(failures) = failures.as_mut() {
+            failures.extend(exhausted);
+            failures.sort();
+            failures.dedup();
+        }
+        let success = status.success() && failures.as_ref().is_none_or(Vec::is_empty);
+        // Those that passed on a later attempt are flaky, but still passed: Bazel's auto
+        // caching reuses a successful result even when it took retries.
         retried.sort();
         retried.dedup();
+        if !status.success() && failures.is_none() {
+            // A crashed retry has no summary proving which of its tests passed.
+            retried.clear();
+        }
         retried.retain(|it| !failures.as_ref().is_some_and(|failed| failed.contains(it)));
         if !retried.is_empty() {
             let names = retried.join(", ");
@@ -272,17 +290,13 @@ pub(crate) fn tests(
             );
         }
         match pick {
-            Pick::Some { mut passed, names, .. } if !status.success() => {
-                passed.retried(&retried);
+            Pick::Some { passed, names, .. } if !success => {
                 passed.failed(names.as_deref(), failures.as_deref())
             }
-            Pick::Some { mut passed, .. } => {
-                passed.retried(&retried);
-                passed.passed()
-            }
+            Pick::Some { passed, .. } => passed.passed(),
             Pick::Asked => {}
         }
-        if !status.success() {
+        if !success {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
@@ -314,6 +328,16 @@ pub(crate) fn tests(
             Ok(FAILED)
         }
     }
+}
+
+/// A failure that exhausted its own attempts must not prevent another test from retrying.
+fn retryable(
+    attempts: &affected::Attempts,
+    package: &str,
+    failed: Vec<String>,
+    attempt: usize,
+) -> (Vec<String>, Vec<String>) {
+    failed.into_iter().partition(|name| attempts.of(package, name) > attempt)
 }
 
 /// Runs the doc tests with cargo, which hands them to ra-jit in rustdoc's place: ra-jit
@@ -453,6 +477,18 @@ pub(crate) fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::failures;
+
+    #[test]
+    fn a_non_flaky_failure_does_not_block_a_flaky_tests_attempts() {
+        let attempts = super::affected::Attempts::with_flaky(&["flaky"]);
+        let failed = ["ordinary", "flaky"].map(str::to_owned).to_vec();
+        let (retry, exhausted) = super::retryable(&attempts, "p", failed, 1);
+        assert_eq!(retry, ["flaky"]);
+        assert_eq!(exhausted, ["ordinary"]);
+        let (retry, exhausted) = super::retryable(&attempts, "p", retry, 3);
+        assert!(retry.is_empty());
+        assert_eq!(exhausted, ["flaky"]);
+    }
 
     #[test]
     fn the_summary_names_the_failures() {

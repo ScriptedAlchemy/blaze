@@ -23,6 +23,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use serde::Deserialize;
@@ -123,12 +124,6 @@ pub(crate) struct Passed {
 }
 
 impl Passed {
-    /// Forgets that the tests `names` passed, which passed on a later attempt: a result that
-    /// took more than one is not kept, so that they run again.
-    pub(crate) fn retried(&mut self, names: &[String]) {
-        names.iter().for_each(|it| _ = self.tests.remove(it));
-    }
-
     /// Forgets that the tests `failed` passed, or, when the program did not say which failed,
     /// all the tests `ran` (all of them when `None`): each runs until it passes again, even
     /// as its code goes back to what passed before. The others that ran passed.
@@ -168,6 +163,7 @@ pub(crate) fn pick(
     state: &State,
     test: &Program,
     sandbox: Option<&str>,
+    command: &Command,
 ) -> Pick {
     if !on() || !asked.positional.is_empty() || !plain(&asked.trailing) {
         return Pick::Asked;
@@ -182,8 +178,11 @@ pub(crate) fn pick(
         .map(|(identity, name)| (name, identity))
         .collect();
     let manifest = Manifest::read(&state.root);
-    let programs =
-        format!("{}{}", programs_run_by(state, test), manifest.given(&state.root, &asked.trailing));
+    let programs = format!(
+        "{}{}",
+        programs_run_by(state, test),
+        manifest.given(&state.root, &asked.trailing, command)
+    );
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -333,11 +332,13 @@ impl Manifest {
     /// contents of the files of `data` (and which are not there), and the value of each
     /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
     /// pass was under another runs.
-    fn given(&self, root: &Path, trailing: &[String]) -> String {
+    fn given(&self, root: &Path, trailing: &[String], command: &Command) -> String {
         let Ok(declared) = &self.0 else { return "+unreadable".to_owned() };
         let mut hash = Sha256::new();
         hash.update(b"threads\0");
         hash.update(test_threads(trailing).unwrap_or_default().as_bytes());
+        hash.update([0]);
+        hash.update(std::env::var_os("RUST_TEST_THREADS").unwrap_or_default().as_encoded_bytes());
         hash.update(b"\0data\0");
         for path in &declared.data {
             hash.update(path.as_bytes());
@@ -354,9 +355,15 @@ impl Manifest {
         for name in names {
             hash.update(name.as_bytes());
             hash.update([0]);
-            match std::env::var(name) {
-                Ok(value) => hash.update(format!("={value}")),
-                Err(_) => hash.update("unset"),
+            let value = command.get_envs().find(|(key, _)| *key == name);
+            let value = value
+                .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()));
+            match value {
+                Some(value) => {
+                    hash.update(b"set\0");
+                    hash.update(value.as_encoded_bytes());
+                }
+                None => hash.update(b"unset"),
             }
             hash.update([0]);
         }
@@ -437,6 +444,17 @@ pub(crate) fn attempts(state: &State) -> Attempts {
 }
 
 impl Attempts {
+    #[cfg(test)]
+    pub(super) fn with_flaky(names: &[&str]) -> Self {
+        Self {
+            all: None,
+            manifest: Manifest(Ok(Declared {
+                flaky: names.iter().map(|it| (*it).to_owned()).collect(),
+                ..Declared::default()
+            })),
+        }
+    }
+
     /// The attempts of the test `name` of `package`: the number asked for, or, as Bazel's
     /// `default` has it, three for a test the manifest marks `flaky` and one for the others.
     pub(crate) fn of(&self, package: &str, name: &str) -> usize {
@@ -518,7 +536,7 @@ mod tests {
         let declared = manifest("data = [\"data\", \"missing.txt\"]\nenv = [\"T1_GIVEN\"]\n");
         let given = |it: &Manifest, args: &[&str]| {
             let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
-            it.given(&dir, &args)
+            it.given(&dir, &args, &Command::new("test"))
         };
         let before = given(&declared, &[]);
         assert_eq!(before, given(&declared, &["--nocapture"]), "display options are not it");
@@ -539,6 +557,13 @@ mod tests {
         std::fs::remove_file(dir.join("missing.txt")).unwrap();
         assert_eq!(before, given(&declared, &[]));
         assert_ne!(before, given(&manifest(""), &[]));
+        let mut command = Command::new("test");
+        command.env("T1_GIVEN", "configured");
+        assert_ne!(
+            before,
+            declared.given(&dir, &[], &command),
+            "the effective test environment is keyed"
+        );
         _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -557,13 +582,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_that_took_a_retry_is_not_kept() {
+    fn successful_results_are_kept_and_failures_are_removed() {
         let dir = std::env::temp_dir().join(format!("ra-jit-retried-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tests = [("a", "1"), ("b", "2")].map(|(n, i)| (n.to_owned(), i.to_owned())).into();
-        let mut passed = Passed { file: dir.join(PASSED), tests, kept: None };
-        passed.retried(&["a".to_owned()]);
-        passed.passed();
+        let passed = Passed { file: dir.join(PASSED), tests, kept: None };
+        passed.failed(None, Some(&["a".to_owned()]));
         assert_eq!(std::fs::read_to_string(dir.join(PASSED)).unwrap(), "2\tb\n");
         _ = std::fs::remove_dir_all(&dir);
     }

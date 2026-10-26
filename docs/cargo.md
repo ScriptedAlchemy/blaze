@@ -236,8 +236,8 @@ test out. A test that failed is not kept as a pass, whatever its code goes back 
 `RA_JIT_FLAKY_TEST_ATTEMPTS` is how many times a test that fails is run in all (Bazel's
 `--flaky_test_attempts`): a number, or `default` for three of a test under `flaky` and one of
 the others, which it is when it is not set. Only the tests that failed run again, `Retrying` says
-so, and one that passes on a later attempt is `Flaky`: the run passes by it, and it is not kept as
-a pass, so it runs at the next run.
+so, and one that passes on a later attempt is `Flaky`: the run passes by it, and its successful
+result is cached, as in Bazel. A failure with no attempts left does not block another test's retries.
 
 While cargo builds, a spare worker already loads the workspace, resolves it and compiles the
 functions of each crate cargo is done with on a quarter of the cores, and reads the symbols of

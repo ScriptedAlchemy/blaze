@@ -19,7 +19,7 @@ edited a step at a time, and checks which tests run after each. It holds blaze t
 - nothing is kept of a failed run, whatever the code goes back to;
 - a test that fails runs again while it has attempts left (`flaky` in the manifest, three, and
   `RA_JIT_FLAKY_TEST_ATTEMPTS`), a pass that took more than one attempt is reported `Flaky` and is
-  not kept.
+  kept as a successful result, as Bazel does.
 
 A test that reaches files or the environment runs every time where no sandbox records what it read
 (macOS), unless the manifest declares `data`: then the declaration is what is trusted, as in
@@ -91,6 +91,9 @@ CACHE = [
     ("its code back to what passed before", [("cache/src/lib.rs", "double(2), 5", "double(2), 4")], None, [], {},
      {"tests::unchanged"}, True),
     ("nothing edited", [], None, [], {}, NONE, True),
+    ("configured declared environment", [(".cargo/config.toml", 'T1_DECLARED = "first"', 'T1_DECLARED = "second"')],
+     None, [], {}, ALL, True),
+    ("configured environment unchanged", [], None, [], {}, NONE, True),
 ]
 # What has to be said (-v) at a step, by its position in CACHE.
 SAYS = {
@@ -105,7 +108,9 @@ class Run:
         self.code, self.out = code, out
         self.outcomes = RAN.findall(out)
         self.ran = {name for name, _ in self.outcomes}
-        self.failed = {name for name, end in self.outcomes if end == "FAILED"}
+        # Retry output includes a failure followed by a pass of the same test. Its final
+        # outcome, not whether it ever failed, decides the job's result.
+        self.failed = {name for name, end in dict(self.outcomes).items() if end == "FAILED"}
 
 
 class Harness:
@@ -155,6 +160,10 @@ class Harness:
         self.watchdog.client = lambda: proc.pid
         try:
             out, _ = proc.communicate(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
         finally:
             self.watchdog.client = None
         if self.watchdog.tripped:
@@ -173,7 +182,7 @@ class Harness:
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {self.home}")
+            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {self.home}\n{run.out[-4000:]}")
         if not positional:
             self.cargo("affected", package)
 
@@ -209,7 +218,7 @@ class Harness:
 
     def flaky(self):
         """A test that fails on its first attempt: retried while the manifest or the environment
-        gives it attempts, reported, and not kept as a pass for having taken two."""
+        gives it attempts, reported, and kept as a successful result."""
         self.write("blaze-tests.toml", FLAKY_MANIFEST)
         # Linux's sandbox keeps what a test writes to itself, and the test counts its attempts in a file.
         off = {"RA_JIT_SANDBOX": "off"}
@@ -224,10 +233,10 @@ class Harness:
             verdict = "THE TEST DID NOT FAIL ONCE AND THEN PASS"
         self.check("a test that fails once is retried, and passes", verdict)
         run = self.cargo("affected", "flaky", verbose=True, extra=off)
-        verdict = self.verdict(run, {"tests::flaky_once"}, True)
+        verdict = self.verdict(run, NONE, True)
         if verdict == "ok" and "Retrying" in run.out:
             verdict = "RETRIED"
-        self.check("what took two attempts is not kept: it runs, and passes", verdict)
+        self.check("what passed after two attempts is cached", verdict)
         self.check("nothing edited", self.verdict(self.cargo("affected", "flaky", extra=off), NONE, True))
         self.edit("flaky/data.txt", "declared", "declared again")
         os.remove(attempts)
@@ -239,6 +248,16 @@ class Harness:
         run = self.cargo("affected", "flaky", extra=off)
         self.check("the failure was not kept: it runs, and passes", self.verdict(run, {"tests::flaky_once"}, True))
         self.check("nothing edited", self.verdict(self.cargo("affected", "flaky", extra=off), NONE, True))
+        self.edit("flaky/src/lib.rs", "assert_eq!(1 + 1, 2)", "assert_eq!(1 + 1, 3)")
+        self.edit("flaky/data.txt", "declared again", "mixed failures")
+        os.remove(attempts)
+        run = self.cargo("affected", "flaky", verbose=True, extra=off)
+        verdict = self.verdict(run, both, False, [r"Retrying .*\(attempt 2\)", r"Flaky .*tests::flaky_once"])
+        if verdict == "ok" and [end for name, end in run.outcomes if name == "tests::flaky_once"] != ["FAILED", "ok"]:
+            verdict = "THE NON-FLAKY FAILURE BLOCKED THE FLAKY RETRY"
+        self.check("a non-flaky failure does not block a flaky retry", verdict)
+        run = self.cargo("affected", "flaky", extra=off)
+        self.check("only the exhausted failure runs again", self.verdict(run, {"tests::steady"}, False))
 
     def before(self):
         """The opt-out and the declared inputs with the ra-jit before the unit: ignored."""
@@ -262,8 +281,9 @@ class Harness:
 
 
 def tools(bin_dir):
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {bin_dir}/ra-jit")
+    for name in ("cargo-ra-jit", "ra-jit-rustc"):
+        if not os.path.exists(os.path.join(bin_dir, name)):
+            raise SystemExit(f"no {name} beside {bin_dir}/ra-jit; supply the complete built tool directory")
     if SANDBOXED:
         probe = subprocess.run([os.path.join(bin_dir, "ra-jit"), "sandbox", "--probe"], capture_output=True, text=True)
         if probe.returncode != 0:
@@ -313,6 +333,9 @@ def self_test():
     run = Run(0, "test tests::a ... ok\ntest tests::b ... FAILED\ntest tests::c ... ignored\nnoise\n")
     if run.ran != {"tests::a", "tests::b", "tests::c"} or run.failed != {"tests::b"}:
         wrong.append("the parsing of libtest's lines is wrong")
+    retried = Run(0, "test a ... FAILED\ntest b ... FAILED\ntest a ... ok\n")
+    if retried.failed != {"b"}:
+        wrong.append("a passed retry was counted as a final failure")
     for at in SAYS:
         if not 0 <= at < len(CACHE) or "opt" not in CACHE[at][0]:
             wrong.append(f"SAYS names step {at}, which is not one that opts a test out")
