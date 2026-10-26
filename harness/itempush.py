@@ -40,8 +40,11 @@ pub fn pick() -> u32 {
     value() + tag!() + e::at() + shapes::Sq::SIDES
 }
 
-pub trait Area {
+pub trait Sides {
     const SIDES: u32 = 4;
+}
+
+pub trait Area {
     fn area(&self) -> u32;
     fn twice(&self) -> u32 {
         self.area() * 2
@@ -57,7 +60,7 @@ FILES = {
     "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
     "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n",
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
-    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
+    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
     "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
 }
