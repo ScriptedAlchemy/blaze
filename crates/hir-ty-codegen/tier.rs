@@ -803,7 +803,6 @@ fn build_body(
 /// Compiles the function `asked` names at the level it asks for: [`prepare`], then
 /// [`Prepared::finish`] with no counters to count in.
 pub fn compile(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Tiered, String> {
-    let _permit = super::budget::enter().map_err(|why| why.to_string())?;
     prepare(db, asked)?.finish(None)
 }
 
@@ -820,6 +819,7 @@ pub struct Prepared {
 /// Builds the IR of the function `asked` names, with what it builds in, for LLVM to compile
 /// at the level asked for once the database is let go of (an edit is then applied at once).
 pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepared, String> {
+    let _permit = super::budget::enter().map_err(|why| why.to_string())?;
     let start = std::time::Instant::now();
     if asked.level == Level::Cranelift {
         return Err("level 1 is what every build compiles".to_owned());
@@ -909,6 +909,7 @@ impl Prepared {
     /// counts in the counters from the first of `counters` on, if all it counts fits in the
     /// second, how many there are.
     pub fn finish(self, counters: Option<(u32, u32)>) -> std::result::Result<Tiered, String> {
+        let _permit = super::budget::enter().map_err(|why| why.to_string())?;
         let Prepared { level, profile, pending, serial, inlined, start } = self;
         let branches = branches(pending.func()).len() as u32;
         let counters = counters
