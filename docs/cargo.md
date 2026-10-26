@@ -214,6 +214,31 @@ working directory, for what a failure prints. Unset, or `all`, runs every test, 
 the daemon then hashes nothing. What is left (a hash that never compiles on a warm store, a
 watch mode) is [#227](https://github.com/indexable-inc/ra-jit/issues/227).
 
+This is Bazel's `cache_test_results=auto` and no more
+([distributed.md](distributed.md#6-distributed-tests)). The owner of a workspace says what it
+declares and what it opts out in `blaze-tests.toml` beside its `Cargo.toml`; every key is a list,
+and a key the file does not have is refused:
+
+    no_cache = ["tests::clock", "slow::*"]       # run every time (Bazel's no-cache tag)
+    external = ["tsel/it_net"]                   # the same (Bazel's external tag)
+    data = ["tsel/data.txt", "fixtures"]         # files and directories every test is given
+    env = ["TZ"]                                 # variables every test is given
+    flaky = ["tests::net"]                       # three attempts (Bazel's flaky = True)
+
+A test is named as libtest shows it, or `package/name`, with a `*` at either end for any text.
+What `data` holds and what `env` and `RA_JIT_TEST_ENV` name have in the environment, and
+`--test-threads`, are what a pass was under: a test passes again, or not, when none of them
+changed. A workspace that declares `data` has tests that reach files skipped where no sandbox
+records (macOS) while that is the same, which is Bazel's trust in a declaration and no more; one
+that does not has them run every time there, as above. A file that cannot be read opts every
+test out. A test that failed is not kept as a pass, whatever its code goes back to.
+
+`RA_JIT_FLAKY_TEST_ATTEMPTS` is how many times a test that fails is run in all (Bazel's
+`--flaky_test_attempts`): a number, or `default` for three of a test under `flaky` and one of
+the others, which it is when it is not set. Only the tests that failed run again, `Retrying` says
+so, and one that passes on a later attempt is `Flaky`: the run passes by it, and it is not kept as
+a pass, so it runs at the next run.
+
 While cargo builds, a spare worker already loads the workspace, resolves it and compiles the
 functions of each crate cargo is done with on a quarter of the cores, and reads the symbols of
 each library as cargo writes it. When cargo is done it reads the symbols of the executable
@@ -405,8 +430,9 @@ build a command line is, so changing one starts from a cargo build again.
 is: `affected` runs the tests an edit reached
 ([above](#running-only-the-tests-an-edit-reached)), `all` every test. The default is `all`.
 `RA_JIT_SANDBOX=off` runs the tests that reach outside their code every time instead of
-sandboxed, and `RA_JIT_TEST_ENV` names more variables a sandboxed test is given, by commas;
-both are read the same way.
+sandboxed, and `RA_JIT_TEST_ENV` names more variables a sandboxed test is given, by commas,
+and `RA_JIT_FLAKY_TEST_ATTEMPTS` says how many times a failing test is run
+([above](#running-only-the-tests-an-edit-reached)); all three are read the same way.
 
 These are read by the daemon when it starts, from the environment of whichever command
 started it. To change one, run `cargo ra-jit stop` first.

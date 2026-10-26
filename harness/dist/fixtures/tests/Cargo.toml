@@ -1,0 +1,6 @@
+# The workspace unit T1's harness (`harness/dist/tests.py --contract`) runs: Bazel's test-result
+# caching as blaze has it (docs/distributed.md, section 6). `cache` has the tests whose passes are
+# reused or not; `flaky` has one that fails on its first attempt.
+[workspace]
+members = ["cache", "flaky"]
+resolver = "2"

@@ -7,9 +7,25 @@
 //! every test, as cargo does. A test that reaches the world outside its code runs in a
 //! sandbox that records what it touched, and runs again only when that changed too
 //! ([`sandboxed`]); where there is no sandbox, it runs every time.
+//!
+//! This is Bazel's `cache_test_results=auto` (docs/distributed.md, section 6): a pass is reused
+//! while the test, the inputs its owner declared and the way it is run are the same. The owner
+//! declares them, and opts tests out, in [`MANIFEST`]:
+//!
+//! - `no_cache` (or `external`, which Bazel gives the same effect) names tests that run every
+//!   time, and a pass is never kept of a test that failed;
+//! - `data` and `env` are what every test is given, as Bazel's `data` and `--test_env` are:
+//!   they are part of what a pass was under, and a test that reaches files runs without a
+//!   sandbox when `data` is declared, trusting that declaration as Bazel does;
+//! - `flaky` names tests that get several attempts, and [`ATTEMPTS`] says how many a test gets
+//!   in all, as Bazel's `flaky = True` and `--flaky_test_attempts` do.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -19,6 +35,18 @@ use super::{
 };
 
 pub(crate) const VAR: &str = "RA_JIT_TESTS";
+
+/// The file in the root of the workspace where its owner opts tests out of the cache and
+/// declares what they are given ([`Manifest`]).
+pub(crate) const MANIFEST: &str = "blaze-tests.toml";
+
+/// How many times a test that fails is run in all, before it fails the run: a number, or
+/// `default` (Bazel's `--flaky_test_attempts` default) for [`FLAKY_ATTEMPTS`] of a test the
+/// manifest marks `flaky` and one for the others.
+pub(crate) const ATTEMPTS: &str = "RA_JIT_FLAKY_TEST_ATTEMPTS";
+
+/// The attempts of a test marked `flaky`, as Bazel gives it.
+const FLAKY_ATTEMPTS: usize = 3;
 
 /// The file beside a program of tests with the tests that passed, one a line: what
 /// [`plan::REACH`] said of the test then, a tab and its name.
@@ -95,6 +123,12 @@ pub(crate) struct Passed {
 }
 
 impl Passed {
+    /// Forgets that the tests `names` passed, which passed on a later attempt: a result that
+    /// took more than one is not kept, so that they run again.
+    pub(crate) fn retried(&mut self, names: &[String]) {
+        names.iter().for_each(|it| _ = self.tests.remove(it));
+    }
+
     /// Forgets that the tests `failed` passed, or, when the program did not say which failed,
     /// all the tests `ran` (all of them when `None`): each runs until it passes again, even
     /// as its code goes back to what passed before. The others that ran passed.
@@ -147,7 +181,9 @@ pub(crate) fn pick(
         .filter_map(|it| it.split_once('\t'))
         .map(|(identity, name)| (name, identity))
         .collect();
-    let programs = programs_run_by(state, test);
+    let manifest = Manifest::read(&state.root);
+    let programs =
+        format!("{}{}", programs_run_by(state, test), manifest.given(&state.root, &asked.trailing));
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -158,8 +194,16 @@ pub(crate) fn pick(
             return Pick::Asked;
         }
         total += 1;
+        if let Some(why) = manifest.opts_out(&test.package, name) {
+            names.push(name.to_owned());
+            always.push(Always { name: name.to_owned(), why, path: None });
+            continue;
+        }
         let outside = hash.strip_prefix('~');
-        if hash == "-" || outside.is_some() && sandbox.is_none() {
+        // Without a sandbox to record what a test reads, the files it was declared to be given
+        // are all there is to go by.
+        let unrecorded = sandbox.is_none() && !manifest.declares_data();
+        if hash == "-" || outside.is_some() && unrecorded {
             names.push(name.to_owned());
             let why = parts.next().unwrap_or_default().to_owned();
             let path = parts.next().map(str::to_owned);
@@ -231,9 +275,188 @@ fn programs_run_by(state: &State, test: &Program) -> String {
     format!("-{hex}")
 }
 
+/// What the owner wrote in [`MANIFEST`], or why it can't be read.
+struct Manifest(Result<Declared, String>);
+
+/// The keys of [`MANIFEST`]. Each is a list; a test is named by its name as libtest shows it
+/// or `package/name`, and a `*` at either end stands for any text.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct Declared {
+    /// Tests that run every time: Bazel's `no-cache` tag.
+    no_cache: Vec<String>,
+    /// Tests that run every time: Bazel's `external` tag, which has the same effect here.
+    external: Vec<String>,
+    /// Files and directories every test is given, relative to the manifest: Bazel's `data`.
+    data: Vec<String>,
+    /// Variables of the environment every test is given: Bazel's `--test_env`.
+    env: Vec<String>,
+    /// Tests that get [`FLAKY_ATTEMPTS`]: Bazel's `flaky = True`.
+    flaky: Vec<String>,
+}
+
+impl Manifest {
+    fn read(root: &Path) -> Manifest {
+        let file = root.join(MANIFEST);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Manifest(Ok(Declared::default()));
+            }
+            Err(error) => return Manifest(Err(format!("{}: {error}", file.display()))),
+        };
+        // A key it does not have is refused rather than ignored: a typo would leave a test
+        // cached that its owner opted out.
+        Manifest(toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display())))
+    }
+
+    /// Why the owner has the test `name` of `package` run every time, if it does. A manifest
+    /// that can't be read opts every test out: nothing is known of which it marks.
+    fn opts_out(&self, package: &str, name: &str) -> Option<String> {
+        let declared = match &self.0 {
+            Ok(declared) => declared,
+            Err(why) => return Some(format!("`{MANIFEST}` can't be read ({why})")),
+        };
+        let tags = [("no_cache", &declared.no_cache), ("external", &declared.external)];
+        tags.into_iter().find_map(|(tag, names)| {
+            let named = names.iter().find(|it| names_test(it, package, name))?;
+            Some(format!("`{MANIFEST}` opts it out of the cache (`{tag}`: `{named}`)"))
+        })
+    }
+
+    /// Whether the owner declared files the tests are given.
+    fn declares_data(&self) -> bool {
+        self.0.as_ref().is_ok_and(|it| !it.data.is_empty())
+    }
+
+    /// What stands for how the tests are run and what they are given: `--test-threads`, the
+    /// contents of the files of `data` (and which are not there), and the value of each
+    /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
+    /// pass was under another runs.
+    fn given(&self, root: &Path, trailing: &[String]) -> String {
+        let Ok(declared) = &self.0 else { return "+unreadable".to_owned() };
+        let mut hash = Sha256::new();
+        hash.update(b"threads\0");
+        hash.update(test_threads(trailing).unwrap_or_default().as_bytes());
+        hash.update(b"\0data\0");
+        for path in &declared.data {
+            hash.update(path.as_bytes());
+            hash.update([0]);
+            feed(&mut hash, &root.join(path));
+        }
+        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+        let mut names: Vec<&str> =
+            declared.env.iter().map(String::as_str).chain(passed.split(',')).collect();
+        names.retain(|it| !it.trim().is_empty());
+        names.sort_unstable();
+        names.dedup();
+        hash.update(b"env\0");
+        for name in names {
+            hash.update(name.as_bytes());
+            hash.update([0]);
+            match std::env::var(name) {
+                Ok(value) => hash.update(format!("={value}")),
+                Err(_) => hash.update("unset"),
+            }
+            hash.update([0]);
+        }
+        let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
+        format!("+{hex}")
+    }
+
+    fn marks_flaky(&self, package: &str, name: &str) -> bool {
+        let flaky = self.0.as_ref().map(|it| &it.flaky[..]).unwrap_or_default();
+        flaky.iter().any(|it| names_test(it, package, name))
+    }
+}
+
+/// Whether `pattern`, a name as libtest shows it or `package/name`, names the test.
+fn names_test(pattern: &str, package: &str, name: &str) -> bool {
+    glob(pattern, name) || glob(pattern, &format!("{package}/{name}"))
+}
+
+/// Whether `text` is `pattern`, which may have a `*` at its start or at its end for any text.
+fn glob(pattern: &str, text: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        _ if pattern == "*" => true,
+        (Some(tail), _) if !tail.contains('*') => text.ends_with(tail),
+        (_, Some(head)) if !head.contains('*') => text.starts_with(head),
+        _ => pattern == text,
+    }
+}
+
+/// The value after `--test-threads` in what follows `--`, which is how the tests are run that
+/// can change how they end.
+fn test_threads(trailing: &[String]) -> Option<&str> {
+    let mut args = trailing.iter();
+    while let Some(arg) = args.next() {
+        match arg.strip_prefix("--test-threads=") {
+            Some(value) => return Some(value),
+            None if arg == "--test-threads" => return args.next().map(String::as_str),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Hashes what is at `path`: nothing, a file's bytes, or a directory's names and what is in them.
+fn feed(hash: &mut Sha256, path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else { return hash.update(b"absent") };
+    if meta.is_dir() {
+        hash.update(b"dir");
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(|it| it.ok().map(|it| it.file_name()))
+            .collect();
+        names.sort();
+        for name in names {
+            hash.update(name.as_encoded_bytes());
+            hash.update([0]);
+            feed(hash, &path.join(name));
+        }
+    } else {
+        hash.update(b"file");
+        match std::fs::File::open(path) {
+            Ok(mut file) => _ = std::io::copy(&mut file, hash),
+            Err(_) => hash.update(b"unreadable"),
+        }
+    }
+}
+
+/// How many attempts each test gets before it fails the run.
+pub(crate) struct Attempts {
+    /// What [`ATTEMPTS`] says, when it says a number.
+    all: Option<usize>,
+    manifest: Manifest,
+}
+
+pub(crate) fn attempts(state: &State) -> Attempts {
+    let all = std::env::var(ATTEMPTS).ok().and_then(|it| it.trim().parse().ok());
+    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(&state.root) }
+}
+
+impl Attempts {
+    /// The attempts of the test `name` of `package`: the number asked for, or, as Bazel's
+    /// `default` has it, three for a test the manifest marks `flaky` and one for the others.
+    pub(crate) fn of(&self, package: &str, name: &str) -> usize {
+        match self.all {
+            Some(all) => all,
+            None if self.manifest.marks_flaky(package, name) => FLAKY_ATTEMPTS,
+            None => 1,
+        }
+    }
+
+    /// Whether some test may get more than one, so that failures have to be listed.
+    pub(crate) fn any(&self) -> bool {
+        self.all.is_some_and(|it| it > 1)
+            || self.all.is_none() && self.manifest.0.as_ref().is_ok_and(|it| !it.flaky.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::plain;
+    use super::*;
 
     fn of(args: &[&str]) -> bool {
         plain(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())
@@ -248,5 +471,100 @@ mod tests {
         assert!(!of(&["--list"]));
         assert!(!of(&["--test-threads"]));
         assert!(!of(&["some_test"]));
+    }
+
+    fn manifest(text: &str) -> Manifest {
+        Manifest(toml::from_str(text).map_err(|error| error.to_string()))
+    }
+
+    #[test]
+    fn a_name_opts_a_test_out_the_way_bazels_tags_do() {
+        let manifest = manifest(
+            "no_cache = [\"tests::clock\", \"slow::*\"]\nexternal = [\"tsel/it_net\", \"*::net\"]\n",
+        );
+        let why = |package, name| manifest.opts_out(package, name);
+        assert!(why("tsel", "tests::clock").unwrap().contains("`no_cache`"));
+        assert!(why("other", "slow::sort").is_some());
+        assert!(why("tsel", "it_net").unwrap().contains("`external`"));
+        assert!(why("other", "it_net").is_none());
+        assert!(why("other", "a::net").is_some());
+        assert!(why("tsel", "tests::plain").is_none());
+        // What can't be read opts every test out.
+        let broken = Manifest(Err("expected `=`".to_owned()));
+        assert!(broken.opts_out("tsel", "tests::plain").unwrap().contains("can't be read"));
+    }
+
+    #[test]
+    fn the_manifest_is_read_from_the_root_and_refuses_what_it_does_not_have() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Manifest::read(&dir).0.is_ok_and(|it| it.no_cache.is_empty()));
+        std::fs::write(dir.join(MANIFEST), "no_cache = [\"a\"]\ndata = [\"d\"]\nflaky = [\"f\"]\n")
+            .unwrap();
+        let read = Manifest::read(&dir);
+        assert!(read.declares_data() && read.marks_flaky("p", "f") && !read.marks_flaky("p", "g"));
+        std::fs::write(dir.join(MANIFEST), "no_cash = [\"a\"]\n").unwrap();
+        assert!(Manifest::read(&dir).0.is_err());
+        std::fs::write(dir.join(MANIFEST), "no_cache = [\"a\"\n").unwrap();
+        assert!(Manifest::read(&dir).0.is_err());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pass_is_under_the_inputs_the_owner_declared_and_how_the_tests_are_run() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-given-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/a.txt"), "a").unwrap();
+        let declared = manifest("data = [\"data\", \"missing.txt\"]\nenv = [\"T1_GIVEN\"]\n");
+        let given = |it: &Manifest, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+            it.given(&dir, &args)
+        };
+        let before = given(&declared, &[]);
+        assert_eq!(before, given(&declared, &["--nocapture"]), "display options are not it");
+        assert_ne!(before, given(&declared, &["--test-threads=1"]));
+        assert_eq!(
+            given(&declared, &["--test-threads=1"]),
+            given(&declared, &["--test-threads", "1"])
+        );
+        std::fs::write(dir.join("data/a.txt"), "b").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a declared file changed");
+        std::fs::write(dir.join("data/a.txt"), "a").unwrap();
+        assert_eq!(before, given(&declared, &[]));
+        std::fs::write(dir.join("data/new.txt"), "").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a file was added to a declared directory");
+        std::fs::remove_file(dir.join("data/new.txt")).unwrap();
+        std::fs::write(dir.join("missing.txt"), "").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a declared path that was absent exists");
+        std::fs::remove_file(dir.join("missing.txt")).unwrap();
+        assert_eq!(before, given(&declared, &[]));
+        assert_ne!(before, given(&manifest(""), &[]));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_test_gets_the_attempts_asked_for_or_bazels_default() {
+        let flaky = manifest("flaky = [\"tests::net\"]\n");
+        let by_default = Attempts { all: None, manifest: flaky };
+        assert_eq!(by_default.of("p", "tests::net"), FLAKY_ATTEMPTS);
+        assert_eq!(by_default.of("p", "tests::plain"), 1);
+        assert!(by_default.any());
+        let asked = Attempts { all: Some(2), manifest: manifest("flaky = [\"tests::net\"]\n") };
+        assert_eq!((asked.of("p", "tests::net"), asked.of("p", "tests::plain")), (2, 2));
+        let once = Attempts { all: Some(1), manifest: manifest("flaky = [\"tests::net\"]\n") };
+        assert_eq!(once.of("p", "tests::net"), 1);
+        assert!(!once.any() && !Attempts { all: None, manifest: manifest("") }.any());
+    }
+
+    #[test]
+    fn a_pass_that_took_a_retry_is_not_kept() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-retried-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tests = [("a", "1"), ("b", "2")].map(|(n, i)| (n.to_owned(), i.to_owned())).into();
+        let mut passed = Passed { file: dir.join(PASSED), tests, kept: None };
+        passed.retried(&["a".to_owned()]);
+        passed.passed();
+        assert_eq!(std::fs::read_to_string(dir.join(PASSED)).unwrap(), "2\tb\n");
+        _ = std::fs::remove_dir_all(&dir);
     }
 }

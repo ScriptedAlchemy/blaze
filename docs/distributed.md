@@ -111,11 +111,12 @@ Three decisions of the program's owner bind this design:
   executor pays only if its front end is warm or shared: trusted builders are warm on `master`, a
   pull request's executors stay warm for its later pushes, and a front-end image of the dependency
   layer (#274) is mapped read-only instead of loaded.
-- **Tests are cached only when every input is declared or recorded.** A test that reaches time,
-  randomness (including `HashMap`'s seed), threads, sockets, unlisted processes or unlisted
-  foreign code always runs. Failures are never cached. An audit mode runs everything uncached and
-  revokes caching for any test whose cached pass it contradicts. tracedecay's flake policy
-  (fail) is kept.
+- **Tests are cached as Bazel caches them, and no further.** A pass is reused while the test, its
+  declared inputs and its run configuration are the same; a test opts out with a tag (`no_cache`,
+  `external`); a failure is never kept; a test that fails is retried up to the configured
+  attempts, as `flaky_test_attempts` does. Revision 3's stricter contract (an always-run
+  classifier for the clock, randomness, threads, sockets, spawns and foreign code, an audit mode
+  and sampling) is dropped under the owner's parity rule, below.
 - **Admission reserves measured memory and CPU** per executor and per job, `Main` first, a bounded
   queue, and stage timestamps on every job so a queue always has a named limiter. CPU and memory
   never enter a key. Disk is bounded on every tier, each with a default, a command and a check.
@@ -344,6 +345,12 @@ run each, hybrid.
   refused process fails the job if the job needed it. A job is never turned green by cargo.
   `RA_JIT_RUSTC_BASE=0` does not disable cargo's dispatch (review A B1; it only stops patching a
   rustc-built base, `main.rs:3686-3695`), so revision 1's reliance on it is dropped.
+- **Parity with Bazel and NativeLink.** blaze adds no capability to the part of the CI it replaces
+  that Bazel and NativeLink did not already provide (the owner's rule, 2026-10-26, given for unit
+  T1). Where revision 3 asked for more, as its test-cache contract did, the unit is narrowed to
+  Bazel's semantics and says what it leaves to the owner: section 6. What blaze already had
+  before this design (`RA_JIT_TESTS=affected` keying a test by what it reaches, and the Linux
+  sandbox that records what a test read) is not removed by it.
 - **Measurement before claims.** Every gate runs at least three times per arm, in one session, on
   the named machine, with median, spread and a limiter named from the phase lines
   (`RA_JIT_STATS`) or the job's stage timestamps. No ratio without a same-session baseline.
@@ -1829,34 +1836,60 @@ same no-rustc boundary.
 
 ### What is cached: the contract
 
-A pass is reused only when everything that could change the verdict was declared or recorded
-and is the same. Bazel caches passes under a declared-input key and limits the damage with an
-`external` tag, `--runs_per_test`, and never caching failures (research 7.10); blaze's key is
-recorded rather than declared, so its contract is stricter:
+blaze reuses the pass of a test as Bazel does with `--cache_test_results=auto`, and no further
+(the owner's parity rule). Bazel reruns a test only if it detects changes in the test or its
+dependencies, the test is tagged `external`, `--runs_per_test` asks for more runs, or it
+previously failed, and it never caches a failure (**read**, research 7.10:
+`TestConfiguration.java:169-183`, `TestRunnerAction.java:576-600`, `650-663`). Its key is the test
+action's digest: the program, the declared runfiles, the arguments, the environment and the
+platform; time, randomness and thread scheduling are not in it (**unverified**, research 7.10,
+inferred from what an action holds). Unit T1 holds blaze to that:
 
-1. **Statically closed.** The test's reach (`RA_JIT_TESTS=affected`'s analysis) touches none of:
-   time (`Instant`, `SystemTime`, `sleep`, timeouts), randomness (`getrandom`, `RandomState` and so
-   every default `HashMap`/`HashSet`), threads and synchronisation with timeouts, sockets
-   including loopback, process spawn other than the bundle's programs, foreign functions not in
-   the platform's C library, environment reads outside `RunSpec.env`. Today the classifier leaves
-   time, randomness, threads and locks out on purpose (`fncache.rs:315-318`); unit T1 adds them as
-   reasons to always run, not as reasons to cache.
-2. **Dynamically recorded.** On Linux the test ran in the sandbox, which recorded every path it
-   looked up, including failed lookups, with content, mode, length and link targets, and it wrote
-   only its temporary directory. The recorded set is its `InputManifest`. `/proc`, `/sys` and `/dev`
-   are not recorded (`sandbox.rs:64-67`), so a test that reads them always runs.
-3. **Not marked.** The owner's test manifest may mark tests always-run, like Bazel's `external`.
-4. **On macOS** there is no recording until unit E2's sandbox exists: only tests that pass rule 1
-   and read no file at all are cacheable; the rest always run.
-5. **Failures are never cached.** A failure is reported and the next run runs the test.
+1. **Reused.** A pass is reused while the test, the inputs its owner declared and how it is run
+   are the same. The owner declares inputs in `blaze-tests.toml` at the workspace root: `data`
+   (files and directories, as Bazel's `data`) and `env` (variables, as `--test_env`; the names
+   `RA_JIT_TEST_ENV` gives a sandboxed test count too). Their contents and values, and
+   `--test-threads`, are digested into what a pass was under, so a change to any of them reruns
+   every test. The test is what `RA_JIT_TESTS=affected` already keys it by: its code and what its
+   code reaches, which is finer than Bazel's key (the whole test binary) and was there before this
+   design.
+2. **Opt out.** `no_cache` and `external` in the same file name tests that run every time, as
+   Bazel's tags do. A name is a libtest name, `package/name`, or either with a `*` at an end.
+   A manifest that cannot be read opts every test out, and a key it does not have is refused.
+3. **Failures are never kept.** A failed test runs again at the next run, whatever its code went
+   back to.
+4. **Flaky tests.** A test that fails runs again while it has attempts left, and only the tests
+   that failed do. A test has one attempt, or three when the manifest lists it under `flaky`
+   (Bazel's `--flaky_test_attempts=default`, **read**, research 7.10), or the number
+   `RA_JIT_FLAKY_TEST_ATTEMPTS` says for all. One that passes on a later attempt is reported
+   `Flaky`, and the run passes by it. blaze does not keep such a pass, so the test runs at the next
+   run (**unverified** against Bazel, which marks the test FLAKY; kept conservative until the owner
+   says).
+5. **Where blaze is stricter than Bazel already, and stays.** A test that reaches files or the
+   environment runs every time where nothing records what it read (macOS), and on Linux runs in the
+   sandbox, which records every path and reruns the test when one changed. When the manifest
+   declares `data`, the declaration is trusted instead, as in Bazel, where nothing records. A test
+   ra-jit cannot compile runs every time. None of this is new in T1.
 
-Anything else always runs. How many of tracedecay's tests the contract caches is measured, not
-assumed (gate GT): if `RandomState` alone makes most tests uncacheable, the next step is to seed
-it per test in the sandbox from a digest of `TestBaseKey` (domain-separated, so the seed is not
-part of what it keys), and to measure again. Time is not virtualised: tests that read the clock
-always run.
+**What revision 3 asked for and the owner dropped.** Revision 3 had the reach classifier name the
+clock, randomness (the seed of every default `HashMap`), threads and locks with timeouts, sockets,
+any child program, the environment, state of the machine (`getpid`, `uname`, `gethostname`,
+`sysconf`, `sched_getaffinity`), foreign functions off a list and assembly as reasons to always
+run, a daily audit that runs every test uncached and revokes the caching of any test it
+contradicts, and a 5% sample of cache hits run anyway. Bazel has none of them: its key leaves
+the clock, randomness and scheduling out, and its protection is the opt-out tag, the rerun of a
+failure and `--runs_per_test`. So they are not in blaze (review B's finding b-B2 is closed by that
+decision, not by code). The consequence is Bazel's: a test whose result turns on the clock, a
+default map's seed or the schedule can have a pass reused while its code and declared inputs are
+the same, and its owner marks it `no_cache` or `flaky`. Whether the classifier returns as
+something Bazel does not do is the owner's call; its design is section 6 and unit T1 as they stand in
+`1050f670`.
 
 ### Finding a pass on a machine that did not run it
+
+This section and unit T2 key a pass by what a run read (an `InputManifest`), which is a stricter
+key than Bazel's declared inputs. Under the parity rule they are for the owner to read again as
+declared inputs (T1 does not depend on them), and nothing in them has changed with T1.
 
 A fresh machine cannot compute a `TestKey` before it runs the test: the key holds what the run
 read (review B M6). So:
@@ -1886,13 +1919,12 @@ read (review B M6). So:
 
 ### Flakes and policy
 
-- tracedecay's policy stays: a failure fails the job; `retries = 1` with `flaky-result = "fail"`
-  is the nextest file's, and changing it is the owner's decision. Revision 1's "an unchanged flaky
-  test does not fail" is withdrawn (review B M10).
-- **Audit mode.** A scheduled run on `master` (daily) runs every test uncached and compares it
-  with the cached verdicts of the same `TestBaseKey`s. A test whose cached pass the audit
-  contradicts loses caching (it is marked always-run until a person clears it), and the report
-  names it. Besides the daily run, 5% of cache hits in every job are run anyway, picked at random.
+- The default is one attempt: a failure fails the job. tracedecay's file says `retries = 1` with
+  `flaky-result = "fail"`, and changing the job to Bazel's `flaky_test_attempts` (a test that
+  passes on a later attempt passes the job as FLAKY) is the owner's decision, the `flake-policy`
+  gate. Revision 1's "an unchanged flaky test does not fail" is withdrawn (review B M10).
+- A test the manifest lists under `flaky`, or a run with `RA_JIT_FLAKY_TEST_ATTEMPTS` above one,
+  retries as section "What is cached" says; with neither, nothing is retried.
 
 ### Tests that run rustc or cargo: an owner gate
 
@@ -3023,24 +3055,30 @@ Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and Docker 
 
 ### Phase 4: tests
 
-**T1 The cacheability contract.** Goal: section 6's rules 1 to 5. The reach classifier marks time,
-randomness, threads, sockets, unlisted spawns, foreign code and unlisted environment as always-run
-reasons; an always-run attribute from the owner's manifest; failures never cached; audit mode
-(`RA_JIT_TESTS=audit`) and 5% sampling. Files: `crates/hir-ty-codegen/fncache.rs`,
-`crates/ra-jit/src/cargo/affected.rs`, `harness/dist/fixtures/tests`. Depends: P0-A. Acceptance:
-a fixture of tests that read the clock, use a `HashMap`, sleep, open a loopback socket, spawn an
-unlisted tool, read an unlisted variable, and one pure test: only the pure one is skipped on a
-second run; audit runs all; a test whose cached pass the audit contradicts loses caching. From
-the reviews:
+**T1 The cacheability contract.** Goal: section 6's contract, which is Bazel's
+`cache_test_results=auto` and no more (the owner's parity rule, 2026-10-26, which narrowed this
+unit from revision 3's classifier, audit mode and sampling). A pass is reused while the test, its
+declared inputs (`data` files and `env` variables of `blaze-tests.toml`) and the run configuration
+(`--test-threads`) are unchanged; `no_cache` and `external` opt a test out; a failed run keeps
+nothing; a test that fails is retried up to its attempts (`flaky` in the manifest,
+`RA_JIT_FLAKY_TEST_ATTEMPTS`) and reported `Flaky`. Files: `crates/ra-jit/src/cargo/affected.rs`,
+`crates/ra-jit/src/cargo/run.rs`, `harness/dist/fixtures/tests`, `harness/dist/tests.py`. Depends:
+P0-A (no-rustc audit); the gate is not met, so the fixtures are not run under that audit, and the
+harness says so (pending). Acceptance: a fixture workspace in which an unchanged test is skipped
+on a second run; a changed test, a changed declared data file, a changed declared variable and a
+changed `--test-threads` each rerun; a test opted out with `no_cache` and with `external` runs
+every time; a test that fails is not skipped at the next run, nor after its code goes back to what
+passed; a test that fails once is retried, reported `Flaky`, and not kept, and with one attempt it
+fails the run. From the reviews:
 - [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
-  unknown effects instead of assuming libc is closed." Checked by: the classifier allows a foreign
-  call only from a listed set of C library functions known to read no machine state (string,
-  memory and math functions); every other foreign call, `getpid`, `uname`, `gethostname`,
-  `sysconf`, `sched_getaffinity` among them, and every child program, listed or not, makes a test
-  always-run; fixtures for each are always run on the second pass.
+  unknown effects instead of assuming libc is closed." Closed by the owner's decision, not by
+  code: Bazel's key has the same blind spots (research 7.10) and blaze holds to Bazel's. What
+  the unit checks instead is what Bazel gives the owner against them: the opt-out marker (a test
+  that reads the clock, `getpid` or a default map's seed and fails now and then is marked
+  `no_cache` or `flaky`) and the rerun of every failure.
 
 Verify: `python3 -I harness/testselect.py && python3 -I harness/dist/tests.py --contract`. Where:
-Mac; Docker for the sandbox.
+Mac; the sandbox steps on Linux (Docker), **not run** for this unit.
 
 **T2 Passes across machines.** Goal: `TestBaseKey`, `InputManifest` with metadata and absent
 paths, logical paths, the server's results index and lookup by namespace, validation on B;
@@ -3152,7 +3190,7 @@ them; it does not decide them.
 | `bazel-reserve` | how much of Ubuntu-main stays with Bazel and NativeLink | measure first: 32 cores and 64 GB reserved | section 4's memory table (`B` = 64 GB), E4 |
 | `pr-isolation` | user and sandbox per pull-request executor, or microVMs? | user and sandbox now, microVM later if a sandbox escape matters | section 2, E1, E2 |
 | `rustc-tests` | tracedecay's tests that run rustc or cargo: keep on Bazel, blaze's compatibility lane, or change the tests? | keep on Bazel | section 6, S2's inventory, GS; S4 only if chosen |
-| `flake-policy` | keep nextest's "flaky fails" for the blaze job? | keep | section 6, T3 |
+| `flake-policy` | keep nextest's "flaky fails" for the blaze job (one attempt), or set Bazel's `flaky_test_attempts` through `RA_JIT_FLAKY_TEST_ATTEMPTS`? | keep (one attempt) | section 6, T1, T3 |
 | `rules-rust-js` | does Rust built for JS and Python tests stay on rules_rust? | yes | section 10 |
 | `td-recursion` | add `#![recursion_limit = "256"]` to `tracedecay-code-index-runtime`? | the owner applies it; blaze runs patch it in throwaway worktrees until then | every tracedecay run |
 
@@ -3229,7 +3267,7 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 | a-m1, 760 packages | resolved | resolved | "What tracedecay runs today" |
 | a-m2, verify commands | partly | **moved to acceptance**: P0.7 [a-m2] and S2 [a-m2], with their verify commands changed | P0.7; S2 |
 | b-B1, signing oracle | resolved | resolved | section 2 |
-| b-B2, test cache inputs | partly | **moved to acceptance**: T1 [b-B2] (unknown effects always run), T2 [b-B2] (metadata and errno observed) | T1; T2 |
+| b-B2, test cache inputs | partly | **owner decision** (parity with Bazel, whose key has the same blind spots): T1 drops the always-run classifier and keeps the opt-out; **moved to acceptance**: T2 [b-B2] (metadata and errno observed), for the owner to re-scope under the same rule | section 6; T1; T2 |
 | b-M1, distribution, not relocation | resolved | resolved | sections 4, 5 |
 | b-M2, slot memory | resolved | resolved | sections 0, 4, 5 |
 | b-M3, OIDC claims and forks | resolved | resolved | section 2; C6 |
@@ -3327,7 +3365,7 @@ docs/distributed.md":
 | 1 | Trust: NativeLink mixes `master` and pull requests; `Main` only from slots that never ran pull-request code; disposable pull-request state | "What tracedecay runs today"; section 2 |
 | 2 | Job identity split; cancel when the last subscriber leaves | "Data shapes"; section 8; E3 |
 | 3 | Admission by reservations, `Main` first, stage timestamps, no CPU or memory in keys | section 5; E4 |
-| 4 | Tests: Bazel's precedent and limits, always-run, audit, failures never cached, read set with the verdict, runtime bundle, flake exemption the owner's | section 6; T1 to T3 |
+| 4 | Tests: Bazel's precedent and limits, the opt-out tag, flaky attempts, failures never cached (always-run classes, audit and sampling dropped under parity); read set with the verdict, runtime bundle, flake policy the owner's | section 6; T1 to T3 |
 | 5 | GC by record generation, completeness, leases | section 3; C7 |
 | 6 | Epoch in signed records; forced rebuild of one crate | section 2 "Records, epochs and repair" |
 | 7 | `cpu_count` in keys, one instance `main`, client uploads, plaintext gRPC, 5.2 GB inputs | "What tracedecay runs today" |

@@ -174,6 +174,7 @@ pub(crate) fn tests(
     let mut failed = Vec::new();
     let (mut left, mut always_run) = (0, 0);
     let sandbox = sandboxed::wanted(affected::on());
+    let attempts = affected::attempts(state);
     if let Some(Err(why)) = &sandbox {
         say::fallback(
             &format!("tests run outside a sandbox: {why}"),
@@ -186,11 +187,7 @@ pub(crate) fn tests(
         let shown = shown_path(&test.executable, cwd);
         let mut running = format!("{unit}{} ({shown})", source.display());
         let mut picked = Vec::new();
-        let mut command = Command::new(&test.executable);
-        configured(&mut command, state);
-        command.envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_built(&mut command)?;
+        let mut command = test_command(state, test)?;
         let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
         let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
         let pick = affected::pick(asked, state, test, identity.as_deref());
@@ -228,16 +225,61 @@ pub(crate) fn tests(
             }
         }
         command.args(asked.program_args()).args(&picked);
-        let ran = match &pick {
-            Pick::Some { .. } => listing_failures(&mut command, held.take(), state),
-            Pick::Asked => ended(&mut command, held.take(), state).map(|it| (it, None)),
+        // The tests a sandbox runs, which a run again of some of them is given too.
+        let sandbox_list = command
+            .get_envs()
+            .find(|(name, _)| *name == crate::test_harness::SANDBOXED)
+            .and_then(|(_, list)| list.map(|it| it.to_owned()));
+        let listing = matches!(pick, Pick::Some { .. }) || attempts.any();
+        let ran = match listing {
+            true => listing_failures(&mut command, held.take(), state),
+            false => ended(&mut command, held.take(), state).map(|it| (it, None)),
         };
-        let (status, failures) = ran.with_context(|| format!("could not execute {shown}"))?;
+        let (mut status, mut failures) =
+            ran.with_context(|| format!("could not execute {shown}"))?;
+        // A test that fails runs again while it has attempts left (Bazel's
+        // `flaky_test_attempts`), and only the tests that failed do.
+        let (mut attempt, mut retried) = (1, Vec::new());
+        while let (false, Some(failed)) = (status.success(), failures.clone())
+            && failed.iter().all(|it| attempts.of(&test.package, it) > attempt)
+        {
+            attempt += 1;
+            say::status(
+                asked.flags.quiet,
+                "Retrying",
+                &format!("{running}: {} (attempt {attempt})", counted(failed.len())),
+            );
+            retried.extend(failed.iter().cloned());
+            let mut again = test_command(state, test)?;
+            if let Some(list) = &sandbox_list {
+                again.env(crate::test_harness::SANDBOXED, list);
+            }
+            again.args(&asked.trailing).arg("--exact").args(&failed);
+            (status, failures) = listing_failures(&mut again, None, state)
+                .with_context(|| format!("could not execute {shown}"))?;
+        }
+        // Those that passed on a later attempt are flaky: the run passes by them, and what
+        // took more than one attempt is not kept as a pass.
+        retried.sort();
+        retried.dedup();
+        retried.retain(|it| !failures.as_ref().is_some_and(|failed| failed.contains(it)));
+        if !retried.is_empty() {
+            let names = retried.join(", ");
+            say::status(
+                asked.flags.quiet,
+                "Flaky",
+                &format!("{names}: passed on attempt {attempt}"),
+            );
+        }
         match pick {
-            Pick::Some { passed, names, .. } if !status.success() => {
+            Pick::Some { mut passed, names, .. } if !status.success() => {
+                passed.retried(&retried);
                 passed.failed(names.as_deref(), failures.as_deref())
             }
-            Pick::Some { passed, .. } => passed.passed(),
+            Pick::Some { mut passed, .. } => {
+                passed.retried(&retried);
+                passed.passed()
+            }
             Pick::Asked => {}
         }
         if !status.success() {
@@ -362,6 +404,16 @@ fn says_doc_tests(line: &[u8]) -> bool {
     }
     let name = plain.trim().strip_prefix("Doc-tests ");
     name.is_some_and(|it| !it.is_empty() && !it.contains(' '))
+}
+
+/// The command that runs the test executable of `test` as cargo does.
+fn test_command(state: &State, test: &Program) -> anyhow::Result<Command> {
+    let mut command = Command::new(&test.executable);
+    configured(&mut command, state);
+    command.envs(test.env.iter().cloned());
+    command.current_dir(&test.package_dir);
+    as_built(&mut command)?;
+    Ok(command)
 }
 
 fn counted(count: usize) -> String {
