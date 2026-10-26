@@ -4,8 +4,9 @@
 //! GC visits them, and each live value they refer, transitively, then removes
 //! those not marked. The sweep phase is done in parallel.
 //!
-//! The marking keeps the values it has reached and not visited yet in a work list, rather than
-//! visiting each as it reaches it: its stack does not grow with the depth of what it marks.
+//! The marking visits a value as it reaches it while the values it is visiting are fewer than
+//! [`DEPTH`] deep, and keeps one it reaches deeper in a work list that it visits from the top:
+//! its stack does not grow past [`DEPTH`] values, whatever the depth of what it marks.
 //!
 //! A value is a root when something besides its storage owns it (its strong count is
 //! more than one), and every value reached from a root is marked, whatever its own count.
@@ -91,9 +92,15 @@ pub trait GcInternedSliceVisit: SliceInternable {
     fn visit_slice(slice: &[Self::SliceType], gc: &mut GarbageCollector);
 }
 
+/// How many values deep the marking visits what it reaches before it keeps them for later: a
+/// type and its arguments are two, so most types are visited whole without the work list.
+const DEPTH: u32 = 64;
+
 #[derive(Default)]
 pub struct GarbageCollector {
     alive: FxHashSet<usize>,
+    /// How many values deep the value being visited is.
+    depth: u32,
     /// The values marked alive whose contents are not visited yet, the last marked first.
     pending: Vec<Pending>,
     storages: Vec<&'static (dyn Storage + Send + Sync)>,
@@ -181,9 +188,10 @@ impl GarbageCollector {
         }
     }
 
-    /// Marks a value reached from a live one, and when it was not marked before, has the
-    /// collector visit what it refers to. Returns `Break`: the caller does not visit the
-    /// value's contents itself, so marking a deep value does not take a deep stack.
+    /// Marks a value reached from a live one, and when it was not marked before, visits what
+    /// it refers to, or keeps it to visit later when the values being visited are [`DEPTH`]
+    /// deep. Returns `Break`: the caller does not visit the value's contents itself, so
+    /// marking a deep value does not take a deep stack.
     ///
     /// The value is marked even when it has owners of its own, which would make it a root:
     /// they may be dropped on another thread before its storage is scanned for roots, and the
@@ -196,7 +204,13 @@ impl GarbageCollector {
 
         let value = interned.as_raw();
         if self.alive.insert(value.addr()) {
-            self.pending.push(Pending { value: value.cast(), visit: visit_interned::<T> });
+            if self.depth < DEPTH {
+                self.depth += 1;
+                interned.get().visit_with(self);
+                self.depth -= 1;
+            } else {
+                self.pending.push(Pending { value: value.cast(), visit: visit_interned::<T> });
+            }
         }
         ControlFlow::Break(())
     }
@@ -210,7 +224,16 @@ impl GarbageCollector {
 
         let value = interned.as_raw();
         if self.alive.insert(value.addr()) {
-            self.pending.push(Pending { value: value.cast(), visit: visit_interned_slice::<T> });
+            if self.depth < DEPTH {
+                self.depth += 1;
+                let slice = interned.get();
+                T::visit_header(&slice.header.header, self);
+                T::visit_slice(&slice.slice, self);
+                self.depth -= 1;
+            } else {
+                let visit = visit_interned_slice::<T>;
+                self.pending.push(Pending { value: value.cast(), visit });
+            }
         }
         ControlFlow::Break(())
     }
@@ -702,8 +725,8 @@ mod tests {
 
     #[test]
     fn a_chain_deeper_than_the_stack_is_marked() {
-        // The marking visits what it reaches from a work list rather than by recursing into
-        // each value it reaches, so its stack does not grow with the depth of what it marks.
+        // The marking recurses into what it reaches only `DEPTH` values deep, and keeps what is
+        // deeper in a work list, so its stack does not grow with the depth of what it marks.
         struct Link {
             id: u32,
             next: Option<InternedRef<'static, Link>>,
