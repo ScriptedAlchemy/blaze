@@ -24,7 +24,7 @@ prints one JSON object {refused, digests{spec,platform,front_end,config,job_cont
 {command,asked,units}, spec, platform} and exits 0 (a spec), 2 (refused: the object is still
 printed) or 1 (any other error: a message on stderr); with `--unit-graph` it prints blaze's unit
 graph in the shape of `cargo build --unit-graph -Z unstable-options`; `--out` writes the spec's
-canonical CBOR. `ra-jit cargo spec run FILE` derives the flags and the environment from the spec
+canonical CBOR. `ra-jit cargo spec --run FILE` derives the flags and the environment from the spec
 alone, recomputes the spec, refuses (exit 2, `blaze: the tree does not match the spec: <field>`)
 when its digest differs and otherwise does what `ra-jit cargo <command>` does.
 
@@ -45,7 +45,7 @@ The arms:
                 here and nowhere else. `run` has no unit graph of its own in cargo and is left out;
                 cargo's `doctest` units are left out, as blaze-metadata's `Mode` has none (doc tests
                 are `RunSpec.doc`).
-  local (9)     `ra-jit cargo <command>` in a fresh copy of the fixture, and `ra-jit cargo spec run
+  local (9)     `ra-jit cargo <command>` in a fresh copy of the fixture, and `ra-jit cargo spec --run
                 <spec.cbor>` in another fresh copy of the same commit (with none of the case's
                 environment: the spec alone), each with a fresh CARGO_TARGET_DIR and RA_JIT_HOME:
                 the programs built, the tests run, the doc tests run, what the programs and the
@@ -1682,7 +1682,7 @@ class Ctx:
             sa, ra, da = self.local_run(case, ["cargo", *case.words], (at(copy_a), os.path.join(local, "run-a")),
                                         self.case_env(case), "command", shared)
             where = copy_b if self.args.spec_run_in == "root" else at(copy_b)
-            sb, rb, db = self.local_run(case, ["cargo", "spec", "run", res.cbor], (where, os.path.join(local, "run-b")),
+            sb, rb, db = self.local_run(case, ["cargo", "spec", "--run", res.cbor], (where, os.path.join(local, "run-b")),
                                         {}, "spec run", shared)
         finally:
             if not self.args.keep:
@@ -1723,7 +1723,7 @@ class Ctx:
         home = self.blaze.new_home()
         env = self.blaze.env(scrubbed_env(), home=home, target=os.path.join(copy, "..", "target-mm"),
                              cargo_home=self.cargo_home)
-        run = self.blaze.run(["cargo", "spec", "run", base.cbor], copy, env, merge=True)
+        run = self.blaze.run(["cargo", "spec", "--run", base.cbor], copy, env, merge=True)
         self.blaze.stop(home, copy, env)
         shutil.rmtree(copy, ignore_errors=True)
         said = run.out.strip().splitlines()[-1] if run.out.strip() else ""
@@ -2627,9 +2627,8 @@ def main():
     if rest[:1] == ["stop"]:
         return 0
     env = dict(os.environ)
-    # `spec run FILE.cbor` runs a spec; `spec run -- y` is the spec of a `run` command (the contract
-    # does not say how the two are told apart: the fake takes a name ending in .cbor for a file).
-    if rest[:1] == ["spec"] and rest[1:2] == ["run"] and len(rest) == 3 and rest[2].endswith(".cbor"):
+    # `spec --run FILE` runs a spec; `spec run -- y` is the spec of a `run` command.
+    if rest[:1] == ["spec"] and rest[1:2] == ["--run"] and len(rest) == 3:
         saved = json.load(open(rest[2]))
         for k in list(env):
             if k in CAPTURED or k.startswith("CARGO_PROFILE_"):
@@ -2997,7 +2996,7 @@ def self_test(args):
                     and c["env"]["RUST_BACKTRACE"] == "0" and c["env"]["RA_JIT_RUN_ID"] for c in guard),
                 f"every one of {len(calls)} runs had the memory guard, the run id and RUST_BACKTRACE=0")
         stops = [c for c in calls if c["args"][:2] == ["cargo", "stop"]]
-        homes = {c["env"]["RA_JIT_HOME"] for c in calls if c["args"][:3] == ["cargo", "spec", "run"]}
+        homes = {c["env"]["RA_JIT_HOME"] for c in calls if c["args"][:3] == ["cargo", "spec", "--run"]}
         t.check(len(stops) >= 2 * len(ctx.locals) and homes <= {s["env"]["RA_JIT_HOME"] for s in stops},
                 "the daemon of every local run is stopped, with its own RA_JIT_HOME", f"{len(stops)} stops, {len(ctx.locals)} local pairs")
         t.check(all(not os.path.exists(h) for h in ctx.blaze.homes), "the daemons' homes are deleted")
