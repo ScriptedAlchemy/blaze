@@ -12,7 +12,8 @@ takes a call from a trait's, a trait's default method called directly and throug
 a file written again with nothing changed, a module added that imports a macro a module that
 stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call in a file
 that is not edited now names instead of std's, and then not, and the import of a macro taken
-away from a module that is edited. After each step
+away from a module that is edited, an inherent constant that a path to the trait's now names,
+moved to a new file and taken away. After each step
 the program the daemon built prints what cargo's prints, or both builds fail.
 
 The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
@@ -36,10 +37,11 @@ use a::*;
 pub use b::scale;
 
 pub fn pick() -> u32 {
-    value() + tag!() + e::at()
+    value() + tag!() + e::at() + shapes::Sq::SIDES
 }
 
 pub trait Area {
+    const SIDES: u32 = 4;
     fn area(&self) -> u32;
     fn twice(&self) -> u32 {
         self.area() * 2
@@ -60,7 +62,8 @@ FILES = {
     "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
-C_RS, D_RS = "lib/src/c.rs", "lib/src/d.rs"
+C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
+SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
 INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
 # (step, edits); an edit is (file, old, new), with `None` for old to write the file whole.
 STEPS = [
@@ -91,6 +94,13 @@ STEPS = [
     ]),
     ("`#[macro_use]` taken off", [(LIB_RS, "#[macro_use]\nmod d;", "mod d;")]),
     ("a macro's import taken away", [(C_RS, "use crate::a::tag;\n\n", ""), (C_RS, "tag!()", "crate::a::tag!()")]),
+    ("inherent const shadows the trait's", [(SHAPES_RS, None, lambda text: text + SIDES)]),
+    ("inherent impl moved to a new file", [
+        (SHAPES_RS, SIDES, ""),
+        (F_RS, None, lambda _: SIDES.replace("impl Sq", "impl crate::shapes::Sq").lstrip()),
+        (LIB_RS, "mod e;\n", "mod e;\nmod f;\n"),
+    ]),
+    ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
 ]
 
 

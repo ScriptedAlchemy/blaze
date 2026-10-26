@@ -16,7 +16,7 @@ use hir_def::{
     expr_store::{Body, ExpressionStore, path::Path},
     hir::{Expr, Pat, type_ref::TypeRef},
     nameres::{crate_def_map, diagnostics::DefDiagnosticKind},
-    signatures::FunctionSignature,
+    signatures::{ConstSignature, FunctionSignature},
     visibility::Visibility,
 };
 use hir_expand::HirFileId;
@@ -465,6 +465,7 @@ impl Index {
                     Some(was) => {
                         was.kind.map_err(|why| refused(db, id, why, "changed"))?;
                         entry.kind.map_err(|why| refused(db, id, why, "changed"))?;
+                        changed_header(id).map_err(|why| refused(db, id, why, "changed"))?;
                         changed.insert(id);
                     }
                     None => {
@@ -512,6 +513,7 @@ impl Index {
             if was.erred || entry.erred || was.digest != entry.digest || was.refs != entry.refs {
                 was.kind.map_err(|why| refused(db, id, why, "named"))?;
                 entry.kind?;
+                changed_header(id).map_err(|why| refused(db, id, why, "named"))?;
                 changed.insert(id);
             }
             self.remove(id);
@@ -619,7 +621,9 @@ fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {
         _ => Ok(()),
     };
     match id {
-        ItemId::Impl(_) => Err("an impl"),
+        // An inherent impl gone or added is its items gone or added, named by their names.
+        ItemId::Impl(imp) if db.impl_trait(imp).is_some() => Err("an impl of a trait"),
+        ItemId::Impl(_) => Ok(()),
         ItemId::Trait(_) => Err("a trait"),
         ItemId::Macro(_) => Err("a macro"),
         ItemId::Function(it) => container(it.lookup(db).container),
@@ -632,12 +636,29 @@ fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {
     }
 }
 
-/// The name of a method of an impl: one added or taken away can be what a call of the name
-/// resolves to.
+/// The name of a function or constant of an impl: one added or taken away can be what a call
+/// of the name or a path to it through its type resolves to.
 fn method_name(db: &dyn HirDatabase, id: ItemId) -> Option<Symbol> {
-    let ItemId::Function(func) = id else { return None };
-    let ItemContainerId::ImplId(_) = func.lookup(db).container else { return None };
-    Some(FunctionSignature::of(db, func).name.symbol().clone())
+    match id {
+        ItemId::Function(func) => {
+            let ItemContainerId::ImplId(_) = func.lookup(db).container else { return None };
+            Some(FunctionSignature::of(db, func).name.symbol().clone())
+        }
+        ItemId::Const(konst) => {
+            let ItemContainerId::ImplId(_) = konst.lookup(db).container else { return None };
+            Some(ConstSignature::of(db, konst).name.as_ref()?.symbol().clone())
+        }
+        _ => None,
+    }
+}
+
+/// Why an item seen differently can't be pushed, beside what its kind says: what an impl's
+/// header is decides which calls its items take, and nothing here tells which.
+fn changed_header(id: ItemId) -> Result<(), &'static str> {
+    match id {
+        ItemId::Impl(_) => Err("an impl seen differently"),
+        _ => Ok(()),
+    }
 }
 
 /// The item of a trait an associated item of an impl of it is a value of.
