@@ -60,6 +60,13 @@ measurement, named) or **unverified** (our inference). No fix is made here; the 
   killed by the 24 GB cap at 25.6 GB footprint. Where the build would end is **unverified**:
   nothing went past 30.2 GB, and u1 reported the end of its completed run as a spare worker at 59.6 GB
   footprint.
+- **After ([section 8](#8-after-the-build-held-to-a-budget), unit u7-bound):** a build is now held
+  to `RA_JIT_WORKER_MEMORY`, by default `RA_JIT_MEMORY_MAX`. Under the guard the cold worker let
+  fewer threads compile from 12 GiB and stopped itself at 16,387 MB with 265,048 functions compiled,
+  where before it ran on to the 24 GB watchdog; the memos cut make it 11% smaller in footprint at the
+  same count. A whole build of tracedecay still needs more than 16 GiB in one revision; what holds the
+  bound back is the 10 GB the front end leaves before the build starts. With the nine crates at
+  `opt-level = 0` the worker builds nothing at load (**read**, one run each).
 
 ## What was done and not done
 
@@ -355,10 +362,228 @@ In the order that removes the most for the least. None is made here, and none is
   need more compiles than the rustc executable has symbols, or the later functions are larger.
 - **Whether the 9 crates are all of it.** With the 9 workspace crates at `opt-level = 0` the plan
   would give the worker rustc's executable and it would compile nothing first, as nushell's does.
-  Not run: **unverified**. It would not make the daemon's own base cheap, only later.
+  Not run: **unverified**. It would not make the daemon's own base cheap, only later. (Run since,
+  and **read**: [section 8](#the-opt-level-hypothesis-confirmed).)
 - **The proportion to other projects** on this Mac ([section 3](#3-is-tracedecay-proportionally-worse)).
 - **The time the unbounded build takes in full.** u1's completed cold run took 1,094 s and the spare
   worker was 59.6 GB at its end (**reported**).
+
+## 8. After: the build held to a budget
+
+2026-10-26, unit u7-bound, on `dist/main` at `f9b5da46` with the changes of its pull request
+(`dist/u7-bound`). The same Mac, the same tracedecay commit with the `recursion_limit` line (a
+worktree of its own, `/Users/bytedance/dev/td-u7`, with every workspace package's `node_modules`
+cloned copy-on-write from `~/dev/tracedecay`), the same command and guard, the same
+`harness/loadmem.py`. The before is run 3 above (`cold-noprof3`). The Mac was shared again: another
+unit held the heavy lock from 01:23 to 03:36, another session ran 54 `yes` processes (17 cores)
+from 01:55 to about 02:45, and the load average was 16 to 38 during the runs here. Byte counts do
+not depend on that; rates and durations do, and are named with it.
+
+### What was decided
+
+The brief offered three routes and the code decided between them (**read**, in the code):
+
+1. **No batches that release memory as they go, because inside one build nothing can be
+   released.** Every memo of a build stays until the next revision of the database: no query of
+   the code generator has an `lru`, an `lru` evicts only as a revision begins
+   (`reset_for_new_revision`, `docs/upstream/daemon-memory/`), and no revision can begin while a
+   build runs, since the build holds references into the memos (`ObjectCodegen<'a, 'db>`, its
+   `later` list of `&'db` compiled instances) until its object is made. A batch of
+   `compile_ahead` could hand its entries to the store, but it could not let go of anything. The
+   batch that does is a revision of its own: the follow-up below.
+2. **The memos nobody needs were cut, where that is safe.** The layout of a future and the
+   debugger's description of it read a monomorphized copy of the coroutine's whole body, which the
+   database kept for every instance (`monomorphized_runtime_mir_body_for_coroutine_query`, 1,525 MB
+   at the cap above, 1,458 MB of it `Vec<BasicBlock>::clone`). They now read the generic runtime
+   body, which the database keeps once per coroutine, and monomorphize only the types of the locals
+   held across yields (`hir_ty::mir::held_frame`): monomorphizing changes a body's types and not its
+   blocks, and `locals_held_across_yields` reads no type (`mir/held.rs`). `inlinable` is asked only
+   of a body small enough to inline (`small_mir`), so one too large leaves no memo and no edges
+   (`inlinable`'s values and edges were 1,304 MB at the cap). No `lru` was added: an `lru` on a query
+   with cycle handling needs the salsa patch of `docs/upstream/daemon-memory/`, which is not applied
+   ([memory.md](../research/memory.md), section 4, item 8).
+3. **A ceiling that holds: slow down, then stop.** `hir_ty_codegen::budget`, set once a process by
+   `memory::bound_builds` to `RA_JIT_WORKER_MEMORY`, by default what `RA_JIT_MEMORY_MAX` lets all
+   the workers hold. Every 100 ms one thread of `compile_ahead`, and of the eager compile of the roots
+   before it, reads the footprint. Past three quarters of the bound it purges jemalloc's free pages
+   (`memory::give_back`, at most once a second) and lets fewer threads compile, in proportion to what
+   is left of the bound, never none; past the bound the threads stop, nothing more goes in the
+   object, and the build fails with `out of memory to build in: the build held N MB, more than the M
+   MB the process may`. Nothing is handed to rustc or cargo. The worker also gives back what name
+   resolution freed before its first build, and the daemon's ceiling stops a worker that alone
+   holds more than `RA_JIT_MEMORY_MAX`, busy or not (`daemon.rs`, `over`).
+
+### Runs
+
+Each one `blaze build --locked -p tracedecay-cli` from an empty home and store, under the guard and
+the lock, one run each (**read**). A1 turns the worker's own bound off
+(`RA_JIT_WORKER_MEMORY=off`) to see what the cut memos save; the daemon's ceiling is still 16 GiB.
+
+| run | binary | what ended the worker's build | worker s: load, resolve | footprint after resolve | functions compiled when it ended | peak footprint of blaze's processes |
+|---|---|---|---|---|---|---|
+| run 3 (before, above) | `dist/main` | the watchdog, at 24 GB | 64.4, 17.8 | 12,969 MB (live 8,786) | 639,973 at 110 s, 25 s into the build | 25.6 GB summed |
+| A1 | this branch, worker bound off | the daemon's ceiling: `worker … stopped: … it alone holds 16632 MB` | 129.0, 20.1 | 10,183 MB (live 6,982) | 208,371 at its last tick, 160 s | 16.6 GB (the daemon's reading) |
+| A2 | this branch, guarded | its own bound: `out of memory to build in: the build held 16387 MB, more than the 16384 MB …` | 64.4, 25.9 | 10,273 MB (live 7,011) | 265,048 at 118 s, 27 s into the build | 16,424 MB |
+| O1 | this branch, the nine crates at `opt-level = 0` | nothing: ready, then the own base given up at 12,322 MB | 90.0, 31.7 | 10,622 MB (live 7,231) | none (`cold: none`) | 13,365 MB |
+
+What the cut memos save, at the same number of functions compiled (run 3 against A1, n=1 each,
+linear between 5 s ticks):
+
+| functions compiled | footprint before | after | live before | after |
+|---|---|---|---|---|
+| 60,416 | 14,144 MB | 12,560 | 10,271 | 10,281 |
+| 122,365 | 15,363 | 13,623 | 11,813 | 11,469 |
+| 208,371 | 16,985 | 15,098 (-1,887, 11%) | 13,490 | 13,118 (-372, 3%) |
+
+- **The live heap is 3% smaller at 208k functions**, of the order of what the coroutine memo held
+  at that stage of the profiled run above (406 MB at 18.6 GB live). The footprint is 11% smaller:
+  the pages resolution freed are given back before the build (12,969 MB after resolve before,
+  10,183 to 10,273 after), and the allocator's gap over the live bytes stays smaller (1,980 MB at
+  208k against 3,495). (**read**; which part of the footprint saving is which is **unverified**.)
+- **The bound holds, and is all that holds.** A2's worker passed three quarters of 16 GiB within
+  5 s of the build's start (12,089 MB at the first tick of it), let fewer threads compile from then
+  on (17 of 18 at 12,336 MB, 1 of 18 at 15,934 MB), purged each second, and stopped itself at
+  16,387 MB; the client's build then ended as one the daemon could not load (below). The peak is
+  40 MB over the bound: the footprint is looked at every 100 ms (**read**).
+- **Fewer threads do not change what each function leaves behind.** A2's live heap grew 21.2 and
+  17.8 KB a function between ticks at 18 threads, and 27.8 and 23.1 KB a function at 1 to 9 (n=1,
+  5 s ticks). Slowing down changes how fast the build reaches the bound, not the bound it reaches:
+  about 265,000 functions fit in 16 GiB, of the 640,000 and more the program needs (**read**).
+- **The purge gives little back here.** Each purge returned 3 to 90 MB (`build budget: gave back`
+  lines). What separates the footprint from the live bytes during the build is fragmentation, pages
+  partly in use, not pages jemalloc keeps free (**read**, from the purges; the split is
+  **unverified**).
+- **The rates.** Run 3 compiled 640,000 functions in the 25 s it had, 25,600 a second; A2 compiled
+  17,700 and 16,700 a second at 18 threads and 6,700 to 2,600 as it narrowed, 9,700 a second over its
+  27 s. The load average was 38 just after A2, and 25 to 42 in run 3's session: no rate here is a
+  claim.
+- **What a stopped build leaves.** Whether the daemon's ceiling stops the worker (A1) or the worker
+  stops itself (A2), the client says `ra-jit: bug: the daemon could not load the workspace …; this
+  build is cargo's, which ra-jit is never to do (no-rustc K, #91, and #84)` and exits 0 with what
+  cargo's build linked. That is the path a worker the watchdog or the system kills takes today; this
+  unit adds no path to rustc or cargo, and a build that stops for memory is that bug's case.
+
+### The opt-level hypothesis: confirmed
+
+O1 is A2 with the nine crates of section 1 given `[profile.dev.package.X] opt-level = 0` in the
+throwaway worktree, nothing else changed (**read**, one run): the plan gives the worker cargo's
+executable (`first build: rustc_binary Some(".../deps/tracedecay-fd7fd86a5d23cbbb") (a file:
+true)`), the worker builds nothing first (`cold: none, the first edits patch what rustc linked
+(3.5s)`), and the client's build ends in 519 s with blaze's processes at 13.4 GB at most. So
+`calls_by_symbol` on those nine units is all that made the first build a whole one. The own base the
+daemon starts next was given up at once (`it holds 12322 MB, more than the 12288 MB it may
+(RA_JIT_OWN_BASE_MEMORY)`): a tracedecay worker is ready at 12.7 GB, over the guard's own-base bound
+before that base compiles anything. Blaze's opt-level rule is not changed here.
+
+### What still holds the memory
+
+A3 is A2 with heap profiling (`--prof`, one profile every 2 GB of live heap), and stopped itself
+the same way at 16,387 MB. Its last profile is at 14,563 MB live, 12,214 MB sampled, shortly before
+the stop (**read**, one run; [loadmem/u7-a3-holders.md](loadmem/u7-a3-holders.md)):
+
+| holder | MB sampled | share |
+|---|---|---|
+| **the front end and what the worker loads, kept from before the build** | **7,878** | **64%** |
+| macro expansions (`parse_macro_expansion` 1,433, `macro_arg` 139, `expand_proc_macro` 117) | 2,029 | |
+| bodies, signatures, item trees (`Body::with_source_map` 612, `Body::relative` 395) | 1,985 | |
+| file parses (`EditionedFileId::parse` 1,411) | 1,547 | |
+| rustc's symbol table | 1,198 | |
+| name resolution | 669 | |
+| vfs | 450 | |
+| **what the build added in its 27 s** | **3,178** | **26%** |
+| MIR (`runtime_mir_body` 348, `mir_body` 264, coroutines 163 + 136) | 1,015 | |
+| codegen products (`compiled_instance` 390 + 153 of edges, `inlinable` 135) | 803 | |
+| inference and traits (`InferenceResult::for_body` 513) | 696 | |
+| the codegen driver outside queries | 441 | |
+| layouts | 223 | |
+| ra-jit's own and salsa's other ingredients | 1,152 | 9% |
+
+- **The remaining holder is the front end the build starts with.** A worker is at 10.3 GB of
+  footprint (7.0 GB live) when its first build begins, so a 16 GiB worker has about 6 GB for the
+  build, which is 265,000 functions at 20 to 28 KB each. Within the build no single query stands
+  out: the monomorphized copies are gone (`monomorphized_runtime_mir_body_for_coroutine` held 406 MB
+  at 18.6 GB live in the profiled run above, and is not in this profile's top 40), and what is left
+  is spread over MIR, code, inference and layouts, each about what a function needs.
+- **So what is left to win is not a memo to cut but a revision boundary** (below), and the front
+  end's own: fixes 4 (evict expansions and parses as resolution goes) and 7 (the symbol table as a
+  view of the file) of [section 6](#6-fixes-each-names-a-function), together 2 to 3 GB of the 10 GB
+  a worker starts its build with (**unverified**).
+
+### Follow-up: a build in revisions
+
+What would let a whole build of tracedecay finish under 16 GiB, in the order of what it frees
+(**unverified**, none built here):
+
+1. **A batch is a revision.** Compile a batch of the work set (u2's home-crate batch,
+   `docs/distributed.md` on `dist/u2-design`) into the store through a throwaway `ObjectCodegen`, the
+   object discarded and the entries kept (entries name their callees by stable name, so a batch's
+   entries need none of another's); then end the batch's database handles, `synthetic_write`, and
+   let the `lru`s evict. The assembly that follows finds every function in the store and stitches it,
+   which holds the object and the store's pages, not the memos. A distributed helper runs the same
+   loop on leased batches.
+2. **`lru` on what each batch alone needs:** `compiled_instance`, `inlinable`, `body_types`,
+   `layout_of_ty`, and, with the salsa evicted-memo patch, `infer`, `mir_body` and
+   `runtime_mir_body`, whose memos are shared between batches and come back at a cost to measure.
+3. **Entries written as functions are defined**, not all at once in `make_later`, so that a build
+   stopped by the bound keeps what it compiled and the next one starts from it.
+4. **The type interner's GC and `give_back` between batches**, once no batch holds interned types.
+
+### Tests and harnesses
+
+Of this branch's release binary (`--features heap-profile`), each under the guard and the lock, one
+run each (**read**):
+
+| what | result |
+|---|---|
+| `cargo +1.99.0 test -p ra-jit` | 194 passed, 0 failed (193 on `dist/main`: the one added is the daemon's lone-worker test) |
+| `cargo +1.99.0 test -p hir-ty-codegen budget` | 4 passed (new: the share of threads, the purge, the stop, no budget) |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH; 949 of 951 functions from ra-jit; layouts: 0 of 1,261 differ from rustc's, the futures of a new generic `async fn` case (`async_frames::generic`) among them; the two functions not from ra-jit are the layout of a type error and an `asm!` constant that is not a literal, neither of which this branch touches |
+| `stress.py` (edits against cargo's builds) | 100 of 100 right, 0 restarts |
+| `storebuilds.py` (the store) | PASS: the first build added 701 functions, another of the same sources found 5 and compiled 0 |
+| `storetracked.py` (the store's tracked entries) | 0 wrong |
+| `wholeprogram.py` (programs built whole) | all six as cargo's: `default_alloc`, `custom_alloc`, `lib_alloc`, `cfg_alloc`, `trait_block`, `c_main` |
+| `aheadready.py` (compiling ahead while the symbols load) | ready, served, an edit: ok |
+
+### Deviations (section 8)
+
+- **The heavy lock was another unit's from 01:23 to 03:36**, with nothing of its running for much of
+  it; nothing heavy of this section ran before 03:36, and every run here took the lock.
+- **The first A2 failed in cargo's part**: the CLI's build script runs the dashboard's `pnpm run
+  build`, which wants every workspace package's `node_modules`, and I had cloned two of five. The
+  others were cloned copy-on-write from `~/dev/tracedecay` (read, nothing written there) and A2 was
+  run again.
+- **The first A3 was stopped by the watchdog at 76 s** for swap (0.8 GB free, grown 1.6 GB): O1's
+  daemon and its ready worker, 12.3 GB, were still running, and the harness counts every daemon of
+  the binary. The kill took them with it. Each run now stops its daemon after it.
+- **A1 turns off the worker's own bound, not the guard's** (`RA_JIT_WORKER_MEMORY=off`; 16 GiB, 12
+  GiB and no spare as in every run), so the daemon's ceiling ended it at 16.6 GB, and its curve
+  stops at 208,371 functions.
+- **The before is run 3**, another session of the same day, not a run of this one: with the lock
+  another unit's for two hours and a third waiting on it, I did not run a fresh one. Byte counts do
+  not depend on that; no rate here is a claim.
+- **No tracedecay program came of a bounded build**, so there is no CLI built by one to set against
+  one built before: a whole build stops at the bound, and O1's program is cargo's executable, which
+  the daemon patches. That what a bounded build makes is what an unbounded one makes is held by the
+  harnesses (below), which build every program whole and set it against cargo's.
+
+### Commands (section 8)
+
+From the worktree of `dist/u7-bound`, each under `/Users/bytedance/dev/blaze-targets/u7-work/
+with-lock.sh LABEL CMD` (the heavy lock), the harnesses also under `guard.py` there (the guard's
+variables, and a kill of the harness's tree and every process of the binary past 24 GB or on swap);
+the scripts are in that directory, not in the tree:
+
+    cargo +1.99.0 build --release -p ra-jit --features heap-profile     # CARGO_TARGET_DIR=.../blaze-targets/u7, 3 min 32 s
+    cargo +1.99.0 test -p ra-jit; cargo +1.99.0 test -p hir-ty-codegen budget
+    loadmem-run.sh NAME BIN loadmem-a.noindex WORK [--env RA_JIT_WORKER_MEMORY=off | --prof --step-mb 2048]
+        # touch crates/tracedecay-cli/src/main.rs, then python3 -I harness/loadmem.py --td /Users/bytedance/dev/td-u7
+        #   --blaze-bin BIN --work WORK --name NAME --target-name loadmem-a.noindex --memory-every 5 [...]
+        #   --cargo-home-from .../u1-work/cargo-home -- blaze build --locked -p tracedecay-cli; then the daemon is stopped
+    # O1: the same, with nine [profile.dev.package.tracedecay-X] opt-level = 0 appended to td-u7's Cargo.toml, reverted after
+    python3 -I harness/heapfold.py at-0014563.prof .../u7/release/ra-jit > at-0014563.folded   # u5's rustfilt on PATH
+    python3 -I harness/loadmem_holders.py at-*.folded --group category    # and --group holder
+    cd harness; RA_JIT_BIN=.../u7/release/ra-jit python3 difftest.py corpus --bin runner --crate cases --layouts
+    python3 stress.py; python3 storebuilds.py; python3 storetracked.py; python3 wholeprogram.py; python3 aheadready.py
 
 ## Deviations
 

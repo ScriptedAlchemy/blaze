@@ -366,7 +366,9 @@ build stops and fails with `out of memory to build in: ...`, naming what it held
 let go of what it computed before it ends (each function it compiles adds to the database, about
 23 KB of it in a cold build of tracedecay, [reports/LOADMEM.md](reports/LOADMEM.md)), so fewer
 threads only slow what it holds on the way: a program that needs more than the bound to build in
-one piece is stopped, not handed to anything else.
+one piece is stopped, and nothing else is given its work. Its client's build then ends as one whose
+worker could not load it, with what cargo's build linked, which is step K of
+[no-rustc.md](no-rustc.md): the same end as a worker killed for its memory.
 
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client

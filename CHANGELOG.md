@@ -8,6 +8,14 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `RA_JIT_WORKER_MEMORY`: the most one worker, or one `ra-jit` run, may hold while it builds; by
+  default what `RA_JIT_MEMORY_MAX` lets all the workers hold. Past three quarters of it the threads
+  that compile ahead give the allocator's free pages back each second and fewer of them compile,
+  in proportion to what is left (`hir_ty_codegen::budget`); past all of it the build stops and
+  fails with `out of memory to build in: ...`. A cold tracedecay worker, which builds the whole
+  program at load and passed 30 GB, is held to it ([docs/reports/LOADMEM.md](docs/reports/LOADMEM.md),
+  section 8). Nothing is given its work instead; its client's build ends as one whose worker could
+  not load, which is no-rustc step K.
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
@@ -444,6 +452,16 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- The daemon's `RA_JIT_MEMORY_MAX` stops a worker that alone holds more than it, though it is
+  busy or the one asked last: nothing else making way would bring it under.
+- A cold build holds less: the layout of a future and the debugger's description of it read the
+  coroutine's generic body and monomorphize only the types of what it keeps across yields
+  (`hir_ty::mir::held_frame`), where the database kept a copy of the whole body for every
+  instance (1.5 GB of a cold tracedecay build at 30 GB); `inlinable` is asked only of a body small
+  enough to inline, so the others leave no memo; and a worker gives back the pages name
+  resolution freed before its first build. At the same number of functions compiled, 208,371, a
+  cold tracedecay worker's footprint was 15.1 GB where it was 17.0 GB (n=1 each, LOADMEM.md
+  section 8).
 - The first edit after a daemon starts on the store no longer compiles every function from
   the store in the edited file to tell what changed. Each entry names the items of the
   checkout its code comes from, by a hash of their text: the body it is written in, the
