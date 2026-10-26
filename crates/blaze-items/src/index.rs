@@ -25,7 +25,7 @@ use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast::HasAttrs};
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::{Fan, ItemId, form, in_scope};
 
@@ -45,6 +45,39 @@ pub struct Index {
     dirty: FxHashSet<FileId>,
     /// Whether an edit since the bindings were taken can have changed them.
     scopes_dirty: bool,
+    /// The items of `entries`, for [`Live`].
+    live: Arc<FxHashSet<ItemId>>,
+}
+
+/// The items an index has, which a thread of its own can ask of an item without asking salsa
+/// what an edit took away: the module of an item gone is gone, and asking of it panics.
+#[derive(Clone)]
+pub struct Live {
+    items: Arc<FxHashSet<ItemId>>,
+    crates: Arc<FxHashSet<Crate>>,
+}
+
+impl Live {
+    /// Whether `id` is of a crate the index doesn't look at, or one it has now. Only what
+    /// salsa interned is asked of `id`.
+    pub fn has(&self, db: &dyn HirDatabase, id: ItemId) -> bool {
+        self.items.contains(&id)
+            || file_of(db, id).is_some_and(|file| {
+                !base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it))
+            })
+    }
+
+    pub fn has_body(&self, db: &dyn HirDatabase, body: DefWithBodyId) -> bool {
+        self.has(
+            db,
+            match body {
+                DefWithBodyId::FunctionId(it) => ItemId::Function(it),
+                DefWithBodyId::ConstId(it) => ItemId::Const(it),
+                DefWithBodyId::StaticId(it) => ItemId::Static(it),
+                DefWithBodyId::VariantId(it) => ItemId::Adt(AdtId::EnumId(it.lookup(db).parent)),
+            },
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +236,7 @@ impl Index {
             attrs: FxHashMap::default(),
             dirty: FxHashSet::default(),
             scopes_dirty: false,
+            live: Arc::default(),
         };
         for Entries(part) in entries {
             for (id, entry) in part {
@@ -218,6 +252,10 @@ impl Index {
 
     pub fn items(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn live(&self) -> Live {
+        Live { items: self.live.clone(), crates: Arc::new(self.crates.clone()) }
     }
 
     /// Before an edit of `files`: what edits before it left out of date is written again, of
@@ -589,10 +627,12 @@ impl Index {
             self.named.entry(name.clone()).or_default().insert(id);
         }
         self.entries.insert(id, entry);
+        Arc::make_mut(&mut self.live).insert(id);
     }
 
     fn remove(&mut self, id: ItemId) {
         let Some(entry) = self.entries.remove(&id) else { return };
+        Arc::make_mut(&mut self.live).remove(&id);
         if let Some(items) = self.files.get_mut(&entry.file) {
             items.retain(|it| *it != id);
         }

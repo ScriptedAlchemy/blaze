@@ -1933,11 +1933,15 @@ impl Base {
         }
         let Some(asked) = &self.reitem else { return };
         let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
+        let live = self.items.as_ref().map(|it| it.index.live());
         let (send, settling) = std::sync::mpsc::channel();
         let at = salsa::plumbing::current_revision(db);
         let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
             let start = std::time::Instant::now();
-            let settled = Settled::new(db, fan, &roots, &instances);
+            let Some(live) = live else { return };
+            let settled = Settled::new(db, fan, &roots, &instances, &live);
+            // The index is written again at the next edit, which needn't copy what it has.
+            drop(live);
             if std::env::var_os("RA_JIT_STATS").is_some() {
                 eprintln!(
                     "items-settled: {} roots and {} instances in {} us",

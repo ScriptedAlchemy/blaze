@@ -35,7 +35,9 @@ use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
-pub use index::{Entries, Index, Pushed, code_names, entries_in, file_of, modules_in, modules_of};
+pub use index::{
+    Entries, Index, Live, Pushed, code_names, entries_in, file_of, modules_in, modules_of,
+};
 
 /// Runs the work for each of `0..count`, on as many threads as there are, each with a
 /// database of its own.
