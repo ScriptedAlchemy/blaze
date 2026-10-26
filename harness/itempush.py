@@ -66,6 +66,8 @@ FILES = {
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
 C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
+# A file of the crate's directory that no module is written in, which the crate doesn't build.
+STRAY = "lib/src/stray.rs"
 SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
 INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
 # (step, edits); an edit is (file, old, new), with `None` for old to write the file whole.
@@ -104,6 +106,8 @@ STEPS = [
         (LIB_RS, "mod e;\n", "mod e;\nmod f;\n"),
     ]),
     ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
+    ("a file no module is written in", [(STRAY, None, lambda _: "pub fn pick() -> u32 {\n    9\n}\n")]),
+    ("it written again", [(STRAY, "9", "90")]),
 ]
 
 

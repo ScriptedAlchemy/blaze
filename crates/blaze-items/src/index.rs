@@ -517,8 +517,23 @@ impl Index {
         let module_files: FxHashSet<FileId> = (scopes.iter().map(|it| &it.1).chain(was_scopes))
             .flat_map(|it| it.modules.values().map(|it| it.0))
             .collect();
-        if files.iter().any(|it| !module_files.contains(it)) {
-            return Err("a file no module is written in");
+        // One no crate `include!`s is in no crate's build, as an example cargo builds alone: it
+        // holds no item.
+        let unwritten: Vec<FileId> =
+            files.iter().copied().filter(|it| !module_files.contains(it)).collect();
+        if !unwritten.is_empty() {
+            let elsewhere = (self.scopes.values())
+                .flat_map(|it| it.modules.values())
+                .any(|it| unwritten.contains(&it.0));
+            if elsewhere {
+                return Err("a file of a module of a crate the file is not of");
+            }
+            for &krate in &self.crates {
+                let included = hir_def::include_macro_invoc(db, krate);
+                if included.iter().any(|(_, it)| unwritten.contains(&it.file_id(db))) {
+                    return Err("a file no module is written in that a module `include!`s");
+                }
+            }
         }
         for &krate in &edited {
             let included = hir_def::include_macro_invoc(db, krate);
