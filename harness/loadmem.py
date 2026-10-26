@@ -72,6 +72,13 @@ def descendants(rows, roots):
     return seen
 
 
+def owned_daemons(rows, client_pid, known, prefix):
+    """Keep this client's daemons after reparenting, without taking another run's daemon."""
+    children = descendants(rows, [client_pid])
+    return {pid for pid, _, _, command in rows
+            if (pid in children or pid in known) and command.startswith(prefix + "ra-jit daemon")}
+
+
 def footprints_mb(pids, rows):
     """pid -> MB held. macOS: `footprint`, which counts compressed and swapped memory. Else RSS."""
     if not pids:
@@ -145,7 +152,9 @@ def main():
     home, store = os.path.join(work, "home.noindex"), os.path.join(work, "store.noindex")
     cargo_home = os.path.join(work, "cargo-home")
     if not os.path.isdir(cargo_home) and a.cargo_home_from:
-        sh(["cp", "-cR", a.cargo_home_from, cargo_home], check=True)
+        if not DARWIN or sh(["cp", "-cR", a.cargo_home_from, cargo_home]).returncode:
+            shutil.rmtree(cargo_home, ignore_errors=True)
+            shutil.copytree(a.cargo_home_from, cargo_home)
     env = dict(os.environ, RUST_BACKTRACE="0", RA_JIT_HOME=home, RA_JIT_CACHE=store, CARGO_HOME=cargo_home,
                CARGO_TARGET_DIR=os.path.join(td, "target", a.target_name),
                PATH=blaze_bin + os.pathsep + os.environ["PATH"], **GUARD)
@@ -182,6 +191,7 @@ def main():
     stop_seen = [0.0]  # when a line matched --stop-after
     last_total = 0.0
     snapped = set()
+    daemons = set()
 
     def logs():
         found = [os.path.join(out, "logs", "client.log")]
@@ -219,7 +229,7 @@ def main():
             rows = ps_table()
             # The daemon is started by the client and is among its descendants until the client
             # ends, so blaze's own tree is the daemon's, and the client's is the rest of its.
-            daemons = {r[0] for r in rows if r[3].startswith(prefix + "ra-jit daemon")}
+            daemons = owned_daemons(rows, client.pid, daemons, prefix)
             ours = daemons | descendants(rows, daemons)
             client_tree = descendants(rows, [client.pid]) - ours
             if a.count_client:
@@ -242,19 +252,6 @@ def main():
                                      "pids": len(ours), "procs": big, "client_procs": cbig, "swap_used_mb": round(used),
                                      "swap_free_mb": round(free)}) + "\n")
             tail(total)
-            if stop_seen[0] and time.time() - stop_seen[0] >= a.stop_delay:
-                top = max((p for p in held if p in ours), key=held.get, default=None)
-                rss = {r[0]: r[2] for r in rows}
-                result["stopped_after"] = {"pattern": a.stop_after, "at_s": round(time.time() - t0, 1),
-                                           "ready_seen_s": round(stop_seen[0] - t0, 1),
-                                           "footprint_mb": round(held[top]) if top else None,
-                                           "rss_mb": round(rss.get(top, 0) / 1024) if top else None,
-                                           "processes_mb": round(total), "pid": top}
-                if top:
-                    snapshot("stopped", top)
-                kill(ours)
-                kill(client_tree, signal.SIGTERM)
-                break
             for mark in MARKS:
                 if total >= mark * GB and mark not in snapped:
                     snapped.add(mark)
@@ -288,6 +285,20 @@ def main():
                 time.sleep(2)
                 kill(client_tree & {r[0] for r in ps_table()})
                 break
+            # A readiness marker cannot turn a simultaneous watchdog violation into a pass.
+            if stop_seen[0] and time.time() - stop_seen[0] >= a.stop_delay:
+                top = max((p for p in held if p in ours), key=held.get, default=None)
+                rss = {r[0]: r[2] for r in rows}
+                result["stopped_after"] = {"pattern": a.stop_after, "at_s": round(time.time() - t0, 1),
+                                           "ready_seen_s": round(stop_seen[0] - t0, 1),
+                                           "footprint_mb": round(held[top]) if top else None,
+                                           "rss_mb": round(rss.get(top, 0) / 1024) if top else None,
+                                           "processes_mb": round(total), "pid": top}
+                if top:
+                    snapshot("stopped", top)
+                kill(ours)
+                kill(client_tree, signal.SIGTERM)
+                break
             if client.poll() is not None:
                 top = max((p for p in held if p in ours), key=held.get, default=None)
                 if top:
@@ -310,7 +321,11 @@ def main():
                     shutil.copyfile(path, dest)
                 except OSError:
                     pass
-        json.dump(result, open(os.path.join(out, "result.json"), "w"), indent=1)
+        with open(os.path.join(out, "result.json"), "w") as file:
+            json.dump(result, file, indent=1)
+        client_log.close()
+        series.close()
+        phases.close()
         print(json.dumps(result), flush=True)
 
 

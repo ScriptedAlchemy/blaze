@@ -262,3 +262,26 @@ For real-project runs, hold the heavy lock around `frontimage.py`; it runs every
 client/daemon under `loadmem.py`'s footprint/swap watchdog and stops them between arms.
 For container pressure, hold `with-docker-lock.sh`; the driver rejects a container over
 6 GiB, uses equal memory/swap limits (no swap), and removes each container on exit.
+
+## PR review follow-up
+
+Publication now uses a unique temporary inode for each writer and removes it on error.
+The former PID-only name let concurrent writes truncate one another and publish incomplete
+images. The concurrency regression reproduced both a missing temporary file and an invalid
+published image before the fix; it passes with independent temporary files. A second
+regression checks cleanup when publication fails.
+
+The measurement driver now requires actual mapped parts in the image arm and actual frozen
+store reads in the store arm. Missing readiness samples, a failed initial build, an empty
+seed and failed profiling arms are errors. It resets the relevant inherited configuration
+and refuses reused run directories so stale logs cannot count as a new readiness event.
+Cleanup addresses the private daemon, while the watchdog tracks only that client's daemon
+and descendants. A readiness marker cannot override a simultaneous watchdog violation.
+The cargo-home copy also works without macOS's `cp -c`.
+
+Validation on Linux x86-64 with Rust 1.99.0: all nine tests in the actual `front_image.rs`
+passed in a small test crate using the real mmap/hash/tempfile dependencies and the source
+`Bytes` owner; store build identity and memory-reporting interfaces were stubbed. The two
+new publication tests both failed against the old writer. The eight Python driver tests,
+the driver help commands, touched Rust formatting and `git diff --check` passed. These are
+focused checks, not full blaze integration, fixture measurements or a new speedup result.
