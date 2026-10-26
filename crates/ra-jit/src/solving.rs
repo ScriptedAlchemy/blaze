@@ -8,12 +8,16 @@
 //! database is not over (a tier compile goes on into LLVM, a build sends its answer), and
 //! `rayon::broadcast` reaches only the threads of the pool. So every other thread takes its
 //! clone as a [`Handle`], which is counted as a solving scope from the thread that makes it to
-//! the thread that ends it, and which clears the solver cache of the thread that ends it before
-//! the clone is dropped. [`Scopes::idle`] says what the collection asks for: that no thread but
-//! the caller holds the database, and that every one that did has cleared its cache.
+//! the thread that ends it, and which lends the clone only to [`Handle::solve`], after which it
+//! clears the solver cache of its thread and then drops the clone. [`Scopes::idle`] says that no
+//! thread but the caller holds the database, and that every one that did has cleared its cache.
 //!
 //! The caller's own thread and the pool's are cleared by [`clear_caller_and_pool`], which
-//! [`collect_types`] does before it asks.
+//! [`collect_types`] does before it asks. Last it asks `hir::live_solver_caches`, which counts
+//! every thread whose cache holds goals, handle or not: a thread that solved with a clone made
+//! some other way (the database is not `Sync`, so another thread solves with a clone or not at
+//! all) keeps the collection off until it clears its cache or ends, rather than leaving a cache
+//! that points at what was freed.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -35,6 +39,9 @@ pub(crate) enum Busy {
     Held(usize),
     /// A handle could not clear the cache of its thread.
     Uncleared,
+    /// This many threads besides the caller's and the pool's have a solver cache that may
+    /// hold goals: they solved without a handle, and have not cleared it or ended.
+    Caches(usize),
 }
 
 impl std::fmt::Display for Busy {
@@ -43,6 +50,10 @@ impl std::fmt::Display for Busy {
             Busy::Held(1) => write!(f, "a thread still holds the database"),
             Busy::Held(held) => write!(f, "{held} threads still hold the database"),
             Busy::Uncleared => write!(f, "a thread's solver cache could not be cleared"),
+            Busy::Caches(1) => write!(f, "a thread that solved without a handle keeps its cache"),
+            Busy::Caches(live) => {
+                write!(f, "{live} threads that solved without a handle keep their caches")
+            }
         }
     }
 }
@@ -82,9 +93,9 @@ impl Scopes {
 }
 
 /// One solving scope: counted from the thread that made it to the thread that drops it, and
-/// on that thread it clears the solver cache as it ends. Held beside the clone of the database
-/// it came with, and declared after it, so that it ends first: see [`Handle::split`].
-pub(crate) struct Solving {
+/// on that thread it clears the solver cache as it ends. It is a field of the [`Handle`] it came
+/// with, declared before the clone of the database, so that it ends first.
+struct Solving {
     scopes: &'static Scopes,
     clear: fn(),
 }
@@ -111,18 +122,20 @@ impl Drop for Solving {
 /// the moment it is made, on the thread that makes it, so that no moment between a thread being
 /// started and it holding the database is uncounted.
 ///
-/// The thread that receives it calls [`Handle::split`] first thing, and solves with the clone;
-/// both bindings end on that thread, the scope first, which clears the cache of the thread's
-/// trait solver before the clone is dropped. A handle dropped whole does the same, on the
-/// thread that drops it.
+/// The thread that receives it solves with [`Handle::solve`], which lends it the clone for as
+/// long as the closure runs and no longer: the clone is never handed out, so it cannot be
+/// solved with once the scope has ended, or kept without it. When the closure returns or
+/// unwinds, the scope clears the cache of the thread's trait solver, and then the clone is
+/// dropped. A handle dropped whole does the same, on the thread that drops it.
 ///
 /// Every clone of the database that leaves the thread that owns it is made with
-/// [`Handle::of`]: `solving::tests::no_bare_clone_of_the_database` fails on one that is not.
+/// [`Handle::of`]. `solving::tests::no_database_clone_spelled_as_this_crate_spells_one` finds
+/// the usual spellings of one that is not; [`collect_types`] does not rely on it.
 pub(crate) struct Handle {
     // In this order, which is the order they are dropped in: the scope clears the cache and
     // stops counting, and then the clone is dropped, which is what a write to the database
-    // waits for.
-    solving: Solving,
+    // waits for. The scope is held for its drop alone.
+    _solving: Solving,
     db: RootDatabase,
 }
 
@@ -132,22 +145,15 @@ impl Handle {
     }
 
     fn in_scopes(scopes: &'static Scopes, db: &RootDatabase, clear: fn()) -> Handle {
-        Handle { solving: scopes.enter(clear), db: db.clone() }
+        Handle { _solving: scopes.enter(clear), db: db.clone() }
     }
 
-    /// The clone to solve with and the scope it is solved in, in the order to bind them:
-    /// `let (db, _solving) = handle.split();` drops `_solving` first, as bindings of a pattern
-    /// are dropped in the reverse of the order they are written in. Nothing is solved with the
-    /// clone after `_solving` is dropped.
-    pub(crate) fn split(self) -> (RootDatabase, Solving) {
-        (self.db, self.solving)
+    /// Solves with the clone, on this thread: `solve` has it for as long as it runs. Then, as
+    /// `self` is dropped whether `solve` returned or unwound, the scope clears this thread's
+    /// solver cache and stops counting, and the clone is dropped.
+    pub(crate) fn solve<T>(self, solve: impl FnOnce(&RootDatabase) -> T) -> T {
+        solve(&self.db)
     }
-}
-
-/// Ends a split handle where it is not left to the end of a scope: the scope, then the clone.
-pub(crate) fn release(db: RootDatabase, solving: Solving) {
-    drop(solving);
-    drop(db);
 }
 
 /// Clears the trait solver's cache on the thread that asks and on every thread of the global
@@ -163,32 +169,37 @@ pub(crate) fn clear_caller_and_pool() {
 /// The caches are cleared first, always: there is no way to collect here without. Then it asks
 /// [`SCOPES`] twice whether any thread solves, before the write that cancels the other handles
 /// of the database (so that a build under way is left to finish) and after it (when each
-/// handle that was cancelled has been dropped, and has cleared its cache before it was).
+/// handle that was cancelled has been dropped, and has cleared its cache before it was). Last
+/// it asks that no other thread's solver cache holds goals.
 pub(crate) fn collect_types(db: &mut RootDatabase) -> Result<(), Busy> {
     use ide_db::base_db::salsa::{Database, Durability};
     // A revision of its own, as rust-analyzer's `AnalysisHost::trigger_garbage_collection`
     // makes: the write cancels every other handle of the database and waits for each to be
     // dropped, so no query of it is under way and none of its results is held.
     let write = |db: &mut RootDatabase| db.synthetic_write(Durability::LOW);
-    collect_in(db, &SCOPES, clear_caller_and_pool, write, || {
+    collect_in(db, &SCOPES, clear_caller_and_pool, write, hir::live_solver_caches, || {
         let interned = || hir::interned_counts().iter().map(|it| it.1).sum::<usize>();
         let (start, before) = (std::time::Instant::now(), interned());
-        // SAFETY:`collect_ty_garbage` needs no type value that is not yet recorded anywhere
+        // SAFETY: `collect_ty_garbage` needs no type value that is not yet recorded anywhere
         // the collection looks, no other handle of the database, and the database held
         // mutably from before it begins until it ends. In turn:
         //  - `collect_in` has `db` as `&mut`, held for the whole call, so no other thread can
         //    make a handle of it: borrowck.
         //  - Every other handle was dropped: the write before this closure runs waits for
         //    each (`zalsa_mut` waits for the clones of the storage to be one): salsa.
-        //  - Every thread that solved with a clone held a [`Handle`], which cleared that
-        //    thread's solver cache before it was dropped, and `SCOPES.idle()` has just said
-        //    that none is held and none failed to clear: `Handle`, and the test that no
-        //    clone of the database is made without one. The caller's thread and the global
-        //    pool's, which hold none, were cleared by `clear_caller_and_pool` first.
+        //  - No thread's trait solver cache holds goals: the caller's thread and the global
+        //    pool's were cleared by `clear_caller_and_pool`, each [`Handle`] cleared its
+        //    thread's before its clone was dropped, and `hir::live_solver_caches` has just
+        //    counted none left, whoever solved. A thread can start no solve after the count:
+        //    it needs the database, which the caller holds mutably and no clone of is left.
         //  - What a build made of types is otherwise in salsa values, which the collection
         //    reaches from the memos it keeps, or in `Stored*` owners, which count as uses
-        //    wherever they are held (a drop of one on another thread only lowers its count),
-        //    or in a local of a build that ended with the thread of the `Handle` it ran on.
+        //    wherever they are held, or in a local of a build that ended with the thread of
+        //    the `Handle` it ran on. A `Stored*` owner may be dropped on another thread while
+        //    the collection runs, as a build's debug information is: the collection marks
+        //    every value reached from one that lives, whatever its count when it is reached
+        //    (`intern`'s `GarbageCollector::mark_interned_alive`), so the drop only lowers a
+        //    count and leaves what lives reachable.
         unsafe { hir::collect_ty_garbage() }
         if std::env::var_os("RA_JIT_STATS").is_some() {
             // What `harness/memgrowth.py` reads the time of a collection from.
@@ -205,12 +216,17 @@ fn collect_in(
     scopes: &Scopes,
     clear: impl FnOnce(),
     write: impl FnOnce(&mut RootDatabase),
+    caches: impl FnOnce() -> usize,
     collect: impl FnOnce(),
 ) -> Result<(), Busy> {
     clear();
     scopes.idle()?;
     write(db);
     scopes.idle()?;
+    match caches() {
+        0 => {}
+        live => return Err(Busy::Caches(live)),
+    }
     collect();
     Ok(())
 }
@@ -306,6 +322,7 @@ mod tests {
                 scopes,
                 || steps.borrow_mut().push("clear"),
                 |_| steps.borrow_mut().push("write"),
+                || 0,
                 || steps.borrow_mut().push("collect"),
             )
         };
@@ -343,6 +360,7 @@ mod tests {
                 steps.borrow_mut().push("write");
                 *straggler.borrow_mut() = Some(Handle::in_scopes(scopes, &other, cleared));
             },
+            || 0,
             || steps.borrow_mut().push("collect"),
         );
         assert_eq!(result, Err(Busy::Held(1)));
@@ -363,6 +381,7 @@ mod tests {
                 scopes,
                 || steps.borrow_mut().push("clear"),
                 |_| steps.borrow_mut().push("write"),
+                || 0,
                 || steps.borrow_mut().push("collect"),
             );
             assert_eq!(result, Err(Busy::Uncleared));
@@ -379,36 +398,112 @@ mod tests {
         let (first, second) = (Handle::of(&db), Handle::of(&db));
         assert_eq!(SCOPES.held(), 2);
         std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let (db, solving) = first.split();
-                release(db, solving);
-            });
+            scope.spawn(move || first.solve(|_| {}));
             scope.spawn(move || drop(second));
         });
         assert_eq!(SCOPES.idle(), Ok(()));
     }
 
     #[test]
-    fn split_binds_the_scope_to_be_dropped_before_the_clone() {
-        // What `Handle::split` relies on of the language: the bindings of a pattern are dropped
-        // in the reverse of the order they are written in, so the one written second goes first.
-        struct Note(&'static str, &'static std::sync::Mutex<Vec<&'static str>>);
-        impl Drop for Note {
-            fn drop(&mut self) {
-                self.1.lock().unwrap().push(self.0);
-            }
-        }
-        static DROPPED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-        {
-            let (_db, _solving) = (Note("clone", &DROPPED), Note("scope", &DROPPED));
-        }
-        assert_eq!(*DROPPED.lock().unwrap(), ["scope", "clone"]);
+    fn a_handle_lends_the_clone_and_clears_the_cache_of_the_thread_that_solves() {
+        let (scopes, db) = (scopes(), RootDatabase::new(None));
+        let handle = Handle::in_scopes(scopes, &db, cleared);
+        let solved = std::thread::spawn(move || {
+            let during = handle.solve(|_| (CLEARED.with(Cell::get), scopes.held()));
+            (during, CLEARED.with(Cell::get))
+        });
+        let (during, after) = solved.join().unwrap();
+        assert_eq!(during, (0, 1), "while it solves, the cache is not cleared and it counts");
+        assert_eq!(after, 1, "once it returns, the thread that solved has cleared its cache");
+        assert_eq!(scopes.idle(), Ok(()));
     }
 
     #[test]
-    fn no_bare_clone_of_the_database() {
-        // A clone of the database that a thread solves with and the collection does not
-        // count is a cache nothing clears. So the clones in this crate are all handles.
+    fn a_solve_that_unwinds_still_clears_the_cache_and_stops_counting() {
+        let (scopes, db) = (scopes(), RootDatabase::new(None));
+        let handle = Handle::in_scopes(scopes, &db, cleared);
+        let unwound = std::thread::spawn(move || {
+            let solve = std::panic::AssertUnwindSafe(|| handle.solve(|_| panic!("cancelled")));
+            (std::panic::catch_unwind(solve).is_err(), CLEARED.with(Cell::get))
+        });
+        assert_eq!(unwound.join().unwrap(), (true, 1));
+        assert_eq!(scopes.idle(), Ok(()));
+    }
+
+    #[test]
+    fn a_thread_that_keeps_a_solver_cache_keeps_the_collection_off() {
+        // A thread that solved with a clone made without a handle is counted by its cache,
+        // not by a scope: once the write is over and no scope is live, a live cache still
+        // stops the collection.
+        use std::cell::RefCell;
+        let (scopes, mut db) = (scopes(), RootDatabase::new(None));
+        let steps = RefCell::new(Vec::new());
+        let result = collect_in(
+            &mut db,
+            scopes,
+            || steps.borrow_mut().push("clear"),
+            |_| steps.borrow_mut().push("write"),
+            || 1,
+            || steps.borrow_mut().push("collect"),
+        );
+        assert_eq!(result, Err(Busy::Caches(1)));
+        assert_eq!(*steps.borrow(), ["clear", "write"], "collected with a live cache");
+    }
+
+    #[test]
+    fn a_thread_that_solves_has_a_live_cache_until_it_clears_it() {
+        // What `collect_types` reads of `hir::live_solver_caches`, on a thread that solves
+        // with a clone of the database made without a handle: its cache counts from its first
+        // solve until it is cleared.
+        use test_fixture::WithFixture;
+        let (db, file) = RootDatabase::with_single_file(
+            r#"
+trait Tr {}
+struct S;
+impl Tr for S {}
+"#,
+        );
+        let (file, bare) = (file.file_id(&db), db.clone());
+        let solved = std::thread::spawn(move || {
+            let db = bare;
+            let before = hir::live_solver_cache_on_this_thread();
+            let implements = hir::attach_db(&db, || {
+                let sema = hir::Semantics::new(&db);
+                let module = sema.file_to_module_def(file).unwrap();
+                let (mut ty, mut tr) = (None, None);
+                for def in module.declarations(&db) {
+                    match def {
+                        hir::ModuleDef::Adt(adt) => ty = Some(adt.ty(&db)),
+                        hir::ModuleDef::Trait(it) => tr = Some(it),
+                        _ => {}
+                    }
+                }
+                ty.unwrap().impls_trait(&db, tr.unwrap(), &[])
+            });
+            let (live, count) =
+                (hir::live_solver_cache_on_this_thread(), hir::live_solver_caches());
+            hir::clear_tls_solver_cache();
+            (before, implements, live, count, hir::live_solver_cache_on_this_thread())
+        });
+        let (before, implements, live, count, cleared) = solved.join().unwrap();
+        assert!(!before, "a thread that has not solved has no live cache");
+        assert!(implements);
+        assert!(live && count >= 1, "a thread that solved has a live cache, and it is counted");
+        assert!(!cleared, "a cleared cache is not live");
+    }
+
+    #[test]
+    fn no_database_clone_spelled_as_this_crate_spells_one() {
+        // A lint, not a proof. A clone of the database that a thread solves with outside a
+        // handle leaves that thread's solver cache uncleared, which keeps the collection off
+        // (`collect_types` counts it in `hir::live_solver_caches`) until the thread ends: that
+        // is what makes such a clone safe, and this finds the usual ones before they turn the
+        // collection off. It reads the text of this crate's sources and hir-ty-codegen's, but
+        // `solving.rs`, before a `//` on each line, for `db.clone()`, `database.clone()`, and
+        // a call of `...::clone(` (`Clone::clone(db)`, `RootDatabase::clone(&self.db)`) whose
+        // argument names `db` or `database`. It does not know types: it misses a clone through
+        // another name (`let root = db; root.clone()`), one split over lines, and one of a
+        // crate it does not read, and flags a `db` that is not the database.
         fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
                 let path = entry.path();
@@ -419,8 +514,20 @@ mod tests {
                 }
             }
         }
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
-        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        sources(&crate_dir.join("src"), &mut files);
+        sources(&crate_dir.join("../hir-ty-codegen"), &mut files);
+        assert!(files.len() > 2, "the sources were found");
+        let names_the_database = |it: &str| it.contains("db") || it.contains("database");
+        let clones = |code: &str| {
+            code.contains("db.clone()")
+                || code.contains("database.clone()")
+                || code.match_indices("::clone(").any(|(at, call)| {
+                    let argument = &code[at + call.len()..];
+                    names_the_database(argument.split(')').next().unwrap_or(argument))
+                })
+        };
         let mut bare = Vec::new();
         for file in files {
             if file.file_name().is_some_and(|it| it == "solving.rs") {
@@ -429,7 +536,7 @@ mod tests {
             let text = std::fs::read_to_string(&file).unwrap();
             for (at, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or(line);
-                if code.contains("db.clone()") || code.contains("database.clone()") {
+                if clones(code) {
                     bare.push(format!("{}:{}: {}", file.display(), at + 1, line.trim()));
                 }
             }

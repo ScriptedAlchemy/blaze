@@ -385,25 +385,26 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
             .map(|part| {
                 let (db, functions) = (solving::Handle::of(&db), &functions);
                 scope.spawn(move || {
-                    let (db, _solving) = db.split();
-                    hir::attach_db(&db, || {
-                        let files = files.iter().zip(functions).enumerate();
-                        files
-                            .skip(part)
-                            .step_by(threads)
-                            .map(|(at, (&file, functions))| {
-                                let Some(functions) = functions else {
-                                    if stats {
-                                        eprintln!(
-                                            "outline: {file:?} has functions that are not listed"
-                                        );
-                                    }
-                                    return (at, None);
-                                };
-                                (at, outline(&db, file, functions))
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    db.solve(|db| {
+                        hir::attach_db(db, || {
+                            let files = files.iter().zip(functions).enumerate();
+                            files
+                                .skip(part)
+                                .step_by(threads)
+                                .map(|(at, (&file, functions))| {
+                                    let Some(functions) = functions else {
+                                        if stats {
+                                            eprintln!(
+                                                "outline: {file:?} has functions that are not listed"
+                                            );
+                                        }
+                                        return (at, None);
+                                    };
+                                    (at, outline(db, file, functions))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                                    })
                 })
             })
             .collect();

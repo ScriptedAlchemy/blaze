@@ -1469,20 +1469,21 @@ fn run(
                 let unit = unit.as_deref();
                 let (tests, counted) = (&tests, &counted);
                 scope.spawn(move || {
-                    let (db, _solving) = db.split();
-                    let Some(unit) = unit else { return };
-                    loop {
-                        let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
-                        let Some((at, name)) = job else { break };
-                        let compiled = compile(&db, building, asked, &tests[at], name, unit);
-                        let compiled = compiled.inspect_err(|why| {
-                            eprintln!("ra-jit: {} is rustc's: {why:#}", tests[at].name);
-                        });
-                        if let Ok(Ours::Linked(_)) = &compiled {
-                            counted.remembered.fetch_add(1, Ordering::Relaxed);
+                    db.solve(|db| {
+                        let Some(unit) = unit else { return };
+                        loop {
+                            let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
+                            let Some((at, name)) = job else { break };
+                            let compiled = compile(db, building, asked, &tests[at], name, unit);
+                            let compiled = compiled.inspect_err(|why| {
+                                eprintln!("ra-jit: {} is rustc's: {why:#}", tests[at].name);
+                            });
+                            if let Ok(Ours::Linked(_)) = &compiled {
+                                counted.remembered.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ = ready.send((at, compiled.ok()));
                         }
-                        _ = ready.send((at, compiled.ok()));
-                    }
+                    })
                 })
             })
             .collect();
