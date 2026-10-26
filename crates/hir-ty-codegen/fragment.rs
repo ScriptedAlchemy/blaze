@@ -91,12 +91,13 @@ pub(super) enum TextPart {
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
 /// until the stitcher replaces them with the ids of its module.
-#[derive(Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub(super) struct Requests {
     pub(super) funcs: Vec<FuncRequest>,
     pub(super) datas: Vec<DataRequest>,
 }
 
+#[derive(Clone)]
 pub(super) struct Code {
     pub(super) signature: Signature,
     pub(super) bytes: Vec<u8>,
@@ -149,7 +150,7 @@ impl PartialEq for Code {
 
 /// Compared by the database when a function is compiled again: one that came out the same
 /// leaves what was built from it alone.
-#[derive(PartialEq, Hash)]
+#[derive(Clone, PartialEq, Hash)]
 pub struct CompiledFunction {
     pub(super) requests: Requests,
     pub(super) code: Code,
@@ -166,7 +167,7 @@ pub struct CompiledFunction {
 
 /// A local written with a name that is kept in one slot of the frame for as long as the
 /// function runs.
-#[derive(PartialEq, Hash)]
+#[derive(Clone, PartialEq, Hash)]
 pub(super) struct Variable {
     pub(super) binding: BindingId,
     pub(super) param: bool,

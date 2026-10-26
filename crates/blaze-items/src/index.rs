@@ -146,6 +146,21 @@ pub struct Pushed {
     pub written: usize,
 }
 
+impl Pushed {
+    /// What changed but the items of `moved`, which are written as they were elsewhere, and
+    /// nothing bound anew: what a moved function's code can have changed by.
+    pub fn unmoved(&self, moved: &FxHashMap<ItemId, ItemId>) -> Pushed {
+        let of_moves: FxHashSet<ItemId> = moved.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        Pushed {
+            changed: self.changed.difference(&of_moves).copied().collect(),
+            bound: FxHashMap::default(),
+            methods: FxHashSet::default(),
+            files: self.files.clone(),
+            written: self.written,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Bound {
     module: ModuleId,

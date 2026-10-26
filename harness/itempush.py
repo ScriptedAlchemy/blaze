@@ -52,20 +52,39 @@ pub trait Area {
 }
 
 mod e;
+pub use e::{here, named};
+"""
+# Functions moved to another file and back: one that tells where it is, which calls another moved
+# with it, and one that names itself by its path.
+MOVED = """
+pub fn here() -> String {
+    let at = std::panic::Location::caller();
+    format!("{}:{}:{}", at.file(), at.line(), inner())
+}
+
+fn inner() -> u32 {
+    5
+}
+
+pub fn named() -> &'static str {
+    std::any::type_name_of_val(&named)
+}
 """
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
     "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
     "lib/src/lib.rs": LIB,
     "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
-    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n",
+    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n" + MOVED,
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
     "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
-    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
+    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n    println!("{} {}", lib::here(), lib::named());\n}\n',
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
-C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
+C_RS, D_RS, E_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/e.rs", "lib/src/f.rs"
+TO_SHAPES = (LIB_RS, "pub use e::{here, named};", "pub use shapes::{here, named};")
+TO_E = (LIB_RS, "pub use shapes::{here, named};", "pub use e::{here, named};")
 # A file of the crate's directory that no module is written in, which the crate doesn't build.
 STRAY = "lib/src/stray.rs"
 SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
@@ -108,7 +127,17 @@ STEPS = [
     ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
     ("a file no module is written in", [(STRAY, None, lambda _: "pub fn pick() -> u32 {\n    9\n}\n")]),
     ("it written again", [(STRAY, "9", "90")]),
+    ("functions moved to another file", [(E_RS, MOVED, ""), (SHAPES_RS, None, lambda t: t + MOVED), TO_SHAPES]),
+    ("an edit after a move", [(B_RS, "x * 3", "x * 5")]),
+    ("moved back", [(SHAPES_RS, MOVED, ""), (E_RS, None, lambda t: t + MOVED), TO_E]),
+    ("moved with a callee changed", [
+        (E_RS, MOVED, ""),
+        (SHAPES_RS, None, lambda t: t + MOVED.replace("    5\n", "    6\n")),
+        TO_SHAPES,
+    ]),
 ]
+# Steps whose moved functions keep their code from before the edit, which items find.
+RELOCATES = {"functions moved to another file"}
 
 
 def logs(home):
@@ -171,7 +200,12 @@ def steps(check_all):
             right &= not missed
             how = re.findall(r"^items: (whole crates: .*|\d+ written, \d+ changed, \d+ names, .*?) in \d+ us$", log, re.M)
             pushed += any(not it.startswith("whole") for it in how)
+            relocated = re.findall(r"^relocated: (\d+) instances, (\d+) moved now by their code.*$", log, re.M)
+            if step in RELOCATES and not check_all:
+                right &= any(int(kept) > 0 for _, kept in relocated)
             detail = f"cargo exit {theirs.returncode}, ours {ours.returncode}{outputs}; items {how}"
+            if relocated:
+                detail += f"; relocated {relocated}"
             if missed:
                 detail += f"; {missed[:3]}"
             print(f"{mode:9} {step:27} {'ok' if right else 'WRONG':6} {detail}")

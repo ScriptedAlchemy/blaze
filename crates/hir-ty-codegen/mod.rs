@@ -2007,6 +2007,9 @@ struct ObjectCodegen<'a, 'db> {
     tiers: Option<&'a tier::Tiers>,
     /// What each function built from an entry of the store is an instance of.
     found_instances: FxHashMap<FuncId, (Instance, StoredParamEnvAndCrate)>,
+    /// The code of instances a patch has without compiling them: a moved function's, from
+    /// before the edit that moved it.
+    given: FxHashMap<Instance, std::sync::Arc<CompiledFunction>>,
     /// Whether the store has the code of a root whole, by its name, for the roots asked
     /// about: those it has are put in the object from it, not compiled.
     stored_roots: FxHashMap<FunctionId, Option<StableName>>,
@@ -4662,6 +4665,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             hidden: Vec::new(),
             tiers: None,
             found_instances: FxHashMap::default(),
+            given: FxHashMap::default(),
             stored_roots: FxHashMap::default(),
             root_names: FxHashMap::default(),
         })
@@ -5094,8 +5098,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let wave = std::mem::take(&mut self.pending);
                     let start = stdx::time::Instant::now();
                     let told = self.tells_variables().then_some(&self.told);
+                    let given = &self.given;
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
                         let (instance, env, _) = &wave[at];
+                        if given.contains_key(instance) {
+                            return;
+                        }
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
                             told.ahead(db, compiled);
@@ -5303,9 +5311,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
         let tiered = tiers.and_then(|it| it.code(self.db, &node));
         let unit = self.unit_instances.remove(instance).filter(|_| tiered.is_none());
+        let given = self.given.get(instance).cloned();
         let compiled = match (tiered, &unit) {
             (Some(code), _) => code,
             (None, Some(unit)) => unit,
+            (None, None) if let Some(given) = &given => given,
             (None, None) => compiled_instance(self.db, instance.clone(), env.clone())
                 .as_ref()
                 .map_err(Clone::clone)?,

@@ -13,7 +13,9 @@ use std::{
 use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 pub(super) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
@@ -26,7 +28,7 @@ use super::{
     Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
-    home::{body_file, body_files, mentioned_crates, written_in},
+    home::{body_file, body_files, instance_gone, mentioned_crates, type_gone, written_in},
     instance_serial, is_thread_local,
     itempush::{Asked, ItemPush, Settled},
     left_to_rustc,
@@ -766,6 +768,87 @@ pub(super) struct Base {
     /// Where a thread of its own puts the code of the functions of [`Self::items`] it wrote,
     /// which moves are found by: taken before the next edit if it is done by then.
     coding: Option<Coding>,
+    /// The instances of the base whose function an edit moved to another place, which the
+    /// base's symbol of each stands for still: what called it there calls it so.
+    relocated: FxHashMap<Instance, Relocated>,
+    /// The instances of `relocated` by the one each is now.
+    relocated_now: FxHashMap<Instance, Instance>,
+    /// The functions of `relocated` by the one each is now.
+    relocated_funcs: FxHashMap<FunctionId, FunctionId>,
+    /// The code of the instances of functions of the files an edit changes, from before it,
+    /// by the function each is of then: what one the edit moves compiles to where it is now.
+    snapshots: FxHashMap<FunctionId, (Instance, Arc<CompiledFunction>)>,
+}
+
+/// An instance of the base whose function an edit moved.
+#[derive(Clone)]
+struct Relocated {
+    /// The instance it is now.
+    now: Instance,
+    /// What it compiles to now, when that is known without compiling it: the edit that moved
+    /// it changed nothing its code is of, so that is the code from before with what the edit
+    /// moved of it where it is now. Each edit after compiles it.
+    code: Option<Arc<CompiledFunction>>,
+}
+
+/// `code` from before an edit, of the function where the edit moved it, with what else of it
+/// the edit moved (`moved`) where that is now. `None` when it refers to anything else the
+/// edit took away, or is generic over anything.
+fn relocated(
+    db: &dyn HirDatabase,
+    code: &CompiledFunction,
+    moved: &FxHashMap<FunctionId, FunctionId>,
+    live: &blaze_items::Live,
+) -> Option<CompiledFunction> {
+    use blaze_items::ItemId;
+    let func = |it: FunctionId| match moved.get(&it) {
+        Some(&now) => Some(now),
+        None => live.has(db, ItemId::Function(it)).then_some(it),
+    };
+    let body = |it: DefWithBodyId| match it {
+        DefWithBodyId::FunctionId(it) => func(it).map(Into::into),
+        other => live.has_body(db, other).then_some(other),
+    };
+    let plain = |env: &StoredParamEnvAndCrate| {
+        let param_env = hir_ty::next_solver::ParamEnv::empty();
+        *env == hir_ty::traits::ParamEnvAndCrate { param_env, krate: env.krate }.store()
+    };
+    let mut now = code.clone();
+    for request in &mut now.requests.funcs {
+        let FuncTarget::Instance(instance, env) = &mut request.target else { continue };
+        match &mut instance.def {
+            InstanceDef::Fn(it) | InstanceDef::VtableShim(it) => *it = func(*it)?,
+            _ => {}
+        }
+        if !plain(env) || instance_gone(db, instance, live) {
+            return None;
+        }
+    }
+    for request in &mut now.requests.datas {
+        match request {
+            DataRequest::Vtable { ty, trait_ref, .. } => {
+                let trait_gone = trait_ref.as_ref().is_some_and(|(id, args)| {
+                    !live.has(db, ItemId::Trait(*id)) || type_gone(db, &args.as_ref(), live)
+                });
+                if trait_gone || type_gone(db, &ty.as_ref(), live) {
+                    return None;
+                }
+            }
+            DataRequest::Static(id) if !live.has(db, ItemId::Static(*id)) => return None,
+            DataRequest::Location(Some((owner, _))) => *owner = body(*owner)?,
+            DataRequest::Declaration(it) => *it = func(*it)?,
+            _ => {}
+        }
+    }
+    if let Some((owner, _)) = &mut now.source {
+        *owner = body(*owner)?;
+    }
+    if let Some((env, variables)) = &now.variables
+        && (!plain(env) || variables.iter().any(|it| type_gone(db, &it.ty.as_ref(), live)))
+    {
+        return None;
+    }
+    Some(now)
 }
 
 /// See [`Base::making`].
@@ -1505,6 +1588,10 @@ impl Base {
             settling: None,
             went: Vec::new(),
             coding: None,
+            relocated: FxHashMap::default(),
+            relocated_now: FxHashMap::default(),
+            relocated_funcs: FxHashMap::default(),
+            snapshots: FxHashMap::default(),
         })
         .map(|mut base| {
             base.make_items(db, cg.symbols);
@@ -1594,6 +1681,10 @@ impl Base {
             settling: None,
             went: Vec::new(),
             coding: None,
+            relocated: FxHashMap::default(),
+            relocated_now: FxHashMap::default(),
+            relocated_funcs: FxHashMap::default(),
+            snapshots: FxHashMap::default(),
         }
     }
 
@@ -2029,6 +2120,7 @@ impl Base {
         if files.is_empty() {
             return;
         }
+        self.snapshot(db, files, fan);
         let now = salsa::plumbing::current_revision(db);
         let settled = (self.settling.take().filter(|_| self.items.is_some()))
             .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
@@ -2074,6 +2166,160 @@ impl Base {
         }
     }
 
+    /// Before an edit of `files`, of the revision before it: the code of the instances of the
+    /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
+    /// Only an edit of two files or more moves a function, and the items tell which it moved.
+    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+        let start = std::time::Instant::now();
+        self.snapshots.clear();
+        let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
+        let moves = !self.rustc && self.items.is_some() && files.len() >= 2;
+        let edited: FxHashSet<FileId> = files.iter().copied().collect();
+        for (key, it) in &mut self.relocated {
+            let code = it.code.take();
+            let InstanceDef::Fn(func) = it.now.def else { continue };
+            if moves && probe(|| edited.contains(&body_file(db, func.into()))) == Some(true) {
+                wanted.push((key.clone(), it.now.clone(), self.instances[key].env.clone(), code));
+            }
+        }
+        if !moves {
+            return;
+        }
+        for (instance, was) in &self.instances {
+            let written =
+                was.files.as_deref().is_some_and(|it| it.iter().any(|f| edited.contains(f)));
+            if !written
+                || was.mark.is_none()
+                || was.forwarded
+                || self.relocated.contains_key(instance)
+                || !matches!(instance.def, InstanceDef::Fn(_))
+                || instance.args.as_ref().iter().any(|it| it.region().is_none())
+            {
+                continue;
+            }
+            wanted.push((instance.clone(), instance.clone(), was.env.clone(), None));
+        }
+        let found: Vec<std::sync::OnceLock<Option<Arc<CompiledFunction>>>> =
+            wanted.iter().map(|_| std::sync::OnceLock::new()).collect();
+        let work = |db: &dyn HirDatabase, at: usize| {
+            found[at].get_or_init(|| {
+                let (_, now, env, code) = &wanted[at];
+                if let Some(code) = code {
+                    return Some(Arc::clone(code));
+                }
+                let compiled =
+                    || compiled_instance(db, now.clone(), env.clone()).as_ref().ok().cloned();
+                probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new)
+            });
+        };
+        fan(wanted.len(), &work);
+        (0..wanted.len()).for_each(|at| work(db, at));
+        let asked = wanted.len();
+        for ((key, now, ..), code) in wanted.into_iter().zip(found) {
+            if let (InstanceDef::Fn(func), Some(code)) = (now.def, code.into_inner().flatten()) {
+                self.snapshots.insert(func, (key, code));
+            }
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "relocate-snapshot: {} of {asked} instances in {} us",
+                self.snapshots.len(),
+                start.elapsed().as_micros()
+            );
+        }
+    }
+
+    /// After an edit is pushed through the items, `pushed` when it is: each instance of the base
+    /// whose function the edit moved within its crate is the one of where it is now, under
+    /// the base's symbol. Its code is that from before the edit when nothing it is of changed
+    /// but the items moved, and is compiled otherwise.
+    fn relocate(&mut self, db: &dyn HirDatabase, pushed: Option<&blaze_items::Pushed>) {
+        use blaze_items::ItemId;
+        let snapshots = std::mem::take(&mut self.snapshots);
+        let Some(items) = &self.items else {
+            self.relocated.clear();
+            self.relocated_now.clear();
+            self.relocated_funcs.clear();
+            return;
+        };
+        let start = std::time::Instant::now();
+        let live = items.index.live();
+        let index_moved = items.index.moved();
+        let moved: FxHashMap<FunctionId, FunctionId> = (index_moved.iter())
+            .filter_map(|it| match it {
+                (ItemId::Function(was), ItemId::Function(now)) => Some((*was, *now)),
+                _ => None,
+            })
+            .collect();
+        let asked: Option<FxHashSet<u32>> =
+            pushed.map(|it| items.asked(&it.unmoved(index_moved)).instances.into_iter().collect());
+        let (mut kept, mut compiled) = (0, 0);
+        for (was, now) in &moved {
+            let Some((key, code)) = snapshots.get(was) else { continue };
+            let base = &self.instances[key];
+            if key.def == InstanceDef::Fn(*now) || probe(|| now.krate(db)) != Some(base.env.krate) {
+                self.relocated.remove(key);
+                continue;
+            }
+            let at = self.instances.get_index_of(key).expect("a key of the base") as u32;
+            let unasked = asked.as_ref().is_some_and(|it| !it.contains(&at));
+            let relocate = || hir_ty::attach_db(db, || relocated(db, code, &moved, &live));
+            let code = unasked.then(|| probe(relocate)).flatten().flatten().map(Arc::new);
+            if code.is_some() {
+                kept += 1;
+            } else {
+                compiled += 1;
+            }
+            let now = Instance { def: InstanceDef::Fn(*now), ..key.clone() };
+            self.relocated.insert(key.clone(), Relocated { now, code });
+        }
+        self.relocated.retain(|_, it| match it.now.def {
+            InstanceDef::Fn(func) => probe(|| live.has(db, ItemId::Function(func))) == Some(true),
+            _ => false,
+        });
+        self.relocated_now =
+            self.relocated.iter().map(|(key, it)| (it.now.clone(), key.clone())).collect();
+        self.relocated_funcs = (self.relocated.iter())
+            .filter_map(|(key, it)| match (key.def, it.now.def) {
+                (InstanceDef::Fn(was), InstanceDef::Fn(now)) => Some((now, was)),
+                _ => None,
+            })
+            .collect();
+        if std::env::var_os("RA_JIT_STATS").is_some() && !moved.is_empty() {
+            eprintln!(
+                "relocated: {} instances, {kept} moved now by their code and {compiled} to compile, of {} functions moved, in {} us",
+                self.relocated.len(),
+                moved.len(),
+                start.elapsed().as_micros()
+            );
+        }
+    }
+
+    /// The mark of `compiled` with what it calls of [`Self::relocated`] called as the base
+    /// does: the base's code that is the same calls the base's symbol, which stands for it.
+    fn moved_mark(&self, db: &dyn HirDatabase, compiled: &CompiledFunction) -> Mark {
+        let func = |it: FunctionId| self.relocated_funcs.get(&it).copied().unwrap_or(it);
+        let mut was = compiled.clone();
+        for request in &mut was.requests.funcs {
+            if let FuncTarget::Instance(instance, _) = &mut request.target
+                && let Some(key) = self.relocated_now.get(instance)
+            {
+                *instance = key.clone();
+            }
+        }
+        for request in &mut was.requests.datas {
+            match request {
+                DataRequest::Location(Some((DefWithBodyId::FunctionId(it), _)))
+                | DataRequest::Declaration(it) => *it = func(*it),
+                _ => {}
+            }
+        }
+        if let Some((DefWithBodyId::FunctionId(it), _)) = &mut was.source {
+            *it = func(*it);
+        }
+        Mark::of_function(db, super::print_of(&was), compiled, self.debug)
+    }
+
     /// Notes that `files` of `crates` changed in their items: what can have changed is what
     /// refers to an item that changed, through its interface, or calls something by a name
     /// bound to another thing now. All of what sees the files when that can't be told.
@@ -2104,9 +2350,11 @@ impl Base {
                 if stats {
                     eprintln!("items: whole crates: {why}");
                 }
+                self.relocate(db, None);
                 return self.touch(db, Some(crates));
             }
         };
+        self.relocate(db, Some(&pushed));
         let items = self.items.as_ref().expect("pushed through them");
         let asked = items.asked(&pushed);
         // Their bodies too, as a body edit's.
@@ -2511,7 +2759,14 @@ impl Base {
                     let compiled = compiled_root(db, root).as_ref().ok()?;
                     Some(stable_mark(db, names, compiled, self.debug) == Some(was))
                 }),
-                _ => probe(|| Some(Mark::of_root(db, root, self.debug)? == self.marks[i])),
+                _ => probe(|| {
+                    let now = Mark::of_root(db, root, self.debug)?;
+                    if now == self.marks[i] || self.relocated.is_empty() {
+                        return Some(now == self.marks[i]);
+                    }
+                    let compiled = compiled_root(db, root).as_ref().ok()?;
+                    Some(self.moved_mark(db, compiled) == self.marks[i])
+                }),
             };
             stale.steps.roots_asked += 1;
             stale.steps.asked(asked.elapsed());
@@ -2585,6 +2840,10 @@ impl Base {
         let instances = &handout.instances;
         for i in handout.each(Look::Instances, instances.len()).map(|it| instances[it]) {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
+            // What it is now is the patch's to tell.
+            if self.relocated.contains_key(instance) {
+                continue;
+            }
             let touched = self.touched.reaches(was.env.krate)
                 || self.touched.reaches_bodies(was.files.as_deref())
                 || self.touched.instances.contains(instance)
@@ -2595,7 +2854,21 @@ impl Base {
                 continue;
             }
             let asked = stdx::time::Instant::now();
-            let mark = probe(|| Mark::of_instance(db, instance, &was.env, self.debug));
+            let mut mark = probe(|| Mark::of_instance(db, instance, &was.env, self.debug));
+            if !self.relocated.is_empty()
+                && let Some(Some(now)) = mark
+                && Some(now) != was.mark
+            {
+                let moved = probe(|| {
+                    let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+                    compiled.as_ref().ok().map(|it| self.moved_mark(db, it))
+                });
+                if let Some(Some(moved)) = moved
+                    && Some(moved) == was.mark
+                {
+                    mark = Some(Some(moved));
+                }
+            }
             stale.steps.instances_asked += 1;
             stale.steps.asked(asked.elapsed());
             stale.their_walk_changed |= touched
@@ -2913,6 +3186,35 @@ impl Base {
             cg.instances.insert(instance.clone(), id);
             cg.pending.push((instance.clone(), was.env.clone(), id));
         }
+        // What a moved function's instance is called by is the base's symbol, which the patch
+        // defines again when the code under it is other code or tells of other places.
+        let mut relocated = 0;
+        for (key, it) in &self.relocated {
+            let was = &self.instances[key];
+            let compiled = || compiled_instance(db, it.now.clone(), was.env.clone()).as_ref();
+            let code: &CompiledFunction = match &it.code {
+                Some(code) => code,
+                None => match probe(compiled) {
+                    Some(Ok(code)) => code,
+                    Some(Err(_)) => return Ok(Err("a function moved no longer compiles")),
+                    // Gone since, with nothing that calls it.
+                    None => continue,
+                },
+            };
+            if Some(self.moved_mark(db, code)) == was.mark {
+                let id = cg.import(&was.symbol, &code.code.signature)?;
+                cg.instances.insert(it.now.clone(), id);
+                continue;
+            }
+            relocated += 1;
+            let id =
+                cg.module.declare_function(&was.symbol, Linkage::Hidden, &code.code.signature)?;
+            cg.instances.insert(it.now.clone(), id);
+            if let Some(code) = &it.code {
+                cg.given.insert(it.now.clone(), Arc::clone(code));
+            }
+            cg.pending.push((it.now.clone(), was.env.clone(), id));
+        }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
             let was = &self.hydrated[i as usize];
@@ -2985,11 +3287,12 @@ impl Base {
             let known: FxHashSet<FunctionId> = known_roots().collect();
             let new = queue.iter().filter(|it| !known.contains(it)).count();
             eprintln!(
-                "patch-made: {} roots changed and {new} new, {} gone; {} instances, {} of them of the base",
+                "patch-made: {} roots changed and {new} new, {} gone; {} instances, {} of them of the base and {relocated} relocated of {}",
                 queue.len() - new,
                 cg.replaced.gone.len(),
                 cg.instances.len(),
-                changed_instances.len()
+                changed_instances.len(),
+                self.relocated.len()
             );
         }
         let (bodies, mut phases) = (cg.bodies, cg.phases);
