@@ -6,7 +6,8 @@ use proc_macro::{TokenStream, TokenTree};
 fn name_of(input: &TokenStream) -> String {
     let mut tokens = input.clone().into_iter();
     while let Some(token) = tokens.next() {
-        if matches!(&token, TokenTree::Ident(it) if it.to_string() == "struct" || it.to_string() == "fn") {
+        if matches!(&token, TokenTree::Ident(it) if it.to_string() == "struct" || it.to_string() == "fn")
+        {
             return tokens.next().map(|it| it.to_string()).unwrap_or_default();
         }
     }
