@@ -662,10 +662,27 @@ pub(crate) struct Cargo<'a> {
 /// 1.99 wrote, or of a run that did not end; when they do not hold what cargo would reckon now (a
 /// variable the script reads has another value, and cargo runs it again with that one); when the
 /// script says nothing of what it reads, and cargo reckons from every file of its package; when a
-/// cargo holds the lock and would run the script, which it may be doing; and when there is no
+/// cargo holds the lock, so its run cannot be read consistently; and when there is no
 /// lock to take. A run that fails, or that printed what cargo does not take, is `Err` too, and
 /// cargo, which finds its records of a run that did not end, runs the script again.
 pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> {
+    let unit = records::Unit::of(out_dir)?;
+    // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
+    // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
+    // reading the invocation too, which cargo can replace with another environment.
+    let _held = match unit.lock() {
+        records::Lock::Held(held) => held,
+        records::Lock::Busy => {
+            return Err(
+                "was not read or run again: a cargo is building in its directory".to_owned()
+            );
+        }
+        records::Lock::Absent => {
+            return Err(
+                "was not read or run again: its directory has no lock of cargo's".to_owned()
+            );
+        }
+    };
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
     let ran: Ran = std::fs::read(run_dir.join(RAN))
         .map_err(|it| format!("{RAN}: {it}"))
@@ -678,9 +695,6 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     let out_dir = cargos.ok_or("ran in another directory than cargo's")?;
     let package = var("CARGO_MANIFEST_DIR").map(Path::new).ok_or("ran without a package")?;
     let unit = records::Unit::of(out_dir)?;
-    // Before cargo's records are read: a cargo that ran the script meanwhile has written them
-    // by the time it lets go.
-    let lock = unit.lock();
     let recorded = unit.recorded()?;
     let output = unit.output();
     let printed = std::fs::read(&output).map_err(|it| format!("{}: {it}", output.display()))?;
@@ -713,15 +727,6 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     if unit.stale(&now, package, &compiled, home).is_none() {
         return Run::left(&printed, out_dir);
     }
-    let _held = match lock {
-        records::Lock::Held(held) => held,
-        records::Lock::Busy => {
-            return Err("was not run again: a cargo is building in its directory".to_owned());
-        }
-        records::Lock::Absent => {
-            return Err("was not run again: its directory has no lock of cargo's".to_owned());
-        }
-    };
     let began = unit.begin()?;
     let mut script = Command::new(&ran.real);
     script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
@@ -1148,9 +1153,10 @@ mod tests {
         let out_dir = ran_script("busy", COUNTS, "");
         let dest = out_dir.parent().unwrap().parent().unwrap().parent().unwrap();
         let mut cargo = held(&dest.join(".cargo-build-lock"));
-        // Cargo's own run is after the last change, so cargo does not run the script again in
-        // this build, and its run is read.
-        assert_eq!(current(&out_dir, &CARGO), Run::of(&out_dir));
+        // Even a run that looks fresh cannot be read while cargo owns the directory: cargo
+        // can replace its records or OUT_DIR immediately after the freshness check.
+        let result = current(&out_dir, &CARGO);
+        assert!(result.as_ref().is_err_and(|it| it.contains("a cargo is building")), "{result:?}");
         // It is not, and cargo may be running the script now.
         changed(&out_dir);
         let result = current(&out_dir, &CARGO);
@@ -1168,6 +1174,16 @@ mod tests {
         drop(cargo.stdin.take());
         assert!(cargo.wait().unwrap().success());
         assert_eq!(runs(&out_dir), 1);
+    }
+
+    #[test]
+    fn a_fresh_run_without_a_cargo_lock_is_not_read() {
+        let out_dir = ran_script("fresh-no-lock", COUNTS, "");
+        let dest = out_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        std::fs::remove_file(dest.join(".cargo-build-lock")).unwrap();
+        let result = current(&out_dir, &CARGO);
+        assert!(result.as_ref().is_err_and(|it| it.contains("no lock")), "{result:?}");
+        assert_eq!(runs(&out_dir), 0, "the script did not run");
     }
 
     /// The verifier's case of round 3: with `build.build-dir`, cargo 1.99 holds
