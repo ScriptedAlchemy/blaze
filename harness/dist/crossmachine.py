@@ -81,6 +81,10 @@ FIXTURES = {
                    about="a proc-macro crate: two pure macros and a derive that reads a file while it expands"),
     "ripgrep": dict(source="pinned", workspace=".", package="ripgrep", run=None,
                     about="13 crates, two build scripts, registry dependencies"),
+    # Acceptance names it; it is 165,752 functions and the project whose memory G0 failed, so it is
+    # asked for by name and not part of `--all`.
+    "nushell": dict(source="pinned", workspace=".", package="nu", run=None,
+                    about="the scale arm: 165,752 functions; asked for by name, not in --all"),
 }
 # `--all` runs these in this order: the small ones first, so a break shows early.
 ALL = ["hello", "paths", "vendored", "macros", "ripgrep"]
