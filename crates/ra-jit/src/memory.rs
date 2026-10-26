@@ -4,7 +4,8 @@
 //! each step of warming up, and once warm and after each request it answers writes there what
 //! every ingredient of the database holds, and how much of the heap is live. A build with the
 //! `heap-profile` feature run with `_RJEM_MALLOC_CONF=prof:true` also writes a profile of the
-//! heap next to the ingredients, for `jeprof` to read.
+//! heap next to the ingredients, for `jeprof` to read. `RA_JIT_MEMORY_EVERY` also has a thread
+//! say every few seconds what jemalloc counts, without waiting for a step to end ([`ticks`]).
 
 use std::{
     fmt::Write as _,
@@ -141,6 +142,96 @@ pub(crate) fn give_back() {
             0,
         );
     }
+}
+
+/// With `RA_JIT_MEMORY_EVERY` naming a number of seconds, starts a thread that says every that
+/// many seconds, in the log, what the process holds and what jemalloc counts: the live bytes,
+/// the pages they are in, what is mapped and what is kept for reuse. With `RA_JIT_MEMORY`
+/// naming a directory it appends the same to `ticks.tsv` there, and, when the build has the
+/// `heap-profile` feature and the process runs with `_RJEM_MALLOC_CONF=prof:true`, writes
+/// `at-<live MB>.prof` each time the live bytes pass the next `RA_JIT_MEMORY_STEP_MB` (1024) of
+/// the last one. It runs beside the workspace's loading, which the report of [`report`] can't:
+/// that one waits for a step to end, and a load that is stopped for its size never gets there.
+pub(crate) fn ticks() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let every = std::env::var("RA_JIT_MEMORY_EVERY").ok().and_then(|it| it.parse::<f64>().ok());
+    let Some(every) = every.filter(|it| *it > 0.0) else { return };
+    STARTED.call_once(|| {
+        let step = std::env::var("RA_JIT_MEMORY_STEP_MB")
+            .ok()
+            .and_then(|it| it.parse::<u64>().ok())
+            .filter(|it| *it > 0)
+            .unwrap_or(1024);
+        let spawned = std::thread::Builder::new().name("memory-ticks".into()).spawn(move || {
+            let (dir, start) = (report_dir(), std::time::Instant::now());
+            if let Some(dir) = &dir {
+                _ = std::fs::create_dir_all(dir);
+            }
+            let mut next = 0;
+            for tick in 1_u64.. {
+                std::thread::sleep(std::time::Duration::from_secs_f64(every));
+                let mb = |bytes: Option<u64>| bytes.map_or(0, |it| it >> 20);
+                let footprint = mb(held_by(std::process::id()));
+                let [live, active, resident, mapped, retained, metadata] = jemalloc_stats();
+                let compiled = hir_ty_codegen::compiled_functions();
+                let line = format!(
+                    "{tick}\t{:.0}\t{footprint}\t{live}\t{active}\t{resident}\t{mapped}\t{retained}\t{metadata}\t{compiled}",
+                    start.elapsed().as_secs_f64(),
+                );
+                eprintln!(
+                    "memory tick {tick} at {:.0}s: {footprint} MB footprint, {live} MB live, {active} MB active, {resident} MB resident, {mapped} MB mapped, {retained} MB retained, {metadata} MB metadata, {compiled} functions compiled",
+                    start.elapsed().as_secs_f64(),
+                );
+                let Some(dir) = &dir else { continue };
+                let ticks = dir.join("ticks.tsv");
+                let new = !ticks.exists();
+                if let Ok(mut file) =
+                    std::fs::OpenOptions::new().create(true).append(true).open(&ticks)
+                {
+                    use std::io::Write as _;
+                    if new {
+                        _ = writeln!(
+                            file,
+                            "tick\tseconds\tfootprint_mb\tlive_mb\tactive_mb\tresident_mb\tmapped_mb\tretained_mb\tmetadata_mb\tcompiled"
+                        );
+                    }
+                    _ = writeln!(file, "{line}");
+                }
+                if live >= next {
+                    let at = dir.join(format!("at-{live:07}.prof"));
+                    if write_heap_profile(&at).is_ok() && at.exists() {
+                        next = live + step;
+                    }
+                }
+            }
+        });
+        if let Err(why) = spawned {
+            eprintln!("memory: the ticks did not start: {why}");
+        }
+    });
+}
+
+/// Megabytes jemalloc counts as live, active, resident, mapped, kept for reuse and used for its
+/// own metadata, each 0 where it can't say.
+fn jemalloc_stats() -> [u64; 6] {
+    #[cfg(unix)]
+    {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return [0; 6];
+        }
+        let mb = |bytes: Result<usize, _>| bytes.map_or(0, |it| it as u64 >> 20);
+        [
+            mb(stats::allocated::read()),
+            mb(stats::active::read()),
+            mb(stats::resident::read()),
+            mb(stats::mapped::read()),
+            mb(stats::retained::read()),
+            mb(stats::metadata::read()),
+        ]
+    }
+    #[cfg(windows)]
+    [0; 6]
 }
 
 /// Reports what the process holds now that `step` is done.

@@ -2422,6 +2422,11 @@ fn selected_target() -> Result<&'static Target> {
 /// How many functions went through Cranelift since the process started.
 static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many functions went through Cranelift since the process started, for the memory report.
+pub fn compiled_functions() -> usize {
+    COMPILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
