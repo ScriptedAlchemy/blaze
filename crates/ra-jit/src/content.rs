@@ -22,6 +22,7 @@ type Hash = [u8; 32];
 #[derive(Default)]
 pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
+    source_hashes: Mutex<FxHashMap<Crate, Hash>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -31,6 +32,15 @@ pub(crate) struct Contents {
 }
 
 impl Contents {
+    pub(crate) fn source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
+        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+            return *hash;
+        }
+        let hash = library_source_hash(db, krate);
+        self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, hash);
+        hash
+    }
+
     /// `None` for a crate that depends on one `stable_crate_id` has nothing for and that is
     /// not of the checkout.
     pub(crate) fn id(
@@ -209,7 +219,7 @@ impl Contents {
                 true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
                 false => {
                     field(&Self::outside(db, on, stable_crate_id(on)));
-                    field(&library_source_hash(db, on));
+                    field(&self.source_hash(db, on));
                 }
             }
         }
@@ -239,7 +249,7 @@ impl Contents {
         };
         field(b"ra-jit library 6");
         field(Self::version(db, krate).as_bytes());
-        field(&library_source_hash(db, krate));
+        field(&self.source_hash(db, krate));
         // Where cargo fetched it to is under another directory on another machine, and so is
         // a crate beside the checkout, which the path that reaches it from there names.
         let root = root.to_string_lossy();
@@ -264,11 +274,11 @@ impl Contents {
                 }
                 Some((id, _)) => {
                     field(&Self::outside(db, on, id));
-                    field(&library_source_hash(db, on));
+                    field(&self.source_hash(db, on));
                 }
                 None => {
                     field(&Self::outside(db, on, None));
-                    field(&library_source_hash(db, on));
+                    field(&self.source_hash(db, on));
                 }
             }
         }
