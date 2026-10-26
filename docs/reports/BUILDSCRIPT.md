@@ -141,16 +141,18 @@ has of what a script prints.
 In blaze, because both halves of the difference are blaze's:
 
 1. **Run the script in a copy of cargo's `OUT_DIR`**, as cargo does. `rerun_matches` copies the
-   directory (files with their times and permissions, links as links) to the directory it runs
-   the script in, so a script that keeps what it built there finds it. cargo's directory is not
-   written to, which is why it was a directory of its own (compilers under way read cargo's; cargo builds
-   the package again when a file there is newer). Copying `td-u8`'s 125 files, 4.5 MB, takes under a
-   second.
+   directory (files and directories with their times and permissions; see "After review" for the
+   links) to the directory it runs the script in, so a script that keeps what it built there finds
+   it. cargo's directory is not written to, which is why it was a directory of its own (compilers
+   under way read cargo's; cargo builds the package again when a file there is newer). Copying
+   `td-u8`'s 125 files, 4.5 MB, took under a second (the cost of the reviewed version is in "After
+   review").
 2. **Compare the lines cargo reads.** `directives()` keeps the lines that, as text and trimmed,
    start with `cargo:` (`cargo::` too), which is where cargo's `BuildOutput::parse` starts (and
    [`blaze-build-script`'s `output::parse`](../../crates/blaze-build-script/src/output.rs)). What the script
    or a tool it runs says besides is the script's own. `rerun_into` and `same_run` compare those, in order.
-   What the script wrote into `OUT_DIR` is still compared whole (`digest_of`), so a script
+   What the script wrote into `OUT_DIR` is still compared whole (`tree_digest`, which is `digest_of`
+   of the first version, made to read links and failures as "After review" says), so a script
    whose files change still sends the build to cargo.
 
 Neither step makes a build the daemon's that cargo would not have built the same. A script that prints
@@ -287,20 +289,105 @@ meet the check again, and the old check ran the frontend's tool again each time 
   of the other crates and `cargo fmt --all -- --check` under CI's toolchain were not run; the last was
   run with 1.99.0's `cargo fmt` and passes. Only `script.rs` of any crate changed.
 - **Linux.** The scratch project, E1 to E4 and the new harness ran on macOS only. The fix has no platform code beyond
-  the copy of links, which Windows leaves to cargo.
+  the copy of links, which Windows leaves to cargo, and of directories, whose times Windows does not
+  let the copy set (`File::open` of a directory), so a rerun there is cargo's too (**inferred**, not run on Windows).
 - **A script that writes the name of its `OUT_DIR` into a file** is still told apart from cargo's run
   (`wrote something else`), as before: the copy of the directory has the old name in it and the script
   writes the new one. Whether the CLI's does: the 125 files of its `OUT_DIR` have the same digest, so it does not.
 - **Run A and run B of [TRACEDECAY.md](TRACEDECAY.md)** (why the message once appeared during a cold
   build and once did not): the u1 target directories are gone.
 - **A size limit on the copy.** A script whose `OUT_DIR` holds gigabytes (a C++ library built there)
-  is copied in full at each check. The cost was not measured, and a run in an empty directory builds
-  that library again, which is more.
+  is copied in full at each check, and read three times (see "After review" for the cost at 4.5 MB). The
+  cost at that size was not measured, there is no limit and no time limit on the script's run, and a
+  run in an empty directory builds that library again, which is more.
 - **Cost of the daemon's other work on this script.** `ra-jit build-script` took over a minute after
   the CLI's script ended in the cold build of E3, in `Kept::of` hashing each `rerun-if-changed`
   directory and file for the store (one stack sample of the running process: 602 of 785 samples in
   `digest_of`, 160 in `watched_digest`; **read**, n=1, load average 24). It is not part of this fix
   and is a follow-up.
+
+## After review (unit u8-fix)
+
+A verifier (GPT 6.1; its report is not in the repository) failed the first version of this fix
+with three findings in `script.rs` and a weak gate in `harness/scriptrerun.py`. All four are
+real and are fixed on the same branch. Each has a test that fails on the first version and
+passes now: `cargo +1.99.0 test -p ra-jit --bin ra-jit -- cargo::script` on `182389d8`'s
+`script.rs` with the new tests added and nothing else gave **18 passed, 10 failed** (1 run), and
+the 10 are the tests named below as failing before (one of them is a hang that the test gives up on
+after 20 s); on this branch the same tests give 29 passed, 0 failed, 1 ignored (see "How the tests
+were run").
+
+| # | Finding | What the first version did | Now | Test (fails before) |
+|---|---|---|---|---|
+| 1 | Times and permissions | Directories were created new: a script that tests whether a directory is older than an input (`make` style) found it new, did not make its output again, and the rerun was "the same". The mtime of a file was set best effort: a read-only file lost it on Linux (**inferred** from the code, which ignored the error: not run on Linux) | Every directory is given the times and permissions of the original after what is in it (a read-only directory is made writable again only to remove the copy), every file is copied through one handle and given its times and permissions on it, and a failure of any of this is an error: the run is cargo's | `a_directory_of_the_copy_is_as_old_as_cargos_is`, `a_directory_of_the_copy_has_the_permissions_of_cargos_and_is_removed_with_them`; `a_read_only_file_of_the_copy_is_as_old_as_cargos_is` passes on the first version **on macOS** (`fs::copy` keeps a file's time there) and is the case for Linux |
+| 2 | Links | A link was copied as it was unless it was an absolute path below the directory: `../state`, an absolute path out of the directory, and `../out/data` (the original by another name) all led from the copy to cargo's own files, so a script wrote there, and the comparison, run after, found both sides the same | Each link is resolved (`canonicalize`). If it ends below the directory it is made a link to the same place below the copy; if it ends anywhere else, or nowhere, or the links go round in a circle, the copy is an error and the run is cargo's. A file that is no file, directory or link (a pipe) is an error too: the copy waited for a writer. The digest before the run is taken from the copy before the script starts, never after, and cargo's directory is read after the run too, for its contents and (a `stat` of everything in it, no read) its sizes and times, and has to be as it was, so a write that reached it by a way not seen is found, one of the same bytes too, which makes its file newer. The digest does not follow links (a link to the directory itself was an endless tree), records where each one leads, and fails on what it cannot read, where it read nothing and called that equal | `a_link_that_leads_out_of_the_directory_is_not_written_through` (relative and absolute), `a_link_that_leads_back_in_by_another_name_is_written_through_in_the_copy`, `a_link_that_leads_nowhere_or_in_a_circle_is_not_run_through`, `a_link_the_script_points_elsewhere_is_a_difference`, `what_the_script_left_is_compared_with_what_was_there_before_it_ran`, `cargos_directory_is_not_written_to_even_with_what_it_has`, `a_file_that_is_not_a_file_is_not_copied_for_a_run`; kept as controls that pass on both: `links_inside_the_directory_are_links_to_the_copy`, `a_link_to_the_directory_itself_is_fine` |
+| 3 | Lossy decoding | `String::from_utf8_lossy` ran before the lines were picked, so a line with a byte that is not UTF-8 (`KEY=\xff`) became `KEY=U+FFFD`, equal to a valid old line, where cargo skips the whole line and has no `KEY` | The lines are picked from the bytes, as `BuildOutput::parse` does (cargo `src/compiler/custom_build.rs`, 933 to 961 at `5f94df478`, the reference the verifier read): a line that is not valid UTF-8 is skipped whole, a valid one is trimmed, `cargo:` and `cargo::` both count, order and repeats are kept; the name of the directory is replaced in the lines picked, so in both callers (`rerun_into`, `same_run`) | `a_line_that_is_not_text_is_not_a_line_cargo_reads_in_either_run` (both callers), `only_the_lines_cargo_reads_are_directives`, `the_name_of_the_directory_a_script_ran_in_is_replaced_in_the_lines_cargo_reads` (these last two use `directives_named`, which the first version lacks, and cannot run on it) |
+| 4 | The gate | The harness compared the program's standard output only, so a program that exited differently, or wrote to standard error, or a reference `cargo run` that failed (both print nothing), passed | `differences()` compares exit status, standard output and standard error (as `program_output` of `cargo_ra_jit.py` reads them), and fails when the reference run failed. `selftest()` runs first, and alone with `--selftest`, over six cases, 4 of them the old check passed | `python3 harness/scriptrerun.py --selftest`; the old check (`ran.stdout != theirs.stdout`) misses 4 of the 5 wrong cases, the new one finds all 5 (run here) |
+
+The verifier's missing-directory and failed-script cases (`a_directory_that_is_missing_is_an_error_and_leaves_no_copy`,
+`a_script_that_fails_is_an_error_and_leaves_no_copy`) pass on both versions; they stay as tests of the
+clean-up, which now looks for any `ra-jit-out-*` beside the directory (the copy's name has a counter
+now, so two checks in one process do not share a directory). One existing test,
+`a_rerun_leaves_what_cargo_has_alone`, took its time for "a second ago" after the check it was
+timing and failed when the machine made the check take more than a second; it takes it before.
+
+### Numbers
+
+| | Count |
+|---|---|
+| `cargo +1.99.0 test -p ra-jit` on `182389d8` (the verifier's run) | 197 passed, 0 failed (read from the verifier's report; not re-run here) |
+| the same on this branch | **213 passed, 0 failed, 1 ignored** (1 run, debug; the ignored one is the measurement below). `cargo::script::tests`: 13 before, 29 run and 1 ignored now |
+
+**Cost of the copy** (n=10 per row, one session, an Apple M5 Pro that was not quiet: load average 3 to 5
+and other units' processes; release build; `cargo test --release -p ra-jit --bin ra-jit -- --ignored
+--nocapture the_cost`). The directory is **not** tracedecay's: its `td-u8` worktree is gone, so it is
+a made-up one of the size the first version of this report measured for it (125 files, 4,530,000
+bytes in 7 directories, random bytes), and the script does nothing, so the figures are the cost of
+the check and not of a script. `rerun_is_same` as a whole, the first version and this one measured
+in the same session, two rounds each:
+
+| | min | median | max |
+|---|---|---|---|
+| first version (`182389d8`), round 1 | 515 ms | 603 ms | 1,000 ms |
+| first version, round 2 | 589 ms | 618 ms | 1,206 ms |
+| this branch, round 1 (before the look at cargo's sizes and times was added) | 259 ms | 357 ms | 641 ms |
+| this branch, round 2 (the same) | 169 ms | 341 ms | 508 ms |
+| this branch, final code | 178 ms | 361 ms | 576 ms |
+
+By step on this branch (final code): copy 55 ms median; hash of the copy before the run 250 ms (min
+85, max 343); the script 5 ms (it does nothing); hash of the copy after 13 ms; hash of cargo's 14 ms;
+removing the copy 26 ms; the `stat` look at cargo's, twice, is in the whole and was not timed alone. The limiter is the first read of a file that was just written, which costs
+about 1.5 to 2.5 ms a file here and 0.1 ms after the first (a scratch program, 125 files, 10 runs: reopening a
+copied file by path to set its time cost 330 ms, setting it through the handle that wrote it
+36 ms for the whole copy). That is why the files are copied through one handle. What on this Mac
+does it was not isolated; the machine runs endpoint-security extensions, which is a **guess**. Linux was not measured. The
+first version's cost is, by this, mostly that reopening (**inferred**; its steps were not timed
+alone), and this one is cheaper than it was though it reads the tree three times (before, after,
+and cargo's) where the first read it twice. A directory of
+gigabytes is not measured and has no limit; it costs a copy, three reads and a removal at each check.
+
+Not done: a limit on the size of the copy or the length of the script's run (the verifier's note,
+not a finding); hard links inside the directory are copied as separate files, so a write through
+one name that the script then reads by another is in the copy as two (not tested: **inferred** that
+the comparison still finds a difference when the script writes anything different); a script that
+finds cargo's directory by its own path (`$OUT_DIR/../out`) writes there, which the copy cannot
+prevent, and the look at cargo's after the run finds it and makes the check an error, after the
+write (`cargos_directory_is_not_written_to_even_with_what_it_has`); the full tracedecay run is still
+not made (this Mac, as above). Windows: the copy of a directory's times and of links is cargo's
+there (**inferred**, not run).
+
+### How the tests were run
+
+Every run held the heavy lock (`with-heavy-lock.sh`) and the guard (24 GB sum of top MEM, swap
+growth), `CARGO_TARGET_DIR` of its own, `RA_JIT_MEMORY_MAX=16G RA_JIT_OWN_BASE_MEMORY=12G
+RA_JIT_SPARE=0`, `RUST_BACKTRACE=0`; peaks 0.9 GB (unit tests), 1.9 GB (release build), 2.6 GB
+(harness). No swap growth in any run. "The first version" for the failing run is the new tests added
+to `182389d8`'s `script.rs` and nothing else (the ones that use only `rerun_is_same`, `rerun_matches` and
+`same_run`, which that version has); the cost rows are the first version's `script.rs` with a
+timing test added, and then this branch's, restored byte for byte (`sha256` checked). The harness:
+`RA_JIT_BIN=.../release/ra-jit python3 harness/scriptrerun.py` on this branch's release build
+passes (the first three edits the daemon's, the fourth cargo's with "wrote something else", the
+program as cargo's in all four, its exit status and standard error too).
 
 ## Commands
 

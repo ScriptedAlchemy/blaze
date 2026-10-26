@@ -296,7 +296,8 @@ A single build goes to cargo when:
   nushell. A file a script reads is not that when the daemon can run the script itself: it
   runs it as cargo would, in a copy of its `OUT_DIR`, and the build stays the daemon's when
   the script prints the same lines cargo reads (`cargo:` and `cargo::`; what a tool the script
-  runs says is not read) and writes the same files;
+  runs says is not read) and writes the same files. A link in `OUT_DIR` that leads out of it, or
+  nowhere, leaves the run to cargo;
 - rust-analyzer finds an error in the source. The daemon refuses it, cargo runs, and you get
   rustc's diagnostics and cargo's exit status. This costs 0.1 to 0.5 s over cargo alone.
   Errors rust-analyzer does not find are not caught here; see "Known problems";

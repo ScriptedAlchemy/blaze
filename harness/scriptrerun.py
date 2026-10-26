@@ -19,9 +19,12 @@ of them beside the bundle, a tool (a shell) that says how long it took, which pr
 and where it wrote prints its lines when the bundle is built, and it lists every file of the
 project as `rerun-if-changed`. After the first build and once the daemon has loaded the
 workspace, three edits to the program are built, one of them with a line added to a file the
-script only watches. Each has to be the daemon's and run as cargo's. A fourth, to an input the
-script bundles, changes what the script writes: the program has to print the new bundle,
-whoever builds it.
+script only watches. Each has to be the daemon's and run as cargo's: the program exits as cargo's
+reference run of the same source does, and prints the same to its standard output and standard
+error, and the reference run has to have succeeded. A fourth, to an input the script bundles,
+changes what the script writes: the program has to print the new bundle, whoever builds it.
+
+usage: scriptrerun.py --selftest    (the comparison alone, without a build)
 
 Python 3, stdlib only.
 """
@@ -30,7 +33,7 @@ import glob, os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
-from cargo_ra_jit import Side, how_built, wait_warm
+from cargo_ra_jit import Side, how_built, program_output, wait_warm
 
 BUILD = r'''use std::{
     collections::hash_map::DefaultHasher,
@@ -101,6 +104,43 @@ FILES = {
 }
 
 
+def differences(ran, theirs):
+    """Why the program built (`ran`) is not what cargo's reference run (`theirs`) of the same source
+    is: the reference run has to have succeeded, or what it is compared with says nothing, and
+    the program's exit status, standard output and standard error are what its are."""
+    problems = []
+    if theirs.returncode != 0:
+        problems.append(f"the reference cargo run failed with status {theirs.returncode}: {theirs.stderr[-500:]!r}")
+    for what, mine, cargos in zip(("exit status", "standard output", "standard error"), program_output(ran), program_output(theirs)):
+        if mine != cargos:
+            problems.append(f"the program's {what} was {mine!r}, cargo's {cargos!r}")
+    return problems
+
+
+def selftest():
+    """The comparison finds what it is to: each of these is a build the daemon made against a
+    reference run of cargo's, and only the first is right."""
+    from types import SimpleNamespace as Ran
+    ok = Ran(returncode=0, stdout="onetwo7\n", stderr="")
+    failed = Ran(returncode=101, stdout="", stderr="")
+    cases = [
+        ("the same", ok, ok, 0),
+        ("another standard output", Ran(returncode=0, stdout="onetwo8\n", stderr=""), ok, 1),
+        ("another exit status", Ran(returncode=3, stdout="onetwo7\n", stderr=""), ok, 1),
+        ("another standard error", Ran(returncode=0, stdout="onetwo7\n", stderr="boom\n"), ok, 1),
+        # Both fail and print nothing: nothing was compared.
+        ("a reference run that failed, as the program did", failed, failed, 1),
+        ("a reference run that failed, and a program that did not", Ran(returncode=0, stdout="", stderr=""), failed, 2),
+    ]
+    wrong = []
+    for name, ran, theirs, count in cases:
+        found = differences(ran, theirs)
+        if len(found) != count:
+            wrong.append(f"{name}: {len(found)} differences, not {count}: {found}")
+    if wrong:
+        raise SystemExit("the comparison of the program with cargo's is wrong:\n  " + "\n  ".join(wrong))
+
+
 def tails(home, lines=40):
     """The last lines of each of the daemon's logs, for a failure on a machine whose files are
     gone once it ends."""
@@ -116,6 +156,10 @@ def build(side, step, home):
 
 
 def main():
+    selftest()
+    if sys.argv[1:] == ["--selftest"]:
+        print("selftest ok")
+        return
     bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
         raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
@@ -160,8 +204,7 @@ def main():
             # given the same print, has nothing to compile.
             if daemon and how != "daemon" and not how.startswith("unchanged"):
                 problems.append(f"built by {how}, not the daemon")
-            if ran.stdout != theirs.stdout:
-                problems.append(f"the program printed {ran.stdout!r}, cargo's {theirs.stdout!r}")
+            problems += differences(ran, theirs)
             if not daemon and "three" not in ran.stdout:
                 problems.append(f"the program printed {ran.stdout!r}, without the input's new text")
             wrong += [f"{step}: {why}" for why in problems]
