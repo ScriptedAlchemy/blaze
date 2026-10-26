@@ -415,3 +415,76 @@ python3 -I harness/tracedecay.py --td /p0a/hello --work /p0a-work --blaze-bin /t
 CARGO_TARGET_DIR=<private> cargo +1.99.0 test -p blaze-build-script -p ra-jit
 python3 harness/scriptedits.py --selftest; python3 harness/rustcsites.py
 ```
+
+## Open-PR review, 2026-10-26
+
+This review checked the current p05r code and its surrounding callers, then merged the current
+`dist/main` into the branch. The documentation conflicts were reconciled with the owner's parity
+scope and the whole-build runner described above. These are additional review results; the earlier
+end-to-end measurements in this report were not repeated.
+
+### Corrections
+
+- **Compiler identity:** script compilation and run records now include the source identity of
+  the blaze build (or its executable identity outside a source build) and the installed toolchain's
+  identity. Different compiler builds with the same package version and sysroot path no longer
+  share the old script records.
+- **Flags and package inputs:** the runner uses blaze-manifest's Cargo flag precedence, including
+  matching `target.'cfg(...)'.rustflags` tables. Inherited `include`/`exclude` rules are read for a
+  workspace's root package and for an explicit `package.workspace` path. Git-listed filenames and
+  checkout paths keep their Unix bytes instead of silently dropping non-UTF-8 inputs or selecting
+  the non-Git file walk.
+- **Shared records:** an OS file lock covers the script freshness decision, compilation, execution
+  and record writes in a target directory. Its guard explicitly unlocks before closing its file:
+  a concurrent fork's inherited open description must not extend the completed critical section.
+- **Build dependencies:** a package's host and target script results are distinct. A library
+  compiled into a build script takes its own script's host output, profile, flags, `TARGET` and
+  target cfgs, including when that package is also a normal target dependency. Host cfgs come from
+  the existing built-in toolchain answers, without a compiler invocation. Their construction is
+  shared with the general cfg answer; SDK settings that do not affect the built-in host cfg do not
+  invalidate this narrower lookup.
+
+### Validation performed
+
+The review ran on Linux with Rust 1.99.0, one Cargo build job, debug information disabled and
+incremental compilation disabled. `RUST_BACKTRACE=0` was set for the harnesses. No Mac or tracedecay
+runtime result is claimed here.
+
+| Check | Result |
+|---|---|
+| `cargo +1.99.0 check --locked --tests -p ra-jit` | Passed in a completely fresh target directory, 5m 30s. Repeated after the final source commit: passed in 0.71s. This typechecks the test targets; it does not execute them. |
+| `cargo +1.99.0 test --locked -p blaze-build-script` | 49 passed, 0 failed. Both new non-UTF-8 regressions failed against the earlier file-listing code and passed after the correction. |
+| Isolated production `scripts.rs` component probe | 15 tests passed, including the compiler identity, flags, inherited rules and host/target dependency regressions. It used the real project-model, manifest and build-script crates. Compiler and daemon integration was stubbed, and the compiler-commit lookup returned no commit for the fixture toolchains. It did not compile a user build script or test the daemon as a whole. |
+| Final production `scripts/lock.rs` module | 2 tests passed: contention and release with a duplicated open description. The latter failed before explicit unlock was added. |
+| `python3 harness/scriptedits.py --selftest` | All 12 comparator checks passed. This is the comparator's synthetic self-test, not the 42-case end-to-end suite. |
+| `cargo +1.99.0 fmt --all -- --check`, `git diff --check` | Passed, including formatting corrections to four blaze-wire files inherited from the base. |
+
+The host/target regression uses a real manifest and a toolchain identity fixture with no compiler
+executable. It checks the script environment, profile and separate `OUT_DIR` paths, then supplies
+distinct host and target script outputs and verifies that a build dependency consumes the host's
+cfgs and environment. Setting `SDKROOT` made the initial general-query implementation fail; the
+dedicated cfg lookup passes the same regression.
+
+PR #5 remains parked. Its separate review tightened reads of Cargo's script records to require a
+held lock and added the same explicit-release guard. Its production `script.rs`/`records.rs`
+component probe passed 49 tests with one measurement intentionally ignored; unused store and daemon
+entry points were stubbed. The duplicated-description regression failed before the guard fix and
+passed afterward. That evidence does not overturn the hybrid mode's earlier failed verifications.
+
+### Remaining limits found by reading the code
+
+- `scripts::JUDGED` remembers only the last build for each run directory. Interleaved requests
+  from multi-target builds A, B, then A can therefore judge and run A's every-build script again.
+  For an impure script this can change its output, not only add work. No end-to-end reproduction
+  of this interleaving was run in this review.
+- The target-directory lock ends when `scripts::run` returns. It protects the script cache
+  transaction, but does not reserve the resulting `OUT_DIR` through the consuming compilation.
+  Another build using the same run directory can replace generated files after that return.
+  Per-build result lifetime and publication need a further correction before concurrent builds
+  can be claimed isolated throughout compilation.
+- A graph containing a proc macro still takes the existing Cargo check path, which runs its
+  scripts too; the direct runner also refuses a build dependency that is a proc macro. These
+  remain the no-rustc step J gap described above. This review added no compiler fallback.
+
+The review's tests establish the corrections listed here. They do not establish the whole of P0-A
+or P0-D, nor replace the 42-case runtime suite or the platform checks required for landing.
