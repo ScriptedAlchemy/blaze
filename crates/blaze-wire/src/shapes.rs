@@ -19,6 +19,10 @@ wire_struct! {
         3 => libc: Option<(String, String)>,
         4 => linker: (String, String, Digest),
         5 => cpu: String,
+        6 => cc: Option<(String, String, Digest)>,
+        7 => cxx: Option<(String, String, Digest)>,
+        8 => ar: Option<(String, String, Digest)>,
+        9 => native_root: Option<Digest>,
     }
 }
 
@@ -93,6 +97,8 @@ wire_struct! {
         7 => split_debuginfo: u8,
         8 => backend: u8,
         9 => mir_opt: u8,
+        10 => backend_opt: u8,
+        11 => backend_emit: u8,
     }
 }
 
@@ -127,6 +133,7 @@ wire_struct! {
         6 => test_threads: Option<u32>,
         7 => harness_args: Vec<String>,
         8 => env: Set<(String, String)>,
+        9 => doc: u8,
     }
 }
 

@@ -385,13 +385,19 @@ struct CrateKey(Digest);
 
 /// What the native side of a build is: everything outside blaze that changes what is linked
 /// or how a program runs. An executor serves a job only on an equal platform.
-struct ExecPlatform {               // 0..=5
+struct ExecPlatform {               // 0..=9
     triple: String,                 // 0, the blaze binary's target: no cross builds
     os: String,                     // 1, "macos 26.6.2", "linux 6.8"
     sdk: Option<(String, String, String)>, // 2, macOS: SDK name, version, deployment target
     libc: Option<(String, String)>, // 3, Linux: name and version, or the declared sysroot
     linker: (String, String, Digest), // 4, what links: name, version, digest of its executable
     cpu: String,                    // 5, target CPU and features codegen assumes
+    cc: Option<(String, String, Digest)>,  // 6, the C compiler a build script runs, as the `cc` crate
+                                    //    resolves it: name, version, digest of its executable
+    cxx: Option<(String, String, Digest)>, // 7, the C++ compiler, the same way
+    ar: Option<(String, String, Digest)>,  // 8, the archiver, the same way
+    native_root: Option<Digest>,    // 9, the SDK (macOS) or the sysroot (Linux) by what is in it:
+                                    //    a digest of the files that name its contents (C2 says which)
 }
 
 /// Which tree a job builds: a commit the server verified (section 2), or #271's root.
@@ -435,7 +441,7 @@ struct UnitSpec {                   // 0..=8
                                     //    build-override (review B M4)
 }
 
-struct ProfileSpec {                // 0..=9
+struct ProfileSpec {                // 0..=11
     name: String,                   // 0
     opt_level: u8,                  // 1, 0..=3; s and z refused until blaze has them
     debug: u8,                      // 2, 0 none, 1 line tables, 2 full
@@ -446,6 +452,8 @@ struct ProfileSpec {                // 0..=9
     split_debuginfo: u8,            // 7, 0 off, 1 packed, 2 unpacked
     backend: u8,                    // 8, blaze's codegen backend: 0 Cranelift, 1 LLVM
     mir_opt: u8,                    // 9, blaze's MIR optimisation level (cli.rs:66-102)
+    backend_opt: u8,                // 10, LLVM's passes, 0..=3; 0 under Cranelift, which it does not change
+    backend_emit: u8,               // 11, LLVM's code selection, 0 optimized, 1 fast; 0 under Cranelift
 }                                   // lto other than off: refused (release stays on Bazel)
 
 enum LocalPolicy { Never, Fallback, Race }  // 0, 1, 2
@@ -459,16 +467,20 @@ enum Command {
 
 /// What a test run is asked to do. A timeout is not here: it schedules, and goes in the job
 /// request (section 8), never in a key (re-review A N7).
-struct RunSpec {                    // 0..=8
-    filters: Vec<String>,           // 0
-    exact: bool,                    // 1
-    skip: Vec<String>,              // 2
-    ignored: u8,                    // 3, 0 not ignored, 1 only ignored, 2 include ignored
+struct RunSpec {                    // 0..=9
+    filters: Vec<String>,           // 0, cargo test's TESTNAME words, in order
+    exact: bool,                    // 1, read out of harness_args
+    skip: Vec<String>,              // 2, read out of harness_args
+    ignored: u8,                    // 3, 0 not ignored, 1 only ignored, 2 include ignored; read out of
+                                    //    harness_args
     no_run: bool,                   // 4
     no_fail_fast: bool,             // 5
-    test_threads: Option<u32>,      // 6
-    harness_args: Vec<String>,      // 7, after `--`; a custom harness gets exactly these
+    test_threads: Option<u32>,      // 6, read out of harness_args
+    harness_args: Vec<String>,      // 7, every word after `--`, as typed and in order, so that a custom
+                                    //    harness gets exactly these (and for `Run`, the program's
+                                    //    arguments before `--` too); 1 to 3 and 6 are read out of them
     env: Vec<(String, String)>,     // 8, set: the environment a test program is given
+    doc: u8,                        // 9, doc tests: 0 none, 1 with the unit tests, 2 only these
 }
 
 /// The part of a BuildSpec a warm front end depends on: what an executor or an image
