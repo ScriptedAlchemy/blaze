@@ -435,9 +435,9 @@ mod tests {
     }
 
     /// `ld.lld`, which links the ELF objects of a test on any host: the toolchain's, which
-    /// the cargo running the test is of, or one on the path. Nothing in the test runs rustc.
+    /// the cargo that built the test is of, or one on the path. Nothing in the test runs rustc.
     fn lld() -> Option<std::process::Command> {
-        let from_cargo = std::env::var_os("CARGO").map(PathBuf::from).and_then(|cargo| {
+        let from_cargo = option_env!("CARGO").map(PathBuf::from).and_then(|cargo| {
             let sysroot = cargo.canonicalize().ok()?.parent()?.parent()?.to_owned();
             let lld = crate::link::lld_dir(&sysroot)?.join("ld.lld");
             Some((lld, Some(sysroot)))
