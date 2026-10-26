@@ -365,7 +365,10 @@ UTF-8, at most the lengths `Hello` answers with.
 
 A digest of a value is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`,
 where `name` is the type's name below. A signature is Ed25519 over the same bytes with `sig/` in
-front of the name. Unit C1 fixes these with golden vectors.
+front of the name. One value signs less than its whole encoding: a `CrateRecord`'s signature is
+over the six-field map of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record
+carries a signature a client checks without field 6, which is the signature itself. Unit C1 fixes
+these with golden vectors.
 
 ```rust
 type Digest = [u8; 32];            // SHA-256
@@ -477,7 +480,8 @@ struct FrontEndKey(Digest);
 /// The namespaces of the cache, and what may write each (section 2).
 enum Namespace {
     Main,                           // 0, written only by trusted builders, at verified commits
-    Pr(u64),                        // 1, written by that pull request's executors and runners
+    Pr(u64),                        // 1, written by that pull request's executors and runners;
+                                    //    its payload is PrNamespace, the map {0: n}
     Std,                            // 2, the shipped standard library (shipped.rs), read-only
 }
 
@@ -489,7 +493,8 @@ struct CrateRecord {                // 0..=6
     generation: u64,                // 3, goes up by one per publish of this crate_key
     packs: Vec<PackRef>,            // 4, set
     source: SourceRef,              // 5, the verified commit whose build published it
-    signature: [u8; 64],            // 6, by the server, over fields 0..=5
+    signature: [u8; 64],            // 6, by the server, over fields 0..=5, under the
+                                    //    CrateRecord signature domain (section 2)
 }
 
 struct PackRef {                    // 0..=4
@@ -1136,7 +1141,9 @@ exercised here, **unverified**):
 ### Records, epochs and repair
 
 - **Signed records.** The server signs `CrateRecord` fields 0 to 5 with its Ed25519 key; clients
-  pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The namespace is in the signed bytes, so a
+  pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The signed bytes are the six-field map of
+  those fields, without field 6, under the `sig/CrateRecord/v1` domain the schema gives every
+  signature; a client checks them the same way. The namespace is in the signed bytes, so a
   `Pr` record is not a `Main` record.
 - **The epoch** (REAPI's `salt`, research 7.8). Each namespace has a current epoch, answered in
   `Hello`. A client refuses a record whose epoch is not the current one. Raising `Main`'s epoch
@@ -1983,6 +1990,281 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 - **Rejected.** gRPC on the hot path; REAPI as the wire (section 3); JSON on the wire; the
   daemon's JSON-line socket protocol over TCP (per user and local by design, `socket.rs`).
 
+### The shapes of the calls
+
+Every request and answer above is a named struct, a CBOR map with every field present, its keys
+the numbers below in ascending order, as "Data shapes" encodes them. The answers to a lookup are
+in the order of the request's keys, so a client reads them without a map. Where this section and
+"Data shapes" are silent, the simplest encoding is taken and said in one line after the code.
+
+```rust
+struct HelloRequest {               // 0..=3
+    versions: Vec<u32>,             // 0, set: the versions the client speaks
+    identity: StoreIdentity,        // 1
+    platform: ExecPlatform,         // 2
+    role: u8,                       // 3, as Capability's role: 0 requester, 1 executor,
+                                    //    2 trusted builder, 3 worker agent
+}
+
+struct HelloAnswer {                // 0..=4
+    version: u32,                   // 0, the one the server picked
+    key: [u8; 32],                  // 1, the server's Ed25519 public key
+    epochs: Vec<(Namespace, u64)>,  // 2, set: the current epoch of each namespace
+    identities: Vec<StoreIdentity>, // 3, set: the store identities served
+    limits: Limits,                 // 4
+}
+
+struct Limits {                     // 0..=5
+    request: u32,                   // 0, bytes, 16 MiB
+    event: u32,                     // 1, bytes, 1 MiB
+    blob: u64,                      // 2, bytes, 4 GiB
+    lookup_items: u32,              // 3, 4,096
+    batch_items: u32,               // 4, 65,536
+    string: u32,                    // 5, bytes, 4 KiB
+}
+
+struct AuthRequest { token: String }             // 0..=0, the GitHub OIDC token
+
+/// The answer to `auth`, and the bytes of `Blaze-Capability`.
+struct SignedCapability {            // 0..=1
+    capability: Capability,          // 0
+    signature: [u8; 64],             // 1, by the server
+}
+
+struct CacheLookupRequest {          // 0..=1
+    namespaces: Vec<Namespace>,      // 0, in order of preference, not a set
+    keys: Vec<CrateKey>,             // 1, set
+}
+
+struct CacheLookupAnswer { records: Vec<Option<CrateRecord>> } // 0..=0, per key
+
+struct CacheMissingRequest { blobs: Vec<Digest> }  // 0..=0, set
+struct CacheMissingAnswer { missing: Vec<Digest> } // 0..=0, set
+
+struct CachePublishRequest {         // 0..=3
+    crate_key: CrateKey,             // 0
+    packs: Vec<PackRef>,             // 1, set
+    generation: u64,                 // 2, the one the publisher read
+    source: SourceRef,               // 3
+}
+
+struct CachePublishAnswer { record: CrateRecord } // 0..=0, signed
+
+struct ResultsLookupRequest {        // 0..=1
+    namespaces: Vec<Namespace>,      // 0, in order of preference, not a set
+    keys: Vec<TestBaseKey>,          // 1, set
+}
+
+struct ResultsLookupAnswer { results: Vec<Vec<TestPass>> } // 0..=0, per key, in key order
+
+struct TestPass {                    // 0..=2
+    key: TestKey,                    // 0
+    manifest: Digest,                // 1
+    duration_ns: u64,                // 2
+}
+
+struct ResultsPublishRequest { verdicts: Vec<TestVerdict> } // 0..=0, order kept
+struct ResultsPublishAnswer { kept: u64 }                   // 0..=0
+
+/// The answer of every call that has nothing to say: `{}`.
+struct Ack {}
+
+struct JobRequest {                  // 0..=4
+    spec: BuildSpec,                 // 0
+    namespace: Namespace,            // 1
+    deadline_ms: u64,                // 2, ms since the epoch
+    local: LocalPolicy,              // 3
+    test_timeout_ms: Option<u64>,    // 4
+}
+
+struct JobAnswer {                   // 0..=2
+    content: JobContent,             // 0
+    execution: ExecutionId,          // 1
+    subscriber: u64,                 // 2
+}
+
+/// One item of an event stream, each behind its four-byte big-endian length.
+struct EventItem {                   // 0..=2
+    sequence: u64,                   // 0
+    attempt: Attempt,                // 1
+    event: JobEvent,                 // 2
+}
+
+struct WorkersHelloRequest {         // 0..=2
+    agent: String,                   // 0
+    capacity: Reservation,           // 1
+    executors: Vec<ExecutorState>,   // 2, order kept
+}
+
+struct WorkersHelloAnswer { accepted: bool } // 0..=0
+
+struct WorkersNextRequest {          // 0..=1
+    free: Vec<Reservation>,          // 0, the reservations it can take work under
+    front_ends: Vec<FrontEndKey>,    // 1, set
+}
+
+/// The long poll's "or nothing" is field 0 as `null`, not an absent map.
+struct WorkersNextAnswer { assignment: Option<Assignment> } // 0..=0
+
+struct Assignment {                  // 0..=4
+    execution: ExecutionId,          // 0
+    attempt: Attempt,                // 1
+    spec: BuildSpec,                 // 2
+    capability: Capability,          // 3
+    role: u8,                        // 4, 0 lead, 1 helper
+}
+
+struct WorkJoinRequest {             // 0..=3
+    execution: ExecutionId,          // 0
+    attempt: Attempt,                // 1
+    roots: RootSet,                  // 2
+    rejected: Vec<WorkName>,         // 3, set
+}
+
+struct WorkJoinAnswer {              // 0..=1
+    roots: RootSet,                  // 0
+    fixed: bool,                     // 1, whether the lead's has fixed it
+}
+
+struct WorkLeaseRequest {            // 0..=1
+    execution: ExecutionId,          // 0
+    attempt: Attempt,                // 1
+}
+
+/// Nothing is field 0 as `null`, as for `WorkersNextAnswer`.
+struct WorkLeaseAnswer { grant: Option<Grant> } // 0..=0
+
+struct WorkResultAnswer {            // 0..=1
+    granted: Vec<WorkName>,          // 0, set
+    conflicts: Vec<WorkName>,        // 1, set
+}
+
+struct WorkersEventsRequest {        // 0..=2
+    execution: ExecutionId,          // 0
+    attempt: Attempt,                // 1
+    events: Vec<JobEvent>,           // 2, order kept
+}
+
+struct WorkersEventsAnswer { verdict: u8 } // 0..=0, 0 continue, 1 cancel
+
+struct WireError {                   // 0..=2
+    code: u8,                        // 0, 1 malformed to 10 internal
+    message: String,                 // 1
+    retry_after_ms: Option<u64>,     // 2
+}
+```
+
+The `Blaze-Agent` signature is over the bytes
+`"blaze/req/v1" ‖ 0x00 ‖ method ‖ 0x00 ‖ path ‖ 0x00 ‖ sha256(body) ‖ 0x00 ‖ the date`, its header
+the Ed25519 signature in base64url without padding. `Blaze-Capability` is `SignedCapability`'s
+canonical CBOR, base64url without padding. The `ops` bits of a `Capability` are 0 lookup, 1 fetch,
+2 publish, 3 events, 4 cancel, 5 roots, 6 delete a namespace, 7 work; a bit set is allowed.
+
+The digest newtypes "Data shapes" defines over a map take their input as these structs:
+
+```rust
+struct CrateKeyInput {               // 0..=3
+    identity: StoreIdentity,         // 0
+    triple: String,                  // 1
+    settings: Digest,                // 2, the entry settings of cache.md
+    stable: Digest,                  // 3, sha256 of the crate's stable id
+}
+
+struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
+    name: String,                    // 0
+    version: String,                 // 1
+    target: (u8, String),            // 2
+    features: Vec<String>,           // 3, set
+    cfg: Vec<String>,                // 4, set
+    edition: u16,                    // 5
+    deps: Vec<(u32, String)>,        // 6, set
+    test: bool,                      // 7
+    host: bool,                      // 8
+    profile: ProfileSpec,            // 9
+}
+
+struct FrontEndKeyInput {            // 0..=4
+    units: Vec<FrontEndUnit>,        // 0, in the canonical unit order
+    lock: Digest,                    // 1
+    cfg_rustflags: Vec<String>,      // 2, set: the rustflags that set cfg
+    toolchain: StoreIdentity,        // 3
+    triple: String,                  // 4
+}
+
+struct ConfigKeyInput {              // 0..=5
+    kind: u8,                        // 0, Command's discriminant
+    asked: Vec<(String, String)>,    // 1, set: package name and target name
+    profiles: Vec<ProfileSpec>,      // 2, each asked unit's, in the canonical unit order
+    platform: Digest,                // 3
+    rustflags: Vec<String>,          // 4, set
+    toolchain: StoreIdentity,        // 5
+}
+
+struct JobContentInput {             // 0..=1
+    spec: Digest,                    // 0, BuildSpec's digest
+    namespace: Namespace,            // 1
+}
+
+struct TestBaseKeyInput {            // 0..=5
+    binary: Digest,                  // 0
+    test: String,                    // 1
+    run: RunSpec,                    // 2
+    platform: Digest,                // 3
+    sandbox: u32,                    // 4, policy version
+    bundle: Digest,                  // 5
+}
+```
+
+`TestKey`'s input is the two-element array `[TestBaseKey, InputManifest's digest]`, and
+`WorkName`'s is the `WorkKey` itself, so neither needs a struct. `StoreIdentity` is ra-jit-store's
+`Identity::new` unchanged and `EntryKey` its own `sha256(identity ‖ key)`, so neither has an input
+struct: the two values are the store's, and their digests below are only for golden vectors and for
+a blob that names them. Every enum's payload is a map of
+the fields its variant names, with these numbers:
+
+```rust
+SourceRef::Git { repo_id: u64, commit: [u8; 20], tree: [u8; 20] } // 0..=2
+SourceRef::Root { root: Digest }                                  // 0
+Namespace::Pr { n: u64 }                                          // 0
+Command::Test(RunSpec), Command::Run(RunSpec)                     // payload: RunSpec's map
+WorkKey::Item { unit: Digest, stable: Digest, env: Digest }        // 0..=2
+WorkKey::Edge { parent: WorkName, ordinal: u32 }                   // 0..=1
+ItemOutcome::Exported { entry: EntryKey }                         // 0
+ItemOutcome::FromStore { entry: EntryKey }                        // 0
+ItemOutcome::Failed { why: String }                               // 0
+ItemOutcome::Local { why: String }                                // 0
+ItemOutcome::Lost { why: String }                                 // 0
+Observation::File { path: String, digest: Digest, mode: u32, len: u64 } // 0..=3
+Observation::Dir { path: String, names: Digest, mode: u32 }       // 0..=2
+Observation::Absent { path: String }                              // 0
+Observation::Link { path: String, target: String }                // 0..=1
+JobEvent::Stage { stage: Stage, at_ms: u64 }                      // 0..=1
+JobEvent::Assigned { executor: String, attempt: Attempt }         // 0..=1
+JobEvent::Published { records: Vec<(CrateKey, u64)> }             // 0
+JobEvent::Program { name: String, blob: Digest }                  // 0..=1
+JobEvent::Verdict(TestVerdict)                                    // payload: TestVerdict's map
+JobEvent::Refused { function: String, why: String }               // 0..=1
+JobEvent::Output { stream: u8, bytes: Vec<u8> }                   // 0..=1
+JobEvent::Done { outcome: Outcome, counters: Vec<(String, u64)> } // 0..=1
+```
+
+`LocalPolicy`, `Stage`, `Outcome` and `Namespace`'s other variants are units: payload `null`; a
+`Pr` is `[1, {0: n}]`, the payload map the list above gives it. A newtype with no field numbers is
+its inner value, unwrapped. Each payload map is a struct of its own, and `crates/blaze-wire` names
+them `GitRef`, `RootRef`, `PrNamespace`, `ItemKey`, `EdgeKey`, `EntryRef`, `Why`, `FileObservation`,
+`DirObservation`, `AbsentObservation`, `LinkObservation`, `StageEvent`, `AssignedEvent`,
+`PublishedEvent`, `ProgramEvent`, `RefusedEvent`, `OutputEvent` and `DoneEvent`.
+`JobEvent::Verdict`'s and `Command::Test`'s payloads are the payload type's own map, not a map that
+holds it, so a decoder reads the enum as an array of two.
+
+What this leaves to the implementation, in one line each: `HelloRequest.role` and
+`WorkersEventsAnswer.verdict` are `u8` (an enum there would be a two-element array for a byte);
+`Limits.blob` is 4 GiB and `Limits.batch_items` 65,536, the two the section does not number;
+lookup answers follow their request's key order; `CrateKeyInput.stable` and
+`TestBaseKeyInput.binary` are digests, not names; a `Vec` not marked set keeps its order;
+`TestPass` is the "pass with manifest digest" the table names in prose; `[u8; N]` and a digest are
+byte strings, and a `Vec<u8>` is an array of integers as any `Vec` is.
+
 ## 9. Upstream's objections
 
 - **"Per-function `Execute` and per-function ActionCache lookups lose"** (#226, ci-runner.md).
@@ -2303,7 +2585,9 @@ separation, errors, limits, JSON rendering. Files: `crates/blaze-wire`, `Cargo.t
 Depends: none. Acceptance: every type round-trips byte-identically; golden vectors for one value
 of every type, its digest and its signature, checked in; the validator accepts all the encoder
 writes on random values and rejects non-shortest heads, indefinite lengths, unsorted keys,
-duplicate keys, floats, tags, unknown keys and oversize items, naming each. From the reviews:
+duplicate keys, floats, tags, unknown keys and oversize items, naming each; the ordinary decoder
+holds a message to the same size and depth limits as the validator; a lookup's collection is held
+to 4,096 items. From the reviews:
 - [a-M4] "enum payload maps and many endpoint response/limits types remain prose; capability
   transport/ops bits and JobContent bytes are unspecified, so C1 still must invent wire choices."
   Checked by: before its code, C1 adds to section 8 a named struct for every endpoint's request and
