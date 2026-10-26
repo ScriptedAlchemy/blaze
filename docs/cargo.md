@@ -355,7 +355,18 @@ Linux the machine's memory is the least of what it has and what the control grou
 was started in allows (a container's, a CI job's, a systemd unit's). Once a
 second, over that, the daemon stops the worker asked longest ago, and the next build of its
 workspace is cargo's while a worker loads it again. A worker that is answering or loading is
-never stopped, nor is the one asked last, nor any while a program takes live edits.
+not stopped, nor is the one asked last, nor any while a program takes live edits, unless it
+alone holds more than all may: nothing else making way would bring it under.
+
+A worker also bounds itself while it builds. Its threads compile ahead of the object on every
+core until the worker holds three quarters of what `RA_JIT_WORKER_MEMORY` says (by default what
+all the workers may hold together); past that it gives the allocator's free pages back to the
+system each second and fewer threads compile, in proportion to what is left; past all of it the
+build stops and fails with `out of memory to build in: ...`, naming what it held. A build cannot
+let go of what it computed before it ends (each function it compiles adds to the database, about
+23 KB of it in a cold build of tracedecay, [reports/LOADMEM.md](reports/LOADMEM.md)), so fewer
+threads only slow what it holds on the way: a program that needs more than the bound to build in
+one piece is stopped, not handed to anything else.
 
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
@@ -416,6 +427,7 @@ started it. To change one, run `cargo ra-jit stop` first.
 | `RA_JIT_HOME` | the daemon's directory (also read by every client) | see above |
 | `RA_JIT_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
 | `RA_JIT_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
+| `RA_JIT_WORKER_MEMORY` | the most one worker (or one `ra-jit` run) may hold while it builds, a size such as `16G`, or `off`: fewer threads compile past three quarters of it, and a build that passes it is stopped | what `RA_JIT_MEMORY_MAX` says |
 | `RA_JIT_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `RA_JIT_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `RA_JIT_CACHE` | directory of the disk store, or `off` for none | `ra-jit/store` in the user's cache directory ([cache.md](cache.md)) |

@@ -96,6 +96,7 @@ use hir_ty::mir::{
 
 mod asm;
 mod backend;
+pub mod budget;
 use backend::Step;
 pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
@@ -158,6 +159,9 @@ pub enum CodegenError {
     /// rustc built the function under a symbol private to its object, so its copy stays the
     /// one that code of that object calls, and goes on using rustc's statics.
     Private,
+    /// Not of a function: the build held more memory than the process may, and was stopped
+    /// ([`budget`]).
+    OverBudget(String),
 }
 
 impl CodegenError {
@@ -176,6 +180,7 @@ impl fmt::Display for CodegenError {
             CodegenError::NoSymbol | CodegenError::Private => {
                 write!(f, "unsupported: no rustc symbol for function")
             }
+            CodegenError::OverBudget(it) => write!(f, "out of memory to build in: {it}"),
         }
     }
 }
@@ -869,8 +874,14 @@ impl CodegenUnit {
                     #[cfg(feature = "llvm")]
                     cg.compile_units(&ours, Vec::new());
                 } else {
+                    // Only ahead of the object: near the memory the process may hold, a root is
+                    // left to the threads that compile ahead, which fewer of then do.
+                    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+                    let governor = budget::Governor::new(budget::budget(), threads);
                     symbols.in_parallel(ours.len(), &|db, symbols, at| {
-                        if symbols.function(ours[at]).is_none() {
+                        governor.look();
+                        if governor.allowed() < threads {
+                        } else if symbols.function(ours[at]).is_none() {
                             _ = db.mir_body(ours[at].into());
                         } else if stored.get(&ours[at]).is_some_and(Option::is_some) {
                         } else if let (Ok(compiled), Some(told)) =
@@ -887,6 +898,9 @@ impl CodegenUnit {
                     // A root still being compiled waits for those compiled after it.
                     let mut held = std::collections::VecDeque::new();
                     loop {
+                        if ahead.as_ref().is_some_and(|it| it.shed()) {
+                            break;
+                        }
                         let root = match (queue.get(next), &ahead) {
                             (Some(&root), Some(ahead))
                                 if !denied.contains(&root)
@@ -941,6 +955,9 @@ impl CodegenUnit {
                     }
                     failed.extend(cg.define_waves(ahead));
                 });
+                if let Some(why) = cg.shed.take() {
+                    return Err(CodegenError::OverBudget(why));
+                }
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
                 if next == queue.len() {
                     break;
@@ -2144,6 +2161,8 @@ struct ObjectCodegen<'a, 'db> {
     type_ids: FxHashMap<FuncId, u128>,
     /// An entry did not fit the object, which now lacks a function it declares.
     misfit: bool,
+    /// Why the threads that compile ahead were stopped for the memory the process held.
+    shed: Option<String>,
     /// The functions of a patch that are at a level above 1, whose code it has at that level.
     tiers: Option<&'a tier::Tiers>,
     /// What each function built from an entry of the store is an instance of.
@@ -3772,6 +3791,7 @@ struct Ahead {
 struct Ready<'a> {
     ahead: &'a std::sync::Mutex<Ahead>,
     idle: &'a std::sync::Condvar,
+    governor: &'a budget::Governor,
     /// The instances to put in the object that a thread is still to compile.
     waiting: FxHashMap<(Instance, StoredParamEnvAndCrate), Vec<FuncId>>,
 }
@@ -3847,6 +3867,12 @@ impl Ready<'_> {
 
     fn through(state: &Ahead, root: FunctionId) -> bool {
         state.stopped || !state.rooted.contains(&root) || state.rooted_done.contains(&root)
+    }
+
+    /// Whether the build was stopped for the memory the process holds: nothing more is to be
+    /// put in the object.
+    fn shed(&self) -> bool {
+        self.governor.shed()
     }
 
     /// Has the threads compile `roots` too, which putting the others in the object found.
@@ -4579,24 +4605,32 @@ fn inlinable(
     tier::plain(|| small_body(db, instance, env))
 }
 
+/// Whether the body of `func` is small enough to be inlined, as its MIR is before any instance of
+/// it is built. Asked before [`inlinable`], so that a body too large leaves no memo of it and of
+/// what it read: `inlinable`'s values and edges were 1.3 GB of the 30 GB a cold build of
+/// tracedecay held (docs/reports/LOADMEM.md, section 2).
+fn small_mir(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    /// The most blocks and statements the body of a function that is inlined has.
+    const BLOCKS: usize = 4;
+    const STATEMENTS: usize = 12;
+    let Ok(generic) = db.mir_body(func.into()) else { return false };
+    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
+    generic.basic_blocks.len() <= BLOCKS
+        && statements <= STATEMENTS
+        && generic.closures.is_empty()
+        && generic.coroutine.is_none()
+}
+
 fn small_body(
     db: &dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
-    /// The most blocks and statements the body of a function that is inlined has, and
-    /// the most instructions it is built to with what it calls inlined into it.
-    const BLOCKS: usize = 4;
-    const STATEMENTS: usize = 12;
+    /// The most instructions the body of a function that is inlined is built to, with what it
+    /// calls inlined into it.
     const INSTRUCTIONS: usize = 64;
     let InstanceDef::Fn(func) = instance.def else { return None };
-    let generic = db.mir_body(func.into()).ok()?;
-    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
-    if generic.basic_blocks.len() > BLOCKS
-        || statements > STATEMENTS
-        || !generic.closures.is_empty()
-        || generic.coroutine.is_some()
-    {
+    if !small_mir(db, func) {
         return None;
     }
     let body = instance_body(db, &instance, env.clone()).ok()?;
@@ -4997,6 +5031,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             type_id_shims: FxHashMap::default(),
             type_ids: FxHashMap::default(),
             misfit: false,
+            shed: None,
             own_statics,
             mixed,
             elf_relocs: Vec::new(),
@@ -5417,6 +5452,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_waves(&mut self, mut ahead: Option<&mut Ready<'_>>) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
         loop {
+            // What the threads did not compile is not compiled here either.
+            if ahead.as_ref().is_some_and(|it| it.shed()) {
+                break;
+            }
             let wave = match &mut ahead {
                 Some(ahead) => ahead.take(&mut self.pending),
                 None if self.pending.is_empty() => Vec::new(),
@@ -5445,7 +5484,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     wave
                 }
             };
-            if wave.is_empty() && self.found_pending.is_empty() {
+            if (wave.is_empty() && self.found_pending.is_empty())
+                || ahead.as_ref().is_some_and(|it| it.shed())
+            {
                 break;
             }
             for (instance, env, id) in wave {
@@ -5476,6 +5517,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// compiled, where the waves of [`Self::define_instances`] each wait for their slowest
     /// function. What this compiles that the object has no use for is only wasted. `beside`
     /// runs on this thread meanwhile, and is told whether anything is compiled ahead of it.
+    ///
+    /// Fewer threads compile as the process nears the memory it may hold ([`budget`]), and
+    /// past it they stop, `shed` says why, and the build is not to be finished.
     fn compile_ahead(
         &mut self,
         roots: Vec<FunctionId>,
@@ -5519,6 +5563,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let idle = std::sync::Condvar::new();
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let governor = budget::Governor::new(budget::budget(), threads);
         let (entries, owned) = (self.entries.clone(), &self.own_statics.crates.clone());
         let entries = entries.as_deref();
         let told = self.tells_variables().then(|| self.told.clone());
@@ -5548,6 +5593,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             loop {
                 if state.stopped {
                     return;
+                }
+                // As many compile as the memory the process holds allows: the others wait for
+                // one of them to be through, and leave with them once nothing is left to do.
+                if state.working >= governor.allowed()
+                    && !(state.roots.is_empty() && state.queue.is_empty())
+                {
+                    state = idle.wait(state).unwrap_or_else(|e| e.into_inner());
+                    continue;
                 }
                 let job = match state.roots.pop_front() {
                     Some(root) => either::Either::Left(root),
@@ -5611,8 +5664,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
                 drop(working);
+                let shed = governor.look();
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
+                if shed {
+                    state.stopped = true;
+                }
                 if let either::Either::Left(root) = job {
                     state.rooted_done.insert(root);
                 }
@@ -5646,13 +5703,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let _leaving = Leaving(&ahead, &idle);
             run(db, symbols);
         };
-        let mut ready = Ready { ahead: &ahead, idle: &idle, waiting: FxHashMap::default() };
+        let mut ready = Ready {
+            ahead: &ahead,
+            idle: &idle,
+            governor: &governor,
+            waiting: FxHashMap::default(),
+        };
         self.symbols.in_parallel_beside(threads, &work, &mut || {
             beside(self, Some(&mut ready));
             ahead.lock().unwrap_or_else(|e| e.into_inner()).open = false;
             idle.notify_all();
         });
         self.ahead = ahead.into_inner().unwrap_or_else(|e| e.into_inner()).seen;
+        if governor.shed() {
+            self.shed = Some(governor.why());
+        }
     }
 
     fn define_instance(
@@ -13010,6 +13075,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // compiled it, and calling that one is less work than building it again.
         let flags = AttrFlags::query(db, func.into());
         if !flags.contains(AttrFlags::IS_INLINE) && args.iter().all(|it| it.region().is_some()) {
+            return None;
+        }
+        if !small_mir(db, func) {
             return None;
         }
         let body = inlinable(db, instance, self.env.store()).as_ref()?;

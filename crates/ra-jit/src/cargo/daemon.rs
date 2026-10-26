@@ -50,7 +50,7 @@ const MEMORY_SHARE: u64 = 2;
 /// The most the workers may hold together, from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
 /// limit. Half of the machine's memory when it does not say, and no limit where the system
 /// does not tell how much that is.
-fn memory_max() -> Result<Option<u64>, String> {
+pub(crate) fn memory_max() -> Result<Option<u64>, String> {
     match std::env::var("RA_JIT_MEMORY_MAX") {
         Err(_) => Ok(crate::memory::of_the_machine().map(|it| it / MEMORY_SHARE)),
         Ok(text) if text == "off" => Ok(None),
@@ -96,7 +96,9 @@ struct Held {
 
 /// The workers to stop for the rest to hold no more than `most`: the ones asked longest ago
 /// first. One that is busy is left, and so is the one asked last, which would only be
-/// started again.
+/// started again, unless it alone holds more than `most`: nothing else making way brings it
+/// under, and a worker that builds a whole program grows on until it is done (a cold
+/// tracedecay worker passed 30 GB, docs/reports/LOADMEM.md).
 fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
     let mut all: u64 = holding.iter().map(|it| it.1.bytes).sum();
     let last = holding.iter().map(|it| it.1.asked).max();
@@ -110,6 +112,11 @@ fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
         }
         all -= held.bytes;
         stopped.push(id.clone());
+    }
+    for (id, held) in holding {
+        if held.bytes > most && !stopped.contains(id) {
+            stopped.push(id.clone());
+        }
     }
     stopped
 }
@@ -1393,9 +1400,14 @@ impl Daemon {
         let all: u64 = holding.iter().map(|it| it.1.bytes).sum();
         for id in over(&holding, most) {
             let Some(worker) = workers.remove(&id) else { continue };
+            let alone = holding.iter().find(|it| it.0 == id).map_or(0, |it| it.1.bytes);
+            let why = match alone > most {
+                true => format!("it alone holds {} MB", alone >> 20),
+                false => "it was asked longest ago".to_owned(),
+            };
             eprintln!(
                 "worker {id} of {} stopped: the workers hold {} MB, over the {} MB of \
-                 RA_JIT_MEMORY_MAX, and it was asked longest ago",
+                 RA_JIT_MEMORY_MAX, and {why}",
                 worker.project.display(),
                 all >> 20,
                 most >> 20
@@ -1607,7 +1619,17 @@ mod tests {
         assert_eq!(over(&holding, 16), Vec::<String>::new());
         assert_eq!(over(&holding, 12), ["oldest"]);
         assert_eq!(over(&holding, 8), ["oldest", "old"]);
-        // The busy one and the one asked last stay, whatever they hold.
-        assert_eq!(over(&holding, 0), ["oldest", "old"]);
+        // The busy one and the one asked last stay while neither alone holds more than all may.
+        assert_eq!(over(&holding, 4), ["oldest", "old"]);
+        assert_eq!(over(&holding, 3), ["oldest", "old", "answering", "last"]);
+    }
+
+    #[test]
+    fn a_worker_alone_over_the_bound_is_stopped_though_it_is_busy() {
+        let now = Instant::now();
+        let loading = Held { bytes: 30, asked: now, busy: true };
+        assert_eq!(over(&[("loading".to_owned(), loading)], 16), ["loading"]);
+        let under = Held { bytes: 16, asked: now, busy: true };
+        assert_eq!(over(&[("loading".to_owned(), under)], 16), Vec::<String>::new());
     }
 }

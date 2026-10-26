@@ -4660,7 +4660,10 @@ fn with_failed_macro(
     let frontend = match &error {
         CodegenError::Frontend(_) => true,
         CodegenError::Unsupported(why) => why.contains("frontend:"),
-        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+        CodegenError::Backend(_)
+        | CodegenError::NoSymbol
+        | CodegenError::Private
+        | CodegenError::OverBudget(_) => false,
     };
     if !frontend {
         return error;
@@ -7721,6 +7724,7 @@ fn run_holding(
     }
     process_wide();
     memory::ticks();
+    memory::bound_builds()?;
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -7877,6 +7881,10 @@ fn run_holding(
     if let Some(said) = ra_jit_expand::report() {
         eprintln!("{said}");
     }
+    // Resolution lets go of a third of what it held at its peak, and the allocator keeps the
+    // pages: 4 GB of tracedecay's (docs/reports/LOADMEM.md). The build that comes next is bounded
+    // by what the process holds.
+    memory::give_back();
     memory::checkpoint("resolve");
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {

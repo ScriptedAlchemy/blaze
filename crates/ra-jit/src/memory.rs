@@ -314,6 +314,29 @@ fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Bytes the process may hold while it builds, from `RA_JIT_WORKER_MEMORY`: a size, or `off` for
+/// no bound. Without it, what a daemon lets its workers hold together (`RA_JIT_MEMORY_MAX`, half of
+/// the machine's memory when that does not say): one worker alone is never let hold more than all
+/// of them may.
+pub(crate) fn build_budget() -> Result<Option<u64>, String> {
+    match std::env::var("RA_JIT_WORKER_MEMORY") {
+        Ok(text) if text == "off" => Ok(None),
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .map(Some)
+            .ok_or_else(|| format!("RA_JIT_WORKER_MEMORY=`{text}` is neither a size nor `off`")),
+        Err(_) => crate::cargo::daemon::memory_max(),
+    }
+}
+
+/// Holds every build of the process to [`build_budget`]: fewer threads compile as it nears it,
+/// and a build that passes it is stopped (`hir_ty_codegen::budget`).
+pub(crate) fn bound_builds() -> anyhow::Result<()> {
+    let Some(most) = build_budget().map_err(anyhow::Error::msg)? else { return Ok(()) };
+    let held = || held_by(std::process::id());
+    hir_ty_codegen::budget::set_budget(hir_ty_codegen::budget::Budget { most, held, give_back });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
