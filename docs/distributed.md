@@ -1,19 +1,31 @@
 # Distributed cache, compile and tests
 
-2026-10-26, revision 2. Status: design, nothing built. Written against the fork's `dist/main` at
-`a67ea8db` (code as at `c8e5f6a8`; `dist/main` has gained docs and one harness since) and
-tracedecay at `d79de82273`. Each claim is marked **read** (in a source we read, or measured by
-us), **reported** (a document or someone says so, not re-checked here) or **unverified** (our
-inference or an estimate). Numbers name the file they come from. Code paths are still `ra-jit`
-where the rename to blaze has not reached them.
+2026-10-26, revision 3. Status: design, nothing built. Written against the fork's `dist/main` at
+`f9b5da46` (code as at `c8e5f6a8` plus u5's memory instruments; line numbers are those of
+`f9b5da46`) and tracedecay at `d79de82273`. Each claim is marked **read** (in a source we read,
+or measured by us), **reported** (a document or someone says so, not re-checked here) or
+**unverified** (our inference or an estimate). A number taken from another document that states
+no run count, spread or limiter is marked **n not stated**. Numbers name the file they come from.
+Code paths are still `ra-jit` where the rename to blaze has not reached them.
 
 Revision 1 (`45449ae6`) was rejected by both reviews of [PR
-#1](https://github.com/ScriptedAlchemy/blaze/pull/1): four blockers and nineteen majors. This
-revision answers each of them; [appendix A](#appendix-a-review-findings) maps every finding to what
-changed and where. It also takes in three things that did not exist when revision 1 was written: the
-measurement of blaze on tracedecay ([reports/TRACEDECAY.md](reports/TRACEDECAY.md), G0), the survey
-of Bazel with NativeLink ([research/bazel-nativelink.md](research/bazel-nativelink.md), whose twelve
-edits are applied, see [appendix B](#appendix-b-the-research-edits)) and the memory survey
+#1](https://github.com/ScriptedAlchemy/blaze/pull/1). Revision 2 (`2fd75c16`) was rejected by both
+re-reviews: re-review A found 10 of 25 findings resolved, 13 partly, 1 not (a-B1) and 1 regressed
+(b-M8), and seven new problems; re-review B found three blockers (the no-rustc boundary is not a
+process tree, a work item cannot rebuild a generic instance on a helper, and the ahead queue
+writes no linkable entries) and seven majors. This revision follows one rule: every blocker, every
+finding not resolved and every regression is fixed here, in the design; every finding partly
+resolved and every major is turned into acceptance lines of the unit that owns it, so the code
+settles it, each line tagged with the finding's id. [Appendix A](#appendix-a-review-findings) gives
+every finding of both re-reviews its status. It also takes in two reports written since revision
+2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
+edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
+under verification).
+
+Revision 2 took in the measurement of blaze on tracedecay
+([reports/TRACEDECAY.md](reports/TRACEDECAY.md), G0), the survey of Bazel with NativeLink
+([research/bazel-nativelink.md](research/bazel-nativelink.md), whose twelve edits are applied, see
+[appendix B](#appendix-b-the-research-edits)) and the memory survey
 ([research/memory.md](research/memory.md)).
 
 The goal: blaze gives tracedecay a distributed cache, distributed compile and distributed tests
@@ -28,7 +40,13 @@ Three decisions of the program's owner bind this design:
   whether it ships. Revision 1's "mode D is deleted if G4 fails" is gone.
 - **Memory is guarded.** Every blaze run on the development Mac sets `RA_JIT_MEMORY_MAX=16G`,
   `RA_JIT_OWN_BASE_MEMORY=12G` and `RA_JIT_SPARE=0`, under a watchdog that kills the ra-jit tree
-  past 24 GB of summed footprint or under 3 GB of free swap.
+  (every process of the run, the client's descendants included) when its summed footprint (`top`'s
+  MEM, not RSS) passes 24 GB, or when swap used has grown by at least 1 GB since the run started
+  and free swap is under 3 GB, or when swap used has grown by 8 GB. (macOS grows swap on demand
+  and other sessions keep free swap low, so free swap alone is not a signal; this replaces
+  revision 2's unconditional 3 GB rule, re-review A N4.) No unit lowers these settings on the Mac
+  without the owner's exception; a predicate that needs a smaller bound runs it on tracedecay at
+  16G, or in Docker.
 - **Heavy runs are serialised** by one lock on the development Mac; no dev host is reachable from
   it. Which gates can run where is part of each gate ([section 11](#11-gates)).
 
@@ -36,32 +54,46 @@ Three decisions of the program's owner bind this design:
 
 - **Phase 0 comes first: blaze builds tracedecay.** G0 measured a no-go on macOS arm64: the
   whole build (no cargo) fails on a writable static of the standard library (#255); 18 of 18
-  edits went to cargo because the CLI's build script prints something else on a rerun; a loaded
-  tracedecay worker reached 58.3 GB on a 48 GiB Mac; `RA_JIT_MEMORY_MAX` does not bound a busy or
-  last-asked worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure
-  that before any distributed code depends on it, each closing a measurable predicate.
-- **rustc is refused before it is spawned.** Every process blaze starts goes through one gate that
-  refuses rustc, rustdoc and a compiling cargo with a named reason; a worker runs with it closed.
-  An audit with stand-in tools counts attempted runs. A log line is no longer the check.
+  edits went to cargo because blaze reran the CLI's build script in an empty `OUT_DIR` and compared
+  every byte it printed (BUILDSCRIPT.md, fix in PR #5); a loaded tracedecay worker reached 58.3 GB
+  on a 48 GiB Mac, which LOADMEM.md traces to the worker compiling the whole program at load in one
+  salsa revision with every memo kept; `RA_JIT_MEMORY_MAX` does not bound a busy or last-asked
+  worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure that before any
+  distributed code depends on it, each closing a measurable predicate.
+- **rustc is kept out by a process-tree boundary, not by a check at one call.** A worker and every
+  process under it (build scripts, proc-macro servers, linkers, native tools, tests) runs inside
+  an OS boundary in which the Rust toolchain's compilers are absent or unreadable and every exec is
+  checked against a compiler identity: a mount namespace and a seccomp exec policy on Linux, a
+  Seatbelt profile on macOS. A worker that cannot install it does not start. blaze's own spawns go
+  through one API as a second layer; negative fixtures try every way around both (section 0).
 - **Trust has three roles.** Trusted `Main` builders that never run pull-request code and are the
   only principals that publish to `Main`; per-pull-request executors created from trusted
   read-only inputs, isolated by user and sandbox, kept for that pull request's pushes only and
   destroyed after; a control plane whose credentials no job can read. Capabilities are short,
   bound to a job, a namespace and a source commit the server verified through GitHub's API, not
   through claims GitHub does not issue. Signed records carry an epoch.
-- **Distributed compile splits codegen into batches over a shared work set.** blaze already
-  compiles ahead from a queue of roots and generic instances that compiled functions discover
-  (`compile_unnamed`, `hir-ty-codegen/mod.rs:2565`). That queue moves to the coordinator. Work
-  items are grouped by home crate (`home.rs`), so a helper needs only the front end of its
-  crates' dependency closure, and its results are content-keyed store entries any machine can
-  link. The lead assembles the object from the store. No system we read splits one crate's
-  compile across machines (Bazel, NativeLink, sccache-dist, buck2 all distribute whole rustc
-  invocations); this is new and its gate decides how, not whether.
+- **Distributed compile splits the build's own ahead loop into batches, over identical front
+  ends.** A whole build compiles ahead from a queue of roots and the generic instances compiled
+  functions name (`ObjectCodegen::compile_ahead`, `hir-ty-codegen/mod.rs:5479`); LOADMEM shows
+  this loop is where a tracedecay build spends its memory, and unit u7 is bounding it in batches
+  that release their memos. The distributed batch is that batch. Every executor of an execution
+  loads the same `BuildSpec`, computes the same roots in one canonical order (by stable name) and
+  proves it by digest; roots are leased in ranges; an instance is compiled by an executor that
+  discovered it, after the coordinator grants it the instance's stable name. So no instance
+  crosses the wire, only names and digests (re-review B, B2). A batch ends by exporting what it
+  compiled as linkable store entries through a new exporter, and the lead assembles a
+  store-hydrated full build that compiles nothing an executor exported (B3). The first
+  distributed unit is a two-process prototype on this Mac, and it gates the network layer. A lossless instance
+  descriptor, which smaller helpers would need, is a later stage, built only if measurement asks
+  for it. No system we read splits one crate's compile across machines (Bazel, NativeLink,
+  sccache-dist, buck2 all distribute whole rustc invocations); this is new and its gate decides
+  how, not whether.
 - **The front end is what costs.** In u1's one tracedecay load, loading, resolving and expanding
-  took 120 to 210 s and compiling all 77,345 functions ahead 40.7 s (**read**, TRACEDECAY.md,
-  one run each, contended). So a helper pays only if its front end is warm or shared: trusted
-  helpers are warm on `master`, a pull request's executors stay warm for its later pushes, and a
-  front-end image of the dependency layer (#274) is mapped read-only instead of loaded.
+  took 120 to 210 s (**read**, TRACEDECAY.md, two runs, contended); the resolution peak is 11.0
+  to 13.1 GB live and 7.0 to 9.0 GB after it (**read**, LOADMEM.md, two runs, contended). So an
+  executor pays only if its front end is warm or shared: trusted builders are warm on `master`, a
+  pull request's executors stay warm for its later pushes, and a front-end image of the dependency
+  layer (#274) is mapped read-only instead of loaded.
 - **Tests are cached only when every input is declared or recorded.** A test that reaches time,
   randomness (including `HashMap`'s seed), threads, sockets, unlisted processes or unlisted
   foreign code always runs. Failures are never cached. An audit mode runs everything uncached and
@@ -74,10 +106,11 @@ Three decisions of the program's owner bind this design:
   configuration and feature resolution, the profile, flags, environment, working directory, the
   run options of a test, and a digest of the native toolchain. A request blaze cannot honour is
   refused before it is scheduled.
-- **Plan.** Twenty-nine units in six phases: Phase 0 (blaze builds tracedecay), the wire and the
-  cache, trust and execution, distributed compile, tests, the CI switch. Each lands alone with a
-  goal, files, acceptance and one verify command that checks all of it. Owner-operated steps in
-  tracedecay's own CI are listed apart from the units.
+- **Plan.** Thirty units in six phases, and one more (S4) if the owner chooses it: Phase 0
+  (blaze builds tracedecay), the wire and the cache, trust and execution, distributed compile (its
+  first unit, D0, the two-process prototype; D2, smaller helpers, only if measurement asks), tests,
+  the CI switch. Each lands alone with a goal, files, acceptance and one verify command that
+  checks all of it; acceptance lines that settle a review finding carry its id, as `[rb-M6]`. Owner-operated steps in tracedecay's own CI are listed apart from the units.
 
 ## What tracedecay runs today
 
@@ -165,6 +198,33 @@ The verdict there: no-go on this Mac. Every distributed unit below assumes blaze
 tracedecay without cargo, within memory, and takes edits as the daemon's. Phase 0 makes those
 true and measures them.
 
+### What LOADMEM and BUILDSCRIPT found since
+
+- **The 58.3 GB is the whole program compiled at load** ([reports/LOADMEM.md](reports/LOADMEM.md),
+  u5, same Mac, two cold runs, contended, load average 25 to 42, **read**). After the front end
+  (2.9 GB live at the end of a 97 s load, 13.1 GB at the resolution peak, 9.0 GB after it; the
+  unprofiled run 2.4, 11.0 and 7.0 GB), 18 threads of `ObjectCodegen::compile_ahead` compile every
+  instance the program reaches and keep every intermediate as a salsa memo: 21.2 GB of live growth
+  in 40 s, about 25,000 functions a second and 23.1 KB of live heap for each; run 3 was killed at
+  25.6 GB footprint with 640,000 functions compiled, run 2 at 33.3 GB. How many functions the whole
+  build has is not known. The top
+  holders are MIR (24%), compiled code and its edges (18%), bodies and item trees (10%).
+- **Why the first build is the daemon's whole build:** 9 of tracedecay's 53 workspace units are
+  `opt-level=1`, so blaze cannot patch cargo's executable (`calls_by_symbol`, `plan.rs:139,180,226`)
+  and compiles the program itself (**read**, the `first build:` line, one run). For this design
+  that build is the work to split, and its memory is a per-worker budget, not a fault.
+- **u7 bounds it** (the program's unit u7-bound, running): `compile_ahead` takes its work in
+  batches, and after each batch hands what it compiled on and releases its memos, against a real
+  per-worker ceiling (LOADMEM section 6, fixes 2 and 3). Section 4 makes that batch the unit of
+  distribution.
+- **Edits went to cargo because of blaze, not the script** (BUILDSCRIPT.md, PR #5, `dist/u8-buildscript`,
+  **reported** here: one run per case): blaze reran the script into an empty `OUT_DIR`, where
+  cargo reruns it in the one it left, and compared every byte of its output, where cargo reads
+  only `cargo:` lines. The fix reruns in a copy of cargo's `OUT_DIR` and compares what cargo reads.
+  Its verification (u8-verify, in progress) has found two blocking bugs in the copy (directory
+  times not kept, symlinks written through) and an invalid-UTF-8 comparison; P0-D stays open until
+  PR #5 lands with those fixed.
+
 ### The store, the keys and the remote
 
 - **The store** (`crates/ra-jit-store/src/lib.rs`): immutable packs named by their SHA-256, values
@@ -179,9 +239,12 @@ true and measures them.
   a hash of its source (`content.rs`); a dependency by its stable crate id. An edit renames the
   edited crate and every checkout crate that depends on it.
 - **The home crate** (`hir-ty-codegen/home.rs`): an instance is compiled "from the point of view
-  of" the crates its own name mentions, so `Vec<u8>::push` does not depend on the workspace crate
-  that asked for it. This is what makes a compiled instance portable between builds, and what
-  section 4 partitions by.
+  of" a crate that sees every crate its name mentions (`home.rs:265-294`), so `Vec<u8>::push` does
+  not depend on the workspace crate that asked for it. That is what makes a compiled instance
+  portable between builds. It is not the crate that wrote the function: `Vec<workspace::T>::push`,
+  `T`'s drop glue and an iterator adapter over a workspace closure are homed in the workspace crate
+  that defines `T` or the closure, whose dependency closure can be most of the program (re-review
+  B, M2). So the home crate does not by itself make a helper's front end small.
 - **The remote** (`crates/ra-jit/src/remote.rs`, `remote/`): `Dir`, `S3` and `Https` places;
   verified transfers with resume (`transfer.rs`); Ed25519-signed manifests with turns
   (`signed.rs`); remote GC by the clock (`collect.rs`, at least two hours' grace); a keeper that
@@ -191,14 +254,33 @@ true and measures them.
 ### What a build schedules
 
 - One daemon compiles "a set of root functions into one object" (`CodegenUnit::compile`,
-  `mod.rs:636`), each function a salsa query whose result names its callees by stable name
+  `mod.rs:636`), each function a salsa query whose result lists its callees as requests
   (`fragment.rs`), on every core (`SymbolResolver::in_parallel`, `mod.rs:388`). A callee that
   cannot be compiled poisons its callers and the build restarts with it rejected
   (`compile_or_hold`, `:656`).
-- **Compiling ahead** (`compile_unnamed`, `mod.rs:2565-2622`) is a shared queue: threads pop a
-  root or an instance, compile it (`compiled_root`, `compiled_instance`), and push every generic
-  callee the result names, with its home crate, unless already seen. "A build that knows them
-  finds it compiled." This loop is the seam section 4 distributes.
+- **Compiling ahead.** Two loops share one shape. The build's own,
+  `ObjectCodegen::compile_ahead` (`mod.rs:5479`, loop from `:5548`), runs on every core while the
+  main thread puts functions in the object: threads pop a root (the build's exported and `main`
+  roots, then an on-demand function when something calls it) or an instance, compile it
+  (`compiled_root`, `compiled_instance`), and push every generic callee the result names, with its
+  home (`Homes::home`), unless it was seen, is rejected, or the store has it with its whole closure
+  (`in_store`, `Entries::usable`). A function that fails here is skipped; the main thread meets the
+  error if the object needs the function. The daemon's spare-time loop, `compile_unnamed`
+  (`mod.rs:2570`), does the same for every listed function and is speculative. Revision 2 named the
+  second; the seam section 4 distributes is the first.
+- **What the queue holds is local.** An item is `(Instance, StoredParamEnvAndCrate)`, interned ids
+  of one salsa database (`mod.rs:2522`, `:3753`); a compiled function's requests name callees as such
+  ids too (`fragment.rs`). The stable name (`stable.rs`) is a one-way spelling of an instance for
+  the store's keys: a type spelled longer than 1,024 bytes is replaced by its hash
+  (`stable.rs:40-46`), and only non-generic functions are looked up from a name (`:289-355`). A name
+  cannot be turned back into an instance (re-review B, B2).
+- **Store entries are made after stitching, not by the compile query.** `compiled_instance` keeps
+  a `CompiledFunction` as a salsa memo. The linkable `cached::Entry` is made in `later.rs`
+  (`keep` at `:300`, `entry` at `:408`) from a function already stitched into the object: whether
+  each callee was imported, type-id hashes, the settled callee, debug type sets, patch tracking.
+  And a build reads the checkout's code from the store only when it is the first full build
+  (`hydrate`, `mod.rs:671`; `roots_from_store`, `:5206`); a patch neither compiles ahead (`:5486`)
+  nor keeps entries (re-review B, B3).
 - `RA_JIT_UNITS=1` groups functions into LLVM modules for whole-program builds; it is not the
   default, as it builds no faster (`units.rs:1-45`).
 - One daemon stops scaling: compiling the standard library is 4.5 s on 16 cores and 3.9 s on 96,
@@ -209,14 +291,18 @@ true and measures them.
 
 Review A M2 asked every retained number to carry its machine, run count, spread and whether
 cargo or rustc did part of it. These are background, not baselines: no ratio below is a claim of
-this design.
+this design. None of the source documents names a limiter or the commit measured for these rows;
+where a cell gives no run count it is **n not stated**, and the same holds for every number this
+design quotes from roadmap.md, ci-runner.md, benchmarks.md and research/codegen-units.md
+(re-review A, a-M2).
 
 | Number | Source | Machine, runs, spread | Hybrid? |
 |---|---|---|---|
 | ripgrep cold 16.8 to 17.4 s with an empty store, 3.98 to 3.99 s warm store, 4.01 to 4.02 s warm remote; nushell 78.9 s, 31.3 s, 31.5 s; helix 87.0 to 89.7 s, 25.5 to 25.7 s, 26.0 to 26.3 s | no-rustc.md, "The cold start without rustc" | dev-aws-8, 96 cores pinned; ranges over the runs recorded, run count not stated | no: "every crate ra-jit's and linked by ra-jit" |
 | of nushell's 31 s warm: resolving 3.8 s, asking the store about roots 3 s, writing the object 7 s, listing 4.7 s, link 1 s | same | same; one breakdown | no |
 | a fresh machine building cargo 0.92.0: 152.4 s no remote, 117.1 s with packs, 94.4 s with packs and cargo's units; lazy 100.2 s | [reports/REMOTE.md](reports/REMOTE.md) | loopback MinIO, one run each, no spread | **yes**: cargo ran rustc for dependencies and link lines, and three refused functions were compiled by rustc. Not all-blaze evidence |
-| nushell body edit 258 ms; ready from nothing 52.1 s; 5.2 GB ready, 7.5 GB after its base, 11.2 GB peak | [roadmap.md](roadmap.md), [ci-runner.md](ci-runner.md) | as reported there; spread not given here | no |
+| nushell body edit 258 ms; ready from nothing 52.1 s; 5.2 GB ready, 7.5 GB after its base, 11.2 GB peak | [roadmap.md](roadmap.md), [ci-runner.md](ci-runner.md) | machine and session not stated; n not stated; no spread | no |
+| about 2 ms of thread time a function, 21.2 s on 16 cores for nushell's 165,752 | [roadmap.md](roadmap.md) | 16 cores; n not stated; no spread | no |
 | sandbox about 16 ms a process on Linux | [ci-runner.md](ci-runner.md):388 (354 ms for 20 runs against 26 ms bare) | one measurement, no spread | no |
 | slot sizes on Linux x86-64, 16 cores pinned: ripgrep to axum 1.4 to 2.0 GB, helix 5.7, nushell 7.1, bevy 15.2, biome 19.3, bun 24.5 GB | [research/memory.md](research/memory.md), from benchmarks.md | per-project rows of one bench run | no |
 
@@ -225,16 +311,19 @@ run each, hybrid.
 
 ## The rules this design keeps
 
-- **No rustc, enforced before spawn.** blaze today reaches cargo and rustc from several places:
-  a cold build dispatches to cargo (`cargo/mod.rs:265-285`), `by` starts `cargo build` or
+- **No rustc, enforced on the process tree.** blaze today reaches cargo and rustc from several
+  places: a cold build dispatches to cargo (`cargo/mod.rs:265-285`), `by` starts `cargo build` or
   `cargo test --no-run` (`cargo/state.rs:490-504`), the wrapper runs the compiler
   (`cargo/wrapper.rs:150-151`), a build script blaze cannot build is left to rustc. Each is a
-  `no-rustc` bug. Phase 0 puts every `Command` blaze spawns behind one function that refuses
-  rustc, rustdoc and a cargo subcommand that compiles, before the spawn, with a named error; in
-  worker mode the refusal cannot be turned off, and refusal fails the job. A job is never turned
-  green by cargo. `RA_JIT_RUSTC_BASE=0` does not disable cargo's dispatch (review A B1; it only
-  stops patching a rustc-built base, `main.rs:3686-3695`), so revision 1's reliance on it is
-  dropped.
+  `no-rustc` bug. And a check at blaze's own `Command::new` would not be the boundary: processes
+  are started from other crates and by raw `execve` (re-review B, B1, lists them), and build
+  scripts, proc macros, linker wrappers and tests start their own. So Phase 0 installs a
+  process-tree boundary in which the toolchain's compilers cannot run, with a spawn API as a second
+  layer and an audit with negative fixtures ([the boundary](#the-no-rustc-boundary-p0-as-mechanism)).
+  In worker mode it cannot be turned off, a worker that cannot install it does not start, and a
+  refused process fails the job if the job needed it. A job is never turned green by cargo.
+  `RA_JIT_RUSTC_BASE=0` does not disable cargo's dispatch (review A B1; it only stops patching a
+  rustc-built base, `main.rs:3686-3695`), so revision 1's reliance on it is dropped.
 - **Measurement before claims.** Every gate runs at least three times per arm, in one session, on
   the named machine, with median, spread and a limiter named from the phase lines
   (`RA_JIT_STATS`) or the job's stage timestamps. No ratio without a same-session baseline.
@@ -293,7 +382,7 @@ enum SourceRef {
 struct BuildSpec {                  // 0..=11
     source: SourceRef,              // 0
     lock: Digest,                   // 1, sha256 of Cargo.lock
-    units: Vec<UnitSpec>,           // 2, the resolved unit graph, sorted by package id
+    units: Vec<UnitSpec>,           // 2, the resolved unit graph, in the canonical unit order
     asked: Vec<u32>,                // 3, set: indexes of the units the command named
     profile: ProfileSpec,           // 4
     platform: Digest,               // 5, ExecPlatform's digest
@@ -306,7 +395,10 @@ struct BuildSpec {                  // 0..=11
     toolchain: StoreIdentity,       // 11
 }
 
-struct UnitSpec {                   // 0..=6
+/// The canonical unit order: units sorted by the bytes of the canonical CBOR of each unit
+/// without field 5. Every field but `deps` together identifies a unit (its dependencies follow
+/// from them), so the order is total; `deps` and `asked` name indexes in it (re-review A N7).
+struct UnitSpec {                   // 0..=8
     package: (String, String, Digest), // 0, name, version, source id digest
     target: (u8, String),           // 1, kind (0 lib, 1 bin, 2 test, 3 example, 4 bench,
                                     //    5 build script, 6 proc macro) and name
@@ -315,9 +407,12 @@ struct UnitSpec {                   // 0..=6
     edition: u16,                   // 4
     deps: Vec<(u32, String)>,       // 5, set: unit index and the name it is used under
     test: bool,                     // 6, cfg(test)
+    host: bool,                     // 7, built for the host: build scripts, proc macros, their deps
+    profile: ProfileSpec,           // 8, this unit's profile after [profile.*.package.*] and
+                                    //    build-override (review B M4)
 }
 
-struct ProfileSpec {                // 0..=7
+struct ProfileSpec {                // 0..=9
     name: String,                   // 0
     opt_level: u8,                  // 1, 0..=3; s and z refused until blaze has them
     debug: u8,                      // 2, 0 none, 1 line tables, 2 full
@@ -326,6 +421,8 @@ struct ProfileSpec {                // 0..=7
     panic: u8,                      // 5, 0 unwind, 1 abort
     strip: u8,                      // 6, 0 none, 1 debuginfo, 2 symbols
     split_debuginfo: u8,            // 7, 0 off, 1 packed, 2 unpacked
+    backend: u8,                    // 8, blaze's codegen backend: 0 Cranelift, 1 LLVM
+    mir_opt: u8,                    // 9, blaze's MIR optimisation level (cli.rs:66-102)
 }                                   // lto other than off: refused (release stays on Bazel)
 
 enum LocalPolicy { Never, Fallback, Race }  // 0, 1, 2
@@ -337,7 +434,9 @@ enum Command {
     Run(RunSpec),                   // 3
 }
 
-struct RunSpec {                    // 0..=9
+/// What a test run is asked to do. A timeout is not here: it schedules, and goes in the job
+/// request (section 8), never in a key (re-review A N7).
+struct RunSpec {                    // 0..=8
     filters: Vec<String>,           // 0
     exact: bool,                    // 1
     skip: Vec<String>,              // 2
@@ -347,13 +446,12 @@ struct RunSpec {                    // 0..=9
     test_threads: Option<u32>,      // 6
     harness_args: Vec<String>,      // 7, after `--`; a custom harness gets exactly these
     env: Vec<(String, String)>,     // 8, set: the environment a test program is given
-    timeout_ms: Option<u64>,        // 9
 }
 
 /// The part of a BuildSpec a warm front end depends on: what an executor or an image
 /// must agree with to take a job as an edit. digest of { 0: units with their features, cfg,
-/// edition and deps but not sources, 1: lock, 2: rustflags that set cfg, 3: profile's
-/// debug_assertions and overflow_checks, 4: toolchain, 5: platform's triple }.
+/// edition, deps, host flag and profile but not sources, 1: lock, 2: rustflags that set cfg,
+/// 3: toolchain, 4: platform's triple }.
 struct FrontEndKey(Digest);
 
 /// The namespaces of the cache, and what may write each (section 2).
@@ -382,17 +480,25 @@ struct PackRef {                    // 0..=4
     format: u32,                    // 4, store FORMAT
 }
 
-/// What one build used: the GC's live roots are record generations, not crate names.
-struct RootManifest {               // 0..=4
+/// What one build used: the GC's live roots are the entries builds used, not crate names
+/// or whole generations (section 3, review B M9).
+struct RootManifest {               // 0..=5
     namespace: Namespace,           // 0
     source: SourceRef,              // 1
-    spec: Digest,                   // 2, BuildSpec digest
-    records: Vec<(CrateKey, u64)>,  // 3, set: crate and generation read or written
-    tests: Vec<TestKey>,            // 4, set
+    config: Digest,                 // 2, ConfigKey: what retention groups by (section 3)
+    spec: Digest,                   // 3, BuildSpec digest
+    used: Vec<(CrateKey, u64, Digest)>, // 4, set: crate, generation read or written, and the
+                                    //    digest of the blob listing the entry keys used of it
+    tests: Vec<TestKey>,            // 5, set
 }
 
+/// The BuildSpec without what changes from commit to commit: digest of { 0: command's kind,
+/// 1: asked units' package names and targets, 2: each asked unit's profile, 3: platform,
+/// 4: rustflags, 5: toolchain }. A commit's builds of one configuration share it.
+struct ConfigKey(Digest);
+
 /// A job's three identities (research 7.11, review A M6).
-struct JobContent(Digest);          // BuildSpec digest plus namespace: what merges duplicates
+struct JobContent(Digest);          // digest of {0: BuildSpec digest, 1: Namespace}: what merges duplicates
 struct ExecutionId(u64);            // the server's, one per execution of a JobContent
 struct Attempt(u32);                // goes up when an execution is reassigned; fences events
 
@@ -405,38 +511,61 @@ struct Capability {                 // 0..=8
     source: SourceRef,              // 3, verified
     execution: Option<ExecutionId>, // 4
     attempt: Option<Attempt>,       // 5
-    ops: u32,                       // 6, bit set: lookup, fetch, publish, events, cancel, roots
+    ops: u32,                       // 6, bits: 0 lookup, 1 fetch, 2 publish, 3 events, 4 cancel,
+                                    //    5 roots, 6 delete a namespace, 7 work (join, lease, result)
     not_after_ms: u64,              // 7, wall clock, at most the job's deadline
     epoch: u64,                     // 8
 }
 
-/// One unit of distributed codegen (section 4): roots or instances of one home crate.
-struct WorkItem {                   // 0..=2
-    name: String,                   // 0, the stable name (stable.rs), machine-independent
-    env: Digest,                    // 1, digest of the param env and crate it is asked under
-    home: CrateKey,                 // 2
+/// A function of distributed codegen (section 4), as every executor of an execution names
+/// it: sha256 of its stable name (stable.rs), the name its store entry is kept under. It is
+/// a name for coverage, never a request another database can rebuild (re-review B, B2).
+struct WorkName(Digest);
+
+/// What an executor computed from its front end before it may take work: every executor of
+/// an execution must post the same one (section 4).
+struct RootSet {                    // 0..=2
+    spec: Digest,                   // 0, BuildSpec digest
+    roots: Digest,                  // 1, digest of the build's roots' stable names, sorted by bytes
+    count: u64,                     // 2
 }
 
-struct Batch {                      // 0..=4
+/// An executor's tenure over the work it holds in one execution.
+struct Lease {                      // 0..=3
     execution: ExecutionId,         // 0
-    id: u64,                        // 1
-    lease: (Attempt, u64),          // 2, holder's attempt and lease end, ms
-    home: CrateKey,                 // 3
-    items: Vec<WorkItem>,           // 4
+    attempt: Attempt,               // 1, the execution's
+    holder: String,                 // 2, executor id
+    generation: u64,                // 3, new at every grant to this holder; fences its results
+}
+
+/// Work given to a holder: a range of the sorted roots, and instance names granted to it.
+struct Grant {                      // 0..=2
+    lease: Lease,                   // 0
+    roots: Vec<(u64, u64)>,         // 1, set: half-open ranges of indexes into the sorted roots
+    names: Vec<WorkName>,           // 2, set: instances granted to the holder, which found them
 }
 
 enum ItemOutcome {
-    Compiled { entry: EntryKey },   // 0
-    Refused { why: String },        // 1, a CodegenError: fails the job, never goes to rustc
-    FromStore { entry: EntryKey },  // 2
+    Exported { entry: EntryKey },   // 0, compiled; its entry is in one of the result's packs
+    FromStore { entry: EntryKey },  // 1, the execution's pinned packs hold its whole usable closure
+    Failed { why: String },         // 2, a CodegenError here; not a verdict on the build
+    Local { why: String },          // 3, compiled but not exportable (the exporter's reason);
+                                    //    the lead compiles it and what calls it
 }
 
-struct BatchResult {                // 0..=4
-    batch: u64,                     // 0
-    lease: (Attempt, u64),          // 1
-    outcomes: Vec<ItemOutcome>,     // 2, in the order of the batch's items
-    found: Vec<WorkItem>,           // 3, set: instances the compiled code names, not yet asked
-    packs: Vec<PackRef>,            // 4, sealed and uploaded before this is sent
+struct ItemResult {                 // 0..=2
+    name: WorkName,                 // 0
+    outcome: ItemOutcome,           // 1
+    found: Vec<WorkName>,           // 2, set: generic instances and on-demand functions its
+                                    //    code names, which the holder can compile
+}
+
+/// One batch's results, committed at once: outcomes, discoveries and packs (section 4).
+struct BatchResult {                // 0..=3
+    lease: Lease,                   // 0
+    seq: u64,                       // 1, the holder's batch number; a replay of one is idempotent
+    items: Vec<ItemResult>,         // 2
+    packs: Vec<PackRef>,            // 3, sealed and uploaded before this is sent
 }
 
 /// A test before it runs (section 6): what a fresh machine can compute without the read set.
@@ -533,9 +662,11 @@ What the server keeps on its own disk:
 | `records/<ns>/<crate_key>/<generation>` | `CrateKey`, generation | a signed `CrateRecord` | no; a new generation is a new file, written by conditional create |
 | `latest/<ns>/<crate_key>` | `CrateKey` | the newest generation number | yes, compare-and-swap |
 | `results/<ns>/<base>/` | `TestBaseKey` | `TestVerdict`s of passes, each with its manifest blob | append |
-| `roots/<ns>/` | `SourceRef` and spec | `RootManifest` | replaced per build of a commit |
+| `roots/<ns>/<config>/` | `ConfigKey`, `SourceRef`, spec | `RootManifest` | replaced per build of a commit |
+| `used/` | digest | a sorted list of entry keys (a `RootManifest`'s `used` blobs) | no |
+| `remap/<ns>/<crate_key>` | `CrateKey`, generation | the compacted generation that holds every live entry of it | append, by the collector |
 | `epochs` | namespace | current epoch | by the operator only |
-| `jobs`, `executors` | execution id, executor id | requests, leases, events, reservations | in memory, with a log |
+| `jobs`, `executors`, `work` | execution id, executor id | requests, leases, events, reservations, the work set | in memory, with a log |
 
 ## 0. Phase 0: blaze builds tracedecay
 
@@ -547,10 +678,10 @@ result is written into [reports/TRACEDECAY.md](reports/TRACEDECAY.md) by the uni
 
 | Predicate | Measured as | Bar | Where |
 |---|---|---|---|
-| **P0-A, no rustc** | the stand-in tools of `harness/norustc.py` on `PATH` and as `RUSTC`, `RUSTDOC`, `CARGO`, every blaze process in worker mode; the gate's own audit log | 0 runs of rustc or rustdoc and 0 compiling cargo subcommands attempted, on hello-world, ripgrep and `tracedecay-cli` build, edit and test; an unsupported project is refused before any spawn, naming the reason | this Mac; Linux at scale |
-| **P0-B, memory bounded** | footprint (macOS) or `RssAnon` plus `RssFile` (Linux) of every worker, 1 s samples; the daemon's log | with `RA_JIT_MEMORY_MAX=M`, no worker passes 1.05 M for more than 2 s in any state (loading, busy, last asked); a worker stopped by the bound fails its build with the bound's message, and the build does not go to cargo; the harness watchdog never fires | this Mac |
+| **P0-A, no rustc** | the process-tree boundary's audit (every exec in the worker's tree, allowed or denied, with its parent chain), the stand-ins of `harness/norustc.py`, and the provenance record of every Rust code artifact the build links or loads; cold isolated target, store and daemon home | **positive:** `tracedecay-cli` cold build, first edit, test-binary build and run, macro expansion and a doctest succeed with 0 compiler execs in the tree and every Rust artifact of blaze's origin, on both platforms; **negative:** each fixture of the boundary's list (below) ends with 0 compiler execs, a named refusal, and the build failing only where it needed the refused process | this Mac; Linux at scale |
+| **P0-B, memory bounded** | footprint (macOS) or `RssAnon` plus `RssFile` (Linux) of every worker and of each executor's whole process tree, 1 s samples; the daemon's log | with `RA_JIT_MEMORY_MAX=M`, the workers together hold at most 1.05 M for no more than 2 s in any state (loading, busy, last asked), and no single worker passes it; a worker stopped by the bound fails its build with the bound's message, and the build does not go to cargo; the harness watchdog never fires. Measured on `tracedecay-cli` at the guard's 16G, the case G0 failed | this Mac |
 | **P0-C, tracedecay fits** | the same samples through a cold load, then 20 edit/undo pairs (memory.md M1) | a loaded `tracedecay-cli` worker holds at most 16 GB footprint on macOS arm64 at ready and after 20 pairs, so a guarded run completes; Linux's number recorded beside it | this Mac; Linux at scale |
-| **P0-D, edits are the daemon's** | `blaze status` and the build logs, 5 runs each of the three edit kinds of TRACEDECAY.md and their reverts | 18 of 18 edit builds `Finished ... [ra-jit]`, 0 `building with cargo`; the CLI's build script rerun when its watched inputs change and its new output used | this Mac |
+| **P0-D, edits are the daemon's** | `blaze status` and the build logs: 5 runs, each of the three edit kinds of TRACEDECAY.md and its revert, after one cold and one warm build that are not counted | 30 of 30 counted builds (5 × 3 × an edit and its revert) `Finished ... [ra-jit]`, 0 `building with cargo`; the CLI's build script rerun when its watched inputs change and its new output used (G0's 18 failures are background, not this denominator; re-review B N2) | this Mac |
 | **P0-E, the whole build on macOS** | `BLAZE_WHOLE_BUILD=1` | hello-world, ripgrep and `tracedecay-cli` build and their programs print what cargo's do; 0 `without a rustc symbol`; `harness/doctestonce.py` passes on macOS (#255) | this Mac |
 | **P0-F, a cold build's peak** | the watchdog's 2 s series | the transient of script compiles at most 4 GB footprint (16.2 GB today) | this Mac |
 | **P0-G, Linux at scale** | P0-A to P0-F on Linux x86-64 | each bar met | a Linux host of at least 64 GB (owner's `linux-host` gate) |
@@ -558,25 +689,30 @@ result is written into [reports/TRACEDECAY.md](reports/TRACEDECAY.md) by the uni
 
 What is decided here, and why:
 
-- **A loading worker is bounded by checking itself** (TRACEDECAY.md's first shape): the worker
-  reads its own footprint while it loads, as the own-base thread does (`main.rs:9030-9050`), and
-  past the ceiling stops with a named reason. `over()` is also changed so a worker alone over the
-  ceiling is not exempt. In worker mode the stop fails the job; locally the daemon tells the
-  user, as it does today, and the no-rustc gate decides what happens next. Unit P0.3.
-- **The worker gets smaller by the ranked list of memory.md section 4**, in its order: reclaim at
-  idle (type GC, solver caches, arena purge), recycle on growth, one worktree path per executor with
-  gone checkouts unloaded, then what the program's unit u5 (a profile of the 58.3 GB load, running)
-  names as the largest holder. P0-C's 16 GB is set by the guard: a worker larger than that cannot be
-  verified on this Mac at all. If the owner grants a Linux host instead, P0-C keeps its bar on macOS
-  (the Mac Studio has 64 GB, section 4) and adds Linux's. Unit P0.4.
-- **A build script whose rerun prints something else is run, not refused.** blaze reruns a
-  script into a second directory and refuses it if the output differs (`cargo/script.rs:670-688`).
-  cargo instead runs the script when a watched input changed and takes its latest output. The
-  CLI's script prints one `rerun-if-changed` per file git does not ignore
-  (`tracedecay-cli/build.rs:417-422`), which an edit changes. The fix: a script whose output
-  differs between two runs on the same inputs is marked impure, run once per build in the
-  sandbox where there is one, and its latest output is used, as cargo does; its run is never
-  shared across machines (section 1). Unit P0.5.
+- **A loading worker is bounded by checking itself, and its build is bounded in batches**
+  (TRACEDECAY.md's first shape, LOADMEM section 6): the worker reads its own footprint while it
+  loads, as the own-base thread does (`main.rs:9048-9068`), and past the ceiling stops with a named
+  reason; `compile_ahead` checks the budget before each job and, past it, ends the batch, hands what
+  it compiled on and releases its memos. `over()` is also changed so a worker alone over the ceiling
+  is not exempt, and the ceiling stays what the daemon's workers hold together. In worker mode the
+  stop fails the job; locally the daemon tells the user, as it does today, and the no-rustc boundary
+  decides what happens next. Unit P0.3, which the program's unit u7-bound is implementing.
+- **The worker gets smaller by LOADMEM's ranked fixes, then memory.md's list**: the bounded batch
+  (above), MIR that is not kept once an instance has code, eviction during resolution, the type GC
+  and the allocator's purge between batches, the driver's maps keyed by hashes, the symbol table as a
+  view of its file; then reclaim at idle, recycle on growth, one worktree path per executor. P0-C's
+  16 GB is set by the guard: a worker larger than that cannot be verified on this Mac at all. If the
+  owner grants a Linux host instead, P0-C keeps its bar on macOS (the Mac Studio has 64 GB, section
+  4) and adds Linux's. Unit P0.4.
+- **A build script is rerun as cargo reruns it.** blaze reran a script into an empty `OUT_DIR` and
+  refused it if any byte of its output differed (`cargo/script.rs:670-688`); cargo reruns in the
+  `OUT_DIR` it left and reads only `cargo:` lines. BUILDSCRIPT.md found that the CLI's script runs
+  `pnpm` in an empty `OUT_DIR` and prints 61 lines of its own there, so every edit went to cargo; it
+  is blaze's bug, and tracedecay needs no change. PR #5 reruns in a copy and compares what cargo
+  reads. A script whose cargo-read output differs between two runs on the same inputs is still
+  marked impure, run once per build in the sandbox where there is one, its latest output used, and
+  its run never shared across machines (section 1). Unit P0.5 lands PR #5 with its verifier's
+  findings fixed.
 - **The standard library's writable statics are blaze's on macOS** (#255): `CLEANUP`,
   `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE` have no rustc symbol in the toolchain's
   `libstd` dylib on macOS (`nm -m`: non-external, #255, **reported**). The whole-program path
@@ -587,6 +723,98 @@ What is decided here, and why:
   warning (TRACEDECAY.md), so tracedecay does not need nightly to build (**read**, one build).
 
 Distributed units depend on Phase 0's predicates by name in the plan below.
+
+### The no-rustc boundary (P0-A's mechanism)
+
+Re-review B (B1) showed that a gate on blaze's own `Command::new` is not "every process blaze
+starts": `sandbox.rs:643,682` forks and calls `execve` itself; `blaze-build-script` runs scripts and
+tools (`run.rs:39,79-84`, `main.rs:104-107`); the vendored `proc-macro-api` starts the macro server
+(`process.rs:115-117,416-438`); `project-model` runs `cargo check --compile-time-deps`
+(`build_dependencies.rs:442-464,492-494,580-582`) and `cargo metadata` (`cargo_workspace.rs`);
+`asm.rs:1088-1096` runs an assembler; `blaze-registry/src/git.rs:212,463,487` runs git, which can run
+configured helpers; `whole.rs:322-331` runs the built program; `main.rs` links through `sh -c`;
+`answers.rs:165-166` still falls back to the real rustc. And descendants (build scripts, proc
+macros, linker wrappers, tests) start what they like. The boundary is therefore the process tree,
+in three layers.
+
+1. **The tree cannot run a compiler** (the boundary itself). It is in place before the worker
+   loads anything: on a fleet machine the agent sets it up as it starts the executor (on Linux the
+   agent, which creates the executor's user, creates its namespaces, E1); locally the daemon
+   installs it on itself. Every descendant inherits it and cannot drop it.
+   - **Linux:** the worker runs in its own mount namespace (`sandbox.rs`'s user and mount
+     namespaces, extended from one test to the worker's whole tree; E1 later makes it the job
+     sandbox). The Rust toolchain's executables and `librustc_driver` are not mounted:
+     `$RUSTUP_HOME/toolchains/*/bin`, `$CARGO_HOME/bin`, the sysroot's `bin` and the rustc-built
+     libraries of `lib/rustlib/<triple>/lib`; rust-src and blaze's shipped standard library are
+     mounted read-only. The seccomp user-notification supervisor, which today records an exec and
+     lets it continue (`sandbox.rs:810-829`), decides instead: it denies, with `EACCES` and an audit
+     line naming the process chain, an exec whose file's last component is `rustc`, `rustdoc`,
+     `cargo`, `cargo-*`, `rustup`, `clippy-driver` or `miri` (other than blaze's own shims, by
+     digest), whose digest is in the toolchain manifest of the pinned toolchain and of any toolchain
+     installed on the host, or whose ELF needs `librustc_driver-*`. Where Landlock is available,
+     execution is also limited to the mounted directories.
+   - **macOS:** the worker applies a Seatbelt profile to itself (`sandbox_init`, inherited by every
+     descendant): `process-exec` denied for the toolchain's `bin` directories and for any path whose
+     last component is one of the names above; `file-read-data` and `file-map-executable` denied for
+     those directories, the rustc-built libraries of `lib/rustlib/<triple>/lib` and any file named
+     `librustc_driver*`, so no copy of a compiler can be made from the host's toolchain and no copy
+     can load its driver. rust-src stays readable. Denials are reported with
+     Seatbelt's `report` action into the audit. The C toolchain, git and other tools stay allowed:
+     tracedecay's CLI build script runs `pnpm`.
+   - **Fails closed on workers.** An executor whose boundary cannot be set up (no user namespaces
+     or seccomp user notification on Linux, `sandbox_init` failing on macOS) does not start, naming
+     why. Locally, the daemon installs the same boundary over build-time descendants (build
+     scripts, proc-macro servers, linkers, blaze's own children) where it can; where it cannot (a
+     Linux that forbids unprivileged user namespaces, as Ubuntu's AppArmor setting can, **unverified**
+     here) it builds with the spawn API's refusals and the audit alone and says the boundary is off.
+     `BLAZE_NO_RUSTC=audit` records instead of denying, for diagnosis; a worker ignores it.
+   - **What the boundary covers.** On a worker, everything, tests included: a worker runs blaze,
+     never rustc. Locally a test program the user runs is the user's program: if
+     it runs rustc at run time, that is the program's behaviour, not blaze compiling with rustc, and
+     the superset rule says it must behave as under cargo; the audit reports it. This is why
+     tracedecay's tests that run rustc or cargo need the owner's `rustc-tests` gate (section 6).
+   - **Out of the boundary's threat model:** a compiler the job brings itself under another name and
+     with its driver renamed. It is caught on Linux by the linkage and digest checks, not on macOS;
+     the security of what a pull request runs is section 2's isolation, not this boundary's.
+2. **Blaze's own spawns go through one API**, `crates/blaze-spawn` (new, small): it resolves the
+   executable, applies the same compiler identity, refuses cargo subcommands that compile (`build`,
+   `check`, `test`, `run`, `rustc`, `doc`, `bench`, `install`, `fix`, `clippy`, `miri`), `cargo
+   metadata` without `--no-deps`, a cargo alias that expands to one of those (read from cargo's
+   config), an external `cargo-*` subcommand, and a `RUSTC`, `RUSTC_WRAPPER` or
+   `RUSTC_WORKSPACE_WRAPPER` that names a compiler, before the spawn, with a named error. Every
+   spawn site above goes through it, the vendored ones by one hook in `stdx::process` and
+   `proc-macro-api`. It is not the boundary; it gives a named error before the boundary's denial,
+   and covers a cold dispatch that never reaches an exec. `harness/spawnsites.py` lists every
+   process-creating call (`Command::new`, `libc::{fork, vfork, execve, execvp, posix_spawn*}`) in
+   `crates/` and `vendor/rust-analyzer` and fails on one outside `blaze-spawn` that
+   `harness/dist/spawn-allow.toml` does not list with its reason.
+3. **Compiler questions are blaze's.** A build script's `RUSTC` and `RUSTDOC` point at blaze's
+   answerer (`ra-jit-rustc`, `answers/own.rs`), which answers `-vV`, `--print` and `--version`
+   itself and checks the probe programs of `autocfg`, `version_check` and `rustversion` with blaze's
+   own front end; the fallback to the real rustc (`answers.rs:165-166`) is removed. A question it
+   cannot answer fails the probe with a named error, never by asking rustc.
+
+**Provenance (re-review B, M5).** Zero execs in the audited interval does not prove the build was
+blaze's: a warm target or store, rustc-built sysroot libraries, a rustc-built base executable,
+script executable or macro library would let a hybrid build pass. So P0-A runs with a cold
+isolated target, store and daemon home; the boundary denies reads of the rustc-built libraries;
+the build records the origin and digest of every Rust code artifact and macro server it links or
+loads; and the audit fails on any origin that is not blaze's. The paths that reach rustc-built
+artifacts today are removed in worker mode: `own_macro.rs:49-73` (the toolchain's macro server when
+a shipped one is absent) and `:86-119` (the rustc-built macro library after a failed own build),
+the symbol files `main.rs:7739-7746` loads, and `whole.rs:37-47`, which makes Build and Run whole
+but not Test and Check.
+
+**Negative fixtures** (`harness/dist/fixtures/norustc/`, both platforms): a build script that runs
+rustc by absolute path; a renamed copy of rustc (Linux: denied by digest and linkage; macOS: the
+copy cannot be made); `sh -c 'rustc ...'`; a linker wrapper (`-C linker=./cc-wrapper`) that runs
+rustc; a build script that runs `cargo build`; a proc macro that runs `rustc -` on source; a test
+that runs `cargo metadata`, `cargo build` and `rustc`; a cargo alias `b = "build"` and `cargo b`; a
+`cargo-foo` plugin on `PATH` that runs rustc; `RUSTC_WRAPPER` pointing at rustc; project-model's
+compile-time dependencies; git with a credential helper that runs rustc. Each ends with 0 compiler
+execs, a named refusal in the audit, and the build failing only where it needed what was refused.
+**Positive fixtures:** the CLI's build script running `pnpm`; `autocfg`, `version_check` and
+`rustversion` probes answered by blaze; a C dependency built with `cc`.
 
 ## 1. Identity
 
@@ -786,28 +1014,40 @@ median ([ci-runner.md](ci-runner.md), #226; the median **reported**). Per projec
 fetches every pack any build pushed.
 
 A dependency crate with many generic instances (an `alloc` in every program's types) gets
-entries from many builds. Each generation lists only the packs of the build that published it
-plus the packs of the generation before that the build used; section 7's GC drops what no live
-generation names (review B M9).
+entries from many builds. A generation is cumulative: it lists the packs of the build that
+published it plus the packs of the generation before that the build used. So a newest generation
+can still name packs whose entries no live build uses, and a pack is kept whole while any of its
+entries is used. Generations alone cannot say what is dead (re-review A, b-M9); the GC below
+collects by the entries builds used.
 
 ### GC
 
-- A build's `RootManifest` names the record generations it read and wrote. Live roots: the last
-  20 commits of `master` per `BuildSpec` and every root written in the last 14 days. A record
-  generation named by no live root is dead; a pack named by no live generation is dead.
-- **Compaction:** the server rewrites a crate's live entries into fresh packs when its live
-  generations name packs that are mostly dead, publishes a new generation of the same content,
-  and lets the old packs die. This is the step a crate-name root could not do.
-- **Leases:** a running job's lookups pin the generations they answered until the job ends or
-  its deadline passes; GC skips pinned generations. No eviction retry is needed (research, the
-  adopt table's row 21).
+- **What is live is what builds used.** A finished build's `RootManifest` lists, per crate, the
+  generation it read or wrote and a blob of the entry keys it used of that crate (the keys the
+  lead's assembly read from the store or wrote to it; a key list per crate, sorted). An entry is
+  live when the `used` blob of a live root names it.
+- **Live roots, by configuration, not by commit** (re-review A N1): roots are grouped by
+  `ConfigKey`, the `BuildSpec` without its source and lock, so one configuration's builds across
+  commits are one history. Live: in `Main`, the roots of the last 20 `master` commits of each
+  `ConfigKey`; in every namespace, every root written in the last 14 days.
+- **Compaction makes generations smaller.** When the live entries of a crate's newest generation
+  are under half of its packs' bytes, the collector writes exactly the crate's live entries (the
+  union of the live roots' `used` lists for it) into fresh packs and publishes generation g' with
+  only those packs. In the same step it appends `remap/<ns>/<crate_key>`: every generation g it
+  replaces maps to g'. A root that names g is then served g' (which holds every entry the root
+  used); g's record and every pack no live generation names are dead.
+- **Leases and pins:** a running job's lookups pin the generations they answered, and an
+  execution pins every blob its executors upload under its capability, from the upload to the
+  execution's end (section 4), until the job ends or its deadline passes; GC skips pinned
+  generations and blobs, and a remap does not unpin. No eviction retry is needed (research, the adopt table's row 21).
 - **Budget:** `--max` bytes with a low-water mark at 80%. Past `--max`, the server collects
   dead data, then live `Pr(n)` namespaces idle longest, then `Main` roots older than the last 20
-  commits; it never collects a pinned generation. If live data alone passes `--max`, the server
-  says so and stops accepting `Pr(n)` publishes before it evicts live `Main` data.
+  commits of their `ConfigKey`; it never collects a pinned generation or pack. If live data alone
+  passes `--max`, the server says so and stops accepting `Pr(n)` publishes before it evicts live
+  `Main` data.
 - **Scheduling:** collection runs in the server every hour and when a publish crosses the budget,
-  not by hand. A blob no generation names is removed after at least two hours (`collect.rs`'s
-  grace), checked again right before removal.
+  not by hand. A blob no generation names and no execution pins is removed after at least two
+  hours (`collect.rs`'s grace) after its last pin ended, checked again right before removal.
 - `Pr(n)` is dropped by `DELETE /v1/ns/pr/<n>` from a `pull_request: closed` workflow or 14 days
   after its last write.
 - Records of an identity the server no longer serves are dead after 7 days.
@@ -826,129 +1066,229 @@ invocations, one crate each; none splits a crate (research 6, 8). The `tracedeca
 200.846 s rustc action on one worker today. blaze has no per-crate action to distribute either:
 a crate's functions are queries over one database.
 
-### The unit: codegen batches by home crate, over one work set
+### The unit: the build's own ahead loop, in batches
 
-blaze already compiles ahead from a work set: roots, then every generic instance a compiled
-function names, deduplicated, popped by any thread (`compile_unnamed`, `mod.rs:2565-2622`).
-Three facts make that set distributable:
+A whole build compiles ahead in `ObjectCodegen::compile_ahead` (`mod.rs:5479`): threads take a
+root or an instance from one queue, compile it, and push the instances its code names. LOADMEM
+shows that a tracedecay build spends its time and its memory there, and u7 bounds it: the loop
+takes its work in batches, and at the end of each it hands what it compiled on and releases the
+batch's memos. That batch is the unit of distribution. A batch ends at one boundary, where its
+functions leave the salsa memos: into the object in a local build, as linkable store entries in a
+distributed one. Memory and distribution are one mechanism.
 
-1. **A compiled function names what it calls by stable name** (`fragment.rs`), not by an address
-   in one object. It compiles without its callees compiled. No worker waits on another to
-   compile.
-2. **An instance's code depends only on what its name mentions** (`home.rs`). Its home crate's
-   dependency closure is all the front end it needs.
-3. **A compiled function is a content-keyed store entry.** Any machine on the same identity that
-   has the entry links it as if it compiled it ("a build that knows them finds it compiled").
-
-So the unit of distribution is a **batch**: work items of one home crate, a few thousand
-functions' worth, leased from a work set the coordinator holds for one execution. It is coarse
-enough that a request costs nothing beside it (about 2 ms of thread time a function on nushell,
-21.2 s on 16 cores for 165,752, roadmap.md, **read**), and fine enough to balance the long pole:
-the `tracedecay` crate's roots and the instances homed in it are many batches, compiled on as
-many executors as hold its closure.
+A batch is thousands of functions: coarse enough that a round trip costs nothing beside it (about
+2 ms of thread time a function on nushell, roadmap.md, n not stated), fine enough to balance.
 
 | Unit | Verdict | Why |
 |---|---|---|
 | one function per request | rejected | a request and its round trip per 2 ms of work |
-| one crate per action (Bazel's) | rejected as the unit, **kept as the partition key** | blaze has no per-crate action; but grouping work by home crate is what lets a helper load less than the whole workspace |
-| static shards by stable-name hash (revision 1's mode D) | rejected | every shard needs the whole front end, a slow shard holds the build, and the reviews found no completion or liveness rule (review A M7, review B M7) |
-| **batches by home crate, leased from one work set** | **chosen** | the existing ahead-compile loop, across processes; dynamic, so it balances; home-crate locality for packs and front ends |
-| one big box | kept where it exists | Ubuntu-main is one (128 cores); its executors are part of the fleet, and helpers on it are the first step (gate GD) |
+| one crate per action (Bazel's) | rejected | blaze has no per-crate action: a crate's functions are queries over one database |
+| static shards by stable-name hash (revision 1's mode D) | rejected | every shard needs the whole front end and, in blaze, the whole program compiled to find its share (below); a slow shard holds the build |
+| **batches of the build's ahead loop, granted from one work set** | **chosen** | the loop u7 bounds, across processes; dynamic, so it balances |
+| one big box | kept where it exists | Ubuntu-main is one (128 cores); several executors on it splitting one build are the first width GD measures |
+
+### Moving work between processes: the decision (re-review B, B2)
+
+A queue item is `(Instance, StoredParamEnvAndCrate)`, ids of one database, and a stable name cannot
+be turned back into one. So the question is how an executor comes to hold an instance to compile.
+
+| Option | What crosses the wire | Cost | Verdict |
+|---|---|---|---|
+| **(a) a lossless instance descriptor**: a versioned encoding in a new crate under `vendor/rust-analyzer` of source, unit, item, closure and coroutine identities, generic and const arguments encoded recursively, the asking param environment's caller bounds and the overflow mode, with rebinding into a helper's database under the exact `BuildSpec`; a type spelled past 1,024 bytes travels as a content-addressed blob, never as its hashed name | a descriptor per work item | an encoding of every type-system construct blaze compiles, kept in step with the front end; a wrong rebinding miscompiles silently unless entry digests are compared; round-trip and compile tests across interning orders, long nested types, closures, coroutines, const generics, caller bounds and repeated units. It is what would let a helper hold less than the whole front end, and re-review B's M2 limits that: an instance homed in a workspace crate needs that crate's closure, often most of the program, and how much of tracedecay's work homes in small closures is not measured | **second stage** (unit D2), built only if D4 names helpers' front ends as the limiter and D2's home inventory shows useful work that fits smaller helpers |
+| (b) static shards over identical front ends: every executor computes the whole work set in one canonical order and compiles shard i of N | names, for coverage | every executor holds the whole front end (G0: 120 to 210 s cold; LOADMEM: 11.0 to 13.1 GB live at the resolution peak; warm executors amortise both). And in blaze an instance is found only by compiling its caller (`requests.funcs` comes out of codegen), so to know its shard each executor would compile the whole program | rejected as stated |
+| **(b′) claimed discovery over identical front ends** | a root-set digest, and the digest of each found instance's stable name | the whole front end per executor, as (b); a canonical root order that does not depend on interning; a test that two processes name everything alike; one claim per found instance, carried in batch results | **chosen, first stage** (units D0, D1) |
+
+How (b′) works. Every executor of an execution loads the same `BuildSpec` and source and computes
+the build's roots and their stable names. Sorted by the bytes of their stable names, the roots are
+one list on every executor, whatever order its interner gave them; the executor posts that list's
+digest and length (`RootSet`), and one whose `RootSet` differs from the execution's is refused.
+Roots are granted in ranges of the list: any executor can compile any root. An instance is
+compiled only by an executor that found it: when a function it compiled names a generic instance,
+that executor holds the instance in its own database, reports the digest of its stable name, and
+the coordinator grants the name to the first executor that reported it and records the others as
+finders. An on-demand function (non-generic, compiled when something calls it) is found by name
+(`stable.rs:291`), so it is granted like a root, to anyone. Nothing about an instance crosses the
+wire but its name's digest.
+
+This leans on what the store already leans on: one stable name, one compiled function. An
+instance asked under two param environments (`home.rs:275-283` keeps the asking environment where
+caller bounds or opaque types need it) must have two names or the same code; D0 checks it by
+comparing every name's entry digest across executors and against the one-process build.
+
+The price is the front end on every executor: hence warm executors (section 2's trusted builders
+on `master`, a pull request's executors across its pushes) and D3's image. What it buys: no
+instance transport in the first stage, D2's descriptor only if measurement asks for it, and warm
+helpers that start before a cold lead is loaded.
 
 ### The protocol
 
-Roles in one execution: the **lead** (the executor that owns the job: it builds the program,
-links it and runs the tests) and **helpers** (executors of the same trust that load a front end
-for the same tree and take batches). The coordinator holds the work set.
+Roles in one execution: the **lead** (the executor that owns the job: it assembles the program,
+links it and runs the tests) and **helpers** (executors of the same trust, platform and
+`FrontEndKey`). Every executor, the lead too, compiles batches; the coordinator holds the work set,
+a sans-IO state machine in `crates/blaze-dist`.
 
-1. **Seed.** The lead loads the front end for the job's `BuildSpec`, computes the roots
-   `compile_unnamed` would start from, looks their crates up in the cache (one batch), and posts
-   the roots whose entries the cache lacks as work items, grouped by home crate, to the
-   coordinator. Items whose entries are in the store are marked `FromStore` without a lease.
-2. **Lease.** An executor asks for a batch of the home crates it can serve (those whose closure
-   its front end holds). The coordinator answers with a `Batch` and a lease (attempt, end); the
-   items are marked leased. Leases last 60 s and are renewed by the holder's heartbeats every 5 s.
-3. **Compile.** The holder compiles each item (`compiled_root`, `compiled_instance`), never
-   waiting for another item. It collects the instances its results name (as `compile_unnamed`
-   does) into `found`.
-4. **Publish, then report.** The holder seals the batch's entries into a pack (`seal_open`),
-   uploads it (`PUT /v1/blob`), and only then sends its `BatchResult`. The coordinator adds
-   `found` items not yet seen to the work set under their home crates. A batch's result is
-   terminal: every item is `Compiled`, `FromStore` or `Refused`.
-5. **Refusal.** A `Refused` item fails the job with blaze's reason, naming the function. It never
-   goes to rustc. (Locally a refusal restarts codegen with the function rejected, `mod.rs:636-645`;
-   in a distributed build the coordinator does the same: it marks the item refused and the lead's
-   assembly treats it as rejected, so the rejection rounds are the lead's, as today.)
-6. **Done.** The compile phase is done when no item is pending or leased. Coverage is tracked per
-   item, so "done" means every root and every found instance has a terminal outcome.
-7. **Assemble.** The lead fetches every helper's pack and imports it into its store, synchronously,
-   before it builds the object. Then it runs the normal build (`CodegenUnit::compile`), which finds
-   every function in the store. What is not a stable-named function stays the lead's: statics,
-   the allocator and runtime shims, vtables, drop glue reached only through them, and the
-   rejection rounds (`mod.rs:800-945`). A missing entry is compiled by the lead then; the lead
-   never waits on a helper for it.
-8. **Fencing.** A lease that expires returns its items to the work set; a later result for that
-   lease is accepted for items still not terminal (entries are content-keyed, so a late duplicate
-   is harmless) and ignored for the rest; a late `Refused` from an expired lease is ignored and
-   the item is compiled again. Every message carries execution id and attempt; a reassigned
-   execution's old attempt is refused.
-9. **Liveness.** No executor waits on another during compile; only assembly waits, and only for
-   leased batches with live leases, which are returned on expiry. So the protocol cannot
-   deadlock on a missing entry (review B M7). Helper reservation is non-blocking: a lead that
-   finds no helper free compiles alone, and two leads never hold helpers waiting for each other.
-10. **Cancellation and deadline.** The agent kills each executor's process group (section 2,
-    rule 4); the coordinator drops the execution's work set and leases.
+1. **Join.** An executor fetches the packs the execution's cache lookup answered (pinned to the
+   execution), loads its front end, and posts `POST /v1/work/join {0: execution,
+   1: attempt, 2: RootSet, 3: rejected}`. The first join fixes the execution's `RootSet` and opens
+   its root ranges; a join with another `RootSet` is refused (conflict: "the executor's front end
+   differs") and counted, as a determinism bug. `rejected` is the names the lead's daemon already
+   rejects (`Rejections`); every executor skips them, as `compile_ahead` does. No executor waits
+   for the lead to seed: a warm helper joins and compiles while a cold lead is still loading
+   (re-review A N6, re-review B M4).
+2. **Grant.** An executor asks `POST /v1/work/lease` and gets a `Grant`: root ranges and the names
+   granted to it, under a `Lease` with a new `generation`. Names come before roots, so a finder
+   compiles what it found while its database holds it.
+3. **Compile a batch.** The executor runs its `compile_ahead` threads over the grant, as the local
+   build does (u7's batch, the same code), with two differences: an instance its code names is not
+   pushed onto the local queue but held until the name is granted, and a function the store has
+   with its whole usable closure (`Entries::usable`, debug type sets included) in the execution's
+   pinned packs is `FromStore`, neither compiled nor followed. A function that fails is `Failed`,
+   with its error; a failure here is speculative, as in the local loop.
+4. **Export, upload, report.** At the batch's end (its grant done, or u7's budget reached) the
+   executor runs the exporter over what the batch compiled (below), seals the entries into a pack
+   (`seal_open`), uploads it (`PUT /v1/blob`, pinned to the execution from the upload), and only
+   then posts its `BatchResult`. Then it releases the batch's memos.
+5. **Commit.** The coordinator commits a `BatchResult` in one transition: each item's outcome; each
+   item's `found` names (a name not seen before is granted to this holder, a name seen before adds
+   this holder as a finder); the packs. Found names are registered in the transition that makes
+   their finder terminal, so coverage never counts an item done before what it found is known
+   (re-review B, M1). A replay of the same `seq` gets the same answer.
+6. **Done.** The compile phase is done when every root range and every granted name is terminal
+   and no lease holds work. The root list's length is fixed at the first join, so an empty work set
+   before the roots are in cannot signal done.
+7. **Assemble.** The lead imports every accepted pack, synchronously, and builds the program as a
+   store-hydrated full build (below), compiling only what nobody could export.
+8. **Outcomes are not verdicts.** No outcome of a batch fails the job. A `Failed` function matters
+   only if the program needs it: the lead's assembly then compiles it, gets the same error, and
+   goes through the rejection rounds of a one-executor build (`mod.rs:636-645`; `whole.rs:120-135`
+   fails on a stand-in the program reaches), with no rustc. So an unused function blaze cannot
+   compile fails neither build (re-review B, M7). A `Local` item, and every exported item whose
+   usable closure reaches it, is compiled by the lead: the lead's tail, counted by reason.
+9. **Leases and fencing** (re-review B, M3; re-review A N5). Compute is at least once; terminal
+   accounting is exactly once.
 
-Placement: the work set's state machine is sans-IO, in a new crate `crates/blaze-dist`; the
-hooks that take items from and give results to codegen go in `crates/hir-ty-codegen`
-(`compile_unnamed`'s queue behind a trait); the IO driver in `crates/ra-jit/src/worker.rs`.
-Nothing here is language semantics; the front-end image below is, and goes in
-`vendor/rust-analyzer`.
+   | Event | Transition |
+   |---|---|
+   | a heartbeat (every 5 s, on `/v1/workers/events`) | the holder's lease end moves to now + 60 s |
+   | no batch committed for 10 times the execution's median batch time, at least 120 s, though heartbeats arrive | the lease is revoked, as for a lost helper (a hung helper) |
+   | a helper lost: its lease end passed, or revoked | the lease's generation is dead; its open root ranges return to the pool; each name it held goes to another finder of it if there is one, else to the lead's tail |
+   | a `BatchResult` whose `Lease.generation` is not the holder's current one | refused whole (conflict); its packs stay unnamed and are collected after the execution; the items are another holder's or the lead's |
+   | a result committed whose answer was lost | the holder replays the same `seq` and gets the same answer |
+   | an upload that fails | the holder retries it under its lease; if the lease ends first, the batch's items go back with it |
+   | the lead's import of a pack fails | that pack's items join the lead's tail, named in the report |
+   | the lead lost | the execution's `Attempt` goes up; every lease of the old attempt is dead; outcomes committed under it stay (their entries are content, their packs pinned to the execution) and the new lead imports them |
+   | cancellation or the deadline | the agents kill each executor's process group (section 2, rule 4); the coordinator drops the work set; the pins end |
+
+10. **Liveness.** No executor waits on another to compile. The lead waits for Done, and Done
+    comes: every lease ends (by heartbeat, progress or deadline), and the work of an ended lease
+    goes back to the pool, to a finder or to the lead. Helper reservation is non-blocking: a lead
+    that finds no helper free compiles alone, and two leads never hold helpers waiting for each
+    other.
+
+### Export and ingestion (re-review B, B3)
+
+- **The exporter** (`hir-ty-codegen/export.rs`, new). From a `CompiledFunction`, its instance and
+  home, and an `ExportContext` (the stable names, the build's symbol resolver, type-id hashes,
+  debug type sets) it writes the `cached::Entry` that `later.rs` writes today, without an object: a
+  callee is `Named` or `Root` by stable name, `Import` only for a symbol the `BuildSpec`'s link
+  provides (an `extern` item, a symbol of the shipped standard library), `TypeId` by the hash of the
+  type, `Asm` by its text; data by its blob, with C4's symbolic rebinding of paths; `tracked`
+  (patch tracking) as `later.rs::tracked` makes it. What it cannot name is `Local { why }`, with
+  `later.rs`'s `unkept` reasons. `later.rs`'s `entry` and `keep` become calls of the exporter
+  whose `ExportContext` answers from the object, so a local and a distributed entry come from one
+  code path, and an executor's entry digest equals the one-process build's (D0 checks it). A helper
+  needs no symbol of a callee it did not compile: requests stay symbolic.
+- **The lead's assembly is a store-hydrated full build.** Today the checkout's code comes from the
+  store only in a daemon's first full build (`hydrate`, `mod.rs:671`), and a patch neither compiles
+  ahead nor keeps entries. A distributed execution's lead builds with `hydrate` and
+  `roots_from_store` set whatever its daemon built before, so every root and instance whose usable
+  closure is in the imported packs comes from the store; and it keeps the imported entries'
+  `tracked`, so that its next edit can be a patch of this build. A body edit stays a local patch
+  (it compiles a few functions and leases nothing, by GD's batch-size rule). A signature edit or an
+  identity change renames what is downstream; it is a distributed execution, and the lead
+  assembles it hydrated again.
+- **Zero compile queries for imported work.** After import, the lead counts by stable name every
+  run of `compiled_root` and `compiled_instance` (a query executed, not a memo hit), each with its
+  reason: a `Local` item, an item whose usable closure reaches a `Local` or missing one, a `Failed`
+  item the program needs, or a lead-only function. "The store had it" is never a reason. The number
+  of names an executor exported that the lead then compiled is reported, and is 0 in D0's runs, on
+  a cold build and on a warm signature edit.
+
+### What stays the lead's
+
+Statics, the allocator and runtime shims, vtables and drop glue reached only through them, the
+rejection rounds (`mod.rs:800-945`), `Local` items and what reaches them, and the link. The tail is
+measured by reason in D0 and D4, not assumed small.
+
+### The first unit: two processes on one Mac (gate GP)
+
+Before any network code, unit D0 proves the mechanism on this Mac: a lead and one helper, two blaze
+processes with their own stores and daemon homes, the coordinator in the lead's process speaking
+section 8's work calls over a Unix socket, splitting one build:
+
+1. `demo/mid` (regex-syntax, serde_json and memchr: generic-heavy) and `demo/real`, with
+   `BLAZE_WHOLE_BUILD=1`. Until P0.6 makes the whole build work on macOS (#255), this stage runs in
+   Docker's Linux VM on this Mac, where it works.
+2. The `tracedecay` crate's library test program (`-p tracedecay --lib`; the crate that is one
+   200.846 s rustc action under Bazel), under the guard: the two processes together stay under the
+   watchdog's 24 GB. If their front ends' peaks overlap past it, the helper loads first and the
+   lead starts after the helper's resolution peak; if the sum still passes, this stage waits for
+   P0-C, which is P0.4's work, not a reason to skip the stage.
+
+**GP's bar**, in every run: the program's output equals a one-process build's (the demo programs'
+output; for tracedecay, the list of tests and the verdicts of a pure subset); every entry digest
+the helper exported equals the one-process build's for that key; both executors compiled a share
+of the functions; the lead compiled 0 names an executor exported; the lead's tail is reported by
+reason; 0 compiler execs (P0-A's boundary on both processes). No network layer (D1) is built before
+GP passes.
 
 ### Where each executor's front end comes from
 
 | Option | Cost, measured | Verdict |
 |---|---|---|
-| each helper loads the whole workspace cold | tracedecay on macOS: load 79.9 to 159.2 s, resolve 20.4 to 26.4 s, macros 19.85 to 23.73 s (2 runs), and 58.3 GB when ready (1 run) (TRACEDECAY.md) | rejected: it costs 3 to 5 times the 40.7 s the whole ahead compile took, and more memory than any fleet machine but one holds |
-| **each helper loads only the closure of the home crates it serves**, from trusted inputs | `tracedecay-framing`'s closure: a 3.0 GB worker against the CLI's 58.3 GB (TRACEDECAY.md, **read**: "the load follows the closure of the package asked for"); load time **unverified** per closure | **chosen, first form** (unit D2). Helpers for lower crates load in a fraction of the time and compile while the lead is still loading: the front end of the lead and the codegen of the helpers overlap |
-| **a warm front end**: a trusted builder warm on `master`, a pull-request executor warm on its pull request's last push | an edit is 258 ms on nushell (**read**); tracedecay's edit time as the daemon's is unmeasured until P0-D | **chosen** for executors that already exist: a job is an edit of what they loaded |
-| **a front-end image of the dependency layer** (#274, #40): the front end's results for the dependency crates, laid out to be mapped read-only and validated by root, published by a trusted builder, keyed by `FrontEndKey` and the dependency sources | not built. #274's target: a warm restart under 1 s against 35.4 s on nushell (**reported**); its kill criterion is in roadmap.md section 5 | **chosen, second form** (unit D3): a new executor maps it instead of loading; executors on one machine share its pages; a pull request's executor starts warm without ever touching trusted state it could write |
+| an executor loads the whole workspace cold for one build | tracedecay on macOS: load 79.9 to 159.2 s, resolve 20.4 to 26.4 s, macros 19.85 to 23.73 s (2 runs, TRACEDECAY.md); 11.0 to 13.1 GB live at the resolution peak (2 runs, LOADMEM.md); 58.3 GB when ready with the whole build unbounded (1 run) | rejected as what a build pays: it costs more than the codegen it would split. D0 does it on fixtures, to prove the mechanism |
+| **a warm full front end**: a trusted builder warm on `master`, a pull-request executor warm on its pull request's last push | an edit is 258 ms on nushell (roadmap.md, n not stated); tracedecay's edit time as the daemon's is unmeasured until P0-D | **chosen**, first stage: a job is an edit of what each executor loaded, and every executor of an execution has the same front end |
+| **a front-end image of the dependency layer** (#274, #40): the front end's results for the dependency crates, laid out to be mapped read-only and validated by root, published by a trusted builder, keyed by `FrontEndKey` and the dependency sources | not built. #274's target: a warm restart under 1 s against 35.4 s on nushell (**reported**, n not stated); its kill criterion is in roadmap.md section 5 | **chosen** (unit D3): a new executor maps it instead of loading; executors on one machine share its pages; a pull request's executor starts warm without touching trusted state it could write |
+| an executor loads only the closure of the home crates it serves | `tracedecay-framing`'s closure: a 3.0 GB worker against the CLI's 58.3 GB (TRACEDECAY.md, **read**); which share of the CLI's work homes in a small closure is not measured, and workspace-specialised instances home in the workspace (re-review B, M2) | **second stage** (unit D2): needs option (a)'s descriptor and D2's home inventory first |
 | fork a warm trusted daemon | not measured | rejected (section 2) |
 | ship MIR | no serialised MIR exists; codegen asks the database for layouts, vtables, type ids and symbols (no-rustc.md, **read**) | rejected |
 
-Helpers are matched to batches by closure: the coordinator knows each unit's dependency closure
-from the `BuildSpec`'s unit graph, and a helper whose front end holds closure C serves every home
-crate whose closure is inside C. The `BuildSpec` carries the unified features and cfg of every
-unit, so a helper loading a sub-graph builds each crate exactly as the lead does.
-
 ### Where it pays, and what is measured
 
-The one tracedecay load measured spent 120 to 210 s in its front end and 40.7 s compiling every
-function ahead (TRACEDECAY.md, one run each, contended). A cold helper cannot pay on that build.
-Distributed compile pays where codegen is large and front ends are warm or small:
+On tracedecay every cold or identity-changing build is the daemon's whole build (LOADMEM: nine
+`opt-level=1` crates), and its codegen ran past 640,000 functions at about 25,000 a second on 18
+cores before the guard stopped it, its end unmeasured (LOADMEM, one run, contended). The front end
+before it took 120 to 210 s (TRACEDECAY.md, two runs) and is serial on the lead: distributing
+codegen does not shorten it. A cold executor cannot pay on such a build. Distributed compile pays
+where codegen is large and front ends are warm or shared:
 
-- **a new blaze identity** (a blaze upgrade): every function is compiled again, on every
-  trusted builder warm on `master`;
+- **a new blaze identity** (a blaze upgrade): every function is compiled again. The new binary's
+  executors are new processes, so they load cold or from an image the new identity accepts, and
+  this scenario's time includes those front ends (re-review B, M4);
 - **a signature edit in a crate many depend on**: it renames every checkout crate downstream
   (cache.md), so their functions compile again until per-item keys (#344) land;
 - **a lock-file change**: the dependency layer's instances compile again;
 - **the first push of a pull request** whose executors start from the image;
 - **a cold `Main` build of a new commit range** after the cache was disowned (an epoch bump).
 
-Gate GD measures these on tracedecay, not on a body edit (which compiles a few functions).
+Gate GD measures these on tracedecay, not on a body edit (which compiles a few functions). If the
+common cold first push must gain too, the front end has to be shared or distributed by crate; D3's
+image is the first part of that, and D4 records whether the front end is the limiter.
 
 ### Memory per machine
 
-A front end's size decides how many executors a machine holds. From fleet.md (**reported**) and the
-numbers above, each executor reserving its size plus 20%; the arithmetic is **unverified** and is
-replaced by measured reservations (section 5) once P0-C and P0-G have numbers.
+In the first stage every executor holds the whole front end. From fleet.md (**reported**) and the
+numbers above, each executor reserving its size plus 20%, rounded down to whole executors; the
+arithmetic is **unverified** and is replaced by measured reservations (section 5) once P0-C and
+P0-G have numbers. `B` is Bazel's reserve on Ubuntu-main; the `bazel-reserve` gate's default is 32
+cores and 64 GB until Bazel's use is measured.
 
-| Machine | RAM | Held back | Whole tracedecay front end, today (58.3 GB, macOS, 1 run) | At P0-C's bar (16 GB) | Small closures (3 GB, like `tracedecay-framing`) |
+| Machine | RAM | Held back | Whole tracedecay front end today (58.3 GB, macOS, 1 run; with 20%, 70 GB) | At P0-C's bar (16 GB; with 20%, 19.2 GB) | Small closures (3 GB; with 20%, 3.6 GB), second stage only |
 |---|---|---|---|---|---|
-| Ubuntu-main, 128 cores | 256 GB | 16 GB system, B GB for what stays on Bazel (owner to say) | (240 − B) / 64 ≈ 3 executors at B = 48 (the Linux size is unmeasured; macOS's footprint counts compressed pages Linux does not have) | (240 − B) / 20 ≈ 9 at B = 48 | many; CPU binds first: blaze stops scaling near 16 cores, so 8 executors of 16 cores is a starting partition |
-| Mac Studio, M1 Ultra | 64 GB | 8 GB system | 0: 58.3 GB does not fit beside the system with headroom | 2 | about 15 by memory; its 20 cores bind first |
-| 12-core desktop | 64 GB | 8 GB | 0 | 2 | about 15 by memory; its 12 cores bind first |
-| 12-core laptop | 16 GB | 4 GB | 0 | 0 | 2 to 3: helpers for low crates and test shards only, if the owner makes it a worker |
+| Ubuntu-main, 128 cores | 256 GB | 16 GB system, B = 64 GB | ⌊176 / 70⌋ = 2 executors (the Linux size is unmeasured; macOS's footprint counts compressed pages Linux does not have) | ⌊176 / 19.2⌋ = 9 | many; CPU binds first: blaze stops scaling near 16 cores, so 8 executors of 16 cores is a starting partition |
+| Mac Studio, M1 Ultra | 64 GB | 8 GB system | 0 | ⌊56 / 19.2⌋ = 2 | ⌊56 / 3.6⌋ = 15 by memory; its 20 cores bind first |
+| 12-core desktop | 64 GB | 8 GB | 0 | 2 | 15 by memory; its 12 cores bind first |
+| 12-core laptop | 16 GB | 4 GB | 0 | 0 | ⌊12 / 3.6⌋ = 3: helpers for low crates and test shards only, if the owner makes it a worker |
 
 The row that decides the most is Ubuntu-main: with P0-C met, one trusted builder and several
 pull-request executors fit beside Bazel's remaining work. With the image (D3), executors on one
@@ -957,34 +1297,38 @@ dirty (**unverified** until D3 measures it).
 
 ### Gate GD, and what changes if it fails
 
-**Measured** (unit D4): tracedecay `tracedecay-cli`, the five scenarios above, on 1 executor
-(the lead alone), 2 executors on two machines, and 3 on three; trusted builders on `master`;
-at least 3 runs per arm, interleaved, one session; stage timestamps and the work set's counters
-(items, batches, leases expired, bytes moved, front-end load per helper).
+**Measured** (unit D4): tracedecay `tracedecay-cli`, the five scenarios above, on 1 executor (the
+lead alone, running the same protocol with no helper), 2 executors on two machines, and 3 on
+three; executors warm; at least 3 runs per arm, interleaved, one session; stage timestamps and the
+work set's counters (items, batches, grants, leases revoked, duplicate compiles, bytes moved,
+front-end load per executor, the lead's tail by reason).
 
-**Correctness bar** (must hold in every run): the program's tests give the same verdicts as the
-one-executor build; every entry key present in both has the same digest; 0 refused items that
-the one-executor build compiled; 0 attempted rustc runs.
+**Correctness bar** (every run): the program's tests give the same verdicts as the one-executor
+build; every entry key present in both has the same digest; the lead compiled 0 names an executor
+exported; 0 compiler execs.
 
-**Speed bar:** on the identity-change and signature-edit scenarios, 2 machines finish the
-compile phase (stage `Loaded` to `Compiled` of the lead) at least 1.4 times faster than 1, and 3
-at least 1.8 times. On a body edit, distribution must cost at most 5% over 1 executor (the lead
-compiles small work alone when it is faster: the coordinator does not lease batches under a
-size, set from this measurement).
+**Speed bar** (re-review B, M4): end to end. On the identity-change and signature-edit scenarios,
+the job's time from `Queued` to `Done`, with its critical path named from the stage timestamps
+(front ends, joins, batches, uploads, import, assembly, link, tests): every run of 2 machines
+faster than every run of 1, and every run of 3 faster than every run of 2. The compile-phase ratios
+of revision 2 (`Loaded` to `Compiled` of the lead, 1.4 times on 2 machines, 1.8 on 3) stay as
+diagnostics, not the bar. On a body edit, distribution costs at most 5% end to end over 1
+executor (the lead compiles small work alone: the coordinator grants nothing under a size set from
+this measurement).
 
 **If the speed bar fails, the limiter named by the stage timestamps decides what changes**, in
 this order, and GD is measured again:
 
-1. **The coordinator or the network** (leases, uploads, imports dominate): larger batches, packs
+1. **The coordinator or the network** (grants, uploads, imports dominate): larger batches, packs
    uploaded while compiling, the lead importing as packs arrive.
-2. **The helpers' front ends** (helpers spend longer loading than compiling): helpers on the
-   lead's machine first, with the image shared (D3) before helpers across machines; then
-   helpers kept warm across jobs by `FrontEndKey`.
-3. **Memory** (a helper cannot hold the closure it needs): partition finer, so helpers take only
-   crates whose closure fits; shrink the worker further (P0.4's list, items 5 and 9 of memory.md).
+2. **The executors' front ends** (they spend longer loading than compiling): executors kept warm
+   across jobs by `FrontEndKey`; the image shared (D3) before executors across machines.
+3. **Memory** (an executor cannot hold the front end): shrink it (P0.4's list), share its pages
+   (D3). Smaller batches do not make a front end smaller (re-review B, M2); only D2's descriptor
+   lets a helper hold less, and only for work homed in a smaller closure.
 4. **Codegen itself is small** next to load and link for a scenario: that scenario's builds lead
    alone, by the batch-size rule above, and GD's speed bar applies to the scenarios where it is
-   not. The work set stays on for every build; only small builds lease nothing.
+   not. The work set stays on for every build; only small builds grant nothing.
 
 ### Warm remote jobs
 
@@ -999,14 +1343,15 @@ not a replacement for it (review B M1).
 developer's machine from the store; a CI job's programs are linked by its lead. The splice and
 live edits stay on the machine of the running program; they are never remote.
 
-**Failure.** An executor that misses three heartbeats loses its leases and its job; the job is
-reassigned once with a new attempt; a second loss fails it with the reason. `LocalPolicy`:
+**Failure.** A lead that misses three heartbeats loses its job: the job is reassigned once with
+a new attempt (the fencing table above keeps what was committed), and a second loss fails it with
+the reason. A helper that misses them loses only its lease. `LocalPolicy`:
 `Never` on hosted runners (tracedecay's own reason: "Fleet compilation must not fall back onto
 the smaller hosted VM"), `Fallback` (build locally after the deadline or a remote failure),
 `Race` (build locally from the start, per job, never per function). Under `Race` the first to
 finish wins, but a first-finishing failure fails the job, as Bazel's dynamic execution does
-(research 7.4), so local and remote differences surface. Locally, every policy goes through the
-same no-rustc gate.
+(research 7.4), so local and remote differences surface. Locally, every policy runs inside the
+same no-rustc boundary.
 
 ## 5. Admission and scheduling
 
@@ -1019,8 +1364,12 @@ same no-rustc gate.
   of its tests plus their declared children; unknown sizes take the largest seen on that machine.
   Reservations are subtracted while running (NativeLink's `minimum` properties, research 7.12)
   and returned at the end. CPU is enforced on Linux by the executor's cgroup (`cpu.max`) and on
-  macOS by blaze's thread count; memory by the executor's `RA_JIT_MEMORY_MAX` set to its
-  reservation and, on Linux, the cgroup's `memory.max`.
+  macOS by blaze's thread count. Memory is enforced on the executor's whole process tree, not on
+  one worker: on Linux by the cgroup's `memory.max`; on macOS by the agent, which sums the tree's
+  footprint every second and stops the executor past its reservation with a named reason; and
+  inside blaze by `RA_JIT_MEMORY_MAX`, which bounds what the daemon's workers hold together and is
+  passed, unchanged, to every blaze child (own-script and own-macro compiles) through an immutable
+  worker context rather than the environment `own_script.rs:253-280` clears (re-review B, M6).
 - **Order.** `Main` before pull requests, then first in, first out. A pull request's next push
   cancels its previous job's execution if nothing else subscribes to it.
 - **Bounded queue.** At most `Q` executions waiting per platform (default 32); past it, `POST
@@ -1116,13 +1465,25 @@ read (review B M6). So:
   contradicts loses caching (it is marked always-run until a person clears it), and the report
   names it. Besides the daily run, 5% of cache hits in every job are run anyway, picked at random.
 
-### Tests that run rustc or cargo
+### Tests that run rustc or cargo: an owner gate
 
-Three of tracedecay's tests run rustc or cargo and assert what they print (above). On a blaze
-executor the no-rustc gate refuses those spawns, so these tests cannot pass there. They are
-listed in the test inventory (unit S2) and stay on Bazel's runner until blaze offers a
-rustc-compatible diagnostics front end on `PATH` that they accept, or the owner changes them.
-Which of those is wanted is an open question for the owner, not a default of this design.
+Three of tracedecay's tests run rustc or cargo and assert what they print (above). A worker runs
+blaze, never rustc ([no-rustc.md](no-rustc.md)), so on a blaze executor the boundary of section 0 denies those
+execs and these tests cannot pass there. Revision 2 kept them on Bazel as if that were this design's
+choice; re-review A called it a regression of the Rust replacement's scope (b-M8). It is the
+owner's: the `rustc-tests` gate, open, with three options.
+
+- **Keep them on Bazel** (the gate's default until the owner answers). S2's inventory marks each
+  such test "stays on Bazel"; GS requires it executed and passing on Bazel and absent from blaze's
+  side; it is not counted as missing.
+- **The compatibility lane.** blaze gives these tests a `rustc` and a `cargo` on their `PATH`
+  that are blaze: `cargo` is `cargo-blaze`, `rustc` is blaze's answerer extended to a
+  diagnostics front end that checks a file and prints rustc-compatible diagnostics, built from
+  blaze's own front end. The tests then run on blaze executors inside the boundary (whose
+  identity check allows blaze's own shims by digest). Whether the tests' asserted output is
+  matched is measured per test; a test whose output blaze cannot match stays on Bazel by name.
+  This is a unit the owner can ask for (S4 below), not part of the default plan.
+- **Change the tests**: the owner's repository, the owner's call.
 
 ## 7. Disk, bounded on every tier
 
@@ -1160,7 +1521,16 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   HTTP status from the code's class. Codes: 1 malformed (400), 2 version (400), 3 unauthenticated
   (401), 4 not allowed (403), 5 not found (404), 6 conflict, a generation or attempt moved (409),
   7 too large (413), 8 busy (429), 9 refused by blaze, with the reason (422), 10 internal (500).
-- **Calls** (every request but `hello` carries a capability):
+- **Credentials** (re-review A N2). `hello` carries none. `auth` carries the GitHub OIDC token in
+  its body and nothing else; it is how a requester first gets a capability. A worker agent signs
+  its requests with its enrolment credential, an Ed25519 key whose public half the operator
+  registered: `Blaze-Agent: <agent name>`, `Blaze-Date: <unix ms>` and `Blaze-Signature:
+  <base64url Ed25519 over "blaze/req/v1" ‖ 0x00 ‖ method ‖ 0x00 ‖ path ‖ 0x00 ‖ sha256(body) ‖
+  0x00 ‖ the date>`; the server refuses a date more than 60 s off and a signature it has seen. The
+  agent's own calls (`/v1/workers/hello`, `/v1/workers/next`) carry only that, and enrolment confers
+  no other operation. Every other request carries `Blaze-Capability: <base64url of the canonical
+  CBOR {0: Capability, 1: signature}>`; one an agent makes for an executor carries both.
+- **Calls** (every request but `hello`, `auth` and the agent's own two carries a capability):
 
   | Call | Request | Answer |
   |---|---|---|
@@ -1174,13 +1544,14 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   | `POST /v1/results/publish` | `{0: list of TestVerdict}` | `{0: count kept}` |
   | `POST /v1/roots` | `RootManifest` | `{}` |
   | `DELETE /v1/ns/pr/<n>` | | `{}` |
-  | `POST /v1/jobs` | `{0: BuildSpec, 1: namespace, 2: deadline, ms since the epoch, 3: LocalPolicy}` | `{0: JobContent, 1: ExecutionId, 2: subscriber id}`; an equal `JobContent` running already is joined, not started again |
+  | `POST /v1/jobs` | `{0: BuildSpec, 1: namespace, 2: deadline, ms since the epoch, 3: LocalPolicy, 4: test timeout ms or null}` | `{0: JobContent, 1: ExecutionId, 2: subscriber id}`; an equal `JobContent` running already is joined, not started again; fields 2 to 4 are the subscriber's, not the content's |
   | `GET /v1/jobs/<execution>/events?from=N` | | stream of `{0: sequence, 1: attempt, 2: event}`; `from` replays after a reconnect |
   | `DELETE /v1/jobs/<execution>/subscribers/<id>` | | `{}`; the execution is cancelled when its last subscriber leaves |
   | `POST /v1/workers/hello` | `{0: agent name, 1: capacity, 2: list of ExecutorState}` | `{0: accepted}` |
-  | `POST /v1/workers/next` (long poll) | `{0: free reservations, 1: FrontEndKeys held}` | an assignment `{0: ExecutionId, 1: Attempt, 2: BuildSpec, 3: Capability}`, or a `Batch`, or nothing |
-  | `POST /v1/work/lease` | `{0: ExecutionId, 1: home crates served, 2: Attempt}` | a `Batch` or nothing |
-  | `POST /v1/work/result` | `BatchResult` | `{0: accepted items}` or error 6 |
+  | `POST /v1/workers/next` (long poll) | `{0: free reservations, 1: FrontEndKeys held}` | an assignment `{0: ExecutionId, 1: Attempt, 2: BuildSpec, 3: Capability, 4: role, lead or helper}`, or nothing |
+  | `POST /v1/work/join` | `{0: ExecutionId, 1: Attempt, 2: RootSet, 3: set of WorkName rejected}` | `{0: the execution's RootSet}` or error 6 (a different one) |
+  | `POST /v1/work/lease` | `{0: ExecutionId, 1: Attempt}` | a `Grant`, or nothing when the work set has none for this holder |
+  | `POST /v1/work/result` | `BatchResult` | `{0: set of WorkName granted to the holder from its found names}` or error 6 (a dead lease generation) |
   | `POST /v1/workers/events` | `{0: ExecutionId, 1: Attempt, 2: list of events}` | `{0: continue or cancel}`; heartbeats ride on it |
 
 - **Joining from a hosted runner.** The Tailscale action with an OIDC client whose only scope is
@@ -1218,7 +1589,7 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 | release and dist (thin LTO) | blaze has no LTO; its release programs ran at 1.02 to 1.35 times cargo's release run time on the bench apps ([research/codegen-units.md](research/codegen-units.md), **read**, run time, not build time) |
 | Clippy | a rustc driver, which blaze never runs |
 | Linux ARM | no ARM worker in the fleet |
-| tests that run rustc or cargo | section 6; until the owner decides |
+| tests that run rustc or cargo | section 6: the owner's `rustc-tests` gate; its default keeps them here, the compatibility lane (S4) would move them |
 | Rust built as an input of a JS or Python test | stays rules_rust until the owner settles it |
 
 **How they coexist.** A `rust-blaze` job runs beside Bazel in shadow mode, then blocking, then
@@ -1226,8 +1597,10 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 tracedecay's repository, after a gate (section 11). The comparison is not "equal verdicts on the
 tests both ran": it is against an inventory (unit S2) of every Rust test target, feature
 variant, custom harness, doctest and generated fixture Bazel runs today, approved by the owner,
-and it fails on any test missing, extra or not executed on either side, as well as on a
-different verdict. Bazel keeps NativeLink for what stays on it, with a reserve on Ubuntu-main
+with each test's timeout, retries and resource group as Bazel runs it. It fails on any test
+missing or extra on either side, on a test neither executed nor validly skipped (a skip counts
+only when its cached pass's manifest held, section 6), on a test the inventory keeps on Bazel that
+Bazel did not execute, and on a different verdict. Bazel keeps NativeLink for what stays on it, with a reserve on Ubuntu-main
 (section 5). The git dependency fetch of 487.687 s is Bazel's crate-universe rule (research 5);
 blaze fetches git dependencies and submodules itself (`blaze-registry/src/git.rs`), once per
 executor, which G2 measures.
@@ -1243,7 +1616,8 @@ tooling and the report form, the owner runs it and the report unit records it).
 
 | Gate | Before | Measurement | Bar | Where |
 |---|---|---|---|---|
-| **P0-A to P0-H** | every unit after Phase 0 that names them | section 0 | section 0 | Mac; P0-G Linux |
+| **P0-A to P0-H** | every unit after Phase 0 that names them; never the Phase 0 unit that remediates the predicate | section 0 | section 0 | Mac; P0-G Linux |
+| **GP, the two-process prototype** | D1 (no network layer before it) | section 4, "The first unit" | section 4 | Mac (Docker on the Mac for the demo stage until P0.6) |
 | **G1, cross-machine hits** | C5's switch to per-crate records | `harness/dist/crossmachine.py`: machine B (other `HOME`, `CARGO_HOME`, checkout path, target and store) builds A's commit from A's published records | ripgrep and nushell: 0 functions compiled on B; tracedecay: at least 99% of functions from the store on B, every miss listed with its cause; programs print on B what cargo's builds print there, panic paths included | Mac (two machines on one host); Linux |
 | **G2, the cache in CI** | S1's blocking step | hosted runner, tracedecay test programs from nothing: no remote, warm `Main`, and Bazel's fleet build of the same commit | warm `Main` no slower than Bazel's fleet build; functions compiled only in the affected closure of the commit's changes (the edited crates and the checkout crates downstream, cache.md), until #344 | fleet |
 | **G3, one job** | E3's switch | a warm lead against Bazel's fleet job, same commits: body edit in a leaf crate, body edit in the `tracedecay` crate, signature edit in a crate many depend on | push to verdicts faster than Bazel's fleet job for each, 5 runs each | fleet |
@@ -1251,7 +1625,7 @@ tooling and the report form, the owner runs it and the report unit records it).
 | **GD, distributed compile** | D4 closes; S3's blocking step | section 4 | section 4; a failure changes how, by section 4's list | Mac and Docker (two executors, small fixtures); Linux; fleet (tracedecay) |
 | **GT, tests** | T2's switch to skipping | tracedecay's suite: share of tests cacheable under the contract; then 20 runs of an unchanged commit with audits; then adversarial changes (a fixture's mode, a removed file, an environment variable, a clock-reading test, a child tool) | 0 cached passes the uncached audit contradicts; every adversarial change runs the affected test; the share cacheable recorded | Mac; Linux; fleet for the suite |
 | **G6, requests per build** | C5 | server counters | one lookup request per build; 0 per-function requests; server CPU per job recorded | Mac |
-| **GS, shadow** | the owner's removal of Bazel's Rust paths | two weeks of shadow mode on `master` and pull requests, against S2's inventory | every inventoried test executed on both sides with equal verdicts, or each difference filed and fixed; 0 missing, extra or unexecuted | fleet |
+| **GS, shadow** | the owner's removal of Bazel's Rust paths | two weeks of shadow mode on `master` and pull requests, against S2's inventory | every inventoried test executed or validly skipped (its cached pass's manifest held) on blaze's side with Bazel's verdict, every test the inventory keeps on Bazel executed there, or each difference filed and fixed; 0 missing or extra (re-review A, b-M10) | fleet |
 
 ## Phase plan
 
@@ -1273,70 +1647,137 @@ export BIN="$CARGO_TARGET_DIR/release/ra-jit"
 Fixture repositories and commits are pinned in `harness/dist/fixtures.toml` and fetched by
 `python3 harness/dist/fetch.py` (unit P0.1), into `~/work/<name>` at the pinned commit. Paths
 under `harness/dist/`, the crates `blaze-wire`, `blaze-serve` and `blaze-dist`,
-`crates/ra-jit/src/{spawn,worker}.rs`, `crates/ra-jit/src/remote/serve.rs` and
+`crates/ra-jit/src/worker.rs`, `crates/ra-jit/src/remote/serve.rs` and
 `docs/reports/DIST-SHADOW.md` are new, made by the unit that first names them; every other path
-exists at `c8e5f6a8`. "Depends" names units and the Phase 0 predicates a unit needs met; a unit
-whose acceptance runs tracedecay needs P0-H on that platform.
+exists at `f9b5da46`; so do `crates/blaze-spawn`, `crates/hir-ty-codegen/export.rs`,
+`crates/ra-jit/src/sandbox/macos.rs` and `harness/spawnsites.py` once their units make them.
+"Depends" names units and the Phase 0 predicates a unit needs met. A unit after Phase 0 whose
+acceptance runs tracedecay needs P0-H on that platform. A Phase 0 unit never depends on the
+predicate it remediates or on P0-H, which P0.8 establishes from them; its own tracedecay runs are
+its acceptance, not a prerequisite (re-review A N3).
 
 ### Phase 0: blaze builds tracedecay
 
 **P0.1 The tracedecay harness, guarded and audited.** Goal: one harness for every Phase 0
-predicate on both platforms. Extends `harness/tracedecay.py` with: the guard as a default it
-cannot turn off; `norustc.py`'s stand-in rustc, rustdoc and cargo on `PATH` and as `RUSTC`,
+predicate on both platforms. Extends `harness/tracedecay.py` with: the program's guard as a default
+it cannot turn off; `norustc.py`'s stand-in rustc, rustdoc and cargo on `PATH` and as `RUSTC`,
 `RUSTDOC`, `CARGO`, counting every run with its argv; a `--predicate P0-x` mode that runs that
 predicate's scenarios and exits non-zero unless its bar holds; `fixtures.toml` and `fetch.py`.
 Files: `harness/tracedecay.py`, `harness/dist/fixtures.toml`, `harness/dist/fetch.py`,
 `harness/norustc.py` (the stand-ins as a module). Depends: none. Acceptance: on hello-world, the
 audit counts the rustc runs today's `blaze build` makes (more than 0) and `--predicate P0-A` fails
-naming them; the watchdog kills a run at a 512 MB limit and records it. Verify:
-`python3 -I harness/tracedecay.py --td ~/work/hello --predicate P0-A --expect-fail && python3 -I harness/tracedecay.py --self-test`.
-Where: Mac.
+naming them; the watchdog's self-test (a synthetic allocator, not blaze) is killed at a 512 MB test
+limit and recorded. From the reviews:
+- [ra-N4] "Restore the standing guard or obtain an explicit owner exception, and verify the full
+  process tree." Checked by: the watchdog applies the guard's three rules (summed `top` MEM past
+  24 GB; swap used grown by at least 1 GB since the start while free swap is under 3 GB; swap used
+  grown by 8 GB), each with a self-test, and sums the run's whole process tree: a self-test child
+  started outside the binary's directory that allocates past the test limit gets the tree killed.
 
-**P0.2 rustc refused before spawn.** Goal: P0-A's mechanism. Every process blaze starts goes through
-`crates/ra-jit/src/spawn.rs`, which refuses rustc and rustdoc with any arguments and cargo's
-`build`, `check`, `test`, `run`, `rustc` and `doc`, recognised by the executable it resolves to and
-not only its name, with a named error and an audit line, when `BLAZE_NO_RUSTC=deny`; worker mode
-sets it and cannot unset it. A unit test fails if any `Command::new` outside `spawn.rs` remains in
-`crates/ra-jit`. Files: `crates/ra-jit/src/spawn.rs`, `cargo/mod.rs`, `cargo/state.rs`,
-`cargo/wrapper.rs`, `cargo/own_script.rs`, `cargo/script.rs`, `main.rs`. blaze already answers
-rustc's questions (`-vV`, `--print`) itself (`crates/ra-jit/src/answers/own.rs`); a question it
-cannot answer is refused like any run. Depends: P0.1. Acceptance: with deny, a project blaze cannot
-build without cargo fails before any spawn, naming the reason; the audit of P0.1 counts 0 compiler
-runs on hello-world on Linux (Docker) where the whole build works. Verify:
-`cargo test -p ra-jit spawn && python3 -I harness/tracedecay.py --td ~/work/hello --predicate P0-A --linux-docker`.
-Where: Mac, Docker.
+Verify: `python3 -I harness/tracedecay.py --td ~/work/hello --predicate P0-A --expect-fail &&
+python3 -I harness/tracedecay.py --self-test`. Where: Mac.
+
+**P0.2 The no-rustc boundary.** Goal: P0-A's mechanism, as section 0 specifies it: the process-tree
+boundary (Linux mount namespace and seccomp exec policy, macOS Seatbelt profile), installed by the
+worker on itself and failing closed; `crates/blaze-spawn` for every spawn site of `crates/` and the
+vendored launchers; blaze's answerer for compiler probes, with `answers.rs`'s fallback removed;
+provenance records. Files: `crates/blaze-spawn` (new), `crates/ra-jit/src/sandbox.rs` (deny instead
+of continue at `:810-829`; the tree-wide namespace), a new `crates/ra-jit/src/sandbox/macos.rs`,
+`crates/ra-jit/src/{main,answers,link,splice,shipped,stub,socket,doctest,test_harness}.rs`,
+`crates/ra-jit/src/cargo/{mod,state,wrapper,script,daemon,run,whole,own_script,own_macro,client}.rs`,
+`crates/ra-jit/src/bin/{ra-jit-rustc,cargo-blaze}.rs`, `crates/blaze-build-script/src/{main,run}.rs`,
+`crates/hir-ty-codegen/{asm,fncache}.rs`, `crates/ra-jit-store/src/lib.rs`,
+`crates/blaze-registry/src/git.rs`, one hook each in `vendor/rust-analyzer/crates/stdx/src/process.rs`
+and `proc-macro-api/src/process.rs`, `harness/spawnsites.py`, `harness/dist/spawn-allow.toml`,
+`harness/dist/fixtures/norustc/`. Depends: P0.1. Acceptance: with deny, a project blaze cannot build
+without cargo fails before any spawn, naming the reason; `spawnsites.py` passes; the audit counts
+0 compiler execs on hello-world on Linux (Docker), where the whole build works. From the reviews:
+- [rb-B1] "Audit actual descendant execution with absolute-path compiler, renamed executable,
+  shell/linker wrapper, script/proc-macro/test spawning cargo, and cargo aliases/plugins. Gate P0-A
+  on those negative fixtures and fail closed where enforcement cannot be provided." Checked by:
+  every negative fixture of section 0 on Linux (Docker) and macOS ends with 0 compiler execs and a
+  named refusal; a worker started where the boundary cannot be installed (a Docker container
+  without user namespaces; `sandbox_init` made to fail) exits naming why; the positive fixtures
+  (`pnpm` from a build script, `autocfg`, `version_check` and `rustversion` probes, a `cc` build)
+  pass.
+- [a-B1] "gating Command::new inside ra-jit does not mediate other crates or execs made by job
+  descendants; PATH stand-ins do not audit absolute compiler execs." Checked by: the fixtures
+  above that exec by absolute path, from a descendant and from `blaze-build-script`, `asm.rs` and
+  the vendored launchers.
+- [rb-M5] "Require successful cold CLI build, first edit, test-binary construction/execution, macro
+  expansion and doctest on both platforms; expected refusal is only a separate negative fixture.
+  Explicitly assign the missing proc-macro/test/check paths before P0-H can close." Checked by: the
+  provenance audit (cold isolated target, store and daemon home; every Rust artifact linked or
+  loaded recorded with origin and digest; reads of rustc-built libraries denied) passes on
+  hello-world and ripgrep here, and on `tracedecay-cli` in P0.8; `own_macro.rs`'s two fallbacks and
+  the loaded symbol files are gone in worker mode, and `whole.rs` makes Test and Check whole as it
+  does Build and Run, each with a test.
+
+Verify: `cargo test -p blaze-spawn -p ra-jit spawn && python3 -I harness/spawnsites.py && python3 -I
+harness/tracedecay.py --td ~/work/hello --predicate P0-A --linux-docker && python3 -I
+harness/tracedecay.py --predicate P0-A --fixtures norustc`. Where: Mac, Docker.
 
 **P0.3 A loading worker is bounded.** Goal: P0-B. The worker checks its own footprint during
 load and its build, and past `RA_JIT_MEMORY_MAX` stops with "the worker holds N MB, over the N MB
-of RA_JIT_MEMORY_MAX, while loading"; `over()` (`cargo/daemon.rs:96-104`) no longer exempts a
-worker alone over the ceiling; in worker mode the stop fails the job. Files:
-`crates/ra-jit/src/cargo/daemon.rs`, `crates/ra-jit/src/main.rs` (load path), `memory.rs`.
-Depends: P0.1. Acceptance: nushell with `RA_JIT_MEMORY_MAX=2G` and ripgrep with `512M`: the worker
-stops within 2 s of passing 1.05 times the bound, the build says why, the watchdog never fires;
-with the bound above the worker's size nothing changes. Verify:
-`python3 -I harness/tracedecay.py --td ~/work/nushell --predicate P0-B --memory-max 2G && python3 -I harness/tracedecay.py --td ~/work/ripgrep --predicate P0-B --memory-max 512M`.
-Where: Mac.
+of RA_JIT_MEMORY_MAX, while loading"; `compile_ahead` takes its work in batches and, past the
+budget, ends the batch, hands what it compiled on and releases its memos (LOADMEM fixes 2 and 3);
+`over()` (`cargo/daemon.rs:96-104`) no longer exempts a worker alone over the ceiling; in worker
+mode the stop fails the job. The program's unit u7-bound is implementing this; its batch is the
+batch D0 distributes, so its hand-on step takes a sink (the object locally, the exporter in D0).
+Files: `crates/ra-jit/src/cargo/daemon.rs`, `crates/ra-jit/src/main.rs` (load path), `memory.rs`,
+`crates/hir-ty-codegen/mod.rs` (`compile_ahead`'s batches), `crates/ra-jit/src/cargo/own_script.rs`
+and `own_macro.rs` (the budget passed to children). Depends: P0.1. Acceptance: `tracedecay-cli` at
+the guard's `RA_JIT_MEMORY_MAX=16G`: the worker stays within 1.05 times the bound, or stops within
+2 s of passing it, the build says why, the watchdog never fires; with the bound above the worker's
+size (a small project) nothing changes. No run on the Mac sets a bound below 16G (the guard);
+smaller bounds run in Docker. From the reviews:
+- [rb-M6] "Extend P0-B to simultaneous busy workers, concurrent script/macro compiles and a child
+  that consumes memory, measuring the summed tree against the executor's reservation." Checked by:
+  two workers busy at once, four own-macro compiles at once and a build script that allocates are
+  each measured as one summed tree; the workers together stay within 1.05 times
+  `RA_JIT_MEMORY_MAX`, which keeps its meaning of what workers hold together; own-script and
+  own-macro children receive the bound from the worker context although `own_script.rs:253-280`
+  clears the environment.
+- [ra-N4] "The revision's new 2G/512M predicate runs ... also need a clearly documented exception
+  to the fixed Mac environment, rather than silently changing it." Checked by: the Mac runs use
+  16G on `tracedecay-cli`; the 2G and 512M cases run only with `--linux-docker`.
 
-**P0.4 A tracedecay worker under 16 GB.** Goal: P0-C. In memory.md section 4's order, stopping when
-P0-C holds: reclaim at idle in `let_go` (type GC, solver caches on every thread, arena purge; the
-program's unit u6, running), recycle on growth, one worktree path per worker and unload of gone
-checkouts, then the largest holders unit u5's profile of the tracedecay load names. Each step lands
-as its own commit with its measured effect. Files: `crates/ra-jit/src/main.rs`, `memory.rs`,
-`cargo/daemon.rs`, and what u5 names (in `vendor/rust-analyzer` for front-end holders). Depends:
-P0.3, the program's unit u5's report. Acceptance: P0-C's bar on macOS, 3 runs; each step's effect in
-TRACEDECAY.md with spread. Verify: `python3 -I harness/tracedecay.py --predicate P0-C --runs 3`.
+Verify: `python3 -I harness/tracedecay.py --predicate P0-B && python3 -I harness/tracedecay.py
+--td ~/work/nushell --predicate P0-B --memory-max 2G --linux-docker`. Where: Mac, Docker.
+
+**P0.4 A tracedecay worker under 16 GB.** Goal: P0-C. LOADMEM's ranked fixes after P0.3's batch,
+stopping when P0-C holds: MIR not kept once an instance has code (`transform.rs:192,218`), eviction
+between batches of crates during resolution (`resolve_crates`), the type GC
+(`hir::collect_ty_garbage`) and the allocator's purge between batches, `cached::Entries` and
+`StableNames` keyed by hashes, the symbol table as a view of its file; then memory.md's reclaim at
+idle (the program's unit u6), recycle on growth, one worktree path per worker. Each step lands as
+its own commit with its measured effect. Files: `crates/ra-jit/src/{main,memory,symbols}.rs`,
+`cargo/daemon.rs`, `crates/hir-ty-codegen/{mod,cached,stable}.rs`, and in
+`vendor/rust-analyzer` the MIR queries of `hir-ty`. Depends: P0.3, LOADMEM.md (landed). Acceptance:
+P0-C's bar on macOS, 3 runs; each step's effect in TRACEDECAY.md with spread. Verify: `python3 -I
+harness/tracedecay.py --predicate P0-C --runs 3`.
 Where: Mac. If 16 GB is not reached, the unit lands what it reached and the owner decides between
 the Linux host and a higher bar (open questions).
 
-**P0.5 Build scripts whose rerun differs.** Goal: P0-D. A script whose second run prints or
-writes something else is marked impure instead of refused: run once per build (in the sandbox on
-Linux, recording its reads), its latest output used, as cargo does; never shared across
-machines. Files: `crates/ra-jit/src/cargo/script.rs` (`rerun_into`, `run_key`),
-`crates/blaze-build-script`. Depends: P0.1. Acceptance: a fixture script that prints a list of
-files git tracks: an edit is the daemon's, the list updated; tracedecay's three edit kinds 15 of
-15 the daemon's, 0 `building with cargo`. Verify:
-`python3 -I harness/scripts.py --impure && python3 -I harness/tracedecay.py --predicate P0-D --runs 5`.
-Where: Mac.
+**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D. Lands PR #5 (unit u8,
+`dist/u8-buildscript`): the rerun in a copy of cargo's `OUT_DIR`, comparing the lines cargo reads,
+with its verifier's findings fixed (directory times kept in the copy, symlinks into the original
+not written through, the baseline digest taken before the rerun, invalid UTF-8 lines ignored as
+cargo ignores them). Then a script whose cargo-read output differs between two runs on the same
+inputs is marked impure instead of refused: run once per build (in the sandbox on Linux, recording
+its reads), its latest output used, as cargo does; never shared across machines. Files:
+`crates/ra-jit/src/cargo/script.rs` (`rerun_into`, `run_key`), `crates/blaze-build-script`,
+`harness/scriptrerun.py`. Depends: P0.1. Acceptance: a fixture script that prints a list of files git
+tracks and runs a tool that prints its own lines into an empty `OUT_DIR`: an edit is the daemon's,
+the list updated; the verifier's regressions pass. From the reviews:
+- [rb-N2] "Specify the number of measured edit and revert builds per run, one consistent
+  denominator (for example 30/30), and whether the cold/warm preparation builds are excluded."
+  Checked by: `--predicate P0-D --runs 5` counts 30 builds (5 runs × 3 edit kinds × an edit and its
+  revert), excludes the one cold and one warm build before them, and passes only at 30 of 30 the
+  daemon's, 0 `building with cargo`.
+
+Verify: `python3 -I harness/scriptrerun.py && python3 -I harness/scripts.py --impure && python3 -I
+harness/tracedecay.py --predicate P0-D --runs 5`. Where: Mac.
 
 **P0.6 The whole build on macOS arm64 (#255).** Goal: P0-E. The standard library's writable statics
 without a rustc symbol (`CLEANUP`, `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE`) are
@@ -1352,10 +1793,14 @@ Where: Mac.
 8.9 to 13.1 GB explained. Script compiles go to the daemon that holds the standard library, or at
 most `cores / 4` run at once (#203, memory.md item 4); the target directory's contents are listed
 by owner and the extra is named. Files: `crates/ra-jit/src/cargo/own_script.rs`, `sandboxed.rs`,
-`cargo/daemon.rs`. Depends: P0.6. Acceptance: P0-F's bar on tracedecay; a table of the target
-directory by producer in TRACEDECAY.md. Verify:
-`python3 -I harness/coldprof.py --memory ~/work/ripgrep && python3 -I harness/tracedecay.py --predicate P0-F`.
-Where: Mac.
+`cargo/daemon.rs`, `harness/tracedecay.py` (`--disk`). Depends: P0.6. Acceptance: P0-F's bar on
+tracedecay; a table of the target directory by producer in TRACEDECAY.md. From the reviews:
+- [a-m2] "P0.7 verify never checks its disk table" Checked by: `--predicate P0-F --disk` lists the
+  target directory by producer and fails unless the producers' sizes add up to the directory's size
+  within 1% and the extra over cargo's is attributed to named producers.
+
+Verify: `python3 -I harness/coldprof.py --memory ~/work/ripgrep && python3 -I harness/tracedecay.py
+--predicate P0-F --disk`. Where: Mac.
 
 **P0.8 G0 again, on both platforms.** Goal: P0-G and P0-H. TRACEDECAY.md's scenarios with
 blaze's whole build against cargo, n ≥ 3, limiters named; on Linux x86-64 at tracedecay scale
@@ -1373,8 +1818,15 @@ separation, errors, limits, JSON rendering. Files: `crates/blaze-wire`, `Cargo.t
 Depends: none. Acceptance: every type round-trips byte-identically; golden vectors for one value
 of every type, its digest and its signature, checked in; the validator accepts all the encoder
 writes on random values and rejects non-shortest heads, indefinite lengths, unsorted keys,
-duplicate keys, floats, tags, unknown keys and oversize items, naming each. Verify:
-`cargo test -p blaze-wire`. Where: Mac.
+duplicate keys, floats, tags, unknown keys and oversize items, naming each. From the reviews:
+- [a-M4] "enum payload maps and many endpoint response/limits types remain prose; capability
+  transport/ops bits and JobContent bytes are unspecified, so C1 still must invent wire choices."
+  Checked by: before its code, C1 adds to section 8 a named struct for every endpoint's request and
+  answer and for `Hello`'s limits, and the payload map of every enum variant, with field numbers;
+  golden vectors cover each of them, the capability headers of section 8, the `ops` bits and
+  `JobContent`'s bytes as "Data shapes" now gives them.
+
+Verify: `cargo test -p blaze-wire`. Where: Mac.
 
 **C2 `BuildSpec` from cargo's resolution.** Goal: review B M4. A requester computes its
 `BuildSpec`, `ExecPlatform` and `FrontEndKey` from the same resolution blaze's own build uses
@@ -1386,8 +1838,19 @@ Acceptance: differential fixtures: `--no-default-features`, `--all-features`, `-
 `--no-fail-fast`, a `harness = false` test, `[env]` in config, a cwd below the root: each gives
 a different spec where it changes the build and the same where it does not, and running the spec
 locally does what the command does (same programs, same tests run); `lto = "thin"` is refused by
-name; whether the deployment target changes a function's code is recorded. Verify:
-`cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
+name; whether the deployment target changes a function's code is recorded. From the reviews:
+- [b-M4] "no field carries blaze backend/MIR optimisation or per-package/build-script profile
+  overrides; refusing already supported settings is not equivalent to local cargo blaze semantics."
+  Checked by: differential fixtures with `[profile.dev.package.X] opt-level = 1` (tracedecay's nine
+  crates), `[profile.dev.build-override]`, and blaze's backend and MIR-level settings: each is
+  carried per unit (`UnitSpec.profile`, `ProfileSpec.backend`, `ProfileSpec.mir_opt`), running the
+  spec locally does what `cargo blaze` does, and none of them is refused.
+- [b-M5] "ExecPlatform omits C/C++ tool/input digests and native closure" Checked by:
+  `ExecPlatform` gains the digests of the C and C++ compilers, archiver and linker a build script
+  may run (as the `cc` crate resolves them) and of the SDK or sysroot; a fixture with a C dependency
+  under two compilers gives two platform digests and two `JobContent`s.
+
+Verify: `cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
 
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's
@@ -1419,8 +1882,16 @@ builds of one commit on A and B give equal entry digests). Files: `crates/ra-jit
 `remote/keeper.rs`, `crates/ra-jit-store/src/lib.rs`, `crates/blaze-serve`. Depends: C3, C4, P0-A.
 Acceptance: crossmachine through the server: G1 holds, one lookup request per build (G6), and with
 two workspaces on the server B fetches only its own crates' packs; a record naming a deleted pack is
-answered without it. Verify: `python3 -I harness/dist/crossmachine.py --all --remote server`. Where:
-Mac.
+answered without it. From the reviews:
+- [b-M5] "a platform field entering only CrateKey cannot separate unchanged local EntryKeys, and
+  different-host portability is not in C5 acceptance." Checked by: a platform field C2 finds to
+  change code enters the entry key's settings (`cached.rs`'s key), not only `CrateKey`, with a
+  fixture where it does; crossmachine with machine B in a Docker container of another libc
+  version: function entries are shared where no such field differs, programs and test verdicts are
+  not (their `ExecPlatform` differs).
+
+Verify: `python3 -I harness/dist/crossmachine.py --all --remote server && python3 -I
+harness/dist/crossmachine.py --remote server --b-docker`. Where: Mac, Docker.
 
 **C6 Trust: identities, capabilities, namespaces.** Goal: section 2's server side. OIDC
 verification against a configured JWKS, the GitHub API lookups, capabilities, roles, `Main` and
@@ -1431,11 +1902,18 @@ Depends: C5. Acceptance: a pull request's token cannot publish `Main` or `Pr(oth
 token with a `SourceRef` not on `master` is refused; a wrong workflow, audience, issuer, expired,
 replayed (`jti`) or unsigned token is refused; a fork's run is refused; an enrolled agent cannot
 publish without a capability or cancel another's job; a record of an old epoch is refused after a
-bump; a `Pr` record replayed as `Main` is refused. Verify:
-`cargo test -p blaze-serve && python3 -I harness/dist/auth.py`. Where: Mac.
+bump; a `Pr` record replayed as `Main` is refused. From the reviews:
+- [ra-N2] "Exempt auth and document exact credential transport plus the separate
+  worker-enrollment authentication method." Checked by: `auth` succeeds without a capability; every
+  other call without `Blaze-Capability` (or, for the agent's own two, without a valid
+  `Blaze-Signature`) is refused 401; an agent signature replayed, dated 61 s off or by an
+  unregistered key is refused; an agent's signature alone cannot publish, cancel or delete.
 
-**C7 GC and disk on every tier.** Goal: sections 3 and 7. Roots by generation, compaction, leases,
-budget with low-water mark, hourly collection, identity expiry; the local store's `--stale` collect
+Verify: `cargo test -p blaze-serve && python3 -I harness/dist/auth.py`. Where: Mac.
+
+**C7 GC and disk on every tier.** Goal: sections 3 and 7. Roots by `ConfigKey` with used-entry
+lists, compaction with remapping, leases and pins, budget with low-water mark, hourly collection,
+identity expiry; the local store's `--stale` collect
 and command; the target directory's bound and `blaze clean --keep-latest`. Files:
 `crates/blaze-serve/src/collect.rs`, `crates/ra-jit-store/src/lib.rs`, `crates/ra-jit/src/main.rs`
 (commands), `harness/dist/gc.py`, `harness/dist/disk.py`. Depends: C5. Acceptance: gc.py's synthetic
@@ -1443,8 +1921,19 @@ publisher (it writes roots and generations through the API, no CI needed): 30 `m
 adding generic instances to the same dependency crate, 10 pull requests opened and closed: within
 budget, every one of the last 20 roots builds with 0 functions compiled, obsolete instances' packs
 gone, a pinned generation survives a collection that overlaps a running lookup; disk.py: the target
-directory bound and the stale identity case of section 7. Verify: `python3 -I harness/dist/gc.py &&
-python3 -I harness/dist/disk.py`. Where: Mac.
+directory bound and the stale identity case of section 7. From the reviews:
+- [b-M9] "no used-entry closure tells compaction which entries are dead or how roots move to
+  replacement generations." Checked by: after gc.py's 30 commits and a collection, the dependency
+  crate's packs hold only entries some live root's `used` list names (counted against the union of
+  the lists); every live root builds with 0 functions compiled, served through `remap`; a root that
+  names a replaced generation is answered with the compacted one.
+- [ra-N1] "Project an explicit source-independent configuration key for root retention ... and an
+  explicit atomic root-remapping/indirection rule." Checked by: 30 `master` commits of one
+  `ConfigKey` keep exactly its last 20 roots, and two `ConfigKey`s keep 20 each; a collector killed
+  between writing g' and appending the remap leaves g live and g' unnamed (the remap is the commit
+  point), and the next collection finishes the job.
+
+Verify: `python3 -I harness/dist/gc.py && python3 -I harness/dist/disk.py`. Where: Mac.
 
 ### Phase 2: trust on the workers, and jobs
 
@@ -1477,7 +1966,20 @@ one host, small fixtures): results equal a local `cargo blaze test`; two identic
 different deadlines and policies share one execution, and cancelling one subscriber leaves the
 other's running; a killed executor's job finishes on the other with attempt 2 and the dead
 attempt's late events are refused; a job needing cargo fails naming why; `fallback`, `race` and
-`never` behave as section 4 says. Verify: `python3 -I harness/dist/jobs.py`. Where: Mac, Docker.
+`never` behave as section 4 says. From the reviews:
+- [a-M6] "independent subscriber deadlines, shared execution lifetime and timeout/fallback
+  behavior for differing policies are still undefined." Checked by: the execution's deadline is the
+  latest of its live subscribers'; a subscriber whose own deadline passes is detached with
+  `TimedOut` and follows its own `LocalPolicy` (`Fallback` builds locally, `Never` fails), while the
+  execution runs on for the others; the execution ends when its last subscriber leaves or the
+  latest deadline passes; jobs.py covers two subscribers with deadlines 1 s apart and policies
+  `never` and `fallback`.
+- [a-M9] "no unit owns the real RootManifest publication client, so production GC still assumes an
+  unassigned producer." Checked by: a finished job's lead writes its `RootManifest` (with `used`
+  lists and `ConfigKey`) through the agent's `POST /v1/roots` before `Done`; a failed job writes
+  none; C7's gc.py, pointed at jobs.py's server, finds the manifests the jobs wrote.
+
+Verify: `python3 -I harness/dist/jobs.py`. Where: Mac, Docker.
 
 **E4 Admission.** Goal: section 5. Capacities, measured reservations, cgroups on Linux, thread
 counts on macOS, `Main` first, the bounded queue, rebuild by drain when overlap does not fit,
@@ -1486,40 +1988,132 @@ stage timestamps on every job and batch; the burst harness for GB. Files: `crate
 on one host with a capacity set to two fixture executors, a third job queues with stage
 `Queued` and a named wait; a `Main` job overtakes queued pull requests; the queue answers `busy`
 past `Q`; a rebuild that does not fit drains first; no reservation ever exceeds capacity in a
-1,000-job random schedule (a property test of the state machine). Verify:
-`cargo test -p blaze-dist admission && python3 -I harness/dist/burst.py --local`. Where: Mac.
+1,000-job random schedule (a property test of the state machine). From the reviews:
+- [rb-M6] "On Linux include the whole tree in a cgroup; on macOS use a supervisor/aggregate
+  footprint guard as the production enforcement, not merely the development harness watchdog."
+  Checked by: an executor whose test spawns a child that allocates past the executor's reservation
+  is stopped with a named reason, by `memory.max` on Linux (Docker) and by the agent's tree
+  footprint guard on macOS, while a second executor beside it keeps running; the stop fails that
+  job, not the machine's other jobs.
+
+Verify: `cargo test -p blaze-dist admission && python3 -I harness/dist/burst.py --local`. Where:
+Mac, Docker.
 
 ### Phase 3: distributed compile
 
-**D1 The work set.** Goal: section 4's protocol. `compile_unnamed`'s queue behind a trait in
-`hir-ty-codegen`, a local and a remote implementation; the coordinator's work set in
-`crates/blaze-dist`; leases, batches by home crate, `found`, publish-then-report, refusals,
-fencing, the lead's synchronous import and assembly. Files: `crates/hir-ty-codegen/mod.rs`,
-`crates/blaze-dist`, `crates/blaze-serve/src/work.rs`, `crates/ra-jit/src/worker.rs`,
-`crates/ra-jit-store/src/lib.rs` (import of a pack). Depends: E3, C5, P0-A, P0-B. Acceptance
-(`harness/dist/shards.py`, a lead and two helpers on one host, each with the whole front end):
-the program equals a one-process build's and its entry digests match; fixtures with mutually
-recursive functions across home crates, generics, trait objects, drop glue, statics, a function
-blaze refuses (the job fails naming it, nothing goes to rustc), a helper killed while uploading
-(its batch is compiled by another, the late result ignored), two leads at once (neither waits on
-the other), and cancellation during compile (every executor's process group gone). Verify:
-`cargo test -p blaze-dist work && python3 -I harness/dist/shards.py`. Where: Mac.
+**D0 Two processes on one Mac (gate GP).** Goal: section 4's mechanism without a network: the
+exporter, claimed discovery, the lead's store-hydrated assembly and the compile-query count,
+proven by a lead and one helper splitting one build. `compile_ahead`'s batch (P0.3) gets a work
+source and a sink behind two traits in `hir-ty-codegen`: locally the queue and the object, in D0
+the coordinator and the exporter. The work set is the sans-IO state machine of section 4 in
+`crates/blaze-dist` (join, grant, commit, done, the fencing table), driven in the lead's process
+over a Unix socket with section 8's `work` calls as CBOR. Files: `crates/hir-ty-codegen/export.rs`
+(new), `later.rs` (`entry`, `keep` and `tracked` through the exporter), `mod.rs` (`compile_ahead`'s
+source and sink, `hydrate` and `roots_from_store` for a distributed lead, the compile-query
+counter), `cached.rs`, `stable.rs` (the root list in canonical order), `crates/blaze-dist` (new),
+`crates/ra-jit/src/worker.rs` (new; the local driver), `crates/ra-jit/src/main.rs`,
+`crates/ra-jit-store/src/lib.rs` (import of a pack), `harness/dist/proto.py`. Depends: P0.3 (u7's
+batch), P0.2 (the boundary on both processes); P0.6 for the Mac's demo stage (Docker until then);
+P0-E and P0-B for the tracedecay stage. Acceptance: GP's bar (section 4) on `demo/mid` and
+`demo/real`, 3 runs each, then on `-p tracedecay --lib` under the guard, 3 runs; every run records
+both executors' shares, grants, duplicate compiles, the lead's tail by reason and each process's
+peak footprint. From the reviews:
+- [rb-B3] "Make D1 test that lead compile-query invocations are zero for successfully imported
+  work on both cold and warm signature edits, not just that the program is correct (which serial
+  recompilation can also satisfy)." Checked by: on a cold build and on a signature edit of
+  `demo/mid`'s workspace crate made after a warm build, the lead's counter shows 0 compile queries
+  for names the helper exported, and every compile query it does run carries a reason.
+- [a-M7] "normal assembly still disables checkout store hydration on warm patch builds and D1
+  assigns no patch/base integration." Checked by: after the distributed signature edit, a body
+  edit is a local patch of the hydrated build (its `tracked` kept), and its program equals a
+  one-process build's.
+- [rb-B2] "Add independent-DB round-trip/compile tests (different interning order, long nested
+  types, closures, async/coroutines, const generics, caller bounds and repeated crate units),
+  before D1 is declared implementable." Checked, for the first stage, by: two processes that load
+  the same fixture with the crates resolved in different orders (so their interners differ) post
+  the same `RootSet`, and name every root and instance with long nested types, closures, async
+  functions, const generics, caller bounds and a unit present twice (host and target) alike; a
+  helper whose `RootSet` differs is refused. The descriptor's own round trip is D2's.
+- [rb-M1] "Add tests with a cached root but evicted callee, cached generic but missing descendant,
+  cyclic cache entries, missing debug type set and GC during upload/import. Measure lead fallback
+  work and forbid false complete-coverage claims." Checked by: each of those five cases is a
+  fixture; in each, the missing entry becomes work (not `FromStore`), Done is not reported until it
+  is terminal, and the lead's tail names it.
+- [rb-M7] "Add a private unused function containing an existing unsupported fixture beside a valid
+  main, then call it in the next version: cold, warm and distributed builds must agree on which
+  version succeeds and on the named error." Checked by: that fixture, run one-process cold, warm and
+  distributed: the first version succeeds in all three and the second fails in all three with the
+  same named error, and nothing goes to rustc.
+- [b-M7] "there is no terminal lead-only outcome for an uncacheable fragment" Checked by: a fixture
+  function the exporter cannot export (data holding the checkout's path, before C4) is `Local`, the
+  lead compiles it and its callers, and the program is right.
 
-**D2 Front ends of a closure.** Goal: helpers that load only the closure of the home crates they
-serve, from the `BuildSpec`'s unit graph with its features and cfg; the coordinator matches
-batches to helpers by closure; small builds lease nothing. Files: `crates/ra-jit/src/main.rs`
-(load of a sub-graph), `crates/blaze-dist`, `crates/ra-jit/src/worker.rs`. Depends: D1, C4 (keys
-of scripts and macros, so a helper does not rerun every script), P0-C. Acceptance: nushell with two
-helpers serving its lowest third of crates: helpers hold less memory than the lead (recorded),
-start compiling before the lead is loaded (stage timestamps), and the program equals a one-process
-build's. Verify: `python3 -I harness/dist/shards.py --closure ~/work/nushell`. Where: Mac.
+Verify: `cargo test -p blaze-dist work && cargo test -p hir-ty-codegen export && python3 -I
+harness/dist/proto.py --demo && python3 -I harness/dist/proto.py --tracedecay`. Where: Mac (Docker for
+the demo stage until P0.6).
+
+**D1 The work set over the network.** Goal: section 4's protocol between machines: the work calls
+of section 8 over HTTP, leases with heartbeats and progress timeouts, the fencing table, pins of
+uploaded packs, several helpers and several leads. Files: `crates/blaze-dist`,
+`crates/blaze-serve/src/work.rs`, `crates/ra-jit/src/worker.rs`, `harness/dist/shards.py`. Depends: D0
+(GP passed), E3, C5, P0-A, P0-B. Acceptance (`shards.py`, a lead and two helpers on one host, each
+with the whole front end, then two in Docker): GP's bar holds with two helpers; fixtures with
+mutually recursive functions across crates, generics, trait objects, drop glue and statics; two
+leads at once (neither waits on the other). From the reviews:
+- [rb-M3] "Test loss after compile, after upload, after result commit but before acknowledgment,
+  stale success during replacement, partial cache-hit batch, coordinator log recovery, and a
+  heartbeating-but-stuck helper. Require no lost discoveries and eventual terminal execution"
+  Checked by: a fault injector kills or stalls a helper at each of those points; in each run every
+  root and found name ends terminal, the coordinator restarted from its log reaches the same
+  state, the stuck helper's lease is revoked by the progress timeout, and the program equals the
+  one-process build's.
+- [ra-N5] "Specify one policy with assignment identity, not just an attempt and timestamp, and
+  test it. Neither a lease timeout nor a missing cache entry should become an unexplained rejection
+  of a program the one-executor build accepts." Checked by: a result carrying a dead `Lease.generation`
+  is refused whole and its items end terminal through the replacement; no run's outcome differs from
+  the one-executor build's because of a lease or a missing entry.
+- [ra-N6] "Define an earlier dependency-closure seeding phase, or change that acceptance and cost
+  model." Checked by: a warm helper joins and compiles roots before a cold lead finishes loading
+  (stage timestamps), and the result equals the one-process build's.
+- [b-M7] "tests omit tiny-pack and cancellation-during-tests cases." Checked by: a batch of one
+  function (a pack of one entry) is exported, imported and used; a cancellation while the lead runs
+  tests leaves no executor process and no pin.
+
+Verify: `cargo test -p blaze-dist work && python3 -I harness/dist/shards.py && python3 -I
+harness/dist/shards.py --faults`. Where: Mac, Docker.
+
+**D2 Smaller helpers (second stage, conditional).** Goal: helpers that hold less than the whole
+front end, only if it pays. First, the home inventory; then, only if it shows useful work that
+fits smaller helpers, option (a) of section 4: the lossless, versioned instance and param-env
+descriptor in a new crate, `vendor/rust-analyzer/crates/hir-ty-instance-desc` (encoding, and rebinding into a
+database under the exact `BuildSpec`), helpers that load the closure of the homes they serve, and
+grants routed by closure. Files: `harness/dist/homes.py`, `hir-ty-instance-desc`,
+`crates/hir-ty-codegen/{mod,home}.rs`, `crates/ra-jit/src/main.rs` (load of a sub-graph),
+`crates/blaze-dist`. Depends: D1; D4's first measurement naming the executors' front ends as the
+limiter; C4 (keys of scripts and macros, so a helper does not rerun every script); P0-C.
+Acceptance: the inventory, then, if built, smaller helpers on the CLI. From the reviews:
+- [rb-M2] "Before choosing helper partitions, measure counts/codegen CPU/critical-path work and
+  peak memory per actual home/required closure on CLI, including workspace ADTs and closures passed
+  into dependency generics. D2 must demonstrate that useful CLI work (not just nushell's lowest
+  third) fits eligible same-platform fleet helpers." Checked by: `homes.py` reports, per actual
+  home (`Homes::home`'s answer) on `tracedecay-cli`, the functions, codegen CPU, critical-path share
+  and the peak memory of that home's closure; the unit stops after the inventory if no closure
+  that fits a fleet helper holds a useful share, and says so.
+- [rb-B2] "Specify a versioned, lossless instance + param-environment descriptor ... Add
+  independent-DB round-trip/compile tests (different interning order, long nested types, closures,
+  async/coroutines, const generics, caller bounds and repeated crate units)" Checked by: each case
+  encoded in one database and rebound in another with a different interning order compiles to an
+  entry with the same digest; a type spelled past 1,024 bytes travels as a blob and round-trips.
+
+Verify: `python3 -I harness/dist/homes.py --td ~/work/tracedecay && cargo test -p
+hir-ty-instance-desc && python3 -I harness/dist/shards.py --closure`. Where: Mac; Linux for the CLI's closures.
 
 **D3 The front-end image.** Goal: #274 for the dependency layer: the front end's results for
 dependency crates laid out to be mapped read-only and validated by root, published by trusted
-builders under `FrontEndKey` and dependency sources, mapped by executors and helpers. Kill criterion
-as roadmap.md section 5's: a part whose mapping and validation costs more than rebuilding it stays
+builders under `FrontEndKey` and dependency sources, mapped by executors. Kill criterion as
+roadmap.md section 5's: a part whose mapping and validation costs more than rebuilding it stays
 rebuilt. Files: a new crate under `vendor/rust-analyzer/crates/` for the image of front-end state,
-`crates/ra-jit/src/main.rs`, `crates/blaze-dist`. Depends: D2. Acceptance: nushell's warm start from
+`crates/ra-jit/src/main.rs`, `crates/blaze-dist`. Depends: D1. Acceptance: nushell's warm start from
 the image against from the store, 3 runs each, same session; two executors on one machine mapping
 one image hold less together than two loading it (`RssAnon`, Linux); a pull request's executor that
 maps the image cannot change it (E1's adversarial test, image added). Verify: `python3 -I
@@ -1530,11 +2124,18 @@ Mac; Docker.
 GD's scenarios at 1, 2 and 3 executors, interleaved, n ≥ 3, with spread and limiter; if a bar
 fails, the unit names the limiter, applies the next change of section 4's list (or files it as the
 next unit), and measures again. Files: `harness/dist/measure.py`, `harness/dist/scenarios.toml`,
-`docs/distributed.md` (results). Depends: D2, P0-H; D3 for the scenarios that start executors.
+`docs/distributed.md` (results). Depends: D1, P0-H; D3 for the scenarios that start executors.
 Acceptance: GD's correctness bar on every run; the speed bar met, or the change list's next step
-taken and measured. Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and
-Docker on fixtures; `--fleet` writes the owner's run form). Where: Mac, Docker, Linux; fleet by
-the owner.
+taken and measured. From the reviews:
+- [rb-M4] "Measure same-session push-to-verdict/build wall time and the complete critical-path
+  timeline for cold first PR, subsequent body edit, signature edit and identity upgrade, including
+  all executor preparation/import/link work; retain a separate codegen-stage bar only as
+  diagnostic." Checked by: `measure.py` reports `Queued` to `Done` for each of those four scenarios
+  with every stage on the critical path, the speed bar is judged on that time, and the
+  compile-phase ratios are printed as diagnostics only.
+
+Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and Docker on fixtures;
+`--fleet` writes the owner's run form). Where: Mac, Docker, Linux; fleet by the owner.
 
 ### Phase 4: tests
 
@@ -1545,7 +2146,15 @@ reasons; an always-run attribute from the owner's manifest; failures never cache
 `crates/ra-jit/src/cargo/affected.rs`, `harness/dist/fixtures/tests`. Depends: P0-A. Acceptance:
 a fixture of tests that read the clock, use a `HashMap`, sleep, open a loopback socket, spawn an
 unlisted tool, read an unlisted variable, and one pure test: only the pure one is skipped on a
-second run; audit runs all; a test whose cached pass the audit contradicts loses caching.
+second run; audit runs all; a test whose cached pass the audit contradicts loses caching. From
+the reviews:
+- [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
+  unknown effects instead of assuming libc is closed." Checked by: the classifier allows a foreign
+  call only from a listed set of C library functions known to read no machine state (string,
+  memory and math functions); every other foreign call, `getpid`, `uname`, `gethostname`,
+  `sysconf`, `sched_getaffinity` among them, and every child program, listed or not, makes a test
+  always-run; fixtures for each are always run on the second pass.
+
 Verify: `python3 -I harness/testselect.py && python3 -I harness/dist/tests.py --contract`. Where:
 Mac; Docker for the sandbox.
 
@@ -1556,8 +2165,14 @@ Files: `crates/ra-jit/src/cargo/affected.rs`, `sandboxed.rs`, `crates/ra-jit-sto
 `crates/blaze-serve/src/results.rs`, `harness/dist/crossmachine.py`. Depends: T1, C5, C6.
 Acceptance: a test that passed on A is skipped on B, which never ran it; changing a read file's
 content or mode on B, creating a path A found absent, or changing an environment variable makes
-B run it; a `Pr(n)` pass never answers a `Main` lookup. Verify:
-`python3 -I harness/dist/crossmachine.py --tests`. Where: Docker; Linux.
+B run it; a `Pr(n)` pass never answers a `Main` lookup. From the reviews:
+- [b-B2] "changing only observed mtime/uid/errno leaves File observations equal" Checked by: a
+  test that reads a file's mtime or owner, or branches on a failed lookup's errno, either records
+  that in its observation (`File` gains `mtime` and `uid` when the test asked `stat` for them;
+  `Absent` keeps its errno) or is always-run; changing only the mtime, the owner or the error kind
+  on B makes B run it.
+
+Verify: `python3 -I harness/dist/crossmachine.py --tests`. Where: Docker; Linux.
 
 **T3 Bundles and shards.** Goal: `RuntimeBundle`s built by the lead and materialised on helpers;
 shards by recorded duration; tracedecay's flake policy (fail) kept. Files: `crates/blaze-dist`,
@@ -1582,15 +2197,41 @@ tracedecay's Bazel runs, from its BUILD files, and the tests that run rustc or c
 `compare.py` fails on a test missing, extra or not executed on either side, and on a different
 verdict. Files: `harness/dist/ci/inventory.py`, `harness/dist/ci/compare.py`. Depends: none.
 Acceptance: the inventory of `d79de82273` checked in for the owner to approve; compare fails on
-a synthetic run that drops a test or adds one. Verify:
-`python3 -I harness/dist/ci/compare.py --self-test`. Where: Mac.
+a synthetic run that drops a test or adds one. From the reviews:
+- [a-m2] "S2 verify only self-tests comparison, not inventory generation." Checked by: the verify
+  command regenerates the inventory from `d79de82273`'s BUILD files and fails if it differs from
+  the checked-in one.
+- [b-M10] "preserving Bazel timeout/retry/resource-group policy is not specified and mandatory
+  executed-on-both-sides gates contradict deliberate cached skips and excluded compiler-fixture
+  tests." Checked by: the inventory records each test's timeout, retries and resource group as
+  Bazel runs it, and blaze's job runs each test under them; compare accepts a skip only with its
+  validated manifest, requires each test the inventory keeps on Bazel (the `rustc-tests` default)
+  executed on Bazel and absent from blaze, and fails a synthetic run for each violation.
+
+Verify: `python3 -I harness/dist/ci/inventory.py --check d79de82273 && python3 -I
+harness/dist/ci/compare.py --self-test`. Where: Mac.
 
 **S3 Shadow-mode report.** Goal: G2, G3, GB, GD and GS as the owner measured them, written
 here with runs and spread, and a recommendation per owner step. Files: `docs/distributed.md`,
 `docs/reports/DIST-SHADOW.md`. Depends: S1, S2, D4, and the owner's runs. Acceptance: each gate's
-table filled from the owner's runs, or marked not run. Verify:
-`python3 -I harness/dist/ci/compare.py BAZEL_TEST_LOGS BLAZE_EVENTS --inventory INVENTORY`.
+table filled from the owner's runs, or marked not run. From the reviews:
+- [a-M2] "several retained rows still omit machine/session/commit, run count or named limiter
+  instead of explicitly marking every missing datum unavailable." Checked by: every number S3
+  writes carries machine, session, commit, run count, spread and limiter, or says which is not
+  stated; `compare.py --provenance` fails on a table row that lacks one without saying so.
+
+Verify: `python3 -I harness/dist/ci/compare.py BAZEL_TEST_LOGS BLAZE_EVENTS --inventory INVENTORY
+&& python3 -I harness/dist/ci/compare.py --provenance docs/reports/DIST-SHADOW.md`.
 Where: fleet by the owner.
+
+**S4 The compatibility lane for tests that run rustc or cargo (only if the owner chooses it at
+the `rustc-tests` gate).** Goal: section 6's second option: `cargo-blaze` as `cargo` and blaze's
+answerer, extended to check a file and print rustc-compatible diagnostics, as `rustc` on those
+tests' `PATH`, allowed by the boundary by digest. Files: `crates/ra-jit/src/bin/ra-jit-rustc.rs`,
+`crates/ra-jit/src/answers/own.rs`, `harness/dist/ci/inventory.py`. Depends: P0-A, T3. Acceptance:
+tracedecay's three tests run on a blaze executor with 0 compiler execs; each passes, or is named as
+staying on Bazel with the diagnostic it could not match. Verify: `python3 -I harness/dist/tests.py
+--compat`. Where: Mac.
 
 ### Owner steps, outside the units
 
@@ -1618,20 +2259,24 @@ named:
 
 ## Open questions for the owner
 
-- **P0-C's bar.** If the tracedecay worker cannot get under 16 GB on macOS, should verification of
-  the full CLI move to a Linux host (the `linux-host` gate), or the guard rise for those runs?
-- **Bazel's reserve on Ubuntu-main** (`B`, section 4): how much CPU and memory NativeLink keeps for
-  Clippy, release, JS and Python after the switch.
-- **The two 12-core machines**: operating system, architecture, and whether the 16 GB laptop is a
-  worker at all.
-- **Isolation strength**: is a separate user and sandbox per pull-request executor enough for
-  same-repository pull requests, or should executors be microVMs (section 2)?
-- **Tests that run rustc or cargo**: keep them on Bazel, give them a blaze-provided
-  rustc-compatible front end, or change them?
-- **Flake policy**: tracedecay's nextest says flakes fail; keep it for the blaze job (this design's
-  default)?
-- **Rust built for JS or Python tests**: does it keep building through rules_rust, or can Bazel take
-  blaze's programs as prebuilt inputs?
+Each is a gate of the program with a default that holds until the owner answers. This design cites
+them; it does not decide them.
+
+| Gate | Question | Default until answered | Where it bites |
+|---|---|---|---|
+| `linux-host` | SSH to Ubuntu-main or the 64 GB desktop, or a larger Docker VM, for Linux at tracedecay scale? | none: Linux checks stay small, in the 8 GB Docker VM | P0-G, P0.8, D2's inventory |
+| `bazel-reserve` | how much of Ubuntu-main stays with Bazel and NativeLink | measure first: 32 cores and 64 GB reserved | section 4's memory table (`B` = 64 GB), E4 |
+| `pr-isolation` | user and sandbox per pull-request executor, or microVMs? | user and sandbox now, microVM later if a sandbox escape matters | section 2, E1, E2 |
+| `rustc-tests` | tracedecay's tests that run rustc or cargo: keep on Bazel, blaze's compatibility lane, or change the tests? | keep on Bazel | section 6, S2's inventory, GS; S4 only if chosen |
+| `flake-policy` | keep nextest's "flaky fails" for the blaze job? | keep | section 6, T3 |
+| `rules-rust-js` | does Rust built for JS and Python tests stay on rules_rust? | yes | section 10 |
+| `td-recursion` | add `#![recursion_limit = "256"]` to `tracedecay-code-index-runtime`? | the owner applies it; blaze runs patch it in throwaway worktrees until then | every tracedecay run |
+
+Not yet gates, asked here: if the tracedecay worker cannot get under 16 GB on macOS (P0-C), should
+verification of the full CLI move to a Linux host, or the guard rise for those runs? What are the
+two 12-core machines' operating system and architecture, and is the 16 GB laptop a worker at all?
+May P0.3 run its 2G and 512M cases on the Mac (an exception to the guard's fixed settings), or do
+they stay in Docker (this design's default)?
 
 ## Not checked
 
@@ -1639,47 +2284,104 @@ named:
 - Linux: nothing of tracedecay has run on Linux under blaze.
 - The fleet's sizes are owner-reported, not measured; the Linux worker's architecture, NativeLink's
   version and configuration, and the hosted runners' sizes were not read.
-- Whether blaze's codegen gives byte-identical entries for the same key on two machines (C5).
-- Whether Seatbelt still enforces on macOS 26 (E2).
+- Whether blaze's codegen gives byte-identical entries for the same key on two machines (C5), and
+  whether two processes with different interning orders name every root and instance alike (D0).
+  Section 4's first stage rests on the second.
+- Whether a Seatbelt profile a process applies to itself holds for all its descendants on macOS
+  26, and whether denying `file-map-executable` of `librustc_driver` stops a copied rustc (P0.2);
+  whether the fleet's Linux kernels allow unprivileged user namespaces, seccomp user notification
+  and Landlock (P0.2 fails closed where they do not).
+- Whether two tracedecay front ends fit under the guard's 24 GB at once (D0's second stage), and
+  how many functions tracedecay's whole build compiles (LOADMEM stopped at 640,000).
+- How many functions the exporter leaves `Local` in a whole build, and so how long the lead's tail
+  is (D0); and whether the instance ids a helper keeps for names it found survive the revision
+  change with which u7's batch releases its memos (salsa's interned values), or must be found again.
 - tracedecay was read at `d79de82273`; its CI may have moved since.
 
 ## Appendix A: review findings
 
-`a-` is review A (claims, compliance, phase plan), `b-` review B (design soundness), both of
-2026-10-25 on `45449ae6`. **Changed**: the design changed to answer it. **Argued**: kept, with the
-evidence given. **Open**: needs the owner. A row can be partly each.
+Revision 3 answers the two re-reviews of revision 2 (`2fd75c16`), both of 2026-10-26. Re-review A
+gave each of the 25 findings of the first reviews a verdict and found seven new problems (here
+`ra-N1` to `ra-N7`); re-review B reviewed the design anew (`rb-`). Revision 2's own mapping of the
+first reviews is in `2fd75c16`'s appendix A.
 
-| Finding | What it said | Resolution | Where |
+Statuses: **resolved** (re-review A found it resolved at revision 2; nothing changed); **fixed in
+doc** (this revision changes the design; where); **moved to acceptance** (the unit's acceptance
+line, tagged with the id, quotes the finding and says how it is checked, so the code settles it);
+**owner gate** (the owner's decision, with its default). A row can be fixed in the doc and carry
+an acceptance line too. A finding fixed in the doc with no acceptance line is one no code can
+check (a dependency rule, an arithmetic or a provenance label in this document).
+
+### Re-review A: the 25 findings of the first reviews
+
+| Finding | Re-review A | Revision 3 | Where |
 |---|---|---|---|
-| a-B1 | rustc only checked after the fact; `RA_JIT_RUSTC_BASE=0` does not stop cargo | **Changed**: one spawn gate refuses before spawn, fails closed in worker mode; an audit with stand-in tools counts attempts; predicate P0-A gates everything after Phase 0 | "The rules this design keeps"; section 0; P0.1, P0.2 |
-| a-B2 | reused slots lack PR/Main isolation | **Changed**: trusted builders never run pull-request code; pull-request executors are per pull request, isolated, destroyed; credentials outside every job; an adversarial test | section 2; E1, E2 |
-| a-M1 | unknown fleet sizes used as evidence; queue taken as capacity | **Changed**: fleet sizes from the owner, Ubuntu-main conceded as a big box, the queue called a symptom; GB measures concurrent pull requests | "What tracedecay runs today"; sections 5, 9 |
-| a-M2 | historical timings lack provenance; hybrid results | **Changed**: a provenance table with machine, runs, spread and hybrid status; the eager-over-lazy conclusion withdrawn | "Numbers kept from revision 1" |
-| a-M3 | G0 and key fixes not assigned to units; G2 contradicts renaming | **Changed**: Phase 0 units with tracedecay acceptance; C4 fixes keys before C5; G2's bar is the affected closure | section 0; section 1 table; C4; section 11 |
-| a-M4 | wire schema under-specified | **Changed**: field numbers and discriminants for every type, set ordering, hash and signature domains, errors, limits, endpoint payloads; golden vectors in C1 | "Data shapes"; section 8; C1 |
-| a-M5 | remote test keys lack input records and baseline; flake exemption undefined | **Changed**: `TestBaseKey` with manifests and validation; the flake exemption withdrawn (tracedecay's fail policy kept); audit and sampling rerun cached passes | section 6; T1, T2 |
-| a-M6 | job digest used as execution and cancellation id | **Changed**: `JobContent`, `ExecutionId`, `Attempt`, subscribers; cancel when the last leaves; fencing | "Data shapes"; section 8; E3 |
-| a-M7 | codegen shards need dataflow, not one predicate | **Changed**: the batch protocol: work set, leases, publish then report, synchronous import, lead-only assembly, fencing | section 4; D1 |
-| a-M8 | gates impossible on the assigned machine | **Changed** and **open**: every gate says where it runs; fleet gates are owner-operated with tooling in units; Linux at scale needs the owner's host | section 11; P0.8; open questions |
-| a-M9 | external rollout bundled into units; GC roots without a producer | **Changed**: S1 to S3 land in the fork; owner steps listed apart with rollback; C7's synthetic publisher | Phase 5; "Owner steps"; C7 |
-| a-m1 | 763 packages should be 760 | **Changed** | "What tracedecay runs today" |
-| a-m2 | verify commands partial; `BIN` ambiguous | **Changed**: `BIN` from the unit's `CARGO_TARGET_DIR`; fixtures pinned; each verify runs all acceptance and fails non-zero | "Phase plan" preamble; every unit |
-| b-B1 | PR and Main share a mutable trust domain; the server is a signing oracle | **Changed**: section 2's roles and isolation; `Main` publication only by trusted builders at verified `master` commits; epochs; audit rebuilds. **Argued**: signing authenticates the publisher by design; restricting who may publish is the control, and a compromised trusted builder is the stated residual risk | section 2 |
-| b-B2 | a passed `TestKey` is not a safe skip | **Changed**: the cacheability contract; time, randomness, threads, sockets, spawns, foreign code always run; failures never cached; audit | section 6; T1; GT |
-| b-M1 | whole-job slots relocate, not distribute; no concurrent-PR gate | **Changed**: distributed compile designed and required (batches over a work set); warm remote jobs renamed and not the deliverable; admission and GB | sections 4, 5; D1 to D4; GB |
-| b-M2 | slot memory unsized | **Changed**: P0-B and P0-C bound and size the worker; measured reservations; a per-machine table; drain-then-rebuild | sections 0, 4, 5; P0.3, P0.4, E4 |
-| b-M3 | OIDC claims GitHub does not issue; fork policy contradictory | **Changed**: only documented claims, then GitHub API lookups by `run_id` and pull request; capabilities bound to verified source; one fork policy (hosted-only, refused) | section 2; C6 |
-| b-M4 | wire request cannot express cargo semantics | **Changed**: `BuildSpec`, `UnitSpec`, `ProfileSpec`, `RunSpec`, refusal before scheduling, differential fixtures | "Data shapes"; C2 |
-| b-M5 | cross-machine reuse conditional; deployment identity undecided | **Changed**: C4 fixes the #105 items with a hit-coverage bar (G1); one pinned blaze artifact per platform; `ExecPlatform` | section 1; C4, C5 |
-| b-M6 | no read-set index; no runtime bundle | **Changed**: `TestBaseKey` index to manifests; `RuntimeBundle` by digest | section 6; T2, T3 |
-| b-M7 | mode D lacks completeness and liveness | **Changed**: coverage per item, terminal batch results, non-blocking compile, bounded assembly waits, fencing, non-blocking helper reservation, process-group cancellation | section 4; D1 |
-| b-M8 | zero cargo lines is not the gate; tests run rustc; nightly | **Changed**: execution audit and pre-spawn refusal. **Argued**: tracedecay builds without nightly (its probe falls back, TRACEDECAY.md). **Open**: what to do with tests that run rustc or cargo | sections 0, 6; P0.1, P0.2; open questions |
-| b-M9 | crate-only GC roots pin every generic instance | **Changed**: roots by record generation, compaction, leases | section 3 GC; C7 |
-| b-M10 | CI switch lacks coverage mapping; flake contract changed | **Changed**: an approved inventory; comparison fails on missing, extra or unexecuted tests; flake policy unchanged | sections 6, 10; S2, S3 |
+| a-B1, spawn gate over job descendants | partly | **fixed in doc**: a process-tree boundary replaces the spawn gate; **moved to acceptance**: P0.2 [a-B1] | section 0, "The no-rustc boundary"; P0.2 |
+| a-B2, PR and Main isolation | resolved | resolved | section 2; E1, E2 |
+| a-M1, fleet sizes and queue | resolved | resolved | "What tracedecay runs today"; sections 5, 9 |
+| a-M2, provenance of retained numbers | partly | **fixed in doc**: "n not stated" marks every quoted number without a run count; the nushell rows; **moved to acceptance**: S3 [a-M2] | header; "Numbers kept from revision 1"; S3 |
+| a-M3, Phase 0 ownership and gating | partly | **fixed in doc**: no Phase 0 unit depends on P0-H or on the predicate it remediates (with ra-N3) | Phase plan preamble; section 11 |
+| a-M4, wire schema | partly | **fixed in doc** in part: credentials and capability transport, `ops` bits, `JobContent` bytes, the work calls; **moved to acceptance**: C1 [a-M4] for every endpoint's and enum variant's payload struct | "Data shapes"; section 8; C1 |
+| a-M5, remote test keys | resolved | resolved | section 6; T1, T2 |
+| a-M6, job identities and subscribers | partly | **moved to acceptance**: E3 [a-M6]; the job request's deadline, policy and test timeout are the subscriber's | section 8; E3 |
+| a-M7, codegen dataflow | partly | **fixed in doc**: the lead's store-hydrated assembly keeps patch tracking; **moved to acceptance**: D0 [a-M7] | section 4, "Export and ingestion"; D0 |
+| a-M8, where gates run | resolved | resolved | section 11 |
+| a-M9, rollout and the GC's root producer | partly | **moved to acceptance**: E3 [a-M9], the lead writes its `RootManifest` | E3 |
+| a-m1, 760 packages | resolved | resolved | "What tracedecay runs today" |
+| a-m2, verify commands | partly | **moved to acceptance**: P0.7 [a-m2] and S2 [a-m2], with their verify commands changed | P0.7; S2 |
+| b-B1, signing oracle | resolved | resolved | section 2 |
+| b-B2, test cache inputs | partly | **moved to acceptance**: T1 [b-B2] (unknown effects always run), T2 [b-B2] (metadata and errno observed) | T1; T2 |
+| b-M1, distribution, not relocation | resolved | resolved | sections 4, 5 |
+| b-M2, slot memory | resolved | resolved | sections 0, 4, 5 |
+| b-M3, OIDC claims and forks | resolved | resolved | section 2; C6 |
+| b-M4, cargo semantics on the wire | partly | **fixed in doc**: `UnitSpec.host`, a per-unit `profile`, `ProfileSpec.backend` and `mir_opt`; **moved to acceptance**: C2 [b-M4] | "Data shapes"; C2 |
+| b-M5, cross-machine reuse and platform | partly | **moved to acceptance**: C2 [b-M5] (native tool digests), C5 [b-M5] (platform fields in the entry key, another host) | C2; C5 |
+| b-M6, read-set index and bundles | resolved | resolved | section 6; T2, T3 |
+| b-M7, completeness and liveness | partly | **fixed in doc**: the `Local` outcome, outcomes that are not verdicts, one fencing rule; **moved to acceptance**: D0 [b-M7], D1 [b-M7] | section 4, "The protocol"; D0; D1 |
+| b-M8, tests that run rustc; nightly | regressed | **fixed in doc** as an **owner gate**: `rustc-tests`, default "keep on Bazel", with the compatibility lane (S4) as an option; the descendant-exec audit is P0.2's [rb-B1] | section 6; section 10; open questions; S2; S4 |
+| b-M9, GC roots | not resolved | **fixed in doc**: GC by the entries builds used, compaction with a remap, retention by `ConfigKey`; **moved to acceptance**: C7 [b-M9] | section 3, "GC"; "Data shapes"; C7 |
+| b-M10, CI switch coverage | partly | **fixed in doc**: GS and section 10 count validated skips and Bazel-kept tests, with Bazel's timeouts, retries and resource groups; **moved to acceptance**: S2 [b-M10] | sections 10, 11; S2 |
 
-Counts: 25 findings. Resolved by a design change alone: 22. Changed and argued in part: 2 (b-B1,
-b-M8). Changed and open in part, waiting on the owner: 2 (a-M8, b-M8). No finding is left
-without a change.
+### Re-review A: new problems
+
+| Finding | Severity | Revision 3 | Where |
+|---|---|---|---|
+| ra-N1, retention keyed by a changing source; no remap | major | **fixed in doc**: `ConfigKey`; the remap is compaction's commit point; **moved to acceptance**: C7 [ra-N1] | section 3; "Data shapes"; C7 |
+| ra-N2, authentication bootstrap | major | **fixed in doc**: `auth` exempt, capability and agent-signature headers; **moved to acceptance**: C6 [ra-N2] | section 8; C6 |
+| ra-N3, Phase 0 gate cycle | major | **fixed in doc**: Phase 0 units never depend on P0-H or their own predicate | Phase plan preamble; section 11 |
+| ra-N4, the watchdog is not the stated guard | major | **fixed in doc**: the guard's three rules over the whole tree; no lowered bounds on the Mac; **moved to acceptance**: P0.1 [ra-N4], P0.3 [ra-N4] | "Three decisions"; P0-B; P0.1; P0.3 |
+| ra-N5, batch outcomes and fencing disagree | major | **fixed in doc**: a result of a dead lease generation is refused whole; no outcome is a verdict; **moved to acceptance**: D1 [ra-N5] | section 4, "The protocol"; D1 |
+| ra-N6, overlap contradicts the seed order | major | **fixed in doc**: executors join with their own `RootSet`; no lead seed; **moved to acceptance**: D1 [ra-N6] | section 4, "The protocol"; D1 |
+| ra-N7, timeout identity and unit order | minor | **fixed in doc**: the test timeout is the job request's, not `RunSpec`'s; a total canonical unit order | "Data shapes"; section 8 |
+
+### Re-review B
+
+| Finding | Severity | Revision 3 | Where |
+|---|---|---|---|
+| rb-B1, the no-rustc boundary is not a process tree | blocker | **fixed in doc**: the boundary (Linux mount namespace and seccomp exec policy, macOS Seatbelt, fail closed), the spawn API, the answerer, negative fixtures; **moved to acceptance**: P0.2 [rb-B1] | section 0; "The rules this design keeps"; P0.2 |
+| rb-B2, a work item cannot rebuild an instance | blocker | **fixed in doc**: claimed discovery over identical front ends, nothing of an instance on the wire; the lossless descriptor as a second stage; **moved to acceptance**: D0 [rb-B2] (names alike across interning orders), D2 [rb-B2] (the descriptor's round trip) | section 4, "Moving work between processes"; D0; D2 |
+| rb-B3, no portable entries; warm assembly does not consume them | blocker | **fixed in doc**: the exporter, the store-hydrated lead, the compile-query count; **moved to acceptance**: D0 [rb-B3] | section 4, "Export and ingestion"; D0 |
+| rb-M1, cache hits do not expand coverage | major | **fixed in doc**: `FromStore` is a usable closure in pinned packs; found names commit with their finder; **moved to acceptance**: D0 [rb-M1] | section 4, "The protocol"; D0 |
+| rb-M2, dependency-only helpers | major | **fixed in doc**: home is not the defining crate; the first stage holds whole front ends; GD's memory step; **moved to acceptance**: D2 [rb-M2] | "What blaze has today"; section 4; D2 |
+| rb-M3, lease expiry and fencing | major | **fixed in doc**: the fencing table, a progress timeout, at-least-once compute with exactly-once accounting, pins from upload; **moved to acceptance**: D1 [rb-M3] | section 4, "The protocol"; section 3; D1 |
+| rb-M4, overlap and GD's hidden cost | major | **fixed in doc**: no lead seed; GD's bar is end to end; the identity scenario counts its front ends; **moved to acceptance**: D4 [rb-M4] | section 4; D4 |
+| rb-M5, P0-A audits execution, not provenance | major | **fixed in doc**: P0-A's positive and provenance bars; **moved to acceptance**: P0.2 [rb-M5] | section 0; P0.2 |
+| rb-M6, aggregate memory and executor trees | major | **fixed in doc**: P0-B is aggregate and per tree; section 5 enforces on the tree; **moved to acceptance**: P0.3 [rb-M6], E4 [rb-M6] | section 0; section 5; P0.3; E4 |
+| rb-M7, eager refusals fail the job | major | **fixed in doc**: the seam is the build's own loop; a failure is speculative and the lead decides; **moved to acceptance**: D0 [rb-M7] | section 4; D0 |
+| rb-N1, the 20% headroom not used | minor | **fixed in doc**: 70 GB, two executors at B = 64 GB | section 4, "Memory per machine" |
+| rb-N2, three denominators for P0-D | minor | **fixed in doc**: 30 of 30; **moved to acceptance**: P0.5 [rb-N2] | section 0; P0.5 |
+
+### Counts
+
+- Re-review A's 25: 10 resolved and unchanged; 9 fixed in the doc (a-B1, a-M2, a-M3, a-M4 in part,
+  a-M7, b-M4, b-M7, b-M9, b-M10), 8 of them with an acceptance line too; 5 moved to acceptance
+  only (a-M6, a-M9, a-m2, b-B2, b-M5); 1 an owner gate stated in the doc (b-M8). The one not
+  resolved (b-M9) and the one regressed (b-M8) are fixed in the doc.
+- Re-review A's 7 new problems: 7 fixed in the doc; 5 with acceptance lines (N1, N2, N4, N5, N6).
+- Re-review B's 12: 12 fixed in the doc, the 3 blockers included; 11 with acceptance lines (all but
+  N1).
+- In all, 44 findings: 10 resolved earlier, 28 fixed in the doc, 5 moved to acceptance only, 1
+  owner gate; 36 tagged acceptance lines in 20 units.
 
 ## Appendix B: the research edits
 
