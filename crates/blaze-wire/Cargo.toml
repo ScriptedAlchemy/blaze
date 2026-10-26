@@ -1,0 +1,21 @@
+[package]
+name = "blaze-wire"
+description = "blaze's wire schema: every type of docs/distributed.md in deterministic CBOR, its validator, digests, signatures and a JSON rendering"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2.2"
+
+[lints]
+workspace = true
