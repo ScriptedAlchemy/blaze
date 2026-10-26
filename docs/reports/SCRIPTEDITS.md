@@ -45,8 +45,9 @@ macOS fails the whole build today, #255, unit P0.6). `RA_JIT_MEMORY_MAX=5G`, `RA
 `RA_JIT_SPARE=0`, `RUST_BACKTRACE=0`: the brief's 16G and 12G are above the VM (a deviation, below).
 
 Every step of every probe is equal in the build's exit status, the scripts' run counts and the
-program's exit status, standard output and standard error (**measured**, 34 probes, 3 consecutive runs
-of the whole suite at the final binary, then two more with `--json` (the last of 34 probes), about 80 s each, and one with no pause between the steps (`SCRIPTEDITS_TICK=0`): no flake). The
+program's exit status, standard output and standard error (**measured**: the suite ran three times
+in a row at 32 probes and twice at 34, once of them with no pause between the steps
+(`SCRIPTEDITS_TICK=0`), each run about 80 s, all on the same binary: no flake). The
 steps are cargo's own run counts ("2" in `links` is the two scripts, `native` and `probe`, each once).
 "Before" is the same harness on `dist/main`'s binary (`3434bc93`, built the same way): 20 of 34 probes
 equal, 135 of 163 steps.
