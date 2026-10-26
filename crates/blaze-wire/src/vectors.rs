@@ -12,9 +12,9 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 
-use crate::cbor::{Named, Wire};
 use crate::calls::*;
 use crate::cbor::Limits;
+use crate::cbor::{Named, Wire};
 use crate::shapes::*;
 use crate::{Digest, Set, digest_of, encode, sign};
 
@@ -80,11 +80,7 @@ impl Gen {
     pub fn len(&mut self, most: usize) -> usize {
         const EDGES: [usize; 6] = [0, 1, 22, 23, 24, 255];
         let edge = EDGES[self.below(EDGES.len() as u64) as usize];
-        if edge <= most {
-            edge
-        } else {
-            self.below(most as u64 + 1) as usize
-        }
+        if edge <= most { edge } else { self.below(most as u64 + 1) as usize }
     }
 
     /// One value of `T`.
@@ -204,8 +200,11 @@ pub struct Vector {
     pub cbor: Vec<u8>,
     /// `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ cbor)`.
     pub digest: Digest,
-    /// Ed25519 over `"blaze/sig/" ‖ name ‖ "/v1" ‖ 0x00 ‖ cbor`.
+    /// Ed25519 over `"blaze/sig/" ‖ name ‖ "/v1" ‖ 0x00 ‖ ` the signed bytes.
     pub signature: [u8; 64],
+    /// The bytes the signature is over, when they are not the whole `cbor`: a `CrateRecord`'s
+    /// fields 0 to 5, which its field 6 is the signature of.
+    pub signed: Option<Vec<u8>>,
     /// The public half of the key the signature is under.
     pub key: [u8; 32],
 }
@@ -226,6 +225,29 @@ impl Vector {
             cbor: encode(value),
             digest: digest_of(value),
             signature: sign(&key, value),
+            signed: None,
+            key: key.verifying_key().to_bytes(),
+        }
+    }
+
+    /// The vector of one value of a type whose signature is a field of it: a `CrateRecord`.
+    ///
+    /// The value's own signature field is the key's signature over the six fields it signs, under
+    /// the type's domain, so the golden vector carries a record a client can check rather than a
+    /// record with a random field 6. The digest is still the whole record's, field 6 included,
+    /// and `signed` is the bytes the signature is over.
+    pub fn of_record<T: Wire + Named + Sample + SelfSigned>(seed: u64) -> Vector {
+        let mut g = Gen::new(seed);
+        let value: T = T::sample(&mut g);
+        let key = key_for(T::NAME);
+        let signed = value.signed_bytes();
+        let value = value.with_signature(&key);
+        Vector {
+            name: T::NAME,
+            cbor: encode(&value),
+            digest: digest_of(&value),
+            signature: value.own_signature().unwrap_or([0u8; 64]),
+            signed: Some(signed),
             key: key.verifying_key().to_bytes(),
         }
     }
@@ -235,10 +257,16 @@ impl Vector {
         key_for(self.name)
     }
 
-    /// Whether the signature is the one this vector's key makes over its CBOR.
+    /// The bytes the vector's signature is over: [`Vector::signed`] when the value carries its
+    /// own signature, and the whole `cbor` otherwise.
+    pub fn signed_bytes(&self) -> &[u8] {
+        self.signed.as_deref().unwrap_or(&self.cbor)
+    }
+
+    /// Whether the signature is the one this vector's key makes over its signed bytes.
     pub fn signature_verifies(&self) -> bool {
         let key = self.signing_key().verifying_key();
-        crate::verify_encoded_name(self.name, &self.cbor, &key, &self.signature)
+        crate::verify_encoded_name(self.name, self.signed_bytes(), &key, &self.signature)
     }
 
     /// Whether the digest is the one this vector's name and CBOR make.
@@ -253,6 +281,10 @@ impl Vector {
         out.push_str(self.name);
         out.push_str("\ncbor: ");
         out.push_str(&crate::json::hex(&self.cbor));
+        if let Some(signed) = &self.signed {
+            out.push_str("\nsigned: ");
+            out.push_str(&crate::json::hex(signed));
+        }
         out.push_str("\ndigest: ");
         out.push_str(&crate::json::hex(&self.digest));
         out.push_str("\nsignature: ");
@@ -267,6 +299,7 @@ impl Vector {
     pub fn from_golden(text: &str) -> Option<Vector> {
         let mut name = None;
         let mut cbor = None;
+        let mut signed = None;
         let mut digest = None;
         let mut signature = None;
         let mut key = None;
@@ -275,6 +308,7 @@ impl Vector {
             match field {
                 "type" => name = Some(value),
                 "cbor" => cbor = Some(unhex(value)?),
+                "signed" => signed = Some(unhex(value)?),
                 "digest" => digest = Some(unhex32(value)?),
                 "signature" => signature = Some(unhex64(value)?),
                 "key" => key = Some(unhex32(value)?),
@@ -286,9 +320,24 @@ impl Vector {
             cbor: cbor?,
             digest: digest?,
             signature: signature?,
+            signed,
             key: key?,
         })
     }
+}
+
+/// A type whose signature is a field of the value itself, rather than the generic signature over
+/// the whole value: a `CrateRecord`, whose field 6 is over fields 0 to 5.
+///
+/// [`Vector::of_record`] builds such a value's golden vector from these, so the vector carries a
+/// signature a client checks the way the server made it.
+pub trait SelfSigned: Sized {
+    /// The bytes the value's own signature is over.
+    fn signed_bytes(&self) -> Vec<u8>;
+    /// This value with its signature field set to `key`'s signature over [`SelfSigned::signed_bytes`].
+    fn with_signature(self, key: &SigningKey) -> Self;
+    /// The value's own signature, as its field carries it.
+    fn own_signature(&self) -> Option<[u8; 64]>;
 }
 
 fn key_for(name: &str) -> SigningKey {
@@ -359,11 +408,7 @@ pub fn round_trip<T: Wire + Named + Sample + PartialEq>(seed: u64) -> Result<(),
     let decoded: T = crate::validate_as(&bytes, &limits).map_err(|e| e.to_string())?;
     let again = encode(&decoded);
     if again != bytes {
-        return Err(format!(
-            "encode(decode(x)) is {} bytes and x is {}",
-            again.len(),
-            bytes.len()
-        ));
+        return Err(format!("encode(decode(x)) is {} bytes and x is {}", again.len(), bytes.len()));
     }
     if decoded != value {
         return Err("decode(x) is another value".to_owned());
@@ -394,9 +439,40 @@ macro_rules! wire_types {
             ]
         }
     };
+    // The same list with a type whose signature is its own field: a `CrateRecord`'s vector is
+    // `Vector::of_record`, so its golden file carries the signature field 6 holds.
+    (signed $signed:ty; $($ty:ty),* $(,)?) => {
+        /// Every type of the schema, one entry each.
+        pub fn every() -> Vec<$crate::vectors::Entry> {
+            let mut entries = vec![
+                $crate::vectors::Entry {
+                    name: <$signed as $crate::Named>::NAME,
+                    vector: (|seed| $crate::vectors::Vector::of_record::<$signed>(seed))
+                        as fn(u64) -> $crate::vectors::Vector,
+                    round_trip: (|seed| $crate::vectors::round_trip::<$signed>(seed))
+                        as fn(u64) -> Result<(), String>,
+                    reencode: (|cbor| $crate::vectors::reencode::<$signed>(cbor))
+                        as fn(&[u8]) -> Result<Vec<u8>, String>,
+                },
+            ];
+            entries.extend(vec![
+                $($crate::vectors::Entry {
+                    name: <$ty as $crate::Named>::NAME,
+                    vector: (|seed| $crate::vectors::Vector::of::<$ty>(seed))
+                        as fn(u64) -> $crate::vectors::Vector,
+                    round_trip: (|seed| $crate::vectors::round_trip::<$ty>(seed))
+                        as fn(u64) -> Result<(), String>,
+                    reencode: (|cbor| $crate::vectors::reencode::<$ty>(cbor))
+                        as fn(&[u8]) -> Result<Vec<u8>, String>,
+                }),*
+            ]);
+            entries
+        }
+    };
 }
 
 wire_types! {
+    signed CrateRecord;
     // "Data shapes"
     ExecPlatform,
     SourceRef,
@@ -410,7 +486,6 @@ wire_types! {
     RunSpec,
     Namespace,
     PrNamespace,
-    CrateRecord,
     PackRef,
     RootManifest,
     Capability,

@@ -24,11 +24,7 @@ fn key() -> SigningKey {
 /// name is in the digest's input.
 #[test]
 fn digests_are_separated_by_their_type_names() {
-    let item = WorkKey::Item(ItemKey {
-        unit: [1u8; 32],
-        stable: [2u8; 32],
-        env: [3u8; 32],
-    });
+    let item = WorkKey::Item(ItemKey { unit: [1u8; 32], stable: [2u8; 32], env: [3u8; 32] });
     let content = JobContentInput { spec: [1u8; 32], namespace: Namespace::Main };
     let a = digest_of(&item);
     let b = digest_of(&content);
@@ -66,22 +62,111 @@ fn a_record_is_signed_over_fields_0_to_5_only() {
     let mut pr = record.clone();
     pr.namespace = Namespace::Pr(PrNamespace { n: 1 });
     assert!(!verify(&key().verifying_key(), &pr, &signed), "a Pr record verified as Main's");
-    // Field 6 is the signature itself, so signing the record with a different field 6 and checking
-    // the old signature fails only because field 6 is not in the signed bytes: the signed bytes are
-    // fields 0 to 5, which a test checks by hashing a record and its copy with another field 6.
+    // Field 6 is the signature itself, so the whole record's digest covers it...
     record.signature = [0u8; 64];
     let mut other = record.clone();
     other.signature = [9u8; 64];
     let digest_a = digest_of(&record);
     let digest_b = digest_of(&other);
     assert_ne!(digest_a, digest_b, "the whole record's digest covers field 6");
-    // What the server signs is the record's own value, so a client that takes the record as it is
-    // gets a signature over field 6 too; the record's signature is checked over the record without
-    // it, which is `CrateRecord::signed_bytes`.
+    // ...and the signed bytes are the six-field map of fields 0 to 5, without field 6 at all.
     let bytes = record.signed_bytes();
-    let mut without = record.clone();
-    without.signature = [0u8; 64];
-    assert_eq!(bytes, encode(&without), "the signed bytes are the record with a zero signature");
+    assert_eq!(bytes[0], 0xa6, "the signed bytes are a map of six, not seven: {bytes:02x?}");
+    let expected = record_fields_0_to_5(&record);
+    assert_eq!(bytes, expected, "the signed bytes are not fields 0 to 5");
+    // The whole record, field 6 included, is seven fields, so the two encodings differ.
+    assert_ne!(bytes, encode(&record), "the signed bytes are the whole record");
+}
+
+/// Fields 0 to 5 of a record, as the six-field map the server signs.
+fn record_fields_0_to_5(record: &CrateRecord) -> Vec<u8> {
+    use blaze_wire::{Encoder, Wire};
+    let mut e = Encoder::new();
+    e.map(6);
+    e.uint(0);
+    record.namespace.encode(&mut e);
+    e.uint(1);
+    record.epoch.encode(&mut e);
+    e.uint(2);
+    record.crate_key.encode(&mut e);
+    e.uint(3);
+    record.generation.encode(&mut e);
+    e.uint(4);
+    record.packs.encode(&mut e);
+    e.uint(5);
+    record.source.encode(&mut e);
+    e.into_bytes()
+}
+
+#[test]
+fn the_golden_record_s_own_signature_is_over_its_six_fields() {
+    // The follow-up the verifier asked for: an independent check of the embedded field, not just
+    // the generic whole-value vector. The golden file's field 6 must be the vector key's signature
+    // over the six fields the server signs, under the CrateRecord domain.
+    let path = format!("{}/tests/golden/CrateRecord.txt", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).expect("no CrateRecord golden file");
+    let golden = Vector::from_golden(&text).expect("the golden file is not a vector");
+    let record: CrateRecord =
+        decode(&golden.cbor, &limits()).expect("the golden record does not decode");
+    let key = golden.signing_key().verifying_key();
+    assert!(
+        record.signature_is(&key, &record.signature),
+        "the golden record's field 6 is not the signature of its fields 0 to 5"
+    );
+    // Its signed bytes are the file's `signed` line, which is the six-field map.
+    assert_eq!(golden.signed_bytes(), record.signed_bytes().as_slice());
+    assert_eq!(golden.signed_bytes()[0], 0xa6);
+    // And the record is the one this build makes from the same seed, so the file is not stale.
+    let made = Vector::of_record::<CrateRecord>(1);
+    assert_eq!(made.cbor, golden.cbor);
+    assert_eq!(made.signed, golden.signed);
+    assert_eq!(made.digest, golden.digest);
+    assert_eq!(made.signature, golden.signature);
+}
+
+#[test]
+fn a_record_signature_is_over_the_six_fields_under_its_own_domain() {
+    // The record's own signature is the schema's signature protocol over the six-field map, not
+    // an undomained signature over raw CBOR: a verifier that takes the domain's bytes accepts it,
+    // and one that takes the raw six-field CBOR does not.
+    let record = sample_record();
+    let signed = record.signed(&key());
+    assert!(
+        signed.signature_is(&key().verifying_key(), &signed.signature),
+        "the record's own signature does not verify"
+    );
+    assert!(
+        blaze_wire::verify_encoded_name(
+            "CrateRecord",
+            &record.signed_bytes(),
+            &key().verifying_key(),
+            &signed.signature
+        ),
+        "the signature is not the CrateRecord domain's over fields 0 to 5"
+    );
+    assert!(
+        !blaze_wire::verify_encoded_name(
+            "CrateRecord",
+            &encode(&record),
+            &key().verifying_key(),
+            &signed.signature
+        ),
+        "the signature verified over the whole record, field 6 included"
+    );
+    // A record whose fields 0 to 5 changed does not verify under the old signature.
+    let mut changed = signed.clone();
+    changed.generation = changed.generation.wrapping_add(1);
+    assert!(!changed.signature_is(&key().verifying_key(), &signed.signature));
+    // A signature made over the raw six-field CBOR, with no domain, is refused.
+    use ed25519_dalek::Signer as _;
+    let raw = key().sign(&record.signed_bytes()).to_bytes();
+    assert!(
+        !record.signature_is(&key().verifying_key(), &raw),
+        "an undomained signature over the signed bytes was accepted"
+    );
+    // And one over the whole record's CBOR is refused, as the generic `sign` would make it.
+    let whole = sign(&key(), &record);
+    assert!(!record.signature_is(&key().verifying_key(), &whole));
 }
 
 #[test]
@@ -148,7 +233,10 @@ fn the_job_content_bytes_are_its_spec_digest_and_namespace() {
     let other = JobContentInput { spec: [4u8; 32], namespace: Namespace::Main };
     assert_ne!(JobContent::of(&main), JobContent::of(&other));
     // And the same content from two builds is one content.
-    assert_eq!(JobContent::of(&main), JobContent::of(&JobContentInput { spec, namespace: Namespace::Main }));
+    assert_eq!(
+        JobContent::of(&main),
+        JobContent::of(&JobContentInput { spec, namespace: Namespace::Main })
+    );
 }
 
 #[test]

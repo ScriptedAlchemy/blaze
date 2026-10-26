@@ -5,18 +5,25 @@
 //! under that hash, and two daemons agree on it byte for byte. The encoder writes shortest heads,
 //! definite lengths, no floats and no tags; a schema type's decoder requires every key of its map,
 //! in ascending order, and refuses any other. [`validate`] checks the bytes alone: heads, lengths,
-//! order, duplicates, floats, tags, depth and size. A decoder checks the schema on top, and
-//! [`validate_as`] does both.
+//! order, duplicates, floats, tags, depth and size. [`decode`] runs that check first and then reads
+//! the schema, so the ordinary decoder never accepts a byte the validator refuses, and
+//! [`validate_as`] is that same call.
 //!
 //! Strings are at most [`Limits::string`] bytes and byte strings at most [`Limits::blob`]; an
 //! array or a map at most [`Limits::batch_items`] items; the whole item at most
 //! [`Limits::request`] bytes unless the caller passes another limit ([`Limits::event`] for one
-//! item of an event stream).
+//! item of an event stream). A lookup's collections are at most [`Limits::lookup_items`] items,
+//! which the bytes-only validator cannot tell apart from any other array, so a lookup's schema
+//! field holds its own collection to that limit ([`Reader::lookup`]).
 
 use std::fmt;
 
-
-/// The deepest nesting a message may have.
+/// The deepest nesting a message may have, counting every item and not only containers.
+///
+/// An item's nesting level is the number of containers around it plus one, so a scalar inside 31
+/// arrays is at level 32 and is the deepest item a message may have, and a scalar inside 32 arrays
+/// is at level 33 and is refused. The validator and the reader count it the same way, so the
+/// ordinary decoder never accepts a message the validator refuses.
 pub const MAX_DEPTH: u32 = 32;
 
 /// The limits a server holds every message to, as `Hello` answers them.
@@ -145,9 +152,21 @@ impl Encoder {
         Encoder::default()
     }
 
-    /// An encoder that appends to `out`, for a prefix and then one value.
-    pub fn new_into(out: &mut Vec<u8>) -> Encoder {
-        Encoder { out: std::mem::take(out) }
+    /// An encoder that writes onto the end of `out`, for a prefix and then one value.
+    ///
+    /// The bytes are in `out` once the returned [`Appender`] is dropped, so a caller writes a
+    /// prefix, encodes one value, and has the two as one buffer:
+    ///
+    /// ```
+    /// let mut out = b"prefix".to_vec();
+    /// {
+    ///     let mut e = blaze_wire::Encoder::new_into(&mut out);
+    ///     e.uint(1);
+    /// }
+    /// assert_eq!(out, b"prefix\x01");
+    /// ```
+    pub fn new_into(out: &mut Vec<u8>) -> Appender<'_> {
+        Appender { encoder: Encoder { out: std::mem::take(out) }, back: out }
     }
 
     /// The bytes written so far.
@@ -220,6 +239,47 @@ impl Encoder {
     }
 }
 
+/// An [`Encoder`] that writes onto the end of a caller's buffer, which it returns the bytes to
+/// when it is dropped.
+///
+/// It dereferences to [`Encoder`], so a value encodes into it the same way:
+///
+/// ```
+/// let mut out = b"blaze/Attempt/v1\0".to_vec();
+/// let mut e = blaze_wire::Encoder::new_into(&mut out);
+/// blaze_wire::Attempt(24).encode(&mut e);
+/// drop(e);
+/// assert_eq!(out.last(), Some(&24));
+/// ```
+pub struct Appender<'a> {
+    encoder: Encoder,
+    back: &'a mut Vec<u8>,
+}
+
+impl std::ops::Deref for Appender<'_> {
+    type Target = Encoder;
+
+    fn deref(&self) -> &Encoder {
+        &self.encoder
+    }
+}
+
+impl std::ops::DerefMut for Appender<'_> {
+    fn deref_mut(&mut self) -> &mut Encoder {
+        &mut self.encoder
+    }
+}
+
+impl Drop for Appender<'_> {
+    fn drop(&mut self) {
+        // The encoder's buffer began as the caller's, and `take` leaves it empty rather than
+        // moving it, so putting the bytes back is one move and no copy.
+        let mut bytes = std::mem::take(&mut self.encoder.out);
+        bytes.append(self.back);
+        *self.back = bytes;
+    }
+}
+
 /// Reads canonical CBOR, refusing what is not.
 pub struct Reader<'a> {
     input: &'a [u8],
@@ -227,6 +287,10 @@ pub struct Reader<'a> {
     limits: Limits,
     depth: u32,
     maps: Vec<MapState>,
+    /// The limit of the one collection whose header is read next, when a lookup's field set it
+    /// with [`Reader::lookup`]. It applies to that collection only, so a lookup's answer is held
+    /// to [`Limits::lookup_items`] at its top and each entry to [`Limits::batch_items`] inside.
+    next_collection_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -238,12 +302,35 @@ struct MapState {
 impl<'a> Reader<'a> {
     /// A reader over `input` that holds every message to `limits`.
     pub fn new(input: &'a [u8], limits: &Limits) -> Reader<'a> {
-        Reader { input, pos: 0, limits: *limits, depth: 0, maps: Vec::new() }
+        Reader {
+            input,
+            pos: 0,
+            limits: *limits,
+            depth: 0,
+            maps: Vec::new(),
+            next_collection_limit: None,
+        }
     }
 
     /// Where in the input the reader is.
     pub fn position(&self) -> usize {
         self.pos
+    }
+
+    /// Reads one value whose first array or map is held to [`Limits::lookup_items`] rather than
+    /// [`Limits::batch_items`], which is a lookup's collection limit.
+    ///
+    /// The bytes-only validator cannot tell a lookup's array from a batch's, so a lookup's field
+    /// reads through this and [`decode`] refuses a lookup with more items than the limit it
+    /// answers. The limit applies to the one collection the field's value starts with, and a
+    /// scalar clears it: anything inside that collection is a batch's, held to
+    /// [`Limits::batch_items`].
+    pub fn lookup<T: Wire>(&mut self) -> Result<T, Error> {
+        let saved = self.next_collection_limit;
+        self.next_collection_limit = Some(u64::from(self.limits.lookup_items));
+        let value = T::decode(self);
+        self.next_collection_limit = saved;
+        value
     }
 
     fn err(&self, kind: ErrorKind) -> Error {
@@ -272,12 +359,11 @@ impl<'a> Reader<'a> {
     /// definite. `None` is a head that has no argument (a simple value).
     fn argument(&mut self, major: u8) -> Result<Option<u64>, Error> {
         let at = self.pos;
+        // A scalar is no collection, so a lookup's pending collection limit ends here.
+        self.next_collection_limit = None;
         let ib = self.byte()?;
         if ib >> 5 != major {
-            return Err(self.err_at(
-                ErrorKind::UnexpectedType { expected: major_name(major) },
-                at,
-            ));
+            return Err(self.err_at(ErrorKind::UnexpectedType { expected: major_name(major) }, at));
         }
         let ai = ib & 0x1f;
         let value = match ai {
@@ -320,21 +406,45 @@ impl<'a> Reader<'a> {
         Ok(Some(value))
     }
 
-    /// A length, held to `limit` for the kind of item `what` names.
+    /// A length, held to `limit` for the kind of item `what` names, or to the lookup limit when a
+    /// lookup's field asked for it ([`Reader::lookup`]) and this is that collection.
+    ///
+    /// Only an array or a map is a collection, so only those take the pending limit; a byte or
+    /// text string is a scalar and clears it, as [`Reader::scalar`] does.
     fn length(&mut self, major: u8, what: &'static str, limit: u64) -> Result<u64, Error> {
         let at = self.pos;
-        let len = self.argument(major)?.ok_or_else(|| self.err_at(ErrorKind::IndefiniteLength, at))?;
+        let limit = if major == 4 || major == 5 {
+            self.next_collection_limit.take().unwrap_or(limit)
+        } else {
+            self.next_collection_limit = None;
+            limit
+        };
+        let len =
+            self.argument(major)?.ok_or_else(|| self.err_at(ErrorKind::IndefiniteLength, at))?;
         if len > limit {
-            return Err(self.err_at(
-                ErrorKind::OversizeItem { what, len, limit },
-                at,
-            ));
+            return Err(self.err_at(ErrorKind::OversizeItem { what, len, limit }, at));
         }
         Ok(len)
     }
 
+    /// A scalar item's level: it sits one deeper than the containers already entered, so a
+    /// scalar inside [`MAX_DEPTH`] containers is past the deepest item a message may have.
+    ///
+    /// The validator counts every item, containers and scalars alike, and this is the reader's
+    /// half of the same rule: a container enters and leaves, a scalar is checked against the
+    /// containers around it, so both refuse an item at level [`MAX_DEPTH`] + 1.
+    fn scalar(&mut self) -> Result<(), Error> {
+        // A scalar is no collection, so a lookup's pending collection limit ends here.
+        self.next_collection_limit = None;
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err(ErrorKind::TooDeep));
+        }
+        Ok(())
+    }
+
     /// An unsigned integer, in the shortest form.
     pub fn uint(&mut self) -> Result<u64, Error> {
+        self.scalar()?;
         Ok(self.argument(0)?.expect("an integer has an argument"))
     }
 
@@ -343,22 +453,20 @@ impl<'a> Reader<'a> {
         let at = self.pos;
         let ib = *self.input.get(self.pos).ok_or_else(|| self.err(ErrorKind::Truncated))?;
         if ib >> 5 != 0 {
-            return Err(self.err_at(
-                ErrorKind::UnexpectedType { expected: "an integer key" },
-                at,
-            ));
+            return Err(self.err_at(ErrorKind::UnexpectedType { expected: "an integer key" }, at));
         }
         self.uint()
     }
 
     /// A byte string.
     pub fn bytes(&mut self) -> Result<&'a [u8], Error> {
+        self.scalar()?;
         let len = self.length(2, "byte string", self.limits.blob)?;
         self.take(len)
     }
-
     /// A byte string of exactly `n` bytes.
     pub fn bytes_of(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        self.scalar()?;
         let at = self.pos;
         let len = self.length(2, "byte string", self.limits.blob)?;
         if len != n as u64 {
@@ -372,6 +480,7 @@ impl<'a> Reader<'a> {
 
     /// A text string.
     pub fn text(&mut self) -> Result<&'a str, Error> {
+        self.scalar()?;
         let at = self.pos;
         let len = self.length(3, "text string", u64::from(self.limits.string))?;
         let bytes = self.take(len)?;
@@ -388,10 +497,9 @@ impl<'a> Reader<'a> {
         let at = self.pos;
         let len = self.length(4, "array", u64::from(self.limits.batch_items))?;
         if len != n as u64 {
-            return Err(self.err_at(
-                ErrorKind::UnexpectedType { expected: "an array of its length" },
-                at,
-            ));
+            return Err(
+                self.err_at(ErrorKind::UnexpectedType { expected: "an array of its length" }, at)
+            );
         }
         self.enter()?;
         Ok(())
@@ -403,7 +511,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// The header of an array of any length within the batch limit.
+    /// The header of an array of any length within the collection limit.
     pub fn array(&mut self) -> Result<u64, Error> {
         let len = self.length(4, "array", u64::from(self.limits.batch_items))?;
         self.enter()?;
@@ -428,9 +536,9 @@ impl<'a> Reader<'a> {
     /// one over for [`Reader::map_end`] to name.
     pub fn field(&mut self, want: u64) -> Result<(), Error> {
         let at = self.pos;
-        let state = *self.maps.last().ok_or_else(|| self.err(ErrorKind::UnexpectedType {
-            expected: "a field inside a map",
-        }))?;
+        let state = *self.maps.last().ok_or_else(|| {
+            self.err(ErrorKind::UnexpectedType { expected: "a field inside a map" })
+        })?;
         if state.remaining == 0 {
             return Err(self.err_at(ErrorKind::MissingKey(want), at));
         }
@@ -463,9 +571,10 @@ impl<'a> Reader<'a> {
     /// a key the schema does not have is named.
     pub fn map_end(&mut self) -> Result<(), Error> {
         let at = self.pos;
-        let state = self.maps.pop().ok_or_else(|| {
-            self.err(ErrorKind::UnexpectedType { expected: "the end of a map" })
-        })?;
+        let state = self
+            .maps
+            .pop()
+            .ok_or_else(|| self.err(ErrorKind::UnexpectedType { expected: "the end of a map" }))?;
         self.depth = self.depth.saturating_sub(1);
         if state.remaining > 0 {
             let key = self.key()?;
@@ -548,18 +657,23 @@ impl<'a> Reader<'a> {
                 // stays past the head the check above read.
                 self.pos = at + 1;
                 match ib & 0x1f {
-                    // `false`, `true` and `null`, and 0 to 19 and 23: the head is the item.
-                    20..=22 => {}
-                    // A simple value of one byte after its head.
+                    // 0 to 23: the head is the item.
+                    0..=23 => {}
+                    // RFC 8949 section 3.3: a two-byte simple value whose second byte is below 32
+                    // is not well-formed, and every such form has a one-byte form (0 to 23) or a
+                    // reserved number (24 to 31).
                     24 => {
-                        self.byte()?;
+                        let value = self.byte()?;
+                        if value < 32 {
+                            return Err(self.err_at(ErrorKind::ReservedSimpleValue(value), at));
+                        }
                     }
                     25..=27 => return Err(self.err_at(ErrorKind::Float, at)),
                     28..=30 => {
                         return Err(self.err_at(ErrorKind::ReservedAdditional(ib & 0x1f), at));
                     }
                     31 => return Err(self.err_at(ErrorKind::IndefiniteLength, at)),
-                    _ => {}
+                    _ => unreachable!("the additional information is five bits"),
                 }
             }
         }
@@ -579,6 +693,9 @@ pub enum ErrorKind {
     NonShortestHead,
     /// An indefinite length, which section 4.2 forbids.
     IndefiniteLength,
+    /// A two-byte simple value whose second byte is below 32, which RFC 8949 section 3.3 says is
+    /// not well-formed: every such form has a one-byte form or a reserved number.
+    ReservedSimpleValue(u8),
     /// A float, which the schema has none of.
     Float,
     /// A tag, which the schema has none of.
@@ -625,6 +742,7 @@ impl ErrorKind {
             ErrorKind::Truncated => "truncated",
             ErrorKind::ReservedAdditional(_) => "reserved additional information",
             ErrorKind::NonShortestHead => "non-shortest head",
+            ErrorKind::ReservedSimpleValue(_) => "reserved simple value",
             ErrorKind::IndefiniteLength => "indefinite length",
             ErrorKind::Float => "float",
             ErrorKind::Tag => "tag",
@@ -711,13 +829,21 @@ pub fn validate(bytes: &[u8], limits: &Limits) -> Result<(), Error> {
 }
 
 /// Checks the bytes and then reads them as `T`, so a key the type does not have is refused too.
+///
+/// This is [`decode`]: the validator's pass first, then the schema's, so a message the validator
+/// refuses is never read as a value.
 pub fn validate_as<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
-    validate(bytes, limits)?;
     decode(bytes, limits)
 }
 
-/// Reads one value of `T` from canonical CBOR.
+/// Reads one value of `T` from canonical CBOR, after the validator's pass over the same bytes.
+///
+/// The pass is what makes the decoder's promise hold: the size limits ([`Limits::request`], the
+/// blob and string limits), the depth rule ([`MAX_DEPTH`]) and the canonical form are all
+/// [`validate`]'s, checked before a schema decoder sees a byte, so [`decode`] never accepts a
+/// message [`validate`] refuses.
 pub fn decode<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
+    validate(bytes, limits)?;
     let mut r = Reader::new(bytes, limits);
     let value = T::decode(&mut r)?;
     r.finish()?;
@@ -768,6 +894,7 @@ impl Wire for bool {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        r.scalar()?;
         let at = r.position();
         match r.byte()? {
             0xf4 => Ok(false),
@@ -810,6 +937,7 @@ impl<T: Wire> Wire for Option<T> {
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
         if r.peek_null() {
+            r.scalar()?;
             r.pos += 1;
             Ok(None)
         } else {
@@ -911,30 +1039,9 @@ impl<T: Wire> Set<T> {
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.items.iter()
     }
-}
 
-impl<T: Wire> FromIterator<T> for Set<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Set<T> {
-        Set::new(iter.into_iter().collect())
-    }
-}
-
-impl<T: Wire> Wire for Set<T> {
-    fn encode(&self, e: &mut Encoder) {
-        // A set built by `new` is already sorted; one built by hand is sorted here, so the bytes
-        // are canonical either way.
-        let mut keyed: Vec<(Vec<u8>, &T)> =
-            self.items.iter().map(|item| (Encoder::of(item), item)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        keyed.dedup_by(|a, b| a.0 == b.0);
-        e.array(keyed.len());
-        for (_, item) in keyed {
-            item.encode(e);
-        }
-    }
-
-    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
-        let len = r.array()?;
+    /// The items of an array whose header is already read, in their canonical order.
+    fn items_of(r: &mut Reader<'_>, len: u64) -> Result<Set<T>, Error> {
         let mut items = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(1024));
         let mut previous: Option<Vec<u8>> = None;
         for _ in 0..len {
@@ -959,6 +1066,32 @@ impl<T: Wire> Wire for Set<T> {
         }
         r.array_finish();
         Ok(Set { items })
+    }
+}
+
+impl<T: Wire> FromIterator<T> for Set<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Set<T> {
+        Set::new(iter.into_iter().collect())
+    }
+}
+
+impl<T: Wire> Wire for Set<T> {
+    fn encode(&self, e: &mut Encoder) {
+        // A set built by `new` is already sorted; one built by hand is sorted here, so the bytes
+        // are canonical either way.
+        let mut keyed: Vec<(Vec<u8>, &T)> =
+            self.items.iter().map(|item| (Encoder::of(item), item)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+        e.array(keyed.len());
+        for (_, item) in keyed {
+            item.encode(e);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let len = r.array()?;
+        Set::items_of(r, len)
     }
 }
 
@@ -1002,11 +1135,16 @@ impl Wire for Bytes {
 ///
 /// The keys are literals in ascending order; the decoder reads them in that order, so a missing,
 /// repeated, out-of-order or unknown key is refused by name.
+///
+/// A `lookup [0, 1]` clause after the name holds those fields' collections to
+/// [`Limits::lookup_items`] rather than [`Limits::batch_items`]: a lookup's collection is 4,096
+/// items and a batch's is 65,536, and the bytes-only validator cannot tell one array from the
+/// other, so a lookup's schema holds its own field to the smaller number.
 #[macro_export]
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
-        $name:ident { $($key:literal => $field:ident : $ty:ty),* $(,)? }
+        $name:ident { $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1027,10 +1165,18 @@ macro_rules! wire_struct {
             }
 
             fn decode(r: &mut $crate::Reader<'_>) -> Result<Self, $crate::Error> {
+                // The keys whose collections are a lookup's rather than a batch's, as the
+                // struct's `lookup` clause lists them. The slice is built once, so the per-field
+                // repetition below only names `$key`.
+                let lookup: &[u64] = &[$($($lookup),*)?];
                 r.map_start()?;
                 $(
                     r.field($key)?;
-                    let $field = <$ty as $crate::Wire>::decode(r)?;
+                    let $field = if lookup.contains(&$key) {
+                        r.lookup::<$ty>()?
+                    } else {
+                        <$ty as $crate::Wire>::decode(r)?
+                    };
                 )*
                 r.map_end()?;
                 Ok($name { $($field),* })
@@ -1206,6 +1352,7 @@ macro_rules! wire_enum {
 impl Reader<'_> {
     /// `null`, and nothing else.
     pub fn null(&mut self) -> Result<(), Error> {
+        self.scalar()?;
         let at = self.pos;
         if self.input.get(at) == Some(&0xf6) {
             self.pos += 1;

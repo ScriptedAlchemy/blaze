@@ -44,7 +44,9 @@ fn a_shortest_head_that_is_not_shortest_is_refused() {
         assert_eq!(kind, ErrorKind::NonShortestHead);
     }
     // The shortest form of each is accepted.
-    for bytes in [&[0x01u8][..], &[0x18, 0x18], &[0x19, 0x01, 0x00], &[0x1a, 0x00, 0x01, 0x00, 0x00]] {
+    for bytes in
+        [&[0x01u8][..], &[0x18, 0x18], &[0x19, 0x01, 0x00], &[0x1a, 0x00, 0x01, 0x00, 0x00]]
+    {
         validate(bytes, &limits()).expect("the shortest form was refused");
     }
 }
@@ -88,6 +90,50 @@ fn duplicate_map_keys_are_refused() {
     let (named, kind) = refused(&bytes);
     assert_eq!(named, "duplicate key");
     assert_eq!(kind, ErrorKind::DuplicateKey(0));
+}
+
+/// RFC 8949 section 3.3: `f8` and any byte below 32 is not well-formed, and every one of those
+/// forms has a one-byte form or a reserved number.
+#[test]
+fn a_two_byte_simple_value_below_32_is_refused() {
+    for n in 0..32u8 {
+        let bytes = [0xf8, n];
+        let (named, kind) = refused(&bytes);
+        assert_eq!(named, "reserved simple value", "f8 {n:02x} was accepted");
+        assert_eq!(kind, ErrorKind::ReservedSimpleValue(n));
+    }
+    // The one-byte forms of the same values are accepted.
+    for n in [0xf4u8, 0xf5, 0xf6] {
+        validate(&[n], &limits()).expect("a one-byte simple value was refused");
+    }
+    // And 32 to 255 after `f8` are well-formed, though the schema has no field of one.
+    for n in 32..=255u8 {
+        validate(&[0xf8, n], &limits()).expect("a two-byte simple value of 32 or more was refused");
+    }
+    // Inside a map key the same rule holds.
+    let error = validate(&[0xa1, 0xf8, 0x14, 0x00], &limits()).expect_err("a nonminimal key");
+    assert_eq!(error.kind, ErrorKind::ReservedSimpleValue(0x14));
+}
+
+/// The ordinary decoder runs the validator's pass first, so it refuses what the validator does:
+/// the request size, the string and array limits.
+#[test]
+fn the_decoder_refuses_what_the_validator_refuses() {
+    let small = Limits { request: 1, ..limits() };
+    assert!(validate(&[0x18, 0x18], &small).is_err());
+    assert!(decode::<u64>(&[0x18, 0x18], &small).is_err(), "decode ignored the request limit");
+    let small = Limits { string: 1, ..limits() };
+    assert!(validate(&[0x62, b'a', b'b'], &small).is_err());
+    assert!(
+        decode::<String>(&[0x62, b'a', b'b'], &small).is_err(),
+        "decode ignored the string limit"
+    );
+    let small = Limits { batch_items: 1, ..limits() };
+    assert!(validate(&[0x82, 0x01, 0x02], &small).is_err());
+    assert!(
+        decode::<Vec<u64>>(&[0x82, 0x01, 0x02], &small).is_err(),
+        "decode ignored the array limit"
+    );
 }
 
 #[test]
@@ -271,6 +317,7 @@ fn every_offence_is_named() {
         ErrorKind::Truncated,
         ErrorKind::ReservedAdditional(28),
         ErrorKind::NonShortestHead,
+        ErrorKind::ReservedSimpleValue(0),
         ErrorKind::IndefiniteLength,
         ErrorKind::Float,
         ErrorKind::Tag,

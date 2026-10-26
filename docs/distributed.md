@@ -365,7 +365,10 @@ UTF-8, at most the lengths `Hello` answers with.
 
 A digest of a value is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`,
 where `name` is the type's name below. A signature is Ed25519 over the same bytes with `sig/` in
-front of the name. Unit C1 fixes these with golden vectors.
+front of the name. One value signs less than its whole encoding: a `CrateRecord`'s signature is
+over the six-field map of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record
+carries a signature a client checks without field 6, which is the signature itself. Unit C1 fixes
+these with golden vectors.
 
 ```rust
 type Digest = [u8; 32];            // SHA-256
@@ -477,7 +480,8 @@ struct FrontEndKey(Digest);
 /// The namespaces of the cache, and what may write each (section 2).
 enum Namespace {
     Main,                           // 0, written only by trusted builders, at verified commits
-    Pr(u64),                        // 1, written by that pull request's executors and runners
+    Pr(u64),                        // 1, written by that pull request's executors and runners;
+                                    //    its payload is PrNamespace, the map {0: n}
     Std,                            // 2, the shipped standard library (shipped.rs), read-only
 }
 
@@ -489,7 +493,8 @@ struct CrateRecord {                // 0..=6
     generation: u64,                // 3, goes up by one per publish of this crate_key
     packs: Vec<PackRef>,            // 4, set
     source: SourceRef,              // 5, the verified commit whose build published it
-    signature: [u8; 64],            // 6, by the server, over fields 0..=5
+    signature: [u8; 64],            // 6, by the server, over fields 0..=5, under the
+                                    //    CrateRecord signature domain (section 2)
 }
 
 struct PackRef {                    // 0..=4
@@ -1136,7 +1141,9 @@ exercised here, **unverified**):
 ### Records, epochs and repair
 
 - **Signed records.** The server signs `CrateRecord` fields 0 to 5 with its Ed25519 key; clients
-  pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The namespace is in the signed bytes, so a
+  pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The signed bytes are the six-field map of
+  those fields, without field 6, under the `sig/CrateRecord/v1` domain the schema gives every
+  signature; a client checks them the same way. The namespace is in the signed bytes, so a
   `Pr` record is not a `Main` record.
 - **The epoch** (REAPI's `salt`, research 7.8). Each namespace has a current epoch, answered in
   `Hello`. A client refuses a record whose epoch is not the current one. Raising `Main`'s epoch
@@ -2242,13 +2249,13 @@ JobEvent::Done { outcome: Outcome, counters: Vec<(String, u64)> } // 0..=1
 ```
 
 `LocalPolicy`, `Stage`, `Outcome` and `Namespace`'s other variants are units: payload `null`; a
-`Pr` is `[1, n]`. A newtype with no field numbers is its inner value, unwrapped. Each payload map is
-a struct of its own, and `crates/blaze-wire` names them `GitRef`, `RootRef`, `PrNamespace`,
-`ItemKey`, `EdgeKey`, `EntryRef`, `Why`, `FileObservation`, `DirObservation`, `AbsentObservation`,
-`LinkObservation`, `StageEvent`, `AssignedEvent`, `PublishedEvent`, `ProgramEvent`,
-`RefusedEvent`, `OutputEvent` and `DoneEvent`. `JobEvent::Verdict`'s and `Command::Test`'s payloads
-are the payload type's own map, not a map that holds it, so a decoder reads the enum as an array of
-two.
+`Pr` is `[1, {0: n}]`, the payload map the list above gives it. A newtype with no field numbers is
+its inner value, unwrapped. Each payload map is a struct of its own, and `crates/blaze-wire` names
+them `GitRef`, `RootRef`, `PrNamespace`, `ItemKey`, `EdgeKey`, `EntryRef`, `Why`, `FileObservation`,
+`DirObservation`, `AbsentObservation`, `LinkObservation`, `StageEvent`, `AssignedEvent`,
+`PublishedEvent`, `ProgramEvent`, `RefusedEvent`, `OutputEvent` and `DoneEvent`.
+`JobEvent::Verdict`'s and `Command::Test`'s payloads are the payload type's own map, not a map that
+holds it, so a decoder reads the enum as an array of two.
 
 What this leaves to the implementation, in one line each: `HelloRequest.role` and
 `WorkersEventsAnswer.verdict` are `u8` (an enum there would be a two-element array for a byte);
@@ -2578,7 +2585,9 @@ separation, errors, limits, JSON rendering. Files: `crates/blaze-wire`, `Cargo.t
 Depends: none. Acceptance: every type round-trips byte-identically; golden vectors for one value
 of every type, its digest and its signature, checked in; the validator accepts all the encoder
 writes on random values and rejects non-shortest heads, indefinite lengths, unsorted keys,
-duplicate keys, floats, tags, unknown keys and oversize items, naming each. From the reviews:
+duplicate keys, floats, tags, unknown keys and oversize items, naming each; the ordinary decoder
+holds a message to the same size and depth limits as the validator; a lookup's collection is held
+to 4,096 items. From the reviews:
 - [a-M4] "enum payload maps and many endpoint response/limits types remain prose; capability
   transport/ops bits and JobContent bytes are unspecified, so C1 still must invent wire choices."
   Checked by: before its code, C1 adds to section 8 a named struct for every endpoint's request and

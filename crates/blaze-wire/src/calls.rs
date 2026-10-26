@@ -5,10 +5,10 @@
 //! `docs/distributed.md` gives in ascending order. A lookup's answer is in the order of its
 //! request's keys, so a client reads it without a map.
 
-use crate::cbor::Wire;
-use crate::wire_struct;
 use crate::cbor::Limits;
+use crate::cbor::Wire;
 use crate::shapes::*;
+use crate::wire_struct;
 use crate::{Digest, Named};
 
 wire_struct! {
@@ -48,8 +48,9 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// `POST /v1/cache/lookup`'s request.
+    /// `POST /v1/cache/lookup`'s request: its keys are held to [`Limits::lookup_items`].
     CacheLookupRequest {
+        lookup [1],
         0 => namespaces: Vec<Namespace>,
         1 => keys: crate::Set<CrateKey>,
     }
@@ -58,20 +59,23 @@ wire_struct! {
 wire_struct! {
     /// `POST /v1/cache/lookup`'s answer: per key, in the request's order, the newest record.
     CacheLookupAnswer {
+        lookup [0],
         0 => records: Vec<Option<CrateRecord>>,
     }
 }
 
 wire_struct! {
-    /// `POST /v1/cache/missing`'s request.
+    /// `POST /v1/cache/missing`'s request: its blobs are held to [`Limits::lookup_items`].
     CacheMissingRequest {
+        lookup [0],
         0 => blobs: crate::Set<Digest>,
     }
 }
 
 wire_struct! {
-    /// `POST /v1/cache/missing`'s answer.
+    /// `POST /v1/cache/missing`'s answer: its missing blobs are held to [`Limits::lookup_items`].
     CacheMissingAnswer {
+        lookup [0],
         0 => missing: crate::Set<Digest>,
     }
 }
@@ -94,8 +98,9 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// `POST /v1/results/lookup`'s request.
+    /// `POST /v1/results/lookup`'s request: its keys are held to [`Limits::lookup_items`].
     ResultsLookupRequest {
+        lookup [1],
         0 => namespaces: Vec<Namespace>,
         1 => keys: crate::Set<TestBaseKey>,
     }
@@ -104,6 +109,7 @@ wire_struct! {
 wire_struct! {
     /// `POST /v1/results/lookup`'s answer: per key, in the request's order, its passes.
     ResultsLookupAnswer {
+        lookup [0],
         0 => results: Vec<Vec<TestPass>>,
     }
 }
