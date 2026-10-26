@@ -93,6 +93,9 @@ struct Entry {
     modules: Box<[ModuleId]>,
     digest: form::Hash,
     refs: Box<[ItemId]>,
+    /// Of a function, the digest of its code and what that refers to, which a move keeps:
+    /// `None` for one whose code could not all be written.
+    code: Option<(form::Hash, Box<[ItemId]>)>,
     names: Box<[Symbol]>,
     missed: Option<&'static str>,
     /// Whether it is written with an error, so that it is told changed whenever it is
@@ -684,13 +687,34 @@ impl Index {
 /// to the same items in the same places, or to ones moved with it. Only a gone item and an added
 /// one that are each the only one written so are taken for one moved.
 fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<ItemId, ItemId> {
-    let whole = |it: &&(ItemId, &Entry)| !it.1.erred && it.1.missed.is_none();
-    let mut written: FxHashMap<form::Hash, (Vec<ItemId>, Vec<ItemId>)> = FxHashMap::default();
+    let whole = |it: &&(ItemId, &Entry)| {
+        !it.1.erred
+            && it.1.missed.is_none()
+            && (it.1.code.is_some() || !matches!(it.0, ItemId::Function(_)))
+    };
+    type Key<'a> = (form::Hash, Option<form::Hash>, Option<&'a [Symbol]>);
+    let key =
+        |entry: &Entry| -> Key<'_> { (entry.digest, entry.code.as_ref().map(|it| it.0), None) };
+    let mut written: FxHashMap<Key<'_>, (Vec<ItemId>, Vec<ItemId>)> = FxHashMap::default();
     for &(id, entry) in gone.iter().filter(whole) {
-        written.entry(entry.digest).or_default().0.push(id);
+        written.entry(key(entry)).or_default().0.push(id);
     }
     for &(id, entry) in added.iter().filter(whole) {
-        written.entry(entry.digest).or_default().1.push(id);
+        written.entry(key(entry)).or_default().1.push(id);
+    }
+    // Of several written alike, those alone with their names.
+    let entries: FxHashMap<ItemId, &Entry> = gone.iter().chain(added).copied().collect();
+    let several: Vec<Key<'_>> =
+        written.iter().filter(|it| it.1.0.len() > 1 || it.1.1.len() > 1).map(|it| *it.0).collect();
+    for at in several {
+        let (was, now) = written.remove(&at).unwrap_or_default();
+        for (side, ids) in [(0, was), (1, now)] {
+            for id in ids {
+                let named = (at.0, at.1, Some(&entries[&id].names[..]));
+                let it = written.entry(named).or_default();
+                if side == 0 { it.0.push(id) } else { it.1.push(id) }
+            }
+        }
     }
     let alike = written.values().filter(|it| it.0.len() > 1 || it.1.len() > 1).count();
     let unlike = written.values().filter(|it| it.0.is_empty() || it.1.is_empty()).count();
@@ -703,14 +727,18 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
         })
         .collect();
     let paired = moved.len();
-    let refs: FxHashMap<ItemId, &[ItemId]> =
-        gone.iter().chain(added).map(|(id, entry)| (*id, &entry.refs[..])).collect();
+    let refs: FxHashMap<ItemId, Vec<ItemId>> = (gone.iter().chain(added))
+        .map(|(id, entry)| {
+            let code = entry.code.iter().flat_map(|it| it.1.iter());
+            (*id, entry.refs.iter().chain(code).copied().collect())
+        })
+        .collect();
     // What one refers to has to have moved with it: those that don't are dropped until none
     // is left that refers to one dropped.
     loop {
         let wrong: Vec<ItemId> = (moved.iter())
             .filter(|&(was, now)| {
-                let (was, now) = (refs[was], refs[now]);
+                let (was, now) = (&refs[was], &refs[now]);
                 was.len() != now.len()
                     || was.iter().zip(now).any(|(a, b)| a != b && moved.get(a) != Some(b))
             })
@@ -906,14 +934,18 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     let mut refs = node.interface.refs;
     let (mut missed, mut erred) = (node.interface.missed, node.interface.erred);
     let seen = seen_into(db, id, &refs);
-    if let (true, ItemId::Function(func)) = (seen, id) {
+    let mut whole_code = None;
+    if let ItemId::Function(func) = id {
         let code = cx.code(func.into());
-        hasher.update(&code.digest);
-        refs.extend(code.refs);
-        if code.missed.is_some() {
-            erred = (missed.is_none() || erred) && code.erred;
-            missed = missed.or(code.missed);
+        if seen {
+            hasher.update(&code.digest);
+            refs.extend(code.refs.iter().copied());
+            if code.missed.is_some() {
+                erred = (missed.is_none() || erred) && code.erred;
+                missed = missed.or(code.missed);
+            }
         }
+        whole_code = code.missed.is_none().then(|| (code.digest, code.refs.into()));
     }
     let missed = missed.filter(|_| !erred);
     let mut unique = FxHashSet::default();
@@ -928,6 +960,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
         modules: modules_of(db, id).into(),
         digest: *hasher.finalize().as_bytes(),
         refs: refs.into(),
+        code: whole_code,
         names: names.into(),
         missed,
         erred,
