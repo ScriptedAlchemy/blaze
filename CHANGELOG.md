@@ -791,20 +791,24 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
-- The daemon runs a build script again as cargo does, in a copy of the `OUT_DIR` cargo left, and
+- The daemon runs a build script again as cargo does, in the `OUT_DIR` cargo left, and
   compares the lines cargo reads, not every byte it printed. A script that keeps what it built
   in `OUT_DIR` and runs a tool that talks, as tracedecay's CLI embeds a frontend, ran the tool
   into an empty directory and printed its lines, which cargo's last run (in the directory with
   the bundle) did not have: "the build script printed something else", and 18 of 18 edit builds
   of tracedecay's CLI were cargo's. `harness/scriptrerun.py` holds it
-  (`docs/reports/BUILDSCRIPT.md`). The copy has the times and permissions of every file and
-  directory in `OUT_DIR`, as the script finds them in cargo's, and a link leads below the copy
-  if it led below the directory; a link that leads out of it or nowhere, or a file that is
-  no file, directory or link, leaves the run to cargo, and what cargo has is read again after the
-  run and has to be as it was. The lines cargo reads are picked from the bytes, as cargo's
-  `BuildOutput::parse` does: a line that is not UTF-8 is skipped whole, so `KEY=\xff` no longer
-  equals `KEY=U+FFFD`. The harness also compares the program's exit status and standard error, and
-  fails when the reference run failed.
+  (`docs/reports/BUILDSCRIPT.md`). The run is in cargo's own directory, not a copy: a copy loses
+  what a script can read there (times, links to links, hard links, extended attributes), and two
+  reviews found it kept old generated files where cargo made new ones. It takes cargo's lock on
+  the build directory first; while a cargo holds it, cargo's own last run is read when cargo would
+  not make it again, and otherwise the build is cargo's. It writes none of what cargo keeps of a
+  run, so cargo runs the script again in its next build, and it is compared with a record of the
+  run the build had, taken when cargo built and when the daemon loaded, so a run that left the
+  directory otherwise stays a difference. A link in `OUT_DIR` is read as what it leads to. The
+  lines cargo reads are picked from the bytes, as cargo's `BuildOutput::parse` does: a line that
+  is not UTF-8 is skipped whole, so `KEY=\xff` no longer equals `KEY=U+FFFD`. The harness runs
+  cargo's reference program itself and compares its exit status, standard output and standard
+  error byte for byte, and fails when the reference build failed.
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).
   The jump goes over the `int3`s and `nop`s the linker padded the function with. When there

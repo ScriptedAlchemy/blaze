@@ -75,6 +75,9 @@ struct Script {
     /// Where cargo ran rustc, which the files rustc read are named from.
     workspace: PathBuf,
     files: Vec<Watched>,
+    /// What the run the daemon loaded printed and wrote, which a run after it is compared
+    /// with: `None` when it could not be read.
+    loaded: Option<crate::cargo::script::Run>,
 }
 
 impl Script {
@@ -88,20 +91,18 @@ impl Script {
     /// set; cargo compiles it again.
     fn reruns_the_same(&self) -> bool {
         use crate::cargo::script;
-        let Some(out_dir) = self.ran() else { return false };
+        let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return false };
         if !script::compiled_from_what_is_there(&out_dir, &self.workspace) {
             return false;
         }
-        // `cargo ra-jit` ran it again before it asked for this build, as it does when
-        // something it reads changed: that is not done twice.
+        // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
+        // it asked for this build, is the one cargo has: it is not made twice.
         let newest = self.files.iter().map(|it| newest(&it.path, it.package));
         let newest = newest.collect::<Option<Vec<_>>>().and_then(|it| it.into_iter().max());
-        if newest.is_some_and(|it| script::checked_after(&out_dir, it))
-            && script::same_run(&out_dir, &self.out_dir)
-        {
-            return true;
-        }
-        script::rerun_matches(&out_dir, &self.out_dir).is_ok()
+        let run = script::current(&out_dir, |at| newest.is_some_and(|it| it < at));
+        run.and_then(|it| it.named(&out_dir, &self.out_dir))
+            .and_then(|it| it.same_as(loaded))
+            .is_ok()
     }
 
     /// Where a run of the script that can be run again wrote: the load's, or else the last
@@ -244,6 +245,7 @@ impl Scripts {
                 root: root.to_owned(),
                 workspace: workspace.to_owned(),
                 files,
+                loaded: crate::cargo::script::Run::of(out_dir).ok(),
             });
         }
         variables.sort();

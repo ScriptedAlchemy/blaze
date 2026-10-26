@@ -20,8 +20,9 @@ and where it wrote prints its lines when the bundle is built, and it lists every
 project as `rerun-if-changed`. After the first build and once the daemon has loaded the
 workspace, three edits to the program are built, one of them with a line added to a file the
 script only watches. Each has to be the daemon's and run as cargo's: the program exits as cargo's
-reference run of the same source does, and prints the same to its standard output and standard
-error, and the reference run has to have succeeded. A fourth, to an input the script bundles,
+reference program, built from the same source and run the same way, does, and prints byte for byte
+the same to its standard output and standard error, and the reference build has to have
+succeeded. A fourth, to an input the script bundles,
 changes what the script writes: the program has to print the new bundle, whoever builds it.
 
 usage: scriptrerun.py --selftest    (the comparison alone, without a build)
@@ -33,7 +34,7 @@ import glob, os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
-from cargo_ra_jit import Side, how_built, program_output, wait_warm
+from cargo_ra_jit import Side, how_built, wait_warm
 
 BUILD = r'''use std::{
     collections::hash_map::DefaultHasher,
@@ -104,37 +105,48 @@ FILES = {
 }
 
 
-def differences(ran, theirs):
-    """Why the program built (`ran`) is not what cargo's reference run (`theirs`) of the same source
-    is: the reference run has to have succeeded, or what it is compared with says nothing, and
-    the program's exit status, standard output and standard error are what its are."""
+def differences(ran, theirs, built=None):
+    """Why the program built (`ran`) is not what cargo's reference program (`theirs`), built from
+    the same source (`built`, cargo's build of it) and run the same way, is: the reference build
+    has to have succeeded, or what it is compared with says nothing, and the program's exit
+    status, standard output and standard error are byte for byte what its are. Both are run
+    directly, so nothing of cargo's is in what they print, and nothing is taken out of it."""
     problems = []
-    if theirs.returncode != 0:
-        problems.append(f"the reference cargo run failed with status {theirs.returncode}: {theirs.stderr[-500:]!r}")
-    for what, mine, cargos in zip(("exit status", "standard output", "standard error"), program_output(ran), program_output(theirs)):
+    if built is not None and built.returncode != 0:
+        problems.append(f"the reference cargo build failed with status {built.returncode}: {built.stderr[-500:]!r}")
+    for what, mine, cargos in zip(("exit status", "standard output", "standard error"),
+                                  (ran.returncode, ran.stdout, ran.stderr),
+                                  (theirs.returncode, theirs.stdout, theirs.stderr)):
         if mine != cargos:
             problems.append(f"the program's {what} was {mine!r}, cargo's {cargos!r}")
     return problems
 
 
 def selftest():
-    """The comparison finds what it is to: each of these is a build the daemon made against a
-    reference run of cargo's, and only the first is right."""
+    """The comparison finds what it is to: each of these is a program the daemon built against
+    cargo's reference program, and only the first is right."""
     from types import SimpleNamespace as Ran
     ok = Ran(returncode=0, stdout="onetwo7\n", stderr="")
-    failed = Ran(returncode=101, stdout="", stderr="")
+    built, broken = Ran(returncode=0, stderr=""), Ran(returncode=101, stderr="error: could not compile")
+    nothing = Ran(returncode=101, stdout="", stderr="")
+    at = lambda time: Ran(returncode=0, stdout=f"{time} onetwo7\n", stderr="")
     cases = [
-        ("the same", ok, ok, 0),
-        ("another standard output", Ran(returncode=0, stdout="onetwo8\n", stderr=""), ok, 1),
-        ("another exit status", Ran(returncode=3, stdout="onetwo7\n", stderr=""), ok, 1),
-        ("another standard error", Ran(returncode=0, stdout="onetwo7\n", stderr="boom\n"), ok, 1),
+        ("the same", ok, ok, built, 0),
+        ("another standard output", Ran(returncode=0, stdout="onetwo8\n", stderr=""), ok, built, 1),
+        ("another exit status", Ran(returncode=3, stdout="onetwo7\n", stderr=""), ok, built, 1),
+        ("another standard error", Ran(returncode=0, stdout="onetwo7\n", stderr="boom\n"), ok, built, 1),
+        # What `program_output` takes out as cargo's or as noise (the verifier's cases).
+        ("a line on standard error that looks like a warning of cargo's",
+         Ran(returncode=0, stdout="onetwo7\n", stderr="warning: boom\n"), ok, built, 1),
+        ("no newline at the end", Ran(returncode=0, stdout="onetwo7", stderr=""), ok, built, 1),
+        ("another time printed", at("2026-10-26T12:00:00Z"), at("2026-10-26T12:00:01Z"), built, 1),
         # Both fail and print nothing: nothing was compared.
-        ("a reference run that failed, as the program did", failed, failed, 1),
-        ("a reference run that failed, and a program that did not", Ran(returncode=0, stdout="", stderr=""), failed, 2),
+        ("a reference build that failed, and a program that did as well", nothing, nothing, broken, 1),
+        ("a reference build that failed, and a program that did not", Ran(returncode=0, stdout="", stderr=""), nothing, broken, 2),
     ]
     wrong = []
-    for name, ran, theirs, count in cases:
-        found = differences(ran, theirs)
+    for name, ran, theirs, building, count in cases:
+        found = differences(ran, theirs, building)
         if len(found) != count:
             wrong.append(f"{name}: {len(found)} differences, not {count}: {found}")
     if wrong:
@@ -175,6 +187,7 @@ def main():
         env.pop(name, None)
     side, reference = Side(ws, env, True), Side(ws, env, False)
     program = os.path.join(ws, "target", "debug", "app")
+    reference_program = os.path.join(ws, "target-ref", "debug", "app")
     wrong = []
     try:
         cold = build(side, "cold", home)
@@ -197,15 +210,16 @@ def main():
             cargo_ra_jit.rewrite(os.path.join(ws, path), old, new)
             out = build(side, step, home)
             how = how_built(out)
-            ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
-            _, theirs = reference.cargo("run", "-q")
+            ran = subprocess.run([program], capture_output=True, timeout=60)
+            _, built = reference.cargo("build", "-q")
+            theirs = subprocess.run([reference_program], capture_output=True, timeout=60)
             problems = []
             # Cargo would compile the package again whatever the script printed; the daemon,
             # given the same print, has nothing to compile.
             if daemon and how != "daemon" and not how.startswith("unchanged"):
                 problems.append(f"built by {how}, not the daemon")
-            problems += differences(ran, theirs)
-            if not daemon and "three" not in ran.stdout:
+            problems += differences(ran, theirs, built)
+            if not daemon and b"three" not in ran.stdout:
                 problems.append(f"the program printed {ran.stdout!r}, without the input's new text")
             wrong += [f"{step}: {why}" for why in problems]
             print(f"{step:36} {'ok' if not problems else 'WRONG':8} {how}")

@@ -177,13 +177,14 @@ enum Guard {
         written: Option<u128>,
     },
     /// A build script that cargo runs again when one of `reruns_for` does not hold, and
-    /// that the daemon then runs itself: the build is cargo's when the script prints or
-    /// writes something else than it did.
+    /// that the daemon then runs itself, as cargo would: the build is cargo's when the script
+    /// prints or writes something else than `built`, the run cargo built with.
     Script {
         package: String,
         out_dir: PathBuf,
         reruns_for: Vec<Guard>,
         checked_at: u128,
+        built: script::Run,
     },
 }
 
@@ -191,11 +192,13 @@ impl Guard {
     /// What changed, when something did.
     fn broken(&mut self, built_at: u128) -> Option<String> {
         match self {
-            Guard::Script { package, out_dir, reruns_for, checked_at } => {
+            Guard::Script { package, out_dir, reruns_for, checked_at, built } => {
                 let since = built_at.max(*checked_at);
                 reruns_for.iter_mut().find_map(|it| it.broken(since))?;
                 let now = stamp_now();
-                match script::rerun_is_same(out_dir) {
+                let unchanged =
+                    |at| reruns_for.iter_mut().all(|it| it.broken(stamp_of(at)).is_none());
+                match script::current(out_dir, unchanged).and_then(|it| it.same_as(built)) {
                     Ok(()) => {
                         *checked_at = now;
                         None
@@ -1511,9 +1514,12 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
         files.push(Guard::Tree { what, dir });
     }
     let out_dir = script.out_dir.clone().into_std_path_buf();
-    if script::can_rerun(&out_dir) {
+    // What the run cargo built with printed and wrote, which a run after it is compared with.
+    if script::can_rerun(&out_dir)
+        && let Ok(built) = script::Run::of(&out_dir)
+    {
         let package = package.name.to_string();
-        files = vec![Guard::Script { package, out_dir, reruns_for: files, checked_at: 0 }];
+        files = vec![Guard::Script { package, out_dir, reruns_for: files, checked_at: 0, built }];
     }
     files.extend(variables);
     files

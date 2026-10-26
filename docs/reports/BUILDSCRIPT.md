@@ -27,8 +27,11 @@ it follows from what was read. Nothing is extrapolated.
   reruns print none, and are byte for byte the same as each other (3 reruns, 877,830 bytes each).
   The script's output depends on the state of its `OUT_DIR`, which cargo leaves as it was between runs
   (**read**: the first rerun found the bundle and did not run pnpm).
-- **Fix: in blaze** (`crates/ra-jit/src/cargo/script.rs`). The daemon runs the script in a copy of
-  the `OUT_DIR` cargo left and compares the lines cargo reads, as cargo reads them. With the
+- **Fix: in blaze** (`crates/ra-jit/src/cargo/script.rs`). The daemon runs the script in the
+  `OUT_DIR` cargo left, under cargo's lock on its build directory, as cargo runs it again, and
+  compares the lines cargo reads, as cargo reads them, and what it wrote with the run the build had.
+  (The first two versions ran it in a copy of the directory, which two reviews failed on what a
+  copy does not keep; "Round 3" is why it is now cargo's own directory.) With the
   fix the scratch project that has tracedecay's own `build.rs` goes from 0 of 3 edit builds the
   daemon's to 3 of 3 (read, 1 run each of `blaze build`), and the harness case that has the script in
   miniature from 0 of 3 to 3 of 3. tracedecay needs no edit; an optional patch that keeps pnpm's lines off the
@@ -140,7 +143,9 @@ has of what a script prints.
 
 In blaze, because both halves of the difference are blaze's:
 
-1. **Run the script in a copy of cargo's `OUT_DIR`**, as cargo does. `rerun_matches` copies the
+1. **Run the script in a copy of cargo's `OUT_DIR`**, as cargo does. (This step is replaced: the
+   script now runs in cargo's own `OUT_DIR`, under cargo's lock, and is compared with a record of
+   the run the build had; see "Round 3".) `rerun_matches` copies the
    directory (files and directories with their times and permissions; see "After review" for the
    links) to the directory it runs the script in, so a script that keeps what it built there finds
    it. cargo's directory is not written to, which is why it was a directory of its own (compilers
@@ -279,6 +284,8 @@ meet the check again, and the old check ran the frontend's tool again each time 
 
 ## What was not measured
 
+(Of the first version. The items on the copy, its size and its platforms no longer apply: "Round 3".)
+
 - **The whole of tracedecay under blaze.** It does not fit this Mac ([TRACEDECAY.md](TRACEDECAY.md),
   items 5 and 7). The script, its environment and its files are tracedecay's; the daemon's load of
   the 586 crates, the 107 build scripts it fails to compile on macOS arm64 and what a loaded daemon
@@ -389,6 +396,195 @@ timing test added, and then this branch's, restored byte for byte (`sha256` chec
 passes (the first three edits the daemon's, the fourth cargo's with "wrote something else", the
 program as cargo's in all four, its exit status and standard error too).
 
+## Round 3: the premise (unit u8-premise)
+
+A second verifier run (GPT 6.1, round 2) failed `88f76038` on three more ways the copy was not
+cargo's directory: a link to a link was made a link to where the last one led, so a script that
+points the middle one elsewhere and back found another file than under cargo; extended attributes
+were not copied (macOS); and two names of one file became two files. Each kept old generated data
+where cargo's run made new (**read** from the verifier's report: its tests returned `Ok` with
+`data` still `old`, and cargo's run in the same directory wrote `new`). Round 1 had failed the copy
+on fresh directory times and on links that wrote into cargo's files. Every fix so far assumed that a
+copy of `OUT_DIR` can stand in for the directory cargo runs the script in again. A copy cannot be
+that in full: the time a file's inode changed, inode numbers, hard links, file flags, ACLs, sparse
+files and where each link in a chain leads are all things a script can read, and a copy keeps some
+of them on some systems. So this round tested the premise before writing a fix.
+
+### Why the rerun was not in cargo's directory
+
+The rerun has been in a directory of its own since the code was imported from rustd (`fb515039`).
+The reason is in the doc of `rerun_is_same` there, word for word: "what cargo's holds is read by the
+compilers of a build under way, and cargo compiles the package again when a file there is newer
+than it was" (**read**, `git show fb515039:crates/rustd/src/cargo/script.rs`). Read against the
+callers on this branch, the first half is true and the second is not a reason:
+
+- **Readers and writers at the same moment: true.** Three places check a script. (A) `cargo ra-jit`,
+  before it decides whether cargo builds (`cargo/mod.rs` `by_daemon` calls `State::broken_guard`), with no
+  lock held: a cargo in another terminal can be building in the same directory. (B) The rustc wrapper
+  under plain cargo (`cargo/wrapper.rs` `Unit::by_daemon`, the same guards), which runs inside cargo's
+  build: that cargo holds the lock on its build directory (`.cargo-lock`) and can be running this
+  script or compiling a crate that `include!`s what it wrote, at that moment. (C) The daemon
+  (`inputs.rs` `Script::reruns_the_same`), asked by either. Nothing locked `OUT_DIR` for the check.
+- **A file made newer: no build cargo would not make.** A check runs only when something the script
+  reads was written after cargo's last run of it. Cargo's next build then runs the script again
+  whatever blaze did, and compiles the package again whatever the script wrote (`fingerprint` of the
+  run unit; the module doc of `script.rs`). The daemon's own guards leave `OUT_DIR` out on purpose
+  (`cargo/state.rs` `guards`: "only cargo writes it again: when the script runs again, which its own
+  guards are for"), and `symbols.rs` compares the files there by their bytes, not their times.
+
+So what a check must not disturb is: `OUT_DIR` while cargo runs the script or a compiler reads it, and
+what cargo keeps of its last run (`output` or `run/stdout`, `invoked.timestamp`, the fingerprint),
+which is what has cargo run the script again.
+
+### In place is cargo's own sequence, under two conditions
+
+Cargo 1.99 runs a script so (`src/cargo/core/compiler/custom_build.rs` `build_work`, the verifier's copy
+of `5f94df478`, **read**): it creates `OUT_DIR` if it is not there and never empties it, stamps
+`invoked.timestamp` before it starts the script, and after the script exits writes `output` with the
+time it started as its time; the fingerprint is written when the unit is done. A run of blaze's in
+`OUT_DIR`, with the environment and directory cargo ran the script with, that writes none of cargo's
+files, leaves cargo as a build that stopped right after the script exited does: `OUT_DIR` from a whole
+run with today's inputs, and cargo's records of the run before. Cargo's next build runs the script
+again (an input is newer than `output`), in the directory the last run left, and compiles the
+package. A script already has to work that way: cargo runs it again for every touch of a file it
+watches, and after any build that stopped. Blaze's run, then cargo's, is what cargo does for an
+edit, a build, a touch and a build (**inferred** from the code read; not run against cargo).
+
+Two conditions make it so, and the code has both:
+
+1. **The exclusion cargo's run has.** The check takes cargo's lock on the build directory
+   (`.cargo-lock` above `OUT_DIR`, as `State::hold` does) without waiting: a cargo that waits for the
+   wrapper it is running would wait for ever. While a cargo holds it (B, and C when B asked), blaze
+   runs nothing. It reads cargo's own last run when cargo's own rule says cargo would not make it
+   again (nothing the script reads is newer than `output`): cargo then ran the script in this build
+   and is done with the directory. Otherwise the build is cargo's ("was not run again: a cargo is
+   building in its directory"). The daemon's own reads of `OUT_DIR` take no lock; they are as open to
+   blaze's run as to cargo's own reruns, which they are today.
+2. **A record of the run the build had.** With a copy, cargo's directory stayed what the build was
+   made from. In place, a run that differs changes `OUT_DIR`, and when the build after it never comes
+   (cargo fails or is stopped first), a later check would compare its run with the changed directory
+   and find them the same. So the run a build had is recorded when the build is made: in the state
+   (`Guard::Script.built`, by `State::after`) and in the load (`Script.loaded`), as the lines cargo reads
+   and a digest of `OUT_DIR`, and a run is compared with that. This also closes a hole both earlier
+   versions had: under plain cargo, cargo runs the script again in the build before the wrapper asks,
+   and the check compared a rerun with cargo's new output, which says whether the script is
+   deterministic, not whether it printed what the build the state is of had (**inferred** from the code;
+   no test of the old version was written for it).
+
+What blaze's run printed is kept beside the directory in `ra-jit-checked`, which it already wrote for
+its time; its time is still when the run began. The last run of the script is cargo's or blaze's,
+whichever began later, and when nothing the script reads changed after it began, no run is made
+(`current`). That takes the place of the shortcut `inputs.rs` had for a run `cargo ra-jit` made just
+before it asked the daemon (`checked_after` and `same_run`, deleted).
+
+### Alternatives not taken
+
+- **A clone of the tree** (`clonefile` on APFS, `FICLONE` on Linux). It keeps more of each file, but
+  two names of one file are still two files, `FICLONE` is per file so a directory is a walk again with
+  its own metadata to set, and an absolute link still leads into cargo's directory. It narrows the
+  list; it does not end it.
+- **Leave to cargo any `OUT_DIR` with links, hard links or extended attributes.** That is the copy with a
+  list of what it refuses, which each review lengthens (the time a file's inode changed, inode numbers,
+  flags and ACLs are not on it), and a script that leaves a link would send every edit to cargo again.
+
+### What was deleted
+
+The copy and everything that was for it: `copy_tree`, `copy_below`, `copy_file`, `times_of`, `copy_link`,
+`remove_copy` and the counter that named the copies; `rerun_matches` and `rerun_into` (a run in a copy
+and its comparison); `same_run` and `checked_after` (the shortcut above); `rerun_is_same` (now
+`current` with the comparison at the caller); the second kind of digest (`Look::Times`, sizes and times
+of cargo's directory, read after the run to find a write that missed the copy); and `led_to`, which
+resolved links for the copy. The code of `script.rs`, without its tests, is 936 lines on `88f76038`
+and 873 here (`wc -l` up to the test module); its tests are 725 lines and 807, 5 tests more. The comparison of the lines cargo reads (`directives`, from `BuildOutput::parse`) is kept as
+it was.
+
+What is new: `Run` (the lines and the digest), `current`, the lock, and the digest following links. A
+link is read as its text and what it leads to (a file's bytes or a directory's tree), as `include!` and
+`fs::read` follow it; a directory reached a second time is named, not read again; a link that leads
+nowhere or round in a circle is its text alone. Times and permissions are not in the digest: rustc
+reads neither.
+
+### The verifier's cases
+
+Each of the eight cases that failed in round 1 or 2, or that round 1 checked, is a test here. The
+verifier's tests asserted two things: that the check said "different", and that cargo's directory
+still held `old` after it. The second half was about the copy and cannot hold in place: blaze's run is
+the one in cargo's directory. It becomes: the directory holds what cargo's run in it leaves (`new`).
+
+| Case (round) | Now | Test |
+|---|---|---|
+| Directory older than an input, a `make` style script (1) | the script finds the real directory: `Err`, `new` | `a_directory_older_than_the_input_is_as_old_as_under_cargo` |
+| Write through a link out of the directory, `../state` (1) | the write reaches `state`, as under cargo; the digest follows the link: `Err` | `a_write_through_a_link_out_of_the_directory_is_a_difference` (relative and absolute) |
+| A line that is not UTF-8 (1) | unchanged code: `Err` in both comparisons | `a_line_that_is_not_text_is_not_a_line_cargo_reads_in_either_run` |
+| `OUT_DIR` missing (1, passed) | `Err`; nothing to clean up | `a_directory_that_is_missing_is_an_error` |
+| Script fails (1, passed) | `Err`, and no record of a run | `a_script_that_fails_is_an_error_and_leaves_no_record_of_a_run` |
+| Two names of one file, `-ef` (2) | one file, as under cargo: `Err`, `new` | `two_names_of_one_file_are_one_file_as_under_cargo` |
+| A link to a link, the middle one pointed elsewhere and back (2) | the real chain: `Err`, `new` | `a_link_to_a_link_leads_through_it_as_under_cargo` |
+| An extended attribute (2, macOS) | the real file: `Err`, `new` | `an_extended_attribute_is_there_as_under_cargo` (macOS only) |
+
+Round 2's two controls hold: a link the script points at another file with the same bytes is a
+difference (`a_link_the_script_points_elsewhere_is_a_difference`), and old whole-second times are not
+compared at all (`the_digest_of_a_directory_is_of_what_a_compiler_reads_there`). Round 2's findings on
+Windows (a directory opened as a file to set its times, which sent every rerun there to cargo) and on
+races while copying are gone with the copy: no directory is opened as a file or copied. A write during
+the digest is still possible from outside cargo, and makes the digest another, which sends the build
+to cargo. Round 2's harness finding is fixed too: `differences` compared output after
+`program_output` took out what looked like cargo's lines, a missing final newline and times. The
+harness now builds cargo's reference program and runs it directly, compares exit status, standard
+output and standard error byte for byte, and its self-test has the verifier's three cases, which the
+old comparison passed (**read**: `program_output` gives equal triples for all three, run here).
+
+New tests besides: a check while another process holds `.cargo-lock` runs nothing, and reads cargo's
+run only when cargo's rule says it is current (`a_run_while_a_cargo_builds_in_the_directory_is_cargos`;
+its lock is held by a `perl` process, because a lock this test process held was also held by a process
+another test started at that moment, which made it fail one run in one when all ran together); a run
+is not made twice after a change (`the_last_run_since_what_the_script_reads_changed_is_not_made_again`);
+and a run that differs is still a difference when read again with nothing changed
+(`a_run_that_differs_is_different_until_cargo_builds_again`).
+
+### What in place changes
+
+- A run that differs leaves `OUT_DIR` as it left it, as cargo's run would. The build is cargo's, and
+  cargo runs the script again there before it compiles the package.
+- A file the script writes again with the bytes it had is the same now (it was "wrote something else"
+  by its time). A script that writes the name of its own `OUT_DIR` into a file is the same as well,
+  where a copy, with another name, never was (CMake's cache in `OUT_DIR` holds that name).
+- A link that leads out of `OUT_DIR`, or nowhere, is checked; it sent the build to cargo before.
+  What it leads to is read at each check: a link to a large directory costs reading it.
+- Under plain cargo, a script cargo has not yet run again in the build when the wrapper asks (one of a
+  package the program does not depend on) sends the program to rustc; it was run in a copy.
+- Each cargo build that the daemon can serve, and each load, takes a digest of the `OUT_DIR` of each
+  script it can run (the record above).
+
+### Numbers (round 3)
+
+| | Count |
+|---|---|
+| `cargo +1.99.0 test -p ra-jit` on `88f76038` | 213 passed, 0 failed, 1 ignored (the round 2 verifier's run, **read** from its report; not run again here) |
+| the same on this branch | **218 passed, 0 failed, 1 ignored** (2 runs, debug, the same each time; the six other targets have no tests). `cargo::script::tests`: 29 run and 1 ignored on `88f76038` (**read**, the same report), 34 and 1 now |
+| `cargo::script` alone | 34 passed, 1 ignored, in each of 2 runs; the run before them had the lock test fail once, when the test held the lock itself (above) |
+| `harness/scriptrerun.py --selftest` | ok, 9 cases (6 before) |
+| `harness/scriptrerun.py`, this branch's release build | exit 0 in 26 s and in 17 s (2 runs, the second of the commit's release build, after a change to a comment only): the three edits the daemon's, the fourth cargo's ("the build script of `app` wrote something else"), and in all four the program's exit status, standard output and standard error byte for byte those of cargo's reference program; peak 2.5 GB, no swap growth |
+
+**Cost of a check** (n=10, one session, release, `cargo test --release -p ra-jit --bin ra-jit -- --ignored
+--nocapture the_cost`, load average 3.9 to 4.7 with other units' processes). The directory is the
+made-up one of "After review" (125 files, 4,530,000 bytes, random bytes) and the script does nothing:
+
+| | min | median | max |
+|---|---|---|---|
+| the record a build takes (`Run::of`, at each cargo build and each load) | 11.9 ms | 15.3 ms | 79.8 ms |
+| the check: the script run in the directory, and the digest after it | 16.4 ms | 20.2 ms | 217.3 ms |
+
+The limiter was not isolated. The files are written just before the ten runs, and "After review" found
+the first read of a file just written to cost 1.5 to 2.5 ms a file on this Mac, so the maxima are
+probably the first runs (**guess**: the time of each run was not printed). These are not compared with
+the copy's 361 ms of "After review", which was another session.
+
+Not run here: the gate's other parts (the LLVM build, `cargo test --release` of `hir-ty`, `hir-def`,
+`parser` and `syntax`, which this change does not touch), Linux, Windows, plain cargo under `ra-jit
+enable` (the wrapper's side, B, is covered by the unit test of the lock and not by a harness run), and
+tracedecay itself (this Mac, as above).
+
 ## Commands
 
 All in this checkout unless a path says otherwise. `H` is the heavy lock of standing order 15 (taken
@@ -414,6 +610,14 @@ CARGO_TARGET_DIR=/Users/bytedance/dev/blaze-targets/u8 cargo +1.99.0 test -p ra-
 # H, G: the new harness, against the fork's binaries and this branch's
 RA_JIT_BIN=.../u1/release/ra-jit python3 harness/scriptrerun.py
 RA_JIT_BIN=.../u8/release/ra-jit python3 harness/scriptrerun.py
+# round 3, CARGO_TARGET_DIR=/Users/bytedance/dev/blaze-targets/u8p (cp -cR of u8fix), each line under H and G
+cargo +1.99.0 test -p ra-jit --bin ra-jit -- cargo::script    # 3 runs: 33 and 1 failed, then 34, 34
+cargo +1.99.0 test -p ra-jit
+cargo +1.99.0 build -p ra-jit --release
+RA_JIT_BIN=.../u8p/release/ra-jit python3 harness/scriptrerun.py --selftest
+RA_JIT_BIN=.../u8p/release/ra-jit python3 harness/scriptrerun.py
+cargo +1.99.0 test --release -p ra-jit --bin ra-jit -- --ignored --nocapture the_cost
+cargo +1.99.0 fmt --all -- --check; git diff --check                  # not under H
 ```
 
 The scripts and raw outputs of E1 to E4 are in `/Users/bytedance/dev/blaze-targets/u8-work` (`exp1.py`,
