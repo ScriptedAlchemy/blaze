@@ -1083,7 +1083,7 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   where the splice had refused every edit (an executable "fixed up in chains"); and it has the
   patch ahead of the object, so that a link the splice declines has the edit too: it had
   linked the program as it was before the edit and said it was built. On ELF the daemon makes
-  the object's definitions of what the patch defines weak before each such link
+  a link-private copy's definitions of what the patch defines weak before each such link
   (`weaken::replaced`), the way Mach-O's are, and tells the linker nothing of duplicates: two
   definitions of any other name, in a library of the program, stay the linker's error, as they
   are in rustc's link (a first version of the line passed `--allow-multiple-definition`, and

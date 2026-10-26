@@ -207,19 +207,36 @@ fn symbol_table(data: &[u8]) -> Option<(Range<usize>, Range<usize>)> {
     None
 }
 
-/// Makes weak the definitions of the ELF object at `base` of the names the ELF object at
-/// `patch` defines too, in place, and says how many. The object is linked after the patch
+/// A link's copy of its base object, with only the definitions the patch replaces made weak.
+/// The original stays strong, including for another link with a different patch.
+pub(crate) struct Replaced {
+    path: PathBuf,
+}
+
+impl Replaced {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Replaced {
+    fn drop(&mut self) {
+        _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Makes a copy of the ELF object at `base` with the definitions of the names the ELF object
+/// at `patch` defines too made weak. `None` when nothing is replaced. It is linked after the patch
 /// with nothing said of duplicates ([`crate::cargo::plan::whole_link_args`]): the patch's
 /// definition is the strong one and stays wherever it is on the line, and a name the patch
 /// does not define stays as the object has it, so that a second definition of it from a
 /// library is the linker's error. Only the bindings of those symbols change; a file that is
 /// no ELF object, or a patch that defines nothing, is not touched.
 ///
-/// The object is the daemon's own, written whole when it is built and read by the links
-/// that follow; this runs where a link starts, with the object inflated and nothing writing
-/// it ([`crate::whole`]). The packed copy of it keeps the bindings it was packed with, which
-/// this makes again at every link.
-pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<usize> {
+/// Never weaken the base in place: successive patches need different definitions, a failed
+/// link must not change the base, and outputs can be hard links to the same whole object.
+/// The copy belongs to this link and is removed when the guard is dropped.
+pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<Option<Replaced>> {
     use std::io::Read as _;
     let is_elf = |path: &Path| -> std::io::Result<bool> {
         let mut head = [0; 4];
@@ -227,19 +244,35 @@ pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<usize> {
         Ok(read == head.len() && head == *b"\x7fELF")
     };
     if !is_elf(patch)? || !is_elf(base)? {
-        return Ok(0);
+        return Ok(None);
     }
     let patch = std::fs::read(patch)?;
     let names = elf_defined(&patch);
     if names.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
-    let file = std::fs::File::options().read(true).write(true).open(base)?;
-    // SAFETY: the daemon writes the object whole before it is linked and does not write it
-    // again while a link of it runs; the bindings changed here are read as either by what
-    // reads it meanwhile (a splice reads definitions, weak or not).
+    let mut original = std::fs::File::open(base)?;
+    // SAFETY: the caller holds whole::read while the daemon's object is read.
+    let object = unsafe { memmap2::Mmap::map(&original)? };
+    let offsets = replaced_offsets(&object, &names);
+    if offsets.is_empty() {
+        return Ok(None);
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut copy = base.as_os_str().to_owned();
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    copy.push(format!(".{}.{}.replaced", std::process::id(), next));
+    let path = PathBuf::from(copy);
+    let mut file = std::fs::File::options().read(true).write(true).create_new(true).open(&path)?;
+    let copy = Replaced { path };
+    std::io::copy(&mut original, &mut file)?;
+    // SAFETY: this is the link's private copy and no other code writes or maps it.
     let mut object = unsafe { memmap2::MmapMut::map_mut(&file)? };
-    Ok(weaken_elf(&mut object, &names))
+    for at in offsets {
+        object[at] = (STB_WEAK << 4) | (object[at] & 0xf);
+    }
+    object.flush()?;
+    Ok(Some(copy))
 }
 
 /// The names a 64-bit little-endian ELF object defines with global binding: the ones another
@@ -254,20 +287,19 @@ fn elf_defined(data: &[u8]) -> FxHashSet<&[u8]> {
     names
 }
 
-/// Makes weak the global definitions of the ELF object `data` of `names`, and says how many.
-fn weaken_elf(data: &mut [u8], names: &FxHashSet<&[u8]>) -> usize {
-    let Some(symbols) = elf_symbols(data) else { return 0 };
+/// The binding bytes of the global definitions of the ELF object `data` of `names`.
+fn replaced_offsets(data: &[u8], names: &FxHashSet<&[u8]>) -> Vec<usize> {
+    let Some(symbols) = elf_symbols(data) else { return Vec::new() };
     let size = size_of::<Sym64<LE>>();
     let info = std::mem::offset_of!(Sym64<LE>, st_info);
-    let at: Vec<usize> = (symbols.table.iter().enumerate())
+    symbols
+        .table
+        .iter()
+        .enumerate()
         .filter(|(_, it)| is_global_definition(it))
         .filter(|(_, it)| symbols.table.symbol_name(LE, it).is_ok_and(|it| names.contains(it)))
         .map(|(index, _)| symbols.offset + index * size + info)
-        .collect();
-    for &at in &at {
-        data[at] = (STB_WEAK << 4) | (data[at] & 0xf);
-    }
-    at.len()
+        .collect()
 }
 
 fn is_global_definition(symbol: &Sym64<LE>) -> bool {
@@ -383,7 +415,11 @@ mod tests {
         let names = elf_defined(&patch);
         assert_eq!(names.len(), 2);
         let mut object = base.clone();
-        assert_eq!(weaken_elf(&mut object, &names), 1);
+        let offsets = replaced_offsets(&object, &names);
+        assert_eq!(offsets.len(), 1);
+        for at in offsets {
+            object[at] = (STB_WEAK << 4) | (object[at] & 0xf);
+        }
         let mut weak: Vec<_> = bindings(&object).into_iter().filter(|it| it.1).collect();
         weak.sort();
         assert_eq!(weak, [("edited".to_owned(), true)]);
@@ -391,11 +427,11 @@ mod tests {
         let changed = base.iter().zip(&object).filter(|(a, b)| a != b).count();
         assert_eq!(changed, 1);
         // Again, nothing is left to make weak.
-        assert_eq!(weaken_elf(&mut object, &names), 0);
+        assert!(replaced_offsets(&object, &names).is_empty());
         // A patch that defines nothing, and one that is no ELF object, leave an object alone.
         assert!(elf_defined(&elf(&[])).is_empty());
         assert!(elf_defined(b"not an object").is_empty());
-        assert_eq!(weaken_elf(&mut Vec::from(&b"not an object"[..]), &names), 0);
+        assert!(replaced_offsets(b"not an object", &names).is_empty());
     }
 
     /// `ld.lld`, which links the ELF objects of a test on any host: the toolchain's, which
@@ -425,6 +461,7 @@ mod tests {
         let ran = lld()
             .expect("an ld.lld")
             .args(["-e", "entry"])
+            .args(crate::cargo::plan::whole_link_args(false, out).unwrap())
             .args(objects)
             .arg("-o")
             .arg(out)
@@ -472,20 +509,32 @@ mod tests {
         let patch = write("patch.o", &elf(&[("edited", b"PTCH")]));
         let said = linked(&[&patch, &base, &first], &out).unwrap_err();
         duplicate(&said, "edited");
-        assert_eq!(replaced(&base, &patch).unwrap(), 1);
-        let with_patch = linked(&[&patch, &base, &first], &out).unwrap();
+        let original = std::fs::read(&base).unwrap();
+        let copy = replaced(&base, &patch).unwrap().unwrap();
+        let with_patch = linked(&[&patch, copy.path(), &first], &out).unwrap();
         assert_eq!(code_of(&with_patch, "edited"), b"PTCH");
         // The patch stays wherever it is on the line.
-        assert_eq!(code_of(&linked(&[&base, &patch], &out).unwrap(), "edited"), b"PTCH");
+        assert_eq!(code_of(&linked(&[copy.path(), &patch], &out).unwrap(), "edited"), b"PTCH");
 
         // Two libraries that both define a name are an error with a patch ...
-        let said = linked(&[&patch, &base, &first, &second], &out).unwrap_err();
+        let said = linked(&[&patch, copy.path(), &first, &second], &out).unwrap_err();
         duplicate(&said, "clash");
         assert!(!said.contains("duplicate symbol: edited"), "{said}");
+        assert_eq!(std::fs::read(&base).unwrap(), original);
+        let copy_path = copy.path().to_owned();
+        drop(copy);
+        assert!(!copy_path.exists());
+        // A later patch that replaces another name cannot inherit an earlier weakening.
+        let other_patch = write("other-patch.o", &elf(&[("entry", b"NEXT")]));
+        let other_copy = replaced(&base, &other_patch).unwrap().unwrap();
+        let collision = write("collision.o", &elf(&[("edited", b"COLL")]));
+        let said = linked(&[&other_patch, other_copy.path(), &collision], &out).unwrap_err();
+        duplicate(&said, "edited");
+        assert_eq!(std::fs::read(&base).unwrap(), original);
         // ... and without one, a patch that defines nothing, as the first build has.
         let empty = write("empty.o", &elf(&[]));
         let base = write("whole.o", &elf(&[("entry", b"ENTR"), ("edited", b"BASE")]));
-        assert_eq!(replaced(&base, &empty).unwrap(), 0);
+        assert!(replaced(&base, &empty).unwrap().is_none());
         let said = linked(&[&empty, &base, &first, &second], &out).unwrap_err();
         duplicate(&said, "clash");
         // With either library alone it links, so the error is theirs.

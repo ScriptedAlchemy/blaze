@@ -5035,21 +5035,40 @@ fn link(
         return Err(RustcLinkedLost { why: declined, onto: true }.into());
     }
     let reading = whole::read(object)?;
-    if let Some(patch) = patch.filter(|_| lock(&OWN_LINES).contains(cmd)) {
+    let replaced = if let Some(patch) = patch.filter(|_| lock(&OWN_LINES).contains(cmd)) {
         weaken::replaced(object, patch).with_context(|| {
             format!(
                 "making the definitions of {} that {} replaces weak",
                 object.display(),
                 patch.display()
             )
-        })?;
-    }
+        })?
+    } else {
+        None
+    };
+    let replaced_cmd = replaced
+        .as_ref()
+        .map(|copy| -> anyhow::Result<String> {
+            let mut args =
+                shlex::split(cmd).context("the whole build's link line is not quoted")?;
+            let base = object.display().to_string();
+            let input = args
+                .iter_mut()
+                .find(|arg| **arg == base)
+                .context("the whole build's link line does not name its base object")?;
+            *input = copy.path().display().to_string();
+            shlex::try_join(args.iter().map(String::as_str))
+                .context("a link argument has a NUL in it")
+        })
+        .transpose()?;
+    let original_cmd = cmd;
+    let cmd = replaced_cmd.as_deref().unwrap_or(cmd);
     if let Some(binary) = splice {
         headerpad_ahead(binary)?;
     }
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
-        Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
+        Some(reached) if lock(&REACHED_ONLY).contains(original_cmd) => {
             run_link(reached, start, &declined)?;
             reached
         }
@@ -5059,7 +5078,7 @@ fn link(
                     .downcast_ref::<LinkFailed>()
                     .is_some_and(|it| it.names_undefined_outside([Some(object), patch])) =>
             {
-                lock(&REACHED_ONLY).insert(cmd.to_owned());
+                lock(&REACHED_ONLY).insert(original_cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
                 run_link(reached, Instant::now(), again)?;
                 reached
@@ -5077,6 +5096,7 @@ fn link(
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
         run_link(cmd, Instant::now(), &again)?;
     }
+    drop(replaced);
     drop(reading);
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
