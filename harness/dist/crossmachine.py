@@ -45,7 +45,7 @@ source, `file!()`, an `OUT_DIR` file, a vendored crate, and proc macros.
 The memory guard of standing order 14 applies to every run: RA_JIT_MEMORY_MAX=16G,
 RA_JIT_OWN_BASE_MEMORY=12G and RA_JIT_SPARE=0, and the watchdog of harness/tracedecay.py over the
 run's whole process tree. Heavy work: run it as
-`/Users/bytedance/dev/blaze-targets/with-heavy-lock.sh c4-keys python3 -I harness/dist/crossmachine.py --all`.
+`with-heavy-lock.sh c4-keys python3 -I harness/dist/crossmachine.py --all`.
 
 Python 3 standard library only. macOS and Linux.
 """
@@ -58,7 +58,10 @@ for path in (HARNESS, HERE):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-DEFAULT_BIN = "/Users/bytedance/dev/blaze-targets/c4-keys/bin"
+# Where the unit's binaries are kept (the shared builds directory moved from ~/dev to ~/code on 2026-10-26).
+DEFAULT_BIN = next((it for it in ("/Users/bytedance/code/blaze-targets/c4-keys/bin",
+                                  "/Users/bytedance/dev/blaze-targets/c4-keys/bin") if os.path.isdir(it)),
+                   os.path.join(ROOT, "target", "release"))
 DEFAULT_WORK = "/tmp/c4xm"
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "paths")
 TOOLCHAIN = open(os.path.join(HARNESS, "toolchain")).read().strip()
