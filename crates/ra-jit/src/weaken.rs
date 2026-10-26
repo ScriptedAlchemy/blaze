@@ -90,7 +90,7 @@ enum Made {
 
 /// Makes the definitions of a Mach-O object weak; an object of another format stays as it is.
 pub(crate) fn definitions(data: &mut [u8]) {
-    weaken_but(data, |_| Made::Private);
+    weaken_but(data, |_, _| Made::Private);
 }
 
 /// As [`definitions`], for an object of ra-jit's. Of a program's whole, with a C `main` of
@@ -104,7 +104,7 @@ pub(crate) fn definitions(data: &mut [u8]) {
 /// Apple's linker exports no private one. The names of Rust's and of ra-jit's are private.
 pub(crate) fn ours(data: &mut [u8]) {
     let has_main = defined(data).iter().any(|it| it == b"_main");
-    weaken_but(data, |name| {
+    weaken_but(data, |name, _| {
         let name = name.strip_prefix(b"_").unwrap_or(name);
         let stays = name == b"main"
             || crate::stub::ALLOCATOR_FUNCTIONS.iter().any(|it| it.as_bytes() == name);
@@ -113,6 +113,21 @@ pub(crate) fn ours(data: &mut [u8]) {
             _ if of_rust(name) => Made::Private,
             _ => Made::Weak,
         }
+    });
+}
+
+/// As [`ours`], for the standard library's unit ([`crate::std_unit`]), which a program is
+/// linked over. The program refers to what the unit defines and compiles its own copy of what
+/// the unit has only a stand-in for, and tells the two apart by how the unit has them
+/// ([`crate::defined_symbols`]). A stand-in is hidden, as in the unit of ELF, and stays hidden
+/// and strong; what the unit defines for the program is made private and weak, as `ours` has
+/// it. Both are private: the program exports neither, and the linker leaves out what it does
+/// not reach.
+pub(crate) fn library(data: &mut [u8]) {
+    weaken_but(data, |name, hidden| match () {
+        _ if hidden => Made::Kept,
+        _ if of_rust(name.strip_prefix(b"_").unwrap_or(name)) => Made::Private,
+        _ => Made::Weak,
     });
 }
 
@@ -129,14 +144,16 @@ fn of_rust(name: &[u8]) -> bool {
 fn defined(data: &[u8]) -> Vec<Vec<u8>> {
     let mut data = data.to_vec();
     let mut names = Vec::new();
-    weaken_but(&mut data, |name| {
+    weaken_but(&mut data, |name, _| {
         names.push(name.to_vec());
         Made::Kept
     });
     names
 }
 
-fn weaken_but(data: &mut [u8], mut made: impl FnMut(&[u8]) -> Made) {
+/// Gives what becomes of each definition other objects can see to `made`, with its name and
+/// whether it is private to the program (hidden) already.
+fn weaken_but(data: &mut [u8], mut made: impl FnMut(&[u8], bool) -> Made) {
     let Some((symbols, strings)) = symbol_table(data) else { return };
     let (Some(names), Some(_)) = (data.get(strings.clone()), data.get(symbols.clone())) else {
         return;
@@ -152,7 +169,7 @@ fn weaken_but(data: &mut [u8], mut made: impl FnMut(&[u8]) -> Made) {
         }
         let name = names.get(symbol.n_strx.get(LE) as usize..).unwrap_or_default();
         let name = name.split(|&it| it == 0).next().unwrap_or_default();
-        let made = made(name);
+        let made = made(name, symbol.n_type & N_PEXT != 0);
         if made == Made::Private {
             symbol.n_type |= N_PEXT;
         }

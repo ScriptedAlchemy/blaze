@@ -9,8 +9,8 @@ as it does under rustdoc.
 The steps: every example passes; an example of the first two libraries fails, and cargo stops
 after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`. In each, the exit status, the results of
 each library in turn, the `Doc-tests` lines and cargo's lines of what failed have to be
-cargo's, every example has to be ra-jit's (on macOS std's writable statics leave them to
-rustc, #255), and ra-jit has to have loaded the workspace once.
+cargo's, every example has to be ra-jit's, on macOS too (#255), and ra-jit has to have
+loaded the workspace once.
 A difference is WRONG and fails the run."""
 import os
 import re
@@ -48,10 +48,6 @@ WORKSPACE = {
     "gamma/src/lib.rs": "/// ```\n/// assert_eq!(beta::quadruple(gamma::one()), 4);\n/// ```\n"
     "pub fn one() -> u32 {\n    1\n}\n",
 }
-
-# On macOS every example is rustc's for this one reason, whichever of std's writable statics
-# (`CLEANUP`, `GLOBAL_PANIC_COUNT`) is reached first (#255); any other is still WRONG.
-MACOS_LEFT = re.compile(r"unsupported: writable static `\w+` without a rustc symbol$")
 
 STEPS = [
     ("every example passes", [], {}),
@@ -100,7 +96,6 @@ def main():
             got, said = tested(ws, ["ra-jit"], args, extra, os.path.join(scratch, "ra-jit"))
             loads = len(re.findall(r"(?m)^load workspace: ", said))
             left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
-            left = [it for it in left if not (sys.platform == "darwin" and MACOS_LEFT.search(it))]
             built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
             parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
             differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
