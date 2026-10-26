@@ -341,7 +341,9 @@ with one worktree moved through `K` heads by file edits is the policy to compare
 
 ### M4. Idle reclaim A/B
 
-On the same worker after M1's last pair: type GC alone, solver caches alone, purge alone,
+On the same worker after M1's last pair: solver caches alone, the type GC (which clears the
+solver caches first on every thread and runs only when no thread solves: the collection is not
+run without them, so the GC's own share is the difference from the caches alone), purge alone,
 `background_thread:true` and one second of decay, each as its own run from the same state;
 record the figure and the next edit's time (the page faults the purge costs). Settles items 1
 and 6's order.
