@@ -8,6 +8,20 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- The whole build (`RA_JIT_WHOLE_BUILD=1`) compiles and runs its build scripts itself, with no
+  cargo and no rustc (`crates/ra-jit/src/scripts.rs`): each script and its build dependencies are
+  compiled by blaze from source, run as cargo 1.99 runs them in an `OUT_DIR` below
+  `target/ra-jit/build-scripts`, and what they print is given to the crates the load reads. When
+  one is compiled or run again is cargo's rule, ported into `blaze-build-script` (`fresh`,
+  `files`) over blaze's own records: the files and the variables (`env!`, `option_env!`) every
+  crate the script links read, what the last run said, the package's files as cargo's
+  `PathSource` lists them (git's tracked and untracked files, `include`, `exclude`, hidden files,
+  packages inside), the output of the last run, and the runs of the `links` dependencies. Its
+  plan is blaze's too (blaze-manifest's profiles and flags, no `cargo build --unit-graph` or
+  `cargo config get`). A build whose graph has a proc macro still has cargo's check build it and
+  run the scripts (no-rustc step J). `harness/scriptedits.py` holds 42 probes of it to cargo, and
+  `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole
+  build.
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
@@ -798,8 +812,13 @@ All notable changes to ra-jit are written here. The format follows
   workspace are watched; a build's requests to the worker run a script once, and a load takes
   what the check ran; and a script sees the variables of the process that asks, not those of the
   process that started the daemon. `harness/scriptedits.py` holds 34 probes of it to cargo.
-- A build script run the store kept is replayed only for the contents `OUT_DIR` held when it
-  ran, so a script that counts in `OUT_DIR` is run again as cargo runs it.
+- A build script run is no longer replayed from the store (`ra-jit build-script`): what a
+  script reads besides the files it names, and what it does beside its `OUT_DIR` (a file
+  elsewhere, an extended attribute), are in no key a run is kept under, so a run that is to
+  happen happens.
+- Two builds that ask one daemon at once are two builds: each request carries the number of
+  its own build to the worker, where the worker kept the last one asked, and a script cargo runs
+  every build runs for each.
 
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).

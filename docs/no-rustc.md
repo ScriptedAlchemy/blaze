@@ -885,11 +885,30 @@ two things the port missed: a `cargo check` has no artifact directory, so `targe
 not in the library path, and the certificates above. Not yet: the description filled by
 blaze's own manifest reader and resolver (the harness fills it from cargo), the run inside
 `ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs` and
-`link.rs` reading output with this crate. `inputs.rs` has it since 2026-10-26: what a script says it
-reads (`output::reads`) and when it runs again (`apply::Rerun`), for the daemon's whole build to ask
-for a script's run exactly when cargo would (docs/distributed.md, P0.5; `harness/scriptedits.py`).
-The run itself is still the `cargo check` of the daemon's load in `target/rust-analyzer`, with
-ra-jit compiling the scripts: this crate does not run a script in a build yet.
+`link.rs` reading output with this crate. Until 2026-10-26 (unit p05r) the whole build ran its
+scripts in the `cargo check --compile-time-deps` of the daemon's load, in `target/rust-analyzer`,
+and that check had rustc compile each script and its build dependencies (**measured** by
+p05w-verify: two checks and four rustc compiles for a script and one build dependency over a cold
+build and an edit); only the decision to ask for it again was blaze's (`inputs.rs`, `apply::Rerun`,
+`output::reads`).
+
+Since then the whole build (`RA_JIT_WHOLE_BUILD=1`) runs no cargo and no rustc for its scripts
+(`crates/ra-jit/src/scripts.rs`): the daemon's load describes each script and its build
+dependencies from blaze's own reading of the workspace, has blaze compile and link them
+(`own_script::link_planned`, every crate from source over the standard library's unit), runs the
+script with this crate (`env`, `run`, `output::parse`) in an `OUT_DIR` of its own below
+`target/ra-jit/build-scripts`, and loads the crates with what it said. When a script is compiled
+or run again is cargo 1.99's rule, ported (`blaze_build_script::fresh`, `files`), over blaze's own
+records: the dep-info of every crate the script links (`--inputs`), the variables `env!` and
+`option_env!` read among it; the fingerprint of the run (what the last run said, the package's
+files as `PathSource::list_files` lists them, git's lists included, the compile of the script and
+the runs of its `links` dependencies); and the output of the last run, which has to be there. A run
+is never replayed from the store. Each build of the daemon's judges a script once, by the number
+its request carries. The whole build's plan is blaze's too (`plan::Plan::own`: blaze-manifest's
+profiles and flags, no `cargo build --unit-graph` or `cargo config get`). A build dependency that
+is a proc macro is refused with the reason; `harness/scriptedits.py` holds the rest to cargo, and
+`harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole build
+([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md), "blaze runs the scripts").
 
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,

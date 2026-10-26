@@ -142,13 +142,17 @@ nothing is handed to cargo:
     error: `kuses` can reach functions blaze could not compile, so it is not built:
       `khalf::halved`: unsupported: f16 and f128
 
-Build scripts and proc macros are still built and run as the daemon's load does
-(`target/rust-analyzer`). A script runs again when cargo 1.99 would run it: for a file it named
+Build scripts are compiled and run by blaze itself (`crates/ra-jit/src/scripts.rs`), with
+no cargo and no rustc: each script and its build dependencies are compiled by blaze from source,
+and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the environment cargo
+1.99 gives it. A build whose graph has a proc macro still has the daemon's load build it with
+cargo's check (`target/rust-analyzer`), which then runs the scripts too (no-rustc step J). A script runs again when cargo 1.99 would run it: for a file it named
 with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
 every build), for a variable it named whose value is another (unset, empty and set are three), for
 any file of its package when it named nothing, for a change to the script, its modules or a
-package it is built with, and once more for having said other than it did the run before. It is
-run once for a build, with the variables of the process that asks. `harness/scriptedits.py` holds
+package it is built with (a file, or a variable `env!` or `option_env!` read there), for the
+output of its last run being gone, and once more for having said other than it did the run before.
+It is run once for a build, with the variables of the process that asks; two builds at once are two. `harness/scriptedits.py` holds
 that to cargo ([harness.md](harness.md)). A build of libraries alone and `test` are as without the
 setting.
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and

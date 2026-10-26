@@ -4,6 +4,10 @@ Unit p05w of the distributed program, 2026-10-26, branch `dist/p05w`. I ran ever
 ran" means that. Claims are labelled as in the other reports: **measured** is a number I took
 here, **read** is from the code, **reported** is another report's.
 
+Unit p05r (2026-10-26, same branch) replaced the finding below: the whole build compiles and runs
+its build scripts itself, with no `cargo check` and no rustc; see [blaze runs the
+scripts](#blaze-runs-the-scripts-unit-p05r). The sections before it are p05w's, as it left them.
+
 ## What was asked, and what the whole build is
 
 [distributed.md](../distributed.md)'s P0-D wants tracedecay's edits built by blaze, not cargo, and
@@ -223,3 +227,191 @@ cargo +1.99.0 test -p blaze-build-script -p ra-jit                # macOS arm64:
 ```
 The base is `git archive origin/dist/main` built into `/target-base`; the "before" column is
 `BIN=/target-base/release`. The container is removed when the unit is done.
+
+## blaze runs the scripts (unit p05r)
+
+Unit p05r, 2026-10-26, on `dist/p05w` (PR #12), after p05w-verify failed it on six findings. Same
+labels as above. I ran everything here.
+
+### What the whole build does now
+
+**Read.** The whole build's load (`RA_JIT_WHOLE_BUILD=1`) no longer calls rust-analyzer's
+`run_build_scripts`. `crates/ra-jit/src/scripts.rs` takes every package of the build that has a
+script, in dependency order:
+
+1. It describes the script and its build dependencies (their normal dependencies too, each with its
+   features, its host profile from blaze-manifest and, when it has a script, what that said) as a
+   `rust-project.json`, from blaze's own reading of the workspace, and has blaze compile and link
+   it (`own_script::link_planned`: every crate from source over the standard library's unit,
+   `--dep-info` and a new `--inputs`, the dep-info of every crate linked but the standard
+   library's, with the variables `env!` and `option_env!` read). The compile runs with the
+   variables of the process that asked, and `[env]`.
+2. It runs the script with `blaze-build-script` (`env`, `run`, `Ran::finish`) in an `OUT_DIR` below
+   `target/ra-jit/build-scripts/<profile>/build/<package>-<hash>`, the hash of the package, its
+   features, profile, flags, target and compiler, as cargo keys a run's directory.
+3. It reads what the script printed as cargo does (`output::parse`) and gives it to the crates the
+   load reads, as `cargo check`'s messages would have (`OUT_DIR`, cfgs, variables); the link reads
+   the libraries it named from the `output` beside `OUT_DIR`, as before.
+
+When a script is compiled again, or run again, is cargo 1.99's rule ported into blaze
+(`blaze_build_script::fresh` and `files`, from `fingerprint/mod.rs` and `sources/path.rs` at
+5f94df478), over records of blaze's own beside what it made, not cargo's:
+
+- **Compile** (`blaze-compile.json`): again when the description, the flags or the compiler
+  changed, a file the `--inputs` dep-info names was written after the compile began, or a variable
+  it read is other now (finding 2).
+- **Run** (`blaze-run.json`, cargo's `Fingerprint` of a run): what the run depends on (the hash of
+  the compile, the runs of the dependencies with `links`), the flags, the compiler and what the run
+  reads (`Local`): the files and variables the last run named, or, when it named neither, the
+  package's newest file as cargo's `PathSource::list_files` lists it: from git, tracked files and
+  untracked ones git does not ignore, a tracked file in `target` included and no untracked
+  `Cargo.lock`; or walked, without hidden files; `include` and `exclude` as gitignore lines;
+  packages inside left out; nothing left out for a `CACHEDIR.TAG` (finding 3). The run is done
+  again when that fingerprint is not the last run's, the output of the last run is not there
+  (finding 4), the script or a `links` dependency was made after it, or a file it named is not
+  there or was written after it began. A run that ends writes the fingerprint of what it named, or
+  keeps what was read before it when it named nothing; a run that fails leaves no record.
+- **A build judges each script once** (finding 1): the daemon numbers each `Request::Build` and
+  the number goes with the request to the worker (`Worker::ask(.., build)`); the worker keeps
+  nothing of the last build asked. The worker remembers which build judged each run directory, so
+  the build's other requests (the load's and one per program) neither run it again nor, when it
+  failed, succeed. A new worker's load runs with the variables of the client that started it
+  (`RA_JIT_LOAD_ENV`), not the daemon's.
+- **No replay** (finding 5): a run is never replayed from the store, in the whole build or by
+  `ra-jit build-script`, whose kept runs (`Kept`, `run_key`, `out_dir_state`) are gone: what a
+  script reads besides the files it names and what it does beside its `OUT_DIR` are in no key.
+- **No rustc and no compiling cargo** (finding 6): the load's plan is blaze's too
+  (`plan::Plan::own`: the packages and features of blaze's own metadata, blaze-manifest's
+  `Profiles::get_profile`, the flags from the variables and the configuration), so the worker runs
+  no `cargo build --unit-graph` and no `cargo config get`.
+- **Failure** (requirement 5): a script that fails fails the build (status 101) with cargo's
+  message (`Ran::finish`), and leaves no record, so the next build runs it again; nothing is
+  retried within a build.
+
+Not done: a build whose graph has a proc macro still has cargo's check build it, and that check runs
+the scripts as before (the worker says so in its log); blaze building proc macros without the check
+is no-rustc step J. A build dependency that is a proc macro is refused with the reason.
+
+### The probes
+
+`harness/scriptedits.py` has 42 cases: p05w's 34 and 8 for the six findings (finding 3 is three).
+**Measured**, Linux aarch64 in Docker (`rust:1.99.0-bookworm`, container capped at 6 GB with no swap,
+`--cpus 10`, `RA_JIT_MEMORY_MAX=5G`, `RA_JIT_OWN_BASE_MEMORY=3G`, `RA_JIT_SPARE=0`,
+`RUST_BACKTRACE=0`), one release binary, two full runs in a row: the first 41 of 42 cases and 192 of
+194 steps equal, the two others `no-compiler`'s, which then failed on any cargo run; the harness now
+fails it on rustc, rustdoc and compiling cargo runs and shows cargo's queries apart, and the second
+run is **194 of 194 steps, 42 of 42 cases equal** (`every case is cargo's`). Each run took about 3
+minutes (from the files' times; not a benchmark). The steps column is cargo's runs per step, which blaze's equal.
+
+| probe | steps | script runs per step (cargo's; blaze's equal) | equal |
+|---|---|---|---|
+| `counter` | 4 | 1 1 1 0 | 4/4 |
+| `watched` | 9 | 1 1 1 1 1 1 1 0 0 | 9/9 |
+| `watched-spelling` | 5 | 1 1 1 1 0 | 5/5 |
+| `writes-what-it-watches` | 4 | 1 1 1 1 | 4/4 |
+| `writes-its-package` | 4 | 1 1 1 1 | 4/4 |
+| `dir-gone` | 5 | 1 1 1 1 0 | 5/5 |
+| `unwatched-env` | 4 | 1 0 1 0 | 4/4 |
+| `missing` | 6 | 1 1 1 0 1 1 | 6/6 |
+| `missing-env` | 4 | 1 1 1 1 | 4/4 |
+| `two-programs` | 3 | 1 1 1 | 3/3 |
+| `env` | 10 | 1 1 0 1 1 1 1 0 1 0 | 10/10 |
+| `env-new` | 6 | 1 0 1 1 0 1 | 6/6 |
+| `env-later` | 4 | 1 1 1 0 | 4/4 |
+| `rustflags` | 5 | 1 1 0 1 0 | 5/5 |
+| `config-env` | 4 | 1 1 1 0 | 4/4 |
+| `manifest` | 4 | 1 1 0 0 | 4/4 |
+| `script-appears` | 4 | 0 1 0 0 | 4/4 |
+| `restart` | 5 | 1 0 1 0 0 | 5/5 |
+| `restart-missing` | 3 | 1 1 1 | 3/3 |
+| `release` | 5 | 1 1 1 0 0 | 5/5 |
+| `features` | 3 | 1 1 0 | 3/3 |
+| `new-syntax` | 4 | 1 1 1 0 | 4/4 |
+| `no-directives` | 6 | 1 1 1 1 1 0 | 6/6 |
+| `directives-dropped` | 5 | 1 1 1 0 1 | 5/5 |
+| `fails` | 5 | 1 1 1 1 0 | 5/5 |
+| `fails-once` | 5 | 1 1 1 1 0 | 5/5 |
+| `cfg-env` | 5 | 1 1 1 0 0 | 5/5 |
+| `utf8` | 3 | 1 1 1 | 3/3 |
+| `links` | 5 | 2 2 2 1 0 | 5/5 |
+| `script-module` | 4 | 1 1 1 0 | 4/4 |
+| `build-dep` | 4 | 1 1 1 0 | 4/4 |
+| `out-dir` | 4 | 1 1 1 0 | 4/4 |
+| `include` | 4 | 1 1 0 0 | 4/4 |
+| `store` | 8 | 1 1 1 1 1 1 1 0 | 8/8 |
+| `two-clients` | 3 | 1 2 2 | 3/3 |
+| `compiler-env` | 6 | 1 1 0 1 1 0 | 6/6 |
+| `package-cachedir` | 3 | 1 1 0 | 3/3 |
+| `package-include` | 4 | 1 0 1 0 | 4/4 |
+| `package-git` | 5 | 1 1 0 1 0 | 5/5 |
+| `output-gone` | 3 | 1 1 0 | 3/3 |
+| `out-dir-xattr` | 3 | 1 1 0 | 3/3 |
+| `no-compiler` | 4 | 1 1 1 0 | 4/4 |
+
+What `no-compiler` (`strace -f` of blaze's build: every program the client, the daemon and its
+workers started) saw, **measured**: no rustc and no rustdoc in any step, and no `cargo check`; the
+cold build asked cargo 8 times (16 execs, each through rustup's proxy) and the edit of the build
+dependency 2, compiling nothing (below).
+
+### P0-A on a hello-world with a build script and a build dependency
+
+`harness/tracedecay.py --predicate P0-A --whole` (new: the whole build's P0-A, the build and the
+program, `--whole-edit` for edits) with `norustc.py`'s stand-in rustc, rustdoc and cargo, on a
+workspace of `helper` (a library) and `hello` (a program whose `build.rs` uses `helper` as a build
+dependency and writes what `include!` reads), in the same container. **Measured**, one run:
+
+| step | build | compiler runs | cargo runs |
+|---|---|---|---|
+| cold build | 0, 14.7 s | 0 | 8 |
+| edit `helper/src/lib.rs` | 0, 0.6 s | 0 | 2 |
+| edit `hello/src/main.rs` | 0, 0.04 s | 0 | 0 |
+| build of nothing | 0, 0.03 s | 0 | 0 |
+
+The program printed `hello helper=two edit=2`. **0 compiler execs** (p05w-verify measured 4 rustc
+compiles and 2 `cargo check`s for the same shape). **P0-A's 0-cargo bar is not met**: the 10 cargo
+runs are rust-analyzer's own loading, not the scripts': in the worker's load `cargo -Z
+unstable-options config get` (`CargoConfigFile::load`), `cargo --version` (`version::get`), `cargo
+rustc --print cfg` and `--print target-spec-json` (`QueryConfig::Cargo`), and `cargo metadata
+--no-deps` and `cargo metadata` of the standard library's workspace (`Sysroot::load_workspace`),
+which every load asks, the load of each script's compile (`ra-jit <rust-project.json>`) included,
+so the edit of `helper` asks it twice. They answer questions and compile nothing (the stand-in
+rustc ran 0 times). Replacing them is the next unit: the configuration and the standard library's
+graph from blaze-manifest and blaze-metadata, as the workspace's already are.
+
+### Tests
+
+`cargo +1.99.0 test -p blaze-build-script -p ra-jit` on the Mac (macOS arm64), through
+`with-heavy-lock.sh` with a private `CARGO_TARGET_DIR` and the top-MEM watchdog: **47 + 217 passed,
+0 failed** (p05w's 36 + 217: 11 new in `blaze-build-script`, `files` and `fresh`; in `ra-jit` 3 new,
+the concurrency test of the daemon's builds and two of the runner's, and 3 gone with the store's
+kept runs). Watchdog: 77 samples, peak top MEM 2142 MB, no swap growth. Not run on Linux.
+`python3 harness/rustcsites.py`: 15 places start rustc, rustdoc or cargo, none new, as before
+(`scripts.rs` starts only blaze itself, and `files.rs` git, which compiles no Rust).
+
+### Deviations
+
+- P0-A's 0-cargo bar is not met (above); 0 compiler execs is.
+- A whole build with a proc macro in its graph keeps cargo's check, which runs its scripts.
+- `no-compiler` fails on rustc, rustdoc and compiling cargo, not on cargo's queries, which it lists.
+- Memory: 5G and 3G in a 6 GB container, as p05w did, under the Docker VM's 8 GB.
+- The probes ran on Linux only; the Mac ran the unit tests.
+
+### Commands
+
+```
+git fetch origin && git switch -c dist/p05r origin/dist/p05w
+docker run -d --platform linux/arm64 --name p05r --memory 6g --memory-swap 6g --cpus 10 \
+  -v $PWD:/work -v p05r-target:/target -v p05r-cargo:/usr/local/cargo/registry \
+  -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS=6 -w /work rust:1.99.0-bookworm sleep infinity
+docker exec p05r bash -c 'rustup component add rust-src; apt-get install -y python3 strace attr git time'
+# each of these under with-heavy-lock.sh p05r, in the container:
+cargo +1.99.0 build -p ra-jit --release
+RA_JIT_BIN=/target/release/ra-jit RA_JIT_MEMORY_MAX=5G RA_JIT_OWN_BASE_MEMORY=3G RA_JIT_SPARE=0 \
+  RUST_BACKTRACE=0 PATH=/target/release:$PATH python3 -I harness/scriptedits.py --work /suite --json /suite.json
+python3 -I harness/tracedecay.py --td /p0a/hello --work /p0a-work --blaze-bin /target/release \
+  --package hello --program hello --memory-max 5G --own-base-memory 3G --predicate P0-A --whole \
+  --whole-edit helper/src/lib.rs one two --whole-edit hello/src/main.rs "EDIT: u32 = 1" "EDIT: u32 = 2"
+# on the Mac, under the lock and the watchdog:
+CARGO_TARGET_DIR=<private> cargo +1.99.0 test -p blaze-build-script -p ra-jit
+python3 harness/scriptedits.py --selftest; python3 harness/rustcsites.py
+```
