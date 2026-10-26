@@ -4321,8 +4321,12 @@ fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(Strin
     for named in args.crates() {
         program.extend(crates_named(db, named, args)?);
     }
-    let objects: Vec<&Path> =
-        std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
+    // The patch is ahead of the object, as on the line of a build over rustc's: a link the
+    // splice declines has the edit too.
+    let objects: Vec<&Path> = (args.patch.iter().map(PathBuf::as_path))
+        .chain([args.out.as_path()])
+        .chain(args.prebuilt.as_deref())
+        .collect();
     let sysroot = SYSROOT.get().and_then(Option::as_deref);
     let cmd = link::command(db, &program, &objects, sysroot, exe)?;
     Ok(Some((cmd, exe.clone())))

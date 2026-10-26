@@ -52,7 +52,8 @@ pub(crate) fn executable(
 }
 
 /// The command that links `objects` into the executable `exe` as [`executable`] does, for a
-/// shell: the daemon's line, which its edits are spliced after.
+/// shell: the daemon's line, which its edits are spliced after. The first of `objects` is the
+/// patch of the object after it: a definition of the patch is the one that stays.
 pub(crate) fn command(
     db: &RootDatabase,
     program: &[Crate],
@@ -77,6 +78,9 @@ pub(crate) fn command(
         }
     }
     args.extend(line.after.iter().cloned());
+    let splices = crate::cargo::plan::whole_link_args(line.apple, exe)
+        .with_context(|| format!("writing what the link of {} asks for", exe.display()))?;
+    args.extend(splices);
     args.extend(["-o".to_owned(), exe.display().to_string()]);
     shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
 }

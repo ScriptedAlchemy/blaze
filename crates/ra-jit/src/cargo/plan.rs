@@ -513,12 +513,7 @@ impl LinkLine {
         if self.flavor == Flavor::Apple {
             // Last, so that it is what the linker takes: it is at least what the line asks.
             let asked = self.args.iter().filter_map(|it| headerpad_in(it)).last();
-            let kept = headerpad_of(binary);
-            let pad = asked.unwrap_or(HEADERPAD).max(kept.unwrap_or(0));
-            if kept != Some(pad) {
-                write_headerpad(binary, pad)?;
-            }
-            let file = headerpad_file(binary);
+            let file = headerpad_at_least(binary, asked)?;
             command.push(shlex::try_quote(&format!("@{}", file.display()))?.into_owned());
         }
         Ok(command.join(" "))
@@ -659,6 +654,30 @@ pub(crate) fn kept_builtins() -> String {
     let kept: Vec<String> =
         hir_ty_codegen::BUILTINS.iter().map(|it| format!("--undefined={it}")).collect();
     format!("{TO_THE_LINKER}{}", kept.join(","))
+}
+
+/// [`headerpad_file`] of the Apple executable at `binary`, asking for at least `asked`, or
+/// [`HEADERPAD`], and what the links before it asked for.
+fn headerpad_at_least(binary: &Path, asked: Option<u64>) -> std::io::Result<PathBuf> {
+    let kept = headerpad_of(binary);
+    let pad = asked.unwrap_or(HEADERPAD).max(kept.unwrap_or(0));
+    if kept != Some(pad) {
+        write_headerpad(binary, pad)?;
+    }
+    Ok(headerpad_file(binary))
+}
+
+/// What the line of a whole build (`link::command`), which the daemon writes itself, is told
+/// besides what the program links, as the daemon's links of the lines rustc gave it are: on
+/// Apple fixups in tables and the room after the load commands, which a splice reads and
+/// makes way in; on ELF that the first definition of a name stays, the patch's, which the line
+/// has ahead of the object it patches.
+pub(crate) fn whole_link_args(apple: bool, binary: &Path) -> std::io::Result<Vec<String>> {
+    if !apple {
+        return Ok(vec![FIRST_DEFINITION_STAYS.to_owned()]);
+    }
+    let file = headerpad_at_least(binary, None)?;
+    Ok(vec![NO_FIXUP_CHAINS.to_owned(), format!("@{}", file.display())])
 }
 
 pub(crate) fn write_headerpad(binary: &Path, pad: u64) -> std::io::Result<()> {
