@@ -35,7 +35,12 @@ struct Sharing<'g> {
     index: FxHashMap<Key, Vec<usize>>,
 }
 
-pub(super) fn share(env: &Env<'_>, graph: &Graph, roots: &[usize]) -> Shared {
+pub(super) fn share(
+    env: &Env<'_>,
+    graph: &Graph,
+    roots: &[usize],
+    doctest_libraries: &[usize],
+) -> Shared {
     let mut sharing = Sharing {
         graph,
         memo: FxHashMap::default(),
@@ -44,6 +49,13 @@ pub(super) fn share(env: &Env<'_>, graph: &Graph, roots: &[usize]) -> Shared {
         index: FxHashMap::default(),
     };
     let roots: Vec<usize> = roots.iter().map(|&root| sharing.traverse(root, false)).collect();
+    // These libraries are dependencies of omitted doctest units, not command roots.
+    // In particular a proc macro's library keeps the host's debuginfo policy even
+    // when its test executable is a root with the full test profile.
+    for &library in doctest_libraries {
+        let is_for_host = env.target(&graph.arena.units[library]).for_host;
+        sharing.traverse(library, is_for_host);
+    }
     let Sharing { units, deps, .. } = sharing;
 
     // The units in cargo's order; those that differ only in their dependencies in the order

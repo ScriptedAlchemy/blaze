@@ -405,11 +405,13 @@ fn unit_specs(
         }
         let profile = profile::spec(&unit.profile, &flags.overrides, settings, &describe(unit))?;
         let kind = unit.target.kind;
-        let test = (unit.mode == Mode::Test && unit.target.harness)
-            || (unit.mode == Mode::Check && matches!(kind, TargetKind::Test | TargetKind::Bench));
+        // The graph distinguishes normal and test checks of the same library or
+        // binary. Target kind alone loses that distinction. A custom harness still
+        // receives cfg(test), but cargo uses --cfg test rather than --test for it.
+        let test = unit.test && unit.target.harness;
         let mut cfg: Vec<String> =
             unit.features.iter().map(|it| format!("feature=\"{it}\"")).collect();
-        if test {
+        if unit.test {
             cfg.push("test".to_owned());
         }
         if kind == TargetKind::ProcMacro {

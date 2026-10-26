@@ -445,11 +445,11 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
         warnings: &mut warnings,
     };
     let roots = generator.generate_root_units(&mut arena)?;
+    let doctest_libraries = generator.doctest_libraries(&mut arena)?;
     let mut reachable = roots.clone();
-    reachable.extend(generator.doctest_libraries(&mut arena)?);
+    reachable.extend(&doctest_libraries);
     let graph = deps::build(&env, arena, &reachable)?;
-    let mut shared = share::share(&env, &graph, &reachable);
-    shared.roots.truncate(roots.len());
+    let shared = share::share(&env, &graph, &roots, &doctest_libraries);
     warnings.extend(ctx.config.take_warnings());
     assemble(&env, &shared, ws.root(), &locked, warnings)
 }

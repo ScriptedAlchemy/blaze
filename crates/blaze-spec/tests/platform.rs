@@ -457,27 +457,44 @@ fn a_platform_is_a_pure_function_of_the_machine() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::print_stderr)]
 fn the_system_probe_reads_this_machine() {
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    let machine = Machine { triple: TRIPLE, cpu: CPU, env: &env, linker: None };
+    let triple = if cfg!(target_os = "macos") {
+        format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else {
+        let abi = if cfg!(target_env = "musl") { "musl" } else { "gnu" };
+        format!("{}-unknown-linux-{abi}", std::env::consts::ARCH)
+    };
+    let machine = Machine { triple: &triple, cpu: std::env::consts::ARCH, env: &env, linker: None };
     let platform: ExecPlatform = exec_platform(&machine, &System).unwrap();
     eprintln!("{platform:#?}");
-    assert_eq!(platform.triple, TRIPLE);
-    assert_eq!(platform.os.split(' ').next(), Some("macos"));
-    assert!(platform.sdk.is_some(), "this machine has an SDK");
-    assert_eq!(platform.libc, None);
+    assert_eq!(platform.triple, triple);
+    assert_eq!(platform.os.split(' ').next(), Some(std::env::consts::OS));
+    if cfg!(target_os = "macos") {
+        assert!(platform.sdk.is_some(), "this machine has an SDK");
+        assert_eq!(platform.libc, None);
+    } else {
+        assert_eq!(platform.sdk, None);
+        assert!(platform.libc.is_some(), "this machine has a libc");
+    }
     assert!(platform.cc.is_some(), "this machine has a C compiler");
     assert!(platform.cxx.is_some(), "this machine has a C++ compiler");
     assert!(platform.ar.is_some(), "this machine has an archiver");
-    assert!(platform.native_root.is_some(), "this machine's SDK is readable");
+    assert!(platform.native_root.is_some(), "this machine's native libraries are readable");
     // `/usr/bin`'s shim is resolved to the developer directory's clang, whose bytes name the
     // compiler; the shim's own bytes are one stub for every tool there and name nothing.
-    let (name, version, compiler) = platform.cc.as_ref().unwrap();
-    assert_eq!(name, "cc");
+    let (_, version, _) = platform.cc.as_ref().unwrap();
     assert!(!version.is_empty());
-    let shim = std::fs::read("/usr/bin/cc").expect("this machine has /usr/bin/cc");
-    assert_ne!(*compiler, digest(&shim));
+    if cfg!(target_os = "macos") {
+        // Probe the shim directly: CC may select a different executable or launcher.
+        let shim_env = vars(&[("PATH", "/usr/bin:/bin"), ("CC", "/usr/bin/cc")]);
+        let shim_machine = Machine { env: &shim_env, ..machine };
+        let resolved = exec_platform(&shim_machine, &System).unwrap();
+        let shim = std::fs::read("/usr/bin/cc").expect("this machine has /usr/bin/cc");
+        assert_ne!(resolved.cc.as_ref().unwrap().2, digest(&shim));
+    }
     // Two calls read one platform: the digests are stable.
     let again = exec_platform(&machine, &System).unwrap();
     assert_eq!(platform, again);

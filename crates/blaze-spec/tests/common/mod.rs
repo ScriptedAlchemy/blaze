@@ -318,7 +318,9 @@ pub fn graph(units: Vec<Make>, roots: &[usize], profile: &Profile) -> UnitGraph 
                 tested: true,
             },
             mode: make.mode,
-            test: make.mode == Mode::Test,
+            test: make.mode == Mode::Test
+                || (make.mode == Mode::Check
+                    && matches!(make.kind, TargetKind::Test | TargetKind::Bench)),
             profile: make.profile.unwrap_or_else(|| profile.clone()),
             features: make.features,
             for_host: make.for_host,

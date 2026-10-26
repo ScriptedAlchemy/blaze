@@ -355,6 +355,12 @@ impl Generator<'_, '_> {
                     let test = self.new_unit(arena, pkg, at, CMode::Test)?;
                     let mut library = arena.units[test].clone();
                     library.mode = CMode::Build;
+                    // rustdoc loads a proc macro as a build dependency. Its own test
+                    // executable has the test profile, but the library it loads must
+                    // use build overrides and deferred host debuginfo.
+                    if target.proc_macro {
+                        library.profile = self.env.profile(pkg, UnitFor::new_host(true));
+                    }
                     libraries.push(arena.intern(library));
                 }
             }

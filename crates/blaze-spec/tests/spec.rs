@@ -185,16 +185,16 @@ fn a_unit_is_what_the_graph_says_it_is() {
     assert!(
         has("lib", "feature=\"x\"") && has("lib", "feature=\"y\"") && !has("lib", "feature=\"z\"")
     );
-    // `test` is a unit compiled with `--test`, a check of a test target too; a custom harness is not.
-    for (name, test) in [
-        ("lib", false),
-        ("itest", true),
-        ("custom", false),
-        ("custom_test_mode", false),
-        ("bench", true),
-        ("bin", false),
+    // A custom harness gets cfg(test) without asking rustc to generate libtest.
+    for (name, test, test_cfg) in [
+        ("lib", false, false),
+        ("itest", true, true),
+        ("custom", false, false),
+        ("custom_test_mode", false, true),
+        ("bench", true, true),
+        ("bin", false, false),
     ] {
-        assert_eq!((unit(name).test, has(name, "test")), (test, test), "{name}");
+        assert_eq!((unit(name).test, has(name, "test")), (test, test_cfg), "{name}");
     }
     assert!(unit("script").host && unit("macro").host && !unit("lib").host);
     assert!(has("macro", "proc_macro") && !has("lib", "proc_macro"));
@@ -213,6 +213,44 @@ fn a_unit_is_what_the_graph_says_it_is() {
     assert_eq!(unit("dep").package.2, <[u8; 32]>::from(Sha256::digest(REGISTRY.as_bytes())));
     assert_eq!(unit("lib").package.2, <[u8; 32]>::from(Sha256::digest(b"path+lib")));
     assert_eq!(spec.build.profile.name, "test");
+}
+
+#[test]
+fn normal_and_test_checks_of_a_library_or_binary_remain_distinct() {
+    let fixture = Fixture::new();
+    for kind in [TargetKind::Lib, TargetKind::Bin, TargetKind::Example] {
+        let checked = |profile: &Profile| {
+            let mut graph = graph(
+                vec![
+                    Make::new("a", kind).mode(Mode::Check),
+                    Make::new("a", kind).mode(Mode::Check),
+                ],
+                &[0, 1],
+                profile,
+            );
+            graph.units[1].test = true;
+            graph
+        };
+        let spec =
+            spec(&fixture, &fixture.env(), Subcommand::Check, &["--all-targets"], Some(&checked))
+                .unwrap();
+        assert_eq!(spec.build.units.len(), 2, "{kind:?}");
+        assert_eq!(spec.build.asked.len(), 2, "{kind:?}");
+        for unit in &spec.build.units {
+            assert_eq!(unit.test, unit.cfg.iter().any(|cfg| cfg == "test"));
+        }
+        assert_eq!(spec.build.units.iter().filter(|unit| unit.test).count(), 1);
+    }
+}
+
+#[test]
+fn custom_harness_checks_enable_test_cfg_without_libtest() {
+    let fixture = Fixture::new();
+    let units = vec![Make::new("a", TargetKind::Test).mode(Mode::Check).no_harness()];
+    let spec = build(&fixture, Subcommand::Check, &["--tests"], units, vec![0]).unwrap();
+    let unit = &spec.build.units[0];
+    assert!(!unit.test);
+    assert!(unit.cfg.iter().any(|cfg| cfg == "test"));
 }
 
 #[test]
@@ -244,6 +282,7 @@ fn the_cfgs_follow_the_profile_and_the_rustflags() {
         "foo".to_owned(),
         "bar=\"xy\"".to_owned(),
         "debug_assertions".to_owned(),
+        "overflow_checks".to_owned(),
         "panic=\"abort\"".to_owned(),
     ];
     want.sort_by_key(|it| encode(it));
