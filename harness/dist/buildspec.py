@@ -101,6 +101,9 @@ RUN_FIELDS = ("filters", "exact", "skip", "ignored", "no_run", "no_fail_fast", "
 COMMANDS = {0: "check", 1: "build", 2: "test", 3: "run"}
 KINDS = {0: "lib", 1: "bin", 2: "test", 3: "example", 4: "bench", 5: "build-script", 6: "proc-macro"}
 
+# A command that only makes a spec does not take longer than this (a local run has --timeout).
+SPEC_TIMEOUT = 300
+
 # The environment a case starts from: everything of the process's that is not about the build.
 SCRUB_PREFIXES = ("RA_JIT_", "CARGO_", "RUSTC", "RUSTDOC", "CC_", "CXX_", "TARGET_CC", "HOST_CC")
 SCRUB_NAMES = {"RUSTFLAGS", "RUSTUP_TOOLCHAIN", "CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS",
@@ -1501,10 +1504,11 @@ class Ctx:
             cbor = os.path.join(self.work, "specs", f"{case.fixture.name}__{case.name}.cbor")
             os.makedirs(os.path.dirname(cbor), exist_ok=True)
             args += ["--out", cbor]
-        run = self.blaze.run(args + case.words, os.path.join(tree, case.cwd), self.spec_env(case))
+        run = self.blaze.run(args + case.words, os.path.join(tree, case.cwd), self.spec_env(case), timeout=SPEC_TIMEOUT)
         res = CaseResult(case, run, tree, cbor)
         if case.expect == "base" and res.error is None:
-            again = self.blaze.run(["cargo", "spec"] + case.words, os.path.join(tree, case.cwd), self.spec_env(case))
+            again = self.blaze.run(["cargo", "spec"] + case.words, os.path.join(tree, case.cwd), self.spec_env(case),
+                                   timeout=SPEC_TIMEOUT)
             res.second = again
         return res
 
@@ -1606,7 +1610,7 @@ class Ctx:
         if not res.made:
             return {"status": "n/a", "note": "no spec"}
         tree = os.path.join(self.tree(case), case.cwd)
-        ran = self.blaze.run(["cargo", "spec", "--unit-graph"] + case.words, tree, self.spec_env(case))
+        ran = self.blaze.run(["cargo", "spec", "--unit-graph"] + case.words, tree, self.spec_env(case), timeout=SPEC_TIMEOUT)
         if ran.code != 0:
             return {"status": "ERROR", "diffs": [f"blaze: exit {ran.code}: {clip(ran.err or ran.out, 300)}"]}
         try:
@@ -2887,6 +2891,39 @@ def oracle_available():
         return False
 
 
+def self_test_oracle(t, tmp):
+    """cargo, as the oracle, on the fixtures the local arm runs: each builds, and the local
+    expectations (what a command's own run shows) hold of cargo's run. cargo is not the thing under
+    test here: it is what the expectations are written against."""
+    print("\ncargo as the oracle of the fixtures and of what the local runs expect (not blaze):")
+    env = scrubbed_env({"CARGO_HOME": os.path.join(tmp, "oracle-cargo-home")})
+    for fixture in fixtures():
+        fake_ctx = argparse.Namespace(work=tmp)
+        reason = fixture.skip(fake_ctx) if fixture.skip else None
+        if reason:
+            print(f"  skip {fixture.name}: {reason}")
+            continue
+        base = os.path.join(tmp, "oracle", fixture.name, "base")
+        write_files(base, fixture.files)
+        if fixture.setup:
+            fixture.setup(fake_ctx)
+        target = os.path.join(tmp, "oracle", fixture.name, "target")
+        for case in fixture.cases:
+            if not (case.local and case.lexpect):
+                continue
+            copy = os.path.join(tmp, "oracle", fixture.name, "case-" + case.name)
+            shutil.copytree(base, copy, symlinks=True)
+            for edit in case.edits:
+                apply_edit(copy, edit)
+            shutil.rmtree(target, ignore_errors=True)
+            cenv = dict(env, CARGO_TARGET_DIR=target)
+            cenv.update({k: (v or "").replace("@TOOLS@", os.path.join(tmp, "tools")) for k, v in case.env.items() if v is not None})
+            ran = subprocess.run(["cargo", f"+{TOOLCHAIN}", *case.words], cwd=os.path.join(copy, case.cwd), env=cenv, text=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+            got = check_lexpect(summarize(ran.stdout, target, ran.returncode), case.lexpect)
+            t.check(not got, f"cargo {' '.join(case.words)} on {case.full} shows what the case expects", "; ".join(got) + " | " + clip(ran.stdout[-300:]))
+
+
 def fake_args(fake, **kw):
     base = dict(bin=fake, work=None, only=[], no_local=True, no_cargo=True, keep=False, self_test=False, json=None, list=False,
                 timeout=300, shared_store=False, no_audit=False, units_with_doctest=False, spec_run_in="root")
@@ -2920,6 +2957,10 @@ def self_test(args):
     run_fixture_checks(t)
     tmp = tempfile.mkdtemp(prefix="rj-bs-self-", dir="/tmp")
     try:
+        if oracle_available():
+            self_test_oracle(t, tmp)
+        else:
+            print(f"\nskip the oracle's check of the local expectations: no cargo +{TOOLCHAIN}")
         fake = os.path.join(tmp, "bin", "ra-jit")
         os.makedirs(os.path.dirname(fake))
         with open(fake, "w") as f:
