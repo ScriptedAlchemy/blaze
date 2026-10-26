@@ -78,9 +78,25 @@ pub fn last_modified(files: &[PathBuf]) -> (SystemTime, PathBuf) {
 /// is when cargo lists the package from git (`discover_gix_repo`).
 fn git_repo(root: &Path) -> Option<PathBuf> {
     let top = git(root, &["rev-parse", "--show-toplevel"])?;
-    let top = PathBuf::from(String::from_utf8(top).ok()?.trim_end_matches('\n'));
+    let top = git_path(top.strip_suffix(b"\n").unwrap_or(&top)).ok()?;
     git(root, &["ls-files", "--error-unmatch", "--", "Cargo.toml"])?;
     Some(top)
+}
+
+/// `git -z` writes filenames as bytes. Unix paths need not be UTF-8, and dropping one would
+/// omit an input from a no-directive script's fingerprint.
+fn git_path(bytes: &[u8]) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
 }
 
 /// What `git -C dir args` prints, when it succeeds.
@@ -109,16 +125,18 @@ fn list_git(
     let mut packages: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for entry in listed.split(|it| *it == 0).filter(|it| !it.is_empty()) {
-        let Ok(entry) = std::str::from_utf8(entry) else { continue };
-        let Some((tag, name)) = entry.split_once(' ') else { continue };
-        let tracked = tag != "?";
-        let at = Path::new(name.trim_end_matches('/'));
+        if entry.get(1) != Some(&b' ') {
+            continue;
+        }
+        let tracked = entry[0] != b'?';
+        let name = &entry[2..];
+        let at = git_path(name.strip_suffix(b"/").unwrap_or(name))?;
         // `target/` is left out of the walk, and what the index tracks there is added back.
         let at_root = root == package;
         if !tracked && at_root && (at.starts_with("target") || at == Path::new("Cargo.lock")) {
             continue;
         }
-        let path = root.join(at);
+        let path = root.join(&at);
         if !seen.insert(path.clone()) {
             continue;
         }
@@ -136,7 +154,7 @@ fn list_git(
         if path.is_dir() {
             // A repository inside, or a link to a directory: walked with git when it is one.
             let top = git(&path, &["rev-parse", "--show-toplevel"]);
-            let top = top.map(|it| PathBuf::from(String::from_utf8_lossy(&it).trim_end()));
+            let top = top.and_then(|it| git_path(it.strip_suffix(b"\n").unwrap_or(&it)).ok());
             let same =
                 |a: &Path, b: &Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
             match top {

@@ -141,6 +141,39 @@ fn a_package_git_tracks_is_listed_from_git() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn git_listed_paths_do_not_need_to_be_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = package("git-bytes", &[("Cargo.toml", "[package]\n")]);
+    let root = dir.path();
+    assert!(git(root, &["init", "-q"]));
+    let tracked = root.join(std::ffi::OsStr::from_bytes(b"tracked-\xff"));
+    std::fs::write(&tracked, "old").unwrap();
+    assert!(git(root, &["add", "."]));
+    let untracked = root.join(std::ffi::OsStr::from_bytes(b"untracked-\xfe"));
+    std::fs::write(&untracked, "new").unwrap();
+    let files = list_files(root, &[], &[]).unwrap();
+    assert!(files.contains(&tracked), "a tracked script input must be fingerprinted");
+    assert!(files.contains(&untracked), "an untracked script input must be fingerprinted");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_checkout_is_still_listed_from_git() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = package("git-root-bytes", &[("placeholder", "")]);
+    let root = dir.path().join(std::ffi::OsStr::from_bytes(b"checkout-\xff"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    assert!(git(&root, &["init", "-q"]));
+    assert!(git(&root, &["add", "Cargo.toml"]));
+    std::fs::write(root.join(".hidden-input"), "").unwrap();
+    assert_eq!(listed(&root, &[], &[]), [".hidden-input", "Cargo.toml"]);
+}
+
 #[test]
 fn the_newest_file_is_the_first_of_the_latest_time() {
     let dir = package("newest", &[("a", ""), ("b", "")]);
