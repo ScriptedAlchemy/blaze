@@ -523,44 +523,66 @@ impl Entry {
     }
 
     /// Names the files under `cargo_home` and the standard library's as every machine does,
-    /// on the way to the store. Not to be kept when a file is already named as one that
-    /// cargo fetched and is not: it would be read back as one.
+    /// on the way to the store, and those below the checkout or beside it. Not to be kept when a
+    /// file is already named as one that cargo fetched, or as one of the checkout, and is not:
+    /// it would be read back as one.
     pub(super) fn leave(
         &mut self,
         cargo_home: Option<&str>,
         library: Option<&super::LibrarySources>,
+        checkout: Option<&str>,
     ) -> bool {
         for file in self.files() {
             if let Some(there) = library.and_then(|it| it.stored(file)) {
                 *file = there;
             }
         }
-        if cargo_home == Some(super::CARGO_HOME) {
-            return true;
+        if cargo_home != Some(super::CARGO_HOME) {
+            if self.of_cargo() {
+                return false;
+            }
+            if let Some(home) = cargo_home {
+                for file in self.files() {
+                    if let Some(there) = super::moved(file, home, super::CARGO_HOME) {
+                        *file = there;
+                    }
+                }
+            }
         }
-        if self.of_cargo() {
-            return false;
-        }
-        let Some(home) = cargo_home else { return true };
-        for file in self.files() {
-            if let Some(there) = super::moved(file, home, super::CARGO_HOME) {
-                *file = there;
+        // After cargo's directory: it can be beside the checkout, and is named by what it is.
+        if let Some(root) = checkout.filter(|it| *it != super::CHECKOUT) {
+            if self.files().any(|it| super::names_checkout(it)) {
+                return false;
+            }
+            for file in self.files() {
+                if let Some(there) = super::stored_as(file, root) {
+                    *file = there;
+                }
             }
         }
         true
     }
 
-    /// Names the files of cargo's directory and the standard library's as this machine
-    /// does, on the way from the store. `None` when the entry has files of cargo's and this
-    /// machine has no such directory.
+    /// Names the files of cargo's directory, the standard library's and the checkout's as this
+    /// machine does, on the way from the store. `None` when the entry has files of cargo's and
+    /// this machine has no such directory, or one that goes up from the checkout past the top
+    /// of the disk.
     pub(super) fn arrived(
         mut self,
         cargo_home: Option<&str>,
         library: Option<&super::LibrarySources>,
+        checkout: Option<&str>,
     ) -> Option<Entry> {
         for file in self.files() {
             if let Some(here) = library.and_then(|it| it.local(file)) {
                 *file = here;
+            }
+        }
+        if let Some(root) = checkout.filter(|it| *it != super::CHECKOUT) {
+            for file in self.files() {
+                if super::names_checkout(file) {
+                    *file = super::read_as(file, root)?;
+                }
             }
         }
         if cargo_home == Some(super::CARGO_HOME) || !self.of_cargo() {
@@ -586,6 +608,8 @@ pub(super) struct Entries {
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
+    /// The checkout's directory here.
+    checkout: Option<String>,
     known: Mutex<Known>,
 }
 
@@ -684,6 +708,7 @@ pub(super) struct Writer {
     store: &'static Store,
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
+    checkout: Option<String>,
     types: KeptTypes,
     written: Written,
     threads: Option<(std::sync::mpsc::Sender<Kept>, Vec<std::thread::JoinHandle<Written>>)>,
@@ -709,7 +734,23 @@ impl Writer {
         library: Option<super::LibrarySources>,
     ) -> Self {
         let (types, written) = Default::default();
-        Writer { store, cargo_home, library, types, written, threads: None, alone: true }
+        Writer {
+            store,
+            cargo_home,
+            library,
+            checkout: None,
+            types,
+            written,
+            threads: None,
+            alone: true,
+        }
+    }
+
+    /// A writer of what is compiled in the checkout at `root`, whose files are named by where
+    /// they are in it.
+    pub(super) fn in_checkout(mut self, root: Option<String>) -> Writer {
+        self.checkout = root;
+        self
     }
 
     pub(super) fn keep(&mut self, kept: Kept) {
@@ -723,7 +764,8 @@ impl Writer {
             let threads: Vec<_> = (0..count)
                 .map_while(|_| {
                     let mut writer =
-                        Writer::alone(self.store, self.cargo_home.clone(), self.library.clone());
+                        Writer::alone(self.store, self.cargo_home.clone(), self.library.clone())
+                            .in_checkout(self.checkout.clone());
                     let queued = queued.clone();
                     let work = move || {
                         loop {
@@ -774,7 +816,9 @@ impl Writer {
             let keys = debug.types.iter().map(|it| self.types.keep(self.store, it));
             debug.stored_types = keys.collect();
         }
-        entry.leave(self.cargo_home.as_deref(), self.library.as_ref()).then(|| entry.encode())?
+        entry
+            .leave(self.cargo_home.as_deref(), self.library.as_ref(), self.checkout.as_deref())
+            .then(|| entry.encode())?
     }
 
     /// Waits for everything kept so far to be in the store, and tells what was written
@@ -819,7 +863,22 @@ impl Entries {
         cargo_home: Option<String>,
         library: Option<super::LibrarySources>,
     ) -> Entries {
-        Entries { store, debug, program, cargo_home, library, known: Mutex::default() }
+        Entries {
+            store,
+            debug,
+            program,
+            cargo_home,
+            library,
+            checkout: None,
+            known: Mutex::default(),
+        }
+    }
+
+    /// The entries as read in the checkout at `root`, whose files are named by where they are
+    /// in it.
+    pub(super) fn in_checkout(mut self, root: Option<String>) -> Entries {
+        self.checkout = root;
+        self
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -851,7 +910,11 @@ impl Entries {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
                 debug.types = types.collect::<Option<_>>()?;
             }
-            entry.arrived(self.cargo_home.as_deref(), self.library.as_ref())
+            entry.arrived(
+                self.cargo_home.as_deref(),
+                self.library.as_ref(),
+                self.checkout.as_deref(),
+            )
         };
         cell.get_or_init(|| {
             let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
@@ -1096,41 +1159,98 @@ mod tests {
     fn a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home() {
         let (one, other) = ("/home/one/.cargo", "/srv/another user/cargo");
         let mut stored = fetched_to(one);
-        assert!(stored.leave(Some(one), None));
+        assert!(stored.leave(Some(one), None, None));
         let mut theirs = fetched_to(other);
-        assert!(theirs.leave(Some(other), None));
+        assert!(theirs.leave(Some(other), None, None));
         let bytes = stored.encode().unwrap();
         assert_eq!(bytes, theirs.encode().unwrap());
         assert!(!holds(&bytes, one) && !holds(&bytes, other));
         assert!(holds(&bytes, "/cargo/registry/src/"));
         // The files of the checkout are named as they were.
         assert!(stored.files().any(|it| it == "src/lib.rs"));
-        let here = Entry::decode(&bytes).unwrap().arrived(Some(other), None).unwrap();
+        let here = Entry::decode(&bytes).unwrap().arrived(Some(other), None, None).unwrap();
         assert_eq!(here.encode().unwrap(), fetched_to(other).encode().unwrap());
     }
 
     #[test]
     fn a_fetched_file_is_not_taken_where_cargo_has_no_directory() {
         let mut stored = fetched_to("/home/one/.cargo");
-        assert!(stored.leave(Some("/home/one/.cargo"), None));
-        assert!(Entry::decode(&stored.encode().unwrap()).unwrap().arrived(None, None).is_none());
+        assert!(stored.leave(Some("/home/one/.cargo"), None, None));
+        assert!(
+            Entry::decode(&stored.encode().unwrap()).unwrap().arrived(None, None, None).is_none()
+        );
         // An entry without one is taken anywhere.
-        assert!(entry().arrived(None, None).is_some());
+        assert!(entry().arrived(None, None, None).is_some());
     }
 
     #[test]
     fn a_directory_named_as_cargos_stands_in_is_not_mistaken_for_it() {
         // A checkout that really is under `/cargo` is not stored as if cargo fetched it.
-        assert!(!fetched_to("/cargo").leave(Some("/home/one/.cargo"), None));
-        assert!(!fetched_to("/cargo").leave(None, None));
+        assert!(!fetched_to("/cargo").leave(Some("/home/one/.cargo"), None, None));
+        assert!(!fetched_to("/cargo").leave(None, None, None));
         // A cargo home that is `/cargo` already names its files as every machine does.
         let mut same = fetched_to("/cargo");
-        assert!(same.leave(Some("/cargo"), None));
+        assert!(same.leave(Some("/cargo"), None, None));
         assert_eq!(same.encode().unwrap(), fetched_to("/cargo").encode().unwrap());
         // Only whole components are the home.
         let mut beside = fetched_to("/home/one/.cargo-old");
-        assert!(beside.leave(Some("/home/one/.cargo"), None));
+        assert!(beside.leave(Some("/home/one/.cargo"), None, None));
         assert!(beside.files().any(|it| it.starts_with("/home/one/.cargo-old/")));
+    }
+
+    /// An entry with each kind of file name a crate beside the checkout can have.
+    fn written_at(file: &str) -> Entry {
+        let mut entry = entry();
+        entry.datas.push(CachedData::Location(Some((file.to_owned(), 3, 9))));
+        entry.datas.push(CachedData::FilePath(file.to_owned()));
+        entry.debug.as_mut().unwrap().files.push(file.to_owned());
+        entry
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_beside_the_checkout_is_stored_under_the_same_name_from_every_checkout() {
+        let (one, other) = ("/home/one/repo/ws", "/Users/two/deeper/place/repo/ws");
+        for (file, stored_as) in [
+            ("shared/src/lib.rs", "/checkout/../shared/src/lib.rs"),
+            ("ws/vendor/dep/src/lib.rs", "/checkout/vendor/dep/src/lib.rs"),
+        ] {
+            let mut ours = written_at(&format!("/home/one/repo/{file}"));
+            assert!(ours.leave(None, None, Some(one)));
+            let mut theirs = written_at(&format!("/Users/two/deeper/place/repo/{file}"));
+            assert!(theirs.leave(None, None, Some(other)));
+            let bytes = ours.encode().unwrap();
+            assert_eq!(bytes, theirs.encode().unwrap(), "{file}");
+            assert!(holds(&bytes, stored_as) && !holds(&bytes, "/home/one"), "{file}");
+            let here = Entry::decode(&bytes).unwrap().arrived(None, None, Some(other)).unwrap();
+            let want = written_at(&format!("/Users/two/deeper/place/repo/{file}"));
+            assert_eq!(here.encode().unwrap(), want.encode().unwrap(), "{file}");
+        }
+        // The files of the workspace are named by their place in it, on every machine.
+        let mut member = written_at("inner/src/lib.rs");
+        assert!(member.leave(None, None, Some(one)));
+        assert_eq!(member.encode().unwrap(), written_at("inner/src/lib.rs").encode().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_not_taken_where_the_checkout_cannot_reach_it() {
+        let mut stored = written_at("/home/one/shared/lib.rs");
+        assert!(stored.leave(None, None, Some("/home/one/a/b/ws")));
+        let bytes = stored.encode().unwrap();
+        assert!(holds(&bytes, "/checkout/../../../shared/lib.rs"));
+        // The checkout of another machine is at the top of its disk: no `..` reaches `shared`.
+        assert!(Entry::decode(&bytes).unwrap().arrived(None, None, Some("/ws")).is_none());
+        // A file that goes by the name of the checkout's place is not stored as one.
+        assert!(!written_at("/checkout/src/lib.rs").leave(None, None, Some("/home/one/repo/ws")));
+        // A directory that is not shared is left as it is, with the cargo home before it.
+        let mut far = written_at("/opt/other/lib.rs");
+        assert!(far.leave(None, None, Some("/home/one/repo/ws")));
+        assert_eq!(far.encode().unwrap(), written_at("/opt/other/lib.rs").encode().unwrap());
+        // Cargo's directory can be beside the checkout, and is named by what it is.
+        let mut fetched = fetched_to("/home/one/.cargo");
+        assert!(fetched.leave(Some("/home/one/.cargo"), None, Some("/home/one/repo/ws")));
+        assert!(holds(&fetched.encode().unwrap(), "/cargo/registry/src/"));
     }
 
     #[test]
@@ -1146,9 +1266,9 @@ mod tests {
         };
         let (one, other) = (sources("/home/one/toolchain/src"), sources("/opt/rust/src"));
         let mut stored = with_file("/home/one/toolchain/src/library/core/src/option.rs");
-        assert!(stored.leave(None, Some(&one)));
+        assert!(stored.leave(None, Some(&one), None));
         assert!(stored.files().any(|it| it == "/rustc/0123/library/core/src/option.rs"));
-        let here = stored.arrived(None, Some(&other)).unwrap();
+        let here = stored.arrived(None, Some(&other), None).unwrap();
         let theirs = with_file("/opt/rust/src/library/core/src/option.rs");
         assert_eq!(here.encode().unwrap(), theirs.encode().unwrap());
     }

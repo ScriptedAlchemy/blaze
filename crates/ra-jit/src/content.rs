@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved};
+use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved, stored_as};
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -222,6 +222,7 @@ impl Contents {
         db: &RootDatabase,
         krate: Crate,
         root: &Path,
+        checkout: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
@@ -233,12 +234,15 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit library 4");
+        field(b"ra-jit library 5");
         field(Self::version(db, krate).as_bytes());
-        // Where cargo fetched it to is under another directory on another machine.
+        // Where cargo fetched it to is under another directory on another machine, and so is
+        // a crate beside the checkout, which the path that reaches it from there names.
         let root = root.to_string_lossy();
         let home = self.cargo_home(db);
-        let there = home.and_then(|home| moved(&root, &home, CARGO_HOME));
+        let there = home
+            .and_then(|home| moved(&root, &home, CARGO_HOME))
+            .or_else(|| stored_as(&root, &checkout.to_string_lossy()));
         field(there.as_deref().unwrap_or(&root).as_bytes());
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
@@ -251,7 +255,9 @@ impl Contents {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
             match known(on) {
-                Some((None, root)) => field(&self.library(db, on, &root, known, process_reads).0),
+                Some((None, root)) => {
+                    field(&self.library(db, on, &root, checkout, known, process_reads).0)
+                }
                 Some((id, _)) => field(&Self::outside(db, on, id)),
                 None => field(&Self::outside(db, on, None)),
             }

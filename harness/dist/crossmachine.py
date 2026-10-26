@@ -88,6 +88,10 @@ ALL = ["hello", "paths", "vendored", "macros", "ripgrep"]
 # A difference whose fix is another unit's, or that waits on a thing no unit here owns. A kind is
 # the `kind` of a Difference; the value is why it is not failing this run. Nothing else passes.
 PENDING = {
+    "expansion-library": "the macro library is built by rustc on each machine, and its bytes hold that machine's paths "
+                         "and signature; a key by the library's content needs the crate's content identity "
+                         "(own proc-macro server, no-rustc.md step J1, where the library is restored from the store "
+                         "by key) or recorded reads (#147)",
     "script-run": "build-script run keys hash the script's executable (cargo/script.rs run_key); "
                   "unit p05r owns script.rs and own_script.rs (docs/distributed.md, P0.5), and the key is "
                   "fixed after it lands",
@@ -128,9 +132,60 @@ def read_keys_log(text):
     found = {}
     for line in text.splitlines():
         parts = line.split("\t", 2)
-        if len(parts) == 3:
+        if len(parts) == 3 and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
             found[parts[0]] = (parts[1], parts[2])
     return found
+
+
+def read_macro_log(text):
+    """The `macro` and `macro-env` lines of RA_JIT_KEYS_LOG (ra-jit-expand): each call with the parts of its
+    key and what became of it, and the environments the calls had, by their hash."""
+    calls, envs = [], {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if parts[0] == "macro" and len(parts) >= 9:
+            parts_of = dict(p.split("=", 1) for p in parts[4:8] if "=" in p)
+            calls.append(dict(kind=parts[1], name=parts[2], key=parts[3], outcome=parts[8], **parts_of))
+        elif parts[0] == "macro-env" and len(parts) >= 3:
+            envs[parts[1]] = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
+    return calls, envs
+
+
+def compare_macros(fixture, a_log, b_log):
+    """What B expanded that A had kept or could have, by which part of the key differs. A call is told by
+    what is not machine's: the macro's kind and name and its input."""
+    (a_calls, a_envs), (b_calls, b_envs) = a_log, b_log
+    a_by = {(c["kind"], c["name"], c.get("input")): c for c in a_calls}
+    causes, kinds = {}, {}
+    for c in b_calls:
+        if c["outcome"] != "expanded":
+            continue
+        a = a_by.get((c["kind"], c["name"], c.get("input")))
+        who = f"{c['kind']} {c['name']}"
+        if a is None:
+            cause, kind = "no call of that macro with that input on A", "expansion"
+        else:
+            differing = [k for k in ("dylib", "env", "cwd") if a.get(k) != c.get(k)]
+            if not differing:
+                cause, kind = f"the key is A's, A did not keep it: {a['outcome']}", "expansion"
+            else:
+                bits = []
+                if "env" in differing:
+                    ours, theirs = a_envs.get(a.get("env"), {}), b_envs.get(c.get("env"), {})
+                    names = sorted(n for n in set(ours) | set(theirs) if ours.get(n) != theirs.get(n))
+                    bits.append("environment " + ", ".join(f"{n} ({ours.get(n)!r} on A, {theirs.get(n)!r} on B)" for n in names[:4]))
+                if "cwd" in differing:
+                    bits.append("current directory")
+                if "dylib" in differing:
+                    bits.append("macro library bytes")
+                cause = "key differs by " + "; ".join(bits)
+                kind = "expansion-library" if differing == ["dylib"] else "expansion"
+        causes.setdefault((cause, kind), []).append(who)
+    diffs = []
+    for (cause, kind), whos in sorted(causes.items(), key=lambda it: -len(it[1])):
+        diffs.append(Difference(fixture, kind, f"{len(whos)} macro expansions B ran with A's store", cause, len(whos),
+                                sorted(set(whos))))
+    return diffs
 
 
 # A crate in a stable name is a run of hex, as `OF_CHECKOUT`, `OF_LIBRARY` or rustc's id spell it.
@@ -543,13 +598,19 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
             name, "script-run", f"{len(scripts) - restored} of {len(scripts)} build-script runs B did not find in A's store",
             "the run key hashes the script's executable and its environment (cargo/script.rs run_key)",
             len(scripts) - restored, scripts).row())
-    # Macros: expansions B did not find.
+    # Macros: expansions B did not find, by the part of the key that differs.
     result["fed"]["expanded"] = c["expanded"]
     result["fed"]["expansions_found"] = c["expansions_found"]
+    a_macros = read_macro_log(open(os.path.join(top, "keys-a.log")).read()) if os.path.exists(os.path.join(top, "keys-a.log")) else ([], {})
+    fed_macros = read_macro_log(open(os.path.join(top, "keys-b-fed.log")).read()) if os.path.exists(os.path.join(top, "keys-b-fed.log")) else ([], {})
     if c["expanded"]:
-        result["differences"].append(Difference(
-            name, "expansion", f"{c['expanded']} macro expansions B ran with A's store", expansion_cause(fed.said, spec),
-            c["expanded"]).row())
+        if fed_macros[0]:
+            for d in compare_macros(name, a_macros, fed_macros):
+                result["differences"].append(d.row())
+        else:
+            result["differences"].append(Difference(
+                name, "expansion", f"{c['expanded']} macro expansions B ran with A's store", expansion_cause(fed.said, spec),
+                c["expanded"]).row())
     for k, r in runs.items():
         if not r.right:
             result["differences"].append(Difference(name, "program", r.label, program_diff(r)).row())
@@ -721,6 +782,17 @@ def self_test():
     log = f"{h('k')}\t{h('v')}\tfn {id_a}:src/a.rs#1<u32>\n"
     check("keys log lines are read", read_keys_log(log)[h("k")][1].endswith("<u32>"))
     check("a skeleton hides every crate id", skeleton(f"fn {id_a}:x#1<{id_b}:y#2>") == "fn #:x#1<#:y#2>")
+    macro_log = (f"macro\tderive\tDescribe\t{h('d1')}\tdylib=aaaa\tinput=1111\tenv=e1\tcwd=c1\texpanded\n"
+                 f"macro-env\te1\tCARGO_MANIFEST_DIR=$PACKAGE$\tCARGO_PKG_NAME=app\n")
+    a_log = read_macro_log(macro_log)
+    check("a macro log is read", a_log[0][0]["name"] == "Describe" and a_log[1]["e1"]["CARGO_PKG_NAME"] == "app")
+    b_text = macro_log.replace("dylib=aaaa", "dylib=bbbb")
+    d = compare_macros("t", a_log, read_macro_log(b_text))
+    check("two macro calls that differ by the library only are the library's", [x.kind for x in d] == ["expansion-library"])
+    b_text = macro_log.replace("env=e1", "env=e2") + "macro-env\te2\tCARGO_MANIFEST_DIR=/Users/b/x\tCARGO_PKG_NAME=app\n"
+    d = compare_macros("t", a_log, read_macro_log(b_text))
+    check("a variable that still holds a path is named", d and "CARGO_MANIFEST_DIR" in d[0].why and d[0].kind == "expansion")
+    check("a macro line is not a function entry", read_keys_log(macro_log) == {})
     pending = Difference("t", "script-run", "k", "why")
     check("a script-run difference is pending, an expansion is not", pending.pending and not Difference("t", "expansion", "k", "w").pending)
     print("self-test:", "ok" if ok else "FAILED")
@@ -797,7 +869,13 @@ def main():
         if a.reference_only:
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
         for n in names:
-            results.append(fixture_report(n, a, work, bin_dir, (a_m, b_m), sources, progress))
+            try:
+                results.append(fixture_report(n, a, work, bin_dir, (a_m, b_m), sources, progress))
+            except Exception as e:  # one fixture's break is a result, and the others still run
+                import traceback
+                traceback.print_exc()
+                results.append(dict(fixture=n, about=FIXTURES[n]["about"], runs={}, numbers={}, differences=[
+                    Difference(n, "harness", "the fixture's run", f"{type(e).__name__}: {e}").row()]))
             if watchdog.tripped:
                 break
     finally:

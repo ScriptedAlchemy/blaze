@@ -31,6 +31,7 @@
 //! [`compare`] holds the toolchain's server against ra-jit's, and keeps nothing while it does.
 
 mod compare;
+mod places;
 
 use std::{
     any::Any,
@@ -55,7 +56,7 @@ use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
 /// What the key of an expansion starts with: another number when the key or the value is
 /// made otherwise.
-const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 2";
+const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 3";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -149,6 +150,19 @@ struct Kept {
 struct Call {
     key: [u8; KEY],
     spans: Spans,
+    /// The places of this machine the key does not have, and the output may not.
+    places: places::Places,
+    /// What each part of the key comes to, when `RA_JIT_KEYS_LOG` is set.
+    parts: Option<Parts>,
+}
+
+/// The parts of a key, each by the first eight bytes of its SHA-256 in hex: two machines that
+/// give one call different keys differ in one of these.
+struct Parts {
+    dylib: String,
+    input: String,
+    env: String,
+    cwd: String,
 }
 
 /// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
@@ -214,6 +228,7 @@ impl Kept {
             attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
         let mut spans = Spans::default();
         let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
+        let places = places::Places::of(env, current_dir);
         let mut env: Vec<_> = env.iter().collect();
         env.sort_unstable();
         let mut hasher = Sha256::new();
@@ -222,20 +237,38 @@ impl Kept {
             hasher.update(bytes);
         };
         field(DOMAIN);
-        field(self.dylib.hash()?);
+        let dylib = self.dylib.hash()?;
+        field(dylib);
         field(self.name.as_bytes());
         field(&[self.kind as u8]);
         field(&CURRENT_API_VERSION.to_le_bytes());
-        field(&postcard::to_allocvec(&input).ok()?);
-        field(&postcard::to_allocvec(&attrs).ok()?);
-        field(&postcard::to_allocvec(&shapes).ok()?);
+        let input = [
+            postcard::to_allocvec(&input).ok()?,
+            postcard::to_allocvec(&attrs).ok()?,
+            postcard::to_allocvec(&shapes).ok()?,
+        ];
+        input.iter().for_each(|it| field(it));
         field(&(env.len() as u64).to_le_bytes());
-        for (name, value) in env {
+        // What the key says of the machine is what stands for its places, not the places.
+        let env: Vec<(&str, std::borrow::Cow<'_, str>)> =
+            env.into_iter().map(|(name, value)| (name, places.unplace(value))).collect();
+        for (name, value) in &env {
             field(name.as_bytes());
             field(value.as_bytes());
         }
-        field(current_dir.as_bytes());
-        Some(Call { key: hasher.finalize().into(), spans })
+        let cwd = places.unplace(current_dir);
+        field(cwd.as_bytes());
+        let key = hasher.finalize().into();
+        let parts = keys_logged().then(|| Parts {
+            dylib: short(dylib),
+            input: short(&input.concat()),
+            env: short(env_text(&env).as_bytes()),
+            cwd: short(cwd.as_bytes()),
+        });
+        if parts.is_some() {
+            log_env(&env);
+        }
+        Some(Call { key, spans, places, parts })
     }
 }
 
@@ -259,6 +292,75 @@ fn read(bytes: &[u8], spans: &Spans) -> Option<tt::TopSubtree> {
 fn store() -> Option<&'static Store> {
     ra_jit_store::toolchain()?;
     Store::global()
+}
+
+/// Where `RA_JIT_KEYS_LOG` says to list the calls of this process, as hir-ty-codegen lists the
+/// entries it adds: `harness/dist/crossmachine.py` reads both.
+fn keys_log() -> Option<&'static Mutex<std::fs::File>> {
+    static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let open = || {
+        let path = std::env::var_os("RA_JIT_KEYS_LOG").filter(|it| !it.is_empty())?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    };
+    LOG.get_or_init(open).as_ref()
+}
+
+fn keys_logged() -> bool {
+    keys_log().is_some()
+}
+
+fn write_log(line: &str) {
+    use std::io::Write as _;
+    if let Some(log) = keys_log() {
+        _ = log.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
+    }
+}
+
+/// The first eight bytes of the SHA-256 of `bytes`, in hex.
+fn short(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)[..8].iter().map(|it| format!("{it:02x}")).collect()
+}
+
+/// The environment of a call as its key has it: a line for each variable, with the places taken
+/// out of its value.
+fn env_text(env: &[(&str, std::borrow::Cow<'_, str>)]) -> String {
+    env.iter().map(|(name, value)| format!("{name}={}\n", value.replace('\n', " "))).collect()
+}
+
+/// The environment of a call, once for each: its parts as the key has them, which say which
+/// variable still holds something of the machine when two machines give a call two keys.
+fn log_env(env: &[(&str, std::borrow::Cow<'_, str>)]) {
+    static SEEN: Mutex<Option<rustc_hash::FxHashSet<String>>> = Mutex::new(None);
+    let text = env_text(env);
+    let id = short(text.as_bytes());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_default().insert(id.clone()) {
+        let vars: Vec<String> = text.lines().map(|it| it.replace('\0', "$")).collect();
+        write_log(&format!("macro-env\t{id}\t{}\n", vars.join("\t")));
+    }
+}
+
+impl Call {
+    /// One line of the log for a call and what became of it: the macro, the parts of its key and
+    /// the key as it is on disk.
+    fn log(&self, kept: &Kept, store: &Store, outcome: &str) {
+        let Some(parts) = &self.parts else { return };
+        let disk: String = store.disk_key(&self.key).iter().map(|it| format!("{it:02x}")).collect();
+        write_log(&format!(
+            "macro\t{}\t{}\t{disk}\tdylib={}\tinput={}\tenv={}\tcwd={}\t{outcome}\n",
+            kind_name(kept.kind),
+            kept.name,
+            parts.dylib,
+            parts.input,
+            parts.env,
+            parts.cwd,
+        ));
+    }
+}
+
+fn kind_name(kind: ProcMacroKind) -> &'static str {
+    ["derive", "attribute", "function-like"][kind_index(kind)]
 }
 
 impl ProcMacroExpander for Kept {
@@ -300,6 +402,9 @@ impl ProcMacroExpander for Kept {
             && let Some(output) = read(bytes, &call.spans)
         {
             COUNTS.found.add(start.elapsed());
+            if let Some(store) = store {
+                call.log(self, store, "found");
+            }
             return Ok(output);
         }
         // What was found and could not be read is written again.
@@ -338,16 +443,27 @@ impl ProcMacroExpander for Kept {
             if expanded.is_err() {
                 COUNTS.failed.add(Duration::ZERO);
             }
+            if let (Some(store), Some(call)) = (store, &call) {
+                call.log(self, store, "failed");
+            }
             return expanded;
         };
         if load_cargo::asked() != asked {
             COUNTS.asked.add(Duration::ZERO);
+            call.log(self, store, "asked the database");
             return expanded;
         }
         let Some(bytes) = written(output, &call.spans) else {
             COUNTS.unspanned.add(Duration::ZERO);
+            call.log(self, store, "output has spans the call has not");
             return expanded;
         };
+        // A path of this machine in the output would be the next machine's.
+        if call.places.names(&bytes) {
+            COUNTS.placed.add(Duration::ZERO);
+            call.log(self, store, "output names a place of this machine");
+            return expanded;
+        }
         match found {
             Some(kept) if kept != bytes => {
                 COUNTS.differed.add(Duration::ZERO);
@@ -359,6 +475,7 @@ impl ProcMacroExpander for Kept {
                 COUNTS.kept.add(Duration::ZERO);
             }
         }
+        call.log(self, store, "expanded");
         expanded
     }
 
@@ -402,6 +519,8 @@ struct Counts {
     kept: Count,
     asked: Count,
     unspanned: Count,
+    /// Output with a place of the machine in it.
+    placed: Count,
     failed: Count,
     differed: Count,
 }
@@ -414,6 +533,7 @@ static COUNTS: Counts = Counts {
     kept: Count::new(),
     asked: Count::new(),
     unspanned: Count::new(),
+    placed: Count::new(),
     failed: Count::new(),
     differed: Count::new(),
 };
@@ -452,6 +572,7 @@ pub fn report() -> Option<String> {
         ("kept", &COUNTS.kept),
         ("not kept, as they asked the database", &COUNTS.asked),
         ("not kept, as their output has spans the call has not", &COUNTS.unspanned),
+        ("not kept, as their output names a place of this machine", &COUNTS.placed),
         ("failed", &COUNTS.failed),
         ("expanded otherwise than kept", &COUNTS.differed),
     ];

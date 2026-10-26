@@ -114,6 +114,7 @@ mod imports;
 mod llvm;
 mod patch;
 mod places;
+mod relocate;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
@@ -208,6 +209,8 @@ pub const CARGO_HOME: &str = "/cargo";
 /// patch after for the same static and value: a running program keeps the copy the first gave
 /// it (`docs/live.md#types`).
 pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
+
+pub use relocate::{CHECKOUT, SHARED, names_checkout, read_as, stored_as};
 
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
@@ -364,6 +367,11 @@ pub trait SymbolResolver {
     /// Where the sources of the standard library are, when the toolchain tells where they
     /// were built.
     fn library_sources(&self) -> Option<LibrarySources> {
+        None
+    }
+    /// The checkout's directory, which [`CHECKOUT`] stands for in what is stored: a file below
+    /// it or beside it is written as that, and read as the directory it is here.
+    fn checkout(&self) -> Option<String> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -4995,13 +5003,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .filter(|_| base.is_none() && std::env::var_os("RA_JIT_CACHE_CHECK").is_none())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
-                    std::sync::Arc::new(cached::Entries::new(
-                        store,
-                        debugged,
-                        program.flatten(),
-                        home,
-                        library,
-                    ))
+                    std::sync::Arc::new(
+                        cached::Entries::new(store, debugged, program.flatten(), home, library)
+                            .in_checkout(symbols.checkout()),
+                    )
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
@@ -5875,6 +5880,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let symbols = self.symbols;
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
+                .in_checkout(symbols.checkout())
         })
     }
 

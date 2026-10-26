@@ -947,7 +947,7 @@ impl Resolver<'_> {
         }
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
-        let place = crate_place(&root, self.inside(&root), home.as_deref());
+        let place = crate_place(&root, self.inside(&root), home.as_deref(), &self.root);
         let named = format!("ra-jit crate {} {place}", name.crate_name());
         Some(short_hash(&named))
     }
@@ -1462,6 +1462,7 @@ impl SymbolResolver for Resolver<'_> {
                 self.db,
                 krate,
                 &root,
+                &self.root,
                 &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
                 &|krate| process_reads(self.db, krate),
             ));
@@ -1486,6 +1487,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn library_sources(&self) -> Option<hir_ty_codegen::LibrarySources> {
         self.contents.library_sources(self.db)
+    }
+
+    fn checkout(&self) -> Option<String> {
+        self.root.to_str().map(str::to_owned)
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -1678,16 +1683,26 @@ fn is_in_body(db: &RootDatabase, module: Module) -> bool {
 
 /// What names the crate whose root is `root` in the id ra-jit gives it, the same on every
 /// machine: its path in the checkout (`inside`), or below where cargo keeps what it fetched
-/// (`cargo_home`), or else where it is.
-fn crate_place(root: &Path, inside: Option<&Path>, cargo_home: Option<&str>) -> String {
+/// (`cargo_home`), or beside the checkout by the path that reaches it from there (`path =
+/// "../shared"` is one crate wherever the repository is), or else where it is.
+fn crate_place(
+    root: &Path,
+    inside: Option<&Path>,
+    cargo_home: Option<&str>,
+    checkout: &Path,
+) -> String {
     if let Some(inside) = inside {
         return inside.display().to_string();
     }
     let fetched = root.to_str().zip(cargo_home);
-    match fetched
+    if let Some(moved) = fetched
         .and_then(|(root, home)| hir_ty_codegen::moved(root, home, hir_ty_codegen::CARGO_HOME))
     {
-        Some(moved) => moved,
+        return moved;
+    }
+    let beside = root.to_str().zip(checkout.to_str());
+    match beside.and_then(|(root, checkout)| hir_ty_codegen::stored_as(root, checkout)) {
+        Some(beside) => beside,
         None => root.display().to_string(),
     }
 }
@@ -9998,16 +10013,37 @@ mod tests {
     #[test]
     fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {
         let fetched = "registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs";
+        let ws = Path::new("/home/one/repo/ws");
         let at =
-            |home: &str| crate_place(Path::new(&format!("{home}/{fetched}")), None, Some(home));
+            |home: &str| crate_place(Path::new(&format!("{home}/{fetched}")), None, Some(home), ws);
         assert_eq!(at("/home/one/.cargo"), at("/Users/other/.cargo"));
         assert_eq!(at("/home/one/.cargo"), format!("/cargo/{fetched}"));
         let elsewhere = Path::new("/opt/crates/lib.rs");
-        assert_eq!(crate_place(elsewhere, None, Some("/home/one/.cargo")), "/opt/crates/lib.rs");
+        assert_eq!(
+            crate_place(elsewhere, None, Some("/home/one/.cargo"), ws),
+            "/opt/crates/lib.rs"
+        );
         let inside = Path::new("/ws/app/src/main.rs");
         assert_eq!(
-            crate_place(inside, Some(Path::new("app/src/main.rs")), None),
+            crate_place(inside, Some(Path::new("app/src/main.rs")), None, Path::new("/ws")),
             "app/src/main.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_crate_beside_the_checkout_is_named_the_same_wherever_the_repository_is() {
+        let at = |repo: &str| {
+            let root = format!("{repo}/shared/src/lib.rs");
+            crate_place(Path::new(&root), None, None, Path::new(&format!("{repo}/ws")))
+        };
+        assert_eq!(at("/home/one/repo"), at("/private/tmp/m/b/x/repo"));
+        assert_eq!(at("/home/one/repo"), "/checkout/../shared/src/lib.rs");
+        // Where nothing is shared with the checkout the crate is only where it is.
+        let far = Path::new("/opt/shared/src/lib.rs");
+        assert_eq!(
+            crate_place(far, None, None, Path::new("/home/one/repo/ws")),
+            "/opt/shared/src/lib.rs"
         );
     }
 
