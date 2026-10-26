@@ -6419,6 +6419,29 @@ fn let_go(db: &mut RootDatabase, builds: &Builds) {
     }
 }
 
+/// Says what the daemon holds of its own for the next `memory::report`: what no ingredient of
+/// the database counts, and where it is held.
+fn held_of_own(checkouts: &Checkouts, programs: &[Program]) -> memory::Own {
+    let rejections = programs.iter().map(|it| {
+        let (rejected, theirs, unknown, left, futures) = it.known.held();
+        rejected + theirs + unknown + left + futures
+    });
+    let patch_originals = lock(&LINKED)
+        .values()
+        .filter_map(|it| match it {
+            Executable::Read(baseline) => Some(baseline.held_originals()),
+            Executable::Linked(_) => None,
+        })
+        .sum();
+    memory::Own {
+        checkouts: checkouts.roots.len(),
+        files_hashed: content::FileHashes::held(),
+        rustc_symbols: lock(&RUSTC_SYMBOLS).len(),
+        rejections: rejections.sum(),
+        patch_originals,
+    }
+}
+
 impl std::io::Write for &Client {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         (&self.stream).write(bytes)
@@ -8010,6 +8033,7 @@ fn run_holding(
             if let Some(said) = ra_jit_expand::report() {
                 eprintln!("{said}");
             }
+            memory::set_own(held_of_own(&checkouts, &[]));
             memory::report(&mut db, "build")?;
             report_stats(&known.stats);
             link(
@@ -8225,6 +8249,7 @@ fn run_holding(
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
                                 let_go(&mut db, &builds);
+                                memory::set_own(held_of_own(&checkouts, &programs));
                                 memory::served(&mut db)?;
                             }
                         }
@@ -8237,6 +8262,7 @@ fn run_holding(
                         let event = builds.events.recv()?;
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds);
+                            memory::set_own(held_of_own(&checkouts, &programs));
                             memory::served(&mut db)?;
                         }
                     }
@@ -8251,6 +8277,7 @@ fn run_holding(
                     while let Ok(event) = builds.events.try_recv() {
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds);
+                            memory::set_own(held_of_own(&checkouts, &programs));
                             memory::served(&mut db)?;
                         }
                     }
@@ -9219,6 +9246,7 @@ fn run_holding(
             links.insert(out, linked);
         }
         let_go(&mut db, &builds);
+        memory::set_own(held_of_own(&checkouts, &programs));
         memory::served(&mut db)?;
     }
 }

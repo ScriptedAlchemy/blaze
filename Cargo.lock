@@ -3471,6 +3471,7 @@ dependencies = [
  "ra-jit-expand",
  "ra-jit-live",
  "ra-jit-store",
+ "rayon",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustls",

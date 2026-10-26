@@ -2726,6 +2726,44 @@ pub unsafe fn collect_ty_garbage() {
     unsafe { gc.collect() };
 }
 
+/// How many values each table of interned types, arguments, clauses and the rest holds, by
+/// the name of the table, in the order [`collect_ty_garbage`] lists them. Reading a table
+/// that was never written does not make it, so a process that has interned nothing reports
+/// zeroes rather than growing for being asked.
+pub fn interned_counts() -> Vec<(&'static str, usize)> {
+    fn of<T: intern::Internable>(name: &'static str) -> (&'static str, usize) {
+        (name, T::storage().len())
+    }
+    fn of_slice<T: intern::SliceInternable>(name: &'static str) -> (&'static str, usize) {
+        (name, T::storage().len())
+    }
+    vec![
+        of::<super::consts::ConstInterned>("ConstInterned"),
+        of::<super::consts::ValTreeInterned>("ValTreeInterned"),
+        of::<super::allocation::AllocationInterned>("AllocationInterned"),
+        of::<PatternInterned>("PatternInterned"),
+        of::<super::opaques::ExternalConstraintsInterned>("ExternalConstraintsInterned"),
+        of::<super::predicate::PredicateInterned>("PredicateInterned"),
+        of::<super::region::RegionInterned>("RegionInterned"),
+        of::<super::ty::TyInterned>("TyInterned"),
+        of_slice::<super::consts::ConstsStorage>("Consts"),
+        of_slice::<super::predicate::ClausesStorage>("Clauses"),
+        of_slice::<super::generic_arg::GenericArgsStorage>("GenericArgs"),
+        of_slice::<BoundVarKindsStorage>("BoundVarKinds"),
+        of_slice::<VariancesOfStorage>("VariancesOf"),
+        of_slice::<CanonicalVarsStorage>("CanonicalVars"),
+        of_slice::<PatListStorage>("PatList"),
+        of_slice::<super::opaques::PredefinedOpaquesStorage>("PredefinedOpaques"),
+        of_slice::<super::opaques::SolverDefIdsStorage>("SolverDefIds"),
+        of_slice::<super::predicate::BoundExistentialPredicatesStorage>(
+            "BoundExistentialPredicates",
+        ),
+        of_slice::<super::region::RegionAssumptionsStorage>("RegionAssumptions"),
+        of_slice::<super::ty::TysStorage>("Tys"),
+        of_slice::<crate::mir::ProjectionStorage>("Projection"),
+    ]
+}
+
 macro_rules! impl_gc_visit {
     ( $($ty:ty),* $(,)? ) => {
         $(

@@ -360,6 +360,16 @@ impl<T: Internable + ?Sized> InternStorage<T> {
     pub(crate) fn get(&self) -> &InternMap<T> {
         self.map.get_or_init(|| DashMap::with_capacity_and_hasher(1024, Default::default()))
     }
+
+    /// How many values are interned in it, and 0 when none ever was: reading it does not
+    /// make the table, which a report of what a long-running process holds must not do.
+    pub fn len(&self) -> usize {
+        self.map.get().map_or(0, |it| it.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub trait Internable: Hash + Eq + Send + Sync + 'static {

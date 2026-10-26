@@ -125,6 +125,35 @@ pub(crate) fn live() -> Option<u64> {
     None
 }
 
+/// What jemalloc says of the pages it holds: the bytes allocated and not freed, the bytes in
+/// pages it maps and touches, the bytes it maps, and the bytes of freed pages it keeps to
+/// reuse rather than give back. None where the allocator does not count them.
+pub(crate) fn allocator() -> Option<Allocator> {
+    #[cfg(unix)]
+    {
+        use tikv_jemalloc_ctl::stats;
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        let read = |it: Result<usize, tikv_jemalloc_ctl::Error>| it.ok().map(|it| it as u64);
+        Some(Allocator {
+            allocated: read(stats::allocated::read())?,
+            resident: read(stats::resident::read())?,
+            mapped: read(stats::mapped::read())?,
+            retained: read(stats::retained::read())?,
+        })
+    }
+    #[cfg(windows)]
+    None
+}
+
+/// See [`allocator`].
+#[derive(Clone, Copy)]
+pub(crate) struct Allocator {
+    pub(crate) allocated: u64,
+    pub(crate) resident: u64,
+    pub(crate) mapped: u64,
+    pub(crate) retained: u64,
+}
+
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
 pub(crate) fn give_back() {
@@ -152,14 +181,82 @@ pub(crate) fn checkpoint(step: &str) {
     eprintln!("memory after {step}: {} MB resident{live}", resident().unwrap_or(0));
 }
 
-/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names.
+/// What the daemon holds that no ingredient of the database counts: the checkouts it has
+/// loaded, the files it has hashed, the symbols of rustc's executables it has read, the maps
+/// a patch keeps, and the addresses of an executable that patches put back. [`set_own`] says
+/// it before each report.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Own {
+    pub(crate) checkouts: usize,
+    pub(crate) files_hashed: usize,
+    pub(crate) rustc_symbols: usize,
+    /// The entries of every map a patch keeps of the builds that are over.
+    pub(crate) rejections: usize,
+    /// The addresses of the executable rustc linked that a patch put back.
+    pub(crate) patch_originals: usize,
+}
+
+static OWN: std::sync::Mutex<Own> = std::sync::Mutex::new(Own {
+    checkouts: 0,
+    files_hashed: 0,
+    rustc_symbols: 0,
+    rejections: 0,
+    patch_originals: 0,
+});
+
+/// Says what the daemon holds of its own, for the next [`report`] to write.
+pub(crate) fn set_own(own: Own) {
+    *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = own;
+}
+
+/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names:
+/// a line for every ingredient of the database, then what the daemon holds of its own, the
+/// tables of interned types and arguments, and what the allocator says.
+///
+/// The trait solver's cache is cleared first, here and on every thread of the pool, as
+/// rust-analyzer's `analysis_stats` clears it before it measures: the cache is per revision and
+/// a build's, not a holder of the daemon's, and what it keeps of its goals would be counted as
+/// held.
 pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
+    rayon::broadcast(|_| hir::clear_tls_solver_cache());
+    hir::clear_tls_solver_cache();
     std::fs::create_dir_all(&dir)?;
     write_heap_profile(&dir.join(format!("{step}.prof")))?;
-    std::fs::write(dir.join(format!("{step}.tsv")), ingredients(db))?;
+    std::fs::write(dir.join(format!("{step}.tsv")), table(db))?;
     Ok(())
+}
+
+/// Everything [`report`] writes, as one table: the ingredient rows, whose `count` is how many
+/// there are and whose `heap` is the bytes of what they own, then `own` and `interned` rows,
+/// whose `count` is a number of things, and `alloc` rows, whose `count` is bytes.
+fn table(db: &mut RootDatabase) -> String {
+    let mut table = ingredients(db);
+    let own = *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, count) in [
+        ("checkouts", own.checkouts),
+        ("files hashed", own.files_hashed),
+        ("rustc symbols", own.rustc_symbols),
+        ("rejections", own.rejections),
+        ("patch originals", own.patch_originals),
+    ] {
+        _ = writeln!(table, "own\t{count}\t\t\t\t{name}");
+    }
+    for (name, count) in hir::interned_counts() {
+        _ = writeln!(table, "interned\t{count}\t\t\t\t{name}");
+    }
+    if let Some(allocator) = allocator() {
+        for (name, bytes) in [
+            ("allocated", allocator.allocated),
+            ("resident", allocator.resident),
+            ("mapped", allocator.mapped),
+            ("retained", allocator.retained),
+        ] {
+            _ = writeln!(table, "alloc\t{bytes}\t\t\t\t{name}");
+        }
+    }
+    table
 }
 
 /// [`report`] once the daemon has answered a request, as `request-N`, N counting from 1.

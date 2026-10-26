@@ -295,6 +295,12 @@ impl Baseline {
         self.path == binary
     }
 
+    /// How many addresses of the executable rustc linked a patch put back, which it holds for
+    /// the next splice: for `memory::Own`.
+    pub(crate) fn held_originals(&self) -> usize {
+        self.originals.len()
+    }
+
     /// Whether a splice leaves what a debugger reads of the executable as it was, so that
     /// it knows nothing of the code added. A PDB is a file of its own that only the linker
     /// writes.

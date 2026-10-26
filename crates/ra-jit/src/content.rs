@@ -330,13 +330,14 @@ enum Written {
 
 /// The hash of each file as it was last read, for as long as the daemon runs: a build hashes
 /// only what was edited since the one before.
-struct FileHashes {
+pub(crate) struct FileHashes {
     files: FxHashMap<vfs::FileId, (Arc<str>, Hash)>,
 }
 
+static HASHES: OnceLock<Mutex<FileHashes>> = OnceLock::new();
+
 impl FileHashes {
     fn of(db: &RootDatabase, file: vfs::FileId) -> Hash {
-        static HASHES: OnceLock<Mutex<FileHashes>> = OnceLock::new();
         let hashes = HASHES.get_or_init(|| Mutex::new(FileHashes { files: FxHashMap::default() }));
         let text = db.file_text(file).text(db);
         let mut hashes = hashes.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +350,11 @@ impl FileHashes {
         let hash: Hash = Sha256::digest(text.as_bytes()).into();
         hashes.files.insert(file, (text.clone(), hash));
         hash
+    }
+
+    /// How many files are hashed and kept, for `memory::Own`: none when none was.
+    pub(crate) fn held() -> usize {
+        HASHES.get().map(|it| it.lock().unwrap_or_else(|e| e.into_inner()).files.len()).unwrap_or(0)
     }
 }
 
