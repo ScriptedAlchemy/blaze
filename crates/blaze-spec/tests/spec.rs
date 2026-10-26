@@ -244,6 +244,7 @@ fn the_cfgs_follow_the_profile_and_the_rustflags() {
         "foo".to_owned(),
         "bar=\"xy\"".to_owned(),
         "debug_assertions".to_owned(),
+        "overflow_checks".to_owned(),
         "panic=\"abort\"".to_owned(),
     ];
     want.sort_by_key(|it| encode(it));
