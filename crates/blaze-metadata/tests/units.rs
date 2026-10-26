@@ -1,5 +1,5 @@
 //! blaze's unit graph against cargo 1.99.0's `--unit-graph` for each run of each workspace of
-//! `tests/units` (`expected.json`, written by `examples/units_expected.rs` with the runs of the
+//! `tests/units` (`expected.json`, written by `harness/dist/units_expected.rs` with the runs of the
 //! fixture's `case.json`): the units, their features, profiles, modes and dependencies, as sets
 //! keyed by what a unit is (its package, target, profile, platform, mode and features, and the
 //! units it depends on and the names it uses them under), and the roots. Where cargo refuses a
