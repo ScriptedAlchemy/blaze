@@ -214,6 +214,15 @@ impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
         self.arc().as_ptr()
     }
 
+    /// # Safety
+    ///
+    /// The pointer needs to come from [`InternedSliceRef::as_raw`] of a slice that is alive.
+    #[inline]
+    pub(crate) unsafe fn from_raw(ptr: *const c_void) -> Self {
+        // SAFETY: Our precondition: `as_raw` gives a `ThinArc`'s pointer, which is not null.
+        Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) }, _marker: PhantomData }
+    }
+
     /// **Available only on GC mode**.
     ///
     /// Changes the attached lifetime, as in GC mode, the lifetime is more kind of a lint to prevent misuse

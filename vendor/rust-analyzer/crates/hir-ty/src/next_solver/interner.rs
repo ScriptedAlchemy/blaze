@@ -336,13 +336,14 @@ macro_rules! impl_stored_interned {
 pub(crate) use impl_stored_interned;
 
 /// This is a visitor trait that treats any interned thing specifically. Visitables are expected to call
-/// the trait's methods when encountering an interned. This is used to implement marking in GC.
+/// the trait's methods when encountering an interned, and to visit its contents when they return
+/// `Continue`. This is used to implement marking in GC, which visits the contents itself.
 pub trait WorldExposer {
-    fn on_interned<T: intern::Internable>(
+    fn on_interned<T: intern::Internable + intern::GcInternedVisit>(
         &mut self,
         interned: InternedRef<'_, T>,
     ) -> ControlFlow<()>;
-    fn on_interned_slice<T: intern::SliceInternable>(
+    fn on_interned_slice<T: intern::SliceInternable + intern::GcInternedSliceVisit>(
         &mut self,
         interned: InternedSliceRef<'_, T>,
     ) -> ControlFlow<()>;
@@ -2673,14 +2674,14 @@ mod tls_cache {
 }
 
 impl WorldExposer for intern::GarbageCollector {
-    fn on_interned<T: intern::Internable>(
+    fn on_interned<T: intern::Internable + intern::GcInternedVisit>(
         &mut self,
         interned: InternedRef<'_, T>,
     ) -> ControlFlow<()> {
         self.mark_interned_alive(interned)
     }
 
-    fn on_interned_slice<T: intern::SliceInternable>(
+    fn on_interned_slice<T: intern::SliceInternable + intern::GcInternedSliceVisit>(
         &mut self,
         interned: InternedSliceRef<'_, T>,
     ) -> ControlFlow<()> {

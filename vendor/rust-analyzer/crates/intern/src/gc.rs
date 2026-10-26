@@ -1,8 +1,11 @@
 //! Garbage collection of interned values.
 //!
 //! The GC is a simple mark-and-sweep GC: you first mark all storages, then the
-//! GC visits them, and each live value they refer, recursively, then removes
+//! GC visits them, and each live value they refer, transitively, then removes
 //! those not marked. The sweep phase is done in parallel.
+//!
+//! The marking keeps the values it has reached and not visited yet in a work list, rather than
+//! visiting each as it reaches it: its stack does not grow with the depth of what it marks.
 //!
 //! A value is a root when something besides its storage owns it (its strong count is
 //! more than one), and every value reached from a root is marked, whatever its own count.
@@ -42,6 +45,7 @@ impl<T: Internable + GcInternedVisit> Storage for InternedStorage<T> {
             let addr = Arc::as_ptr(item).addr();
             if Arc::strong_count(item) > 1 && gc.alive.insert(addr) {
                 item.visit_with(gc);
+                gc.visit_pending();
             }
         }
     }
@@ -67,6 +71,7 @@ impl<T: SliceInternable + GcInternedSliceVisit> Storage for InternedSliceStorage
             if ThinArc::strong_count(item) > 1 && gc.alive.insert(addr) {
                 T::visit_header(&item.header.header, gc);
                 T::visit_slice(&item.slice, gc);
+                gc.visit_pending();
             }
         }
     }
@@ -89,7 +94,46 @@ pub trait GcInternedSliceVisit: SliceInternable {
 #[derive(Default)]
 pub struct GarbageCollector {
     alive: FxHashSet<usize>,
+    /// The values marked alive whose contents are not visited yet, the last marked first.
+    pending: Vec<Pending>,
     storages: Vec<&'static (dyn Storage + Send + Sync)>,
+}
+
+/// A value marked alive whose contents are not visited yet, and the function that visits them.
+struct Pending {
+    value: *const (),
+    visit: unsafe fn(*const (), &mut GarbageCollector),
+}
+
+// SAFETY: `value` points at an interned value, which is `Send` and `Sync` (`Internable` asks
+// for it, and `SliceInternable` of the header and the elements), and is read only by `visit`,
+// as the type it is.
+unsafe impl Send for Pending {}
+unsafe impl Sync for Pending {}
+
+/// Visits the contents of an interned `T`.
+///
+/// # Safety
+///
+/// `value` is the address of a `T` that its storage holds.
+unsafe fn visit_interned<T: GcInternedVisit>(value: *const (), gc: &mut GarbageCollector) {
+    // SAFETY: Our precondition.
+    unsafe { &*value.cast::<T>() }.visit_with(gc);
+}
+
+/// Visits the header and the elements of an interned slice of `T`.
+///
+/// # Safety
+///
+/// `value` is [`InternedSliceRef::as_raw`] of a slice that its storage holds.
+unsafe fn visit_interned_slice<T: GcInternedSliceVisit>(
+    value: *const (),
+    gc: &mut GarbageCollector,
+) {
+    // SAFETY: Our precondition.
+    let value = unsafe { InternedSliceRef::<T>::from_raw(value.cast()) }.get();
+    T::visit_header(&value.header.header, gc);
+    T::visit_slice(&value.slice, gc);
 }
 
 impl GarbageCollector {
@@ -127,6 +171,7 @@ impl GarbageCollector {
         for &storage in &storages {
             storage.mark(&mut self);
         }
+        debug_assert!(self.pending.is_empty());
 
         // Miri doesn't support rayon.
         if cfg!(miri) {
@@ -136,31 +181,48 @@ impl GarbageCollector {
         }
     }
 
-    /// Marks a value reached from a live one. Returns `Continue` when it was not marked
-    /// before, and the caller should visit what it refers to.
+    /// Marks a value reached from a live one, and when it was not marked before, has the
+    /// collector visit what it refers to. Returns `Break`: the caller does not visit the
+    /// value's contents itself, so marking a deep value does not take a deep stack.
     ///
     /// The value is marked even when it has owners of its own, which would make it a root:
     /// they may be dropped on another thread before its storage is scanned for roots, and the
     /// scan would then see no owner and skip it, while the value that reached it lives on.
-    pub fn mark_interned_alive<T: Internable>(
+    pub fn mark_interned_alive<T: Internable + GcInternedVisit>(
         &mut self,
         interned: InternedRef<'_, T>,
     ) -> ControlFlow<()> {
         const { assert!(T::USE_GC) };
 
-        let addr = interned.as_raw().addr();
-        if !self.alive.insert(addr) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        let value = interned.as_raw();
+        if self.alive.insert(value.addr()) {
+            self.pending.push(Pending { value: value.cast(), visit: visit_interned::<T> });
+        }
+        ControlFlow::Break(())
     }
 
     /// As [`GarbageCollector::mark_interned_alive`], for an interned slice.
-    pub fn mark_interned_slice_alive<T: SliceInternable>(
+    pub fn mark_interned_slice_alive<T: SliceInternable + GcInternedSliceVisit>(
         &mut self,
         interned: InternedSliceRef<'_, T>,
     ) -> ControlFlow<()> {
         const { assert!(T::USE_GC) };
 
-        let addr = interned.as_raw().addr();
-        if !self.alive.insert(addr) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        let value = interned.as_raw();
+        if self.alive.insert(value.addr()) {
+            self.pending.push(Pending { value: value.cast(), visit: visit_interned_slice::<T> });
+        }
+        ControlFlow::Break(())
+    }
+
+    /// Visits the contents of each value marked and not visited yet, and of each value that
+    /// marks in turn, until there is none.
+    fn visit_pending(&mut self) {
+        while let Some(Pending { value, visit }) = self.pending.pop() {
+            // SAFETY: `value` was marked in this collection, whose storages hold every value
+            // until the sweep, which comes after the marking; `visit` is the one of its type.
+            unsafe { visit(value, self) };
+        }
     }
 
     fn sweep_storage<T: Hash + Eq + Send + Sync>(
@@ -635,6 +697,66 @@ mod tests {
         unsafe { gc.collect() };
         if !cfg!(feature = "prevent-gc") {
             assert_eq!(Ring::storage().len(), 0);
+        }
+    }
+
+    #[test]
+    fn a_chain_deeper_than_the_stack_is_marked() {
+        // The marking visits what it reaches from a work list rather than by recursing into
+        // each value it reaches, so its stack does not grow with the depth of what it marks.
+        struct Link {
+            id: u32,
+            next: Option<InternedRef<'static, Link>>,
+        }
+
+        impl PartialEq for Link {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
+        impl Eq for Link {}
+
+        impl Hash for Link {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.id.hash(state)
+            }
+        }
+
+        crate::impl_internable!(gc; Link);
+
+        impl GcInternedVisit for Link {
+            fn visit_with(&self, gc: &mut GarbageCollector) {
+                if let Some(next) = self.next
+                    && gc.mark_interned_alive(next).is_continue()
+                {
+                    next.visit_with(gc);
+                }
+            }
+        }
+
+        const DEPTH: u32 = 100_000;
+        let collect = || {
+            let mut gc = GarbageCollector::default();
+            gc.add_storage::<Link>();
+            unsafe { gc.collect() };
+        };
+        let small_stack = std::thread::Builder::new().stack_size(512 * 1024);
+        let marked = small_stack.spawn(move || {
+            let mut next = None;
+            for id in 0..DEPTH {
+                next = Some(Interned::new_gc(Link { id, next }).change_lifetime());
+            }
+            let head = next.unwrap().to_owned();
+            collect();
+            let kept = Link::storage().len();
+            drop(head);
+            collect();
+            (kept, Link::storage().len())
+        });
+        let (kept, left) = marked.unwrap().join().unwrap();
+        if !cfg!(feature = "prevent-gc") {
+            assert_eq!((kept, left), (DEPTH as usize, 0));
         }
     }
 }
