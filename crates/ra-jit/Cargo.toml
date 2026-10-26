@@ -70,6 +70,8 @@ ra-jit-expand.workspace = true
 ra-jit-store.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
+blaze-spec = { path = "../blaze-spec" }
+blaze-wire = { path = "../blaze-wire" }
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

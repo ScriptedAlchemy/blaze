@@ -21,6 +21,11 @@ use sha2::{Digest as _, Sha256};
 
 mod own;
 
+/// Only blaze's ported answer rules, with no kept answer or process fallback.
+pub(crate) fn own_answer(rustc: &Path, args: &[OsString]) -> Option<Vec<u8>> {
+    own::answer(rustc, args, &[], &|_| None)
+}
+
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
     "all-target-specs-json",

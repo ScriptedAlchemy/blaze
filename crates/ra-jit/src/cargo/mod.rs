@@ -18,6 +18,7 @@ pub(crate) mod run;
 mod sandboxed;
 pub(crate) mod say;
 pub(crate) mod script;
+mod spec;
 mod state;
 pub(crate) mod switch;
 mod toolchain;
@@ -37,6 +38,10 @@ pub(crate) use units::Record;
 /// `ra-jit cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
+    if let Some(rest) = args.strip_prefix(&["spec".to_owned()]) {
+        crate::end_with_reader();
+        std::process::exit(spec::command(rest)?);
+    }
     if let [word, cargo, rest @ ..] = args.as_slice()
         && word == SETTLE
     {
