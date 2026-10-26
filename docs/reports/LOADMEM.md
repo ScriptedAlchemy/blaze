@@ -705,5 +705,10 @@ the source functions extracted into a dependency-free test driver; the new parti
 case failed on the previous implementation. All seven tests in the actual `budget.rs`
 passed in a small driver that supplies the codegen error and progress interfaces. Touched
 Rust formatting and `git diff --check` passed. These focused checks do not validate a full
-daemon, a pressure-interrupted patch, coroutine layout or LLVM; the full crate and runtime
+daemon, a pressure-interrupted patch, coroutine layout or LLVM.
+
+A subsequent `cargo +1.99.0 check --locked --tests -p ra-jit` passed on Linux x86-64 in
+6 minutes 33 seconds, with one compile job, debug information disabled and incremental
+compilation disabled. This checked the real workspace dependencies, the codegen changes
+and ra-jit's test targets. It did not execute the tests or a daemon; the runtime and LLVM
 gates remain required before merging.
