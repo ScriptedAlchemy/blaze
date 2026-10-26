@@ -17,10 +17,16 @@ doctest = false
 anyhow.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
+blaze-registry = { path = "../blaze-registry" }
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-wire.workspace = true
+cargo-util-schemas = "=0.14.3"
 serde_json.workspace = true
 sha2 = "0.10"
+
+[dev-dependencies]
+semver.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

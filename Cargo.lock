@@ -751,10 +751,14 @@ dependencies = [
  "anyhow",
  "blaze-manifest",
  "blaze-metadata",
+ "blaze-registry",
  "blaze-resolve",
  "blaze-wire",
+ "cargo-util-schemas",
+ "semver",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
