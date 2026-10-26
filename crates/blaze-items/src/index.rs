@@ -692,6 +692,8 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
     for &(id, entry) in added.iter().filter(whole) {
         written.entry(entry.digest).or_default().1.push(id);
     }
+    let alike = written.values().filter(|it| it.0.len() > 1 || it.1.len() > 1).count();
+    let unlike = written.values().filter(|it| it.0.is_empty() || it.1.is_empty()).count();
     let mut moved: FxHashMap<ItemId, ItemId> = (written.into_values())
         .filter_map(|it| match (&it.0[..], &it.1[..]) {
             (&[was], &[now]) if std::mem::discriminant(&was) == std::mem::discriminant(&now) => {
@@ -700,6 +702,7 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
             _ => None,
         })
         .collect();
+    let paired = moved.len();
     let refs: FxHashMap<ItemId, &[ItemId]> =
         gone.iter().chain(added).map(|(id, entry)| (*id, &entry.refs[..])).collect();
     // What one refers to has to have moved with it: those that don't are dropped until none
@@ -714,6 +717,62 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
             .map(|it| *it.0)
             .collect();
         if wrong.is_empty() {
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                let erred = gone.iter().filter(|it| !whole(it)).count();
+                let kinds = |all: &[(ItemId, &Entry)]| {
+                    let mut kinds: FxHashMap<&str, usize> = FxHashMap::default();
+                    for (id, _) in all.iter().filter(|it| !moved.contains_key(&it.0)) {
+                        *kinds.entry(id.kind()).or_default() += 1;
+                    }
+                    let mut kinds: Vec<_> = kinds.into_iter().collect();
+                    kinds.sort();
+                    kinds
+                };
+                eprintln!(
+                    "items-unmoved: {erred} of the gone with errors, {} digests of several, {} of one side, {} paired and dropped for their refs; unmoved gone {:?}",
+                    alike,
+                    unlike,
+                    paired - moved.len(),
+                    kinds(gone)
+                );
+                let now: FxHashSet<ItemId> = moved.values().copied().collect();
+                let mut twins: FxHashMap<&[Symbol], Vec<&Entry>> = FxHashMap::default();
+                for (_, entry) in added.iter().filter(|it| !now.contains(&it.0)) {
+                    twins.entry(&entry.names[..]).or_default().push(entry);
+                }
+                let (mut digest, mut refs, mut shown) = (0, 0, 0);
+                for (id, was) in gone.iter().filter(|it| !moved.contains_key(&it.0)) {
+                    let Some([now]) = twins.get(&was.names[..]).map(|it| &it[..]) else { continue };
+                    if now.digest != was.digest {
+                        digest += 1;
+                    } else {
+                        refs += 1;
+                    }
+                    if shown < 6 {
+                        shown += 1;
+                        let names: Vec<&str> =
+                            was.names.iter().take(6).map(|it| it.as_str()).collect();
+                        let diff: Vec<String> = (was.refs.iter().zip(&now.refs))
+                            .filter(|(a, b)| a != b && moved.get(a) != Some(b))
+                            .take(3)
+                            .map(|(a, b)| format!("{a:?}->{b:?}"))
+                            .collect();
+                        eprintln!(
+                            "items-unmoved: {} {names:?}: digest {}, refs {} and {}, {diff:?}, erred {} {}, missed {:?}",
+                            id.kind(),
+                            if now.digest == was.digest { "same" } else { "other" },
+                            was.refs.len(),
+                            now.refs.len(),
+                            was.erred,
+                            now.erred,
+                            now.missed
+                        );
+                    }
+                }
+                eprintln!(
+                    "items-unmoved: twins by name with another digest {digest}, with the digest {refs}"
+                );
+            }
             return moved;
         }
         for it in wrong {
