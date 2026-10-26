@@ -278,11 +278,6 @@ impl<'a, T: Internable> InternedRef<'a, T> {
         unsafe { drop(Arc::from_raw(self.as_raw())) }
     }
 
-    #[inline]
-    pub(crate) fn strong_count(self) -> usize {
-        ArcBorrow::strong_count(&self.arc)
-    }
-
     /// **Available only on GC mode**.
     ///
     /// Changes the attached lifetime, as in GC mode, the lifetime is more kind of a lint to prevent misuse

@@ -210,11 +210,6 @@ impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
     }
 
     #[inline]
-    pub(crate) fn strong_count(self) -> usize {
-        ThinArc::strong_count(&self.arc())
-    }
-
-    #[inline]
     pub(crate) fn as_raw(self) -> *const c_void {
         self.arc().as_ptr()
     }
