@@ -137,6 +137,11 @@ pub(crate) fn run(
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
         return Ok(project_model::WorkspaceBuildScripts::default());
     };
+    // Workers for different feature sets can share a script's compile directory and OUT_DIR.
+    // Keep the freshness check, compile, run and record writes in one critical section so a
+    // worker cannot execute another worker's half-written executable or reuse its records.
+    let target: &Path = cargo.target_directory().as_ref();
+    let _held = lock::acquire(&target.join(DIR)).context("locking the build-script directory")?;
     let sysroot: PathBuf = workspace.sysroot.root().map(|it| PathBuf::from(it.as_str())).context(
         "blaze runs build scripts with the standard library's source, and has no toolchain",
     )?;
@@ -223,7 +228,7 @@ impl<'a> Runner<'a> {
             .into_iter()
             .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
             .collect();
-        let flags = rustflags(&ctx.config, asked.env, asked.target)?;
+        let flags = rustflags(&ctx.config, asked.target, rustc_cfg)?;
         // Without `--target` the scripts are compiled with the target's flags; with it, with
         // none (cargo's `target-applies-to-host`).
         let host_flags = match asked.target == asked.host {
@@ -231,8 +236,12 @@ impl<'a> Runner<'a> {
             false => Vec::new(),
         };
         let target: &Path = cargo.target_directory().as_ref();
-        // The compiler of the scripts is blaze, over the toolchain's standard library.
-        let rustc = format!("blaze {} over {}", env!("CARGO_PKG_VERSION"), sysroot.display());
+        // A version string is shared by different builds of blaze. A compiler change must
+        // invalidate the scripts it compiled even when their source files did not change.
+        let build = option_env!("RA_JIT_SOURCES")
+            .map(str::to_owned)
+            .unwrap_or_else(crate::cargo::daemon::version);
+        let rustc = compiler_identity(&sysroot, &build);
         Ok(Runner {
             cargo,
             asked,
@@ -787,6 +796,13 @@ fn set_for_crates(name: &str) -> bool {
     crate::cargo::own_script::read_by_crates(name)
 }
 
+/// The compiler and installed toolchain that made a script, including an in-place upgrade.
+fn compiler_identity(sysroot: &Path, build: &str) -> String {
+    let mut toolchain = crate::installed_identity(&format!("{}/", sysroot.display()));
+    toolchain.sort();
+    json!([build, sysroot, toolchain]).to_string()
+}
+
 /// A target as `cargo metadata` lists it.
 fn target_of(target: &project_model::TargetData) -> unit::Target {
     let (kind, crate_type) = match target.kind {
@@ -818,10 +834,18 @@ fn include_exclude(dir: &Path) -> (Vec<String>, Vec<String>) {
         let Some(value) = package.and_then(|it| it.get(key)) else { return Vec::new() };
         let value = match value.get("workspace").and_then(|it| it.as_bool()) {
             Some(true) => {
-                let root = dir.ancestors().skip(1).find_map(|it| {
-                    let root = read(&it.join("Cargo.toml"))?;
-                    root.get("workspace").is_some().then_some(root)
-                });
+                let root = if manifest.contains_key("workspace") {
+                    Some(manifest.clone())
+                } else if let Some(workspace) =
+                    package.and_then(|it| it.get("workspace")).and_then(|it| it.as_str())
+                {
+                    read(&dir.join(workspace).join("Cargo.toml"))
+                } else {
+                    dir.ancestors().skip(1).find_map(|it| {
+                        let root = read(&it.join("Cargo.toml"))?;
+                        root.get("workspace").is_some().then_some(root)
+                    })
+                };
                 let inherited = root
                     .as_ref()
                     .and_then(|it| it.get("workspace")?.get("package")?.get(key).cloned());
@@ -847,25 +871,25 @@ fn include_exclude(dir: &Path) -> (Vec<String>, Vec<String>) {
 /// and the `target.'cfg(..)'` tables, then `build.rustflags`.
 pub(crate) fn rustflags(
     config: &Config,
-    env: &BTreeMap<String, String>,
     target: &str,
+    cfg: &[cfg::CfgAtom],
 ) -> anyhow::Result<Vec<String>> {
-    if let Some(encoded) = env.get("CARGO_ENCODED_RUSTFLAGS") {
-        return Ok(match encoded.is_empty() {
-            true => Vec::new(),
-            false => encoded.split('\u{1f}').map(str::to_owned).collect(),
-        });
-    }
-    if let Some(flags) = env.get("RUSTFLAGS") {
-        return Ok(flags.split_whitespace().map(str::to_owned).collect());
-    }
-    let of_target: Option<blaze_manifest::config::StringList> =
-        config.get(&format!("target.{target}.rustflags"))?;
-    if let Some(flags) = of_target {
-        return Ok(flags.as_slice().to_vec());
-    }
-    let build = config.build_config()?;
-    Ok(build.rustflags.as_ref().map(|it| it.as_slice().to_vec()).unwrap_or_default())
+    let cfg: Vec<cargo_platform::Cfg> = cfg
+        .iter()
+        .map(|atom| match atom {
+            cfg::CfgAtom::Flag(name) => name.to_string(),
+            cfg::CfgAtom::KeyValue { key, value } => format!("{key}={:?}", value.as_str()),
+        })
+        .map(|it| it.parse())
+        .collect::<Result<_, _>>()?;
+    let kind = CompileKind::Target(target.to_owned());
+    config.extra_args(
+        std::slice::from_ref(&kind),
+        target,
+        Some(&cfg),
+        &kind,
+        blaze_manifest::config::Flags::Rust,
+    )
 }
 
 /// A package as a profile's `[profile.*.package.<spec>]` is matched against it.
@@ -917,3 +941,5 @@ impl ProfilePackage for Named<'_> {
 
 #[cfg(test)]
 mod tests;
+
+mod lock;

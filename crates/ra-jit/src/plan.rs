@@ -573,7 +573,7 @@ impl Plan {
             &selection.profile,
             asked.triple,
         )?;
-        let flags = crate::scripts::rustflags(&ctx.config, &env, asked.triple)?;
+        let flags = crate::scripts::rustflags(&ctx.config, asked.triple, asked.cfg)?;
         let flags = Flags::parse(flags.iter().map(String::as_str));
         anyhow::ensure!(
             !flags.lto,
