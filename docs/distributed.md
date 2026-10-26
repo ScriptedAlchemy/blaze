@@ -2209,7 +2209,10 @@ struct TestBaseKeyInput {            // 0..=5
 ```
 
 `TestKey`'s input is the two-element array `[TestBaseKey, InputManifest's digest]`, and
-`WorkName`'s is the `WorkKey` itself, so neither needs a struct. Every enum's payload is a map of
+`WorkName`'s is the `WorkKey` itself, so neither needs a struct. `StoreIdentity` is ra-jit-store's
+`Identity::new` unchanged and `EntryKey` its own `sha256(identity ‖ key)`, so neither has an input
+struct: the two values are the store's, and their digests below are only for golden vectors and for
+a blob that names them. Every enum's payload is a map of
 the fields its variant names, with these numbers:
 
 ```rust
@@ -2239,16 +2242,21 @@ JobEvent::Done { outcome: Outcome, counters: Vec<(String, u64)> } // 0..=1
 ```
 
 `LocalPolicy`, `Stage`, `Outcome` and `Namespace`'s other variants are units: payload `null`; a
-`Pr` is `[1, n]`. A newtype with no field numbers is its inner value, unwrapped.
-`JobEvent::Verdict`'s and `Command::Test`'s payloads are the payload type's own map, not a map
-that holds it, so a decoder reads the enum as an array of two.
+`Pr` is `[1, n]`. A newtype with no field numbers is its inner value, unwrapped. Each payload map is
+a struct of its own, and `crates/blaze-wire` names them `GitRef`, `RootRef`, `PrNamespace`,
+`ItemKey`, `EdgeKey`, `EntryRef`, `Why`, `FileObservation`, `DirObservation`, `AbsentObservation`,
+`LinkObservation`, `StageEvent`, `AssignedEvent`, `PublishedEvent`, `ProgramEvent`,
+`RefusedEvent`, `OutputEvent` and `DoneEvent`. `JobEvent::Verdict`'s and `Command::Test`'s payloads
+are the payload type's own map, not a map that holds it, so a decoder reads the enum as an array of
+two.
 
 What this leaves to the implementation, in one line each: `HelloRequest.role` and
 `WorkersEventsAnswer.verdict` are `u8` (an enum there would be a two-element array for a byte);
 `Limits.blob` is 4 GiB and `Limits.batch_items` 65,536, the two the section does not number;
 lookup answers follow their request's key order; `CrateKeyInput.stable` and
 `TestBaseKeyInput.binary` are digests, not names; a `Vec` not marked set keeps its order;
-`TestPass` is the "pass with manifest digest" the table names in prose.
+`TestPass` is the "pass with manifest digest" the table names in prose; `[u8; N]` and a digest are
+byte strings, and a `Vec<u8>` is an array of integers as any `Vec` is.
 
 ## 9. Upstream's objections
 
