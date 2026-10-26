@@ -235,6 +235,20 @@ impl ItemPush {
         self.take_settled(Settled::new(db, fan, &roots, &instances, &live));
     }
 
+    /// Takes what `asked` refers to for unknown, as it could not be settled.
+    pub(super) fn forget(&mut self, asked: &Asked) {
+        for &at in &asked.roots {
+            if let Some(it) = self.roots.get_mut(at as usize) {
+                *it = Err(PANICKED);
+            }
+        }
+        for &at in &asked.instances {
+            if let Some(it) = self.instances.get_mut(at as usize) {
+                *it = Err(PANICKED);
+            }
+        }
+    }
+
     pub(super) fn take_settled(&mut self, settled: Settled) {
         let roots = self.roots.len() as At;
         let told = (settled.roots.into_iter())

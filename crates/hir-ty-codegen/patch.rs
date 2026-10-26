@@ -1980,27 +1980,34 @@ impl Base {
         self.went.clear();
         let Some(items) = &mut self.items else { return };
         let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
-        let taken = probe(|| {
-            hir_ty::attach_db(db, || {
-                let took = start.elapsed();
-                match (reitem, settled) {
-                    (Some(_), Some((_, settled))) => items.take_settled(settled),
-                    (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
-                    (None, _) => {}
-                }
-                let settled = start.elapsed();
-                items.index.before_edit(db, files, fan);
-                if std::env::var_os("RA_JIT_STATS").is_some() {
-                    eprintln!(
-                        "items-before: taken {} us, settled {} us, written {} us",
-                        took.as_micros(),
-                        (settled - took).as_micros(),
-                        (start.elapsed() - settled).as_micros()
-                    );
-                }
+        let took = start.elapsed();
+        let asked = reitem.clone();
+        let settling = probe(|| {
+            hir_ty::attach_db(db, || match (reitem, settled) {
+                (Some(_), Some((_, settled))) => items.take_settled(settled),
+                (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
+                (None, _) => {}
             })
         });
-        if taken.is_none() {
+        // What could not be settled is asked about at every edit until it is: the threads
+        // building the last patch, stopped by this edit, can have left what it reads unasked.
+        if settling.is_none()
+            && let Some(asked) = &asked
+        {
+            items.forget(asked);
+        }
+        let settled = start.elapsed();
+        let written = probe(|| hir_ty::attach_db(db, || items.index.before_edit(db, files, fan)));
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "items-before: taken {} us, settled {} us{}, written {} us",
+                took.as_micros(),
+                (settled - took).as_micros(),
+                if settling.is_none() { " (unsettled)" } else { "" },
+                (start.elapsed() - settled).as_micros()
+            );
+        }
+        if written.is_none() {
             self.items = None;
         }
     }
