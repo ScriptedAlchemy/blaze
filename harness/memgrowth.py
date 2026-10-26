@@ -14,9 +14,13 @@ bytes it started with, and after each the daemon is waited for until it has buil
 `RssFile` and `VmHWM` on Linux (its physical footprint on macOS); jemalloc's `stats.allocated`,
 `resident`, `mapped` and `retained`; the ingredient table; and what the daemon reports of its
 own: the lengths of the `intern` tables per type, the checkouts, the files hashed, the symbols
-of rustc's executables it has read, and the maps a patch keeps. Every edit is built by the
-daemon, and the program is run after the edit and after its undoing: a build that fails, is
-left to cargo, or a program that says something else than it said first, ends the run.
+of rustc's executables it has read (one entry for each executable, not for each symbol), and
+the maps a patch keeps. Every edit and every undoing is built by the daemon, the last undoing
+too, and the program is run after each: a build that fails or is left to cargo, a program that
+is not there or does not run, or one that exits or prints (stdout; stderr is not compared)
+something other than the unedited program did, ends the run. The unedited program is run first,
+once the daemon is ready, and must exit with the project's `exit` (0 unless the project says).
+Each arm says how many builds and runs it checked.
 
 At the end, the arm's figure is read, then one more edit is made and its undoing: that is the
 edit's time with the reclaim's page faults in it. With `--recycle` a worker recycle follows, which
@@ -25,10 +29,12 @@ the floor.
 
 M4, idle reclaim A/B. The arms are `RA_JIT_RECLAIM`'s values: `0` (nothing) and `1` (the type
 GC, the solver caches on every thread, and the purge), or any of `gc`, `cache` and `purge` for
-one step alone, separated by commas. Each arm is its own daemon from the same source and store,
+one step alone, separated by commas. The type GC is never run without the caches cleared: `gc`
+is the clearing and the collection, and `cache` is the clearing alone, so `cache` against `gc`
+is what the collection gives back. Each arm is its own daemon from the same source and store,
 makes the same `--pairs` pairs, and records what the worker holds after its last pair: the arms
 are the same state at the start and differ in what the reclaim gave back, so the difference
-between two arms is the reclaim's. `--arms 0,gc,purge,1` reads what each step alone gives back,
+between two arms is the reclaim's. `--arms 0,cache,gc,purge,1` reads what each step gives back,
 in the order M1's section 5 asks for. `--runs` (at least 2) interleaves the arms, and the
 medians are printed with the samples.
 
@@ -367,7 +373,8 @@ def program_of(spec, ws):
 
 def run_program(spec, ws):
     """Runs the program the build wrote, with the arguments the project says, and its status
-    and output. `None` when no program of it is there, which is a failure of the build."""
+    and stdout. The status is `None`, and the output says why, when no program of it is there
+    or it did not run, which is a failure of the build. stderr is not compared."""
     named = program_of(spec, ws)
     if named is None:
         return None, "the build wrote no program"
@@ -378,43 +385,65 @@ def run_program(spec, ws):
     return ran.returncode, ran.stdout
 
 
+def baseline_of(spec, label):
+    """What the unedited program does, once the daemon is ready: the status and stdout every
+    edit and undoing is held to. The program must run, and exit as the project says (`exit`,
+    0 unless it names another), or there is nothing to hold them to."""
+    got = run_program(spec, spec["ws"])
+    expected = spec.get("exit", 0)
+    if got[0] is None:
+        raise SystemExit(f"{label}: the unedited program did not run: {got[1]}")
+    if got[0] != expected:
+        raise SystemExit(f"{label}: the unedited program exits {got[0]}, not {expected}:\n{got[1][-1000:]}")
+    return got
+
+
+def checked_edit(side, daemon, spec, changes, back, label, step, baseline, checked):
+    """One edit or undoing, and everything that can be asked of it: the build exits 0 and the
+    daemon built it (not cargo), and the program it wrote runs and exits and prints what the
+    unedited program did. Each is counted in `checked`. The result is what `edit` returns."""
+    took, ran, built, said = edit(side, daemon, spec, changes, back)
+    if ran.returncode != 0:
+        raise SystemExit(f"{label} {step}: the build failed (exit {ran.returncode}):\n{ran.stderr[-3000:]}")
+    if built != "daemon":
+        raise SystemExit(f"{label} {step}: built by {built}:\n{ran.stderr[-2000:]}")
+    checked["builds"] += 1
+    got = run_program(spec, spec["ws"])
+    if got[0] is None:
+        raise SystemExit(f"{label} {step}: the program did not run: {got[1]}")
+    if got != baseline:
+        raise SystemExit(f"{label} {step}: the program exits {got[0]} and says {got[1][:400]!r}, "
+                         f"not {baseline[0]} and {baseline[1][:400]!r}")
+    checked["runs"] += 1
+    return took, ran, built, said
+
+
 def one_arm(spec, work, label, reclaim, pairs, every, kinds, build, output):
-    """One arm: a daemon, M1's pairs, then M4's figures and one more edit timed."""
+    """One arm: a daemon, M1's pairs, then M4's figures and one more edit timed. Every edit and
+    undoing, the last included, is held to `checked_edit`."""
     reports = os.path.join(work, "reports", label)
     shutil.rmtree(reports, ignore_errors=True)
     os.makedirs(reports)
     env = dict(output["env"], RA_JIT_MEMORY=reports, RA_JIT_RECLAIM=reclaim)
     side, daemon, env, took, warm, states = start(spec, work, label, env)
+    checked = dict(builds=0, runs=0)
     arm = dict(label=label, reclaim=reclaim, first_build_s=round(took, 1), warm_s=round(warm, 1),
-               states=states, samples=[], run=output["run"])
+               states=states, samples=[], run=output["run"], checked=checked)
     try:
         with memory.Sampler() as sampler:
             sampler.add(daemon.pid())
             waited, how = wait_base(daemon)
         arm["base_s"], arm["base_how"], arm["peak_mb"] = round(waited, 1), how, sampler.peak_mb
         print(f"{label}: base in {waited:.1f} s ({how}), peak {sampler.peak_mb} MB", flush=True)
-        first = None
+        # The program as it is before any edit, which the first edit's is held to as well.
+        first = baseline_of(spec, label)
         for at in range(pairs):
             kind = kinds[at % len(kinds)]
-            took, ran, built, said = edit(side, daemon, spec, output["edits"][kind], False)
-            if ran.returncode != 0:
-                raise SystemExit(f"{label} pair {at + 1} ({kind}): the build failed:\n{ran.stderr[-3000:]}")
-            if built != "daemon":
-                raise SystemExit(f"{label} pair {at + 1} ({kind}): built by {built}:\n{ran.stderr[-2000:]}")
-            said_first = run_program(spec, spec["ws"])
-            if first is None:
-                first = said_first
-            elif said_first != first:
-                raise SystemExit(f"{label} pair {at + 1} ({kind}): the program says "
-                                 f"{said_first[1][:400]!r}, not {first[1][:400]!r}")
-            back_s, ran, built, said = edit(side, daemon, spec, output["edits"][kind], True)
-            if ran.returncode != 0 or built != "daemon":
-                raise SystemExit(f"{label} pair {at + 1} ({kind}, back): built by {built} "
-                                 f"(exit {ran.returncode}):\n{ran.stderr[-2000:]}")
-            said_back = run_program(spec, spec["ws"])
-            if said_back != first:
-                raise SystemExit(f"{label} pair {at + 1} ({kind}, back): the program says "
-                                 f"{said_back[1][:400]!r}, not {first[1][:400]!r}")
+            step = f"pair {at + 1} ({kind})"
+            took, ran, built, said = checked_edit(side, daemon, spec, output["edits"][kind], False,
+                                                  label, step, first, checked)
+            back_s, ran, built, said = checked_edit(side, daemon, spec, output["edits"][kind], True,
+                                                    label, f"{step}, back", first, checked)
             if (at + 1) % every == 0 or at + 1 == pairs:
                 got = figure(daemon, reports, pair=at + 1, kind=kind,
                              edit_s=round(took, 3), undo_s=round(back_s, 3))
@@ -428,19 +457,18 @@ def one_arm(spec, work, label, reclaim, pairs, every, kinds, build, output):
                       f"top {top}", flush=True)
         # M4: the state the arm ends in, and the next edit, which the reclaim's page faults
         # are in. The arms name the reclaim each run makes, so the arm that names one step
-        # (`--arms 0,gc,purge,1`) says what that step alone gave back.
+        # (`--arms 0,cache,gc,purge,1`) says what that step gave back.
         arm["end"] = figure(daemon, reports, pair=pairs, kind="end")
-        took, ran, built, said = edit(side, daemon, spec, output["edits"][kinds[0]], False)
-        if ran.returncode != 0 or built != "daemon":
-            raise SystemExit(f"{label}: the edit after the last pair was built by {built}")
-        said_after = run_program(spec, spec["ws"])
-        if said_after != first:
-            raise SystemExit(f"{label}: the program after the reclaim says "
-                             f"{said_after[1][:400]!r}, not {first[1][:400]!r}")
-        back_s, ran, built, said = edit(side, daemon, spec, output["edits"][kinds[0]], True)
+        took, ran, built, said = checked_edit(side, daemon, spec, output["edits"][kinds[0]], False,
+                                              label, "the edit after the last pair", first, checked)
+        back_s, ran, built, said = checked_edit(side, daemon, spec, output["edits"][kinds[0]], True,
+                                                label, "the undoing of the edit after the last pair",
+                                                first, checked)
         arm["next_edit_s"] = round(took, 3)
         arm["next_undo_s"] = round(back_s, 3)
         arm["after_next"] = figure(daemon, reports, pair=pairs, kind="after-next-edit")
+        print(f"{label}: {checked['builds']} builds and {checked['runs']} runs checked, "
+              f"the unedited program exits {first[0]}", flush=True)
         if output["recycle"]:
             # The floor: the daemon stopped and started again on the same store and target
             # directory, which is what a recycle costs and what it gets back.
@@ -462,10 +490,12 @@ def one_arm(spec, work, label, reclaim, pairs, every, kinds, build, output):
     return arm
 
 
-def fit(samples, field):
-    """A least-squares line of `field` against the pair number, and its r²: what M1's leak rule
-    reads. `None` when there are fewer than three samples, or the line is flat."""
-    points = [(it["pair"], it[field]) for it in samples if it.get(field) is not None]
+def fit(samples, group, field):
+    """A least-squares line of `field` of a sample's `group` (`alloc`, the allocator's figures)
+    against the pair number, and its r²: what M1's leak rule reads. `None` when there are fewer
+    than three samples that have it, or the line is flat."""
+    points = [(it["pair"], it[group][field]) for it in samples
+              if it.get(group, {}).get(field) is not None]
     if len(points) < 3:
         return None
     n = len(points)
@@ -491,7 +521,7 @@ def leak_rule(runs):
     out = {}
     for label, arm in runs.items():
         for field, ready in (("allocated", "allocated"),):
-            lines = [fit(arm_run["samples"], field) for arm_run in arm]
+            lines = [fit(arm_run["samples"], "alloc", field) for arm_run in arm]
             lines = [it for it in lines if it]
             if not lines:
                 continue
@@ -538,10 +568,10 @@ def medians(arms):
             found = [it[field] for it in runs if it.get(field) is not None]
             got[field] = round(statistics.median(found), 3) if found else None
         for field in ("VmRSS", "RssAnon", "RssFile", "VmHWM", "footprint"):
-            found = [it["end"]["pages"].get(field) for it in runs if it["end"]["pages"].get(field)]
+            found = [it["end"]["pages"].get(field) for it in runs if it["end"]["pages"].get(field) is not None]
             got[f"end_{field}"] = int(statistics.median(found)) if found else None
         for field in ("allocated", "resident", "mapped", "retained"):
-            found = [it["end"]["alloc"].get(field) for it in runs if it["end"]["alloc"].get(field)]
+            found = [it["end"]["alloc"].get(field) for it in runs if it["end"]["alloc"].get(field) is not None]
             got[f"end_{field}"] = int(statistics.median(found)) if found else None
         for field in ("TyInterned", "GenericArgs", "Tys", "Clauses", "PredicateInterned"):
             found = [it["end"]["interned"].get(field) for it in runs
@@ -614,9 +644,14 @@ def main():
                   f"{rule['over_1000']:.1%} of the first over 1,000, r² {rule['r2']}: {verdict} "
                   f"(the rule is a proposal, unverified)", flush=True)
         else:
-            samples = sum(len(it["samples"]) for it in arms_of[label])
-            print(f"    M1: the line needs three samples and has {samples} "
-                  f"(`--reclaim-every` smaller than `--pairs / 3`)", flush=True)
+            fewest = min(len(it["samples"]) for it in arms_of[label])
+            if fewest < 3:
+                print(f"    M1: the line needs three samples of a run and a run has {fewest} "
+                      f"(`--reclaim-every` {every} of `--pairs` {pairs}: below `--pairs / 2` "
+                      f"makes three)", flush=True)
+            else:
+                print("    M1: no line: the samples have no allocator figure, or the pairs "
+                      "do not differ", flush=True)
         if label in grew:
             grew_any = [it for it in grew[label] if it[3] > 0]
             if grew_any:
