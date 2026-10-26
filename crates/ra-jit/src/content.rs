@@ -207,7 +207,10 @@ impl Contents {
             field(dependency.name.as_str().as_bytes());
             match on.data(db).origin.is_local() {
                 true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
-                false => field(&Self::outside(db, on, stable_crate_id(on))),
+                false => {
+                    field(&Self::outside(db, on, stable_crate_id(on)));
+                    field(&library_source_hash(db, on));
+                }
             }
         }
         Some(ContentId(hasher.finalize().into()))
@@ -234,8 +237,9 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit library 5");
+        field(b"ra-jit library 6");
         field(Self::version(db, krate).as_bytes());
+        field(&library_source_hash(db, krate));
         // Where cargo fetched it to is under another directory on another machine, and so is
         // a crate beside the checkout, which the path that reaches it from there names.
         let root = root.to_string_lossy();
@@ -258,8 +262,14 @@ impl Contents {
                 Some((None, root)) => {
                     field(&self.library(db, on, &root, checkout, known, process_reads).0)
                 }
-                Some((id, _)) => field(&Self::outside(db, on, id)),
-                None => field(&Self::outside(db, on, None)),
+                Some((id, _)) => {
+                    field(&Self::outside(db, on, id));
+                    field(&library_source_hash(db, on));
+                }
+                None => {
+                    field(&Self::outside(db, on, None));
+                    field(&library_source_hash(db, on));
+                }
             }
         }
         let id = ContentId(hasher.finalize().into());
@@ -318,6 +328,65 @@ fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
     }
 }
 
+/// Source replacements are mutable even when cargo calls their origin "registry".
+/// Cover the loaded source root, including included binary/text files. Relative names
+/// preserve portability; source bytes ensure equal vendor locations do not alias edits.
+/// Hashing the whole source root is conservative when it contains multiple packages.
+pub(crate) fn library_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
+    fn closure(db: &RootDatabase, krate: Crate, seen: &mut FxHashSet<Crate>) -> Hash {
+        if !seen.insert(krate) {
+            return Sha256::digest(b"already hashed library dependency").into();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(library_own_source_hash(db, krate));
+        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
+        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        for dep in dependencies {
+            hasher.update((dep.name.as_str().len() as u64).to_le_bytes());
+            hasher.update(dep.name.as_str().as_bytes());
+            hasher.update(closure(db, dep.crate_id, seen));
+        }
+        hasher.finalize().into()
+    }
+    closure(db, krate, &mut FxHashSet::default())
+}
+
+fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
+    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    let sources = db.source_root(root).source_root(db);
+    let mut files: Vec<_> = sources
+        .iter()
+        .filter_map(|file| {
+            let path = sources.path_for_file(&file)?.as_path()?.to_string();
+            Some((path, file))
+        })
+        .collect();
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    hash_source_files(
+        &files
+            .iter()
+            .map(|(path, file)| (path.clone(), file_hash(db, *file, Path::new(path))))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn hash_source_files(files: &[(String, Hash)]) -> Hash {
+    let common = files.first().map(|(path, _)| Path::new(path).parent().unwrap());
+    let common = common.and_then(|first| {
+        first.ancestors().find(|dir| files.iter().all(|(path, _)| Path::new(path).starts_with(dir)))
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"ra-jit library sources 1");
+    for (path, hash) in files {
+        let relative = common.and_then(|dir| Path::new(path).strip_prefix(dir).ok());
+        let name = relative.unwrap_or(Path::new(path)).to_string_lossy();
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(hash);
+    }
+    hasher.finalize().into()
+}
+
 /// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry
 /// are in its `registry/src`, those of git in its `git/checkouts`.
 fn cargo_home_of(path: &Path) -> Option<&Path> {
@@ -367,6 +436,21 @@ impl FileHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_vendor_places_share_only_equal_source_bytes() {
+        let files = |home: &str, body: &[u8]| {
+            vec![
+                (format!("{home}/vendor/dep/src/lib.rs"), Sha256::digest(body).into()),
+                (format!("{home}/vendor/dep/src/other.rs"), Sha256::digest(b"same").into()),
+            ]
+        };
+        let one = hash_source_files(&files("/home/a/repo", b"fn value() -> u32 { 1 }"));
+        let other = hash_source_files(&files("/Users/b/repo", b"fn value() -> u32 { 1 }"));
+        let changed = hash_source_files(&files("/Users/b/repo", b"fn value() -> u32 { 2 }"));
+        assert_eq!(one, other);
+        assert_ne!(one, changed);
+    }
 
     #[test]
     fn the_cargo_home_is_told_from_a_file_cargo_fetched() {

@@ -6,6 +6,7 @@ fn main() {
         println!("panic at {}:{}", at.file(), at.line());
     }));
     println!("shared: {}", shared::describe());
+    println!("literal paths: {:?}", shared::literal_paths());
     println!("inner: {:?} {}", inner::where_am_i(), inner::generated());
     println!("table {} blob {:?} built {}", inner::checked(5), inner::BLOB, inner::built());
     println!("doubled {} {}", shared::double(21u32), shared::double(1.5f64));

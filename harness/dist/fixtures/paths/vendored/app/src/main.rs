@@ -1,6 +1,7 @@
 use std::panic;
 
 fn main() {
+    println!("vendor identity {}", fastrand::c4_identity());
     panic::set_hook(Box::new(|info| {
         let at = info.location().unwrap();
         println!("panic at {}:{}", at.file(), at.line());

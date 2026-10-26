@@ -32,6 +32,7 @@ fn named(path: &Path) -> usize {
 /// `None` for a path that is relative (a file of the workspace is, and is the same on every
 /// machine) and one that shares fewer than [`SHARED`] directories with the root.
 pub fn stored_as(path: &str, root: &str) -> Option<String> {
+    let text = path;
     let (path, root) = (Path::new(path), Path::new(root));
     if !path.is_absolute() || !root.is_absolute() {
         return None;
@@ -41,15 +42,16 @@ pub fn stored_as(path: &str, root: &str) -> Option<String> {
         return None;
     }
     let up = named(root.strip_prefix(common).ok()?);
-    let down = path.strip_prefix(common).ok()?;
+    // Only the common directory and generated leading traversal are structural.
+    // The tail can be concat!(file!(), "/../tag") text, not a filesystem path.
+    let common_text = common.to_str()?;
+    let down = text.strip_prefix(common_text)?.strip_prefix('/')?;
     let mut stored = String::from(CHECKOUT);
     for _ in 0..up {
         stored.push_str("/..");
     }
-    for part in down.components() {
-        stored.push('/');
-        stored.push_str(&part.as_os_str().to_string_lossy());
-    }
+    stored.push('/');
+    stored.push_str(down);
     Some(stored)
 }
 
@@ -57,20 +59,17 @@ pub fn stored_as(path: &str, root: &str) -> Option<String> {
 /// say and down as the rest of the path goes. `None` for a path the store does not name so, and
 /// one that goes up from the root past its top.
 pub fn read_as(stored: &str, root: &str) -> Option<String> {
-    let rest = stored.strip_prefix(CHECKOUT)?.strip_prefix('/')?;
+    let mut rest = stored.strip_prefix(CHECKOUT)?.strip_prefix('/')?;
     let mut path = PathBuf::from(root);
-    for part in rest.split('/') {
-        match part {
-            ".." => {
-                if !path.pop() {
-                    return None;
-                }
-            }
-            "" | "." => {}
-            part => path.push(part),
+    // Interpret only the leading ".." emitted by stored_as. Everything after the
+    // first ordinary segment is exact program text, including slash/dot suffixes.
+    while let Some(tail) = rest.strip_prefix("../") {
+        if !path.pop() {
+            return None;
         }
+        rest = tail;
     }
-    Some(path.to_string_lossy().into_owned())
+    Some(format!("{}/{rest}", path.to_str()?.trim_end_matches('/')))
 }
 
 /// Whether `path` is already named as the store names a place of the checkout, and so would be
@@ -145,5 +144,19 @@ mod tests {
         assert!(!names_checkout("/checkout"));
         assert!(!names_checkout("/checkouts/x"));
         assert!(!names_checkout("src/lib.rs"));
+    }
+
+    #[test]
+    fn literal_suffixes_are_not_filesystem_traversal() {
+        for tail in ["shared/src/lib.rs/../tag", "shared/src/lib.rs//./tag///"] {
+            let text = format!("/home/a/repo/{tail}");
+            let stored = stored_as(&text, "/home/a/repo/ws").unwrap();
+            assert_eq!(stored, format!("/checkout/../{tail}"));
+            assert_eq!(
+                read_as(&stored, "/Users/b/repo/ws").unwrap(),
+                format!("/Users/b/repo/{tail}")
+            );
+            assert_eq!(read_as(&stored, "/home/a/repo/ws").unwrap(), text);
+        }
     }
 }

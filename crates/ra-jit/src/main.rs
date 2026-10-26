@@ -949,6 +949,10 @@ impl Resolver<'_> {
         let home = self.contents.cargo_home(self.db);
         let place = crate_place(&root, self.inside(&root), home.as_deref(), &self.root);
         let named = format!("ra-jit crate {} {place}", name.crate_name());
+        if !krate.data(self.db).origin.is_local() {
+            let source = content::library_source_hash(self.db, krate);
+            return Some(short_hash(&format!("{named} {source:x?}")));
+        }
         Some(short_hash(&named))
     }
 

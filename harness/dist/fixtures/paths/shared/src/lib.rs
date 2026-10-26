@@ -7,6 +7,10 @@ pub fn describe() -> String {
     format!("shared at {}:{}", file!(), line!())
 }
 
+pub fn literal_paths() -> (&'static str, &'static str) {
+    (concat!(file!(), "/../tag"), concat!(file!(), "//./tag///"))
+}
+
 /// Panics, with a location in this crate, for any number above two.
 pub fn boom(n: u32) -> u32 {
     if n > 2 {

@@ -1232,6 +1232,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_concatenated_file_literal_keeps_its_exact_suffix() {
+        for suffix in ["/../tag", "//./tag///"] {
+            let mut entry = written_at(&format!("/home/a/repo/shared/src/lib.rs{suffix}"));
+            assert!(entry.leave(None, None, Some("/home/a/repo/ws")));
+            let bytes = entry.encode().unwrap();
+            let arrived = Entry::decode(&bytes)
+                .unwrap()
+                .arrived(None, None, Some("/Users/b/repo/ws"))
+                .unwrap();
+            let expected = written_at(&format!("/Users/b/repo/shared/src/lib.rs{suffix}"));
+            assert_eq!(arrived.encode().unwrap(), expected.encode().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_file_is_not_taken_where_the_checkout_cannot_reach_it() {
         let mut stored = written_at("/home/one/shared/lib.rs");
         assert!(stored.leave(None, None, Some("/home/one/a/b/ws")));
