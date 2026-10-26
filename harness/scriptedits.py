@@ -49,7 +49,7 @@ from cargo_ra_jit import RA_JIT, base_env
 TIMEOUT = 900
 # Edits are made this long after the last build: a file system's clock is as coarse as a tick,
 # and cargo calls a file newer than its output only when it is.
-TICK = 0.05
+TICK = float(os.environ.get("SCRIPTEDITS_TICK", "0.05"))
 
 PRELUDE = r'''use std::{env, fs, io::Write, path::PathBuf};
 
@@ -210,6 +210,35 @@ fn main() {
     step("rebuild, nothing changed: a file of its package is newer than its run", 1),
     step("rebuild, nothing changed", 1),
     edit(2, runs=1),
+])
+
+# 2g. A watched directory that goes: not there, which is every build; and a script that names nothing
+# and is given variables, which cargo does not run it for.
+case("dir-gone", "a directory the script watches goes and comes back", single(r'''
+fn main() {
+    note("probe");
+    println!("cargo:rerun-if-changed=assets");
+    let n = fs::read_dir("assets").map(|it| it.count()).unwrap_or(0);
+    generated(&format!("files={n}"));
+}
+''', files={"assets/a.txt": "a\n"}), [
+    step("cold build", 1),
+    step("the directory goes", 1, remove=["assets"]),
+    step("rebuild, nothing changed: it is not there", 1),
+    step("the directory comes back", 1, write={"assets/b.txt": "b\n"}),
+    step("rebuild, nothing changed", 0),
+])
+
+case("unwatched-env", "a script that names nothing is not run for a variable", single(r'''
+fn main() {
+    note("probe");
+    generated(&format!("var={:?}", env::var("PROBE_VAR").ok()));
+}
+'''), [
+    step("cold build", 1),
+    step("PROBE_VAR=a: not watched, so not run", 0, env={"PROBE_VAR": "a"}),
+    edit(2, runs=1, env={"PROBE_VAR": "b"}),
+    step("rebuild, nothing changed", 0),
 ])
 
 # 2b. A watched file that is not there: cargo runs the script again for every build.

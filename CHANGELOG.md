@@ -797,7 +797,7 @@ All notable changes to ra-jit are written here. The format follows
   did, is run again as cargo does; the script's own modules and a build dependency of the
   workspace are watched; a build's requests to the worker run a script once, and a load takes
   what the check ran; and a script sees the variables of the process that asks, not those of the
-  process that started the daemon. `harness/scriptedits.py` holds 32 probes of it to cargo.
+  process that started the daemon. `harness/scriptedits.py` holds 34 probes of it to cargo.
 - A build script run the store kept is replayed only for the contents `OUT_DIR` held when it
   ran, so a script that counts in `OUT_DIR` is run again as cargo runs it.
 

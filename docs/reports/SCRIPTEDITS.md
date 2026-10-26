@@ -19,12 +19,12 @@ fingerprints. After each edit the daemon decides whether to ask for that run aga
 `Inputs::stale`), and when it does cargo decides what runs. `crates/blaze-build-script`, which runs
 and reads scripts as cargo does, is not wired into any build; only its `Rerun` rules and a new
 `output::reads` are now used, by that decision. So this unit makes the daemon's decision cargo's, as
-far as 32 probes can show; it does not make a worker free of cargo, and no unit of the plan does. That
+far as 34 probes can show; it does not make a worker free of cargo, and no unit of the plan does. That
 is [no-rustc.md](../no-rustc.md)'s step I, K and the 107 scripts of P0.6.
 
 ## The probes
 
-`harness/scriptedits.py` holds 32 cases ([harness.md](../harness.md)). A case is a project and steps
+`harness/scriptedits.py` holds 34 cases ([harness.md](../harness.md)). A case is a project and steps
 (an edit, a variable, a clean, nothing). Two directories hold the same project: blaze's whole build
 (`cargo ra-jit build`, one daemon for the steps of the case) builds one, and cargo 1.99.0 (`cargo
 build`, its own target directory) builds the other. The oracle, cargo, is never part of blaze's
@@ -45,11 +45,11 @@ macOS fails the whole build today, #255, unit P0.6). `RA_JIT_MEMORY_MAX=5G`, `RA
 `RA_JIT_SPARE=0`, `RUST_BACKTRACE=0`: the brief's 16G and 12G are above the VM (a deviation, below).
 
 Every step of every probe is equal in the build's exit status, the scripts' run counts and the
-program's exit status, standard output and standard error (**measured**, 32 probes, 3 consecutive runs
-of the whole suite at the final commit, then one more with `--json`, about 75 s each, no flake). The
+program's exit status, standard output and standard error (**measured**, 34 probes, 3 consecutive runs
+of the whole suite at the final binary, then two more with `--json` (the last of 34 probes), about 80 s each, and one with no pause between the steps (`SCRIPTEDITS_TICK=0`): no flake). The
 steps are cargo's own run counts ("2" in `links` is the two scripts, `native` and `probe`, each once).
-"Before" is the same harness on `dist/main`'s binary (`3434bc93`, built the same way): 20 of 32 probes
-equal, 129 of 154 steps.
+"Before" is the same harness on `dist/main`'s binary (`3434bc93`, built the same way): 20 of 34 probes
+equal, 135 of 163 steps.
 
 | probe | steps | script runs per step (cargo, and blaze: equal) | blaze = cargo at, now | before |
 |---|---|---|---|---|
@@ -58,6 +58,8 @@ equal, 129 of 154 steps.
 | `watched-spelling` | 5 | 1 1 1 1 0 | 5/5 | 5/5 |
 | `writes-what-it-watches` | 4 | 1 1 1 1 | 4/4 | 1/4 |
 | `writes-its-package` | 4 | 1 1 1 1 | 4/4 | 0/4 |
+| `dir-gone` | 5 | 1 1 1 1 0 | 5/5 | 4/5 |
+| `unwatched-env` | 4 | 1 0 1 0 | 4/4 | 2/4 |
 | `missing` | 6 | 1 1 1 0 1 1 | 6/6 | 4/6 |
 | `missing-env` | 4 | 1 1 1 1 | 4/4 | 1/4 |
 | `two-programs` | 3 | 1 1 1 | 3/3 | 1/3 |
@@ -183,7 +185,7 @@ passed, after 36 + 217 = 253 passed, 0 failed. On macOS arm64 (the Mac, Rust 1.9
   guard did not watch the container; the Mac ran only unit tests, under the heavy lock.
 - `P0.5`'s old verify line named `harness/scripts.py --impure`, which does not exist; the impure
   marking it meant is C4's (distributed.md), and the line is now `scriptedits.py` and P0-D.
-- The probes are 32, not nine: the brief's nine are several probes each (the verifier's cases were
+- The probes are 34, not nine: the brief's nine are several probes each (the verifier's cases were
   split by what they differ in), and I added those the reports hint at (a script that writes what it
   watches, a module of the script, a build dependency, a link, the manifest, RUSTFLAGS, `[env]`).
 
@@ -214,7 +216,7 @@ docker exec p05w rustup component add rust-src
 cargo +1.99.0 build -p ra-jit --release                           # 2m26s cold, 22 to 38 s after
 cargo +1.99.0 test -p blaze-build-script -p ra-jit                # 36 + 217 passed
 RA_JIT_BIN=/target/release/ra-jit RA_JIT_MEMORY_MAX=5G RA_JIT_OWN_BASE_MEMORY=3G RA_JIT_SPARE=0 \
-  RUST_BACKTRACE=0 PATH=/target/release:$PATH python3 -I harness/scriptedits.py --json OUT   # 32 of 32
+  RUST_BACKTRACE=0 PATH=/target/release:$PATH python3 -I harness/scriptedits.py --json OUT   # 34 of 34
 python3 harness/scriptedits.py --selftest                         # on the Mac too
 cargo +1.99.0 test -p blaze-build-script -p ra-jit                # macOS arm64: 36 + 217 passed
 ```
