@@ -513,6 +513,7 @@ impl Worker {
             }
             None => {
                 let mut command = Command::new(std::env::current_exe()?);
+                clear_worker_memory(&mut command);
                 command.args(&args);
                 match store() {
                     Some(store) => command.env("RA_JIT_CACHE", store),
@@ -788,6 +789,7 @@ impl Spare {
         private_dir(dir)?;
         let log = dir.join("log");
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.arg("--spare").arg(dir.join("package"));
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -870,6 +872,7 @@ impl Checker {
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.args(&args);
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -938,6 +941,14 @@ impl Checker {
     fn stop(&mut self) {
         kill(&mut self.child);
         let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// An unset request setting must not inherit the daemon's old budget. Spares are cleared
+/// at spawn and receive the requested policy in Told before starting their monitor.
+fn clear_worker_memory(command: &mut Command) {
+    for name in super::cli::MEMORY_ENV {
+        command.env_remove(name);
     }
 }
 
@@ -1686,6 +1697,19 @@ mod tests {
         let holding = [("loading".into(), Held { bytes: 30, asked: Instant::now(), busy: false })];
         assert!(over(&holding, 16, false).is_empty());
         assert_eq!(over(&holding, 16, true), ["loading"]);
+    }
+
+    #[test]
+    fn workers_clear_inherited_memory_policy_before_applying_the_request() {
+        let mut command = Command::new("unused-worker");
+        command.env("RA_JIT_WORKER_MEMORY", "old-budget");
+        clear_worker_memory(&mut command);
+        for name in super::super::cli::MEMORY_ENV {
+            assert!(command.get_envs().any(|(key, value)| key == *name && value.is_none()));
+        }
+        command.env("RA_JIT_WORKER_MEMORY", "32G");
+        assert!(command.get_envs().any(|(key, value)| key == "RA_JIT_WORKER_MEMORY"
+            && value == Some(std::ffi::OsStr::new("32G"))));
     }
 
     #[test]
