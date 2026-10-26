@@ -1513,7 +1513,8 @@ coordinator (inside an `Execution`) and two to four executors over a network tha
 horizon, loses up to 25% of messages, duplicates up to 15%, delays them up to 3 s (and so reorders
 them) and partitions executors; executors die before or after any effect, clocks run at 0.8 to
 1.25 times (one at 0.05 to 0.2), one helper may have another front end (a swapped tie, another
-root, impure inputs), one may hang, findings are dropped and call sites disagree on tuples. One
+root, impure inputs), one may stall past the progress timeout but eventually finishes, findings
+are dropped and call sites disagree on tuples. One
 executor never dies. The checker holds, from the coordinator's log and the calls it sees: no root
 or name in two live leases; no result committed for a fenced or expired lease (expiry by the
 checker's own clock), of another attempt, or after Done; at Done every root, found name and edge

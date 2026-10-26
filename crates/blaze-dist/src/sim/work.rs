@@ -868,12 +868,16 @@ impl World {
                 self.send(node, Kind::ToCoord { from: node, id, call });
             }
             holder::Effect::Compile(plan) => {
-                if self.nodes[node].hung {
-                    return Ok(());
-                }
                 let (batch, took) = self.compile(node, &plan);
                 let attempt = self.nodes[node].attempt;
-                self.push(self.now + took, Kind::Compiled { node, attempt, batch });
+                // A hung batch exceeds the progress timeout, but the fault is finite.
+                // Its eventual completion exercises fencing; later batches run normally.
+                let at = if self.nodes[node].hung && self.faulty() {
+                    self.profile.horizon_ms + WorkConfig::default().progress_first_ms + took
+                } else {
+                    self.now + took
+                };
+                self.push(at, Kind::Compiled { node, attempt, batch });
             }
             holder::Effect::Release(_) => {}
             holder::Effect::Stop(why) => {
