@@ -3193,10 +3193,13 @@ nothing; a test that fails is retried up to its attempts (`flaky` in the manifes
 none. The no-rustc audit (P0-A) remains pending: the fixtures have not run under it, and the
 harness says so. Acceptance: a fixture workspace in which an unchanged test is skipped
 on a second run; a changed test, a changed declared data file, a changed declared variable and a
-changed `--test-threads` each rerun; a test opted out with `no_cache` and with `external` runs
-every time; a test that fails is not skipped at the next run, nor after its code goes back to what
+changed `--test-threads` or declared executable mode each rerun; a test opted out with
+`no_cache` and with `external` runs every time; a test that fails is not skipped at the next run,
+nor after its code goes back to what
 passed; a test that fails once is retried, reported `Flaky`, and cached, and with one attempt it
-fails the run. From the reviews:
+fails the run. The complete parity gate also includes Bazel repeated-run requests
+(`--runs_per_test` above one) bypassing the cache; the current local harness has not measured
+that part. From the reviews:
 - [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
   unknown effects instead of assuming libc is closed." Closed by the owner's decision, not by
   code: Bazel's key has the same blind spots (research 7.10) and blaze holds to Bazel's. What

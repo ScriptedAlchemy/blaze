@@ -470,6 +470,11 @@ fn data_hash(path: &Path, visiting: &mut BTreeSet<PathBuf>) -> std::io::Result<[
         visiting.remove(&here);
     } else if meta.is_file() {
         hash.update(b"file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            hash.update((meta.permissions().mode() & 0o111).to_le_bytes());
+        }
         let mut file = std::fs::File::open(path)?;
         std::io::copy(&mut file, &mut hash)?;
     } else {
@@ -660,6 +665,21 @@ mod tests {
         symlink("other", dir.join("link")).unwrap();
         symlink("link", dir.join("other")).unwrap();
         assert!(declared.given(&dir, &[], &command).unwrap_err().contains("cycle"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_tools_executable_mode_is_part_of_its_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = data_hash(&file, &mut BTreeSet::new()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(before, data_hash(&file, &mut BTreeSet::new()).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

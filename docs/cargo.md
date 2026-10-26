@@ -226,9 +226,10 @@ and a key the file does not have is refused:
     flaky = ["tests::net"]                       # three attempts (Bazel's flaky = True)
 
 A test is named as libtest shows it, or `package/name`, with a `*` at either end for any text.
-What `data` holds and what `env` and `RA_JIT_TEST_ENV` name have in the environment, and
-`--test-threads` and the effective `RUST_TEST_THREADS`, are what a pass was under: a test passes again, or not, when none of them
-changed. A workspace that declares `data` has tests that reach files skipped where no sandbox
+What `data` holds (including executable mode on Unix) and what `env` and `RA_JIT_TEST_ENV`
+name have in the environment, and `--test-threads` and the effective `RUST_TEST_THREADS`, are
+what a pass was under: a test passes again, or not, when none of them changed. A workspace that
+declares `data` has tests that reach files skipped where no sandbox
 records (macOS) while that is the same, which is Bazel's trust in a declaration and no more; one
 that does not has them run every time there, as above. A file that cannot be read, a directory
 cycle or a special file opts every test out; the tests still run. A test that failed is not kept as a pass, whatever its code goes back to.
