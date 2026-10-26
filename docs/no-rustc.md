@@ -884,8 +884,12 @@ its threads happen to look). Three scripts fail under cargo for want of a system
 two things the port missed: a `cargo check` has no artifact directory, so `target/debug` is
 not in the library path, and the certificates above. Not yet: the description filled by
 blaze's own manifest reader and resolver (the harness fills it from cargo), the run inside
-`ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs`,
-`inputs.rs` and `link.rs` reading output with this crate.
+`ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs` and
+`link.rs` reading output with this crate. `inputs.rs` has it since 2026-10-26: what a script says it
+reads (`output::reads`) and when it runs again (`apply::Rerun`), for the daemon's whole build to ask
+for a script's run exactly when cargo would (docs/distributed.md, P0.5; `harness/scriptedits.py`).
+The run itself is still the `cargo check` of the daemon's load in `target/rust-analyzer`, with
+ra-jit compiling the scripts: this crate does not run a script in a build yet.
 
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,
