@@ -13,12 +13,17 @@
 //! `check` resolves and finds as well and fails the build on any difference, `verify` writes
 //! what was read and fails on any difference, `off` neither reads nor writes.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use ide_db::base_db::Crate;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
-use hir_def::nameres::frozen::{self as hir_frozen, Frozen, Mode};
+use hir_def::nameres::frozen::{self as hir_frozen, Bytes, Frozen, Mode};
 use hir_ty::method_resolution::frozen as impls_frozen;
+
+use crate::front_image;
 
 /// What a build did with what is frozen of the crates it resolved.
 #[derive(Default)]
@@ -30,6 +35,15 @@ pub(crate) struct Served {
     /// The parts the store has but which name a file that is not loaded.
     unreadable: usize,
     mode: Option<Mode>,
+    /// The image `RA_JIT_FRONT_IMAGE` names, when it was mapped.
+    image: Option<Arc<front_image::Image>>,
+    /// How many of each part came out of the image, and the bytes of each part served or
+    /// written, in the order of [`Part::ALL`].
+    from_image: [usize; 3],
+    bytes: [u64; 3],
+    /// What reading the parts took, and what all of `serve` took.
+    fetch_took: Duration,
+    serve_took: Duration,
 }
 
 fn mode() -> Option<Mode> {
@@ -210,9 +224,13 @@ impl Part {
 }
 
 /// Has name resolution, finding impls and finding lang items read what the store has of
-/// `crates` and their dependencies.
+/// `crates` and their dependencies, or what the image `RA_JIT_FRONT_IMAGE` names has.
 pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
-    let Some(mode) = mode() else { return Served::default() };
+    let mode = mode();
+    if mode.is_none() && !census_wanted() {
+        return Served::default();
+    }
+    let started = Instant::now();
     let mut all: FxHashMap<Crate, Option<[u8; 32]>> = FxHashMap::default();
     for &krate in crates {
         for dep in krate.transitive_deps(db) {
@@ -221,8 +239,14 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
     }
     let keys: FxHashMap<Crate, [u8; 32]> =
         all.into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect();
+    // With nothing frozen, the keys are kept for the census to tell the dependencies apart.
+    let Some(mode) = mode else { return Served { keys, ..Served::default() } };
     let mut served = Served { keys, mode: Some(mode), ..Served::default() };
-    let Some(store) = ra_jit_store::Store::global() else { return served };
+    let store = ra_jit_store::Store::global();
+    let image = front_image::open().map(Arc::new);
+    if store.is_none() && image.is_none() {
+        return served;
+    }
     for (index, part) in Part::ALL.into_iter().enumerate() {
         let mut maps = FxHashMap::default();
         for (&krate, key) in &served.keys {
@@ -230,22 +254,46 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
             if part != Part::DefMap && !served.served[0].contains(&krate) {
                 continue;
             }
-            let Some(bytes) = store.get(&part.key(key)) else { continue };
+            let fetched = Instant::now();
+            let from_image = image.as_ref().and_then(|it| it.get(index as u8, &part.key(key)));
+            let bytes = match from_image {
+                Some(bytes) => {
+                    served.from_image[index] += 1;
+                    bytes
+                }
+                None => match store.and_then(|it| it.get(&part.key(key))) {
+                    Some(bytes) => Bytes::from(bytes),
+                    None => continue,
+                },
+            };
+            served.fetch_took += fetched.elapsed();
             if part.unreadable(db, krate, &bytes).is_some() {
                 served.unreadable += 1;
                 continue;
             }
-            maps.insert(krate, Frozen { bytes: bytes.into(), mode });
+            served.bytes[index] += bytes.len() as u64;
+            maps.insert(krate, Frozen { bytes, mode });
             served.served[index].push(krate);
         }
         part.set(db, maps);
     }
+    if let Some(image) = &image {
+        front_image::watch(image);
+    }
+    served.image = image;
+    served.serve_took = started.elapsed();
     served
 }
 
 /// Writes to the store what can be frozen of the crates that were resolved, and fails on a
 /// difference between what was frozen and what is live.
 pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Result<()> {
+    if served.mode.is_none() {
+        if census_wanted() {
+            census(db, served);
+        }
+        return Ok(());
+    }
     if served.mode != Some(Mode::Serve) {
         for (index, part) in Part::ALL.into_iter().enumerate() {
             served.served[index].iter().for_each(|&krate| part.check(db, krate));
@@ -257,6 +305,7 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
     }
     let Some(store) = served.mode.and(ra_jit_store::Store::global()) else { return Ok(()) };
     let mut stored = 0;
+    let mut encoded = [0u64; 3];
     let mut refused: FxHashMap<String, usize> = FxHashMap::default();
     for (index, part) in Part::ALL.into_iter().enumerate() {
         for (&krate, key) in &served.keys {
@@ -270,6 +319,7 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
                         store.settled();
                     }
                     store.insert(&key, &bytes);
+                    encoded[index] += bytes.len() as u64;
                     stored += 1;
                 }
                 Err(why) => *refused.entry(format!("{} with {why}", part.name())).or_default() += 1,
@@ -299,5 +349,138 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
         said += &format!(", not frozen: {}", why.join(", "));
     }
     eprintln!("{said}");
+    front_image_report(db, served, store, encoded);
     Ok(())
+}
+
+fn megabytes(bytes: impl Into<u64>) -> String {
+    format!("{:.1}", bytes.into() as f64 / (1 << 20) as f64)
+}
+
+/// Writes the image `RA_JIT_FRONT_IMAGE` names when it was not mapped, and says what the
+/// frozen parts and the image hold (`RA_JIT_FRONT_STATS`), in the worker's log. `encoded` is
+/// the bytes of each part written to the store just now.
+fn front_image_report(
+    db: &ide_db::RootDatabase,
+    served: &Served,
+    store: &ra_jit_store::Store,
+    encoded: [u64; 3],
+) {
+    let path = front_image::path();
+    if let Some(path) = path.as_ref().filter(|_| served.image.is_none()) {
+        let started = Instant::now();
+        let mut parts = Vec::new();
+        for (index, part) in Part::ALL.into_iter().enumerate() {
+            for key in served.keys.values() {
+                let key = part.key(key);
+                if let Some(bytes) = store.get(&key) {
+                    parts.push((index as u8, key, bytes));
+                }
+            }
+        }
+        let count = parts.len();
+        let bytes: usize = parts.iter().map(|it| it.2.len()).sum();
+        match front_image::write(path, parts) {
+            Ok(size) => eprintln!(
+                "front-end image: wrote {count} parts, {} MB of them in a {} MB file, to {} in {:.1?}",
+                megabytes(bytes as u64),
+                megabytes(size as u64),
+                path.display(),
+                started.elapsed()
+            ),
+            Err(error) => eprintln!("front-end image: {} not written: {error}", path.display()),
+        }
+    }
+    if !front_image::stats() && path.is_none() {
+        return;
+    }
+    let held: Vec<String> = Part::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            format!("{} {} MB", part.name(), megabytes(served.bytes[index] + encoded[index]))
+        })
+        .collect();
+    eprintln!("front-end parts: {}", held.join(", "));
+    eprintln!(
+        "front-end serve: {:.0?} in all, {:.0?} of it reading parts, {} of {} parts from the image",
+        served.serve_took,
+        served.fetch_took,
+        served.from_image.iter().sum::<usize>(),
+        served.served.iter().map(Vec::len).sum::<usize>(),
+    );
+    if let Some(image) = &served.image {
+        let (parts, bytes) = image.totals();
+        let (present, pages) = image.in_memory().unwrap_or((0, 0));
+        eprintln!(
+            "front-end image: {} mapped, {parts} parts, {} MB of them in a {} MB file, {present} of {pages} pages in memory, process holds {} MB",
+            image.path().display(),
+            megabytes(bytes),
+            megabytes(image.size() as u64),
+            crate::memory::resident().map(|it| it.to_string()).unwrap_or_default(),
+        );
+    }
+    if census_wanted() {
+        census(db, served);
+    }
+}
+
+fn census_wanted() -> bool {
+    std::env::var("RA_JIT_FRONT_STATS").as_deref() == Ok("census")
+}
+
+/// What the front end holds of each kind of crate, for docs/research/front-end-image.md:
+/// `RA_JIT_FRONT_STATS=census`. A crate is frozen when `serve` could freeze it, a dependency
+/// when its source is the toolchain's, a registry's or a git checkout's, and the workspace's
+/// when it is neither.
+fn census(db: &ide_db::RootDatabase, served: &Served) {
+    use ide_db::base_db::SourceDatabase as _;
+    #[derive(Default)]
+    struct Count {
+        crates: usize,
+        modules: usize,
+        files: usize,
+        text: u64,
+    }
+    const CLASSES: [&str; 3] = ["frozen", "dependency, not frozen", "workspace"];
+    let mut counts: [Count; 3] = Default::default();
+    hir::attach_db(db, || {
+        for krate in ide_db::base_db::all_crates(db).iter().copied() {
+            let class = if served.keys.contains_key(&krate) {
+                0
+            } else if crate::crate_root_file(db, krate)
+                .as_deref()
+                .and_then(|it| it.to_str())
+                .is_some_and(|it| immutable(it).is_some())
+            {
+                1
+            } else {
+                2
+            };
+            let def_map = hir_def::nameres::crate_def_map(db, krate);
+            let mut files = FxHashSet::default();
+            let mut modules = 0;
+            for (_, data) in def_map.modules(db) {
+                modules += 1;
+                if let Some(file) = data.origin.file_id() {
+                    files.insert(file.file_id(db));
+                }
+            }
+            let count = &mut counts[class];
+            count.crates += 1;
+            count.modules += modules;
+            count.files += files.len();
+            count.text +=
+                files.iter().map(|&it| db.file_text(it).text(db).len() as u64).sum::<u64>();
+        }
+    });
+    for (name, count) in CLASSES.iter().zip(&counts) {
+        eprintln!(
+            "front-end census: {name}: {} crates, {} modules, {} files, {} MB of source text",
+            count.crates,
+            count.modules,
+            count.files,
+            megabytes(count.text),
+        );
+    }
 }

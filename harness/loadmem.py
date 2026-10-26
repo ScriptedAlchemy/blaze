@@ -132,6 +132,9 @@ def main():
     ap.add_argument("--memory-max", help="RA_JIT_MEMORY_MAX instead of 16G")
     ap.add_argument("--own-base-memory", help="RA_JIT_OWN_BASE_MEMORY instead of 12G")
     ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the daemon and the client")
+    ap.add_argument("--stop-after", help="a regex: --stop-delay seconds after a log line matches it, record what the "
+                    "biggest process holds (stopped_after in result.json) and stop the run")
+    ap.add_argument("--stop-delay", type=float, default=3.0)
     ap.add_argument("command", nargs="*", help="after --; default: blaze build --locked -p tracedecay-cli")
     a = ap.parse_args()
 
@@ -176,6 +179,7 @@ def main():
               "watchdog_mb": a.watchdog_mb, "marks": {}, "tripped": None, "peak_mb": 0, "peak_client_mb": 0,
               "swap_start_mb": round(swap_start), "guard": {k: env[k] for k in GUARD}}
     seen_lines = {}  # log path -> bytes read
+    stop_seen = [0.0]  # when a line matched --stop-after
     last_total = 0.0
     snapped = set()
 
@@ -198,6 +202,8 @@ def main():
             except OSError:
                 continue
             for line in data.decode("utf-8", "replace").splitlines():
+                if a.stop_after and not stop_seen[0] and re.search(a.stop_after, line):
+                    stop_seen[0] = time.time()
                 if line.strip():
                     phases.write(json.dumps({"t": round(time.time() - t0, 1), "mb": round(total),
                                              "log": os.path.relpath(path, work), "line": line[:400]}) + "\n")
@@ -236,6 +242,19 @@ def main():
                                      "pids": len(ours), "procs": big, "client_procs": cbig, "swap_used_mb": round(used),
                                      "swap_free_mb": round(free)}) + "\n")
             tail(total)
+            if stop_seen[0] and time.time() - stop_seen[0] >= a.stop_delay:
+                top = max((p for p in held if p in ours), key=held.get, default=None)
+                rss = {r[0]: r[2] for r in rows}
+                result["stopped_after"] = {"pattern": a.stop_after, "at_s": round(time.time() - t0, 1),
+                                           "ready_seen_s": round(stop_seen[0] - t0, 1),
+                                           "footprint_mb": round(held[top]) if top else None,
+                                           "rss_mb": round(rss.get(top, 0) / 1024) if top else None,
+                                           "processes_mb": round(total), "pid": top}
+                if top:
+                    snapshot("stopped", top)
+                kill(ours)
+                kill(client_tree, signal.SIGTERM)
+                break
             for mark in MARKS:
                 if total >= mark * GB and mark not in snapped:
                     snapped.add(mark)
@@ -279,7 +298,8 @@ def main():
         if client.poll() is None:
             kill(descendants(ps_table(), [client.pid]))
         result["exit"] = client.poll()
-        result["outcome"] = "watchdog-killed" if result["tripped"] else ("ok" if client.returncode == 0 else "failed")
+        result["outcome"] = ("watchdog-killed" if result["tripped"] else "stopped" if result.get("stopped_after")
+                             else "ok" if client.returncode == 0 else "failed")
         result["wall_s"] = round(time.time() - t0, 1)
         result["last_mb"] = round(last_total)
         tail(last_total)

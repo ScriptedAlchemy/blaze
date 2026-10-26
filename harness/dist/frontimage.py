@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""frontimage.py: what a worker holds, and how long it takes to be ready, when the front end of the
+dependency crates comes from nothing, from the store or from a mapped image (D3,
+docs/research/front-end-image.md).
+
+    frontimage.py --td DIR --package NAME --blaze-bin DIR --work DIR --cargo-home-from DIR
+                  [--runs 3] [--arms off,store,image] [--prof-bin DIR] [--toolchain 1.99.0]
+
+Every run is `harness/loadmem.py` (the memory guard of the distributed program, a watchdog, a
+private home, store and CARGO_HOME) stopped a few seconds after the worker says `memory after
+resolve` and `front-end ready`: the worker has loaded the workspace and resolved the names
+of every crate it will build. It is held there, before codegen, while sampled. The steps:
+
+  build   `blaze build` of the package to the end, so that cargo's target directory is whole and the
+          build scripts' output is what every later run reads (the frozen keys count it)
+  seed    a worker on an empty store with `RA_JIT_FRONT_IMAGE` naming a file that is not there: it
+          resolves everything, freezes the dependency crates into the store, writes the image,
+          and reports what the workspace holds by kind of crate (`RA_JIT_FRONT_STATS=census`)
+  arms    `--runs` rounds of the arms, in turn within a round, each on a copy of the seed's store:
+            off    `RA_JIT_FROZEN=off`: every crate is resolved
+            store  the frozen parts are read out of the store into the heap (what a worker does today)
+            image  `RA_JIT_FRONT_IMAGE`: the frozen parts are ranges of a mapped file
+  prof    with `--prof-bin` (a build with the `heap-profile` feature), one more run of `off` and of
+          `store` with jemalloc's profile: the files are for harness/heapfold.py and
+          loadmem_holders.py
+
+Writes WORK/summary.json and prints a table: per arm the seconds the worker spent loading and
+resolving (its own timers), what reading the parts took, and what it held when it was ready (the
+physical footprint on macOS, which leaves out a mapped file's clean pages, and the resident set,
+which counts them).
+"""
+import argparse, json, os, re, shutil, statistics, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOADMEM = os.path.join(os.path.dirname(HERE), "loadmem.py")
+READY = r"front-end ready"
+UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
+
+
+def seconds(number, unit):
+    return float(number) * UNITS[unit]
+
+
+def sh(args, **kw):
+    kw.setdefault("text", True)
+    kw.setdefault("stdout", subprocess.PIPE)
+    kw.setdefault("stderr", subprocess.STDOUT)
+    return subprocess.run(args, **kw)
+
+
+def clone(src, dst):
+    """A copy that shares blocks where the file system can (APFS), else a plain copy."""
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    if sh(["cp", "-cR", src, dst]).returncode != 0:
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst)
+
+
+def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=None):
+    """One guarded run below WORK/name; the directory of what loadmem.py recorded."""
+    work = os.path.join(a.work, name)
+    os.makedirs(work, exist_ok=True)
+    if store_from:
+        clone(store_from, os.path.join(work, "store.noindex"))
+    cmd = [sys.executable, "-I", LOADMEM, "--td", a.td, "--blaze-bin", blaze_bin or a.blaze_bin, "--work", work,
+           "--name", "r", "--cargo-home-from", a.cargo_home_from, "--target-name", "d3m.noindex",
+           "--memory-every", "0.5", "--every", "0.5", "--env", f"RUSTUP_TOOLCHAIN={a.toolchain}",
+           "--env", "RA_JIT_FRONT_STATS=1"]
+    for kv in env:
+        cmd += ["--env", kv]
+    if stop:
+        cmd += ["--env", "RA_JIT_FRONT_HOLD_MS=30000"]
+        cmd += ["--stop-after", READY, "--stop-delay", "8" if prof else "4"]
+    if prof:
+        cmd += ["--prof", "--step-mb", "2048"]
+    cmd += ["--", "blaze", "build", "--locked", "-p", a.package]
+    print("+", " ".join(cmd[3:]), flush=True)
+    out = sh(cmd)
+    # A daemon and a worker that got ready outlive the client; what they hold would count against
+    # the next run.
+    sh(["pkill", "-9", "-f", f"^{os.path.abspath(blaze_bin or a.blaze_bin)}/ra-jit"])
+    with open(os.path.join(work, "loadmem.out"), "w") as kept:
+        kept.write(out.stdout)
+    return os.path.join(work, "r")
+
+
+def worker_log(run):
+    """The text of the worker's log among the logs loadmem.py copied: the one that got ready."""
+    best = ""
+    logs = os.path.join(run, "logs")
+    for name in sorted(os.listdir(logs)) if os.path.isdir(logs) else []:
+        with open(os.path.join(logs, name), errors="replace") as file:
+            text = file.read()
+        if re.search(READY, text) and len(text) > len(best):
+            best = text
+    return best
+
+
+def parse(run):
+    """What one run says: the worker's timers and counts, and what loadmem.py saw of its footprint."""
+    with open(os.path.join(run, "result.json")) as file:
+        result = json.load(file)
+    log = worker_log(run)
+    row = {"outcome": result.get("outcome"), "tripped": result.get("tripped"),
+           "swap_growth_mb": result.get("peak_swap_growth_mb")}
+    stopped = result.get("stopped_after") or {}
+    row.update(ready_footprint_mb=stopped.get("footprint_mb"), ready_rss_mb=stopped.get("rss_mb"))
+    row["ready_seen_s"] = stopped.get("ready_seen_s")
+
+    def find(pattern, *, last=False):
+        found = re.findall(pattern, log, re.M)
+        return (found[-1] if last else found[0]) if found else None
+
+    m = find(r"^load workspace: ([\d.]+)(\S+)$")
+    row["load_s"] = seconds(*m) if m else None
+    m = find(r"^resolve: (\d+) crates in ([\d.]+)(\S+)$")
+    row["crates"], row["resolve_s"] = (int(m[0]), seconds(m[1], m[2])) if m else (None, None)
+    m = find(r"^front-end serve: ([\d.]+)(\S+) in all, ([\d.]+)(\S+) of it reading parts, (\d+) of (\d+) parts from the image")
+    if m:
+        row.update(serve_s=seconds(m[0], m[1]), fetch_s=seconds(m[2], m[3]), from_image=int(m[4]), parts=int(m[5]))
+    m = find(r"^front-end parts: def maps ([\d.]+) MB, impls ([\d.]+) MB, lang items ([\d.]+) MB")
+    if m:
+        row["parts_mb"] = dict(zip(("def_maps", "impls", "lang_items"), map(float, m)))
+    m = find(r"^front-end image: .* (\d+) of (\d+) pages in memory, process holds (\d*) MB")
+    if m:
+        row["image_pages"] = [int(m[0]), int(m[1])]
+    m = find(r"^frozen, of (\d+) crates: def maps of (\d+).* from the store, (\d+) written")
+    if m:
+        row["frozen"] = dict(crates=int(m[0]), def_maps=int(m[1]), written=int(m[2]))
+    m = find(r"^memory after resolve: (\d+) MB resident(?:, (\d+) MB live)?")
+    if m:
+        row["after_resolve_resident_mb"], row["after_resolve_live_mb"] = int(m[0]), int(m[1] or 0)
+    ticks = re.findall(r"^memory tick \d+ at [\d.]+s: (\d+) MB footprint, (\d+) MB live", log, re.M)
+    if ticks:
+        row["peak_footprint_mb"] = max(int(t[0]) for t in ticks)
+    row["census"] = {name: {k: float(v) for k, v in zip(("crates", "modules", "files", "text_mb"), vals)}
+                     for name, *vals in re.findall(
+                         r"^front-end census: ([\w, ]+?): (\d+) crates, (\d+) modules, (\d+) files, ([\d.]+) MB", log, re.M)}
+    return row
+
+
+def spread(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return "-"
+    mean = statistics.mean(values)
+    return f"{mean:.2f} ({min(values):.2f}-{max(values):.2f})" if mean < 100 else f"{mean:.0f} ({min(values):.0f}-{max(values):.0f})"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--td", required=True, help="the checkout (a fixture of harness/dist/fixtures.toml)")
+    ap.add_argument("--package", required=True, help="the package `blaze build -p` builds: ripgrep, nu")
+    ap.add_argument("--blaze-bin", required=True)
+    ap.add_argument("--prof-bin", help="a build with the heap-profile feature, for one run of off and of store")
+    ap.add_argument("--work", required=True)
+    ap.add_argument("--cargo-home-from", required=True)
+    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--arms", default="off,store,image")
+    ap.add_argument("--toolchain", default="1.99.0")
+    ap.add_argument("--skip-build", action="store_true", help="cargo's target directory is whole already")
+    a = ap.parse_args()
+    a.td, a.work = os.path.abspath(a.td), os.path.abspath(a.work)
+    os.makedirs(a.work, exist_ok=True)
+    image = os.path.join(a.work, "front.image")
+    summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {}}
+
+    if not a.skip_build:
+        run = loadmem(a, "build", stop=False)
+        summary["build"] = parse(run) if os.path.exists(os.path.join(run, "result.json")) else None
+    if os.path.exists(image):
+        os.remove(image)
+    seed = loadmem(a, "seed", env=[f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_STATS=census"])
+    summary["seed"] = parse(seed)
+    if not os.path.exists(image):
+        print("NO IMAGE was written by the seed run:", json.dumps(summary["seed"]), flush=True)
+        json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
+        return 1
+    summary["image_bytes"] = os.path.getsize(image)
+    store = os.path.join(a.work, "seed", "store.noindex")
+    env = {"off": ["RA_JIT_FROZEN=off", "RA_JIT_FRONT_STATS=census"], "store": [],
+           "image": [f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_IMAGE_WATCH=500"]}
+    arms = a.arms.split(",")
+    rows = {arm: [] for arm in arms}
+    for n in range(1, a.runs + 1):
+        for arm in arms:
+            run = loadmem(a, f"{arm}-{n}", env=env[arm], store_from=store)
+            row = parse(run)
+            rows[arm].append(row)
+            print(arm, n, json.dumps(row), flush=True)
+    summary["arms"] = rows
+    if a.prof_bin:
+        summary["prof"] = {}
+        for arm in ("off", "store"):
+            run = loadmem(a, f"prof-{arm}", env=env[arm], store_from=store, prof=True, blaze_bin=os.path.abspath(a.prof_bin))
+            summary["prof"][arm] = parse(run)
+            summary["prof"][arm]["dir"] = run
+    json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
+
+    print(f"\n{a.package}: mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
+    print("| arm | ready seen s | load s | resolve s | serve s | reading parts s | ready footprint MB | ready rss MB | live MB |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for arm in arms:
+        r = rows[arm]
+        print(f"| {arm} | {spread([x['ready_seen_s'] for x in r])} | "
+              f"{spread([x['load_s'] for x in r])} | {spread([x['resolve_s'] for x in r])} | "
+              f"{spread([x.get('serve_s') for x in r])} | {spread([x.get('fetch_s') for x in r])} | "
+              f"{spread([x['ready_footprint_mb'] for x in r])} | {spread([x['ready_rss_mb'] for x in r])} | "
+              f"{spread([x.get('after_resolve_live_mb') for x in r])} |")
+    bad = [(arm, i) for arm in arms for i, x in enumerate(rows[arm], 1) if x["outcome"] != "stopped"]
+    if bad:
+        print("RUNS THAT DID NOT REACH READY:", bad, flush=True)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -12,6 +12,7 @@ mod dep_info;
 mod deps;
 mod doctest;
 mod errors;
+mod front_image;
 mod frozen;
 mod inputs;
 mod link;
@@ -7941,7 +7942,19 @@ fn run_holding(
     if let Some(said) = ra_jit_expand::report() {
         eprintln!("{said}");
     }
-    memory::checkpoint("resolve");
+    // With `RA_JIT_MEMORY`: the table of ingredients and the heap's profile as the front end
+    // stands before any build (`checkpoint` says the footprint, as it did here).
+    memory::report(&mut db, "resolve")?;
+    if front_image::stats() {
+        eprintln!("front-end ready");
+        // Measurement only: hold this exact front-end state while the external watchdog
+        // samples it. Without the opt-in stats and delay, builds proceed as before.
+        if let Ok(delay) = std::env::var("RA_JIT_FRONT_HOLD_MS") {
+            if let Ok(delay) = delay.parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(delay.min(60_000)));
+            }
+        }
+    }
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();

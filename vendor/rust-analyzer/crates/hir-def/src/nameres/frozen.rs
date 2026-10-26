@@ -78,10 +78,76 @@ pub enum Mode {
     Verify,
 }
 
+/// A range of bytes some owner holds: a vector, or a file mapped read-only (ra-jit's front-end
+/// image), whose pages the kernel can drop and read again, and share between processes. Equal
+/// when the bytes are, whoever owns them.
+#[derive(Clone)]
+pub struct Bytes {
+    owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    start: usize,
+    end: usize,
+}
+
+impl Bytes {
+    /// `range` of what `owner` holds. Fails when `range` is not inside it.
+    pub fn slice_of(
+        owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        range: std::ops::Range<usize>,
+    ) -> Option<Bytes> {
+        let len = (*owner).as_ref().len();
+        (range.start <= range.end && range.end <= len).then_some(Bytes {
+            owner,
+            start: range.start,
+            end: range.end,
+        })
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &(*self.owner).as_ref()[self.start..self.end]
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, other: &Bytes) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Bytes {}
+
+impl Hash for Bytes {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bytes").field("len", &self.len()).finish()
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(bytes: Vec<u8>) -> Bytes {
+        let end = bytes.len();
+        Bytes { owner: Arc::new(bytes), start: 0, end }
+    }
+}
+
+impl From<&[u8]> for Bytes {
+    fn from(bytes: &[u8]) -> Bytes {
+        bytes.to_vec().into()
+    }
+}
+
 /// The frozen `DefMap` of a crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Frozen {
-    pub bytes: Arc<[u8]>,
+    pub bytes: Bytes,
     pub mode: Mode,
 }
 
@@ -2911,6 +2977,25 @@ mod tests {
 
     use super::*;
     use crate::test_db::TestDB;
+
+    #[test]
+    fn byte_views_have_content_identity_and_checked_ranges() {
+        let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(b"prefix payload".to_vec());
+        let view = Bytes::slice_of(owner.clone(), 7..14).unwrap();
+        let owned: Bytes = b"payload".as_slice().into();
+        assert_eq!(view, owned);
+        let hash = |bytes: &Bytes| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&view), hash(&owned));
+        assert!(Bytes::slice_of(owner.clone(), 14..15).is_none());
+        assert!(Bytes::slice_of(owner.clone(), 8..7).is_none());
+        assert_eq!(&*Bytes::slice_of(owner.clone(), 14..14).unwrap(), b"");
+        drop(owner);
+        assert_eq!(&*view, b"payload");
+    }
 
     const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib
