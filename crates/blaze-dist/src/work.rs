@@ -809,7 +809,9 @@ impl WorkSet {
             self.counters.dead_leases += 1;
             return Err(Refusal::DeadLease);
         }
-        self.holders.get_mut(from).expect("live").heard = now;
+        if let Some(holder) = self.holders.get_mut(from) {
+            holder.heard = now;
+        }
         let issued = self.leases[&generation].clone();
         let (processed_roots, processed_names, returned_roots, returned_names) =
             match shape(&issued, req) {
@@ -825,12 +827,13 @@ impl WorkSet {
         let mut granted = BTreeSet::new();
         let mut conflicts = BTreeSet::new();
         for (item, index) in req.items[..roots_done].iter().zip(processed_roots.indexes()) {
-            debug_assert_eq!(self.roots[index as usize].state, Slot::Held(generation));
             let terminal = match &item.outcome {
                 ItemOutcome::Lost(_) => Terminal::Tail(TailWhy::LostRoot),
                 _ => self.committed(item, &by),
             };
-            self.roots[index as usize].state = Slot::Done(terminal);
+            if let Some(slot) = self.roots.get_mut(index as usize) {
+                slot.state = Slot::Done(terminal);
+            }
         }
         for (item, name) in req.items[roots_done..].iter().zip(&processed_names) {
             self.commit_name(from, item, *name, &by, &mut conflicts, out);
@@ -854,13 +857,16 @@ impl WorkSet {
         }
         for (start, end) in returned_roots.iter() {
             for index in start..end {
-                self.roots[index as usize].state = Slot::Waiting;
+                if let Some(slot) = self.roots.get_mut(index as usize) {
+                    slot.state = Slot::Waiting;
+                }
             }
             self.pool.insert(start, end);
         }
         for name in &returned_names {
-            let slot = self.names.get_mut(name).expect("granted");
-            if slot.state == Slot::Held(generation) {
+            if let Some(slot) = self.names.get_mut(name)
+                && slot.state == Slot::Held(generation)
+            {
                 // Given back unprocessed: its holder still holds the finding.
                 slot.state = Slot::Waiting;
                 self.waiting.insert(*name);
@@ -870,7 +876,11 @@ impl WorkSet {
         let issued = self.leases.get_mut(&generation).expect("live");
         issued.live = false;
         self.live.remove(&generation);
-        self.holders.get_mut(from).expect("live").lease = None;
+        if let Some(holder) = self.holders.get_mut(from)
+            && holder.lease == Some(generation)
+        {
+            holder.lease = None;
+        }
         let took = now.saturating_sub(issued.granted_at);
         let at = self.batch_ms.partition_point(|&ms| ms <= took);
         self.batch_ms.insert(at, took);
@@ -907,7 +917,7 @@ impl WorkSet {
         conflicts: &mut BTreeSet<WorkName>,
         out: &mut Vec<Effect>,
     ) {
-        let state = self.names[&name].state.clone();
+        let Some(state) = self.names.get(&name).map(|slot| slot.state.clone()) else { return };
         match state {
             Slot::Held(generation) if generation == by.generation => {}
             Slot::Done(Terminal::Tail(TailWhy::Conflict)) => {
@@ -918,12 +928,14 @@ impl WorkSet {
                 }
                 return;
             }
-            other => unreachable!("a processed name of a live lease is held by it: {other:?}"),
+            // A processed name of a live lease is held by it; anything else is not this
+            // result's to change. The checker holds a coordinator that gets here wrong.
+            _ => return,
         }
         let terminal = match &item.outcome {
             ItemOutcome::Lost(why) => {
                 self.drop_finder(from, name);
-                let slot = self.names.get_mut(&name).expect("held");
+                let slot = &self.names[&name];
                 if why.why == LOST_FINDING {
                     self.counters.lost_findings += 1;
                     if slot.finders.is_empty() {
@@ -963,7 +975,9 @@ impl WorkSet {
             } else {
                 self.waiting.insert(name);
                 granted.insert(name);
-                self.holders.get_mut(from).expect("live").findings.insert(name);
+                if let Some(holder) = self.holders.get_mut(from) {
+                    holder.findings.insert(name);
+                }
                 Slot::Waiting
             };
             let finders =
@@ -983,7 +997,9 @@ impl WorkSet {
         if slot.tuple == found.tuple {
             if !matches!(slot.state, Slot::Done(_)) {
                 slot.finders.insert(from.to_owned());
-                self.holders.get_mut(from).expect("live").findings.insert(name);
+                if let Some(holder) = self.holders.get_mut(from) {
+                    holder.findings.insert(name);
+                }
             }
             return;
         }

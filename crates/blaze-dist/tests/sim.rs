@@ -8,6 +8,8 @@
 //!
 //! `BLAZE_DIST_SEEDS=<n>` changes the number of seeds per invariant set.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use blaze_dist::sim;
 
 const WORK_SHARDS: u64 = 8;
@@ -30,6 +32,25 @@ fn fail(set: &str, run: u64, failures: &[sim::Violation]) {
     }
 }
 
+/// A seed's run, with a panic reported as a failure of that seed rather than of the shard.
+fn guarded<T>(
+    set: &'static str,
+    seed: u64,
+    run: impl FnOnce() -> Result<T, sim::Violation>,
+) -> Result<T, sim::Violation> {
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_default();
+            Err(sim::Violation { seed, invariant: set, at: 0, detail: format!("panicked: {what}") })
+        }
+    }
+}
+
 fn work_shard(shard: u64) {
     let mut failures = Vec::new();
     let (mut run, mut done, mut lost_twice, mut no_lead, mut events) = (0, 0, 0, 0, 0);
@@ -37,7 +58,7 @@ fn work_shard(shard: u64) {
         (0, 0, 0, 0, 0);
     for seed in (0..seeds()).filter(|s| s % WORK_SHARDS == shard) {
         run += 1;
-        match sim::work::run(seed) {
+        match guarded("panic", seed, || sim::work::run(seed)) {
             Ok(s) => {
                 done += u64::from(s.done);
                 lost_twice += u64::from(s.ended == Some(blaze_dist::work::EndWhy::LeadLostTwice));
@@ -65,7 +86,7 @@ fn jobs_shard(shard: u64) {
     let (mut run, mut executions, mut busy, mut joined, mut reassigned) = (0, 0, 0, 0, 0);
     for seed in (0..seeds()).filter(|s| s % JOBS_SHARDS == shard) {
         run += 1;
-        match sim::jobs::run(seed) {
+        match guarded("panic", seed, || sim::jobs::run(seed)) {
             Ok(s) => {
                 executions += s.executions;
                 busy += s.busy;
