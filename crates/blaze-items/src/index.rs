@@ -47,6 +47,8 @@ pub struct Index {
     scopes_dirty: bool,
     /// The items of `entries`, for [`Live`].
     live: Arc<FxHashSet<ItemId>>,
+    /// What the last push found moved: each item gone with the one added in its place.
+    moved: FxHashMap<ItemId, ItemId>,
 }
 
 /// The items an index has, which a thread of its own can ask of an item without asking salsa
@@ -238,6 +240,7 @@ impl Index {
             dirty: FxHashSet::default(),
             scopes_dirty: false,
             live: Arc::default(),
+            moved: FxHashMap::default(),
         };
         for Entries(part) in entries {
             for (id, entry) in part {
@@ -253,6 +256,11 @@ impl Index {
 
     pub fn items(&self) -> usize {
         self.entries.len()
+    }
+
+    /// [`moves`] of the last edit pushed, which a push refused after finding them keeps.
+    pub fn moved(&self) -> &FxHashMap<ItemId, ItemId> {
+        &self.moved
     }
 
     pub fn live(&self) -> Live {
@@ -344,6 +352,7 @@ impl Index {
         fan: &Fan<'_>,
     ) -> Result<Pushed, &'static str> {
         let start = std::time::Instant::now();
+        self.moved.clear();
         let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
@@ -492,7 +501,28 @@ impl Index {
         let declared = self.declared(db, fan, &rewritten);
         let declared_at = start.elapsed();
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
-        let mut entries = entries_of(db, fan, &ids).into_iter();
+        let entries = entries_of(db, fan, &ids);
+        let now: FxHashSet<ItemId> = ids.iter().copied().collect();
+        let gone: Vec<(ItemId, &Entry)> = (declared.iter())
+            .flat_map(|(file, _)| self.files.get(file).into_iter().flatten())
+            .filter(|it| !now.contains(it))
+            .filter_map(|it| Some((*it, self.entries.get(it)?)))
+            .collect();
+        let added: Vec<(ItemId, &Entry)> = (ids.iter().zip(&entries))
+            .filter(|(id, _)| !self.entries.contains_key(id))
+            .filter_map(|(id, entry)| Some((*id, entry.as_ref()?)))
+            .collect();
+        let moved = moves(&gone, &added);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "items-moved: {} of {} gone and {} added",
+                moved.len(),
+                gone.len(),
+                added.len()
+            );
+        }
+        self.moved = moved;
+        let mut entries = entries.into_iter();
         for (file, now) in declared {
             let was: FxHashSet<ItemId> =
                 self.files.get(&file).into_iter().flatten().copied().collect();
@@ -646,6 +676,48 @@ impl Index {
             if let Some(named) = self.named.get_mut(name) {
                 named.remove(&id);
             }
+        }
+    }
+}
+
+/// The items an edit moved: each gone with the one added that is written the same and refers
+/// to the same items in the same places, or to ones moved with it. Only a gone item and an added
+/// one that are each the only one written so are taken for one moved.
+fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<ItemId, ItemId> {
+    let whole = |it: &&(ItemId, &Entry)| !it.1.erred && it.1.missed.is_none();
+    let mut written: FxHashMap<form::Hash, (Vec<ItemId>, Vec<ItemId>)> = FxHashMap::default();
+    for &(id, entry) in gone.iter().filter(whole) {
+        written.entry(entry.digest).or_default().0.push(id);
+    }
+    for &(id, entry) in added.iter().filter(whole) {
+        written.entry(entry.digest).or_default().1.push(id);
+    }
+    let mut moved: FxHashMap<ItemId, ItemId> = (written.into_values())
+        .filter_map(|it| match (&it.0[..], &it.1[..]) {
+            (&[was], &[now]) if std::mem::discriminant(&was) == std::mem::discriminant(&now) => {
+                Some((was, now))
+            }
+            _ => None,
+        })
+        .collect();
+    let refs: FxHashMap<ItemId, &[ItemId]> =
+        gone.iter().chain(added).map(|(id, entry)| (*id, &entry.refs[..])).collect();
+    // What one refers to has to have moved with it: those that don't are dropped until none
+    // is left that refers to one dropped.
+    loop {
+        let wrong: Vec<ItemId> = (moved.iter())
+            .filter(|&(was, now)| {
+                let (was, now) = (refs[was], refs[now]);
+                was.len() != now.len()
+                    || was.iter().zip(now).any(|(a, b)| a != b && moved.get(a) != Some(b))
+            })
+            .map(|it| *it.0)
+            .collect();
+        if wrong.is_empty() {
+            return moved;
+        }
+        for it in wrong {
+            moved.remove(&it);
         }
     }
 }
