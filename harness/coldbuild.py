@@ -21,7 +21,7 @@ a remote `ra-jit std` made once, as a release's does.
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py.
 """
-import os, re, shutil, subprocess, sys, tempfile, time
+import glob, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -134,6 +134,66 @@ def cargo_built(target):
                if at != own and not at.startswith(own + os.sep))
 
 
+def c_main_allocation():
+    """A cold no_main executable owns allocation independently of Rust's start shim."""
+    root = tempfile.mkdtemp(prefix="ra-jit-cmain-", dir="/tmp")
+    wrong = []
+    source = """#![no_main]
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let words = vec![String::from("c-main original")];
+    println!("{}", words[0]);
+    0
+}
+"""
+    try:
+        for splice in ("1", "0"):
+            ws = os.path.join(root, "ws-" + splice)
+            write(ws, {
+                "Cargo.toml": '[package]\nname="cold_c_main"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
+                "src/main.rs": source,
+            })
+            env = env_for(os.path.join(root, "home-" + splice))
+            env["RA_JIT_SPLICE"] = splice
+            try:
+                for label, text in (("cold", source),
+                                    ("body", source.replace("original", "edited")),
+                                    ("declined", source.replace("original", "new function")
+                                     .replace("    0\n", "    newly_added()\n")
+                                     + '\n#[inline(never)]\nfn newly_added() -> i32 { println!("added"); 0 }\n')):
+                    write(ws, {"src/main.rs": text})
+                    refdir = os.path.join(root, "ref-" + splice)
+                    reference, _ = cargo(ws, env, refdir, "build")
+                    assert reference.returncode == 0, reference.stderr[-3000:]
+                    program = os.path.join(ws, "target", "debug", "cold_c_main")
+                    if label == "declined" and os.path.exists(program):
+                        # Remove the image so the remembered baseline cannot write its
+                        # redirects. This exercises the declined-splice full link,
+                        # independently of whether adding a function itself can be spliced.
+                        os.remove(program)
+                    ran, _ = blaze(ws, env, "build")
+                    ok = (ran.returncode == 0 and os.path.exists(program)
+                          and not cargo_built(os.path.join(ws, "target"))
+                          and printed(program) == printed(os.path.join(refdir, "debug", "cold_c_main")))
+                    print(f"no_main allocation splice={splice} {label:8} {'ok' if ok else 'WRONG'}", flush=True)
+                    if not ok:
+                        wrong.append(f"splice={splice} {label}")
+                        print(ran.stdout + ran.stderr, flush=True)
+                for log in glob.glob(os.path.join(env["RA_JIT_HOME"], "workers", "*", "log")):
+                    with open(log, errors="replace") as worker:
+                        for line in worker:
+                            if line.startswith("link:"):
+                                print(line.rstrip(), flush=True)
+            finally:
+                subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env,
+                               capture_output=True, timeout=120)
+        if wrong:
+            sys.exit(f"coldbuild.py: no_main allocation wrong: {wrong}; under {root}")
+    finally:
+        if not wrong:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 def fixtures():
     root = tempfile.mkdtemp(prefix="ra-jit-coldbuild-", dir="/tmp")
     ws, bad = os.path.join(root, "ws"), os.path.join(root, "bad")
@@ -196,6 +256,7 @@ def fixtures():
         sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
     print("coldbuild.py: all right")
     shutil.rmtree(root, ignore_errors=True)
+    c_main_allocation()
 
 
 # The edits of bench.py's projects a whole build is measured on, after its cold build: the
