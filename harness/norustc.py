@@ -6,6 +6,12 @@ baseline fails: ra-jit is to run no rustc, and a change may only lower the count
 
     norustc.py [--record] [--keep]
 
+It is also the module of the stand-ins: [`stand_ins`] writes a `rustc`, `rustdoc` and `cargo`
+that log each run (the tool, its pid, its parent's command line, its argv) and then run the real
+tool, and [`runs`] reads that log back. `harness/tracedecay.py` puts them on `PATH` and in
+`RUSTC`, `RUSTDOC` and `CARGO` for a blaze run, so that a run of rustc or rustdoc by blaze, by
+cargo or by anything they start is counted and can be named (P0-A, docs/distributed.md).
+
 The workspace, norustc/fixture, has a program with an `asm!` block, a library with unit tests,
 doctests and features, which the root package uses through another library, a proc macro, and a path dependency outside the workspace with a build script that
 `include!`s a file, `include_str!`s another, reads a variable with `option_env!` and expands the proc macro. It
@@ -19,7 +25,7 @@ lowered them. Where a count differs from run to run (cargo's own cache of what r
 is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
 """
-import json, os, platform, shutil, subprocess, sys, tempfile, time
+import json, os, platform, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -33,12 +39,15 @@ PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
 COUNTED = ("rustc", "rustdoc", "cargo")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
+# The variable a harness puts in the environment of every process of a run, so that a process
+# the run started can be found after it was reparented (docs/distributed.md, P0.1's watchdog).
+RUN_ID_ENV = "RA_JIT_RUN_ID"
 
 # The stand-in for a tool: one line per run (the tool, its pid, its parent's command line, its
-# arguments), then the real tool, which keeps the pid.
+# arguments, the run it belongs to), then the real tool, which keeps the pid.
 STAND_IN = """#!/bin/sh
 parent=$(ps -o args= -p $PPID 2>/dev/null | cut -c1-300 | tr '\\t\\n' '  ')
-printf '%s\\t%s\\t%s\\t%s\\n' {tool} $$ "$parent" "$(echo "$*" | cut -c1-1500 | tr '\\t\\n' '  ')" >> {log}
+printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {tool} $$ "$parent" "$(echo "$*" | cut -c1-1500 | tr '\\t\\n' '  ')" "${{{run_id_env}-}}" >> {log}
 exec {real} "$@"
 """
 
@@ -80,11 +89,29 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kwargs)
 
 
-def counted_toolchain(work, log):
-    """A copy of the pinned toolchain whose rustc, rustdoc and cargo are stand-ins. rustc finds
-    its sysroot by where its library is, so the libraries are copied and the rest linked."""
-    sysroot = run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
+def real_toolchain():
+    """The sysroot of the pinned toolchain, from the rustup proxy on PATH."""
+    return run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
+
+
+def stand_ins(work, log, run_id_env=RUN_ID_ENV):
+    """A copy of the pinned toolchain at `work/toolchain` whose rustc, rustdoc and cargo are
+    stand-ins that append a line to `log` for each run and then run the real tool, which keeps
+    the pid. Every other program of the toolchain is linked, and its libraries are copied, so
+    that rustc, finding its sysroot by where its library is, finds the copy and the copy is
+    what a build's `--print=sysroot` names.
+
+    The line is tab-separated: the tool, its pid, its parent's command line, its argv and the
+    value of `run_id_env`, which a run sets so that what it started can be found after it was
+    reparented. Returns the directory to put first on `PATH` and to name in `RUSTC`, `RUSTDOC`
+    and `CARGO`."""
+    sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
+    marker = os.path.join(toolchain, ".stand-in-log")
+    if os.path.exists(marker) and open(marker).read().strip() == log:
+        return toolchain  # made for this log already: every blaze run of the work directory shares it
+    if os.path.exists(toolchain):
+        shutil.rmtree(toolchain)
     os.makedirs(os.path.join(toolchain, "bin"))
     os.makedirs(os.path.join(toolchain, "lib"))
     for entry in os.listdir(sysroot):
@@ -103,9 +130,40 @@ def counted_toolchain(work, log):
             continue
         shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
-            out.write(STAND_IN.format(tool=entry, log=log, real=copy + ".real"))
+            out.write(STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+                                      run_id_env=run_id_env))
         os.chmod(copy, 0o755)
+    with open(marker, "w") as f:
+        f.write(log + "\n")
     return toolchain
+
+
+def counted_toolchain(work, log):
+    """The stand-ins of [`stand_ins`], for the scenarios below."""
+    return stand_ins(work, log)
+
+
+def runs(log):
+    """The runs in `log`, in the order they happened: dicts of `tool`, `pid`, `parent`, `argv`
+    and `run_id`. A line a stand-in could not write whole is skipped, not fatal."""
+    found = []
+    if not os.path.exists(log):
+        return found
+    for line in open(log, errors="replace"):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 4:
+            continue
+        tool, pid, parent, argv = parts[:4]
+        found.append({"tool": tool, "pid": int(pid) if pid.isdigit() else None, "parent": parent,
+                      "argv": argv, "run_id": parts[4] if len(parts) > 4 else ""})
+    return found
+
+
+def argv_list(argv):
+    """`argv` as a list of words. The stand-in logs the shell's `$*`, which joins the words with
+    spaces and cannot show one that had a space in it; that is enough to name what ran."""
+    return argv.split()
+
 
 
 def counts(lines):
