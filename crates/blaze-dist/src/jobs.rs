@@ -67,7 +67,7 @@ pub enum SubscriberState {
 }
 
 /// Where an execution is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecState {
     /// Waiting for admission.
     Queued,
@@ -161,7 +161,7 @@ impl Execution {
 
     /// Where it is.
     pub fn state(&self) -> ExecState {
-        self.state
+        self.state.clone()
     }
 
     /// Its current attempt.
@@ -278,7 +278,6 @@ impl Execution {
         self.helpers = helpers.iter().filter(|h| *h != lead).cloned().collect();
         self.lead_heard = now;
         self.heard.insert(lead.to_owned(), now);
-        self.refused = false;
         let mut log = Vec::new();
         match &mut self.work {
             None => {
@@ -412,7 +411,12 @@ impl Execution {
         for event in &req.events {
             match event {
                 JobEvent::Refused(_) => self.refused = true,
-                JobEvent::Done(d) if lead => done = Some(d.outcome.clone()),
+                JobEvent::Done(d) if lead => {
+                    // Publish only the coordinator's final verdict, once. A raw Passed
+                    // here could otherwise escape into replay before refusal normalization.
+                    done = Some(d.outcome.clone());
+                    continue;
+                }
                 JobEvent::Done(_) => return Err(Refusal::NotHolder),
                 _ => {}
             }
@@ -487,7 +491,7 @@ impl Execution {
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
     fn after_work(&mut self, now: Millis, out: &mut Vec<Effect>) {
         if self.work.as_ref().is_some_and(WorkSet::is_done)
-            && !self.stages.iter().any(|&(s, _)| s == Stage::Compiled)
+            && !self.stages.iter().any(|(s, _)| *s == Stage::Compiled)
         {
             self.stage(now, Stage::Compiled, out);
         }

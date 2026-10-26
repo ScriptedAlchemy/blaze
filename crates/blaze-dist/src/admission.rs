@@ -4,9 +4,10 @@
 //! holds a [`Reservation`] on its machine from the moment it is created to the moment it
 //! stops, and no machine's reservations ever sum past its capacity. Jobs wait in one queue per
 //! platform: `Main` before pull requests, then first in, first out, with no job overtaking the
-//! head of its class. A `Main` job runs only on a trusted builder; a pull request's only on that
-//! pull request's own executor, created on its first job when it fits (section 2, rule 5). A
-//! trusted builder's rebuild starts beside the old one only if both fit; otherwise the old one
+//! head of its class. Executors are matched by platform, lifecycle namespace and reservation,
+//! not a new application trust policy: access remains the deployment's existing ACLs.
+//! An executor's rebuild starts
+//! beside the old one only if both fit; otherwise the old one
 //! drains first. Past `Q` waiting jobs a platform answers `busy`.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -85,7 +86,7 @@ pub struct ExecutorSlot {
     pub id: String,
     /// The machine it runs on.
     pub machine: String,
-    /// The one namespace it may ever serve: `Main` for a trusted builder, `Pr(n)` otherwise.
+    /// The namespace that created the slot, for lifecycle bookkeeping, not an access boundary.
     pub namespace: Namespace,
     /// What it holds on its machine.
     pub reservation: Reservation,
@@ -170,6 +171,11 @@ impl Admission {
         self.machines.get(machine).map(|m| &m.capacity)
     }
 
+    /// The execution platform served by a machine.
+    pub fn platform(&self, machine: &str) -> Option<Digest> {
+        self.machines.get(machine).map(|m| m.platform)
+    }
+
     /// What the executors on a machine hold now.
     pub fn used(&self, machine: &str) -> Reservation {
         let mut used = Reservation { memory: 0, cpus: 0, disk: 0 };
@@ -231,7 +237,7 @@ impl Admission {
         Some(id)
     }
 
-    /// A trusted builder on `machine`, as the operator starts one: only if it fits.
+    /// A builder on `machine`, as the operator starts one: only if it fits.
     pub fn add_builder(
         &mut self,
         now: Millis,
@@ -305,7 +311,7 @@ impl Admission {
         admitted
     }
 
-    /// An executor for `job`: an idle one of its namespace on its platform, or, for a pull
+    /// An executor for `job`: an idle one of its lifecycle namespace on its platform, or, for a pull
     /// request, a new one where its reservation fits.
     fn place(&mut self, now: Millis, job: &Waiting) -> Option<(String, bool)> {
         // An idle executor runs it only within what it reserved: a job never runs past its
@@ -321,7 +327,7 @@ impl Admission {
             return Some((e.id.clone(), false));
         }
         if job.namespace == Namespace::Main {
-            // Trusted builders are started by the operator, never on demand for a job.
+            // Persistent builders are started by the operator, never on demand for a job.
             return None;
         }
         let machines: Vec<String> = self
@@ -455,6 +461,11 @@ impl Admission {
     }
 
     fn start_rebuild(&mut self, now: Millis, old: &str) {
+        // Once a rebuild chose draining, finish that lifecycle before replacing it.
+        // Room freed by another executor must not restart a still-busy old builder.
+        if self.executors.get(old).is_none_or(|e| e.phase != ExecutorPhase::Stopped) {
+            return;
+        }
         let Some(reservation) = self.rebuilds.remove(old) else { return };
         let machine = self.executors[old].machine.clone();
         if self.create(now, &machine, Namespace::Main, reservation.clone()).is_none() {
