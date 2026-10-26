@@ -65,6 +65,7 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
         clone(store_from, os.path.join(work, "store.noindex"))
     cmd = [sys.executable, "-I", LOADMEM, "--td", a.td, "--blaze-bin", blaze_bin or a.blaze_bin, "--work", work,
            "--name", "r", "--cargo-home-from", a.cargo_home_from, "--target-name", "d3m.noindex",
+           "--timeout", str(a.timeout),
            "--memory-every", "0.5", "--every", "0.5", "--env", f"RUSTUP_TOOLCHAIN={a.toolchain}",
            "--env", "RA_JIT_FRONT_STATS=1"]
     for kv in env:
@@ -157,6 +158,7 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--cargo-home-from", required=True)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--timeout", type=int, default=900, help="seconds per guarded run")
     ap.add_argument("--arms", default="off,store,image")
     ap.add_argument("--toolchain", default="1.99.0")
     ap.add_argument("--skip-build", action="store_true", help="cargo's target directory is whole already")
