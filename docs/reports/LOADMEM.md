@@ -690,3 +690,20 @@ The method of attributing a heap profile to salsa ingredients is `harness/heap.p
 [daemon-memory.md](../research/daemon-memory.md)); the question and the 56 GB are u1's, and the
 watchdog's rule for macOS swap (growth, not free space alone) is u1b's `harness/tracedecay.py`,
 which I read and did not copy. The first-person "I" is the session that did the work.
+
+## PR review follow-up
+
+Linux pressure signals are now read independently: an unavailable PSI file no longer
+discards a critical `MemAvailable` reading, and a missing memory counter no longer discards
+critical full-memory stalls. Incomplete quiet readings remain unknown. Pressure admission
+errors from patch roots and instance waves propagate as build errors, and an abandoned
+object cannot be finalized; they no longer masquerade as an unsupported edit or an empty
+successful instance wave.
+
+Validation on Linux x86-64 with Rust 1.99.0: the two pressure-classifier tests passed using
+the source functions extracted into a dependency-free test driver; the new partial-signal
+case failed on the previous implementation. All seven tests in the actual `budget.rs`
+passed in a small driver that supplies the codegen error and progress interfaces. Touched
+Rust formatting and `git diff --check` passed. These focused checks do not validate a full
+daemon, a pressure-interrupted patch, coroutine layout or LLVM; the full crate and runtime
+gates remain required before merging.

@@ -389,8 +389,8 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
 #[cfg(target_os = "linux")]
 pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     linux_pressure(
-        &std::fs::read_to_string("/proc/meminfo").ok()?,
-        &std::fs::read_to_string("/proc/pressure/memory").ok()?,
+        &std::fs::read_to_string("/proc/meminfo").unwrap_or_default(),
+        &std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default(),
         pressure_reserve().ok()?,
     )
 }
@@ -407,20 +407,26 @@ fn linux_pressure(
     reserve: u64,
 ) -> Option<hir_ty_codegen::budget::Pressure> {
     use hir_ty_codegen::budget::Pressure;
-    let available = kilobytes(meminfo, "MemAvailable:")?;
+    let available = kilobytes(meminfo, "MemAvailable:");
     let avg = |name: &str| -> Option<f64> {
         let row = psi.lines().find(|line| line.starts_with(name))?;
         let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
         value.parse::<f64>().ok().filter(|it| it.is_finite() && *it >= 0.0)
     };
-    let (some, full) = (avg("some ")?, avg("full ")?);
-    Some(if available <= reserve || full >= 10.0 {
-        Pressure::Critical
-    } else if available <= reserve.saturating_mul(2) || some >= 10.0 {
-        Pressure::Warning
+    let (some, full) = (avg("some "), avg("full "));
+    // PSI can be disabled by the kernel or unavailable in a container. An unreadable
+    // signal is unknown, but must not erase pressure observed by another signal.
+    if available.is_some_and(|it| it <= reserve) || full.is_some_and(|it| it >= 10.0) {
+        Some(Pressure::Critical)
+    } else if available.is_some_and(|it| it <= reserve.saturating_mul(2))
+        || some.is_some_and(|it| it >= 10.0)
+    {
+        Some(Pressure::Warning)
+    } else if available.is_some() && some.is_some() && full.is_some() {
+        Some(Pressure::Normal)
     } else {
-        Pressure::Normal
-    })
+        None
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +445,22 @@ mod tests {
         assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(10, 0), 1 << 20), Some(Warning));
         assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 10), 1 << 20), Some(Critical));
         assert_eq!(linux_pressure("MemAvailable: 4096 kB", "unreadable", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_keeps_known_pressure_when_another_signal_is_unavailable() {
+        use hir_ty_codegen::budget::Pressure::*;
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", "", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", "", 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("", "full avg10=10 total=0\n", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("", "some avg10=10 total=0\n", 1 << 20), Some(Warning));
+        assert_eq!(
+            linux_pressure("MemAvailable: 1024 kB", "full avg10=NaN total=0\n", 1 << 20),
+            Some(Critical)
+        );
+        // Incomplete quiet signals do not claim that all pressure sources are normal.
+        assert_eq!(linux_pressure("", "full avg10=0 total=0\n", 1 << 20), None);
+        assert_eq!(linux_pressure("", "", 1 << 20), None);
     }
 
     #[test]

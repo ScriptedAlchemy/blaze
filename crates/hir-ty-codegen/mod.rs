@@ -5058,6 +5058,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// The object, and the files of what a debugger reads that is kept apart from it.
     fn finish(mut self) -> Result<(Vec<u8>, Vec<Sidecar>)> {
+        if let Some(why) = self.shed.take() {
+            return Err(CodegenError::OverBudget(why));
+        }
         self.make_later();
         if Target::current().writes_wasm_objects() {
             return Ok((self.finish_wasm()?, Vec::new()));
@@ -5454,10 +5457,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
-    fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
+    fn define_instances(&mut self) -> Result<Vec<(Instance, Rejected)>> {
         let mut failed = Vec::new();
         self.compile_ahead(Vec::new(), &mut |cg, ahead| failed.extend(cg.define_waves(ahead)));
-        failed
+        if let Some(why) = self.shed.take() {
+            return Err(CodegenError::OverBudget(why));
+        }
+        Ok(failed)
     }
 
     /// Puts what is pending in the object, and what that calls. With `ahead`, the other

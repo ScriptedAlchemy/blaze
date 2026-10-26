@@ -2648,6 +2648,9 @@ impl Base {
                 }
                 match cg.define_function(root) {
                     Ok(_) => {}
+                    // Pressure stopped this build, not the function's support for patching.
+                    // Preserve the error instead of asking for a full rebuild to retry it.
+                    Err(e @ CodegenError::OverBudget(_)) => return Err(e),
                     // As in a full build, a function added to a crate whose symbols are
                     // rustc's has none to be put in the object under: what calls it has a
                     // copy of its own.
@@ -2656,7 +2659,7 @@ impl Base {
                 }
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
             }
-            if !cg.define_instances().is_empty() {
+            if !cg.define_instances()?.is_empty() {
                 return Ok(Err("an instance can't be compiled"));
             }
             queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
