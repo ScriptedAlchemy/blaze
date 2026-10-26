@@ -613,9 +613,18 @@ def main():
             print(f"    M1: allocated grows {rule['slope_per_pair']} bytes a pair, "
                   f"{rule['over_1000']:.1%} of the first over 1,000, r² {rule['r2']}: {verdict} "
                   f"(the rule is a proposal, unverified)", flush=True)
+        else:
+            samples = sum(len(it["samples"]) for it in arms_of[label])
+            print(f"    M1: the line needs three samples and has {samples} "
+                  f"(`--reclaim-every` smaller than `--pairs / 3`)", flush=True)
         if label in grew:
-            named = ", ".join(f"{name} {first} to {last} ({change:+})" for name, first, last, change in grew[label])
-            print(f"    grew most: {named}", flush=True)
+            grew_any = [it for it in grew[label] if it[3] > 0]
+            if grew_any:
+                named = ", ".join(f"{name} {first} to {last} ({change:+})"
+                                  for name, first, last, change in grew_any)
+                print(f"    grew: {named}", flush=True)
+            else:
+                print("    nothing of what is counted grew over the pairs", flush=True)
     print(json.dumps(dict(project=name, pairs=pairs, reclaim_every=every, kinds=kinds,
                           arms=arms, runs=runs, medians=med, leak_rule=leaks, grew=grew,
                           samples=arms_of)))
