@@ -2760,6 +2760,27 @@ name; whether the deployment target changes a function's code is recorded. From 
 
 Verify: `cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
 
+Review status of the C2 prototype: the Linux Rust 1.99.0 tests of `blaze-spec`,
+`blaze-metadata` and `blaze-wire` pass (197 tests, including the test over all 317 recorded
+Cargo unit graphs). The graph now keeps proc-macro doctest libraries under their host/build
+profile, and a normal check and test check of the same library or binary remain distinct.
+A custom test harness receives `cfg(test)` without acquiring the libtest harness. These
+checks do not establish local execution acceptance or the macOS gate.
+
+Two source-identity gaps remain before the prototype can be used to schedule work. The CLI
+currently names `HEAD` and `HEAD^{tree}` while resolution reads the working tree: changing a
+Rust body without committing can leave `BuildSpec` and `JobContent` unchanged. It needs an
+immutable snapshot of the actual source closure, including inputs outside Git's tracked
+files. Also, the wire contract lacks the Cargo workspace's location within its repository.
+Two sibling workspaces with identical package metadata but different source can have equal
+specs, and replay joins the workspace-relative `cwd` to the Git root. A repository-relative
+workspace location must enter the keyed contract and be used by materialization and replay.
+Refusing those supported local builds is not the completed C2 design.
+
+Matching replay still deliberately ends at the owned-executor diagnostic; routing it through
+the existing Cargo dispatcher would add a compiler fallback. The executor, complete native
+input closure and local execution differential remain pending, and C2 stays draft.
+
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's
 `manifests/`; a client place `Place::Serve` (`blaze+http://host:port`). Push, pull, lazy and the
