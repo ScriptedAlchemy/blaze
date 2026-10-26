@@ -245,6 +245,9 @@ pub struct PackageData {
     pub readme: Option<Utf8PathBuf>,
     /// Rust version as given in the `Cargo.toml`
     pub rust_version: Option<semver::Version>,
+    /// `links` as given in the `Cargo.toml`: the native library its build script links, whose
+    /// metadata the scripts of its dependents are given (blaze's runner of build scripts).
+    pub links: Option<String>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
     /// If this package is a member of the workspace, store all direct and transitive
@@ -397,6 +400,7 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 ..
             } = meta_pkg;
             let id = Arc::new(id);
@@ -435,6 +439,7 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),

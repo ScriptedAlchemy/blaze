@@ -211,7 +211,7 @@ fn compile_in(
     // A proc macro's library is kept in the store, by its description.
     let key = made.proc_macro.then(|| super::own_macro::library_key(&described));
     if !key.is_some_and(|key| super::own_macro::restored(&key, made)) {
-        let said = build(&described, dir, made, super::daemon::store(), true)?;
+        let said = build(&described, dir, made, super::daemon::store(), true, None)?;
         if let Some(line) =
             said.lines().find(|it| it.contains(" functions in it ra-jit could not compile"))
             && !line.ends_with(", 0 functions in it ra-jit could not compile")
@@ -239,13 +239,16 @@ fn description(sysroot: &Path, crates: &[Described]) -> String {
 
 /// Builds the first crate of `described`, a [`description`], as `made` says, describing them
 /// in `dir`, with `store` as the store: what the build said, or why it did not build. With
-/// `shipped` it fetches the standard library as builds do (`shipped.rs`).
+/// `shipped` it fetches the standard library as builds do (`shipped.rs`). `asked` is the
+/// variables to run the build with in place of this process's, and where to write the
+/// dep-info of every crate the program links.
 fn build(
     described: &str,
     dir: &Path,
     made: &Made<'_>,
     store: Option<PathBuf>,
     shipped: bool,
+    asked: Option<(&[(String, String)], &Path)>,
 ) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
     let project = dir.join("rust-project.json");
@@ -258,11 +261,23 @@ fn build(
     }
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
-    for (name, _) in std::env::vars_os() {
-        let text = name.to_string_lossy();
+    let not_the_builds = |text: &str| {
         let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        if cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO" {
+        cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO"
+    };
+    if let Some((env, inputs)) = asked {
+        ra_jit.env_clear();
+        ra_jit.envs(env.iter().filter(|(name, _)| !not_the_builds(name)).map(|(k, v)| (k, v)));
+        ra_jit.arg("--inputs").arg(inputs);
+    }
+    for (name, _) in std::env::vars_os() {
+        if not_the_builds(&name.to_string_lossy()) {
             ra_jit.env_remove(&name);
+        }
+    }
+    for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE"] {
+        if let Some(value) = std::env::var_os(kept).filter(|_| asked.is_some()) {
+            ra_jit.env(kept, value);
         }
     }
     for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
@@ -308,7 +323,60 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
     let exe = dir.join("build-script-build");
     let made = Made { name: SCRIPT, proc_macro: false, dep_info: exe.with_extension("d"), exe };
     let described = description(sysroot, &[script]);
-    build(&described, dir, &made, Some(store.to_owned()), false)
+    build(&described, dir, &made, Some(store.to_owned()), false, None)
+}
+
+/// A crate of a build script's description that blaze's runner of build scripts makes from
+/// blaze's own reading of the workspace (`crate::scripts`), not from what cargo told rustc.
+pub(crate) struct Planned {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
+    pub(crate) edition: String,
+    pub(crate) cfg: Vec<String>,
+    pub(crate) env: BTreeMap<String, String>,
+    /// The name each library is linked under and where it is among the crates.
+    pub(crate) deps: Vec<(String, usize)>,
+}
+
+/// The `rust-project.json` of the script that is the first of `crates`, over the standard
+/// library of `sysroot`.
+pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> String {
+    let crates: Vec<Described> = crates
+        .into_iter()
+        .map(|it| Described {
+            name: it.name,
+            root: it.root,
+            edition: it.edition,
+            cfg: it.cfg,
+            env: it.env,
+            deps: it.deps,
+            proc_macro: None,
+            compiled_macro: false,
+            inputs: None,
+        })
+        .collect();
+    description(sysroot, &crates)
+}
+
+/// Compiles and links the build script `described` (a [`planned_description`]) into `exe`
+/// in `dir`, with its dep-info beside it and the dep-info of every crate it links at
+/// `inputs`, the build run with the variables `env` (those of the process that asked for
+/// the build) and nothing of the daemon's but what the store and the backend are. What the
+/// build said, or why it did not build.
+pub(crate) fn link_planned(
+    described: &str,
+    dir: &Path,
+    exe: &Path,
+    inputs: &Path,
+    env: &[(String, String)],
+) -> Result<String, String> {
+    let made = Made {
+        name: SCRIPT,
+        proc_macro: false,
+        exe: exe.to_owned(),
+        dep_info: exe.with_extension("d"),
+    };
+    build(described, dir, &made, super::daemon::store(), true, Some((env, inputs)))
 }
 
 /// Why rustc is to compile the script when it read a variable as another than rustc would,

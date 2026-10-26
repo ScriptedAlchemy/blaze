@@ -136,6 +136,11 @@ pub(crate) const BUILD: &str = "RA_JIT_BUILD";
 /// The variable that tells a worker which build started it, whose load runs the scripts for it.
 pub(crate) const LOAD_BUILD: &str = "RA_JIT_LOAD_BUILD";
 
+/// The variable that names the file of the variables of the process whose build started a
+/// worker ([`crate::process::encode`]): its load runs the build scripts with them, as cargo
+/// run by that process would, and not with the daemon's, which another process started.
+pub(crate) const LOAD_ENV: &str = "RA_JIT_LOAD_ENV";
+
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
 /// loaded the workspace, in JSON, before it ends.
 pub(crate) fn errors_beside(socket: &Path) -> PathBuf {
@@ -429,9 +434,6 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
-    /// The build of the daemon's that asked it last, or `0` for none: what its requests say
-    /// of what they are for ([`BUILD`]).
-    build: AtomicU64,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -533,6 +535,16 @@ impl Worker {
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
                 command.env(LOAD_BUILD, build.to_string());
+                if !checkout.env.is_empty() {
+                    let asked: ide_db::base_db::Env = checkout.env.clone().into_iter().collect();
+                    let file = dir.join("load-env");
+                    private_file(
+                        OpenOptions::new().write(true).create(true).truncate(true),
+                        &file,
+                    )?
+                    .write_all(crate::process::encode(&asked).as_bytes())?;
+                    command.env(LOAD_ENV, file);
+                }
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -554,7 +566,6 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
-            build: AtomicU64::new(build),
         })
     }
 
@@ -629,9 +640,10 @@ impl Worker {
         }
     }
 
-    /// Waits for the process to listen, then has it build every program of `checkout` once.
-    fn warm(&self, checkout: &Checkout) {
-        let warmth = match self.warmed(checkout) {
+    /// Waits for the process to listen, then has it build every program of `checkout` once,
+    /// for the daemon's `build` that asked.
+    fn warm(&self, checkout: &Checkout, build: u64) {
+        let warmth = match self.warmed(checkout, build) {
             Ok(None) => Warmth::Ready,
             Ok(Some(said)) => Warmth::Broken(said, SystemTime::now()),
             Err(why) => match std::fs::read(errors_beside(&self.socket)) {
@@ -654,14 +666,18 @@ impl Worker {
     }
 
     /// The errors in the source, when the worker found any.
-    fn warmed(&self, checkout: &Checkout) -> anyhow::Result<Option<crate::errors::Said>> {
+    fn warmed(
+        &self,
+        checkout: &Checkout,
+        build: u64,
+    ) -> anyhow::Result<Option<crate::errors::Said>> {
         self.connected()?;
         // A source written since cargo built is the daemon's like any edit: it compiles
         // every function and static of the workspace from what it reads. The program the
         // worker was started on is built already, and is asked for too: what the worker then
         // compiles again by itself, for the first edit to be a patch, is part of warming up.
         for plan in &checkout.programs {
-            match self.ask(checkout, plan)? {
+            match self.ask(checkout, plan, build)? {
                 Ok(_) => {}
                 Err(NotBuilt::Error(said)) => return Ok(Some(said)),
                 Err(why) => anyhow::bail!(why.why()),
@@ -689,9 +705,16 @@ impl Worker {
         }
     }
 
-    /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
-    /// the inner one its answer that it does not build this.
-    fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, NotBuilt>> {
+    /// Asks the process for `plan` of `checkout`, for the daemon's `build`, or `0` for none.
+    /// The outer error is the worker's failing, the inner one its answer that it does not
+    /// build this. The build is the request's own: two clients that ask at once are two
+    /// builds, each of which runs a script cargo runs every build ([`BUILD`]).
+    fn ask(
+        &self,
+        checkout: &Checkout,
+        plan: &Plan,
+        build: u64,
+    ) -> anyhow::Result<Result<String, NotBuilt>> {
         let _answering = Answering::new(&self.answering);
         let failed = || match self.ended_within(EXITING) {
             Some(how) => {
@@ -713,9 +736,8 @@ impl Worker {
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
-        match self.build.load(Relaxed) {
-            0 => {}
-            build => env.set(BUILD, build.to_string()),
+        if build != 0 {
+            env.set(BUILD, build.to_string());
         }
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream
@@ -731,9 +753,9 @@ impl Worker {
         }
     }
 
-    /// Brings the programs of `checkout` up to date, all at once: the worker builds the
-    /// requests that wait for it together.
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    /// Brings the programs of `checkout` up to date for the daemon's `build`, all at once: the
+    /// worker builds the requests that wait for it together.
+    fn sync(&self, checkout: &Checkout, build: u64) -> Reply {
         let spans = Mutex::new(Vec::new());
         let asked: Vec<anyhow::Result<Result<String, NotBuilt>>> = std::thread::scope(|scope| {
             let asking: Vec<_> = checkout
@@ -742,7 +764,7 @@ impl Worker {
                 .map(|plan| {
                     scope.spawn(|| {
                         let start = Instant::now();
-                        let asked = self.ask(checkout, plan);
+                        let asked = self.ask(checkout, plan, build);
                         let level = Some(crate::trace::ASKED);
                         let span =
                             crate::trace::span("daemon↔worker", level, start, Instant::now());
@@ -1193,7 +1215,7 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
+            Request::Sync(checkout) => self.sync(&checkout, 0),
             Request::Warm(checkout) => match self.warm(checkout, 0) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -1214,10 +1236,14 @@ impl Daemon {
                 }
                 Reply::Warming
             }
-            Request::Build(checkout) => match self.warm(checkout.clone(), self.next_build()) {
-                Ok(()) => self.built(&checkout),
-                Err(why) => Reply::Cold { reason: format!("{why:#}") },
-            },
+            Request::Build(checkout) => {
+                // The number is this request's alone, carried with it to the worker.
+                let build = self.next_build();
+                match self.warm(checkout.clone(), build) {
+                    Ok(()) => self.built(&checkout, build),
+                    Err(why) => Reply::Cold { reason: format!("{why:#}") },
+                }
+            }
             Request::Check(ahead) => self.check(&ahead),
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
@@ -1234,7 +1260,7 @@ impl Daemon {
         }
     }
 
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    fn sync(&self, checkout: &Checkout, build: u64) -> Reply {
         let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
         let Some(worker) = worker else {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
@@ -1248,7 +1274,7 @@ impl Daemon {
             ),
         };
         match warmth {
-            Warmth::Ready => worker.sync(checkout),
+            Warmth::Ready => worker.sync(checkout, build),
             Warmth::Loading(since) => Reply::Cold {
                 reason: format!(
                     "the daemon is still loading the workspace ({:.0?} so far)",
@@ -1263,10 +1289,11 @@ impl Daemon {
         }
     }
 
-    /// What the worker that loads `checkout` has to say of its programs once it has.
-    fn built(&self, checkout: &Checkout) -> Reply {
+    /// What the worker that loads `checkout` has to say of its programs once it has, for the
+    /// daemon's `build`.
+    fn built(&self, checkout: &Checkout, build: u64) -> Reply {
         loop {
-            match self.sync(checkout) {
+            match self.sync(checkout, build) {
                 Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
                 reply => return reply,
             }
@@ -1318,7 +1345,6 @@ impl Daemon {
         }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
-            worker.build.store(build, Relaxed);
             let mut checkouts = lock(&worker.checkouts);
             match checkouts.get(&checkout.key) {
                 Some(loaded) if loaded.generation == checkout.generation => return Ok(()),
@@ -1332,7 +1358,7 @@ impl Daemon {
                     };
                     checkouts.insert(checkout.key.clone(), loading);
                     let worker = worker.clone();
-                    std::thread::spawn(move || worker.warm(&checkout));
+                    std::thread::spawn(move || worker.warm(&checkout, build));
                     return Ok(());
                 }
             }
@@ -1355,7 +1381,7 @@ impl Daemon {
             worker.project.display()
         );
         workers.insert(id, worker.clone());
-        std::thread::spawn(move || worker.warm(&checkout));
+        std::thread::spawn(move || worker.warm(&checkout, build));
         Ok(())
     }
 
@@ -1646,5 +1672,92 @@ mod tests {
         assert_eq!(over(&holding, 8), ["oldest", "old"]);
         // The busy one and the one asked last stay, whatever they hold.
         assert_eq!(over(&holding, 0), ["oldest", "old"]);
+    }
+
+    /// Two clients that ask one worker at once are two builds, and each request says its own
+    /// (p05w-verify, finding 1): a worker that kept the number of the last build asked told
+    /// both requests the second's, and a script cargo runs every build ran once for the two.
+    #[cfg(unix)]
+    #[test]
+    fn requests_that_ask_at_once_each_say_their_own_build() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("ra-jit-daemon-builds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // A worker that answers each request once both have come, with the build it said.
+        let said = std::thread::spawn(move || {
+            let mut streams = Vec::new();
+            let mut builds = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut sync, mut env) = (String::new(), String::new());
+                reader.read_line(&mut sync).unwrap();
+                reader.read_line(&mut env).unwrap();
+                builds.push(crate::process::decode_request(env.trim_end()).1);
+                streams.push(stream);
+            }
+            for mut stream in streams {
+                stream.write_all(b"ok\n").unwrap();
+            }
+            builds.sort_unstable();
+            builds
+        });
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let worker = Worker {
+            project: dir.clone(),
+            socket,
+            log: dir.join("log"),
+            env: ide_db::base_db::Env::default(),
+            child: Mutex::new(child),
+            checkouts: Mutex::new(FxHashMap::default()),
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            noted: AtomicBool::new(false),
+        };
+        let plan = Plan {
+            crates: vec![dir.join("src/main.rs")],
+            object: dir.join("probe.o"),
+            patch: dir.join("probe.patch.o"),
+            binary: dir.join("probe"),
+            rustc_binary: None,
+            link_cmd: String::new(),
+            symbol_files: Vec::new(),
+            unit_test: false,
+            linked_as_built: Vec::new(),
+            copies: Vec::new(),
+            package: None,
+            stamp: 0,
+            whole: true,
+        };
+        let checkout = Checkout {
+            key: "probe-whole".to_owned(),
+            generation: 0,
+            built_at: 0,
+            config: WorkerConfig {
+                repository: dir.clone(),
+                project: PathBuf::new(),
+                cfg_test: false,
+                selection: crate::plan::Selection::default(),
+                env: BTreeMap::new(),
+                whole: true,
+            },
+            root: dir.clone(),
+            programs: vec![plan.clone()],
+            sources: Vec::new(),
+            env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
+            scripts: None,
+        };
+        let answers = std::thread::scope(|scope| {
+            let first = scope.spawn(|| worker.ask(&checkout, &plan, 5));
+            let second = scope.spawn(|| worker.ask(&checkout, &plan, 6));
+            [first.join().unwrap().unwrap(), second.join().unwrap().unwrap()]
+        });
+        assert!(answers.iter().all(|it| it.as_ref().is_ok_and(|it| it == "ok")));
+        assert_eq!(said.join().unwrap(), [5, 6]);
+        let _ = lock(&worker.child).kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

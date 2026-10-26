@@ -283,7 +283,7 @@ impl Rerun {
 /// The newest time of the file at `path`, or of the directory there and everything below
 /// it, as cargo's `mtime_recursive` takes it: links followed, a link's own time and its
 /// target's, what cannot be read left out.
-fn newest(path: &Path) -> Option<SystemTime> {
+pub(crate) fn newest(path: &Path) -> Option<SystemTime> {
     let meta = std::fs::metadata(path).ok()?;
     let mut newest = meta.modified().ok()?;
     if !meta.is_dir() {

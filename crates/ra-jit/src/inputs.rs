@@ -91,6 +91,10 @@ struct Scripts {
     /// workspace is stale until it is loaded again, and that load takes what they said and does
     /// not run them again.
     ready: Option<WorkspaceBuildScripts>,
+    /// In the whole build, what blaze's runs of the scripts were asked for with: blaze compiles
+    /// and runs them, deciding as cargo does which run again (`crate::scripts`), and no cargo
+    /// is asked.
+    own: Option<crate::scripts::Own>,
 }
 
 /// What a script said it reads when it ran, and when that run began.
@@ -359,6 +363,7 @@ impl Inputs {
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
         build: u64,
+        own: Option<crate::scripts::Own>,
     ) {
         let mut files = Vec::new();
         for dir in root.ancestors() {
@@ -383,7 +388,7 @@ impl Inputs {
         if self.asked_with.is_empty() {
             self.asked_with.extend(std::env::vars().map(|it| it.0));
         }
-        let mut scripts = Scripts::of(workspace, config, given, build);
+        let mut scripts = Scripts::of(workspace, config, given, build, own);
         // A checkout loaded again has run its scripts again, where cargo found one to: a script
         // that said other than it did is owed a run for it, as it is from a check.
         let before = self.checkouts.iter().find(|it| it.root == root);
@@ -452,6 +457,7 @@ impl Scripts {
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
         build: u64,
+        own: Option<crate::scripts::Own>,
     ) -> Option<Scripts> {
         let ProjectWorkspaceKind::Cargo { cargo, build_scripts, .. } = &workspace.kind else {
             return None;
@@ -501,10 +507,10 @@ impl Scripts {
         }
         variables.sort();
         variables.dedup();
-        if scripts.is_empty() && variables.is_empty() {
+        if scripts.is_empty() && variables.is_empty() && own.is_none() {
             return None;
         }
-        Some(Scripts { workspace: workspace.clone(), config, scripts, variables, ready: None })
+        Some(Scripts { workspace: workspace.clone(), config, scripts, variables, ready: None, own })
     }
 
     /// Runs the scripts again where cargo would for a process with `env`, or with `None`
@@ -519,6 +525,25 @@ impl Scripts {
         // Until the workspace is loaded again it is not what the scripts said.
         if self.ready.is_some() {
             return Ok(true);
+        }
+        if let Some(own) = &self.own {
+            // blaze judges each script itself, as cargo does at every build: a script whose
+            // last run stands is not run, and the workspace is another only when what one
+            // said is.
+            let asked: std::collections::BTreeMap<String, String> = match env {
+                Some(env) => env.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+                None => own.env.clone(),
+            };
+            let said = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
+            let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind
+            else {
+                return Ok(false);
+            };
+            let other = said != *loaded;
+            if other {
+                self.ready = Some(said);
+            }
+            return Ok(other);
         }
         let changed: Vec<usize> =
             (0..self.scripts.len()).filter(|&at| self.scripts[at].changed(build)).collect();

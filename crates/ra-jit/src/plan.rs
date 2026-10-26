@@ -537,6 +537,146 @@ impl Plan {
         graph.plan(&Flags::of(dir, asked)?)
     }
 
+    /// [`Plan::of`] made by blaze with no cargo, for the whole build: the packages of `cargo`,
+    /// the workspace blaze read and resolved itself for this build (`cargo/metadata.rs`), each
+    /// with the features that reading has and the profile blaze-manifest gives it as cargo's
+    /// `Profiles::get_profile` does (for the target when the packages the build selects reach
+    /// it without a build script or proc macro between, for the host otherwise), and the
+    /// flags for rustc of the process that asks and of cargo's configuration.
+    pub(crate) fn own(
+        cargo: &project_model::CargoWorkspace,
+        manifest: &Path,
+        selection: &Selection,
+        asked: &Asked<'_>,
+    ) -> anyhow::Result<Plan> {
+        use blaze_manifest::profiles::{Profiles, UnitFor};
+        use project_model::DepKind;
+        let root: &Path = cargo.workspace_root().as_ref();
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (name, value) in asked.env {
+            match value {
+                Some(value) => env.insert(name.clone(), value.clone()),
+                None => env.remove(name),
+            };
+        }
+        let mut config = blaze_manifest::Config::load(root, env.clone(), &[])?;
+        config.start("build", &selection.config)?;
+        let ctx = blaze_manifest::Context::new(config);
+        let root_manifest =
+            blaze_manifest::metadata::root_manifest(Some(&root.join("Cargo.toml")), &ctx)?;
+        let ws = blaze_manifest::Workspace::new(&root_manifest, &ctx)?;
+        let host = selection.target.is_none();
+        let profiles = Profiles::new(
+            ws.profiles(),
+            ws.unstable_features(),
+            &ctx.config,
+            &selection.profile,
+            asked.triple,
+        )?;
+        let flags = crate::scripts::rustflags(&ctx.config, &env, asked.triple)?;
+        let flags = Flags::parse(flags.iter().map(String::as_str));
+        anyhow::ensure!(
+            !flags.lto,
+            "`-C lto` is among the flags: rustc compiles the whole program again as it links \
+             it and leaves no library on the link line for ra-jit's functions to be linked against"
+        );
+        // The packages the build selects: those `-p` names, every member for `--workspace`,
+        // else the one asked in, or every member of a virtual workspace.
+        let asked_in = match &selection.asked_in {
+            Some(it) if it.is_dir() => it.join("Cargo.toml"),
+            Some(it) => it.clone(),
+            None => manifest.to_owned(),
+        };
+        let members: Vec<project_model::Package> =
+            cargo.packages().filter(|&it| cargo[it].is_member).collect();
+        let named = |it: &project_model::Package| {
+            selection
+                .packages
+                .iter()
+                .any(|name| name.split('@').next() == Some(cargo[*it].name.as_str()))
+        };
+        let excluded = |it: &project_model::Package| {
+            selection.excludes.iter().any(|name| *name == cargo[*it].name)
+        };
+        let manifest_of = |it: &project_model::Package| -> PathBuf {
+            AsRef::<Path>::as_ref(&cargo[*it].manifest).to_owned()
+        };
+        let roots: Vec<project_model::Package> = if !selection.packages.is_empty() {
+            members.iter().copied().filter(named).collect()
+        } else if selection.workspace {
+            members.iter().copied().filter(|it| !excluded(it)).collect()
+        } else {
+            let at: Vec<_> =
+                members.iter().copied().filter(|it| manifest_of(it) == asked_in).collect();
+            if at.is_empty() { members.clone() } else { at }
+        };
+        // Reached from the roots for the target, and for the host.
+        let mut target: FxHashSet<project_model::Package> = FxHashSet::default();
+        let mut hosted: FxHashSet<project_model::Package> = FxHashSet::default();
+        let is_macro = |it: project_model::Package| {
+            cargo[it].targets.iter().any(|&t| {
+                matches!(cargo[t].kind, ide_db::base_db::TargetKind::Lib { is_proc_macro: true })
+            })
+        };
+        let mut pending: Vec<(project_model::Package, bool)> =
+            roots.iter().map(|&it| (it, is_macro(it))).collect();
+        while let Some((package, for_host)) = pending.pop() {
+            let seen = match for_host {
+                true => &mut hosted,
+                false => &mut target,
+            };
+            if !seen.insert(package) {
+                continue;
+            }
+            for dep in &cargo[package].dependencies {
+                let dep_host = for_host || dep.kind == DepKind::Build || is_macro(dep.pkg);
+                if dep.kind != DepKind::Dev || selection.dev_deps {
+                    pending.push((dep.pkg, dep_host));
+                }
+            }
+        }
+        let kind = match &selection.target {
+            Some(triple) => blaze_manifest::config::CompileKind::Target(triple.clone()),
+            None => blaze_manifest::config::CompileKind::Host,
+        };
+        let mut packages = FxHashMap::default();
+        let mut lto = false;
+        for package in target.iter().chain(hosted.iter().filter(|it| !target.contains(it))) {
+            let data = &cargo[*package];
+            let for_target = target.contains(package);
+            let unit_for = match for_target {
+                true => UnitFor::new_normal(),
+                false => UnitFor::new_host(false),
+            };
+            let kind = match for_target && !host {
+                true => kind.clone(),
+                false => blaze_manifest::config::CompileKind::Host,
+            };
+            let named = crate::scripts::named(data);
+            let profile =
+                profiles.get_profile(&named, data.is_member, data.is_local, unit_for, &kind);
+            let profile: Profile = serde_json::from_value(serde_json::to_value(&profile)?)
+                .context("blaze-manifest's profile is not the unit graph's form")?;
+            lto |= for_target && profile.links_from_bitcode();
+            let built = Built {
+                features: data.active_features.iter().cloned().collect(),
+                profile: profile.with(&flags),
+                primary: roots.contains(package),
+                for_target,
+            };
+            packages.insert(package_named(&data.id.repr), built);
+        }
+        if lto {
+            eprintln!("{LTO_ACCEPTED}");
+        }
+        Ok(Plan {
+            packages,
+            lto,
+            frame_pointers: flags.frame_pointers,
+            lints_capped: flags.lints_capped,
+        })
+    }
+
     /// The programs the build `selection` names, of the targets `targets` picks (`--bin`,
     /// `--example`), asked for in `dir` (of the package of `manifest`, when there is one): the
     /// units cargo would link an executable of.

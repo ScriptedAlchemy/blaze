@@ -24,6 +24,7 @@ mod plan;
 mod process;
 mod remote;
 mod sandbox;
+mod scripts;
 mod shipped;
 mod socket;
 mod solving;
@@ -51,7 +52,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _, TargetKind};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
@@ -146,6 +147,10 @@ struct Args {
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
+    /// Where to write, after `exe` is linked, the dep-info of every crate it links but the
+    /// standard library's: what blaze's runner of build scripts compiles a script again for
+    /// (`scripts.rs`), the script's own crate and its build dependencies alike.
+    inputs: Option<PathBuf>,
     /// The build is of the standard library alone ([`std_unit`]): a crate it names is the
     /// library's, not another of that name the program has too.
     library: bool,
@@ -241,6 +246,7 @@ impl Args {
         let mut exe = None;
         let mut shared = false;
         let mut dep_info = None;
+        let mut inputs = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
         let mut own_target = false;
@@ -285,6 +291,7 @@ impl Args {
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--shared" => shared = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
+                "--inputs" => inputs = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
@@ -335,6 +342,7 @@ impl Args {
             exe,
             shared,
             dep_info,
+            inputs,
             library: false,
             cfg_test,
             own_target,
@@ -2572,7 +2580,12 @@ impl Checkouts {
             // Cargo's lines are of the build of the project asked for first.
             let said =
                 if Some(project) == projects.first() { self.scripts_said.take() } else { None };
-            let (workspace, told) = workspace_at(
+            // Loaded for the build that started the worker, whose scripts the load runs, with the
+            // variables of the process that asked for it.
+            let build = std::env::var(cargo::daemon::LOAD_BUILD).ok();
+            let build = build.and_then(|it| it.parse().ok()).unwrap_or(0);
+            let load_env = scripts::load_env();
+            let (workspace, told, own) = workspace_at(
                 project,
                 &self.cargo_config,
                 &self.load_config,
@@ -2580,6 +2593,7 @@ impl Checkouts {
                 beside,
                 said,
                 None,
+                Some((&load_env, build)),
             )?;
             debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
@@ -2598,10 +2612,8 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            // Loaded for the build that started the worker, whose scripts the load ran.
-            let build = std::env::var(cargo::daemon::LOAD_BUILD).ok();
-            let build = build.and_then(|it| it.parse().ok()).unwrap_or(0);
-            self.inputs.watch(&root, &workspace, &self.cargo_config, &FxHashMap::default(), build);
+            let config = &self.cargo_config;
+            self.inputs.watch(&root, &workspace, config, &FxHashMap::default(), build, own);
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
@@ -2667,10 +2679,10 @@ impl Checkouts {
     ) -> anyhow::Result<()> {
         let mut loaded = Vec::new();
         for &at in stale {
-            loaded.push(self.loaded_again(at, env)?);
+            loaded.push(self.loaded_again(at, env, build)?);
         }
-        for (&at, (workspace, debug, config, given)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config, &given, build);
+        for (&at, (workspace, debug, config, given, own)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config, &given, build, own);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2681,9 +2693,9 @@ impl Checkouts {
             };
             let over = self.roots[at].1.clone();
             if !self.builds_alike(&self.roots[base].1, &over) {
-                match self.loaded_again(at, env) {
-                    Ok((workspace, debug, config, given)) => {
-                        self.place(at, workspace, debug, &config, &given, build);
+                match self.loaded_again(at, env, build) {
+                    Ok((workspace, debug, config, given, own)) => {
+                        self.place(at, workspace, debug, &config, &given, build, own);
                         continue;
                     }
                     Err(error) => failed = Err(error),
@@ -2705,11 +2717,13 @@ impl Checkouts {
         &mut self,
         at: usize,
         env: &ide_db::base_db::Env,
+        build: u64,
     ) -> anyhow::Result<(
         ProjectWorkspace,
         plan::Whole,
         CargoConfig,
         FxHashMap<String, Option<String>>,
+        Option<scripts::Own>,
     )> {
         let (project, root) = self.roots[at].clone();
         let mut config = self.cargo_config.clone();
@@ -2717,9 +2731,19 @@ impl Checkouts {
         config.extra_env.extend(given.clone());
         // The scripts the check for this build ran are not run again for the load.
         let ready = self.inputs.ready(&root);
-        let (workspace, debug) =
-            workspace_at(&project, &config, &self.load_config, &self.selection, None, None, ready)?;
-        Ok((workspace, debug, config, given))
+        let asked: BTreeMap<String, String> =
+            env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+        let (workspace, debug, own) = workspace_at(
+            &project,
+            &config,
+            &self.load_config,
+            &self.selection,
+            None,
+            None,
+            ready,
+            Some((&asked, build)),
+        )?;
+        Ok((workspace, debug, config, given, own))
     }
 
     /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
@@ -2732,9 +2756,10 @@ impl Checkouts {
         config: &CargoConfig,
         given: &FxHashMap<String, Option<String>>,
         build: u64,
+        own: Option<scripts::Own>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.inputs.watch(&root, &workspace, config, given, build);
+        self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
         self.splits[at] = None;
@@ -2909,6 +2934,11 @@ struct View {
     project: PathBuf,
 }
 
+/// The workspace of the build `selection` names of the package at `project`, with what its
+/// build scripts say: what `ready`, `said` or cargo's build `beside` it says, or, in the whole
+/// build, what blaze's runs of them for the daemon's build `asked.1` by a process with the
+/// variables `asked.0` say (`scripts.rs`), which it then also returns the ask of.
+#[expect(clippy::too_many_arguments, reason = "each says where what the scripts said comes from")]
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
@@ -2917,7 +2947,8 @@ fn workspace_at(
     beside: Option<&mut Beside>,
     said: Option<Vec<String>>,
     ready: Option<WorkspaceBuildScripts>,
-) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
+    asked: Option<(&BTreeMap<String, String>, u64)>,
+) -> anyhow::Result<(ProjectWorkspace, plan::Whole, Option<scripts::Own>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
@@ -2934,6 +2965,7 @@ fn workspace_at(
     let mut debug =
         plan::Whole { debug: plan::Described::NOTHING, lto: false, lints_capped: false };
     let mut scripts = None;
+    let mut own = None;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -2947,10 +2979,53 @@ fn workspace_at(
             &cargo_config.extra_env,
         )?;
         let triple = triple.first().context("no target to build for")?;
-        let asked = plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
-        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
+        let plan_asked =
+            plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
+        let whole = scripts::own();
+        let plan = match whole {
+            // The whole build asks no cargo for its plan either.
+            true => {
+                plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?
+            }
+            false => plan::Plan::of(manifest.manifest_path().as_ref(), selection, &plan_asked)?,
+        };
         debug = plan.whole()?;
         let packages: Vec<_> = cargo.packages().collect();
+        // A proc macro of the build is still built by cargo's check of the load (step J), which
+        // then runs the scripts too: blaze runs them where the build has none.
+        let built = |it: &&project_model::Package| plan.package(&cargo[**it].id.repr).is_some();
+        let is_macro = |it: &&project_model::Package| {
+            cargo[**it].targets.iter().any(|&target| {
+                matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+            })
+        };
+        let proc_macro = packages.iter().filter(built).find(is_macro);
+        if whole && let Some(found) = proc_macro {
+            eprintln!(
+                "build scripts: the build has the proc macro `{}`, which blaze does not build \
+                 without cargo's check yet (no-rustc step J): the check runs the scripts",
+                cargo[*found].name
+            );
+        }
+        if whole
+            && proc_macro.is_none()
+            && let Some((env, _)) = asked
+        {
+            let host = project_model::toolchain_info::target_tuple::get(
+                project_model::toolchain_info::QueryConfig::Rustc(&workspace.sysroot, dir.as_ref()),
+                None,
+                &cargo_config.extra_env,
+            )?;
+            let ids = packages.iter().map(|&it| &cargo[it].id.repr);
+            own = Some(scripts::Own {
+                env: env.clone(),
+                profile: selection.profile.clone(),
+                config: selection.config.clone(),
+                host: host.first().context("no host to run build scripts on")?.clone(),
+                target: triple.clone(),
+                packages: ids.filter(|it| plan.package(it).is_some()).cloned().collect(),
+            });
+        }
         if let Some(beside) = beside {
             let built = packages.iter().filter(|it| plan.package(&cargo[**it].id.repr).is_some());
             beside.awaits(cargo, built.copied());
@@ -2987,6 +3062,12 @@ fn workspace_at(
             (None, ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
                 WorkspaceBuildScripts::of_messages(cargo, said.iter().map(String::as_str))
             }
+            // The whole build's scripts are blaze's to compile and run, with no cargo.
+            (None, _, _) if own.is_some() => {
+                let own = own.as_ref().expect("the whole build's ask");
+                let build = asked.map_or(0, |it| it.1);
+                scripts::run(&workspace, &own.asked(&own.env, build))?
+            }
             (None, kind, _) => {
                 if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
                     && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
@@ -3004,7 +3085,7 @@ fn workspace_at(
         }
         workspace.set_build_scripts(build_scripts);
     }
-    Ok((workspace, debug))
+    Ok((workspace, debug, own))
 }
 
 /// Starts ra-jit's own target directory from what cargo built in `target`, so that the build
@@ -4365,9 +4446,47 @@ fn write_dep_info(
     exe: &Path,
     path: &Path,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::new();
     let krates = crates_named(db, &args.krate, args)?;
-    for &krate in &krates {
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+}
+
+/// Writes to `path` the dep-info of every crate `exe` links but those of the standard library:
+/// the crate asked for and all it depends on, as [`write_dep_info`] writes that of one. A
+/// build script is compiled again, as cargo compiles it, when a file or a variable of a build
+/// dependency of it changed, which rustc's dep-info of the script alone does not name.
+fn write_inputs(
+    db: &RootDatabase,
+    args: &Args,
+    vfs: &vfs::Vfs,
+    exe: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut krates = crates_named(db, &args.krate, args)?;
+    let mut linked: Vec<ide_db::base_db::Crate> = Vec::new();
+    for krate in &krates {
+        linked.extend(deps_of(db, (*krate).into()));
+    }
+    for krate in linked {
+        let krate = Crate::from(krate);
+        if !krate.origin(db).is_lang() && !krates.contains(&krate) {
+            krates.push(krate);
+        }
+    }
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+}
+
+/// The dep-info of `krates`, the files of their modules and what `include!` and its kin read,
+/// and the variables `env!` and `option_env!` read of them, to `path`.
+fn write_dep_info_of(
+    db: &RootDatabase,
+    krates: &[Crate],
+    asked: &str,
+    vfs: &vfs::Vfs,
+    exe: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    for &krate in krates {
         let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
         files.extend(modules.map(|it| it.original_file(db).file_id(db)));
         let included = hir_def::include_macro_invoc(db, krate.into()).iter();
@@ -4383,7 +4502,7 @@ fn write_dep_info(
             paths.push(path);
         }
     }
-    anyhow::ensure!(!paths.is_empty(), "no file of `{}` was loaded", args.krate);
+    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
     let target = dep_info::escaped(&exe.display().to_string());
     let mut text = format!("{target}: {}\n\n", escaped.join(" "));
@@ -5980,6 +6099,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             exe: args.exe.clone(),
             shared: args.shared,
             dep_info: None,
+            inputs: None,
             library: args.library,
             cfg_test: args.cfg_test,
             own_target: args.own_target,
@@ -7423,7 +7543,7 @@ impl Held {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Told {
     pub(crate) args: Vec<String>,
-    pub(crate) env: std::collections::BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     pub(crate) cwd: PathBuf,
     /// The build is one cargo has only started: these are the workspace and its crates, and
     /// what cargo wrote is in the arguments of the line that follows.
@@ -7796,6 +7916,9 @@ fn run_holding(
     held: Option<Held>,
     ahead: bool,
 ) -> anyhow::Result<()> {
+    // A build that links the program itself, a whole build's worker among them, runs the
+    // build scripts of the workspace it loads itself.
+    scripts::set_own(args.exe.is_some());
     // As cargo does: the flag, then the environment, then the host.
     if args.selection.target.is_none() {
         args.selection.target =
@@ -8144,6 +8267,9 @@ fn run_holding(
                 }
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
+                }
+                if let Some(path) = &args.inputs {
+                    write_inputs(&db, &args, tree.vfs(), exe, path)?;
                 }
             }
             Some(cold)
