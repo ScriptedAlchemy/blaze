@@ -81,12 +81,12 @@ impl Unit {
         if build.try_lock().is_err() {
             return Lock::Busy;
         }
-        let mut held = vec![build];
+        let mut held = Held(vec![build]);
         if let Ok(artifacts) = std::fs::File::open(self.dest.join(".cargo-lock")) {
             if artifacts.try_lock_shared().is_err() {
                 return Lock::Busy;
             }
-            held.push(artifacts);
+            held.0.push(artifacts);
         }
         Lock::Held(held)
     }
@@ -245,12 +245,25 @@ fn at(path: &Path) -> impl FnOnce(std::io::Error) -> String + '_ {
 
 /// Cargo's locks on a build directory, as [`Unit::lock`] finds them.
 pub(crate) enum Lock {
-    Held(#[allow(dead_code, reason = "held until dropped")] Vec<std::fs::File>),
+    Held(Held),
     /// A cargo holds them.
     Busy,
     /// There is none: the directory is not one a cargo 1.99 built in, or is on NFS, where cargo
     /// takes none. Nothing keeps a cargo out, so nothing is run there.
     Absent,
+}
+
+/// Release the advisory locks when the run ends, even if a concurrent fork has inherited
+/// one of the open descriptions and has not reached exec yet. Closing only our descriptors
+/// leaves a flock held until that process closes its copies too.
+pub(crate) struct Held(Vec<std::fs::File>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = file.unlock();
+        }
+    }
 }
 
 /// When `path` was last written, as cargo reads it (`paths::mtime`, which follows a link).
@@ -421,6 +434,30 @@ fn to_hex(num: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_duplicated_description_does_not_keep_a_finished_runs_lock() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-record-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".cargo-build-lock"), "").unwrap();
+        let unit = Unit {
+            out_dir: PathBuf::new(),
+            run_dir: PathBuf::new(),
+            dest: dir.clone(),
+            hash: PathBuf::new(),
+        };
+        let Lock::Held(held) = unit.lock() else { panic!("the first run holds its lock") };
+        // A concurrent fork can inherit this open description until exec closes it. A dup
+        // keeps that same description alive deterministically, without a fork timing race.
+        let inherited = held.0[0].try_clone().unwrap();
+        drop(held);
+        let next = unit.lock();
+        assert!(matches!(next, Lock::Held(_)), "the finished run released its lock");
+        drop(next);
+        drop(inherited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A fingerprint of a run, and its hash, that cargo 1.99.0 wrote for the build script of a
     /// package with one `rerun-if-changed` and one `rerun-if-env-changed`
