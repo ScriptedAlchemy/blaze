@@ -170,7 +170,6 @@ struct Shadow {
 }
 
 /// The checker: what the coordinator must never do, from what it can see.
-#[derive(Default)]
 struct Checker {
     lease_ms: u64,
     live: BTreeMap<u64, Shadow>,
@@ -299,7 +298,13 @@ impl Checker {
                 return Err(("once", format!("root {index} accounted by {other:?} and {key:?}")));
             }
         }
-        for name in &names {
+        let k = roots.len() as usize;
+        for (item, name) in req.items[k..].iter().zip(&names) {
+            // Lost is a returned finding, not accepted compute. Another finder may
+            // legitimately commit this name later under a new lease.
+            if matches!(item.outcome, ItemOutcome::Lost(_)) {
+                continue;
+            }
             if let Some(other) = self.name_claims.insert(*name, key.clone()) {
                 return Err((
                     "once",
@@ -307,7 +312,6 @@ impl Checker {
                 ));
             }
         }
-        let k = roots.len() as usize;
         for (item, name) in req.items[k..].iter().zip(&names) {
             if let ItemOutcome::Lost(why) = &item.outcome
                 && why.why == UNKNOWN_NAME
@@ -347,6 +351,7 @@ impl Checker {
                     self.accepted.clear();
                     self.root_claims.clear();
                     self.name_claims.clear();
+                    self.done_at = None;
                 }
                 work::Effect::Done => {
                     if !self.live.is_empty() {
@@ -533,7 +538,6 @@ struct World {
     execution: Execution,
     checker: Checker,
     deaths: u32,
-    trace: bool,
 }
 
 fn wire(refusal: Refusal) -> blaze_wire::WireError {
@@ -542,7 +546,7 @@ fn wire(refusal: Refusal) -> blaze_wire::WireError {
 }
 
 impl World {
-    fn new(seed: u64, trace: bool) -> World {
+    fn new(seed: u64) -> World {
         let mut rng = Rng::new(seed);
         let profile = Profile::draw(&mut rng);
         let program = Program::generate(&mut rng.fork(), profile.conflicts);
@@ -591,8 +595,18 @@ impl World {
             },
             ..ExecutionConfig::default()
         };
-        let mut checker =
-            Checker { lease_ms: config.work.lease_ms, attempt: Attempt(1), ..Checker::default() };
+        let mut checker = Checker {
+            lease_ms: config.work.lease_ms,
+            attempt: Attempt(1),
+            live: BTreeMap::new(),
+            dead: BTreeSet::new(),
+            held_roots: BTreeMap::new(),
+            held_names: BTreeMap::new(),
+            accepted: BTreeMap::new(),
+            root_claims: BTreeMap::new(),
+            name_claims: BTreeMap::new(),
+            done_at: None,
+        };
         let subscriber = Subscriber {
             id: 1,
             deadline_ms: DEADLINE_MS,
@@ -626,7 +640,6 @@ impl World {
             execution,
             checker,
             deaths: 0,
-            trace,
         };
         for i in 0..world.nodes.len() {
             // Every executor heartbeats from its assignment; a cold lead joins only once its
@@ -634,7 +647,8 @@ impl World {
             let at = world.rng.below(2_000);
             let load_ms = if i == 0 { world.profile.lead_load_ms } else { world.rng.below(5_000) };
             world.push(at, Kind::Assign { to: i, attempt: Attempt(1), lead: i == 0, load_ms });
-            world.push(at + 1 + world.rng.below(TICK_MS), Kind::NodeTick { node: i });
+            let tick = at + 1 + world.rng.below(TICK_MS);
+            world.push(tick, Kind::NodeTick { node: i });
         }
         world.push(COORD_TICK_MS, Kind::CoordTick);
         world
@@ -681,7 +695,7 @@ impl World {
         Violation { seed: self.seed, invariant, at: self.now, detail }
     }
 
-    fn run(mut self) -> Result<Summary, Violation> {
+    fn run(mut self, mut trace: Option<&mut Vec<String>>) -> Result<Summary, Violation> {
         let mut events = 0u64;
         while let Some(((at, _), kind)) = self.queue.pop_first() {
             self.now = at;
@@ -691,8 +705,8 @@ impl World {
                     self.violation(("progress", format!("{EVENT_CAP} events without an end")))
                 );
             }
-            if self.trace {
-                eprintln!("{at:>9} {kind:?}");
+            if let Some(trace) = trace.as_mut() {
+                trace.push(format!("{at:>9} {kind:?}"));
             }
             self.event(kind)?;
             if let ExecState::Ended(_) = self.execution.state() {
@@ -1068,10 +1082,10 @@ impl World {
 
 /// Runs the simulation of `seed`.
 pub fn run(seed: u64) -> Result<Summary, Violation> {
-    World::new(seed, false).run()
+    World::new(seed).run(None)
 }
 
-/// Runs the simulation of `seed`, printing every event to stderr.
-pub fn trace(seed: u64) -> Result<Summary, Violation> {
-    World::new(seed, true).run()
+/// Runs the simulation of `seed`, appending every event to the caller's trace.
+pub fn trace(seed: u64, events: &mut Vec<String>) -> Result<Summary, Violation> {
+    World::new(seed).run(Some(events))
 }

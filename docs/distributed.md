@@ -1482,7 +1482,7 @@ starts a thread or reads a clock. D0 drives them in the lead's process, D1 over 
 | Finder retention and `Lost` answers (c3-B2.2); an unknown name a conflict and `Local` (c3-B2 pre-index) | `holder::Holder::plan`, `committed`; `WorkSet::commit_name` |
 | A lead that misses three heartbeats, one reassignment, a dead attempt's calls refused, a second loss `Lost` ("Warm remote jobs") | `jobs::Execution::tick`, `assign`, `worker_events` |
 | One execution per `JobContent`, subscribers' own deadlines and policies, cancellation when the last leaves, a pull request's new push (E3, a-M6) | `jobs::Jobs::submit`, `Execution::unsubscribe`, `tick`, `jobs::local_action` |
-| Capacity and reservations, `Main` first, `Q`, trust matching, rebuild by drain (section 5, E4) | `admission::Admission` |
+| Capacity and reservations, `Main` first, `Q`, platform matching, rebuild by drain (section 5, E4) | `admission::Admission` |
 
 What the crate fixes that this section leaves open, one line each:
 
@@ -1520,7 +1520,7 @@ checker's own clock), of another attempt, or after Done; at Done every root, fou
 terminal, from exactly one accepted result whose item is the lead's front end's, or in the lead's
 tail; an unknown name a conflict or `Local`; Done reached unless the lead was lost twice or no
 lead was left; a correct holder never told it is malformed. The jobs simulation checks capacity,
-`Main` first and first in first out, `Q`, trust matching, attempts, subscribers, stage order and
+`Main` first and first in first out, `Q`, platform matching, attempts, subscribers, stage order and
 that every execution ends. `cargo test -p blaze-dist` runs 10,000 seeds of each and prints the
 seed of a failure with the command that replays it; timings and the mutation check are in the
 unit's report.

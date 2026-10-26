@@ -9,8 +9,7 @@
 //! - **order**: a pull request's job is admitted only while no `Main` job waits on its
 //!   platform, and every job only after the jobs of its class queued before it;
 //! - **queue**: at most `Q` executions wait per platform, and `busy` is answered exactly then;
-//! - **trust**: a `Main` execution runs only on trusted builders, a pull request's only on its
-//!   own executors;
+//! - **placement**: an execution runs on its platform within the executor's reservation;
 //! - **attempts**: an execution is reassigned at most once, a second loss ends it `Lost`, and a
 //!   dead attempt's events are refused;
 //! - **subscribers**: equal content shares one execution while it runs; `TimedOut` only past a
@@ -484,9 +483,10 @@ impl World {
                 let class = Class::of(&namespace).expect("a job's");
                 let queue = self.shadow.entry((platform, class)).or_default();
                 if queue.front() != Some(&id) {
+                    let first = queue.front().copied();
                     return Err(self.violation(
                         "order",
-                        format!("{id:?} admitted before {:?} of its class", queue.front()),
+                        format!("{id:?} admitted before {first:?} of its class"),
                     ));
                 }
                 queue.pop_front();
@@ -503,10 +503,11 @@ impl World {
             JobEvent::Assigned(assigned) => {
                 let executor = self.jobs.admission_view().executor(&assigned.executor).cloned();
                 match executor {
-                    Some(e) if e.namespace == namespace => {}
+                    Some(e)
+                        if self.jobs.admission_view().platform(&e.machine) == Some(platform) => {}
                     other => {
                         return Err(self.violation(
-                            "trust",
+                            "placement",
                             format!("{id:?} of {namespace:?} assigned to {other:?}"),
                         ));
                     }

@@ -9,6 +9,7 @@
 //! `BLAZE_DIST_SEEDS=<n>` changes the number of seeds per invariant set.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::Instant;
 
 use blaze_dist::sim;
 
@@ -52,6 +53,7 @@ fn guarded<T>(
 }
 
 fn work_shard(shard: u64) {
+    let started = Instant::now();
     let mut failures = Vec::new();
     let (mut run, mut done, mut lost_twice, mut no_lead, mut events) = (0, 0, 0, 0, 0);
     let (mut conflicts, mut revocations, mut resets, mut replays, mut dead_leases) =
@@ -76,12 +78,14 @@ fn work_shard(shard: u64) {
     eprintln!(
         "work shard {shard}: {run} seeds, {done} done, {lost_twice} lead lost twice, {no_lead} no lead, \
          {events} events; {conflicts} conflicts, {revocations} revocations, {resets} resets, \
-         {replays} replays, {dead_leases} dead-lease refusals"
+         {replays} replays, {dead_leases} dead-lease refusals; {:.3} seconds",
+        started.elapsed().as_secs_f64(),
     );
     fail("work", run, &failures);
 }
 
 fn jobs_shard(shard: u64) {
+    let started = Instant::now();
     let mut failures = Vec::new();
     let (mut run, mut executions, mut busy, mut joined, mut reassigned) = (0, 0, 0, 0, 0);
     for seed in (0..seeds()).filter(|s| s % JOBS_SHARDS == shard) {
@@ -98,7 +102,8 @@ fn jobs_shard(shard: u64) {
     }
     eprintln!(
         "jobs shard {shard}: {run} seeds, {executions} executions, {busy} busy, {joined} joined, \
-         {reassigned} reassigned"
+         {reassigned} reassigned; {:.3} seconds",
+        started.elapsed().as_secs_f64(),
     );
     fail("jobs", run, &failures);
 }
@@ -159,8 +164,15 @@ fn replay() {
     let Some(seed) = std::env::var("BLAZE_DIST_SEED").ok().and_then(|s| s.parse().ok()) else {
         return;
     };
-    eprintln!("work: {:?}", sim::work::trace(seed));
-    eprintln!("jobs: {:?}", sim::jobs::run(seed));
+    let mut events = Vec::new();
+    let work = sim::work::trace(seed, &mut events);
+    for event in events {
+        eprintln!("{event}");
+    }
+    let jobs = sim::jobs::run(seed);
+    eprintln!("work: {work:?}");
+    eprintln!("jobs: {jobs:?}");
+    assert!(work.is_ok() && jobs.is_ok(), "seed {seed} failed replay");
 }
 
 /// A seed replays exactly: the same run, event for event.
@@ -169,5 +181,8 @@ fn deterministic() {
     for seed in [0, 1, 42, 9_999] {
         assert_eq!(sim::work::run(seed), sim::work::run(seed));
         assert_eq!(sim::jobs::run(seed), sim::jobs::run(seed));
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        assert_eq!(sim::work::trace(seed, &mut first), sim::work::trace(seed, &mut second),);
+        assert_eq!(first, second, "seed {seed} changed its event trace");
     }
 }
