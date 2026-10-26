@@ -38,7 +38,7 @@ use blaze_manifest::{
 };
 use ide_db::base_db::TargetKind;
 use project_model::{CargoWorkspace, DepKind, Package, ProjectWorkspace, ProjectWorkspaceKind};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use serde_json::json;
 
 /// Where below the target directory the scripts are compiled and run.
@@ -58,8 +58,9 @@ pub(crate) struct Asked<'a> {
     /// The triple of the machine the scripts run on, and of the one the build is for.
     pub(crate) host: &'a str,
     pub(crate) target: &'a str,
-    /// The ids of the packages the build has, whose scripts run; `None` for every package.
-    pub(crate) packages: Option<&'a FxHashSet<String>>,
+    /// The packages the build has and whether they are built for the target, rather than
+    /// only for the host; `None` for every package, treated as a target package.
+    pub(crate) packages: Option<&'a FxHashMap<String, bool>>,
 }
 
 /// Whether this process runs the build scripts of what it loads: a whole build's worker.
@@ -98,7 +99,7 @@ pub(crate) struct Own {
     pub(crate) config: Vec<String>,
     pub(crate) host: String,
     pub(crate) target: String,
-    pub(crate) packages: FxHashSet<String>,
+    pub(crate) packages: FxHashMap<String, bool>,
 }
 
 impl Own {
@@ -151,7 +152,11 @@ pub(crate) fn run(
         if !runner.runs(package) {
             continue;
         }
-        let done = runner.script(package).map_err(anyhow::Error::msg)?;
+        let for_host = asked
+            .packages
+            .and_then(|it| it.get(&cargo[package].id.repr))
+            .is_some_and(|for_target| !for_target);
+        let done = runner.script(package, for_host).map_err(anyhow::Error::msg)?;
         let output = &done.output;
         lines.push(
             json!({
@@ -191,12 +196,13 @@ struct Runner<'a> {
     /// `[env]`, as it applies.
     config_env: BTreeMap<String, String>,
     target_cfgs: Vec<String>,
+    host_cfgs: Option<Vec<String>>,
     /// What `rustc -vV` says, which every fingerprint has.
     rustc: String,
     base: PathBuf,
-    done: FxHashMap<Package, Result<std::rc::Rc<Done>, String>>,
+    done: FxHashMap<(Package, bool), Result<std::rc::Rc<Done>, String>>,
     /// The scripts being made, which a dependency cycle reaches again.
-    making: Vec<Package>,
+    making: Vec<(Package, bool)>,
 }
 
 impl<'a> Runner<'a> {
@@ -242,19 +248,25 @@ impl<'a> Runner<'a> {
             .map(str::to_owned)
             .unwrap_or_else(crate::cargo::daemon::version);
         let rustc = compiler_identity(&sysroot, &build);
+        let target_cfgs: Vec<String> = rustc_cfg
+            .iter()
+            .map(|it| match it {
+                cfg::CfgAtom::Flag(name) => name.to_string(),
+                cfg::CfgAtom::KeyValue { key, value } => format!("{key}={:?}", value.as_str()),
+            })
+            .collect();
+        let host_cfgs = match asked.target == asked.host {
+            true => Some(target_cfgs.clone()),
+            false => crate::answers::target_cfg(&sysroot, asked.host, asked.env),
+        };
         Ok(Runner {
             cargo,
             asked,
             sysroot,
             base: target.join(DIR),
             // One a line, as `rustc --print cfg` prints them.
-            target_cfgs: rustc_cfg
-                .iter()
-                .map(|it| match it {
-                    cfg::CfgAtom::Flag(name) => name.to_string(),
-                    cfg::CfgAtom::KeyValue { key, value } => format!("{key}={:?}", value.as_str()),
-                })
-                .collect(),
+            target_cfgs,
+            host_cfgs,
             flags,
             host_flags,
             config_env,
@@ -271,7 +283,7 @@ impl<'a> Runner<'a> {
             .targets
             .iter()
             .any(|&it| self.cargo[it].kind == TargetKind::BuildScript);
-        has && self.asked.packages.is_none_or(|it| it.contains(&self.cargo[package].id.repr))
+        has && self.asked.packages.is_none_or(|it| it.contains_key(&self.cargo[package].id.repr))
     }
 
     /// The variable `name` as the build has it: `[env]`'s where that applies, else the
@@ -287,24 +299,25 @@ impl<'a> Runner<'a> {
     }
 
     /// The script of `package`, made and run where cargo would, or as it was.
-    fn script(&mut self, package: Package) -> Result<std::rc::Rc<Done>, String> {
-        if let Some(done) = self.done.get(&package) {
+    fn script(&mut self, package: Package, for_host: bool) -> Result<std::rc::Rc<Done>, String> {
+        let key = (package, for_host);
+        if let Some(done) = self.done.get(&key) {
             return done.clone();
         }
-        if self.making.contains(&package) {
+        if self.making.contains(&key) {
             return Err(format!(
                 "the build scripts of `{}` depend on each other",
                 self.cargo[package].name
             ));
         }
-        self.making.push(package);
-        let done = self.make(package).map(std::rc::Rc::new);
+        self.making.push(key);
+        let done = self.make(package, for_host).map(std::rc::Rc::new);
         self.making.pop();
-        self.done.insert(package, done.clone());
+        self.done.insert(key, done.clone());
         done
     }
 
-    fn make(&mut self, package: Package) -> Result<Done, String> {
+    fn make(&mut self, package: Package, for_host: bool) -> Result<Done, String> {
         let cargo = self.cargo;
         let data = &cargo[package];
         let descr = format!("{} v{} ({})", data.name, data.version, data.manifest.parent());
@@ -319,7 +332,7 @@ impl<'a> Runner<'a> {
             if !self.runs(dep.pkg) {
                 continue;
             }
-            let ran = self.script(dep.pkg)?;
+            let ran = self.script(dep.pkg, for_host)?;
             dependencies.push(unit::Dependency {
                 name: dep_data.name.clone(),
                 links: ran.links.clone(),
@@ -329,8 +342,9 @@ impl<'a> Runner<'a> {
                 deps.push((format!("run of {}", dep_data.name), ran.fingerprint, ran.made));
             }
         }
-        let lib = self.profile(package, UnitFor::new_normal(), &self.kind());
-        let unit = self.unit(package, &lib, exe, dependencies)?;
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let lib = self.profile(package, unit_for, &self.kind(for_host));
+        let unit = self.unit(package, for_host, &lib, exe, dependencies)?;
         let run_dir = blaze_build_script::run::run_dir(&unit).to_owned();
         let output_file = run_dir.join("output");
         let record = run_dir.join("blaze-run.json");
@@ -339,7 +353,7 @@ impl<'a> Runner<'a> {
         let said = std::fs::read(&output_file).ok().and_then(|it| output::reads(&it).ok());
         let now = Fingerprint {
             rustc: self.rustc.clone(),
-            rustflags: self.flags.clone(),
+            rustflags: unit.rustflags.clone(),
             deps: std::iter::once(("build-script-build".to_owned(), compiled.0))
                 .chain(deps.iter().map(|(name, hash, _)| (name.clone(), *hash)))
                 .collect(),
@@ -418,8 +432,8 @@ impl<'a> Runner<'a> {
     }
 
     /// The kind of the build's own units: the host's, or the target's.
-    fn kind(&self) -> CompileKind {
-        match self.asked.target == self.asked.host {
+    fn kind(&self, for_host: bool) -> CompileKind {
+        match for_host || self.asked.target == self.asked.host {
             true => CompileKind::Host,
             false => CompileKind::Target(self.asked.target.to_owned()),
         }
@@ -448,6 +462,7 @@ impl<'a> Runner<'a> {
     fn unit(
         &self,
         package: Package,
+        for_host: bool,
         lib: &Profile,
         script: PathBuf,
         dependencies: Vec<unit::Dependency>,
@@ -457,21 +472,25 @@ impl<'a> Runner<'a> {
         features.sort();
         let dir_name = self.profiles.get_dir_name().to_owned();
         let target_dir: &Path = self.cargo.target_directory().as_ref();
+        let (target, flags, cfgs) = if for_host {
+            let cfgs = self.host_cfgs.as_ref().ok_or_else(|| {
+                format!(
+                    "blaze has no built-in cfg answer for build-script host `{}`",
+                    self.asked.host
+                )
+            })?;
+            (self.asked.host, &self.host_flags, cfgs)
+        } else {
+            (self.asked.target, &self.flags, &self.target_cfgs)
+        };
         let mut artifacts = target_dir.to_owned();
         let mut runs = self.base.clone();
-        if self.asked.target != self.asked.host {
-            artifacts.push(self.asked.target);
-            runs.push(self.asked.target);
+        if target != self.asked.host {
+            artifacts.push(target);
+            runs.push(target);
         }
         artifacts.push(&dir_name);
-        let key = json!([
-            data.id.repr,
-            features,
-            format!("{lib:?}"),
-            self.flags,
-            self.asked.target,
-            self.rustc
-        ]);
+        let key = json!([data.id.repr, features, format!("{lib:?}"), flags, target, self.rustc]);
         let hash = fresh::hash_bytes(key.to_string().as_bytes());
         let out_dir = runs
             .join(&dir_name)
@@ -511,10 +530,10 @@ impl<'a> Runner<'a> {
                 debuginfo: lib.debuginfo.is_turned_on(),
                 debug_assertions: lib.debug_assertions,
             },
-            target: self.asked.target.to_owned(),
+            target: target.to_owned(),
             host: self.asked.host.to_owned(),
-            target_cfgs: self.target_cfgs.clone(),
-            rustflags: self.flags.clone(),
+            target_cfgs: cfgs.clone(),
+            rustflags: flags.clone(),
             jobs: std::thread::available_parallelism().map_or(1, |it| it.get() as u32),
             script,
             out_dir,
@@ -703,7 +722,7 @@ impl<'a> Runner<'a> {
         let host = self.profile(package, UnitFor::new_host(false), &CompileKind::Host);
         // A library with a script of its own is compiled with what that script said.
         let ran = match self.runs(package) {
-            true => Some(self.script(package)?),
+            true => Some(self.script(package, true)?),
             false => None,
         };
         let described = self.described(package, &name, &root, &host, ran.as_deref())?;

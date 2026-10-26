@@ -219,6 +219,60 @@ impl<'a> Given<'a> {
     }
 }
 
+/// The built-in cfgs of `target`, without running a compiler. Unlike a general query,
+/// this asks for neither version output nor a target specification, so an SDK or version
+/// override does not invalidate the answer. Build dependencies need the host's cfgs even
+/// when their workspace was loaded for another target.
+pub(crate) fn target_cfg(
+    sysroot: &Path,
+    target: &str,
+    env: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let nightly = match env.get("RUSTC_BOOTSTRAP").map(String::as_str) {
+        None => false,
+        Some("1") => true,
+        Some(_) => return None,
+    };
+    let toolchain = Toolchain::of(&sysroot.join("bin/rustc"))?;
+    let target = toolchain.release.targets.get(target)?;
+    let given = Given { opt_level: Some("2"), ..Given::default() };
+    cfgs(target, &given, nightly)
+}
+
+fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {
+    let mut cfgs = target.cfg.clone();
+    if nightly {
+        cfgs.extend(target.nightly_cfg.iter().cloned());
+    }
+    let debug_assertions = given.debug_assertions();
+    if debug_assertions {
+        cfgs.push("debug_assertions".to_owned());
+    }
+    if nightly && given.overflow_checks.unwrap_or(debug_assertions) {
+        cfgs.push("overflow_checks".to_owned());
+    }
+    if nightly && debug_assertions {
+        cfgs.push("ub_checks".to_owned());
+    }
+    let panic = given.panic.unwrap_or(&target.panic);
+    if panic != target.panic && panic != "abort" {
+        return None;
+    }
+    cfgs.push(format!("panic=\"{panic}\""));
+    if given.crate_types.contains(&"proc-macro") {
+        cfgs.push("proc_macro".to_owned());
+    }
+    for cfg in &given.cfgs {
+        if !is_plain_cfg(cfg) {
+            return None;
+        }
+        cfgs.push((*cfg).to_owned());
+    }
+    cfgs.sort();
+    cfgs.dedup();
+    Some(cfgs)
+}
+
 /// The variables rustc reads for a question that ra-jit answers only when unset.
 const UNSET: [&str; 8] = [
     "RUSTC_OVERRIDE_VERSION_STRING",
@@ -344,36 +398,7 @@ pub(super) fn answer(
                 }
             }
             "cfg" => {
-                let mut cfgs: Vec<String> = target.cfg.clone();
-                if nightly {
-                    cfgs.extend(target.nightly_cfg.iter().cloned());
-                }
-                let debug_assertions = given.debug_assertions();
-                if debug_assertions {
-                    cfgs.push("debug_assertions".to_owned());
-                }
-                if nightly && given.overflow_checks.unwrap_or(debug_assertions) {
-                    cfgs.push("overflow_checks".to_owned());
-                }
-                if nightly && debug_assertions {
-                    cfgs.push("ub_checks".to_owned());
-                }
-                let panic = given.panic.unwrap_or(&target.panic);
-                if panic != target.panic && panic != "abort" {
-                    return None;
-                }
-                cfgs.push(format!("panic=\"{panic}\""));
-                if given.crate_types.contains(&"proc-macro") {
-                    cfgs.push("proc_macro".to_owned());
-                }
-                for cfg in &given.cfgs {
-                    if !is_plain_cfg(cfg) {
-                        return None;
-                    }
-                    cfgs.push((*cfg).to_owned());
-                }
-                cfgs.sort();
-                cfgs.dedup();
+                let cfgs = cfgs(target, &given, nightly)?;
                 cfgs.iter().for_each(|it| out += &format!("{it}\n"));
             }
             "target-spec-json" if given.unstable_options && nightly => {

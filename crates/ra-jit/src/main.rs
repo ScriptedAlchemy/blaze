@@ -3023,7 +3023,9 @@ fn workspace_at(
                 config: selection.config.clone(),
                 host: host.first().context("no host to run build scripts on")?.clone(),
                 target: triple.clone(),
-                packages: ids.filter(|it| plan.package(it).is_some()).cloned().collect(),
+                packages: ids
+                    .filter_map(|id| plan.package(id).map(|it| (id.clone(), it.for_target)))
+                    .collect(),
             });
         }
         if let Some(beside) = beside {

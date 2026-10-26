@@ -21,6 +21,8 @@ use sha2::{Digest as _, Sha256};
 
 mod own;
 
+pub(crate) use own::target_cfg;
+
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
     "all-target-specs-json",
