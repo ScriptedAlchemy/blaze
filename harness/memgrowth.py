@@ -36,7 +36,9 @@ makes the same `--pairs` pairs, and records what the worker holds after its last
 are the same state at the start and differ in what the reclaim gave back, so the difference
 between two arms is the reclaim's. `--arms 0,cache,gc,purge,1` reads what each step gives back,
 in the order M1's section 5 asks for. `--runs` (at least 2) interleaves the arms, and the
-medians are printed with the samples.
+medians are printed with the samples. Each arm also says how long each collection of the
+interned types took (the `reclaim-types-us:` lines `RA_JIT_STATS` makes the daemon print): how
+many there were over its runs, their median and their range.
 
 Writes the steps as JSON on stdout's last line. Linux and macOS. The projects are `bench.py`'s,
 fetched as it fetches them, or a directory of this repository with `--local` (for example
@@ -239,6 +241,12 @@ def write_edit(ws, changes, back):
 def logs(daemon):
     """What every worker of the daemon has logged so far."""
     return "".join(open(log, errors="replace").read() for _, log in daemon.workers() if os.path.exists(log))
+
+
+def collections(text):
+    """The time of each collection of the interned types a worker logged, in microseconds, in
+    the order it made them."""
+    return [int(it) for it in re.findall(r"^reclaim-types-us: (\d+)", text, re.M)]
 
 
 def wait_base(daemon, timeout=3600, still=20):
@@ -467,6 +475,7 @@ def one_arm(spec, work, label, reclaim, pairs, every, kinds, build, output):
         arm["next_edit_s"] = round(took, 3)
         arm["next_undo_s"] = round(back_s, 3)
         arm["after_next"] = figure(daemon, reports, pair=pairs, kind="after-next-edit")
+        arm["collections_us"] = collections(logs(daemon))
         print(f"{label}: {checked['builds']} builds and {checked['runs']} runs checked, "
               f"the unedited program exits {first[0]}", flush=True)
         if output["recycle"]:
@@ -516,21 +525,27 @@ def fit(samples, group, field):
 def leak_rule(runs):
     """M1's leak rule, as section 5 proposes it: the source is the same after every pair, so
     what the allocator holds should plateau. It is a leak when the line adds more than 5% of
-    the ready size over 1,000 pairs with r² above 0.8. The holder that grows with it is named
-    from the samples. Unverified: this is a proposal, not a rule anyone has run."""
+    the ready size over 1,000 pairs with r² above 0.8, the ready size being what the first
+    sample of the run holds. A run with a line whose first sample has no figure has nothing to
+    measure the line against: the verdict is unknown (`leak` is `None`, and `unknown` says
+    why), never no leak. The holder that grows with it is named from the samples. Unverified:
+    this is a proposal, not a rule anyone has run."""
     out = {}
     for label, arm in runs.items():
         for field, ready in (("allocated", "allocated"),):
-            lines = [fit(arm_run["samples"], "alloc", field) for arm_run in arm]
-            lines = [it for it in lines if it]
+            lines = [(fit(arm_run["samples"], "alloc", field), arm_run["samples"]) for arm_run in arm]
+            lines = [(line, samples) for line, samples in lines if line]
             if not lines:
                 continue
-            slope = statistics.median(it["slope"] for it in lines)
-            r2 = statistics.median(it["r2"] for it in lines)
-            ready_bytes = [arm_run["samples"][0]["alloc"].get(ready) for arm_run in arm
-                           if arm_run["samples"] and arm_run["samples"][0]["alloc"].get(ready)]
-            ready_bytes = statistics.median(ready_bytes) if ready_bytes else 0
-            over = slope * 1000 / ready_bytes if ready_bytes else 0
+            slope = statistics.median(line["slope"] for line, _ in lines)
+            r2 = statistics.median(line["r2"] for line, _ in lines)
+            ready_bytes = [samples[0].get("alloc", {}).get(ready) for _, samples in lines]
+            if not all(ready_bytes):
+                out[label] = dict(field=field, slope_per_pair=slope, r2=r2, over_1000=None, leak=None,
+                                  unknown=f"the first sample of a run has no `{ready}` to measure "
+                                          "the line against")
+                continue
+            over = slope * 1000 / statistics.median(ready_bytes)
             out[label] = dict(field=field, slope_per_pair=slope, r2=r2, over_1000=round(over, 3),
                               leak=over > 0.05 and r2 > 0.8)
     return out
@@ -580,6 +595,10 @@ def medians(arms):
         for field in ("checkouts", "files hashed", "rustc symbols", "rejections", "patch originals"):
             found = [it["end"]["own"].get(field) for it in runs if it["end"]["own"].get(field) is not None]
             got[f"end_{field.replace(' ', '_')}"] = int(statistics.median(found)) if found else None
+        took = [us for it in runs for us in it.get("collections_us", [])]
+        got["collections"] = len(took)
+        got["collection_us"] = (dict(median=statistics.median(took), min=min(took), max=max(took))
+                                if took else None)
         out[label] = got
     return out
 
@@ -637,12 +656,22 @@ def main():
               f"interned: tys {got['end_Tys']} clauses {got['end_Clauses']} predicates {got['end_PredicateInterned']}  "
               f"own: files hashed {got['end_files_hashed']} rustc symbols {got['end_rustc_symbols']} "
               f"rejections {got['end_rejections']} patch originals {got['end_patch_originals']}", flush=True)
+        took = got["collection_us"]
+        if took:
+            print(f"    type collections: {got['collections']} over the runs, median {took['median']} us "
+                  f"(range {took['min']} to {took['max']} us)", flush=True)
+        else:
+            print("    type collections: none", flush=True)
         if label in leaks:
             rule = leaks[label]
-            verdict = "LEAK by the rule" if rule["leak"] else "no leak by the rule"
-            print(f"    M1: allocated grows {rule['slope_per_pair']} bytes a pair, "
-                  f"{rule['over_1000']:.1%} of the first over 1,000, r² {rule['r2']}: {verdict} "
-                  f"(the rule is a proposal, unverified)", flush=True)
+            if rule["leak"] is None:
+                print(f"    M1: allocated grows {rule['slope_per_pair']} bytes a pair, r² {rule['r2']}: "
+                      f"unknown, {rule['unknown']}", flush=True)
+            else:
+                verdict = "LEAK by the rule" if rule["leak"] else "no leak by the rule"
+                print(f"    M1: allocated grows {rule['slope_per_pair']} bytes a pair, "
+                      f"{rule['over_1000']:.1%} of the first over 1,000, r² {rule['r2']}: {verdict} "
+                      f"(the rule is a proposal, unverified)", flush=True)
         else:
             fewest = min(len(it["samples"]) for it in arms_of[label])
             if fewest < 3:

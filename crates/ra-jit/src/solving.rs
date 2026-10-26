@@ -171,7 +171,9 @@ pub(crate) fn collect_types(db: &mut RootDatabase) -> Result<(), Busy> {
     // dropped, so no query of it is under way and none of its results is held.
     let write = |db: &mut RootDatabase| db.synthetic_write(Durability::LOW);
     collect_in(db, &SCOPES, clear_caller_and_pool, write, || {
-        // SAFETY: `collect_ty_garbage` needs no type value that is not yet recorded anywhere
+        let interned = || hir::interned_counts().iter().map(|it| it.1).sum::<usize>();
+        let (start, before) = (std::time::Instant::now(), interned());
+        // SAFETY:`collect_ty_garbage` needs no type value that is not yet recorded anywhere
         // the collection looks, no other handle of the database, and the database held
         // mutably from before it begins until it ends. In turn:
         //  - `collect_in` has `db` as `&mut`, held for the whole call, so no other thread can
@@ -188,6 +190,11 @@ pub(crate) fn collect_types(db: &mut RootDatabase) -> Result<(), Busy> {
         //    wherever they are held (a drop of one on another thread only lowers its count),
         //    or in a local of a build that ended with the thread of the `Handle` it ran on.
         unsafe { hir::collect_ty_garbage() }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            // What `harness/memgrowth.py` reads the time of a collection from.
+            let (took, after) = (start.elapsed().as_micros(), interned());
+            eprintln!("reclaim-types-us: {took} ({before} interned values before, {after} after)");
+        }
     })
 }
 

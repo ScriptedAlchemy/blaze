@@ -39,6 +39,12 @@ def sample(pair, allocated=None):
 
 OK = SimpleNamespace(returncode=0, stderr="")
 
+# What a worker logs of two collections of the interned types, among its other lines.
+LOGGED = ("edit-to-binary: 12\n"
+          "reclaim-types-us: 840 (20000 interned values before, 17000 after)\n"
+          "check-us: 3\n"
+          "reclaim-types-us: 610 (17100 interned values before, 17000 after)\n")
+
 
 class Arm(unittest.TestCase):
     """`one_arm` with the daemon, the builds and the program replaced. `steps` is the list of
@@ -60,6 +66,7 @@ class Arm(unittest.TestCase):
                 "holders": [], "pages": {}, "alloc": {}, "interned": {}, "own": {}}),
             mock.patch.object(m, "edit", self.edit),
             mock.patch.object(m, "run_program", self.run_program),
+            mock.patch.object(m, "logs", lambda daemon: LOGGED),
         ]
         for patch in patches:
             patch.start()
@@ -95,6 +102,9 @@ class Arm(unittest.TestCase):
         # The unedited program, then one run after each of the four builds.
         self.assertEqual(self.runs, [0, 1, 2, 3, 4])
         self.assertEqual(got["checked"], {"builds": 4, "runs": 4})
+
+    def test_an_arm_records_the_time_of_each_collection_its_worker_logged(self):
+        self.assertEqual(self.arm()["collections_us"], [840, 610])
 
     def test_the_final_undoing_is_checked_for_its_build_failing(self):
         self.build_script[3] = (1, "daemon")
@@ -175,6 +185,22 @@ class Line(unittest.TestCase):
         rule = m.leak_rule({"arm": [{"samples": samples}]})
         self.assertFalse(rule["arm"]["leak"])
 
+    def test_a_line_with_no_first_figure_to_measure_it_against_is_unknown_not_no_leak(self):
+        # The first sample has no allocator figure and the three after it make a line: there
+        # is nothing to say what share of the ready size it adds.
+        samples = [sample(1)] + [sample(n, n * 1000) for n in (2, 3, 4)]
+        rule = m.leak_rule({"arm": [{"samples": samples}]})["arm"]
+        self.assertEqual((rule["slope_per_pair"], rule["r2"]), (1000.0, 1.0))
+        self.assertIsNone(rule["leak"])
+        self.assertIsNone(rule["over_1000"])
+        self.assertIn("first sample", rule["unknown"])
+
+    def test_one_run_with_no_first_figure_makes_the_arm_unknown(self):
+        known = [sample(n, 50_000_000) for n in (1, 2, 3, 4)]
+        missing = [sample(1)] + [sample(n, 50_000_000 + n * 100000) for n in (2, 3, 4)]
+        rule = m.leak_rule({"arm": [{"samples": known}, {"samples": missing}]})["arm"]
+        self.assertIsNone(rule["leak"])
+
     def test_fewer_than_three_samples_or_no_figures_make_none(self):
         self.assertIsNone(m.fit([sample(1, 1), sample(2, 2)], "alloc", "allocated"))
         self.assertIsNone(m.fit([sample(n) for n in (1, 2, 3, 4)], "alloc", "allocated"))
@@ -191,6 +217,22 @@ class Medians(unittest.TestCase):
         self.assertEqual(got["end_retained"], 0)
         self.assertEqual(got["end_VmRSS"], 0)
         self.assertEqual(got["end_allocated"], 10)
+
+    def test_the_collections_of_every_run_are_put_together(self):
+        end = {"pages": {}, "alloc": {}, "interned": {}, "own": {}}
+        runs = [{"reclaim": "1", "end": end, "collections_us": [840, 610]},
+                {"reclaim": "1", "end": end, "collections_us": [700]}]
+        got = m.medians({"arm": runs})["arm"]
+        self.assertEqual(got["collections"], 3)
+        self.assertEqual(got["collection_us"], {"median": 700, "min": 610, "max": 840})
+        none = m.medians({"arm": [{"reclaim": "0", "end": end, "collections_us": []}] * 2})["arm"]
+        self.assertEqual((none["collections"], none["collection_us"]), (0, None))
+
+
+class Collections(unittest.TestCase):
+    def test_only_the_lines_of_a_collection_are_read(self):
+        self.assertEqual(m.collections(LOGGED), [840, 610])
+        self.assertEqual(m.collections("tests-reach-us: 5\n"), [])
 
 
 if __name__ == "__main__":
