@@ -963,6 +963,13 @@ fn trait_counterpart(db: &dyn HirDatabase, id: ItemId) -> Option<ItemId> {
 /// The digest of a function's code and what it refers to, `None` when it can't all be written.
 pub type Code = Option<(form::Hash, Box<[ItemId]>)>;
 
+/// The [`Code`] of a function's code form: its digest with the places of its code.
+fn written_code(code: form::Sub) -> Code {
+    let digest =
+        *blake3::Hasher::new().update(&code.digest).update(&code.spans).finalize().as_bytes();
+    code.missed.is_none().then(|| (digest, code.refs.into()))
+}
+
 /// [`Code`] of each of `ids`, on the threads `fan` has; `None` of one `live` doesn't have.
 pub fn codes_of(
     db: &dyn HirDatabase,
@@ -982,8 +989,7 @@ pub fn codes_of(
                     if live.is_some_and(|it| !it.has(db, ItemId::Function(func))) {
                         return None;
                     }
-                    let code = cx.code(func.into());
-                    code.missed.is_none().then(|| (code.digest, code.refs.into()))
+                    written_code(cx.code(func.into()))
                 })
                 .collect()
         });
@@ -1039,7 +1045,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
             erred = (missed.is_none() || erred) && code.erred;
             missed = missed.or(code.missed);
         }
-        whole_code = code.missed.is_none().then(|| (code.digest, code.refs.into()));
+        whole_code = written_code(code);
     }
     let missed = missed.filter(|_| !erred);
     let mut unique = FxHashSet::default();
