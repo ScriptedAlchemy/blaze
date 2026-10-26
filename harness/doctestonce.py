@@ -5,6 +5,7 @@ cargo's do, one library after another, each example reading where it runs and th
 as it does under rustdoc.
 
     RA_JIT_BIN=../target/release/ra-jit python3 doctestonce.py
+    python3 -I harness/doctestonce.py --selftest  # from the repository root
 
 The steps: every example passes; an example of the first two libraries fails, and cargo stops
 after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`. In each, the exit status, the results of
@@ -18,9 +19,11 @@ import subprocess
 import sys
 import tempfile
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+# The documented isolated invocation does not add the script's directory to sys.path.
+sys.path.insert(0, HERE)
 from buildmodel import doctest_report
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 RA_JIT = os.path.abspath(os.environ.get("RA_JIT_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
 
 # An exit status, not a panic: where a panic in an example is said is not this step's to check.
@@ -84,6 +87,61 @@ def first_difference(want, got):
     return f"cargo's {want!r}, ra-jit's {got!r}"
 
 
+def differences(want, got, said):
+    """Compare the result and require evidence that blaze compiled every example run."""
+    loads = len(re.findall(r"(?m)^load workspace: ", said))
+    left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
+    built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
+    parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
+    differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
+    if loads != 1:
+        differs.append(f"the workspace was loaded {loads} times")
+    if left:
+        differs.append(f"not ra-jit's: {left[0][:80]} ... {left[0][-160:]}")
+    # The fixture has no ignored or compile-fail examples: every test cargo reports
+    # must have a compiled blaze example, including examples whose program fails.
+    expected = sum(1 for library in want[1] for line in library
+                   if line.startswith("test ") and not line.startswith("test result"))
+    if expected == 0:
+        differs.append("cargo ran no doctest")
+    if built != expected:
+        differs.append(f"ra-jit built {built} examples, cargo ran {expected}")
+    return differs, loads, built
+
+
+def selftest():
+    import unittest
+
+    class Provenance(unittest.TestCase):
+        def result(self, count, status=0):
+            return (status, [[f"test example_{n} ... ok" for n in range(count)]], ["alpha"], [])
+
+        def test_every_example_has_compiler_evidence(self):
+            for count, status in [(6, 0), (3, 101), (6, 101)]:
+                result = self.result(count, status)
+                said = f"load workspace: once\ndoctests: {count} built by ra-jit\n"
+                self.assertEqual(differences(result, result, said)[0], [])
+
+        def test_matching_results_without_compiler_evidence_fail(self):
+            result = self.result(6)
+            for count in [0, 3, 7]:
+                said = f"load workspace: once\ndoctests: {count} built by ra-jit\n"
+                self.assertTrue(differences(result, result, said)[0])
+            self.assertTrue(differences(result, result, "load workspace: once\n")[0])
+
+        def test_empty_reference_is_not_a_pass(self):
+            result = self.result(0)
+            self.assertTrue(differences(result, result, "load workspace: once\n")[0])
+
+        def test_counts_from_all_libraries_are_combined(self):
+            result = self.result(6)
+            said = "load workspace: once\ndoctests: 3 built by ra-jit\ndoctests: 3 built by ra-jit\n"
+            self.assertEqual(differences(result, result, said)[0], [])
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(Provenance))
+    return 0 if result.wasSuccessful() else 1
+
+
 def main():
     wrong = 0
     with tempfile.TemporaryDirectory(prefix="ra-jit-doctestonce-") as scratch:
@@ -94,17 +152,7 @@ def main():
         for name, args, extra in STEPS:
             want, _ = tested(ws, [], args, extra, os.path.join(scratch, "cargo"))
             got, said = tested(ws, ["ra-jit"], args, extra, os.path.join(scratch, "ra-jit"))
-            loads = len(re.findall(r"(?m)^load workspace: ", said))
-            left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
-            built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
-            parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
-            differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
-            if loads != 1:
-                differs.append(f"the workspace was loaded {loads} times")
-            if left:
-                differs.append(f"not ra-jit's: {left[0][:80]} ... {left[0][-160:]}")
-            if not want[1]:
-                differs.append("cargo ran no doctest")
+            differs, loads, built = differences(want, got, said)
             verdict = "WRONG" if differs else "same"
             wrong += bool(differs)
             print(f"  {name:32} exit {got[0]:3}  {len(got[1])} libraries, {built} examples built by ra-jit, "
@@ -118,4 +166,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--selftest"]:
+        sys.exit(selftest())
     main()
