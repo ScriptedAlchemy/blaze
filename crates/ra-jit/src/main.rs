@@ -6412,10 +6412,53 @@ impl Drop for Tiering {
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
+///
+/// Then, once nothing runs, it reclaims what nothing will read again (see [`reclaim`]): the
+/// types, arguments and clauses interned for the builds that are over, the trait solver's
+/// cache on every thread, and the pages of what was freed.
 fn let_go(db: &mut RootDatabase, builds: &Builds) {
     use ide_db::base_db::salsa::Database;
     if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 {
         db.trigger_lru_eviction();
+        reclaim(db);
+    }
+}
+
+/// Gives an idle worker back what a build made and nothing will read again, as
+/// `docs/research/memory.md`'s item 1 says: the types interned for it, the trait solver's
+/// cache, and the pages the allocator kept. `RA_JIT_RECLAIM` turns it off, or names the steps.
+fn reclaim(db: &mut RootDatabase) {
+    use ide_db::base_db::salsa::Database;
+    let reclaim = memory::Reclaim::of_env();
+    if !reclaim.any() {
+        return;
+    }
+    // The solver caches go first, and on every thread before the collection: a cache entry
+    // holds its goals by an `InternedRef`, which does not count as a use of the interned value
+    // (unlike an `Interned`), so a cache left behind while the collection runs would point at
+    // what the collection frees. rust-analyzer's `analysis_stats` clears them before the same
+    // call for this reason. Every thread of the pool is cleared here, and this one with them.
+    if reclaim.solver_caches {
+        rayon::broadcast(|_| hir::clear_tls_solver_cache());
+        hir::clear_tls_solver_cache();
+    }
+    if reclaim.types {
+        // A revision of its own, as rust-analyzer's `AnalysisHost::trigger_garbage_collection`
+        // makes: the write cancels every other handle of the database and waits for each to be
+        // dropped, so no query of it is under way and none of its results is held.
+        db.synthetic_write(ide_db::base_db::salsa::Durability::LOW);
+        // SAFETY: The write above drained every other handle of the database: `zalsa_mut`
+        // waits for each to be dropped, and `db`, the only one, is held mutably here for the
+        // length of the call. Every thread that solved has had its cache cleared, and the
+        // daemon's builds run in threads that are over (`builds.running` is empty and no tier
+        // compile runs). What a build made of types is otherwise in salsa values, which the
+        // collection reaches from the memos it keeps, or in a local of a build, which is gone.
+        // What the daemon holds outside the database was checked and holds none: see the list
+        // in this change's pull request.
+        unsafe { hir::collect_ty_garbage() };
+    }
+    if reclaim.pages {
+        memory::give_back();
     }
 }
 

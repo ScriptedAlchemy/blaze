@@ -154,6 +154,46 @@ pub(crate) struct Allocator {
     pub(crate) retained: u64,
 }
 
+/// What an idle daemon gives back, from `RA_JIT_RECLAIM`: `0` or `off` for nothing, `1` or
+/// `on` for everything, or any of `gc`, `cache` and `purge`, separated by commas, for those
+/// steps alone. Everything is the default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reclaim {
+    /// `hir::collect_ty_garbage()`: the types, arguments and clauses interned for builds
+    /// that are over.
+    pub(crate) types: bool,
+    /// The trait solver's cache on every thread.
+    pub(crate) solver_caches: bool,
+    /// `give_back()`: the pages of what was freed.
+    pub(crate) pages: bool,
+}
+
+impl Reclaim {
+    /// What `RA_JIT_RECLAIM` says: everything unless it says otherwise, and `0` or `off` for
+    /// nothing. Any of `gc`, `cache` and `purge`, separated by commas, asks for those steps
+    /// alone, which `harness/memgrowth.py`'s M4 runs one at a time to read what each gives back.
+    pub(crate) fn of_env() -> Reclaim {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        let Ok(text) = std::env::var("RA_JIT_RECLAIM") else { return all };
+        match text.trim() {
+            "" | "1" | "on" | "all" => all,
+            "0" | "off" | "none" => Reclaim { types: false, solver_caches: false, pages: false },
+            steps => {
+                let named = |it: &str| steps.split(',').any(|step| step.trim() == it);
+                Reclaim {
+                    types: named("gc") || named("types"),
+                    solver_caches: named("cache") || named("caches") || named("solver"),
+                    pages: named("purge") || named("pages"),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.types || self.solver_caches || self.pages
+    }
+}
+
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
 pub(crate) fn give_back() {
