@@ -586,6 +586,11 @@ the scripts are in that directory, not in the tree:
     cd harness; RA_JIT_BIN=.../u7/release/ra-jit python3 difftest.py corpus --bin runner --crate cases --layouts
     python3 stress.py; python3 storebuilds.py; python3 storetracked.py; python3 wholeprogram.py; python3 aheadready.py
 
+Since the runs the owner moved `/Users/bytedance/dev` to `/Users/bytedance/code`. The scripts, the
+logs and the heap profiles of these runs are now in `/Users/bytedance/code/blaze-targets/u7-work`,
+and the two binaries in `.../u7/release` (this branch) and `.../u7-before/release` (`dist/main`);
+`td-u7` was removed once the runs were done.
+
 ## Deviations
 
 - **The guard was exceeded.** The watchdog of the second run sorted the daemon and the worker
