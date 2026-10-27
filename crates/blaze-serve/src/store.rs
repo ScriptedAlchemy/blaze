@@ -22,7 +22,10 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock},
+    sync::{
+        Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -399,11 +402,11 @@ impl Store {
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
                 let temporary = name.strip_suffix(".tmp").is_some_and(|name| {
                     name.rsplit_once('.').is_some_and(|(_, stamp)| {
-                        stamp.split_once('-').is_some_and(|(pid, nanos)| {
-                            !pid.is_empty()
-                                && !nanos.is_empty()
-                                && pid.bytes().chain(nanos.bytes()).all(|it| it.is_ascii_digit())
-                        })
+                        let parts: Vec<_> = stamp.split('-').collect();
+                        matches!(parts.len(), 2 | 3)
+                            && parts.iter().all(|it| {
+                                !it.is_empty() && it.bytes().all(|byte| byte.is_ascii_digit())
+                            })
                     })
                 });
                 if !temporary {
@@ -541,9 +544,11 @@ fn wrong(name: &str, got: &str, want: &str) -> Error {
 
 /// A dot-prefixed temporary name, excluded from every kind of object in the layout.
 pub(crate) fn temporary(to: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |it| it.as_nanos());
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-    to.with_file_name(format!(".{name}.{}-{nanos}.tmp", std::process::id()))
+    to.with_file_name(format!(".{name}.{}-{nanos}-{sequence}.tmp", std::process::id()))
 }
 
 #[cfg(test)]

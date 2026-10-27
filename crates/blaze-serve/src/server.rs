@@ -431,8 +431,9 @@ impl Server {
                 Ok(answer)
             }
             Method::PUT => {
-                let condition = preconditions::parse(headers)?;
+                let condition = preconditions::parse(headers);
                 let bytes = self.read_whole(headers, body).await?;
+                let condition = condition?;
                 let expect = match &condition {
                     Condition::Any => Expect::Any,
                     Condition::None => Expect::Absent,
