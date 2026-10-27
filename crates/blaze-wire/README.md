@@ -42,7 +42,7 @@ Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 
 ## Digests and signatures
 
-A digest is `sha256("blaze/" ‖ name ‖ "/v3" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
+A digest is `sha256("blaze/" ‖ name ‖ "/v4" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
 the type's name; a signature is Ed25519 over the same bytes with `sig/` in front of the name. The
 domain separation means a `WorkKey`'s and a `JobContentInput`'s bytes never collide even when their
 encodings do, and a signature can never be replayed as a digest or as another type's. [`digest_input`]
@@ -73,9 +73,9 @@ byte strings as lowercase hex, sets as arrays, and an enum as the wire's two-ele
 (`[discriminant, payload]`, `Namespace::Main` as `[0,null]`). It is never the wire and nothing's
 identity is taken from it.
 
-## Schema version 3
+## Schema version 4
 
-Version 3 retains required `BuildSpec.workspace_manifest` (field 12), a logical path
+Version 4 retains required `BuildSpec.workspace_manifest` (field 12), a logical path
 relative to the declared source root, and carries it in FrontEndKeyInput (5) and
 ConfigKeyInput (6). `cwd` remains relative to that workspace's directory. These
 are not absolute checkout paths or replacements for the source Git tree.
@@ -89,13 +89,20 @@ Field 7's config values are now `[0, literal_text]` or `[1, workspace_relative_p
 The old untagged config string encoding is invalid in schemas 2 and 3. The serialized tag determines
 whether a worker keeps the literal or joins the selected workspace path.
 
-This crate speaks schema 3 only. Prior versions require a separately pinned codec at
+Config values additionally support `[2, native_bytes]` and script env values use
+the same tags. NUL-free native bytes preserve raw Unix values without replacement.
+Literal values and individual rustflags/cfg values are InputText: unchanged CBOR
+text, bounded by Limits.request rather than the 4 KiB identifier limit.
+The raw-byte variant and tagged script-env representation require schema 4;
+text budget changes alone do not change encoding.
+
+This crate speaks schema 4 only. Prior versions require a separately pinned codec at
 the transport negotiation boundary; this implementation does not advertise it or
-silently assign their records version-3 identity. Unchanged structural types may
+silently assign their records version-4 identity. Unchanged structural types may
 decode older bytes; version negotiation and typed domains must gate their identity.
-Every typed digest/signature domain is now `/v3`; golden vectors were regenerated. `/v1` HTTP routes and the
+Every typed digest/signature domain is now `/v4`; golden vectors were regenerated. `/v1` HTTP routes and the
 `blaze/req/v1` request-authentication framing are transport contracts, unchanged.
-No prior-version typed digest identity can be reused as a version-3 typed digest.
+No prior-version typed digest identity can be reused as a version-4 typed digest.
 
 ## Limits
 

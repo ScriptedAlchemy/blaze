@@ -457,7 +457,7 @@ fn a_digest_renders_as_its_hex() {
 
 #[test]
 fn the_version_is_one() {
-    assert_eq!(blaze_wire::VERSION, 3);
+    assert_eq!(blaze_wire::VERSION, 4);
     // `HelloRequest` carries the versions a client speaks; a server that speaks this one answers
     // it.
     let request = HelloRequest {

@@ -363,7 +363,7 @@ fn a_batch_keeps_the_batch_limit_not_the_lookup_limit() {
 #[test]
 fn digest_input_matches_documented_formula() {
     let v = Attempt(24);
-    let mut expected = b"blaze/Attempt/v3\0".to_vec();
+    let mut expected = b"blaze/Attempt/v4\0".to_vec();
     expected.extend(encode(&v));
     assert_eq!(digest_of(&v), <[u8; 32]>::from(Sha256::digest(&expected)));
     assert_eq!(digest_input(&v), expected, "public digest_input must return actual hash preimage");
@@ -391,7 +391,7 @@ fn every_digest_input_is_the_encoding_the_golden_digest_uses() {
     assert!(!input.is_empty(), "digest_input returned no bytes");
     assert_eq!(<[u8; 32]>::from(Sha256::digest(&input)), digest_of(&v));
     // It is exactly the bytes the golden digest is taken over for the same value.
-    let mut expected = b"blaze/Attempt/v3\0".to_vec();
+    let mut expected = b"blaze/Attempt/v4\0".to_vec();
     expected.extend(encode(&v));
     assert_eq!(input, expected);
     assert_eq!(<[u8; 32]>::from(Sha256::digest(&expected)), digest_of(&v));
@@ -424,14 +424,14 @@ fn new_into_really_appends_to_caller_output() {
 #[test]
 fn all_domains_are_unique_and_prefix_free() {
     let entries = every();
-    assert_eq!(entries.len(), 100);
+    assert_eq!(entries.len(), 102);
     let mut names = BTreeSet::new();
     let mut domains = vec![];
     for e in entries {
         assert!(names.insert(e.name));
         assert!(!e.name.contains('\0'));
-        domains.push(format!("blaze/{}/v3\0", e.name).into_bytes());
-        domains.push(format!("blaze/sig/{}/v3\0", e.name).into_bytes());
+        domains.push(format!("blaze/{}/v4\0", e.name).into_bytes());
+        domains.push(format!("blaze/sig/{}/v4\0", e.name).into_bytes());
     }
     domains.push(b"blaze/req/v1\0".to_vec());
     for (i, a) in domains.iter().enumerate() {
@@ -448,7 +448,7 @@ fn generic_signature_covers_documented_domain_cbor_not_digest() {
     let k = SigningKey::from_bytes(&[7; 32]);
     let v = Attempt(24);
     let sig = sign(&k, &v);
-    let mut input = b"blaze/sig/Attempt/v3\0".to_vec();
+    let mut input = b"blaze/sig/Attempt/v4\0".to_vec();
     input.extend(encode(&v));
     assert_eq!(signature_input(&v), input);
     assert_eq!(sig, k.sign(&input).to_bytes());
@@ -498,7 +498,7 @@ fn record_signs_only_fields_0_to_5() {
 fn record_signature_uses_documented_domain_separation() {
     let r = record();
     let k = SigningKey::from_bytes(&[7; 32]);
-    let mut preimage = b"blaze/sig/CrateRecord/v3\0".to_vec();
+    let mut preimage = b"blaze/sig/CrateRecord/v4\0".to_vec();
     preimage.extend(record_fields_0_to_5(&r));
     let sig = k.sign(&preimage).to_bytes();
     assert!(r.signature_is(&k.verifying_key(), &sig), "valid documented signature rejected");

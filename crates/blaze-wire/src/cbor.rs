@@ -489,6 +489,13 @@ impl<'a> Reader<'a> {
         self.text_with_limit(u64::from(self.limits.request))
     }
 
+    /// Environment native bytes are bounded by message size, not the large blob limit.
+    pub fn input_bytes(&mut self) -> Result<&'a [u8], Error> {
+        self.scalar()?;
+        let len = self.length(2, "input bytes", u64::from(self.limits.request))?;
+        self.take(len)
+    }
+
     fn text_with_limit(&mut self, limit: u64) -> Result<&'a str, Error> {
         self.scalar()?;
         let at = self.pos;
