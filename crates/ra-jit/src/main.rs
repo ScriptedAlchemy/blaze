@@ -3701,6 +3701,25 @@ fn current_input_paths(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<
     paths
 }
 
+/// The common path reads tracked observations only. Current-owner discovery is
+/// needed to disambiguate live from obsolete reads only when something is missing.
+fn missing_required_input(
+    observations: Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)>,
+    current: impl FnOnce() -> Vec<AbsPathBuf>,
+) -> Option<AbsPathBuf> {
+    let missing: Vec<_> =
+        observations.into_iter().filter_map(|(path, bytes)| bytes.is_none().then_some(path)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let required = current();
+    missing.into_iter().find(|path| required.contains(path))
+}
+
+fn missing_input_of(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Option<AbsPathBuf> {
+    missing_required_input(db.included_by(krate), || current_input_paths(db, krate))
+}
+
 fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
     let start = Instant::now();
     // The first thing asked of a crate after an edit: name resolution is redone here.
@@ -9833,12 +9852,7 @@ impl Program {
                 let mut closure = ide_db::base_db::Crate::from(krate).transitive_deps(db);
                 closure.push(krate.into());
                 for dependency in closure {
-                    let required = current_input_paths(db, dependency);
-                    if let Some((path, _)) = db
-                        .included_by(dependency)
-                        .into_iter()
-                        .find(|(path, bytes)| bytes.is_none() && required.contains(path))
-                    {
+                    if let Some(path) = missing_input_of(db, dependency) {
                         let said =
                             errors::of_none(&format!("could not read included input `{path}`"));
                         return Ok(Err(Refused::Error(errors::Said::one(said))));
@@ -10399,3 +10413,19 @@ fn main() {}
         assert_eq!(*lock(&held), 2);
     }
 }
+    #[test]
+    fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate() {
+        let path = AbsPathBuf::assert_utf8(PathBuf::from("/fixture/payload.bin"));
+        let calls = std::cell::Cell::new(0);
+        let discover = || {
+            calls.set(calls.get() + 1);
+            vec![path.clone()]
+        };
+        assert_eq!(missing_required_input(vec![], discover), None);
+        assert_eq!(missing_required_input(vec![(path.clone(), Some(vec![1].into()))], discover), None);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(missing_required_input(vec![(path.clone(), None)], discover), Some(path.clone()));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
+    }
+
