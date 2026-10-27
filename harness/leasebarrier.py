@@ -1407,8 +1407,10 @@ def same_build(sc, source_sha, fails):
                           within=LOST)
         sc.notes["a2"] = (rc2, said2[-400:])
         if fails:
-            if rc2 == 0 or said2 != said1:
-                sc.fail(f"A's join was to fail with the same message: {rc2} {said2[-300:]!r}, first {said1[-300:]!r}")
+            # S is independent of R: A's join is judged on S's own script (which fails for A's variables
+            # too) and says S; the failure of R is A's for good and is said again for R (the third).
+            if rc2 == 0 or "/s)" not in said2:
+                sc.fail(f"A's join was to fail with S's message: {rc2} {said2[-300:]!r}, first {said1[-300:]!r}")
         elif rc2 != 0:
             sc.fail(f"A's request that joins S exited {rc2}: {said2[-500:]}")
         # And once more, the same request as the first.
@@ -1635,7 +1637,7 @@ def first_join(sc, source_sha, shared):
     Independent (`shared` false): S, another package with a script of its own that R does not
     consume: S is built, the way cargo builds it, and R's script is not run for `b`.
     Shared (`shared`): V, a checkout of R's repository with the same scripts: it reads R's, so R's
-    script IS judged for `b` (here it fails, as cargo's would), and the trail says so."""
+    script IS judged for `b` (once, the trail says so) and V is built from it, as cargo builds it."""
     once = os.path.join(sc.dir, "once")
     os.makedirs(once)
     extra = shared_projects(sc, worktrees=shared)
@@ -1648,7 +1650,7 @@ def first_join(sc, source_sha, shared):
     else:
         extra["FAIL_PKG_VALUE"] = "gena:b"
         target, crate, pkg = sc.s, "genb_one", "genb"
-    oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"}, pkg=pkg) if not shared else None
+    oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"}, pkg=pkg)
     worker, sock, env = by_hand(sc, dict(extra, ONCE_TAG="load"), gen_="a", crate="gen_one" if shared else "gena_one")
     try:
         if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
@@ -1667,11 +1669,21 @@ def first_join(sc, source_sha, shared):
         log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
         sc.notes["failed-lines"] = [l[:200] for l in log.splitlines() if "failed:" in l and "build script" in l]
         if shared:
-            # V reads R's scripts: R is judged for `b` (and fails, as the same script does under cargo).
+            # V reads R's scripts: R is judged for `b`, once, and V is built from it.
             if after[len(before):] != ["b B"]:
                 sc.fail(f"V shares R's scripts: R's script was to run once for b: its trail is {after[len(before):]}")
-            if rc == 0:
-                sc.fail("V reads R's script, which fails for b: the request was to fail")
+            if rc != 0:
+                sc.fail(f"V was not built (rc {rc}): {said[-300:]}")
+            else:
+                got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+                want = oracle["gen-one"]
+                sc.notes.setdefault("programs", {})["V"] = got
+                strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+                if strip(got) != strip(want):
+                    sc.fail(f"V printed {got!r}, cargo's {want!r}")
+                elif got != want:
+                    sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+            sc.notes["retire"] = retire(sc, sock, "3001")
             return
         if rc != 0:
             sc.fail(f"S (independent of R) was not built (rc {rc}): {said[-300:]}")
