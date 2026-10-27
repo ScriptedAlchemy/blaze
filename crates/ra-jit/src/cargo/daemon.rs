@@ -1916,9 +1916,30 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
         };
         assert!(!stop.blocks(42, &request_key(&checkout), 1, checkout.written_since(stop.at)));
+        // Exercise warm's source invalidation, not only the blocks predicate. No real
+        // compiler is launched: this checkout deliberately has no program, so passing
+        // the tombstone reaches the normal request-validation error.
+        lock(&daemon.pressure_stops).insert((id.clone(), checkout.key.clone()), stop);
+        let retry = daemon.warm(checkout.clone()).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty());
         let mut config = checkout.config.clone();
         config.env.insert("RA_JIT_WORKER_MEMORY".into(), "off".into());
         assert_ne!(config.id(), id);
+        lock(&daemon.pressure_stops).insert(
+            (id.clone(), checkout.key.clone()),
+            PressureStop {
+                generation: 42,
+                request: request_key(&checkout),
+                most: 1,
+                at: SystemTime::now(),
+            },
+        );
+        let mut changed = checkout.clone();
+        changed.config = config;
+        let retry = daemon.warm(changed).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert_eq!(lock(&daemon.pressure_stops).len(), 1, "other identity's tombstone stays");
         assert!(!pressure_persisted(&mut since, Some(Normal), now + grace * 4, grace));
         assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 5, grace));
         assert!(!pressure_persisted(

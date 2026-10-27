@@ -782,5 +782,25 @@ mod tests {
         assert!(controller.state.lock().unwrap().queue.is_empty());
         SIGNAL.store(0, Relaxed);
         until(&|| host_pressure() == Some(Pressure::Normal));
+        let completed = controller.state.lock().unwrap().completed;
+        let parent = enter().unwrap();
+        let context = job_context();
+        let helper = std::thread::spawn(move || {
+            std::panic::catch_unwind(|| {
+                context.run(|| {
+                    let _nested = enter().unwrap();
+                    panic!("dependent work unwinds");
+                })
+            })
+            .is_err()
+        });
+        assert!(helper.join().unwrap());
+        drop(parent);
+        assert_eq!(controller.state.lock().unwrap().active, 0);
+        assert_eq!(
+            controller.state.lock().unwrap().completed,
+            completed,
+            "an unwound helper must not count as compile progress"
+        );
     }
 }
