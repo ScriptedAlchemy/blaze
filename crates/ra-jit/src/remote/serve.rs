@@ -323,31 +323,121 @@ impl Serve {
         Ok(Some(Object { name: name.to_owned(), len, written }))
     }
 
-    /// The objects whose names start with `prefix`, which ends a directory.
+    /// Every page of the immutable listing extension, or a complete legacy small listing.
     pub(crate) async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
-        let path = format!("/v1/objects?prefix={}", escape(prefix));
-        let request = Request::builder().method(Method::GET).uri(self.address(&path));
-        let answer = self.call(request, empty(), Duration::ZERO).await?;
-        let (status, _, bytes) = answer.whole().await?;
-        if status != StatusCode::OK {
-            bail!("{} does not list {prefix}: {status}", self.base);
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut objects = Vec::new();
+        let mut total = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Refused("the listing snapshot lease deadline expired".into()).into());
+            }
+            let mut path = format!(
+                "/v1/objects?prefix={}&limit={}",
+                escape(prefix),
+                self.limits.batch_items.min(1024)
+            );
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&cursor={cursor}"));
+            }
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(self.address(&path))
+                .header("x-blaze-listing-version", "1");
+            let (status, headers, bytes) =
+                self.call(request, empty(), Duration::ZERO).await?.whole().await?;
+            if status != StatusCode::OK {
+                return Err(Refused(format!(
+                    "{} does not list {prefix}: {status}: {}",
+                    self.base,
+                    said(&bytes)
+                ))
+                .into());
+            }
+            let version = headers.get("x-blaze-listing-version").and_then(|it| it.to_str().ok());
+            let next = headers.get("x-blaze-listing-next").and_then(|it| it.to_str().ok());
+            for name in ["x-blaze-listing-version", "x-blaze-listing-next", "x-blaze-listing-total"]
+            {
+                if headers.get_all(name).iter().count() > 1
+                    || headers.get(name).is_some_and(|value| value.to_str().is_err())
+                {
+                    return Err(Refused(
+                        "the server returned duplicate or malformed listing headers".into(),
+                    )
+                    .into());
+                }
+            }
+            if version.is_some_and(|it| it != "1")
+                || (cursor.is_some() && version != Some("1"))
+                || (next.is_some() && version != Some("1"))
+            {
+                return Err(Refused(
+                    "the server returned an invalid listing extension version".into(),
+                )
+                .into());
+            }
+            if version == Some("1") {
+                let length = headers
+                    .get("x-blaze-listing-total")
+                    .and_then(|it| it.to_str().ok())
+                    .and_then(|it| it.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        Refused("the server omitted the listing snapshot length".into())
+                    })?;
+                if total.is_some_and(|old| old != length) {
+                    return Err(Refused("the listing snapshot length changed".into()).into());
+                }
+                total = Some(length);
+            }
+            let answer: ObjectsAnswer = decode(&bytes, &self.limits).map_err(|e| {
+                Refused(format!(
+                    "the server's listing is not the negotiated schema: {}",
+                    e.offence()
+                ))
+            })?;
+            for object in answer.objects {
+                if !object.name.starts_with(prefix)
+                    || blaze_serve::ObjectName::parse(&object.name).is_none()
+                    || objects.last().is_some_and(|it: &Object| it.name >= object.name)
+                {
+                    return Err(Refused(
+                        "the server returned an invalid, duplicate or unordered listing object"
+                            .into(),
+                    )
+                    .into());
+                }
+                let written = UNIX_EPOCH
+                    .checked_add(Duration::from_millis(object.written_ms))
+                    .context("the server's listing timestamp overflows")?;
+                objects.push(Object { name: object.name, len: object.len, written });
+            }
+            let Some(next) = next else {
+                if total.is_some_and(|length| objects.len() != length) {
+                    return Err(Refused("the server truncated its listing snapshot".into()).into());
+                }
+                return Ok(objects);
+            };
+            if total.is_some_and(|length| objects.len() >= length) {
+                return Err(Refused("the listing cursor is beyond its snapshot".into()).into());
+            }
+            let Some((id, offset)) = next.split_once('.') else {
+                return Err(Refused("the server returned a malformed listing cursor".into()).into());
+            };
+            if id.len() != 32
+                || !id.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+                || offset.parse::<usize>().ok() != Some(objects.len())
+                || objects.is_empty()
+                || !seen.insert(next.to_owned())
+                || cursor.as_ref().is_some_and(|old: &String| !old.starts_with(&format!("{id}.")))
+            {
+                return Err(
+                    Refused("the server returned a non-progressing listing cursor".into()).into()
+                );
+            }
+            cursor = Some(next.to_owned());
         }
-        let answer: ObjectsAnswer = decode(&bytes, &self.limits).map_err(|e| {
-            anyhow::anyhow!(
-                "`{}` answers a listing that is not the schema's: {}",
-                self.base,
-                e.offence()
-            )
-        })?;
-        Ok(answer
-            .objects
-            .into_iter()
-            .map(|it| Object {
-                name: it.name,
-                len: it.len,
-                written: UNIX_EPOCH + Duration::from_millis(it.written_ms),
-            })
-            .collect())
     }
 
     /// Removes the object under `name`.
@@ -779,6 +869,206 @@ mod tests {
 
     fn reply(status: StatusCode, bytes: Vec<u8>) -> Reply {
         (status, Vec::new(), bytes)
+    }
+
+    #[tokio::test]
+    async fn paginated_real_server_lists_more_than_the_batch_limit_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        // Hard links keep the 65,537-entry fixture small while exercising real readdir/stat.
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(root.join("units")).unwrap();
+            std::fs::write(root.join("seed"), b"x").unwrap();
+            for at in 0..65_537u64 {
+                std::fs::hard_link(root.join("seed"), root.join(format!("units/{at:064x}")))
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let mut config = blaze_serve::Config::at(dir.path(), 0);
+        config.limits.request = 1024;
+        config.limits.batch_items = 8;
+        config.limits.lookup_items = 8;
+        let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("blaze+http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(blaze_serve::serve_on(listener, server.clone()));
+        let remote = super::super::Remote::open(&url, dir.path()).await.unwrap();
+        let result = remote.list("units/").await;
+        task.abort();
+        let objects = result.unwrap();
+        assert_eq!(objects.len(), 65_537);
+        assert_eq!(objects[0].name, format!("units/{:064x}", 0));
+        assert_eq!(objects.last().unwrap().name, format!("units/{:064x}", 65_536));
+        assert!(objects.windows(2).all(|it| it[0].name < it[1].name));
+    }
+
+    #[tokio::test]
+    async fn snapshot_pages_stay_ordered_across_deletion_and_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = blaze_serve::Config::at(dir.path(), 0);
+        config.limits.request = 256;
+        config.limits.batch_items = 8;
+        config.limits.lookup_items = 8;
+        let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
+        for name in ["manifests/a", "manifests/b", "manifests/c"] {
+            server.store().put_list(name, b"\n", blaze_serve::Expect::Any).unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("blaze+http://{}", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(blaze_serve::serve_on(listener, server.clone()));
+        let client =
+            Serve::open(&url, Duration::from_secs(2), Arc::new(Traffic::new(4))).await.unwrap();
+        let request = Request::builder()
+            .uri(client.address("/v1/objects?prefix=manifests/&limit=1"))
+            .header("x-blaze-listing-version", "1");
+        let (_, headers, bytes) =
+            client.call(request, empty(), Duration::ZERO).await.unwrap().whole().await.unwrap();
+        assert!(bytes.len() <= 256);
+        let page: ObjectsAnswer = decode(&bytes, &client.limits).unwrap();
+        assert_eq!(page.objects[0].name, "manifests/a");
+        let cursor = headers.get("x-blaze-listing-next").unwrap().to_str().unwrap().to_owned();
+        let wrong_prefix = Request::builder()
+            .uri(client.address(&format!("/v1/objects?prefix=deps/&cursor={cursor}")))
+            .header("x-blaze-listing-version", "1");
+        assert_eq!(
+            client.call(wrong_prefix, empty(), Duration::ZERO).await.unwrap().status,
+            StatusCode::BAD_REQUEST
+        );
+        server.store().delete("manifests/b").unwrap();
+        server.store().put_list("manifests/d", b"\n", blaze_serve::Expect::Any).unwrap();
+        let request = Request::builder()
+            .uri(client.address(&format!("/v1/objects?prefix=manifests/&limit=2&cursor={cursor}")))
+            .header("x-blaze-listing-version", "1");
+        let (_, headers, bytes) =
+            client.call(request, empty(), Duration::ZERO).await.unwrap().whole().await.unwrap();
+        let page: ObjectsAnswer = decode(&bytes, &client.limits).unwrap();
+        assert_eq!(
+            page.objects.iter().map(|it| it.name.as_str()).collect::<Vec<_>>(),
+            ["manifests/b", "manifests/c"]
+        );
+        assert!(headers.get("x-blaze-listing-next").is_none());
+        assert!(client.read_small("manifests/b", 256).await.unwrap().is_none());
+        assert_eq!(
+            client
+                .list("manifests/")
+                .await
+                .unwrap()
+                .iter()
+                .map(|it| it.name.as_str())
+                .collect::<Vec<_>>(),
+            ["manifests/a", "manifests/c", "manifests/d"]
+        );
+        for query in [
+            "prefix=../&cursor=../key",
+            "prefix=manifests/&cursor=bad",
+            "prefix=manifests/&limit=0",
+            "prefix=manifests/&prefix=deps/",
+        ] {
+            let request = Request::builder()
+                .uri(client.address(&format!("/v1/objects?{query}")))
+                .header("x-blaze-listing-version", "1");
+            assert_ne!(
+                client.call(request, empty(), Duration::ZERO).await.unwrap().status,
+                StatusCode::OK
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn paginated_gc_reads_all_reference_lists_and_preserves_named_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = blaze_serve::Config::at(dir.path(), 0);
+        config.limits.request = 512;
+        config.limits.batch_items = 8;
+        config.limits.lookup_items = 8;
+        let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
+        let bytes = b"referenced unit";
+        let d = super::super::Digest::of(bytes);
+        let name = format!("units/{d}");
+        server.store().put_blob(&name, bytes).unwrap();
+        for at in 0..20 {
+            server
+                .store()
+                .put_list(
+                    &format!("deps/project-{at:03}"),
+                    format!("unit-{at} {d}\n").as_bytes(),
+                    blaze_serve::Expect::Any,
+                )
+                .unwrap();
+            server
+                .store()
+                .put_list(&format!("manifests/project-{at:03}"), b"\n", blaze_serve::Expect::Any)
+                .unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("blaze+http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(blaze_serve::serve_on(listener, server.clone()));
+        let remote = super::super::Remote::open(&url, dir.path()).await.unwrap();
+        assert_eq!(remote.list("deps/").await.unwrap().len(), 20);
+        let ages = super::super::collect::Ages {
+            unlisted: Duration::from_secs(86400),
+            listed: None,
+            dry: false,
+        };
+        let result = super::super::collect::collect(&remote, &ages).await;
+        task.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(server.store().read_small(&name, 100).unwrap().unwrap(), bytes);
+        assert_eq!(server.store().list("manifests/").unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_repeated_unordered_or_truncated_pages() {
+        let limits = Limits { batch_items: 8, lookup_items: 8, ..Limits::DOCUMENTED };
+        let page = |names: &[&str]| {
+            encode(&ObjectsAnswer {
+                objects: names
+                    .iter()
+                    .map(|name| blaze_serve::ListedObject {
+                        name: (*name).into(),
+                        len: 1,
+                        written_ms: 0,
+                    })
+                    .collect(),
+            })
+        };
+        let cursor = format!("{}.1", "a".repeat(32));
+        let headers = vec![
+            ("x-blaze-listing-version", "1".into()),
+            ("x-blaze-listing-total", "2".into()),
+            ("x-blaze-listing-next", cursor.clone()),
+        ];
+        for second in [
+            (StatusCode::OK, headers.clone(), page(&["manifests/a"])),
+            (
+                StatusCode::OK,
+                vec![
+                    ("x-blaze-listing-version", "1".into()),
+                    ("x-blaze-listing-total", "2".into()),
+                ],
+                page(&[]),
+            ),
+            (
+                StatusCode::OK,
+                vec![
+                    ("x-blaze-listing-version", "1".into()),
+                    ("x-blaze-listing-total", "2".into()),
+                ],
+                page(&["../key"]),
+            ),
+        ] {
+            let fake = Fake::start(
+                encode(&hello(limits)),
+                vec![(StatusCode::OK, headers.clone(), page(&["manifests/a"])), second],
+            )
+            .await;
+            let client = fake.client().await.unwrap();
+            assert!(client.list("manifests/").await.is_err());
+            assert_eq!(fake.requests.lock().unwrap().len(), 3);
+        }
     }
 
     #[tokio::test]

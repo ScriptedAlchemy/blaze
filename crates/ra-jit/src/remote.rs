@@ -1853,7 +1853,8 @@ fn serve_command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             "serve: listening on {listen}, which is not this machine: there is no authentication yet (C6)"
         );
     }
-    let config = blaze_serve::Config { dir: cache, listen };
+    let mut config = blaze_serve::Config::at(cache, listen.port());
+    config.listen = listen;
     runtime()?.block_on(blaze_serve::serve(config))
 }
 

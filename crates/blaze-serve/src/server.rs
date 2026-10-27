@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use blaze_wire::{
@@ -31,17 +31,19 @@ use hyper::{
     server::conn::http1,
     service::service_fn,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
 };
 
 use crate::blob::{ObjectName, hex, parse_range};
 use crate::error::{Error, failed};
 use crate::store::{Expect, Store, Verification, temporary};
 
+mod pages;
 mod preconditions;
 mod publication;
 
@@ -62,12 +64,48 @@ pub struct Config {
     pub dir: PathBuf,
     /// Where it listens. `127.0.0.1:PORT` unless the operator says otherwise.
     pub listen: SocketAddr,
+    /// Request and connection liveness policy, not a compile-worker memory limit.
+    pub resources: Resources,
+    /// Wire ceilings advertised in hello.
+    pub limits: Limits,
+}
+
+/// Resource leases for network peers and listing snapshots.
+#[derive(Clone, Debug)]
+pub struct Resources {
+    /// Longest pause between request-body frames or while reading request headers.
+    pub idle: Duration,
+    /// Concurrent accepted connections.
+    pub connections: usize,
+    /// Interval between sweeps of abandoned staging files.
+    pub sweep_every: Duration,
+    /// Age after which an unlocked staging file can be removed.
+    pub temporary_age: Duration,
+    /// Lifetime of an immutable listing snapshot.
+    pub snapshot_age: Duration,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(30),
+            connections: 256,
+            sweep_every: Duration::from_secs(60),
+            temporary_age: Duration::from_secs(3600),
+            snapshot_age: Duration::from_secs(600),
+        }
+    }
 }
 
 impl Config {
     /// A server on `dir`, listening on `127.0.0.1:port`.
     pub fn at(dir: impl Into<PathBuf>, port: u16) -> Config {
-        Config { dir: dir.into(), listen: SocketAddr::from(([127, 0, 0, 1], port)) }
+        Config {
+            dir: dir.into(),
+            listen: SocketAddr::from(([127, 0, 0, 1], port)),
+            resources: Resources::default(),
+            limits: Limits::DOCUMENTED,
+        }
     }
 }
 
@@ -78,18 +116,49 @@ pub struct Server {
     limits: Limits,
     /// One epoch, Main's. C6 makes epochs real; until then a record that names one names 1.
     epochs: Vec<(Namespace, u64)>,
+    resources: Resources,
+    pages: pages::Pages,
 }
 
 impl Server {
     /// The server on `config.dir`, with its key read from the directory or made now.
     pub fn open(config: &Config) -> Result<Server, Error> {
+        if config.resources.idle.is_zero()
+            || config.resources.connections == 0
+            || config.resources.sweep_every.is_zero()
+            || config.resources.snapshot_age.is_zero()
+            || config.limits.request == 0
+            || config.limits.batch_items == 0
+        {
+            return Err(Error::malformed(
+                "server resource leases and wire limits must be positive",
+            ));
+        }
+        let limits = config.limits;
+        let ceiling = Limits::DOCUMENTED;
+        if limits.request > ceiling.request
+            || limits.blob < 32
+            || limits.blob > ceiling.blob
+            || limits.event == 0
+            || limits.event > ceiling.event
+            || limits.lookup_items == 0
+            || limits.lookup_items > limits.batch_items
+            || limits.lookup_items > ceiling.lookup_items
+            || limits.batch_items > ceiling.batch_items
+            || limits.string == 0
+            || limits.string > ceiling.string
+        {
+            return Err(Error::malformed("unsupported server wire limits"));
+        }
         let store = Store::open(&config.dir)?;
         let key = key_of(&config.dir)?;
         Ok(Server {
             store: Arc::new(store),
             key,
-            limits: Limits::DOCUMENTED,
+            limits: config.limits,
             epochs: vec![(Namespace::Main, 1)],
+            resources: config.resources.clone(),
+            pages: pages::Pages::default(),
         })
     }
 
@@ -106,6 +175,16 @@ impl Server {
     /// The limits the `hello` answer carries.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    async fn disk<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Store) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || work(&store))
+            .await
+            .map_err(|e| failed("cache filesystem work", e))?
     }
 
     /// One request, answered. This is what a connection calls.
@@ -132,7 +211,7 @@ impl Server {
             "/" => Ok(text(StatusCode::OK, "blaze-serve: a cache of today's layout\n")),
             "/v1/hello" => self.hello(method, headers, body).await,
             "/v1/cache/missing" => self.missing(method, headers, body).await,
-            "/v1/objects" => self.objects(method, query),
+            "/v1/objects" => self.objects(method, query, headers).await,
             _ => {
                 let Some((endpoint, name)) =
                     path.strip_prefix("/v1/").and_then(|it| it.split_once('/'))
@@ -196,9 +275,17 @@ impl Server {
     }
 
     /// `GET /v1/objects?prefix=<p>`: the objects under a prefix, for `cache gc --remote`.
-    fn objects(&self, method: &Method, query: &str) -> Result<HttpResponse<Body>, Error> {
+    async fn objects(
+        &self,
+        method: &Method,
+        query: &str,
+        headers: &hyper::HeaderMap,
+    ) -> Result<HttpResponse<Body>, Error> {
         if *method != Method::GET {
             return Err(method_not_allowed(method, "GET"));
+        }
+        if headers.contains_key("x-blaze-listing-version") {
+            return self.paged_objects(query, headers).await;
         }
         let prefix = query
             .split('&')
@@ -206,8 +293,8 @@ impl Server {
             .map(unescape)
             .unwrap_or_default();
         let objects: Vec<_> = self
-            .store
-            .list(&prefix)?
+            .disk(move |store| store.list(&prefix))
+            .await?
             .into_iter()
             .map(|it| (it.name, it.len, written_ms(it.written)))
             .collect();
@@ -235,14 +322,17 @@ impl Server {
     ) -> Result<HttpResponse<Body>, Error> {
         // Section 8 writes a blob's path as `/v1/blob/<sha256>`: a bare digest finds the object
         // named by it, whichever of today's four kinds that is.
+        let lookup = name.to_owned();
         let name = match bare_digest(name) {
             Some(digest) if *method == Method::PUT => {
                 crate::blob::ObjectName::of(crate::blob::Kind::Unit, &digest).expect("a unit name")
             }
-            Some(digest) => self.store.name_of_digest(&digest).ok_or_else(|| {
-                Error::not_found(format!("no blob of this cache is named {}", hex(&digest)))
-            })?,
-            None => name.to_owned(),
+            Some(digest) => {
+                self.disk(move |store| Ok(store.name_of_digest(&digest))).await?.ok_or_else(
+                    || Error::not_found(format!("no blob of this cache is named {}", hex(&digest))),
+                )?
+            }
+            None => lookup,
         };
         let object = ObjectName::parse(&name)
             .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
@@ -253,11 +343,18 @@ impl Server {
         let name = name.as_str();
         match *method {
             Method::GET | Method::HEAD => {
-                let Some((file, len)) = self.store.open_blob(name)? else {
+                let owned = name.to_owned();
+                let opened = self
+                    .disk(move |store| {
+                        let Some((file, len)) = store.open_blob(&owned)? else { return Ok(None) };
+                        let written = file.metadata()?.modified().ok();
+                        Ok(Some((file, len, written)))
+                    })
+                    .await?;
+                let Some((file, len, written)) = opened else {
                     return Err(Error::not_found(format!("{name} is not here")));
                 };
                 let mut file = tokio::fs::File::from_std(file);
-                let written = self.store.found(name)?.map(|it| it.written);
                 let asked = match headers.get(header::RANGE).and_then(|it| it.to_str().ok()) {
                     None => None,
                     Some(text) => match parse_range(text) {
@@ -326,7 +423,8 @@ impl Server {
                 Ok(answer)
             }
             Method::DELETE => {
-                self.store.delete(name)?;
+                let name = name.to_owned();
+                self.disk(move |store| store.delete(&name)).await?;
                 Ok(empty(StatusCode::NO_CONTENT))
             }
             _ => Err(method_not_allowed(method, "GET, HEAD, PUT, DELETE")),
@@ -349,12 +447,8 @@ impl Server {
                 self.limits.blob
             )));
         }
-        let to = self.store.checked_path(&object.name)?;
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| failed(&format!("making {}", parent.display()), e))?;
-        }
+        let name = object.name.clone();
+        let to = self.disk(move |store| store.checked_path(&name)).await?;
         let partial = temporary(&to);
         // Creation returns both the file and its cleanup owner from the blocking task. If
         // this await is cancelled, dropping that task's result still removes its own file.
@@ -364,7 +458,10 @@ impl Server {
             .map_err(|e| failed(&format!("writing {}", object.name), e))?;
         let mut file = tokio::fs::File::from_std(file);
         let mut taken = 0u64;
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Refused, "upload body idle deadline expired"))?
+        {
             let frame =
                 frame.map_err(|e| Error::malformed(format!("the body of a PUT broke: {e}")))?;
             let Some(data) = frame.into_data().ok() else { continue };
@@ -408,8 +505,16 @@ impl Server {
         }
         match *method {
             Method::GET | Method::HEAD => {
-                let Some(bytes) = self.store.read_small(name, u64::from(self.limits.request))?
-                else {
+                let owned = name.to_owned();
+                let most = u64::from(self.limits.request);
+                let read = self
+                    .disk(move |store| {
+                        let bytes = store.read_small(&owned, most)?;
+                        let found = store.found(&owned)?;
+                        Ok((bytes, found))
+                    })
+                    .await?;
+                let (Some(bytes), found) = read else {
                     return Err(Error::not_found(format!("{name} is not here")));
                 };
                 let etag = hex(&sha256(&bytes));
@@ -418,7 +523,7 @@ impl Server {
                     .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
                     .header(header::CONTENT_LENGTH, bytes.len().to_string())
                     .header(header::ETAG, format!("\"{etag}\""));
-                if let Some(found) = self.store.found(name)? {
+                if let Some(found) = found {
                     answer = answer
                         .header(header::LAST_MODIFIED, httpdate::fmt_http_date(found.written));
                     answer = answer.header(WRITTEN_MS, written_ms(found.written).to_string());
@@ -434,12 +539,17 @@ impl Server {
                 let condition = preconditions::parse(headers);
                 let bytes = self.read_whole(headers, body).await?;
                 let condition = condition?;
-                let expect = match &condition {
-                    Condition::Any => Expect::Any,
-                    Condition::None => Expect::Absent,
-                    Condition::Match(tag) => Expect::Read(tag),
-                };
-                let wrote = self.store.put_list(name, &bytes, expect)?;
+                let owned = name.to_owned();
+                let wrote = self
+                    .disk(move |store| {
+                        let expect = match &condition {
+                            Condition::Any => Expect::Any,
+                            Condition::None => Expect::Absent,
+                            Condition::Match(tag) => Expect::Read(tag),
+                        };
+                        store.put_list(&owned, &bytes, expect)
+                    })
+                    .await?;
                 if !wrote {
                     return Err(Error::new(
                         ErrorCode::Conflict,
@@ -449,7 +559,8 @@ impl Server {
                 Ok(empty(StatusCode::NO_CONTENT))
             }
             Method::DELETE => {
-                self.store.delete(name)?;
+                let name = name.to_owned();
+                self.disk(move |store| store.delete(&name)).await?;
                 Ok(empty(StatusCode::NO_CONTENT))
             }
             _ => Err(method_not_allowed(method, "GET, HEAD, PUT, DELETE")),
@@ -487,7 +598,10 @@ impl Server {
             )));
         }
         let mut bytes = Vec::new();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = tokio::time::timeout(self.resources.idle, body.frame())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Refused, "request body idle deadline expired"))?
+        {
             let frame = frame.map_err(|e| Error::malformed(format!("the body broke: {e}")))?;
             let Ok(data) = frame.into_data() else { continue };
             if bytes.len().saturating_add(data.len()) > self.limits.request as usize {
@@ -501,7 +615,8 @@ impl Server {
 
 /// Serves `config` until the process ends: one task a connection.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let server = Arc::new(Server::open(&config).map_err(anyhow::Error::msg)?);
+    let setup = config.clone();
+    let server = Arc::new(tokio::task::spawn_blocking(move || Server::open(&setup)).await??);
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|e| anyhow::anyhow!("listening on {}: {e}", config.listen))?;
@@ -519,22 +634,48 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 /// Serves the connections of `listener` with `server`, until the listener fails. A test uses
 /// this with a listener of its own, so the port is one the machine gives.
 pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Result<()> {
+    let permits = Arc::new(Semaphore::new(server.resources.connections));
+    let mut connections = tokio::task::JoinSet::new();
+    let mut sweep = tokio::time::interval(server.resources.sweep_every);
     loop {
-        let (stream, _) = listener.accept().await?;
-        let server = server.clone();
-        tokio::spawn(async move {
-            let _ = connection(stream, server).await;
-        });
+        tokio::select! {
+            _ = sweep.tick() => {
+                let age = server.resources.temporary_age;
+                server.disk(move |store| store.sweep_temporaries(age)).await?;
+                server.pages.expire(server.resources.snapshot_age);
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept(), if permits.available_permits() != 0 => {
+                let (stream, _) = accepted?;
+                let permit = permits.clone().acquire_owned().await?;
+                let server = server.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    _ = connection(stream, server).await;
+                });
+            }
+        }
     }
 }
 
 async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()> {
+    let idle = server.resources.idle;
+    let socket = socket2::SockRef::from(&stream);
+    socket.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10)),
+    )?;
     let io = TokioIo::new(stream);
     let service = service_fn(move |request| {
         let server = server.clone();
         async move { Ok::<_, Infallible>(server.answer(request).await) }
     });
-    http1::Builder::new().serve_connection(io, service).await?;
+    http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle)
+        .serve_connection(io, service)
+        .await?;
     Ok(())
 }
 
@@ -679,7 +820,14 @@ mod tests {
     impl Running {
         async fn start() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let server = Arc::new(Server::open(&Config::at(dir.path(), 0)).unwrap());
+            Self::with_config(dir, |config| config).await
+        }
+
+        async fn with_config(
+            dir: tempfile::TempDir,
+            change: impl FnOnce(Config) -> Config,
+        ) -> Self {
+            let server = Arc::new(Server::open(&change(Config::at(dir.path(), 0))).unwrap());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let task = tokio::spawn(serve_on(listener, server.clone()));
@@ -716,6 +864,149 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn an_idle_upload_times_out_without_blocking_a_healthy_client() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.idle = Duration::from_millis(200);
+            config
+        })
+        .await;
+        let name = format!("units/{}", hex(&sha256(b"complete")));
+        let mut idle = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
+        idle.write_all(
+            format!(
+                "PUT /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\ncut"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let directory = run.server.store().dir().join("units");
+        for _ in 0..100 {
+            if std::fs::read_dir(&directory).unwrap().count() != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read_dir(&directory).unwrap().count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(run.server.store().found(&name).unwrap().is_none());
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn periodic_sweeps_remove_only_unlocked_abandoned_staging_files() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.sweep_every = Duration::from_millis(20);
+            config.resources.temporary_age = Duration::ZERO;
+            config
+        })
+        .await;
+        let abandoned = run.server.store().dir().join("units/.abandoned.123-456-1.tmp");
+        std::fs::write(&abandoned, b"cut").unwrap();
+        let path = run.server.store().dir().join("units/.active.123-456-2.tmp");
+        let (file, owner) = Temporary::create(path.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while abandoned.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+        })
+        .await
+        .unwrap();
+        assert!(path.exists());
+        drop(file);
+        assert!(path.exists(), "the cleanup lease retains the staging lock");
+        drop(owner);
+        assert!(!path.exists());
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn restarting_a_server_keeps_fresh_stale_files_hidden_until_periodic_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(&Config::at(dir.path(), 0)).unwrap();
+        let stale = server.store().dir().join("manifests/.default.123-456-3.tmp");
+        std::fs::write(&stale, b"incomplete").unwrap();
+        drop(server);
+        let run = Running::with_config(dir, |mut config| {
+            config.resources.sweep_every = Duration::from_millis(20);
+            config.resources.temporary_age = Duration::ZERO;
+            config
+        })
+        .await;
+        assert!(run.server.store().list("manifests/").unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stale.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_slot_is_released_when_idle_headers_expire() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.connections = 1;
+            config.resources.idle = Duration::from_millis(100);
+            config
+        })
+        .await;
+        let mut stalled = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
+        stalled.write_all(b"PUT /v1/blob/").await.unwrap();
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut bytes))
+            .await
+            .unwrap();
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn expired_listing_cursors_fail_without_silently_restarting_the_snapshot() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.snapshot_age = Duration::from_millis(50);
+            config
+        })
+        .await;
+        for name in ["manifests/a", "manifests/b"] {
+            run.server.store().put_list(name, b"\n", Expect::Any).unwrap();
+        }
+        let (status, headers, _) = run
+            .request(
+                "GET",
+                "/v1/objects?prefix=manifests/&limit=1",
+                "X-Blaze-Listing-Version: 1\r\n",
+                &[],
+            )
+            .await;
+        assert_eq!(status, 200);
+        let cursor = headers
+            .lines()
+            .find_map(|it| it.strip_prefix("x-blaze-listing-next: "))
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            run.request(
+                "GET",
+                &format!("/v1/objects?prefix=manifests/&cursor={cursor}"),
+                "X-Blaze-Listing-Version: 1\r\n",
+                &[],
+            )
+            .await
+            .0,
+            409
+        );
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
     }
 
     #[tokio::test]

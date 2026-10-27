@@ -260,7 +260,7 @@ The server has these calls.
 | `POST /v1/cache/missing` | Up to 4,096 digests, answered from the existence set. The client splits larger requests. |
 | `GET`, `HEAD`, `PUT`, `DELETE /v1/blob/<name>` | Today's blob names, such as `packs/<sha256>.pack`. |
 | `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>` | Today's text lists, with content-hash ETags and conditional PUT. |
-| `GET /v1/objects?prefix=<prefix>` | A CBOR listing for remote collection. The prefix names a cache directory. |
+| `GET /v1/objects?prefix=<prefix>` | A legacy complete CBOR listing, or the explicitly requested paged extension below. |
 
 A bare `/v1/blob/<sha256>` PUT stores raw content in `units/`. GET and HEAD find the
 existing raw object named by that digest. A compressed-only pack is not returned by a
@@ -313,12 +313,47 @@ The client validates advertised limits against the codec's supported ceiling and
 limits for missing batches, request bodies, bounded answers and small-object reads.
 Zero, inconsistent or unsupported larger limits are refused.
 
-Two server resource limits remain open. Idle uploads have no server-side read deadline or
-connection cap. A paused peer can retain a temporary file until disconnection or restart.
-Some filesystem work still blocks runtime workers. Large listings are not paginated.
-A response beyond the request-byte limit or 65,536 items fails with `413`, so remote
-collection cannot operate on a directory above that bound. These are follow-up designs,
-not claims of support at all scales.
+The server gives request headers and each body frame a 30-second idle deadline.
+An idle or cancelled upload removes its owned staging file without publishing it.
+At most 256 connections are accepted concurrently. TCP keepalive detects dead peers.
+Filesystem setup, reads, listing, deletion and publication use the blocking pool, not
+async runtime workers. These are network resource leases, not compile-worker memory caps.
+
+Every minute the server sweeps staging files older than one hour. Live staging files hold
+an exclusive file lock through verification, so a sweep does not remove an active upload.
+Restart sweeps old abandoned files as well. Newer crash leftovers stay hidden until eligible.
+The public library's `Config::resources` configures the deadlines and lease counts.
+
+### Paginated listing extension
+
+The C3 listing extension is versioned separately from the C1 CBOR codec.
+`X-Blaze-Listing-Version: 1` requests paging on `/v1/objects`.
+The query accepts `prefix`, `limit` and an optional `cursor`, each once.
+The response body remains the existing `ObjectsAnswer` CBOR map.
+Every page fits the advertised request-byte and batch-item limits.
+`X-Blaze-Listing-Version: 1` and `X-Blaze-Listing-Total` identify a paged response.
+`X-Blaze-Listing-Next` names the next page when more objects remain.
+
+A cursor contains a random snapshot ID and its next row offset. It is not a filesystem path.
+The server validates the prefix and offset against an immutable, sorted metadata snapshot.
+Snapshots expire after ten minutes and their lease count is bounded by the connection limit.
+An unknown or expired cursor returns `409`. An invalid cursor or query returns `400`.
+When leases are occupied, a new snapshot returns `429`; it never truncates a listing.
+
+Each snapshot captures all names once. Later publication does not insert rows between pages.
+Deletion after capture does not shift offsets or skip later objects.
+The client checks the declared total, strict ordering, typed names and cursor progress.
+It follows every page before returning a list to GC. A real manifest deleted after capture
+still fails its subsequent read, so GC does not silently lose references.
+A fresh listing sees subsequent publication and deletion.
+Snapshot construction is proportional to directory size and uses memory for metadata.
+This is not a claim of unlimited cache scale or a root-based GC implementation.
+
+Requests without the extension header retain the complete legacy response.
+An oversized legacy response still fails with `413`, not a partial result.
+The new client accepts a complete legacy small response from an older server.
+Older clients can use the new server's legacy route unchanged.
+No CBOR field, `blaze_wire::VERSION`, C2 BuildSpec or signing domain changed here.
 
 `python3 -I harness/remote.py --server` exercises the server alongside available S3 services.
 `--server --transfers-only` runs its transfer, damage and signing checks without compiler

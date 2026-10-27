@@ -14,12 +14,24 @@ use crate::store::temporary;
 /// Only a successful creator owns cleanup. A failed create must not unlink another writer's
 /// staging file. The file precedes this guard in the returned tuple so cancellation also
 /// closes it before trying to remove it on Windows.
-pub(super) struct Temporary(PathBuf);
+pub(super) struct Temporary {
+    path: PathBuf,
+    lease: Option<File>,
+}
 
 impl Temporary {
     pub(super) fn create(path: PathBuf) -> std::io::Result<(File, Self)> {
-        let file = File::options().write(true).create_new(true).open(&path)?;
-        Ok((file, Self(path)))
+        let mut options = File::options();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        file.try_lock().map_err(std::io::Error::from)?;
+        let writer = file.try_clone()?;
+        Ok((writer, Self { path, lease: Some(file) }))
     }
 
     /// Blocking verification outlives a cancelled waiter. Move the cleanup owner into that
@@ -29,7 +41,7 @@ impl Temporary {
         work: impl FnOnce(&Path) -> Result<T, Error> + Send + 'static,
     ) -> tokio::task::JoinHandle<Result<T, Error>> {
         tokio::task::spawn_blocking(move || {
-            let result = work(&self.0);
+            let result = work(&self.path);
             drop(self);
             result
         })
@@ -38,7 +50,8 @@ impl Temporary {
 
 impl Drop for Temporary {
     fn drop(&mut self) {
-        _ = std::fs::remove_file(&self.0);
+        drop(self.lease.take());
+        _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -62,17 +75,8 @@ fn read_key(at: &Path) -> Result<SigningKey, Error> {
 fn install_key(dir: &Path, seed: &[u8; 32]) -> Result<SigningKey, Error> {
     let at = dir.join("key");
     let partial = temporary(&at);
-    let mut options = File::options();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&partial)
+    let (mut file, _cleanup) = Temporary::create(partial.clone())
         .map_err(|error| failed(&format!("creating {}", partial.display()), error))?;
-    let _cleanup = Temporary(partial.clone());
     let written = file.write_all(seed).and_then(|()| file.sync_all());
     // Close before either returning an error or dropping the cleanup owner on Windows.
     drop(file);
