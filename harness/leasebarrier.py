@@ -52,8 +52,16 @@ internal      An editor's `edit` of a source file, which the worker builds for a
               build. It is held before its compile and link while another worker, with another
               `GEN`, asks for the scripts; it must wait.
 groups        Two direct runs (`ra-jit <R> --also <S>` and `ra-jit <S> --also <R>`), the same target
-              directory, another `GEN` for each: each has judged its first script group and holds
-              it when the other needs it. Both have to be built (neither is refused).
+              directory, another `GEN` for each, scripts that run every build and a guard that
+              fails the second execution of one for one value in one package. The first holds its
+              first group (it has the admission of both); the second asks, and waits. Each script
+              runs once for each build, and both are built.
+generation    Another worker runs a script over a file it watches (one fingerprint, other output)
+              while A's database is of the first run; an editor's edit to A reads the generated
+              file in a body. A's program is what cargo builds of the tree: include, variable and
+              `cfg` of the value it has now, the world that moved loaded again for the edit.
+unrelated     A worker has R and S loaded, another runs S's script again, and an edit to R is
+              built: S's moved world is not R's to refuse.
 overlay       `internal` with `RA_JIT_OVERLAY=1` (which builds without the background path) and an
               edit that reads the generated file with `include_bytes!`.
 worlds        A worker that has R and S loaded and an editor's edit of R, held before its compile
@@ -88,12 +96,36 @@ WATCH = float(os.environ.get("LEASEBARRIER_WATCH", "4"))
 BUILD_RS = r'''use std::{env, fs, io::Write, path::PathBuf, process::{exit, Command}};
 
 fn main() {
-    let gen_ = env::var("GEN").unwrap_or_else(|_| "none".to_owned());
     println!("cargo:rerun-if-env-changed=GEN");
     println!("cargo:rerun-if-env-changed=FAIL");
     println!("cargo:rerun-if-env-changed=GEN_ARCHIVE");
+    println!("cargo:rerun-if-env-changed=GEN_FROM_FILE");
+    println!("cargo:rerun-if-env-changed=ALWAYS");
+    println!("cargo:rerun-if-env-changed=ONCE_DIR");
+    // The value is the variable's, or the content of a file that the script watches: the same
+    // fingerprint (a watched path) for a run that leaves other output.
+    let gen_ = match env::var("GEN_FROM_FILE").as_deref() {
+        Ok("1") => {
+            println!("cargo:rerun-if-changed=value.txt");
+            fs::read_to_string("value.txt").unwrap().trim().to_owned()
+        }
+        _ => env::var("GEN").unwrap_or_else(|_| "none".to_owned()),
+    };
+    // A script cargo runs every build.
+    if env::var("ALWAYS").as_deref() == Ok("1") {
+        println!("cargo:rerun-if-changed=missing.txt");
+    }
     let mut log = fs::OpenOptions::new().create(true).append(true).open("@LOG@").unwrap();
     writeln!(log, "{gen_}").unwrap();
+    // A script that fails the second time it runs for one value, in one package: the extra
+    // execution of a build is an effect that is not undone by anything that follows.
+    if let Ok(once) = env::var("ONCE_DIR") {
+        let mark = format!("{once}/{}-{gen_}", env::var("CARGO_PKG_NAME").unwrap());
+        if fs::OpenOptions::new().write(true).create_new(true).open(&mark).is_err() {
+            eprintln!("script ran twice: {mark}");
+            exit(7);
+        }
+    }
     if env::var("FAIL").as_deref() == Ok("1") {
         eprintln!("script failed for {gen_}");
         exit(3);
@@ -925,30 +957,39 @@ def direct_run(sc, tag, project, also, crate, gen_, home, extra):
 
 
 def groups(sc, source_sha):
+    """Two direct runs with `--also` in opposite orders over one target directory, scripts that
+    run every build, and an external guard that fails the second execution of one for one value.
+    The first holds its first group, with the admission, while the second asks: the second has
+    nothing for the first to wait for, waits for the admission, and each runs each script once."""
     extra = shared_projects(sc)
-    exp_a, exp_b = sc.oracle("a", extra, pkg="gena"), sc.oracle("b", extra, pkg="genb")
+    extra = dict(extra, ALWAYS="1", ONCE_DIR=os.path.join(sc.dir, "once"))
+    os.makedirs(extra["ONCE_DIR"])
+    exp_a, exp_b = sc.oracle("a", {"GEN_ARCHIVE": "same"}, pkg="gena"), sc.oracle("b", {"GEN_ARCHIVE": "same"}, pkg="genb")
     sc.arm("a", "group")
-    sc.arm("b", "group")
     A = direct_run(sc, "A", sc.r, sc.s, "gena_one", "a", "a", extra)
     ba = sc.reached("a", "group", A)
-    B = direct_run(sc, "B", sc.s, sc.r, "genb_one", "b", "b", extra)
-    bb = sc.reached("b", "group", B)
-    if ba is None or bb is None:
+    if ba is None:
         A.kill()
-        B.kill()
         return
-    # Each judged the group it was asked for first and holds it: A has R's, B has S's.
-    sc.notes["held"] = sc.hash_all()
     sc.disarm("a", "group")
-    sc.disarm("b", "group")
+    B = direct_run(sc, "B", sc.s, sc.r, "genb_one", "b", "b", extra)
+    deadline = time.time() + 60
+    while time.time() < deadline and not any(
+            e[0] == "waits" for e in sc.events("b", open(os.path.join(sc.dir, "direct-B.err"), errors="replace").read())):
+        time.sleep(0.2)
+    waits = [e for e in sc.events("b", open(os.path.join(sc.dir, "direct-B.err"), errors="replace").read()) if e[0] == "waits"]
+    sc.notes["b-waits"] = waits[:1]
+    if not waits:
+        sc.fail("B (direct) did not wait for A's admission")
+    sc.notes["held"] = sc.hash_all()
+    sc.unchanged(sc.notes["held"], "B asking while A holds the admission of both groups", B)
     sc.release("a", "group", ba)
-    sc.release("b", "group", bb)
     for tag, p in (("A", A), ("B", B)):
         try:
             p.wait(timeout=LOST)
         except subprocess.TimeoutExpired:
             p.kill()
-            sc.fail(f"{tag} (direct) did not end in {LOST:.0f}s: it waits for the other, which waits for it")
+            sc.fail(f"{tag} (direct) did not end in {LOST:.0f}s")
         sc.timeline.append((time.time_ns() // 1000, f"direct {tag} ended rc={p.returncode}"))
         if p.returncode != 0:
             sc.fail(f"{tag} (direct) exited {p.returncode}: {open(p.errfile, errors='replace').read()[-500:]}")
@@ -957,8 +998,10 @@ def groups(sc, source_sha):
         if got != want[name]:
             sc.fail(f"{tag} (direct): printed {got!r}, the oracle's {want[name]!r}")
         sc.notes.setdefault("programs", {})[tag] = got
-    sc.notes["direct-events"] = {t: sc.events(t, open(p.errfile, errors="replace").read())
-                                 for t, p in (("a", A), ("b", B))}
+    ran = sorted(os.listdir(extra["ONCE_DIR"]))
+    sc.notes["executions"] = ran
+    if ran != ["gena-a", "gena-b", "genb-a", "genb-b"]:
+        sc.fail(f"each script was to run once for each build: {ran}")
     sc.timeouts()
 
 
@@ -1127,6 +1170,114 @@ def join(sc, source_sha):
         worker.kill()
 
 
+def edited_program(pkg):
+    """`one.rs` as an editor writes it when it adds a read of the generated file in the body
+    (`include_bytes!`), and prints whether it has the other value."""
+    text = PROGRAM.replace("@NAME@", f"{pkg}-one")
+    old = 'native());'
+    assert old in text
+    text = text.replace(
+        'native={}", env!("GEN_VALUE"), native());',
+        'native={} bytes_has_b={}", env!("GEN_VALUE"), native(), '
+        'String::from_utf8_lossy(GENERATED).contains("\\"b\\""));')
+    return text + '\nstatic GENERATED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gen.rs"));\n'
+
+
+def oracle_of(sc, files, env_extra):
+    """What cargo builds of the project with `files` over it: the output of `gen-one`."""
+    ws = os.path.join(sc.dir, "oracle-ws")
+    shutil.rmtree(ws, ignore_errors=True)
+    saved, sc.runs_log = sc.runs_log, os.path.join(sc.dir, "oracle-runs.log")
+    sc.project(ws)
+    sc.runs_log = saved
+    for name, text in files.items():
+        with open(os.path.join(ws, name), "w") as f:
+            f.write(text)
+    env = dict(sc.env("oracle"), **env_extra)
+    env["CARGO_TARGET_DIR"] = os.path.join(sc.dir, "oracle-target")
+    env.pop("RA_JIT_WHOLE_BUILD", None)
+    ran = subprocess.run(["cargo", "build"], cwd=ws, env=env, capture_output=True, text=True, timeout=WAIT)
+    if ran.returncode != 0:
+        sc.fail(f"the oracle (cargo) did not build: {ran.stderr[-400:]}")
+        return None
+    return subprocess.run([os.path.join(sc.dir, "oracle-target", "debug", "gen-one")],
+                          capture_output=True, text=True).stdout
+
+
+def generation(sc, source_sha):
+    """A reruns nothing: another worker runs the script again over a file it watches (one
+    fingerprint, other output), and an editor's edit to A then reads the generated file in a
+    body. What A prints has to be what cargo builds of the tree, include, variable and `cfg`
+    all of the value the tree has now."""
+    extra = {"GEN_ARCHIVE": "same", "GEN_FROM_FILE": "1"}
+    one = ("--bin", "gen-one")
+    sc.project()
+    value = os.path.join(sc.ws, "value.txt")
+    with open(value, "w") as f:
+        f.write("a\n")
+    A = sc.client("a", one, **extra)
+    sc.finish(A, "A")
+    if A.returncode != 0:
+        sc.fail(f"A's build exited {A.returncode}: {A.err[-600:]}")
+        return
+    time.sleep(1.2)
+    with open(value, "w") as f:
+        f.write("b\n")
+    B = sc.client("b", one, **extra)
+    sc.finish(B, "B")
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+        return
+    if sc.runs() != ["a", "b"]:
+        sc.fail(f"the script was to run for each of the two values: {sc.runs()}")
+    text = edited_program("gen")
+    want = oracle_of(sc, {"src/one.rs": text, "value.txt": "b\n"}, extra)
+    said = send_edit(sc.env("a")["RA_JIT_HOME"], os.path.join(sc.ws, "src", "one.rs"), text)
+    sc.notes["edit-said"] = said
+    if not said.startswith("ok"):
+        sc.fail(f"the edit of A was answered {said!r}: a world that moved is loaded again for it")
+        return
+    got = sc.program("gen-one")
+    sc.notes["edited-a"] = [got, want]
+    strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+    if strip(got) != strip(want):
+        sc.fail(f"A's edited program printed {got!r}, what cargo builds of the tree {want!r}")
+    elif got != want:
+        sc.gaps.append(f"A's edited program printed {got!r}, cargo's {want!r} (the warm worker's native link)")
+    sc.notes["refused"] = [e for e in sc.events("a") if e[0] == "refused"]
+    sc.timeouts()
+
+
+def unrelated(sc, source_sha):
+    """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
+    which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
+    extra = shared_projects(sc, worktrees=True)
+    worker, sock, env = by_hand(sc, extra)
+    try:
+        if not serving(sc, sock, env):
+            return
+        rc, said = join_s(sc, sock, env, "a")
+        if rc != 0:
+            sc.fail(f"S did not join (rc {rc}): {said[-400:]}")
+            return
+        B = sc.client("b", ("--bin", "gen-one"), cwd=sc.s, GEN="b", **extra)
+        sc.finish(B, "B (S)")
+        if B.returncode != 0:
+            sc.fail(f"B's build in S exited {B.returncode}: {B.err[-400:]}")
+            return
+        if sc.runs() != ["a", "b"]:
+            sc.fail(f"the script of S was to run for B: {sc.runs()}")
+        path = os.path.join(sc.r, "src", "one.rs")
+        text = open(path).read() + "// an edit\n"
+        said = send_edit(sc.dir, path, text, "worker.sock")
+        sc.notes["edit-said"] = said
+        if not said.startswith("ok"):
+            sc.fail(f"the edit of R was answered {said!r}: S's world moved, and R reads nothing of S's")
+        sc.timeouts()
+    finally:
+        worker.kill()
+
+
 def link_control(sc, source_sha):
     """No concurrency, no barrier: GEN=a, then GEN=b, a static library named for the value. Not
     about leases: whether a warm worker, which finds only the script's output changed, links the
@@ -1174,6 +1325,8 @@ SCENARIOS = {
     "coab": coab,
     "internal": internal,
     "groups": groups,
+    "generation": generation,
+    "unrelated": unrelated,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,

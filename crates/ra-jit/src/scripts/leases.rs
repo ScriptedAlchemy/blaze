@@ -151,44 +151,78 @@ pub(crate) fn anonymous() -> u64 {
 
 /// Moves [`generation`] when `path`, held by another process, is free to be taken: a thread
 /// of its own polls it, so that the worker's main loop does not. It is for `build` and ends
-/// when no build that asked is left, however long the file stays held.
+/// when no build that asked is left, however long the file stays held. A watch is a
+/// registration with an identity of its own: the thread ends its own and no other, and does
+/// so under the lock that registrations are made under, so that a build that asks as the last
+/// one's watch ends gets a watch of its own.
 pub(crate) fn watch(path: &Path, build: u64) {
-    let new = {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = {
         let mut map = interest();
-        let owners = map.get_or_insert_with(HashMap::default).entry(path.to_owned()).or_default();
-        let new = owners.is_empty();
-        owners.insert(build);
-        new
-    };
-    if !new {
-        return;
-    }
-    let path = path.to_owned();
-    std::thread::spawn(move || {
-        let wanted =
-            || interest().as_ref().and_then(|it| it.get(&path)).is_some_and(|it| !it.is_empty());
-        let freed = wait_while(&path, None, &wanted).is_ok_and(|ended| !ended);
-        interest().get_or_insert_with(HashMap::default).remove(&path);
-        if freed {
-            moved();
+        let map = map.get_or_insert_with(HashMap::default);
+        match map.get_mut(path) {
+            Some(registration) => {
+                registration.owners.insert(build);
+                return;
+            }
+            None => {
+                let id = NEXT.fetch_add(1, Ordering::SeqCst);
+                let owners = HashSet::from([build]);
+                map.insert(path.to_owned(), Registration { id, owners });
+                id
+            }
         }
-    });
+    };
+    let path = path.to_owned();
+    std::thread::spawn(move || watching(&path, id));
+}
+
+/// The thread of the watch `id` of `path`.
+fn watching(path: &Path, id: u64) {
+    let ends = |freed: bool| {
+        let mut map = interest();
+        let map = map.get_or_insert_with(HashMap::default);
+        let mine = map.get(path).is_some_and(|it| it.id == id);
+        // Nobody left to wake: ends with the entry, if it is still empty.
+        if !freed && map.get(path).is_some_and(|it| it.id == id && !it.owners.is_empty()) {
+            return false;
+        }
+        if mine {
+            map.remove(path);
+        }
+        true
+    };
+    let Ok(file) = open(path) else {
+        ends(false);
+        return;
+    };
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                ends(true);
+                moved();
+                return;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(_)) => {
+                ends(false);
+                return;
+            }
+        }
+        if ends(false) {
+            return;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(250));
+    }
 }
 
 /// Waits until no process holds `path`, for at most `within` if that is said; none, without
 /// end, as cargo waits for the build directory. A message every half minute says what is waited
 /// for. It takes the file and gives it back: the attempt that follows takes it again.
 pub(super) fn wait(path: &Path, within: Option<Duration>) -> Result<(), String> {
-    wait_while(path, within, &|| true).map(|_| ())
-}
-
-/// [`wait`] for as long as `wanted` says someone is waiting for it: `Ok(true)` when it ended
-/// because nobody was, `Ok(false)` when the file was free.
-fn wait_while(
-    path: &Path,
-    within: Option<Duration>,
-    wanted: &dyn Fn() -> bool,
-) -> Result<bool, String> {
     let file = open(path).map_err(|it| match it {
         Refused::Failed(why) => why,
         Refused::Busy(busy) => busy.to_string(),
@@ -200,13 +234,10 @@ fn wait_while(
         match file.try_lock() {
             Ok(()) => {
                 let _ = file.unlock();
-                return Ok(false);
+                return Ok(());
             }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(err)) => return Err(err.to_string()),
-        }
-        if !wanted() {
-            return Ok(true);
         }
         let waited = began.elapsed();
         if within.is_some_and(|it| waited >= it) {
@@ -219,6 +250,16 @@ fn wait_while(
         std::thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_millis(250));
     }
+}
+
+/// What a build decided of a script.
+pub(super) enum Judged {
+    /// It ran, or was found fresh, and the build holds the output.
+    Standing(Arc<Done>),
+    /// The same, but the build gave the lease up to wait (it yielded).
+    Released(Arc<Done>),
+    /// It failed, with this message.
+    Failed(String),
 }
 
 /// The leases a process holds, and what its builds judged.
@@ -240,13 +281,22 @@ struct State {
     consumers: HashMap<u64, usize>,
     /// The builds that yielded while a consumer of theirs was reading: they let go when it ends.
     yielding: HashSet<u64>,
+    /// How many operations of each build are under way: a judging of the scripts of all the
+    /// checkouts it reads, which has the admission for as long as it lasts.
+    operations: HashMap<u64, usize>,
 }
 
-/// The files of other processes that builds wait for, and which builds: a watch ends when none
-/// of them is left.
-static INTEREST: Mutex<Option<HashMap<PathBuf, HashSet<u64>>>> = Mutex::new(None);
+/// A watch of a file of another process: which one it is (a thread ends only the registration
+/// it was made for), and the builds that wait for the file.
+struct Registration {
+    id: u64,
+    owners: HashSet<u64>,
+}
 
-fn interest() -> std::sync::MutexGuard<'static, Option<HashMap<PathBuf, HashSet<u64>>>> {
+/// The files of other processes that builds wait for.
+static INTEREST: Mutex<Option<HashMap<PathBuf, Registration>>> = Mutex::new(None);
+
+fn interest() -> std::sync::MutexGuard<'static, Option<HashMap<PathBuf, Registration>>> {
     INTEREST.lock().unwrap_or_else(|it| it.into_inner())
 }
 
@@ -261,6 +311,85 @@ impl Leases {
             return None;
         }
         self.state().judged.get(&(build, run_dir.to_owned())).cloned()
+    }
+
+    /// What `build` decided of the script in `run_dir`, and whether it holds the output that
+    /// decision is of. A failure is the build's for good; a result whose lease the build gave up
+    /// (it yielded) is only as good as the output is: [`Leases::reacquire`] looks.
+    pub(super) fn decision(&self, build: u64, run_dir: &Path) -> Option<Judged> {
+        if build == 0 {
+            return None;
+        }
+        let state = self.state();
+        let key = (build, run_dir.to_owned());
+        match state.judged.get(&key)? {
+            Err(why) => Some(Judged::Failed(why.clone())),
+            Ok(done) if state.held.contains_key(&key) => Some(Judged::Standing(done.clone())),
+            Ok(done) => Some(Judged::Released(done.clone())),
+        }
+    }
+
+    /// Has `build` hold the output of a result it gave up the lease of, if the output is still
+    /// the run `generation` made. `false` when another build ran the script since (the result
+    /// is the output of nothing now and is forgotten: the script is judged again, which is the
+    /// only way to read what it left); an error when a script is running.
+    pub(super) fn reacquire(
+        &self,
+        build: u64,
+        run_dir: &Path,
+        generation: u64,
+    ) -> Result<bool, Refused> {
+        let path = run_dir.join(FILE);
+        let file = open(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(Busy::Elsewhere { path }.into()),
+            Err(std::fs::TryLockError::Error(err)) => return Err(Refused::Failed(err.to_string())),
+        }
+        let mut state = self.state();
+        let key = (build, run_dir.to_owned());
+        if super::generation_of(run_dir) == Some(generation) {
+            if let Some(old) = state.held.insert(key, file) {
+                let _ = old.unlock();
+            }
+            return Ok(true);
+        }
+        let _ = file.unlock();
+        state.judged.remove(&key);
+        Ok(false)
+    }
+
+    /// Whether an operation of `build` is under way.
+    pub(super) fn in_operation(&self, build: u64) -> bool {
+        self.state().operations.get(&build).is_some_and(|it| *it > 0)
+    }
+
+    /// Begins an operation of `build`: the admission it takes is kept until it ends.
+    pub(super) fn begin_operation(&self, build: u64) {
+        if build != 0 {
+            *self.state().operations.entry(build).or_default() += 1;
+        }
+    }
+
+    /// Ends an operation of `build`. The admission goes with the last, unless the operation
+    /// waits (`waiting`) and is asked again, which has it.
+    pub(super) fn end_operation(&self, build: u64, waiting: bool) {
+        if build == 0 {
+            return;
+        }
+        let last = {
+            let mut state = self.state();
+            let Some(count) = state.operations.get_mut(&build) else { return };
+            *count -= 1;
+            let last = *count == 0;
+            if last {
+                state.operations.remove(&build);
+            }
+            last
+        };
+        if last && !waiting {
+            self.release_admission(build);
+        }
     }
 
     /// The admission of the script directory `base` for `build`. It is kept until the attempt
@@ -367,7 +496,8 @@ impl Leases {
     /// How many leases it held.
     pub(super) fn retire(&self, build: u64) -> usize {
         let mut state = self.state();
-        let released = release_world(&mut state, build);
+        state.judged.retain(|(it, _), _| *it != build);
+        let released = release_leases(&mut state, build);
         let admitted: Vec<_> =
             state.admission.iter().filter(|it| it.1.0 == build).map(|it| it.0.clone()).collect();
         for path in admitted {
@@ -377,18 +507,21 @@ impl Leases {
         }
         state.consumers.remove(&build);
         state.yielding.remove(&build);
+        state.operations.remove(&build);
         drop(state);
         if let Some(map) = interest().as_mut() {
-            map.values_mut().for_each(|it| _ = it.remove(&build));
+            map.values_mut().for_each(|it| _ = it.owners.remove(&build));
         }
         moved();
         released
     }
 
-    /// `build` is refused what it waits for: it lets go of what it holds that no consumer of its
-    /// is reading, and of what it judged, so that it waits holding nothing; with a consumer
-    /// reading, it does when the last ends. Not the build that has the admission: what it holds
-    /// is what the readers it waits for wait for nothing of. Whether it let go now.
+    /// `build` is refused what it waits for: it lets go of the leases that no consumer of its is
+    /// reading, so that it waits holding nothing; with a consumer reading, it does when the last
+    /// ends. What it decided stays, a failure for good and a result as far as the output is the
+    /// run it was ([`Leases::reacquire`]): only a build that another ran the script of meanwhile
+    /// judges it again. Not the build that has the admission: what it holds is what the readers
+    /// it waits for wait for nothing of. Whether it let go now.
     pub(super) fn yield_world(&self, build: u64) -> bool {
         if build == 0 {
             return false;
@@ -397,32 +530,32 @@ impl Leases {
         if state.admission.values().any(|it| it.0 == build) {
             return false;
         }
-        let holds = state.held.keys().any(|it| it.0 == build)
-            || state.judged.keys().any(|it| it.0 == build);
-        if !holds {
+        if !state.held.keys().any(|it| it.0 == build) {
             return false;
         }
         if state.consumers.get(&build).is_some_and(|it| *it > 0) {
             state.yielding.insert(build);
             return false;
         }
-        release_world(&mut state, build);
+        release_leases(&mut state, build);
         drop(state);
         moved();
         true
     }
 
-    /// Has `build` read the output of the scripts of `world`, each with the token of the run
-    /// it was loaded from: shared leases on all of it, taken before anything is read, and the
-    /// tokens looked at after. A script that is running is waited for, which it ends by itself.
-    /// A world that moved since is [`Stale`], and nothing of it is held for this call.
+    /// Has `build` read the output of the scripts of `world`, each with the generation of the
+    /// run it was loaded from: the consumer is counted first, so that no release can come
+    /// between, then shared leases on all of it, taken before anything is read, and the
+    /// generations looked at after. A script that is running is waited for, which it ends by
+    /// itself. A world that moved since is [`Stale`], and nothing of it is held for this call.
     pub(super) fn pin(&self, build: u64, world: &[(PathBuf, u64)]) -> Result<(), Stale> {
         if build == 0 {
             return Ok(());
         }
+        *self.state().consumers.entry(build).or_default() += 1;
         let mut taken = Vec::new();
         let mut failed = None;
-        for (dir, token) in world {
+        for (dir, generation) in world {
             let key = (build, dir.clone());
             let held = self.state().held.contains_key(&key);
             if !held {
@@ -443,7 +576,7 @@ impl Leases {
                 }
                 taken.push(key);
             }
-            if super::token_of(dir) != Some(*token) {
+            if super::generation_of(dir) != Some(*generation) {
                 failed = Some(Stale { run_dir: dir.clone(), why: "it was run again".to_owned() });
                 break;
             }
@@ -455,9 +588,10 @@ impl Leases {
                     let _ = file.unlock();
                 }
             }
+            drop(state);
+            self.unpin(build);
             return Err(stale);
         }
-        *self.state().consumers.entry(build).or_default() += 1;
         Ok(())
     }
 
@@ -474,7 +608,7 @@ impl Leases {
         }
         state.consumers.remove(&build);
         if state.yielding.remove(&build) {
-            release_world(&mut state, build);
+            release_leases(&mut state, build);
             drop(state);
             moved();
         }
@@ -497,9 +631,8 @@ impl Leases {
     }
 }
 
-/// What a build judged and the leases it holds, let go. How many leases.
-fn release_world(state: &mut State, build: u64) -> usize {
-    state.judged.retain(|(it, _), _| *it != build);
+/// The leases a build holds, let go. How many.
+fn release_leases(state: &mut State, build: u64) -> usize {
     let held: Vec<_> = state.held.keys().filter(|(it, _)| *it == build).cloned().collect();
     let released = held.len();
     for key in held {
@@ -588,8 +721,6 @@ impl Drop for Writer<'_> {
 mod tests {
     use std::time::Duration;
 
-    use blaze_build_script::fresh::Fingerprint;
-
     use super::*;
 
     fn dir(test: &str) -> PathBuf {
@@ -599,20 +730,20 @@ mod tests {
         dir
     }
 
-    /// The record a run leaves, and its token.
+    /// What a run leaves of its generation: `marker` names it. Its number.
     fn record(run_dir: &Path, marker: &str) -> u64 {
-        let fingerprint = Fingerprint { rustc: marker.to_owned(), ..Default::default() };
+        let generation = blaze_build_script::fresh::hash_bytes(marker.as_bytes());
         std::fs::create_dir_all(run_dir).unwrap();
-        std::fs::write(run_dir.join("blaze-run.json"), serde_json::to_vec(&fingerprint).unwrap())
-            .unwrap();
-        fingerprint.hash()
+        std::fs::write(run_dir.join("blaze-generation"), generation.to_string()).unwrap();
+        generation
     }
 
     fn done(out: &Path, token: u64) -> Arc<Done> {
         Arc::new(Done {
             out_dir: out.to_owned(),
             output: Default::default(),
-            fingerprint: token,
+            fingerprint: 0,
+            generation: token,
             made: None,
             links: None,
         })
@@ -730,12 +861,17 @@ mod tests {
             let refused = busy(reader.admit(1, &base));
             assert!(matches!(refused, Busy::Process { .. } | Busy::Elsewhere { .. }));
             assert!(reader.yield_world(1));
-            assert!(reader.judged(1, &r).is_none() && !reader.builds().contains(&1));
+            // It holds no lease, and what it decided stays.
+            assert!(matches!(reader.decision(1, &r), Some(Judged::Released(_))));
+            let old = super::super::generation_of(&r).unwrap();
             // W goes on, and ends; M asks again and gets the admission.
             let token = record(&r, "r2");
             writer_side.writer(2, &r).unwrap().stands(done(&r, token)).unwrap();
             writer_side.release_admission(2);
             reader.admit(1, &base).unwrap();
+            // W ran R meanwhile: M's result is of an output that is not there, and is forgotten.
+            assert!(!reader.reacquire(1, &r, old).unwrap());
+            assert!(reader.decision(1, &r).is_none());
             reader.release_admission(1);
             writer_side.retire(2);
         }
@@ -795,7 +931,7 @@ mod tests {
         assert!(matches!(busy(leases.writer(2, &x)), Busy::Process { build: 1, .. }));
         leases.unpin(1);
         leases.writer(2, &x).unwrap();
-        assert!(leases.builds().iter().all(|it| *it != 1));
+        assert!(matches!(leases.decision(1, &x), Some(Judged::Released(_))));
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&x);
     }
@@ -860,6 +996,139 @@ mod tests {
         while interest().as_ref().is_some_and(|it| it.contains_key(&held)) {
             assert!(began.elapsed() < Duration::from_secs(5), "the watch outlived its build");
             std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&x);
+    }
+
+    #[test]
+    fn a_result_that_was_yielded_is_the_builds_again_while_the_output_is_the_run_it_was_of() {
+        let (base, x) = (dir("released"), dir("released-x"));
+        let leases = Leases::default();
+        let generation = runs(&leases, 1, &base, &x, "one");
+        leases.release_admission(1);
+        assert!(matches!(leases.decision(1, &x), Some(Judged::Standing(_))));
+        assert!(leases.yield_world(1));
+        assert!(matches!(leases.decision(1, &x), Some(Judged::Released(_))));
+        // Another build reads it meanwhile, which is nothing to the result.
+        let other = anonymous();
+        leases.hold(other, &x).unwrap();
+        assert!(leases.reacquire(1, &x, generation).unwrap());
+        assert!(
+            matches!(leases.decision(1, &x), Some(Judged::Standing(done)) if done.generation == generation)
+        );
+        // A failure is the build's, with or without a lease.
+        leases.admit(1, &base).unwrap();
+        leases.retire(other);
+        leases.writer(1, &x).unwrap().failed("exit status: 3".to_owned());
+        assert!(leases.yield_world(1) || !leases.builds().is_empty());
+        assert!(
+            matches!(leases.decision(1, &x), Some(Judged::Failed(why)) if why == "exit status: 3")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&x);
+    }
+
+    #[test]
+    fn a_pin_that_is_taking_its_leases_is_a_consumer_before_it_has_them() {
+        let (base, x, y) = (dir("inflight"), dir("inflight-x"), dir("inflight-y"));
+        let leases = Arc::new(Leases::default());
+        let token = runs(&leases, 1, &base, &x, "one");
+        leases.release_admission(1);
+        // Y is being run by another build: a pin that wants it waits.
+        let other = Leases::default();
+        let on_y = record(&y, "y");
+        other.admit(2, &base).unwrap();
+        let writer = other.writer(2, &y).unwrap();
+        let pinning = {
+            let (leases, world) = (leases.clone(), vec![(x.clone(), token), (y.clone(), on_y)]);
+            std::thread::spawn(move || leases.pin(1, &world))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!pinning.is_finished());
+        // The build is refused something and yields while that pin is not done: it is a
+        // consumer already, so nothing it holds is let go under it.
+        assert!(!leases.yield_world(1));
+        assert!(matches!(leases.decision(1, &x), Some(Judged::Standing(_))));
+        writer.stands(done(&y, on_y)).unwrap();
+        pinning.join().unwrap().unwrap();
+        // Its end is the release the yield waited for.
+        leases.unpin(1);
+        assert!(matches!(leases.decision(1, &x), Some(Judged::Released(_))));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&x);
+        let _ = std::fs::remove_dir_all(&y);
+    }
+
+    #[test]
+    fn an_operation_has_the_admission_for_all_its_groups_and_no_build_is_between_them() {
+        let (base, r, s) = (dir("operation"), dir("operation-r"), dir("operation-s"));
+        let (a, b) = (Leases::default(), Leases::default());
+        a.begin_operation(1);
+        // A judges R and S; its first group ends an attempt, and the admission is its still.
+        a.admit(1, &base).unwrap();
+        let token = record(&r, "r-a");
+        a.writer(1, &r).unwrap().stands(done(&r, token)).unwrap();
+        assert!(a.in_operation(1));
+        // B asks for S first: it holds nothing, so it has nothing for A to wait for.
+        assert!(matches!(busy(b.admit(2, &base)), Busy::Elsewhere { .. }));
+        assert!(b.builds().is_empty());
+        let token = record(&s, "s-a");
+        a.writer(1, &s).unwrap().stands(done(&s, token)).unwrap();
+        a.end_operation(1, false);
+        assert!(!a.in_operation(1));
+        // The operation is over and the admission with it; A reads both, and B runs after it.
+        b.admit(2, &base).unwrap();
+        assert!(matches!(busy(b.writer(2, &s)), Busy::Elsewhere { .. }));
+        a.retire(1);
+        b.writer(2, &s).unwrap();
+        // One that waits keeps it.
+        b.begin_operation(2);
+        b.end_operation(2, true);
+        assert!(matches!(busy(a.admit(3, &base)), Busy::Elsewhere { .. }));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// The window the review named: the last build that asked for a file retires, the thread
+    /// that watches it decides to end, a build asks for the same file, and the thread ends. The
+    /// build that asked is woken when the file is free, whichever way the threads are scheduled.
+    #[test]
+    fn a_build_that_asks_as_a_watch_ends_is_woken_when_the_file_is_free() {
+        let (base, x) = (dir("watch-window"), dir("watch-window-x"));
+        let holder = Leases::default();
+        runs(&holder, 1, &base, &x, "one");
+        let held = x.join(FILE);
+        let first = 100;
+        watch(&held, first);
+        for round in 0..200u64 {
+            // The retirement of the build that asked, and the next asker, close together.
+            let retiring = first + round;
+            let retired = std::thread::spawn(move || {
+                Leases::default().retire(retiring);
+            });
+            watch(&held, first + round + 1);
+            retired.join().unwrap();
+        }
+        let last = first + 200;
+        // The asker that is left has a watch of its own: the entry is there, and it has it.
+        let owners = || {
+            interest()
+                .as_ref()
+                .and_then(|it| it.get(&held))
+                .map(|it| it.owners.iter().copied().collect::<Vec<_>>())
+        };
+        assert_eq!(owners(), Some(vec![last]), "the watch of the build that is left was lost");
+        // The holder lets go: the thread that has the entry sees the file free and ends it.
+        holder.retire(1);
+        let began = Instant::now();
+        while owners().is_some() {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "no thread woke the build that asked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&x);

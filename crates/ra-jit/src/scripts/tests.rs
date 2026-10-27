@@ -243,6 +243,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
                 out_dir: unit.out_dir.clone(),
                 output,
                 fingerprint: 0,
+                generation: 0,
                 made: None,
                 links: None,
             })),
@@ -436,7 +437,7 @@ fn a_script_runs_once_in_each_build_whatever_the_other_builds_did_between_its_re
     let a1 = pkg.request(&leases, 1, "a", &always).unwrap();
     assert_eq!(pkg.generated(&a1), "a");
     // The token a consumer of this output holds is the record the run left.
-    assert_eq!(token_of(a1.out_dir.parent().unwrap()), Some(a1.fingerprint));
+    assert_eq!(generation_of(a1.out_dir.parent().unwrap()), Some(a1.generation));
     assert_eq!(pkg.runs(), ["a"]);
     // B asks while A reads the output: it does not write over it and is put off.
     assert_eq!(why(pkg.request(&leases, 2, "b", &always)), Err("busy 1".to_owned()));
@@ -626,4 +627,76 @@ fn wait_within(child: &mut std::process::Child, within: Duration) -> std::proces
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn two_runs_of_one_fingerprint_are_two_generations_and_a_world_of_one_is_not_the_other() {
+    let base = dir("generation");
+    let pkg = Fixture::at(&base);
+    let (first, second) = (Leases::default(), Leases::default());
+    let always = [("ALWAYS", "1")];
+    // A script that runs every build, over one fingerprint: the same inputs, the same watched
+    // paths, two executions that may leave other output.
+    let a = pkg.request(&first, 1, "a", &always).unwrap();
+    let a_world = vec![(a.out_dir.parent().unwrap().to_owned(), a.generation)];
+    first.retire(1);
+    let b = pkg.request(&second, 2, "a", &always).unwrap();
+    assert_eq!(a.fingerprint, b.fingerprint, "what the runs were made from is the same");
+    assert_ne!(a.generation, b.generation, "and they are two runs");
+    assert_eq!(generation_of(a.out_dir.parent().unwrap()), Some(b.generation));
+    // A database loaded from the first run is not read with the second's output.
+    let reader = anonymous();
+    let stale = second.pin(reader, &a_world).unwrap_err();
+    assert_eq!(stale.run_dir, a.out_dir.parent().unwrap());
+    second.retire(2);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_script_runs_once_in_a_build_that_yields_unless_another_build_ran_it_meanwhile() {
+    let base = dir("once");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let always = [("ALWAYS", "1")];
+    pkg.request(&leases, 1, "a", &always).unwrap();
+    assert_eq!(pkg.runs(), ["a"]);
+    // The build yields to wait for something else: its lease goes, its decision stays.
+    assert!(leases.yield_world(1));
+    let again = pkg.request(&leases, 1, "a", &always).unwrap();
+    assert_eq!(pkg.runs(), ["a"], "an always-stale script runs once in a build, yielded or not");
+    assert_eq!(pkg.generated(&again), "a");
+    // Another build runs it while this one has given the lease up: the output is that build's,
+    // and the only way to read what the script left is to judge it again.
+    assert!(leases.yield_world(1));
+    pkg.request(&leases, 2, "b", &always).unwrap();
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    let third = pkg.request(&leases, 1, "a", &always);
+    assert!(matches!(third, Err(Attempt::Busy(_))), "build 2 reads it: the build waits for it");
+    leases.retire(2);
+    let last = pkg.request(&leases, 1, "a", &always).unwrap();
+    assert_eq!(pkg.generated(&last), "a");
+    assert_eq!(pkg.runs(), ["a", "b", "a"]);
+    leases.retire(1);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failure_is_the_builds_for_good_whether_it_yielded_or_not() {
+    let base = dir("failed-yield");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let fails = [("ALWAYS", "1"), ("FAIL", "1")];
+    let first = why(pkg.request(&leases, 1, "a", &fails)).unwrap_err();
+    assert_eq!(pkg.runs(), ["a"]);
+    // The build holds nothing of a failure; it yields what it has, and another build runs.
+    leases.yield_world(1);
+    assert!(pkg.request(&leases, 2, "b", &[("ALWAYS", "1")]).is_ok());
+    assert_eq!(why(pkg.request(&leases, 1, "a", &fails)), Err(first));
+    assert_eq!(pkg.runs(), ["a", "b"], "the failed script is not run again for the build");
+    leases.retire(2);
+    leases.retire(1);
+    let _ = std::fs::remove_dir_all(&base);
 }

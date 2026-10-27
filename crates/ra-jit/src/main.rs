@@ -2565,14 +2565,23 @@ impl Checkouts {
         vfs: &mut vfs::Vfs,
         owner: u64,
     ) -> anyhow::Result<()> {
+        // All the checkouts' scripts are judged under one admission, which no other build is
+        // between the groups of.
+        let mut operation = scripts::operation(owner);
         for attempt in 1.. {
             match self.add_once(projects, db, vfs, owner) {
+                // Each time the groups are judged again, over the output as it is now.
                 Err(error) if error.downcast_ref::<scripts::Stale>().is_some() && attempt < 16 => {
                     eprintln!(
                         "load: the scripts' output moved while it was loaded, again: {error}"
                     );
                 }
-                done => return done,
+                done => {
+                    if done.as_ref().is_err_and(|it| it.downcast_ref::<scripts::Busy>().is_some()) {
+                        operation.wait();
+                    }
+                    return done;
+                }
             }
         }
         unreachable!("the loop ends in a return")
@@ -2586,6 +2595,8 @@ impl Checkouts {
         owner: u64,
     ) -> anyhow::Result<()> {
         let mut world = scripts::World::new();
+        // What is watched of each, which is not told to the inputs until the database has them.
+        let mut watched = Vec::new();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
@@ -2641,9 +2652,8 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            let config = &self.cargo_config;
             world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
-            self.inputs.watch(&root, &workspace, config, &FxHashMap::default(), build, own);
+            watched.push((root.clone(), workspace.clone(), self.cargo_config.clone(), build, own));
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
             scripts::barrier::hold("group", owner);
@@ -2652,12 +2662,28 @@ impl Checkouts {
         // a group a build gave up to wait for another are taken again, and the tokens looked at.
         world.sort();
         world.dedup();
-        scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
+        let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        for (root, workspace, config, build, own) in watched {
+            self.inputs.watch(&root, &workspace, &config, &FxHashMap::default(), build, own);
+        }
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
         Ok(())
+    }
+
+    /// The scripts the programs at `ats` read the output of through the database: those of the
+    /// checkouts they are built from, with the generation of each run it was loaded from. A
+    /// stale group of a checkout none of them reads is not theirs to wait for or to refuse.
+    fn world_for(&self, programs: &[Program], ats: &[usize]) -> scripts::World {
+        let mut roots = Vec::new();
+        for &at in ats {
+            let args = &programs[at].args;
+            roots.push(args.checkout.clone());
+            roots.extend(args.base.clone());
+        }
+        self.inputs.world_of(&roots)
     }
 
     /// The checkouts that are no longer what they were loaded from, for a build of
@@ -6516,14 +6542,23 @@ struct Client {
     /// The client reading the output of the scripts of the database ([`scripts::pin`]) for as
     /// long as it lives: the compile, the link, the errors and the link that is detached.
     pin: Option<scripts::Pin>,
+    /// How many times the world it reads moved and it was put off to read the one that is.
+    recovered: u8,
 }
 
 impl Client {
     /// A client of the build `build`, or when that is `0` of one of its own.
     fn of(stream: UnixStream, env: ide_db::base_db::Env, build: u64) -> Client {
         match build {
-            0 => Client { stream, env, build: scripts::anonymous(), own_build: true, pin: None },
-            build => Client { stream, env, build, own_build: false, pin: None },
+            0 => Client {
+                stream,
+                env,
+                build: scripts::anonymous(),
+                own_build: true,
+                pin: None,
+                recovered: 0,
+            },
+            build => Client { stream, env, build, own_build: false, pin: None, recovered: 0 },
         }
     }
 
@@ -6862,6 +6897,9 @@ struct Builds {
     /// not sleep through a generation that has moved since, however the event that moved it
     /// was taken.
     busy_since: Option<u64>,
+    /// Requests were put back to be asked again at once (a world that moved is loaded again):
+    /// the worker does not sleep before it asks them.
+    again: bool,
     /// The edits that wait, the newest of each file: one typed over before it was built is
     /// answered as superseded.
     edits: Vec<Edited>,
@@ -7012,7 +7050,12 @@ impl Builds {
                 return Ok(false);
             }
             program.interrupted += 1;
-            clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
+            // Not reading while they wait to be built again: no pin of theirs holds up what
+            // the build they wait for needs.
+            clients.into_iter().rev().for_each(|mut it| {
+                it.2.pin = None;
+                self.waiting.push_front(it);
+            });
             return Ok(false);
         };
         (program.interrupted, program.moved) = (0, false);
@@ -8531,6 +8574,7 @@ fn run_holding(
         waiting: Default::default(),
         stuck: false,
         busy_since: None,
+        again: false,
         edits: Vec::new(),
         tier_asks: Vec::new(),
         tiered: Vec::new(),
@@ -8637,6 +8681,7 @@ fn run_holding(
                 }
                 // Every request that waits is asked now: one that is still put off says so.
                 builds.busy_since = None;
+                builds.again = false;
                 loop {
                     // Asked again after each: a checkout that joins takes long enough for the
                     // requests sent with its own to arrive.
@@ -8670,6 +8715,8 @@ fn run_holding(
                     // Read before anything is asked of the scripts, so that what moves while
                     // they are is seen by the worker before it sleeps.
                     let generation = scripts::generation();
+                    // The scripts of all the checkouts are judged under one admission.
+                    let mut operation = scripts::operation(stream.build);
                     match checkouts.stale(project, &stream.env, stream.build) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
@@ -8724,6 +8771,7 @@ fn run_holding(
                                         &format!("reload: {error}"),
                                     );
                                     builds.put_off(generation);
+                                    operation.wait();
                                     scripts::barrier::hold("deferred", stream.build);
                                     later.push((request, asked, stream));
                                     continue;
@@ -8737,6 +8785,7 @@ fn run_holding(
                         Err(error) if error.downcast_ref::<scripts::Busy>().is_some() => {
                             scripts::barrier::event("put-off", stream.build, &format!("{error}"));
                             builds.put_off(generation);
+                            operation.wait();
                             scripts::barrier::hold("deferred", stream.build);
                             later.push((request, asked, stream));
                             continue;
@@ -8885,6 +8934,7 @@ fn run_holding(
                     {
                         scripts::barrier::event("put-off", stream.build, &format!("join: {error}"));
                         builds.put_off(generation);
+                        operation.wait();
                         later.push((request, asked, stream));
                         continue;
                     }
@@ -9053,6 +9103,32 @@ fn run_holding(
                         builds.edits.push(edited);
                         continue;
                     }
+                    // The edit is built from the world its programs' checkouts were loaded from.
+                    // If another worker ran their scripts since, that world is another than the
+                    // disk's: the checkouts are asked for as a request for each of the programs
+                    // would, with the variables the edit is built for, and the edit, with its
+                    // text, is put back to be taken when they are loaded again.
+                    let world = checkouts.world_for(&programs, &owners);
+                    if let Err(stale) = edited.client.read(&world) {
+                        scripts::barrier::event("refused", edited.client.build, &stale.to_string());
+                        if edited.client.recovered >= 4 {
+                            let _ = writeln!(&edited.client, "failed: {stale}; ask again");
+                            continue;
+                        }
+                        edited.client.recovered += 1;
+                        let env = ide_db::base_db::ProcessEnv::try_get(&db)
+                            .map(|it| it.vars(&db).clone())
+                            .unwrap_or_default();
+                        for &at in &owners {
+                            let Some(mut client) = Client::nobody() else { continue };
+                            client.env = env.clone();
+                            let target = (at != 0).then(|| Target::of(&programs[at].args));
+                            builds.waiting.push_back((Request::Sync, target, client));
+                        }
+                        builds.edits.push(edited);
+                        builds.again = true;
+                        continue;
+                    }
                     let rust = path.extension().is_some_and(|it| it == "rs");
                     let text = std::mem::take(&mut edited.text);
                     let text = if rust { load_cargo::source_text(text) } else { text };
@@ -9089,7 +9165,7 @@ fn run_holding(
                 // What waited for the build that was interrupted is asked again at once.
                 // Not asleep when a build that held what a request waits for ended meanwhile.
                 let moved = builds.busy_since.is_some_and(|it| it != scripts::generation());
-                builds.stuck = clients.is_empty() && !interrupt && !moved;
+                builds.stuck = clients.is_empty() && !interrupt && !moved && !builds.again;
                 if clients.is_empty() {
                     continue;
                 }
@@ -9097,15 +9173,26 @@ fn run_holding(
                 // there is to build: the clients read it from here on, the numbered ones with
                 // what their builds hold, an edit or a rebuild nobody asked for with what they
                 // take now. A world that moved is not read.
-                let world = checkouts.inputs.world();
-                clients.retain_mut(|(_, (_, _, client))| match client.read(&world) {
-                    Ok(()) => true,
-                    Err(stale) => {
-                        scripts::barrier::event("refused", client.build, &stale.to_string());
-                        let _ = writeln!(&*client, "failed: {stale}; ask again");
-                        false
+                let mut reading = Vec::new();
+                for (at, (request, target, mut client)) in std::mem::take(&mut clients) {
+                    let world = checkouts.world_for(&programs, &[at]);
+                    let Err(stale) = client.read(&world) else {
+                        reading.push((at, (request, target, client)));
+                        continue;
+                    };
+                    scripts::barrier::event("refused", client.build, &stale.to_string());
+                    // A request that came through the check of the scripts asks it again, with
+                    // its own variables: the world that moved is loaded as it is now.
+                    let asks = matches!(request, Request::Sync | Request::Patch);
+                    if asks && client.env.iter().next().is_some() && client.recovered < 4 {
+                        client.recovered += 1;
+                        builds.waiting.push_back((request, target, client));
+                        builds.again = true;
+                    } else {
+                        let _ = writeln!(&client, "failed: {stale}; ask again");
                     }
-                });
+                }
+                clients = reading;
                 if clients.is_empty() {
                     continue;
                 }

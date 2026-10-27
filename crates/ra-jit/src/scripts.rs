@@ -70,15 +70,77 @@ pub(crate) fn release(build: u64) {
     LEASES.retire(build);
 }
 
-/// The scripts a database was loaded from: the run directory of each, with the token of the run
-/// it was loaded from (the hash of the record the run left, [`token_of`]).
+/// An operation of a build: the judging of the scripts of all the checkouts it reads, which has
+/// the admission for as long as it lasts, however many times [`run`] is called, so that no build
+/// holds one group and waits for another. It ends when it is dropped; one that is put off and is
+/// asked again (`wait`) keeps the admission.
+pub(crate) struct Operation {
+    build: u64,
+    waiting: bool,
+}
+
+impl Operation {
+    /// The operation is put off for what another build holds, and asked again.
+    pub(crate) fn wait(&mut self) {
+        self.waiting = true;
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        LEASES.end_operation(self.build, self.waiting);
+    }
+}
+
+/// Begins an operation of `build`.
+pub(crate) fn operation(build: u64) -> Operation {
+    LEASES.begin_operation(build);
+    Operation { build, waiting: false }
+}
+
+/// The scripts a database was loaded from: the run directory of each, with the generation of
+/// the run it was loaded from ([`generation_of`]).
 pub(crate) type World = Vec<(PathBuf, u64)>;
 
-/// The token of the run in `run_dir`: what its record says now, or `None` when there is none.
-pub(crate) fn token_of(run_dir: &Path) -> Option<u64> {
-    let record: Fingerprint =
-        serde_json::from_slice(&std::fs::read(run_dir.join("blaze-run.json")).ok()?).ok()?;
-    Some(record.hash())
+/// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
+/// stays as cargo has it.
+const GENERATION: &str = "blaze-generation";
+
+/// The generation of the output in `run_dir`: which run left it. It is not the fingerprint: that
+/// says what a run was made from (a watched file by its path, not its contents), and two runs
+/// of one fingerprint (a watched file edited, a script that runs every build, one that is not
+/// deterministic) leave different output. A run writes it as it begins, so that a run that
+/// fails, which leaves what it likes in `OUT_DIR`, is another generation too. `None` when
+/// there is none.
+pub(crate) fn generation_of(run_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(run_dir.join(GENERATION)).ok()?.trim().parse().ok()
+}
+
+/// A generation that no other run has had, written to `run_dir` (replaced whole, so that a
+/// reader sees one or the other).
+fn new_generation(run_dir: &Path) -> Result<u64, String> {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.as_nanos());
+    let count = COUNT.fetch_add(1, SeqCst);
+    let text = format!("{}:{nanos}:{count}:{}", std::process::id(), run_dir.display());
+    let generation = fresh::hash_bytes(text.as_bytes());
+    let (part, file) = (run_dir.join(format!("{GENERATION}.{count}")), run_dir.join(GENERATION));
+    std::fs::create_dir_all(run_dir)
+        .and_then(|()| std::fs::write(&part, generation.to_string()))
+        .and_then(|()| std::fs::rename(&part, &file))
+        .map_err(|it| format!("{}: {it}", file.display()))?;
+    Ok(generation)
+}
+
+/// The generation of the output in `run_dir`, made if a run of an earlier blaze left none (the
+/// caller has the admission and a lease, so no run is writing).
+fn ensure_generation(run_dir: &Path) -> Result<u64, String> {
+    match generation_of(run_dir) {
+        Some(it) => Ok(it),
+        None => new_generation(run_dir),
+    }
 }
 
 /// One consumer of `build` reading the output of a world, until it is dropped: a compile or a
@@ -293,7 +355,8 @@ fn attempt(
         // A build that waits holds nothing that is not read: what it holds, a build that has
         // the admission and waits for it, or one that waits for what it holds, would wait for.
         leases.yield_world(asked.build);
-    } else {
+    } else if !leases.in_operation(asked.build) {
+        // Else the operation has it, for all the groups it judges.
         leases.release_admission(asked.build);
     }
     said
@@ -359,6 +422,8 @@ struct Done {
     /// The hash of the run's fingerprint, and when its output was written: what the runs of
     /// the packages that depend on it with `links` depend on.
     fingerprint: u64,
+    /// Which run left the output ([`generation_of`]).
+    generation: u64,
     made: Option<SystemTime>,
     links: Option<String>,
 }
@@ -551,15 +616,26 @@ impl<'a> Runner<'a> {
     ) -> Result<Option<Arc<Done>>, String> {
         let probe = self.unit(package, for_host, lib, PathBuf::new(), Vec::new())?;
         let run_dir = blaze_build_script::run::run_dir(&probe).to_owned();
-        match self.leases.judged(self.asked.build, &run_dir) {
-            Some(Ok(done)) => {
-                self.judged.push((run_dir, done.fingerprint));
+        let build = self.asked.build;
+        match self.leases.decision(build, &run_dir) {
+            Some(leases::Judged::Standing(done)) => {
+                self.judged.push((run_dir, done.generation));
                 return Ok(Some(done));
             }
-            Some(Err(failed)) => return Err(failed),
+            // The build gave its lease up to wait: its result is the build's again if the output
+            // is still the run it was of, and if another build ran the script meanwhile it is not
+            // (that build's output is not this one's) and the script is judged again.
+            Some(leases::Judged::Released(done)) => {
+                let again = self.leases.reacquire(build, &run_dir, done.generation);
+                if again.map_err(|it| self.refused(it))? {
+                    self.judged.push((run_dir, done.generation));
+                    return Ok(Some(done));
+                }
+            }
+            Some(leases::Judged::Failed(failed)) => return Err(failed),
             None => {}
         }
-        self.leases.admit(self.asked.build, &self.base).map_err(|it| self.refused(it))?;
+        self.leases.admit(build, &self.base).map_err(|it| self.refused(it))?;
         Ok(None)
     }
 
@@ -616,10 +692,12 @@ impl<'a> Runner<'a> {
             self.asked.env.iter().map(|(k, v)| (k.into(), v.into())).collect();
         let cx = output::Context::of(&unit, &cargo_env);
         let mut writer = None;
+        let mut generation = 0;
         let printed = match stale {
             None => {
                 self.leases.hold(build, &run_dir).map_err(|it| self.refused(it))?;
                 barrier::event("holds", build, &format!("fresh run_dir={}", run_dir.display()));
+                generation = ensure_generation(&run_dir)?;
                 let printed = std::fs::read(&output_file)
                     .map_err(|it| format!("{}: {it}", output_file.display()))?;
                 output::parse(&printed, &cx).map_err(|it| it.0)?
@@ -631,6 +709,8 @@ impl<'a> Runner<'a> {
                 barrier::event("runs", build, &format!("run_dir={}", run_dir.display()));
                 // As cargo empties its record before a run: a run that does not end is not one.
                 _ = std::fs::remove_file(&record);
+                // This run's, whether it ends well or not: it leaves what it likes in `OUT_DIR`.
+                generation = new_generation(&run_dir)?;
                 let ran = blaze_build_script::env(&unit, &cargo_env)
                     .and_then(|env| run::run(&unit, run::Invocation::of(&unit, env).command()))
                     .map_err(|it| it.0)
@@ -668,6 +748,7 @@ impl<'a> Runner<'a> {
             out_dir: unit.out_dir.clone(),
             output: printed,
             fingerprint: fingerprint.hash(),
+            generation,
             made: std::fs::metadata(&output_file).and_then(|it| it.modified()).ok(),
             links: data.links.clone(),
         });
@@ -679,7 +760,7 @@ impl<'a> Runner<'a> {
             }
             None => self.leases.record(build, &run_dir, Ok(done.clone())),
         }
-        self.judged.push((run_dir, done.fingerprint));
+        self.judged.push((run_dir, done.generation));
         Ok(done)
     }
 

@@ -449,18 +449,28 @@ impl Inputs {
         Some((scripts.ready.clone()?, scripts.ready_world.clone().unwrap_or_default()))
     }
 
-    /// The scripts every workspace that is loaded was loaded from, with the token of each run:
-    /// what a build reads of the output when it reads the database.
-    pub(crate) fn world(&self) -> crate::scripts::World {
-        let mut world: crate::scripts::World = self
-            .checkouts
-            .iter()
-            .filter_map(|it| it.scripts.as_ref())
-            .flat_map(|it| it.world.iter().cloned())
-            .collect();
-        world.sort();
-        world.dedup();
-        world
+    /// The scripts the workspaces of `roots` were loaded from, with the generation of each run:
+    /// what a build reads of the output when it reads the database through them. A root that is
+    /// not watched (it is read as another, whole) has none of its own; when none of them has,
+    /// the world of every workspace loaded is what is read.
+    pub(crate) fn world_of(&self, roots: &[PathBuf]) -> crate::scripts::World {
+        let of = |wanted: &dyn Fn(&Checkout) -> bool| {
+            let mut world: crate::scripts::World = self
+                .checkouts
+                .iter()
+                .filter(|it| wanted(it))
+                .filter_map(|it| it.scripts.as_ref())
+                .flat_map(|it| it.world.iter().cloned())
+                .collect();
+            world.sort();
+            world.dedup();
+            world
+        };
+        let own = of(&|it| roots.contains(&it.root));
+        match self.checkouts.iter().any(|it| roots.contains(&it.root)) {
+            true => own,
+            false => of(&|_| true),
+        }
     }
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
