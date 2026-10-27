@@ -2725,7 +2725,7 @@ impl Checkouts {
                         // build's for good. Another loaded checkout is not the request's to run
                         // scripts of, nor to load again with its variables: it is judged for the
                         // build that asks for it, when one does.
-                        let changed = match reached(asked, built, root) {
+                        let changed = match reached(asked, built.map(|it| it.as_path()), root) {
                             true => self.inputs.stale(root, Some(env), build)?,
                             false => false,
                         };
