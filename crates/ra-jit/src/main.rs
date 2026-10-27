@@ -6657,6 +6657,9 @@ enum Event {
     Tiered(usize, Tiered),
     /// The daemon's own base of the program at the index holds more memory than it may.
     OverBudget(usize),
+    /// A build of the daemon's is over: the output of the build scripts it held is free to be
+    /// written, which the requests put off for it can now ask for.
+    Retired,
 }
 
 /// The functions of a program compiled at a higher level, for its next patch.
@@ -6871,6 +6874,7 @@ impl Builds {
                 }
                 return Ok(false);
             }
+            Event::Retired => return Ok(false),
         };
         let Some(Running { clients, own_base, .. }) = self.running.remove(&at) else {
             return Ok(false);
@@ -7067,6 +7071,19 @@ fn requested(stream: UnixStream) -> Option<Event> {
     trace::arrived();
     let (name, rest) = request.split_once('\t').unwrap_or((&request, ""));
     eprintln!("request: {name} at_us={}", live::epoch_us());
+    // The daemon has answered a client: what the build held of the build scripts' output is
+    // let go at once, whatever the worker is busy with.
+    if name == "retire" {
+        let answer = match rest.trim().parse::<u64>() {
+            Ok(build) => {
+                scripts::retire(build);
+                "ok retired".to_owned()
+            }
+            Err(_) => format!("failed: no build in {request:?}"),
+        };
+        let _ = writeln!(&stream, "{answer}");
+        return Some(Event::Retired);
+    }
     if name == "edit"
         && let Some((path, text)) = rest.split_once('\t')
     {
@@ -8566,6 +8583,12 @@ fn run_holding(
                                 let _ = writeln!(&stream, "failed: {error:#}");
                                 continue;
                             }
+                        }
+                        // Another build of this worker reads the output of a script this one
+                        // is to run: it is asked for again once that build is retired.
+                        Err(error) if error.downcast_ref::<scripts::Busy>().is_some() => {
+                            later.push((request, asked, stream));
+                            continue;
                         }
                         Err(error) => {
                             let _ = writeln!(&stream, "failed: {error:#}");

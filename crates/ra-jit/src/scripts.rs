@@ -17,12 +17,17 @@
 //! `OUT_DIR` cannot be keyed, so a script that is to run runs. Each build of the daemon's
 //! judges a script once ([`Asked::build`]): a build is several requests to the worker, and
 //! two clients that ask at once are two builds.
+//!
+//! What a build judged, and the output it judged, last as long as the build ([`leases`]): the
+//! build holds a lease on each script's run directory until the daemon retires it, so a build
+//! that must run the script again waits for the builds that read its output, and what one
+//! build's compile and link read is what its own run or fresh record said.
 
 use std::{
     collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::LazyLock,
     time::SystemTime,
 };
 
@@ -43,6 +48,18 @@ use serde_json::json;
 
 /// Where below the target directory the scripts are compiled and run.
 const DIR: &str = "ra-jit/build-scripts";
+
+pub(crate) use leases::Busy;
+use leases::{Leases, Refused};
+
+/// What this process's builds judged and hold.
+static LEASES: LazyLock<Leases> = LazyLock::new(Leases::default);
+
+/// Ends the build `build`: the output of the scripts it held is free to be written again, and
+/// what it judged is forgotten. The daemon says so when it has answered the client.
+pub(crate) fn retire(build: u64) {
+    LEASES.retire(build);
+}
 
 /// What the runs of a build are asked for with.
 pub(crate) struct Asked<'a> {
@@ -117,36 +134,88 @@ impl Own {
     }
 }
 
-/// The run directories each build of this process has judged, the build, and why the run
-/// failed when it did: a script cargo runs every build is run once for it, and one that
-/// failed fails each request of the build.
-static JUDGED: Mutex<Option<FxHashMap<PathBuf, (u64, Option<String>)>>> = Mutex::new(None);
-
-/// Has `run_dir` judged for the `build`, with what came of it.
-fn judged(run_dir: &Path, build: u64, failed: Option<String>) {
-    let mut judged = JUDGED.lock().unwrap_or_else(|it| it.into_inner());
-    judged.get_or_insert_with(FxHashMap::default).insert(run_dir.to_owned(), (build, failed));
-}
-
 /// Compiles and runs the build scripts of `workspace` that are to run, as `asked`: what they
 /// all said, read as `cargo check` says it. `Err` is cargo's message of a script that failed,
-/// or what blaze could not do.
+/// or what blaze could not do, or a [`Busy`] when another build of this process reads the
+/// output of a script this one is to run: the request is asked again once that build is
+/// retired. A script whose output another worker's build reads is waited for.
 pub(crate) fn run(
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
 ) -> anyhow::Result<project_model::WorkspaceBuildScripts> {
+    run_with(&LEASES, workspace, asked)
+}
+
+fn run_with(
+    leases: &Leases,
+    workspace: &ProjectWorkspace,
+    asked: &Asked<'_>,
+) -> anyhow::Result<project_model::WorkspaceBuildScripts> {
+    retrying(|| attempt(leases, workspace, asked))
+}
+
+/// The result of `once`, asked again for as long as a worker's build reads the output it is to
+/// write. The transaction lock is let go for the wait: the build that holds the output needs
+/// it to judge its next request.
+fn retrying<T>(mut once: impl FnMut() -> Result<T, Attempt>) -> anyhow::Result<T> {
+    loop {
+        match once() {
+            Ok(done) => return Ok(done),
+            Err(Attempt::Failed(error)) => return Err(error),
+            Err(Attempt::Waits(run_dir)) => {
+                eprintln!(
+                    "build script: waits for the build of another worker that reads {}",
+                    run_dir.display()
+                );
+                Leases::wait(&run_dir, leases::deadline()).map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+}
+
+/// Why one pass over the scripts did not end.
+#[derive(Debug)]
+enum Attempt {
+    Failed(anyhow::Error),
+    /// A worker's build reads the output of the script in this run directory.
+    Waits(PathBuf),
+}
+
+impl Attempt {
+    /// Why a script did not make: a build reads its output, or `why`.
+    fn of(busy: Option<Busy>, why: String) -> Attempt {
+        match busy {
+            Some(Busy::Elsewhere { run_dir }) => Attempt::Waits(run_dir),
+            Some(busy) => Attempt::Failed(anyhow::Error::new(busy)),
+            None => Attempt::Failed(anyhow::Error::msg(why)),
+        }
+    }
+}
+
+impl From<anyhow::Error> for Attempt {
+    fn from(error: anyhow::Error) -> Attempt {
+        Attempt::Failed(error)
+    }
+}
+
+fn attempt(
+    leases: &Leases,
+    workspace: &ProjectWorkspace,
+    asked: &Asked<'_>,
+) -> Result<project_model::WorkspaceBuildScripts, Attempt> {
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
         return Ok(project_model::WorkspaceBuildScripts::default());
     };
     // Workers for different feature sets can share a script's compile directory and OUT_DIR.
     // Keep the freshness check, compile, run and record writes in one critical section so a
     // worker cannot execute another worker's half-written executable or reuse its records.
+    // What a build reads of the output afterwards is held by its leases, not by this lock.
     let target: &Path = cargo.target_directory().as_ref();
     let _held = lock::acquire(&target.join(DIR)).context("locking the build-script directory")?;
     let sysroot: PathBuf = workspace.sysroot.root().map(|it| PathBuf::from(it.as_str())).context(
         "blaze runs build scripts with the standard library's source, and has no toolchain",
     )?;
-    let mut runner = Runner::new(cargo, asked, sysroot, &workspace.rustc_cfg)?;
+    let mut runner = Runner::new(leases, cargo, asked, sysroot, &workspace.rustc_cfg)?;
     let mut lines = Vec::new();
     for package in cargo.packages() {
         if !runner.runs(package) {
@@ -156,7 +225,10 @@ pub(crate) fn run(
             .packages
             .and_then(|it| it.get(&cargo[package].id.repr))
             .is_some_and(|for_target| !for_target);
-        let done = runner.script(package, for_host).map_err(anyhow::Error::msg)?;
+        let done = match runner.script(package, for_host) {
+            Ok(done) => done,
+            Err(why) => return Err(Attempt::of(runner.busy.take(), why)),
+        };
         let output = &done.output;
         lines.push(
             json!({
@@ -186,6 +258,9 @@ struct Done {
 }
 
 struct Runner<'a> {
+    leases: &'a Leases,
+    /// Why the script that was to run did not: the output it would write is read by a build.
+    busy: Option<Busy>,
     cargo: &'a CargoWorkspace,
     asked: &'a Asked<'a>,
     sysroot: PathBuf,
@@ -207,6 +282,7 @@ struct Runner<'a> {
 
 impl<'a> Runner<'a> {
     fn new(
+        leases: &'a Leases,
         cargo: &'a CargoWorkspace,
         asked: &'a Asked<'a>,
         sysroot: PathBuf,
@@ -260,6 +336,8 @@ impl<'a> Runner<'a> {
             false => crate::answers::target_cfg(&sysroot, asked.host, asked.env),
         };
         Ok(Runner {
+            leases,
+            busy: None,
             cargo,
             asked,
             sysroot,
@@ -345,6 +423,35 @@ impl<'a> Runner<'a> {
         let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
         let lib = self.profile(package, unit_for, &self.kind(for_host));
         let unit = self.unit(package, for_host, &lib, exe, dependencies)?;
+        self.judge(package, unit, compiled, &deps)
+    }
+
+    /// The error of a lease that was not given: a [`Busy`] is kept for [`attempt`] to say.
+    fn refused(&mut self, refused: Refused) -> String {
+        match refused {
+            Refused::Busy(busy) => {
+                let why = busy.to_string();
+                self.busy = Some(busy);
+                why
+            }
+            Refused::Io(why) => why,
+        }
+    }
+
+    /// Whether the script `unit` describes runs for this build, runs it if so, and holds its
+    /// output for the build: cargo's decision, over the records blaze keeps, once for each
+    /// build. `compiled` is the hash and time of the executable, `deps` the runs of the
+    /// dependencies with `links` that it depends on.
+    fn judge(
+        &mut self,
+        package: Package,
+        unit: Unit,
+        compiled: (u64, SystemTime),
+        deps: &[(String, u64, Option<SystemTime>)],
+    ) -> Result<Done, String> {
+        let cargo = self.cargo;
+        let data = &cargo[package];
+        let build = self.asked.build;
         let run_dir = blaze_build_script::run::run_dir(&unit).to_owned();
         let output_file = run_dir.join("output");
         let record = run_dir.join("blaze-run.json");
@@ -367,28 +474,27 @@ impl<'a> Runner<'a> {
             std::iter::once(("build-script-build".to_owned(), Some(compiled.1)))
                 .chain(deps.iter().map(|(name, _, made)| (name.clone(), *made)))
                 .collect();
-        let before = {
-            let judged = JUDGED.lock().unwrap_or_else(|it| it.into_inner());
-            let judged = judged.as_ref().and_then(|it| it.get(&run_dir)).cloned();
-            judged.filter(|(build, _)| self.asked.build != 0 && *build == self.asked.build)
-        };
-        let stale = match before {
-            // This build judged it already, and ran it if it was to run.
-            Some((_, Some(failed))) => return Err(failed),
-            Some((_, None)) if was.is_some() => None,
-            _ => fresh::stale(was.as_ref(), &now, &output_file, &made, &package_dir),
+        let stale = match self.leases.judged(build, &run_dir) {
+            // This build judged it already, whatever other builds did since: it failed, and
+            // fails each request the same way, or it stands, and the lease the build took then
+            // has held what the script wrote.
+            Some(Some(failed)) => return Err(failed),
+            Some(None) => None,
+            None => fresh::stale(was.as_ref(), &now, &output_file, &made, &package_dir),
         };
         let cargo_env: Vec<(OsString, OsString)> =
             self.asked.env.iter().map(|(k, v)| (k.into(), v.into())).collect();
         let cx = output::Context::of(&unit, &cargo_env);
-        let stands = stale.is_none();
         let printed = match stale {
             None => {
+                self.leases.stands(build, &run_dir).map_err(|it| self.refused(it))?;
                 let printed = std::fs::read(&output_file)
                     .map_err(|it| format!("{}: {it}", output_file.display()))?;
                 output::parse(&printed, &cx).map_err(|it| it.0)?
             }
             Some(why) => {
+                // No build reads the output this run is to replace.
+                let writer = self.leases.writer(build, &run_dir).map_err(|it| self.refused(it))?;
                 eprintln!("build script of {}: runs, {why}", data.name);
                 // As cargo empties its record before a run: a run that does not end is not one.
                 _ = std::fs::remove_file(&record);
@@ -402,8 +508,13 @@ impl<'a> Runner<'a> {
                             format!("{}{}", logged.collect::<String>(), failed.error.0)
                         })
                     });
-                judged(&run_dir, self.asked.build, ran.as_ref().err().cloned());
-                let printed = ran?;
+                let printed = match ran {
+                    Ok(printed) => printed,
+                    Err(failed) => {
+                        writer.failed(failed.clone());
+                        return Err(failed);
+                    }
+                };
                 let reads = output::Reads {
                     files: printed.rerun_if_changed.clone(),
                     env: printed.rerun_if_env_changed.clone(),
@@ -412,12 +523,10 @@ impl<'a> Runner<'a> {
                 let json = serde_json::to_vec(&after).map_err(|it| it.to_string())?;
                 std::fs::write(&record, json)
                     .map_err(|it| format!("{}: {it}", record.display()))?;
+                writer.stands().map_err(|it| self.refused(it))?;
                 printed
             }
         };
-        if stands {
-            judged(&run_dir, self.asked.build, None);
-        }
         let fingerprint: Fingerprint = std::fs::read(&record)
             .ok()
             .and_then(|it| serde_json::from_slice(&it).ok())
@@ -961,4 +1070,5 @@ impl ProfilePackage for Named<'_> {
 #[cfg(test)]
 mod tests;
 
+mod leases;
 mod lock;

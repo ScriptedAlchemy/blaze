@@ -753,6 +753,19 @@ impl Worker {
         }
     }
 
+    /// Tells the process that the daemon's `build` is over, once the client has its answer:
+    /// the output of the build scripts that the build held is free to be written again.
+    /// A process that does not hear it holds that output until it ends, as with the daemon.
+    fn retire(&self, build: u64) {
+        if build == 0 {
+            return;
+        }
+        let Ok(mut stream) = socket::connect(&self.socket) else { return };
+        let _ = stream.write_all(format!("retire\t{build}\n\n").as_bytes());
+        let mut reply = String::new();
+        let _ = BufReader::new(stream).read_line(&mut reply);
+    }
+
     /// Brings the programs of `checkout` up to date for the daemon's `build`, all at once: the
     /// worker builds the requests that wait for it together.
     fn sync(&self, checkout: &Checkout, build: u64) -> Reply {
@@ -1239,10 +1252,16 @@ impl Daemon {
             Request::Build(checkout) => {
                 // The number is this request's alone, carried with it to the worker.
                 let build = self.next_build();
-                match self.warm(checkout.clone(), build) {
+                let reply = match self.warm(checkout.clone(), build) {
                     Ok(()) => self.built(&checkout, build),
                     Err(why) => Reply::Cold { reason: format!("{why:#}") },
+                };
+                // The build ends with its answer: what its scripts wrote is no longer read.
+                let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
+                if let Some(worker) = worker {
+                    worker.retire(build);
                 }
+                reply
             }
             Request::Check(ahead) => self.check(&ahead),
             Request::Status => Reply::Status(Status {

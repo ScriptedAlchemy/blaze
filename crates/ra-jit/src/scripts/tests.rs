@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 
 fn dir(test: &str) -> PathBuf {
@@ -209,7 +211,8 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
             value: intern::Symbol::intern("aarch64"),
         },
     ];
-    let mut runner = Runner::new(&cargo, &asked, sysroot, &target_cfg).unwrap();
+    let leases = Leases::default();
+    let mut runner = Runner::new(&leases, &cargo, &asked, sysroot, &target_cfg).unwrap();
     let profile = runner.profile(package, UnitFor::new_normal(), &runner.kind(false));
     let target = runner.unit(package, false, &profile, root.join("script"), Vec::new()).unwrap();
     let profile = runner.profile(package, UnitFor::new_host(false), &runner.kind(true));
@@ -252,4 +255,355 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
     assert_eq!(crates[index].env["SCRIPT_CONTEXT"], "host");
     assert_eq!(crates[index].env["OUT_DIR"], host.out_dir.display().to_string());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A package whose build script is a shell script that counts its runs and writes what it is
+/// told to generate (`GEN`), so that what a build reads of a run can be compared with what the
+/// build asked for. Its requests are the judgment of `Runner` as `run` makes it, over the real
+/// run, record and lease files; only compiling the script is left out, as the other tests do.
+#[cfg(unix)]
+struct Fixture {
+    root: PathBuf,
+    cargo: CargoWorkspace,
+    package: Package,
+    sysroot: PathBuf,
+    cfg: Vec<cfg::CfgAtom>,
+}
+
+#[cfg(unix)]
+const HOST: &str = "x86_64-unknown-linux-gnu";
+
+#[cfg(unix)]
+const SCRIPT: &str = r#"#!/bin/sh
+echo "$GEN" >> "$COUNTER"
+if [ "$FAIL" = 1 ]; then echo "script failed for $GEN" >&2; exit 3; fi
+printf '%s' "$GEN" > "$OUT_DIR/gen.txt"
+echo "cargo:rerun-if-env-changed=GEN"
+if [ "$ALWAYS" = 1 ]; then echo "cargo:rerun-if-changed=missing.txt"; fi
+echo "cargo:rustc-cfg=gen_$GEN"
+echo "cargo:rustc-env=GEN_VALUE=$GEN"
+echo "cargo:rustc-link-search=native=$OUT_DIR"
+echo "cargo:rustc-link-lib=static=gen_$GEN"
+"#;
+
+#[cfg(unix)]
+impl Fixture {
+    /// The package in `base/pkg`, made if it is not there; the counter is beside it, where
+    /// nothing watches it.
+    fn at(base: &Path) -> Fixture {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = base.join("pkg");
+        let write = |path: PathBuf, text: &str| {
+            if !path.exists() {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+        };
+        write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"gen\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\npath = \"lib.rs\"\n[workspace]\n",
+        );
+        write(root.join("lib.rs"), "");
+        write(root.join("build.rs"), "fn main() {}\n");
+        write(root.join("script.sh"), SCRIPT);
+        std::fs::set_permissions(root.join("script.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let env =
+            BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+        let config = Config::load(&root, env, &[]).unwrap();
+        let cx = blaze_manifest::Context::new(config);
+        let manifest = root.join("Cargo.toml");
+        let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+        let metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+        let metadata = serde_json::from_value(metadata).unwrap();
+        let manifest =
+            project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest))
+                .unwrap();
+        let cargo = CargoWorkspace::new(metadata, manifest, ide_db::base_db::Env::default(), false);
+        let package = cargo.packages().next().unwrap();
+        // The installed toolchain's identity selects checked-in cfg answers; no compiler runs.
+        let sysroot = base.join("toolchain");
+        let rustlib = sysroot.join("lib/rustlib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        write(sysroot.join("lib/librustc_driver-test.so"), "");
+        write(rustlib.join(format!("manifest-rustc-{HOST}")), "");
+        let answers: serde_json::Value =
+            serde_json::from_str(include_str!("../answers/rustc-1.99.0.json")).unwrap();
+        write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            &format!("\n[pkg.rustc]\nversion = {}\n", answers["version"]),
+        );
+        let cfg = vec![cfg::CfgAtom::Flag(intern::Symbol::intern("unix"))];
+        Fixture { root, cargo, package, sysroot, cfg }
+    }
+
+    fn counter(&self) -> PathBuf {
+        self.root.parent().unwrap().join("counter.log")
+    }
+
+    /// How many times the script has run, and for which value of `GEN`.
+    fn runs(&self) -> Vec<String> {
+        let counted = std::fs::read_to_string(self.counter()).unwrap_or_default();
+        counted.lines().map(str::to_owned).collect()
+    }
+
+    fn generated(&self, done: &Done) -> String {
+        std::fs::read_to_string(done.out_dir.join("gen.txt")).unwrap_or_default()
+    }
+
+    /// One request of `build` to a worker with `leases`, as `run` makes it for the package's
+    /// script: what the script printed, as cargo reads it.
+    fn request(
+        &self,
+        leases: &Leases,
+        build: u64,
+        gen_: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<std::rc::Rc<Done>, Attempt> {
+        let mut env = BTreeMap::from([
+            (
+                "CARGO_HOME".to_owned(),
+                self.root.parent().unwrap().join("home").display().to_string(),
+            ),
+            ("COUNTER".to_owned(), self.counter().display().to_string()),
+            ("GEN".to_owned(), gen_.to_owned()),
+        ]);
+        env.extend(extra.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        let id = self.cargo[self.package].id.repr.clone();
+        let packages = FxHashMap::from_iter([(id, true)]);
+        let asked = Asked {
+            env: &env,
+            build,
+            profile: "dev",
+            config: &[],
+            host: HOST,
+            target: HOST,
+            packages: Some(&packages),
+        };
+        let base: &Path = self.cargo.target_directory().as_ref();
+        let _held = lock::acquire(&base.join(DIR)).unwrap();
+        let mut runner =
+            Runner::new(leases, &self.cargo, &asked, self.sysroot.clone(), &self.cfg).unwrap();
+        let profile = runner.profile(self.package, UnitFor::new_normal(), &runner.kind(false));
+        let script = self.root.join("script.sh");
+        let unit = runner.unit(self.package, false, &profile, script.clone(), Vec::new()).unwrap();
+        let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
+        match runner.judge(self.package, unit, (1, made), &[]) {
+            Ok(done) => Ok(std::rc::Rc::new(done)),
+            Err(why) => Err(Attempt::of(runner.busy.take(), why)),
+        }
+    }
+}
+
+/// The messages of an attempt that did not end: the build that holds the output, or the failure.
+#[cfg(unix)]
+fn why(attempt: Result<std::rc::Rc<Done>, Attempt>) -> Result<String, String> {
+    match attempt {
+        Ok(_) => Ok("ran".to_owned()),
+        Err(Attempt::Waits(dir)) => Err(format!("waits {}", dir.display())),
+        Err(Attempt::Failed(error)) => match error.downcast_ref::<Busy>() {
+            Some(Busy::Process { build, .. }) => Err(format!("busy {build}")),
+            _ => Err(format!("{error:#}")),
+        },
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_script_runs_once_in_each_build_whatever_the_other_builds_did_between_its_requests() {
+    let base = dir("aba");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    // An always-stale script, which cargo runs once in each build: A, then B, then A again.
+    let always = [("ALWAYS", "1")];
+    let a1 = pkg.request(&leases, 1, "a", &always).unwrap();
+    assert_eq!(pkg.generated(&a1), "a");
+    assert_eq!(pkg.runs(), ["a"]);
+    // B asks while A reads the output: it does not write over it and is put off.
+    assert_eq!(why(pkg.request(&leases, 2, "b", &always)), Err("busy 1".to_owned()));
+    assert_eq!(pkg.runs(), ["a"], "B did not run the script over A's output");
+    assert_eq!(pkg.generated(&a1), "a");
+    // A's next request is the same build: judged already, not run a second time.
+    let a2 = pkg.request(&leases, 1, "a", &always).unwrap();
+    assert_eq!(pkg.runs(), ["a"], "an always-stale script runs once in a build");
+    assert_eq!(a2.output.cfgs, a1.output.cfgs);
+    assert_eq!(a2.output.library_links, a1.output.library_links);
+    assert_eq!(pkg.generated(&a2), "a");
+    // A is over; B runs, once, and its later request does not.
+    leases.retire(1);
+    let b1 = pkg.request(&leases, 2, "b", &always).unwrap();
+    let b2 = pkg.request(&leases, 2, "b", &always).unwrap();
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    assert_eq!((pkg.generated(&b1), pkg.generated(&b2)), ("b".to_owned(), "b".to_owned()));
+    assert_eq!(b2.output.cfgs, ["gen_b"]);
+    assert_eq!(a1.output.cfgs, ["gen_a"]);
+    leases.retire(2);
+    assert!(leases.builds().is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_script_that_failed_fails_each_request_of_its_build_alike_and_is_not_run_again() {
+    let base = dir("aba-failed");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let (fails, works) = ([("ALWAYS", "1"), ("FAIL", "1")], [("ALWAYS", "1")]);
+    let a1 = why(pkg.request(&leases, 1, "a", &fails)).unwrap_err();
+    assert!(a1.contains("script failed for a") && a1.contains("exit"), "{a1}");
+    assert_eq!(pkg.runs(), ["a"]);
+    // B's request in between succeeds: a failure holds nothing, so B runs the script.
+    let b1 = pkg.request(&leases, 2, "b", &works).unwrap();
+    assert_eq!(pkg.generated(&b1), "b");
+    // A's next requests fail with the same message, and run nothing.
+    for _ in 0..2 {
+        assert_eq!(why(pkg.request(&leases, 1, "a", &fails)), Err(a1.clone()));
+    }
+    assert_eq!(
+        why(pkg.request(&leases, 1, "a", &works)),
+        Err(a1.clone()),
+        "the build's failure stands"
+    );
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    // And B's output is not A's failure.
+    assert!(pkg.request(&leases, 2, "b", &works).is_ok());
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    leases.retire(1);
+    leases.retire(2);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_judgment_that_stands_is_not_taken_for_the_output_another_worker_wrote_after_it() {
+    let base = dir("elsewhere");
+    let pkg = Fixture::at(&base);
+    // Two workers over one target directory: separate leases, one set of files.
+    let (first, second) = (Leases::default(), Leases::default());
+    let a = pkg.request(&first, 1, "a", &[]).unwrap();
+    assert_eq!((pkg.generated(&a), pkg.runs()), ("a".to_owned(), vec!["a".to_owned()]));
+    // The other worker's build has another value of a variable the script watches, so it must
+    // run the script, and cannot while the first worker's build reads the output.
+    assert!(matches!(pkg.request(&second, 9, "b", &[]), Err(Attempt::Waits(_))));
+    assert_eq!((pkg.generated(&a), pkg.runs()), ("a".to_owned(), vec!["a".to_owned()]));
+    // The first build's next request is the same judgment, over the same output.
+    let again = pkg.request(&first, 1, "a", &[]).unwrap();
+    assert_eq!((pkg.generated(&again), pkg.runs().len()), ("a".to_owned(), 1));
+    // The first build is over; the second runs, and the first's judgment is gone with the
+    // build: a request that names it again is judged by the record, which is the second's.
+    first.retire(1);
+    let b = pkg.request(&second, 9, "b", &[]).unwrap();
+    assert_eq!((pkg.generated(&b), pkg.runs().len()), ("b".to_owned(), 2));
+    assert!(matches!(pkg.request(&first, 1, "a", &[]), Err(Attempt::Waits(_))));
+    assert_eq!(pkg.generated(&b), "b");
+    second.retire(9);
+    let a_again = pkg.request(&first, 1, "a", &[]).unwrap();
+    assert_eq!((pkg.generated(&a_again), pkg.runs().len()), ("a".to_owned(), 3));
+    assert_eq!(a_again.output.cfgs, ["gen_a"]);
+    first.retire(1);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn builds_that_find_the_script_fresh_read_its_output_together() {
+    let base = dir("fresh-together");
+    let pkg = Fixture::at(&base);
+    let (first, second) = (Leases::default(), Leases::default());
+    pkg.request(&first, 1, "a", &[]).unwrap();
+    // The same value: nothing is to run, so the second worker's build does not wait for the
+    // first's.
+    let b = pkg.request(&second, 2, "a", &[]).unwrap();
+    assert_eq!((pkg.generated(&b), pkg.runs().len()), ("a".to_owned(), 1));
+    // A build that must run it waits for both.
+    let third = Leases::default();
+    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Waits(_))));
+    first.retire(1);
+    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Waits(_))));
+    second.retire(2);
+    let c = pkg.request(&third, 3, "c", &[]).unwrap();
+    assert_eq!((pkg.generated(&c), pkg.runs().len()), ("c".to_owned(), 2));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The other worker of [`two_workers_each_compile_and_link_the_output_of_their_own_build`]: a
+/// process of its own, which asks for another value of `GEN` while the first worker's build
+/// reads the output, and says what it found by its exit status.
+#[cfg(unix)]
+#[test]
+fn the_second_worker_of_the_barrier_test() {
+    let Some(base) = std::env::var_os("RA_JIT_LEASE_TEST_BASE").map(PathBuf::from) else { return };
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    std::fs::write(base.join("b-asks"), "").unwrap();
+    // As `run` asks: put off for a worker's build, and asked again once it is over.
+    let done = retrying(|| pkg.request(&leases, 7, "b", &[("ALWAYS", "1")])).unwrap();
+    std::fs::write(base.join("b-ran"), pkg.generated(&done)).unwrap();
+    assert_eq!(done.output.cfgs, ["gen_b"]);
+    assert_eq!(done.output.library_links, ["static=gen_b"]);
+    assert_eq!(pkg.generated(&done), "b");
+    leases.retire(7);
+}
+
+#[cfg(unix)]
+#[test]
+fn two_workers_each_compile_and_link_the_output_of_their_own_build() {
+    let base = dir("barrier");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let always = [("ALWAYS", "1")];
+    // Worker A: its script is done. Its compile and link have not begun.
+    let a = pkg.request(&leases, 1, "a", &always).unwrap();
+    // Worker B is a process of its own and wants another value of the same script's output.
+    let mut b = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "scripts::tests::the_second_worker_of_the_barrier_test", "--nocapture"])
+        .env("RA_JIT_LEASE_TEST_BASE", &base)
+        .env("RA_JIT_SCRIPT_LEASE_WAIT_SECS", "60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    while !base.join("b-asks").exists() {
+        assert!(began.elapsed() < Duration::from_secs(60), "worker B did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // B has asked and is held at the barrier: the output is A's, whatever B is generating.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(b.try_wait().unwrap().is_none(), "worker B ran the script over A's output");
+    assert_eq!(pkg.runs(), ["a"]);
+    // A resumes: its compile reads the source `include!` names, its link reads the libraries
+    // and the paths it printed, all of them in the one output directory A's script wrote.
+    assert_eq!(std::fs::read_to_string(a.out_dir.join("gen.txt")).unwrap(), "a");
+    assert_eq!(a.output.cfgs, ["gen_a"]);
+    assert_eq!(a.output.env, [("GEN_VALUE".to_owned(), "a".to_owned())]);
+    assert_eq!(a.output.library_links, ["static=gen_a"]);
+    // As cargo's `linked_paths` have it: the kind, then the path.
+    let paths: Vec<_> =
+        a.output.library_paths.iter().map(|it| it.path().display().to_string()).collect();
+    assert_eq!(paths, [format!("native={}", a.out_dir.display())]);
+    // A's build is over: the daemon retires it, and B proceeds.
+    leases.retire(1);
+    let status = wait_within(&mut b, Duration::from_secs(60));
+    assert!(status.success(), "worker B found another output than its own: {status}");
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    assert_eq!(std::fs::read_to_string(base.join("b-ran")).unwrap(), "b");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+fn wait_within(child: &mut std::process::Child, within: Duration) -> std::process::ExitStatus {
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if began.elapsed() > within {
+            let _ = child.kill();
+            panic!("the worker did not end in {within:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

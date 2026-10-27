@@ -21,7 +21,12 @@ All notable changes to ra-jit are written here. The format follows
   `cargo config get`). A build whose graph has a proc macro still has cargo's check build it and
   run the scripts (no-rustc step J). `harness/scriptedits.py` holds 42 probes of it to cargo, and
   `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole
-  build.
+  build. What a build judged of a script, and the output it judged, last as long as the build
+  (`scripts/leases.rs`): the build holds a lease on the script's run directory until the daemon
+  retires it, so builds that find a script fresh read its output together, a build that must run
+  it waits for the builds that read the output (another worker's) or is asked again once they
+  are over (this worker's), and a script runs once in each build whatever other builds asked in
+  between. A script that failed fails each request of its build with the same message.
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
