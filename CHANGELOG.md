@@ -799,6 +799,10 @@ All notable changes to ra-jit are written here. The format follows
   --features x` then `cargo blaze build` left the program built with `x`. The directory is
   the build's own key, which the daemon already names the checkout of, so the same mechanism
   covers every part of the resolved configuration that key has in it.
+  Worker resolution keeps the original invocation directory and relative `--manifest-path`,
+  so a member build does not load the root's default members instead. Starting another build
+  does not delete older linked directories: an old directory can still have an active client
+  reading or placing its output.
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).
   The jump goes over the `int3`s and `nop`s the linker padded the function with. When there

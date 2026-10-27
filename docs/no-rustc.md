@@ -1053,7 +1053,9 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   `harness/coldbuild.py` holds a fixture's programs, an example and a build script's output equal
   to cargo's, and a program whose source is the same under two feature sets: each set's build
   prints what cargo's does, also when the other set's program is already at the one path cargo
-  has. Measured on the bench projects ([self-contained.md](self-contained.md)): ripgrep,
+  has. Member builds from below their root, including a relative `--manifest-path`, also use
+  the member's feature graph rather than distinct workspace default members.
+  Measured on the bench projects ([self-contained.md](self-contained.md)): ripgrep,
   fd, hyperfine, just, bat and nushell build whole and run as cargo's builds; axum and biome missed
   a build script's variable, until the loads read the graph of the build with blaze's own
   resolution ([resolve.md](resolve.md), 2026-10-25): axum then builds, and biome reaches 9

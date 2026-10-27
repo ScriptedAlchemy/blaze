@@ -151,6 +151,10 @@ has a new worker load the workspace. Each build links its programs into a direct
 under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
 checkout of it, so a build with other features, another profile, another target or other
 flags is the program cargo would have built, not the one another build linked before.
+The worker resolves the build from the original invocation directory, including relative
+`--manifest-path` arguments, not from the workspace root. These linked directories stay until
+the target directory is cleaned while no build uses it; a directory's age does not say whether
+another client is still reading or placing its output.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
