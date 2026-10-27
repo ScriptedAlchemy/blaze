@@ -1118,7 +1118,13 @@ def main():
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
                 json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
             print(json.dumps(rows, indent=1))
-            return 1 if any(not r["right"] or r["classification"] != "daemon" for r in rows) or watchdog.tripped else 0
+            return 1 if any(
+                not r["right"]
+                or (r["step"] != "deleted" and r["classification"] != "daemon")
+                or "building with cargo" in r["build_log"]
+                or "this build is cargo's" in r["build_log"]
+                for r in rows
+            ) or watchdog.tripped else 0
         for n in names:
             try:
                 results.append(fixture_report(n, a, work, bin_dir, (a_m, b_m), sources, progress))
