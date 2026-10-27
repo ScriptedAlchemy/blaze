@@ -923,6 +923,30 @@ def only_asks(argv):
     return bool(printing or {"-vV", "-V", "--version"} & set(words))
 
 
+def cargo_only_asks(argv):
+    """Whether a cargo run only asked a question (`--version`, `config get`, `metadata`, a stand-in `rustc`
+    `--print`), as opposed to building, checking, testing or running something."""
+    words = argv.split()
+    if {"--version", "-V", "-vV"} & set(words[:2]):
+        return True
+    # `-Z unstable-options` is a flag and its value, not the subcommand.
+    rest = [w for w in words if not w.startswith("-") and w != "unstable-options"]
+    first = rest[0] if rest else ""
+    if first in ("metadata", "locate-project", "pkgid", "tree", "read-manifest", "verify-project"):
+        return True
+    if first == "config" and "get" in rest[:2]:
+        return True
+    if first == "rustc" and any(w.startswith("--print") or w == "--print" for w in words):
+        return True
+    return False
+
+
+def cargo_summary(runs):
+    """`N cargo runs, M of them only asking`: what tells a query of cargo from a build by cargo."""
+    asking = sum(1 for run in runs if cargo_only_asks(run["argv"]))
+    return f"{len(runs)} cargo runs, {asking} of them only asking, {len(runs) - asking} compiling or otherwise running things"
+
+
 def compiler_summary(runs):
     """`N compiler runs, M of them only asking`, which is what tells a probe from a compile."""
     asking = sum(1 for run in runs if only_asks(run["argv"]))
@@ -1047,7 +1071,7 @@ def predicate_a_whole(ctx, a):
     for rec in records:
         compilers, cargos = rec["audit"]["compiler"], rec["audit"]["cargo"]
         r.facts.append(f"{rec['scenario']}: exit {rec['exit']}, {rec['finished']!r}, {compiler_summary(compilers)}, "
-                       f"{len(cargos)} cargo runs")
+                       f"{cargo_summary(cargos)}")
         if rec["exit"] != 0:
             r.fail(f"{rec['scenario']} failed ({rec['exit']}): {rec['finished']}")
         if not rec.get("rajit_finished"):
@@ -1066,7 +1090,8 @@ def predicate_a_whole(ctx, a):
     compilers = sum(compiler_count(rec) for rec in records)
     cargos = sum(len(rec["audit"]["cargo"]) for rec in records)
     if compilers or cargos:
-        r.fail(f"{compilers} compiler execs and {cargos} cargo execs in the tree; the whole build's bar is 0 and 0")
+        every = [run for rec in records for run in rec["audit"]["cargo"]]
+        r.fail(f"{compilers} compiler execs and {cargo_summary(every)} in the tree; the whole build's bar is 0 and 0")
     stop_daemon(ctx, tool)
     return r
 
