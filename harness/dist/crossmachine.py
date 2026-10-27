@@ -63,6 +63,16 @@ for path in (HARNESS, HERE):
 DEFAULT_BIN = next((it for it in ("/Users/bytedance/code/blaze-targets/c4-keys/bin",) if os.path.isdir(it)),
                    os.path.join(ROOT, "target", "release"))
 DEFAULT_WORK = "/tmp/c4xm"
+DAEMON_ROOT = None
+
+
+def daemon_home(fixture, label):
+    """Daemon sockets have a separate, owned short root independent of --work."""
+    path = os.path.join(DAEMON_ROOT, fixture[:4] + "-" + label)
+    socket = os.path.join(path, "workers", "f" * 16, "sock.new", "s")
+    if len(socket.encode()) >= 104:
+        raise RuntimeError(f"daemon socket exceeds platform budget: {socket}")
+    return path
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "paths")
 TOOLCHAIN = open(os.path.join(HARNESS, "toolchain")).read().strip()
 
@@ -618,7 +628,7 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     stores = {"a": os.path.join(a.top, "store-" + name), "b-solo": os.path.join(b.top, "store-solo-" + name),
               "b-fed": os.path.join(b.top, "store-fed-" + name)}
     # Short: a daemon's socket lives below its directory, and a socket path has 104 bytes on macOS.
-    homes = {k: os.path.join(work, "h", f"{name[:4]}-{k}") for k in stores}
+    homes = {k: daemon_home(name, k) for k in stores}
     for k in stores:
         os.makedirs(stores[k], exist_ok=True)
 
@@ -653,7 +663,10 @@ def fixture_report(name, args, work, bin_dir, machines, sources, progress):
     for k, r in runs.items():
         with open(os.path.join(top, f"said-{k}.txt"), "w") as f:
             f.write(r.said)
-        result["runs"][k] = dict(right=r.right, error=r.error, seconds=round(r.seconds, 1), **counts(r.said))
+        result["runs"][k] = dict(right=r.right, error=r.error, actual=r.out, expected=r.expected,
+                                seconds=round(r.seconds, 1), **counts(r.said))
+        if r.error is None and not r.right:
+            result["differences"].append(Difference(name, "program", r.label, program_diff(r)).row())
     broken = [r for r in runs.values() if r.error]
     if broken:
         for r in broken:
@@ -810,7 +823,7 @@ def reference_only(names, work, bin_dir, machines, sources, progress):
         outs = {}
         for m in (a, b):
             ws = os.path.join(m.checkout(name, sources[name]), spec["workspace"])
-            store, home = os.path.join(m.top, "store-ref-" + name), os.path.join(work, "h", name[:4] + "-ref" + m.name)
+            store, home = os.path.join(m.top, "store-ref-" + name), daemon_home(name, "ref" + m.name)
             outs[m.name] = reference(m, bin_dir, ws, spec, store, home)
             progress(f"  {name} on {m.name}: {ws}\n    status {outs[m.name][0]}, stdout {len(outs[m.name][1])} bytes")
             for line in outs[m.name][1].splitlines()[:12]:
@@ -951,6 +964,7 @@ def self_test():
 # --- main ----------------------------------------------------------------------------------------------
 
 def main():
+    global DAEMON_ROOT
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("fixtures", nargs="*")
     p.add_argument("--all", action="store_true")
@@ -1001,6 +1015,7 @@ def main():
             if entry != "seed-cargo-home":
                 shutil.rmtree(os.path.join(work, entry), ignore_errors=True)
     os.makedirs(work, exist_ok=True)
+    DAEMON_ROOT = tempfile.mkdtemp(prefix="c4h-", dir="/tmp")
 
     from tracedecay import Watchdog
     watchdog = Watchdog(bin_dir, limit_mb=a.watchdog_mb, run_id=run_id, homes=(),
@@ -1033,6 +1048,7 @@ def main():
                 break
     finally:
         watchdog.stop.set()
+        shutil.rmtree(DAEMON_ROOT, ignore_errors=True)
     print()
     print(render(results))
     if watchdog.tripped:

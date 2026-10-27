@@ -460,6 +460,25 @@ mod tests {
 
     #[test]
     fn an_out_of_vfs_payload_invalidates_its_library_and_dependent_caller() {
+        check_payload_owner("pub fn value() -> u8 { include_bytes!(\"payload.bin\")[0] }", false);
+    }
+
+    #[test]
+    fn lazy_const_and_type_owners_discover_payloads_before_any_identity_lookup() {
+        for body in [
+            "#[repr(u8)] enum E { X = include_bytes!(\"payload.bin\")[0] } pub fn value() -> u8 { E::X as u8 }",
+            "#[repr(u8)] enum E { X = include_str!(\"payload.bin\").as_bytes()[0] } pub fn value() -> u8 { E::X as u8 }",
+            "type A = [u8; include_bytes!(\"payload.bin\")[0] as usize]; pub fn value() -> u8 { 1 }",
+            "struct A([u8; include_bytes!(\"payload.bin\")[0] as usize]); pub fn value() -> u8 { 1 }",
+            "pub fn value<const N: usize = { include_bytes!(\"payload.bin\")[0] as usize }>() -> u8 { 1 }",
+        ] {
+            for caller_first in [false, true] {
+                check_payload_owner(body, caller_first);
+            }
+        }
+    }
+
+    fn check_payload_owner(body: &str, caller_first: bool) {
         use test_fixture::WithFixture;
         let top = std::env::temp_dir().join(format!("c4-payload-{}", std::process::id()));
         std::fs::create_dir_all(top.join("vendor/dep/src")).unwrap();
@@ -468,7 +487,8 @@ mod tests {
             "//- {}/app.rs crate:app deps:dep\nfn caller() -> u8 {{ dep::value() + 10 }}\n\
              //- {}/vendor/dep/src/lib.rs crate:dep library new_source_root:library\n\
              #[rustc_builtin_macro]\nmacro_rules! include_bytes {{ () => {{}} }}\n\
-             pub fn value() -> u8 {{ include_bytes!(\"payload.bin\")[0] }}\n",
+             #[rustc_builtin_macro]\nmacro_rules! include_str {{ () => {{}} }}\n\
+             {body}\n",
             top.display(),
             top.display(),
         );
@@ -508,9 +528,10 @@ mod tests {
                 let (dep, app) = (find("dep"), find("app"));
                 assert!(db.included_by(dep).is_empty());
                 let contents = Contents::default();
+                let caller_hash = caller_first.then(|| contents.source_hash(&db, app));
                 let dep_hash = contents.source_hash(&db, dep);
                 assert_eq!(db.included_by(dep)[0].1.as_deref(), Some(&[byte][..]));
-                (dep_hash, contents.source_hash(&db, app))
+                (dep_hash, caller_hash.unwrap_or_else(|| contents.source_hash(&db, app)))
             })
         };
         let one = hash(1);

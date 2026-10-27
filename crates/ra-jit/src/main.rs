@@ -3987,6 +3987,43 @@ impl Declared {
 
     fn in_scope(&mut self, db: &RootDatabase, scope: &ItemScope) {
         for def in scope.declarations() {
+            // Input discovery must cover all three ExpressionStoreOwnerId families:
+            // bodies (including discriminants), signatures (generic defaults, array
+            // lengths/type const arguments), and ADT fields. Lowering just callable
+            // bodies leaves lazy const expressions out of content identities.
+            let generic = match def {
+                ModuleDefId::FunctionId(id) => Some(id.into()),
+                ModuleDefId::ConstId(id) => Some(id.into()),
+                ModuleDefId::StaticId(id) => Some(id.into()),
+                ModuleDefId::AdtId(id) => Some(id.into()),
+                ModuleDefId::TraitId(id) => Some(id.into()),
+                ModuleDefId::TypeAliasId(id) => Some(id.into()),
+                _ => None,
+            };
+            if let Some(generic) = generic {
+                self.signature(db, generic);
+            }
+            if let ModuleDefId::AdtId(adt) = def {
+                match adt {
+                    hir_def::AdtId::EnumId(id) => {
+                        for &(variant, _) in id.enum_variants(db).variants.values() {
+                            self.body(variant.into());
+                            self.expression_store(
+                                db,
+                                hir_def::ExpressionStoreOwnerId::VariantFields(variant.into()),
+                            );
+                        }
+                    }
+                    other => {
+                        self.expression_store(
+                            db,
+                            hir_def::ExpressionStoreOwnerId::VariantFields(
+                                hir_def::VariantId::from_non_enum(other).unwrap(),
+                            ),
+                        );
+                    }
+                }
+            }
             match def {
                 // A function declared in an `extern` block has no body to compile, nor has an
                 // intrinsic declared without one: every call to it is the compiler's own code.
@@ -4006,8 +4043,9 @@ impl Declared {
                         match item {
                             AssocItemId::FunctionId(id) => self.provided.push(id.into()),
                             AssocItemId::ConstId(id) => self.provided.push(id.into()),
-                            AssocItemId::TypeAliasId(_) => {}
+                            AssocItemId::TypeAliasId(id) => self.signature(db, id.into()),
                         }
+                        self.signature(db, item.into());
                     }
                 }
                 _ => {}
@@ -4017,12 +4055,27 @@ impl Declared {
             self.body(id.into());
         }
         for imp in scope.impls() {
+            self.signature(db, imp.into());
             for &(_, item) in imp.impl_items(db).items.iter() {
+                self.signature(db, item.into());
                 match item {
                     AssocItemId::FunctionId(id) => self.function(id),
                     AssocItemId::ConstId(id) => self.body(id.into()),
                     AssocItemId::TypeAliasId(_) => {}
                 }
+            }
+        }
+    }
+
+    fn signature(&mut self, db: &RootDatabase, id: hir_def::GenericDefId) {
+        self.expression_store(db, hir_def::ExpressionStoreOwnerId::Signature(id));
+    }
+
+    fn expression_store(&mut self, db: &RootDatabase, owner: hir_def::ExpressionStoreOwnerId) {
+        let store = hir_def::expr_store::ExpressionStore::of(db, owner);
+        for (_, def_map) in store.blocks(db) {
+            for (_, module) in def_map.modules(db) {
+                self.in_scope(db, module.scope(db));
             }
         }
     }

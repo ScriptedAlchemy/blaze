@@ -736,11 +736,18 @@ fn keys_of(store: &Path, pack: Digest) -> anyhow::Result<(u64, Vec<u8>)> {
 /// Sends a pack and its keys, unless the remote has them, and says how to list it.
 async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Result<(Listed, u64)> {
     let from = store.to_owned();
-    let (size, keys) = tokio::task::spawn_blocking(move || keys_of(&from, pack)).await??;
+    let (size, keys) = tokio::task::spawn_blocking(move || {
+        keys_of(&from, pack)
+            .with_context(|| format!("reading keys from {}", from.join(pack_file(&pack)).display()))
+    })
+    .await??;
     let keys_digest = Digest::of(&keys);
     remote.send_named_by_hash(&keys_object(&keys_digest), keys).await?;
     let from = store.join(pack_file(&pack));
-    let packed = tokio::task::spawn_blocking(move || packed(&from, size)).await??;
+    let packed = tokio::task::spawn_blocking(move || {
+        packed(&from, size).with_context(|| format!("reading pack {}", from.display()))
+    })
+    .await??;
     let mut listed = Listed { size, keys: keys_digest, format: STORE_FORMAT, packed: None };
     if let Some(packed) = packed {
         let len = packed.len() as u64;
@@ -753,7 +760,9 @@ async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Resul
     if remote.holds(&object, size).await? {
         return Ok((listed, 0));
     }
-    remote.send_file(&object, &store.join(pack_file(&pack)), size).await?;
+    remote.send_file(&object, &store.join(pack_file(&pack)), size).await.with_context(|| {
+        format!("sending {} as {object}", store.join(pack_file(&pack)).display())
+    })?;
     Ok((listed, size))
 }
 
