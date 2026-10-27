@@ -5,6 +5,7 @@ on:
     branches: [dist/main]
     paths:
       - crates/blaze-dist/**
+      - crates/blaze-dist-local/**
       - crates/blaze-wire/**
       - Cargo.toml
       - Cargo.lock
@@ -35,6 +36,6 @@ jobs:
         with:
           components: rustfmt
       - name: Check protocol formatting
-        run: cargo fmt -p blaze-dist -- --check
+        run: cargo fmt -p blaze-dist -p blaze-dist-local -- --check
       - name: Test the actual protocol and wire crates
-        run: cargo test --locked -p blaze-dist -p blaze-wire -- --test-threads=2
+        run: cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -- --test-threads=2

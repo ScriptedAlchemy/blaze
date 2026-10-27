@@ -8,6 +8,11 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `blaze-dist-local`: a bounded length-framed CBOR Unix coordinator/client facade
+  over the actual distributed protocol, with session retry journals, typed terminal
+  binding, monotonic timers and a CLI. Real socket/process-callback tests cover
+  transport behavior; a compiler-holder backend remains to be connected.
+
 - Distributed job ingress reserves authoritative stages/assignments to the coordinator, validates whole
   event batches, and requires authoritative current-attempt completion before success.
   Explicit no-compile admission covers verified cache-only work. An additive terminal-v2

@@ -295,6 +295,19 @@ impl Execution {
         };
         if subscriber.state == SubscriberState::Attached {
             subscriber.state = SubscriberState::Left;
+            self.terminals.insert(
+                id,
+                SubscriberTerminalV2 {
+                    execution: self.id,
+                    attempt: self.attempt,
+                    subscriber: id,
+                    termination: TerminationV2 {
+                        version: TERMINAL_VERSION,
+                        outcome: Outcome::Cancelled,
+                        reason: TerminationReasonV2::Cancelled,
+                    },
+                },
+            );
         }
         if self.attached().next().is_none() && !matches!(self.state, ExecState::Ended(_)) {
             self.end(now, Outcome::Cancelled, EndWhy::Cancelled, out);
@@ -776,6 +789,11 @@ impl Jobs {
         }
     }
 
+    /// The registry's compile bounds, for a carrier's frame-size preflight.
+    pub fn config(&self) -> &ExecutionConfig {
+        &self.config
+    }
+
     /// Admission, for its operator calls: machines, builders, rebuilds, closed pull requests.
     pub fn admission(&mut self) -> &mut Admission {
         &mut self.admission
@@ -804,6 +822,100 @@ impl Jobs {
     /// Every execution.
     pub fn executions(&self) -> impl Iterator<Item = &Execution> {
         self.executions.values()
+    }
+
+    /// Attach another subscriber to this exact running execution, not a new build.
+    pub fn subscribe(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        content: JobContent,
+        deadline_ms: Millis,
+        policy: LocalPolicy,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<JobAnswer, Refusal> {
+        let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
+        if e.content != content {
+            return Err(Refusal::NoExecution);
+        }
+        self.tick(now, out);
+        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        if e.content != content {
+            return Err(Refusal::NoExecution);
+        }
+        let id = self.next_subscriber;
+        e.subscribe(Subscriber {
+            id,
+            deadline_ms,
+            policy,
+            test_timeout_ms: None,
+            state: SubscriberState::Attached,
+        })?;
+        self.next_subscriber += 1;
+        Ok(JobAnswer { content, execution, subscriber: id })
+    }
+
+    fn work_route<T>(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        out: &mut Vec<(ExecutionId, Effect)>,
+        call: impl FnOnce(&mut Execution, &mut Vec<Effect>) -> Result<T, Refusal>,
+    ) -> Result<T, Refusal> {
+        let e = self.executions.get_mut(&execution).ok_or(Refusal::NoExecution)?;
+        let mut log = Vec::new();
+        let result = call(e, &mut log);
+        self.after(now, execution, log, out);
+        result
+    }
+
+    /// Route the actual work-join call through the registry's lifecycle/effect tracking.
+    pub fn join(
+        &mut self,
+        now: Millis,
+        from: &str,
+        req: &WorkJoinRequest,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<WorkJoinAnswer, Refusal> {
+        self.work_route(now, req.execution, out, |e, log| e.join(now, from, req, log))
+    }
+
+    /// Route the actual work-lease call through the registry.
+    pub fn lease(
+        &mut self,
+        now: Millis,
+        from: &str,
+        req: &WorkLeaseRequest,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<WorkLeaseAnswer, Refusal> {
+        self.work_route(now, req.execution, out, |e, log| e.lease(now, from, req, log))
+    }
+
+    /// Route an uploaded batch's result through the registry.
+    pub fn result(
+        &mut self,
+        now: Millis,
+        from: &str,
+        req: &BatchResult,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) -> Result<WorkResultAnswer, Refusal> {
+        self.work_route(now, req.lease.execution, out, |e, log| e.result(now, from, req, log))
+    }
+
+    /// Forget a terminal execution only once all assignment-stop acknowledgments arrived.
+    /// A transport supplies its own retention time and calls this after it elapsed.
+    pub fn forget_terminal(&mut self, execution: ExecutionId) -> bool {
+        if self.assignments.values().any(|(token, _)| token.execution == execution)
+            || self
+                .executions
+                .get(&execution)
+                .is_none_or(|e| !matches!(e.state(), ExecState::Ended(_)))
+        {
+            return false;
+        }
+        self.executions.remove(&execution);
+        self.platforms.remove(&execution);
+        true
     }
 
     /// `POST /v1/jobs`, with the reservation the server measured for its lead. An equal
@@ -941,10 +1053,10 @@ impl Jobs {
         executor: &str,
         assignment: AssignmentToken,
         alive: bool,
-    ) {
+    ) -> bool {
         // An acknowledgment is meaningful only for a stop we requested on this assignment.
         if self.assignments.get(executor) != Some(&(assignment, true)) {
-            return;
+            return false;
         }
         self.assignments.remove(executor);
         if self
@@ -952,13 +1064,14 @@ impl Jobs {
             .executor(executor)
             .is_none_or(|slot| slot.busy != Some((assignment.execution, assignment.attempt)))
         {
-            return;
+            return false;
         }
         if alive {
             self.admission.finished(now, executor, assignment.execution, assignment.attempt);
         } else {
             self.admission.lost(now, executor);
         }
+        true
     }
 
     /// Time passed: executions' deadlines and lead losses, reassignments, then admission.

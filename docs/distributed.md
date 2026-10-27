@@ -1605,9 +1605,13 @@ request-auth framing have their own versions. A general schema-1 peer requires i
 not a schema-2 decoder accepting old shapes.
 
 The codec, effect-to-response model and client-policy function are implemented and tested.
-The HTTP/Unix route, pending-response status, negotiated compatibility enforcement, and real
-client fallback/race execution still need the D1/E3 driver. No transport or client execution is
-claimed by this protocol-core test.
+The local Unix driver in [blaze-dist-local](../crates/blaze-dist-local/README.md) now implements
+length-framed deterministic CBOR, explicit transport/global-codec/terminal negotiation,
+actual registry routing and immutable typed terminal/pending lookup. It retains exact
+request replies over reconnect, enforces bounds and forwards real effects to the backend.
+Its CLI and socket tests do not supply a compiler holder or execute a fallback/race build.
+HTTP/fleet transport, source/store/compiler execution and production client-race behavior
+remain D1/E3 integration work.
 
 ### Export and ingestion (re-review B, B3)
 

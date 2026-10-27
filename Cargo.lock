@@ -670,6 +670,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-dist-local"
+version = "0.1.0"
+dependencies = [
+ "blaze-dist",
+ "blaze-wire",
+]
+
+[[package]]
 name = "blaze-manifest"
 version = "0.1.0"
 dependencies = [
