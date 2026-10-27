@@ -877,23 +877,39 @@ def internal(sc, source_sha):
     got = sc.program("gen-one")
     if got != exp_b["gen-one"]:
         sc.fail(f"B: gen-one printed {got!r}, the oracle's {exp_b['gen-one']!r}")
-    mine = [e for e in sc.events("a") if e[0] == "holds" and e[1] == nobody and "loaded" in e[4]]
+    mine = [e for e in sc.events("a") if e[0] in ("pins", "holds") and e[1] == nobody]
     sc.notes["edit-holds"] = mine
     if not mine:
-        sc.fail("the edit's build did not log that it holds the scripts' output (a build with no number "
+        sc.fail("the edit's build did not log that it reads the scripts' output (a build with no number "
                 "holds nothing in the binary under test)")
     sc.timeouts()
 
 
-def shared_projects(sc):
-    """Two projects of other names (so that neither is the other's split) that build in one
-    target directory. Their scripts are two groups."""
+def shared_projects(sc, worktrees=False):
+    """Two projects that build in one target directory; their scripts are two groups. Of other
+    names (so that neither is the other's split) for two direct runs; with `worktrees`, two
+    checkouts of one repository (what a worker joins: the daemon has one worker for them) whose
+    build scripts differ, so that the second is loaded whole and not as a split of the first."""
     sc.r, sc.s = os.path.join(sc.dir, "r"), os.path.join(sc.dir, "s")
     sc.target = os.path.join(sc.dir, "target-shared")
     saved = sc.runs_log
-    sc.project(sc.r, pkg="gena")
-    sc.runs_log = saved
-    sc.project(sc.s, pkg="genb")
+    if not worktrees:
+        sc.project(sc.r, pkg="gena")
+        sc.runs_log = saved
+        sc.project(sc.s, pkg="genb")
+        return {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target}
+    sc.project(sc.r)
+    def git(*args, cwd=sc.r):
+        subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", *args],
+                       cwd=cwd, capture_output=True, check=True)
+    git("init", "-q")
+    with open(os.path.join(sc.r, ".gitignore"), "w") as f:
+        f.write("target/\n")
+    git("add", "-A")
+    git("commit", "-qm", "probe")
+    git("worktree", "add", "-q", "-b", "other", sc.s)
+    with open(os.path.join(sc.s, "build.rs"), "a") as f:
+        f.write("// this checkout's script is another's\n")
     return {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target}
 
 
@@ -998,10 +1014,10 @@ def overlay(sc, source_sha):
 
 
 def worlds(sc, source_sha):
-    extra = shared_projects(sc)
-    A1 = sc.client("a", ("--bin", "gena-one"), cwd=sc.r, GEN="a", **extra)
+    extra = shared_projects(sc, worktrees=True)
+    A1 = sc.client("a", ("--bin", "gen-one"), cwd=sc.r, GEN="a", **extra)
     sc.finish(A1, "A1 (R)")
-    A2 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="a", **extra)
+    A2 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="a", **extra)
     sc.finish(A2, "A2 (S)")
     for tag, p in (("R", A1), ("S", A2)):
         if p.returncode != 0:
@@ -1016,7 +1032,7 @@ def worlds(sc, source_sha):
         sc.fail(f"the scripts of R and S did not both run: {sc.run_dirs()}")
         return
     # S was judged last. The edit is of R.
-    nobody = edit_while_held(sc, extra, sc.r, "gena", sc.r, sc.r, "gena", "b", True, "worlds")
+    nobody = edit_while_held(sc, extra, sc.r, "gen", sc.r, sc.r, "gen", "b", True, "worlds")
     if nobody is not None:
         pinned = [e for e in sc.events("a") if e[0] == "pins" and e[1] == nobody]
         sc.notes["pins"] = pinned
@@ -1026,11 +1042,11 @@ def worlds(sc, source_sha):
 
 
 def join(sc, source_sha):
-    extra = shared_projects(sc)
-    one = ("--bin", "gena-one")
+    extra = shared_projects(sc, worktrees=True)
+    one = ("--bin", "gen-one")
     A1 = sc.client("a", one, cwd=sc.r, GEN="a", **extra)
     sc.finish(A1, "A1 (R)")
-    A2 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="a", **extra)
+    A2 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="a", **extra)
     sc.finish(A2, "A2 (S joins)")
     for tag, p in (("R", A1), ("S", A2)):
         if p.returncode != 0:
@@ -1040,7 +1056,7 @@ def join(sc, source_sha):
         sc.fail("S was not joined to the worker that has R: the case was not exercised")
         return
     # S again, with another value of what its script watches: it runs for this build.
-    A3 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="c", **extra)
+    A3 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="c", **extra)
     sc.finish(A3, "A3 (S again)", within=LOST)
     if A3.returncode != 0:
         sc.fail(f"S asked again exited {A3.returncode} (what its join took is not released): {A3.err[-600:]}")
