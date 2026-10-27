@@ -802,6 +802,32 @@ product does not do for itself: the registry crates of `Cargo.lock` from `cargo 
 `rust-src` for the toolchain, in a 6 GiB container (no extra swap), under the docker lock. Not shown: several candidates,
 mixed placed/split roots, root-changing reloads, intervening source edits.
 
+### A candidate is certified by its files, not by metadata that may be old (`d2ffc096` → this head)
+
+The eighth independent review found that the candidate was still chosen by comparing the current manifests
+with the script targets of the workspace as it was loaded. Once R1's manifest was made V's, R1 was alike by its old
+target (the same unused `build.rs`) while it selects another script now; the check reloaded R1 and ran that script for
+V's request, and when it fails V failed with it, before the choice could be revalidated and V loaded on its own. `alike_by`
+now finds a candidate only among the checkouts whose watched files (their manifests, lock, configuration, build scripts)
+are as they were when they were loaded (`Inputs::describes`: stat only, nothing run, no metadata refresh). One that is not is
+no checkout to read another through until a request for it loads it again; the next alike checkout, or none, supplies the
+packages. The cost is a worktree that loads on its own, instead of sharing, while its twin has a changed manifest. Typed
+`Sharing`, the first load and a failing base V truly consumes are unchanged: the failure of a consumed base is said.
+
+| Linux, split on, quick overlay; R1 and R2 loaded in full under `GEN=a`; R1's manifest made R2's/V's (`Cargo.toml` hashes equal after); ONE request for V, `GEN=b` | baseline `d2ffc096` | fixed |
+|---|---|---|
+| `choice-edited-failing`: R1's newly selected `build-new.rs` fails for `b` (in R1's directory only), V's succeeds | fails with R1's message (`gen … /r1`); R1's trail `b B`; no V program | V split from R2, judged once for `b` (trail `b B`); R1 not run; V `include=b env=b cfg=b native=98` = cargo's |
+| `choice-edited` (R1's new script succeeds) | R1 judged (`b B`), V on its own (`b B`), `b b b 98` | R1 not run, V split from R2 (`b B`), `b b b 98` |
+| `choice-stable` (no edit) | V split from R2, R2 `b B`, `b b b 98` | the same; the full tuple is now asserted (a mismatch fails, native alone is a recorded gap) |
+| `choice-failing-base` (V's and R2's shared script fails for `b`) | fails with R2's message; R1 not run | the same: a consumed base's failure is said |
+
+`quick-choice`, `first-join`, `first-join-shared`, `first-join-private` and `join` pass on the fixed binary in the same
+batch. Component: `Inputs::describes` (not watched; as loaded; manifest selects another script; another root), 43 passed with the
+other `scripts::`, `recovery::`, policy, `reached` and `Sharing` tests. Same pinned Linux setup as before (vendored
+registry crates, host `rust-src`, 6 GiB, no extra swap). Not shown: several candidates beyond these three roots, mixed
+placed/split roots, a candidate whose watched files change between the choice and the load, a checkout whose
+files are touched without a content change (it is not shared until it is loaded again).
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
