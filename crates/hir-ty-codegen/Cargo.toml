@@ -65,6 +65,9 @@ llvm-sys = { version = "201.1.1", features = ["no-llvm-linking"], optional = tru
 
 [dev-dependencies]
 ra-jit-fuzz.workspace = true
+hir.workspace = true
+ide-db.workspace = true
+test-fixture.workspace = true
 
 [features]
 llvm = ["dep:inkwell", "dep:llvm-sys"]

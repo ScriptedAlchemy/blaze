@@ -260,6 +260,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
+    /// A portable type identity for backend metadata. Unlike StoredTy's Hash this
+    /// contains no process-local interner key. Long types retain all SHA-256 bits.
+    pub(super) fn type_name(&self, ty: Ty<'db>) -> Option<String> {
+        let mut name = String::new();
+        self.ty(&mut name, ty)?;
+        Some(name)
+    }
+
     /// The vtable of a type for a trait object, or the one with no methods.
     pub(super) fn vtable(
         &self,
@@ -582,7 +590,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let root = source.file_id.parse_or_expand(self.db);
             let text = source.value.syntax_node_ptr().to_node(&root).text().to_string();
             let digest = Sha256::digest(text.as_bytes());
-            digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
+            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
         });
         self.written.borrow_mut().insert(closure, written.clone());
         written

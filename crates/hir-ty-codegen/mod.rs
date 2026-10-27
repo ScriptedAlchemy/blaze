@@ -101,6 +101,7 @@ pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
 mod debuginfo;
 pub use debuginfo::Sidecar;
+pub mod export;
 mod float_pair;
 mod fncache;
 pub use fncache::{AlwaysRun, Reach, tests_reach};
@@ -2074,7 +2075,7 @@ struct ObjectCodegen<'a, 'db> {
     /// What those types are told as, and the ones the threads that compile told of.
     told: ToldTypes,
     /// Writes what is kept to the store, once there is something to keep.
-    writer: Option<cached::Writer>,
+    writer: Option<cached::Writer<'static>>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -2227,6 +2228,9 @@ impl Kept {
     }
 
     fn written(&mut self, written: cached::Written) {
+        for error in &written.errors {
+            eprintln!("store: {error}");
+        }
         self.added += written.added;
         if written.of_cargo != 0 {
             *self.unkept.entry(OF_CARGO).or_default() += written.of_cargo;
@@ -2735,6 +2739,25 @@ fn callee_name(db: &dyn HirDatabase, def: InstanceDef) -> &str {
         InstanceDef::FnPointerShim => "{closure}::fn_pointer",
         InstanceDef::ReifyShim { .. } => "{reify}",
     }
+}
+
+/// The requested type of the compiler's TypeId intrinsic. Shared by object and batch
+/// lowering; the hash comes from the type, never an object FuncId.
+fn type_id_of<'db>(
+    db: &'db dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+) -> Option<Ty<'db>> {
+    if FunctionSignature::of(db, func).name.as_str() != "of" {
+        return None;
+    }
+    let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
+    let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).skip_binder().kind() else { return None };
+    if symbols.item(adt.def_id().into())? != "core::any::TypeId" {
+        return None;
+    }
+    args.as_slice().first()?.ty()
 }
 
 /// Writes into `blob` the `TypeId`s it has the places of.
@@ -5751,8 +5774,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             stable_names: &mut self.stable_names,
             source_paths: &mut self.source_paths,
             kept: &mut self.kept,
-            declarations: self.module.declarations(),
-            type_ids: &self.type_ids,
             root_names: &self.root_names,
             own_crates: &self.own_statics.crates,
             told: &self.told,
@@ -5775,7 +5796,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             });
             settled.collect()
         });
-        let made = self.keeper(settled).make(later);
+        let bindings =
+            export::ObjectBindings::new(self.module.declarations(), &self.type_ids, later);
+        let made = self.keeper(settled).make(later, &bindings);
         self.apply(later, made);
     }
 
@@ -5825,8 +5848,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     stable_names: &mut stable_names,
                     source_paths: &mut source_paths,
                     kept: &mut kept,
-                    declarations,
-                    type_ids,
                     root_names,
                     own_crates: owned,
                     told,
@@ -5840,7 +5861,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 loop {
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(part) = parts.get(at) else { break };
-                    let part = part.iter().map(|it| keeper.make(it)).collect();
+                    let part = part
+                        .iter()
+                        .map(|it| {
+                            let bindings = export::ObjectBindings::new(declarations, type_ids, it);
+                            keeper.make(it, &bindings)
+                        })
+                        .collect();
                     let kept = std::mem::take(&mut *keeper.kept);
                     let misses = names.misses.take();
                     *made[at].lock().unwrap_or_else(|e| e.into_inner()) =
@@ -5855,8 +5882,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A resolver without threads leaves the work to whoever asks for it.
             let Some((part_made, kept, misses)) = made else {
                 for it in part.iter() {
-                    let made = self.keeper(None).make(it);
-                    self.apply(it, made);
+                    self.make_now(it);
                 }
                 continue;
             };
@@ -5871,7 +5897,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
-    fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer {
+    fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer<'static> {
         let symbols = self.symbols;
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
@@ -6089,6 +6115,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 CachedData::Location(at) => self.define_location(at.clone())?,
                 CachedData::FilePath(path) => self.define_file_path(path.clone())?,
+                CachedData::Text(parts) => {
+                    let text = parts
+                        .iter()
+                        .map(|it| match it {
+                            cached::CachedTextPart::Text(text)
+                            | cached::CachedTextPart::FilePath(text) => text.as_str(),
+                        })
+                        .collect::<String>();
+                    self.define_file_path(text)?
+                }
             };
             ids.datas.push(id);
         }
@@ -6961,16 +6997,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// The `T` of `TypeId::of::<T>`, when `func` is that function.
     fn type_id_of(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<Ty<'db>> {
-        let db = self.db;
-        if FunctionSignature::of(db, func).name.as_str() != "of" {
-            return None;
-        }
-        let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
-        let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).skip_binder().kind() else { return None };
-        if self.symbols.item(adt.def_id().into())? != "core::any::TypeId" {
-            return None;
-        }
-        args.as_slice().first()?.ty()
+        type_id_of(self.db, self.symbols, func, args)
     }
 
     fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
