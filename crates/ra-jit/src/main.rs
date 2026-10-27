@@ -3144,6 +3144,23 @@ impl Quick {
     }
 }
 
+/// The reply for a request that failed, on one line: what cargo says of a script that failed has several
+/// (the cause, the script's output), and the client reads one. Newlines and backslashes are escaped
+/// ([`unfailed`] reads them back).
+fn failed_reply(why: &str) -> String {
+    let mut line = String::from("failed: ");
+    ra_jit_live::format::escape(why, &mut line);
+    line
+}
+
+/// A reply [`failed_reply`] wrote, as the message it was; any other reply as it is.
+pub(crate) fn unfailed(reply: &str) -> String {
+    match reply.strip_prefix("failed: ") {
+        Some(why) => format!("failed: {}", ra_jit_live::format::unescape(why)),
+        None => reply.to_owned(),
+    }
+}
+
 /// Whether a request reads the checkout loaded at `root`, when `built` is the one whose scripts it
 /// reads: its own checkout, or the one it shares packages with, and none when it reads no
 /// loaded checkout (a project that will be loaded on its own).
@@ -7321,7 +7338,7 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
-    anyhow::ensure!(reply.starts_with("ok"), "daemon: {reply}");
+    anyhow::ensure!(reply.starts_with("ok"), "daemon: {}", unfailed(reply));
     println!("{}", trace::without_spans(reply));
     Ok(())
 }
@@ -8962,7 +8979,8 @@ fn run_holding(
                                     later.push((request, asked, stream));
                                     continue;
                                 }
-                                let _ = writeln!(&stream, "failed: {error:#}");
+                                let _ =
+                                    writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
                                 continue;
                             }
                         }
@@ -8977,7 +8995,7 @@ fn run_holding(
                             continue;
                         }
                         Err(error) => {
-                            let _ = writeln!(&stream, "failed: {error:#}");
+                            let _ = writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
                             continue;
                         }
                     }
@@ -9198,7 +9216,7 @@ fn run_holding(
                         }
                         // A request for what can't be built is the client's mistake.
                         Err(e) => {
-                            let _ = writeln!(&stream, "failed: {e:#}");
+                            let _ = writeln!(&stream, "{}", failed_reply(&format!("{e:#}")));
                         }
                     }
                 }
@@ -9965,7 +9983,7 @@ fn run_holding(
                 for (_, _, client) in clients {
                     let _ = match &failed {
                         None => writeln!(&client, "ok {built}"),
-                        Some(why) => writeln!(&client, "failed: {why}"),
+                        Some(why) => writeln!(&client, "{}", failed_reply(&why.to_string())),
                     };
                 }
                 if let (Some(_), Some((over, unlinked))) = (&failed, read_as) {
@@ -10694,6 +10712,19 @@ mod tests {
         let from = Sharing::From(r1.to_owned());
         assert!(from.allows(r1) && !from.allows(r2));
         assert_eq!(from.judged(), Some(r1));
+    }
+
+    #[test]
+    fn a_failure_is_one_line_to_the_client_and_all_of_it_to_the_user() {
+        let why = "failed to run custom build command for `a v0.1.0 (/r)`\n\nCaused by:\n  process didn't exit \
+                   successfully (exit status: 3)\n  --- stderr\n  script failed for a\\n done\n";
+        let line = failed_reply(why);
+        assert!(!line.contains('\n'), "a reply is one line: {line:?}");
+        assert!(line.starts_with("failed: failed to run custom build command"));
+        assert_eq!(unfailed(&line), format!("failed: {why}"));
+        // Any other reply is left as it is.
+        assert_eq!(unfailed("ok object=x"), "ok object=x");
+        assert_eq!(unfailed("cargo: a b"), "cargo: a b");
     }
 
     #[test]

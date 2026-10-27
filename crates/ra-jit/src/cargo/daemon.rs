@@ -237,7 +237,7 @@ impl NotBuilt {
         }
         match reply.strip_prefix("error: ") {
             Some(said) => NotBuilt::Error(crate::errors::Said::of_reply(said)),
-            None => NotBuilt::Failed(reply.to_owned()),
+            None => NotBuilt::Failed(crate::unfailed(reply)),
         }
     }
 }

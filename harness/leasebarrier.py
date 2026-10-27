@@ -1395,8 +1395,9 @@ def same_build(sc, source_sha, fails):
         rc1, said1 = sync(sc, sock, env_a, within=LOST)
         sc.notes["a1"] = (rc1, said1[-300:])
         if fails:
-            if rc1 == 0:
-                sc.fail(f"A's first request was to fail: {rc1} {said1[-300:]!r}")
+            # The message is all of cargo's: the cause and the script's own output, not its first line.
+            if rc1 == 0 or "script failed for a" not in said1 or "Caused by" not in said1:
+                sc.fail(f"A's first request was to fail with all of the script's message: {rc1} {said1[-300:]!r}")
         elif rc1 != 0:
             sc.fail(f"A's first request exited {rc1}: {said1[-400:]}")
             return
