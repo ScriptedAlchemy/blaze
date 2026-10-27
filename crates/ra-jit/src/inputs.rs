@@ -51,8 +51,7 @@ struct Checkout {
     /// the files cargo's configuration is read from: those that are not there too. Each by its
     /// content ([`Structural`]), not by when it was written.
     files: Vec<Structural>,
-    /// Whether the build scripts the loaded workspace selects are those the manifests select, as
-    /// they were when the files above were read for this record.
+    /// Whether the loaded structural sources and selected scripts still describe the checkout.
     consistent: bool,
     /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
@@ -524,11 +523,15 @@ impl Inputs {
         for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"] {
             files.push(Structural::new(root.join(name)));
         }
-        // The files are read here, after the workspace was: a manifest written between the two is not
-        // what the workspace says. For the script each package selects, the one thing a candidate is
-        // chosen by, that is looked at: the targets loaded against the manifests as they are read now.
         let mut consistent = true;
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+            // These are the bytes that produced the resolved graph, including its features,
+            // not the bytes a script may have left behind. Retain every structural read.
+            for (path, bytes) in cargo.sources() {
+                let source = Structural::read(path.clone(), &Ok(bytes.clone()));
+                consistent &= !source.changed();
+                files.push(source);
+            }
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
                 // The manifest is read once: the bytes recorded and the selection compared with the

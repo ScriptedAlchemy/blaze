@@ -91,8 +91,10 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             offline: false,
             store: None,
         };
-        let json = blaze_metadata::metadata(&asked)?;
-        serde_json::from_str(&json).context("blaze's own metadata is not cargo's form")
+        let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
+        let metadata =
+            serde_json::from_str(&json).context("blaze's own metadata is not cargo's form")?;
+        Ok((metadata, sources))
     };
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),

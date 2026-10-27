@@ -3235,6 +3235,9 @@ fn workspace_at(
             false => plan::Plan::of(manifest.manifest_path().as_ref(), selection, &plan_asked)?,
         };
         debug = plan.whole()?;
+        let mut sources = cargo.sources().to_vec();
+        sources.extend_from_slice(plan.sources());
+        cargo.set_sources(sources);
         let packages: Vec<_> = cargo.packages().collect();
         // A proc macro of the build is still built by cargo's check of the load (step J), which
         // then runs the scripts too: blaze runs them where the build has none.

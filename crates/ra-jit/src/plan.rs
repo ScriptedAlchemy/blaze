@@ -503,6 +503,8 @@ pub(crate) struct Plan {
     lto: bool,
     frame_pointers: bool,
     lints_capped: bool,
+    /// Profiles and workspace configuration read by the owned planner.
+    sources: Vec<(PathBuf, Vec<u8>)>,
 }
 
 /// What a plan says of a program as a whole.
@@ -674,7 +676,12 @@ impl Plan {
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,
+            sources: ctx.sources(),
         })
+    }
+
+    pub(crate) fn sources(&self) -> &[(PathBuf, Vec<u8>)] {
+        &self.sources
     }
 
     /// The programs the build `selection` names, of the targets `targets` picks (`--bin`,
@@ -901,6 +908,7 @@ impl UnitGraph {
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,
+            sources: Vec::new(),
         })
     }
 }

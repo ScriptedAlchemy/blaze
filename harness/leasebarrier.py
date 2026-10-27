@@ -2029,7 +2029,7 @@ def choice_failing_base(sc, source_sha):
     consumption_choice(sc, source_sha, "failing-base")
 
 
-def selector_moves(sc, source_sha):
+def selector_moves(sc, source_sha, features=False):
     """R's manifest selects `old/build.rs`, which succeeds for `a`, fails for `b`, and, as a persistent effect of its first
     run, rewrites the manifest's selector to `new/build.rs` (the workspace was parsed before: its target is the old one).
     V's manifest is R's after that, and V has the same old script, dormant, and a new script that succeeds for `b`.
@@ -2049,6 +2049,14 @@ def selector_moves(sc, source_sha):
         '        fs::write(&manifest, text.replace("old/build.rs", "new/build.rs")).unwrap();\n'
         '    }\n'
         "    // A script cargo runs every build.", 1)
+    if features:
+        old_rs = new_rs.replace("    // A script cargo runs every build.",
+            '    if cfg!(feature = "old") && gen_ == "b" {\n'
+            '        eprintln!("the old feature fails for b");\n        exit(3);\n    }\n'
+            '    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("Cargo.toml");\n'
+            '    let text = fs::read_to_string(&manifest).unwrap();\n'
+            '    fs::write(&manifest, text.replace("default = [\\"old\\"]", "default = [\\"new\\"]")).unwrap();\n'
+            "    // A script cargo runs every build.", 1)
     assert old_rs != new_rs
     for name, path in paths.items():
         sc.runs_log = saved
@@ -2059,12 +2067,22 @@ def selector_moves(sc, source_sha):
                 f.write(text)
         select = "old/build.rs" if name == "r" else "new/build.rs"
         manifest = open(os.path.join(path, "Cargo.toml")).read().replace('build = "build.rs"', f'build = "{select}"')
+        if features:
+            manifest = manifest.replace(f'build = "{select}"', 'build = "build.rs"')
+            feature = "old" if name == "r" else "new"
+            manifest += f'\n[features]\ndefault = ["{feature}"]\nold = []\nnew = []\n'
+            with open(os.path.join(path, "build.rs"), "w") as f:
+                f.write(old_rs)
         with open(os.path.join(path, "Cargo.toml"), "w") as f:
             f.write(manifest)
     sc.r = paths["r"]
     extra = {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target, "ONCE_DIR": once, "ONCE_ONLY": "none",
              "ONCE_BY_DIR": "1"}
     oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"})
+    if features:
+        want = oracle_of(sc, {"Cargo.toml": open(os.path.join(paths["v"], "Cargo.toml")).read(),
+                              "build.rs": old_rs}, {"GEN": "b", "GEN_ARCHIVE": "same"})
+        oracle = {"gen-one": want}
     env = sc.env("a", dict(GEN="a", ONCE_TAG="load", **extra))
     env.pop("RA_JIT_WHOLE_BUILD", None)
     sock = os.path.join(sc.dir, "worker.sock")
@@ -2124,6 +2142,12 @@ def selector_moves(sc, source_sha):
         sc.timeouts()
     finally:
         worker.kill()
+
+
+def feature_capture(sc, source_sha):
+    """The same script rewrites default=["old"] to default=["new"] on its first run.
+    The first V request must not execute R's stale old-feature compilation for GEN=b."""
+    selector_moves(sc, source_sha, features=True)
 
 
 HOSTFLAGS_BUILD_RS = r"""fn main() {
@@ -2364,6 +2388,7 @@ SCENARIOS = {
     "choice-failing-base": choice_failing_base,
     "choice-same-stamp": choice_same_stamp,
     "selector-moves": selector_moves,
+    "feature-capture": feature_capture,
     "hostflags": hostflags,
     "choice-stable": choice_stable,
     "overlay": overlay,

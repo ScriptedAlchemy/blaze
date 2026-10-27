@@ -310,7 +310,10 @@ impl ProjectWorkspace {
                 .ok();
             (cfg, metadata)
         });
-        let own_metadata = own.as_mut().and_then(|it| it.1.take());
+        let (own_metadata, sources) = match own.as_mut().and_then(|it| it.1.take()) {
+            Some((metadata, sources)) => (Some(metadata), sources),
+            None => (None, Vec::new()),
+        };
         let fetch_metadata = own_metadata.is_none().then(|| {
             FetchMetadata::new(
                 cargo_toml,
@@ -485,6 +488,7 @@ impl ProjectWorkspace {
             )
         })?;
         let mut cargo = CargoWorkspace::new(meta, cargo_toml.clone(), cargo_env, false);
+        cargo.set_sources(sources);
         cargo.set_executables(config.executables.clone());
         if let Some(loaded_sysroot) = loaded_sysroot {
             tracing::info!(src_root = ?sysroot.rust_lib_src_root(), root = %loaded_sysroot, "Loaded sysroot");

@@ -47,6 +47,8 @@ pub struct CargoWorkspace {
     requires_rustc_private: bool,
     /// The directory the build put the executables of the workspace in.
     executables: Option<AbsPathBuf>,
+    /// Source bytes supplied by the owned manifest reader, before scripts can edit them.
+    sources: Vec<(std::path::PathBuf, Vec<u8>)>,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -168,7 +170,7 @@ type Metadata = dyn Fn(
         Option<&str>,
         &[cfg::CfgAtom],
         &FxHashMap<String, Option<String>>,
-    ) -> anyhow::Result<cargo_metadata::Metadata>
+    ) -> anyhow::Result<(cargo_metadata::Metadata, Vec<(std::path::PathBuf, Vec<u8>)>)>
     + Send
     + Sync;
 
@@ -542,6 +544,7 @@ impl CargoWorkspace {
             is_virtual_workspace,
             requires_rustc_private,
             executables: None,
+            sources: Vec::new(),
             is_sysroot,
             env: cargo_env,
         }
@@ -551,6 +554,14 @@ impl CargoWorkspace {
     /// build of the whole workspace.
     pub fn set_active_features(&mut self, package: Package, features: Vec<String>) {
         self.packages[package].active_features = features;
+    }
+
+    pub fn set_sources(&mut self, sources: Vec<(std::path::PathBuf, Vec<u8>)>) {
+        self.sources = sources;
+    }
+
+    pub fn sources(&self) -> &[(std::path::PathBuf, Vec<u8>)] {
+        &self.sources
     }
 
     /// Sets what the profile the package is built with changes of the toolchain's cfg.

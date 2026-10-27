@@ -33,11 +33,31 @@ use crate::workspace::find_workspace_root;
 pub struct Context {
     pub config: Config,
     pub(crate) ws_roots: RefCell<FxHashMap<PathBuf, WorkspaceRootConfig>>,
+    sources: RefCell<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 impl Context {
     pub fn new(config: Config) -> Context {
-        Context { config, ws_roots: RefCell::new(FxHashMap::default()) }
+        Context {
+            config,
+            ws_roots: RefCell::new(FxHashMap::default()),
+            sources: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Read a structural input and retain the bytes used to interpret it. Every read is
+    /// retained: two different versions of a manifest cannot certify one resolved graph.
+    pub fn read_source(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let bytes = std::fs::read(path)?;
+        self.sources.borrow_mut().push((path.to_owned(), bytes.clone()));
+        Ok(bytes)
+    }
+
+    /// The source of this reading, not a snapshot taken after resolution or script execution.
+    pub fn sources(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut sources = self.sources.borrow().clone();
+        sources.extend(self.config.sources());
+        sources
     }
 }
 
@@ -351,7 +371,7 @@ pub fn read_manifest(
         bail!("parsing `{}` requires `-Zscript`", path.display());
     }
     let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+        ctx.read_source(path).with_context(|| format!("failed to read `{}`", path.display()))?;
     let contents = String::from_utf8(bytes)
         .map_err(|_| anyhow!("path at `{}` was not valid utf-8", path.display()))?;
     let original_toml: TomlManifest =
@@ -1678,4 +1698,27 @@ supported tools: {}",
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn structural_sources_are_the_bytes_read_not_the_files_after_a_script() {
+        let dir = std::env::temp_dir().join(format!("manifest-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+        let old = b"[features]\ndefault = [\"old\"]\n";
+        let new = b"[features]\ndefault = [\"new\"]\n";
+        std::fs::write(&manifest, old).unwrap();
+        let config = Config::load(&dir, [], &[]).unwrap();
+        let ctx = Context::new(config);
+        assert_eq!(ctx.read_source(&manifest).unwrap(), old);
+        std::fs::write(&manifest, new).unwrap();
+        assert_eq!(ctx.sources(), [(manifest.clone(), old.to_vec())]);
+        assert_eq!(ctx.read_source(&manifest).unwrap(), new);
+        assert_eq!(ctx.sources(), [(manifest.clone(), old.to_vec()), (manifest, new.to_vec())]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
