@@ -536,7 +536,10 @@ fn the_script_environment_is_what_a_build_script_may_read_and_the_config_env_is_
     ];
     want.sort_by_key(|it| encode(it));
     assert_eq!(script, want);
-    assert_eq!(spec.build.config_env.as_slice(), [("FROM_CONFIG".to_owned(), "1".to_owned())]);
+    assert_eq!(
+        spec.build.config_env.as_slice(),
+        [("FROM_CONFIG".to_owned(), blaze_wire::ConfigEnvValue::Literal("1".to_owned()))]
+    );
 }
 
 #[test]

@@ -36,8 +36,8 @@ It reports a mismatch with status 2. A matching spec currently fails with a mess
 that the owned unit executor is not connected. It never dispatches to the existing
 cargo/rustc fallback. Connecting an executor for libraries, tests, build scripts, proc
 macros and doctests, and passing the real local-run harness, remain C2 acceptance work.
-Config-relative path metadata and configuration/profile overrides must also survive
-reproduction without guessing.
+Config values now preserve literal/workspace-relative tags in CBOR. Original
+CLI configuration/profile overrides still need complete reconstruction without guessing.
 
 ## Tests
 

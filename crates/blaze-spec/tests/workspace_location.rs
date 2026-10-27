@@ -126,3 +126,36 @@ fn nested_explicit_parent_manifest_and_saved_replay_use_the_selected_workspace()
     }
     assert!(matched, "the same reconstruction path used by CLI replay must validate");
 }
+
+#[test]
+fn literal_and_relative_config_are_keyed_and_materialized_after_round_trip() {
+    let fixture = repository();
+    let root = fixture.root();
+    fixture.write("left/.cargo/config.toml", "[env]\nASSET = \"data\"\n");
+    let literal = make(&fixture, &root.join("left"), &[]);
+    fixture
+        .write("left/.cargo/config.toml", "[env]\nASSET = { value = \"data\", relative = true }\n");
+    let relative = make(&fixture, &root.join("left"), &[]);
+    // Dirty input snapshots remain separate work; only the env tag changes in these specs.
+    assert_eq!(literal.build.source, relative.build.source);
+    assert_eq!(literal.build.units, relative.build.units);
+    assert_ne!(literal.digest, relative.digest);
+    assert_ne!(literal.job_content(Namespace::Main), relative.job_content(Namespace::Main));
+    let decode = |spec: &BuildSpec| {
+        blaze_wire::decode::<BuildSpec>(&blaze_wire::encode(spec), &blaze_wire::Limits::default())
+            .unwrap()
+    };
+    let literal = decode(&literal.build);
+    let relative = decode(&relative.build);
+    assert_eq!(literal.config_env.as_slice()[0].1.text(), "data");
+    assert_eq!(relative.config_env.as_slice()[0].1.text(), "data");
+    let worker = repository();
+    assert_eq!(
+        run::config_environment(&literal, &worker.root()).unwrap(),
+        [("ASSET".to_owned(), "data".to_owned())]
+    );
+    assert_eq!(
+        run::config_environment(&relative, &worker.root()).unwrap(),
+        [("ASSET".to_owned(), worker.root().join("left/data").to_string_lossy().into_owned())]
+    );
+}

@@ -2529,7 +2529,7 @@ def resolve(cwd, words, env):
     lock = open(os.path.join(root, "Cargo.lock"), "rb").read() if os.path.exists(os.path.join(root, "Cargo.lock")) else b""
     script_env = sorted([k, env[k]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
     spec = {"0": source, "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
-            "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_env.items()),
+            "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, [0, v]] for k, v in config_env.items()),
             "8": script_env, "9": "" if os.path.relpath(start, root) == "." else os.path.relpath(start, root),
             "10": command, "11": sha("toolchain"), "12": os.path.relpath(os.path.join(root, "Cargo.toml"), checkout)}
     spec_digest = sha("spec" + canon(spec))

@@ -81,6 +81,9 @@ ConfigKeyInput (6). `cwd` remains relative to that workspace's directory. These
 are not absolute checkout paths or replacements for the source Git tree.
 SourcePath decoding rejects non-normalized paths; BuildSpec decoding also checks cwd.
 Missing location fields and unknown fields are rejected, not defaulted.
+Field 7's config values are now `[0, literal_text]` or `[1, workspace_relative_path]`.
+The old string encoding is invalid in schema 2. The serialized tag determines
+whether a worker keeps the literal or joins the selected workspace path.
 
 This crate speaks schema 2 only. Version 1 requires a separately pinned codec at
 the transport negotiation boundary; this implementation does not advertise it or

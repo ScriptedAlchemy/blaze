@@ -118,10 +118,7 @@ impl Key {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Resolved {
     /// `[env]` against the requester's environment, by name.
-    pub config_env: Vec<(String, String)>,
-    /// The names in `config_env` whose value is a path relative to the workspace root, which
-    /// the worker joins to its own root: the wire has no field to say it.
-    pub rebased: Vec<String>,
+    pub config_env: Vec<(String, blaze_wire::ConfigEnvValue)>,
     /// Whether the configuration (`net.offline`) is offline.
     pub offline: bool,
 }
@@ -268,8 +265,8 @@ pub fn check(
     }
 
     let offline = config.net_config().map_err(|it| rejected("[net]", it))?.offline.unwrap_or(false);
-    let (config_env, rebased) = resolve_env(config, root, env)?;
-    Ok(Resolved { config_env, rebased, offline })
+    let config_env = resolve_env(config, root, env)?;
+    Ok(Resolved { config_env, offline })
 }
 
 /// The name a refusal of `build.target` gives: its variable when one set it.
@@ -335,20 +332,21 @@ fn target_tables(
 /// the build runs in make it: a variable the environment has wins unless the entry is
 /// `force`d, and a `relative` path is relative to the directory above the `.cargo` its file
 /// is in, which a spec names from the workspace root so that it means the same on a worker.
-/// The names whose value was made so are the second answer.
+/// The distinction is an explicit wire tag, not an out-of-band list of names.
 fn resolve_env(
     config: &Config,
     root: &Path,
     env: &BTreeMap<String, String>,
-) -> Result<(Vec<(String, String)>, Vec<String>), Refusal> {
+) -> Result<Vec<(String, blaze_wire::ConfigEnvValue)>, Refusal> {
+    use blaze_wire::{ConfigEnvValue, SourcePath};
     let table = config.get_cv(&ConfigKey::parse("env")).map_err(|it| rejected("[env]", it))?;
-    let Some(table) = table else { return Ok((Vec::new(), Vec::new())) };
+    let Some(table) = table else { return Ok(Vec::new()) };
     let ConfigValue::Table(entries, _) = table else {
         return Err(rejected("[env]", "expected a table"));
     };
     let mut names: Vec<&String> = entries.keys().collect();
     names.sort();
-    let (mut resolved, mut rebased) = (Vec::new(), Vec::new());
+    let mut resolved = Vec::new();
     for name in names {
         if matches!(name.as_str(), "CARGO_HOME" | "RUSTUP_HOME" | "RUSTUP_TOOLCHAIN") {
             let what = format!("env.{name}");
@@ -376,11 +374,11 @@ fn resolve_env(
             _ => return Err(rejected(&what, "expected a string or a table")),
         };
         if !force && let Some(set) = env.get(name) {
-            resolved.push((name.clone(), set.clone()));
+            resolved.push((name.clone(), ConfigEnvValue::Literal(set.clone())));
             continue;
         }
         if !relative {
-            resolved.push((name.clone(), value));
+            resolved.push((name.clone(), ConfigEnvValue::Literal(value)));
             continue;
         }
         let from = paths::normalize_path(&definition.root(config.cwd()).join(&value));
@@ -394,8 +392,8 @@ fn resolve_env(
         let parts: Vec<String> =
             inside.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
         let rel = if parts.is_empty() { ".".to_owned() } else { parts.join("/") };
-        rebased.push(name.clone());
-        resolved.push((name.clone(), rel));
+        let path = SourcePath::new(rel).map_err(|error| rejected(&what, error))?;
+        resolved.push((name.clone(), ConfigEnvValue::WorkspaceRelative(path)));
     }
-    Ok((resolved, rebased))
+    Ok(resolved)
 }

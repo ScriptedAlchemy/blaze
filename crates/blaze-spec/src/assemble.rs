@@ -108,9 +108,6 @@ pub struct Spec {
     pub front_end: FrontEndKey,
     /// What retention groups the spec by.
     pub config: ConfigKey,
-    /// The names in `config_env` whose value is a path relative to the workspace root, which a
-    /// worker joins to its own root; the wire has no field to say so.
-    pub rebased_env: Vec<String>,
 }
 
 impl Spec {
@@ -271,7 +268,13 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
         let asked = asked_units(request, command, graph, &units)?;
 
         let mut machine_env = ctx.env.clone();
-        machine_env.extend(opened.resolved.config_env.iter().cloned());
+        machine_env.extend(
+            opened
+                .resolved
+                .config_env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.materialize(opened.workspace.root()))),
+        );
         let machine =
             Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
@@ -304,15 +307,7 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
         let digest = digest_of(&build);
         let front_end = front_end_key(&build, &flags, &host.triple);
         let config = config_key(&build, kind_of(command));
-        Ok(Spec {
-            build,
-            platform,
-            platform_digest,
-            digest,
-            front_end,
-            config,
-            rebased_env: opened.resolved.rebased.clone(),
-        })
+        Ok(Spec { build, platform, platform_digest, digest, front_end, config })
     })
 }
 

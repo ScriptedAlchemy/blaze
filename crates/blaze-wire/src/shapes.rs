@@ -112,7 +112,7 @@ wire_struct! {
         4 => profile: ProfileSpec,
         5 => platform: Digest,
         6 => rustflags: Vec<String>,
-        7 => config_env: Set<(String, String)>,
+        7 => config_env: Set<(String, ConfigEnvValue)>,
         8 => script_env: Set<(String, String)>,
         9 => cwd: String,
         10 => command: Command,
@@ -127,6 +127,34 @@ fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
         return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
     }
     Ok(())
+}
+
+wire_enum! {
+    /// Schema 2 preserves whether configuration text is literal or a workspace-relative path.
+    ConfigEnvValue {
+        Literal => 0 (String),
+        WorkspaceRelative => 1 (SourcePath),
+    }
+}
+
+impl ConfigEnvValue {
+    /// Render the value for a worker at the selected workspace, without guessing from its text.
+    pub fn materialize(&self, workspace: &std::path::Path) -> String {
+        match self {
+            Self::Literal(value) => value.clone(),
+            Self::WorkspaceRelative(path) => {
+                workspace.join(path.as_str()).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    /// Its logical text, for diagnostics; this alone does not preserve its semantics.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Literal(value) => value,
+            Self::WorkspaceRelative(path) => path.as_str(),
+        }
+    }
 }
 
 wire_struct! {

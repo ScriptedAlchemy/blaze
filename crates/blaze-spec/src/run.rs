@@ -31,6 +31,20 @@ pub fn locations(
     Ok((manifest.clone(), workspace.join(cwd.as_str())))
 }
 
+/// Configuration values for a worker's selected workspace, preserving serialized tags.
+pub fn config_environment(
+    spec: &BuildSpec,
+    source_root: &std::path::Path,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let (manifest, _) = locations(spec, source_root)?;
+    let workspace = manifest.parent().expect("locations checked the parent");
+    Ok(spec
+        .config_env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.materialize(workspace)))
+        .collect())
+}
+
 /// One way of saying a spec as a cargo command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reproduction {

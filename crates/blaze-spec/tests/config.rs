@@ -226,7 +226,11 @@ fn a_config_that_cargo_rejects_is_refused_with_its_message() {
 }
 
 fn env_of(spec: &Spec) -> Vec<(String, String)> {
-    spec.build.config_env.iter().cloned().collect()
+    spec.build
+        .config_env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.text().to_owned()))
+        .collect()
 }
 
 fn pair(name: &str, value: &str) -> (String, String) {
@@ -251,7 +255,12 @@ fn the_env_table_is_resolved_against_the_requesters_environment() {
     ];
     want.sort_by_key(|it| blaze_wire::encode(it));
     assert_eq!(env_of(&spec), want);
-    assert!(spec.rebased_env.is_empty());
+    assert!(
+        spec.build
+            .config_env
+            .iter()
+            .all(|(_, value)| matches!(value, blaze_wire::ConfigEnvValue::Literal(_)))
+    );
     // With no variable of its own the same file gives the entry's.
     let spec = of(&fixture, Subcommand::Build, &[]).unwrap();
     assert!(env_of(&spec).contains(&pair("SET", "from-config")));
@@ -267,7 +276,14 @@ fn a_relative_path_is_made_relative_to_the_workspace_root() {
     assert!(env.contains(&pair("VENDOR", "vendor/x")), "{env:?}");
     assert!(env.contains(&pair("HERE", ".")));
     assert!(env.contains(&pair("ABSOLUTE", "/abs")));
-    let mut rebased = spec.rebased_env.clone();
+    let mut rebased: Vec<_> = spec
+        .build
+        .config_env
+        .iter()
+        .filter_map(|(name, value)| {
+            matches!(value, blaze_wire::ConfigEnvValue::WorkspaceRelative(_)).then(|| name.clone())
+        })
+        .collect();
     rebased.sort();
     assert_eq!(rebased, ["HERE", "VENDOR"]);
     // The workspace in another place is the same spec: no path of the machine is in it.
