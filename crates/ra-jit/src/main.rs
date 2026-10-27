@@ -9079,6 +9079,7 @@ fn run_holding(
         }
         // Asked after the change: a file can have joined a crate with it.
         let included_changed = !included.is_empty();
+        let changed_inputs: FxHashSet<_> = included.iter().cloned().collect();
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!("included-watch: changed={}, sources={}", included.len(), sources.len());
         }
@@ -9086,6 +9087,21 @@ fn run_holding(
             let reloaded = db.reload_included_file(&path);
             if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
                 eprintln!("included-reload: path={path}, changed={reloaded}");
+                hir::attach_db(&db, || {
+                    for &krate in ide_db::base_db::all_crates(&db).iter() {
+                        if db.included_by(krate).iter().any(|(read, _)| read == &path) {
+                            let declared = declared_in(&db, krate.into());
+                            for function in declared.functions {
+                                let body = Body::of(&db, function.into());
+                                eprintln!("included-owner: {:?}, literals={:?}",
+                                    function, body.exprs().filter_map(|(_, expr)| match expr {
+                                        hir_def::hir::Expr::Literal(hir_def::hir::Literal::ByteString(bytes)) => Some(bytes.len()),
+                                        _ => None,
+                                    }).collect::<Vec<_>>());
+                            }
+                        }
+                    }
+                });
             }
         }
         // Invalidate memoized code/listings only after the tracked input revision
@@ -9093,6 +9109,17 @@ fn run_holding(
         if included_changed {
             programs.iter_mut().for_each(|it| it.known.touch(&db, None));
             listed.touch(&db, None);
+            // An external input is not an edited Rust file. Attribute it to the
+            // crate that read it so the ordinary edit/reach machinery also sees
+            // the change (checks, retained roots and dependent callers).
+            for &krate in ide_db::base_db::all_crates(&db).iter() {
+                if db.included_by(krate).iter().any(|(path, _)| changed_inputs.contains(path)) {
+                    let root = krate.data(&db).root_file_id;
+                    if !sources.contains(&root) {
+                        sources.push(root);
+                    }
+                }
+            }
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
         for program in &mut programs {
