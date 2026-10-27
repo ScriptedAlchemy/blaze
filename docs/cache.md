@@ -315,6 +315,8 @@ Zero, inconsistent or unsupported larger limits are refused.
 
 The server gives request headers and each body frame a 30-second idle deadline.
 An idle or cancelled upload removes its owned staging file without publishing it.
+Response writes use the same progress-idle deadline. A peer that stops reading releases
+its connection slot; a slow transfer that keeps writing can exceed the idle interval.
 At most 256 connections are accepted concurrently. TCP keepalive detects dead peers.
 Filesystem setup, reads, listing, deletion and publication use the blocking pool, not
 async runtime workers. These are network resource leases, not compile-worker memory caps.
@@ -322,6 +324,11 @@ async runtime workers. These are network resource leases, not compile-worker mem
 Every minute the server sweeps staging files older than one hour. Live staging files hold
 an exclusive file lock through verification, so a sweep does not remove an active upload.
 Restart sweeps old abandoned files as well. Newer crash leftovers stay hidden until eligible.
+Unopenable or un-lockable janitor files are logged and left untouched. They do not stop
+the service or cause locked uploads to be removed. Transient accept failures, including
+descriptor exhaustion, back off and retry while existing connections can finish.
+Upload publication still requires file locks; filesystems without that facility are
+explicit failures, not an unsafe unlocked fallback.
 The public library's `Config::resources` configures the deadlines and lease counts.
 
 ### Paginated listing extension

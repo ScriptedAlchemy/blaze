@@ -45,6 +45,7 @@ use crate::store::{Expect, Store, Verification, temporary};
 
 mod pages;
 mod preconditions;
+mod progress;
 mod publication;
 
 use preconditions::Condition;
@@ -118,6 +119,8 @@ pub struct Server {
     epochs: Vec<(Namespace, u64)>,
     resources: Resources,
     pages: pages::Pages,
+    #[cfg(test)]
+    accept_errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
 }
 
 impl Server {
@@ -159,6 +162,8 @@ impl Server {
             epochs: vec![(Namespace::Main, 1)],
             resources: config.resources.clone(),
             pages: pages::Pages::default(),
+            #[cfg(test)]
+            accept_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -641,12 +646,22 @@ pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Res
         tokio::select! {
             _ = sweep.tick() => {
                 let age = server.resources.temporary_age;
-                server.disk(move |store| store.sweep_temporaries(age)).await?;
+                if let Err(error) = server.disk(move |store| store.sweep_temporaries(age)).await {
+                    eprintln!("blaze-serve: staging janitor failed: {error}; service continues");
+                }
                 server.pages.expire(server.resources.snapshot_age);
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            accepted = listener.accept(), if permits.available_permits() != 0 => {
-                let (stream, _) = accepted?;
+            accepted = accept(&listener, &server), if permits.available_permits() != 0 => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) if retry_accept(&error) => {
+                        eprintln!("blaze-serve: accept failed: {error}; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let permit = permits.clone().acquire_owned().await?;
                 let server = server.clone();
                 connections.spawn(async move {
@@ -658,6 +673,17 @@ pub async fn serve_on(listener: TcpListener, server: Arc<Server>) -> anyhow::Res
     }
 }
 
+async fn accept(
+    listener: &TcpListener,
+    _server: &Server,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    #[cfg(test)]
+    if let Some(error) = _server.accept_errors.lock().unwrap().pop_front() {
+        return Err(error);
+    }
+    listener.accept().await
+}
+
 async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()> {
     let idle = server.resources.idle;
     let socket = socket2::SockRef::from(&stream);
@@ -666,7 +692,7 @@ async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()
             .with_time(Duration::from_secs(30))
             .with_interval(Duration::from_secs(10)),
     )?;
-    let io = TokioIo::new(stream);
+    let io = TokioIo::new(progress::ProgressIo::new(stream, idle));
     let service = service_fn(move |request| {
         let server = server.clone();
         async move { Ok::<_, Infallible>(server.answer(request).await) }
@@ -677,6 +703,27 @@ async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()
         .serve_connection(io, service)
         .await?;
     Ok(())
+}
+
+fn retry_accept(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::OutOfMemory
+    ) || {
+        #[cfg(unix)]
+        {
+            matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
 }
 
 /// The body of every answer: bytes, or a file streamed from it, or nothing.
@@ -968,6 +1015,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn stalled_response_releases_its_connection_permit() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.connections = 1;
+            config.resources.idle = Duration::from_millis(200);
+            config
+        })
+        .await;
+        let bytes = vec![b'x'; 16 << 20];
+        let name = format!("units/{}", hex(&sha256(&bytes)));
+        run.server.store().put_blob(&name, &bytes).unwrap();
+        let mut stalled = TcpStream::connect(("127.0.0.1", run.port)).await.unwrap();
+        socket2::SockRef::from(&stalled).set_recv_buffer_size(4096).unwrap();
+        stalled
+            .write_all(
+                format!("GET /v1/blob/{name} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // With one permit, this response cannot arrive until the blocked writer expires.
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+        assert!(run.server.store().found(&name).unwrap().is_some());
+        drop(stalled);
+    }
+
+    #[tokio::test]
+    async fn transient_accept_errors_and_bad_janitor_entries_leave_service_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = Running::with_config(dir, |mut config| {
+            config.resources.sweep_every = Duration::from_millis(20);
+            config.resources.temporary_age = Duration::ZERO;
+            config
+        })
+        .await;
+        run.server.accept_errors.lock().unwrap().push_back(std::io::ErrorKind::Interrupted.into());
+        #[cfg(unix)]
+        run.server
+            .accept_errors
+            .lock()
+            .unwrap()
+            .push_back(std::io::Error::from_raw_os_error(libc::EMFILE));
+        let stale_dir = run.server.store().dir().join("units/.bad.123-456-1.tmp");
+        std::fs::create_dir(&stale_dir).unwrap();
+        let abandoned = run.server.store().dir().join("units/.abandoned.123-456-2.tmp");
+        std::fs::write(&abandoned, b"leftover").unwrap();
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while abandoned.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stale_dir.is_dir());
+        assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+        assert!(run.server.accept_errors.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

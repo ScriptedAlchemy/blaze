@@ -875,13 +875,24 @@ mod tests {
     async fn paginated_real_server_lists_more_than_the_batch_limit_without_loss() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
-        // Hard links keep the 65,537-entry fixture small while exercising real readdir/stat.
+        // Bound links per inode below ext4's ceiling without reducing the directory count.
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(root.join("units")).unwrap();
-            std::fs::write(root.join("seed"), b"x").unwrap();
             for at in 0..65_537u64 {
-                std::fs::hard_link(root.join("seed"), root.join(format!("units/{at:064x}")))
-                    .unwrap();
+                let seed = root.join(format!("seed-{}", at / 16_384));
+                if at % 16_384 == 0 {
+                    std::fs::write(&seed, b"x").unwrap();
+                }
+                std::fs::hard_link(seed, root.join(format!("units/{at:064x}"))).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                for at in 0..5 {
+                    let seed = root.join(format!("seed-{at}"));
+                    assert!(std::fs::metadata(&seed).unwrap().nlink() <= 16_385);
+                    assert_eq!(std::fs::read(seed).unwrap(), b"x");
+                }
             }
         })
         .await
@@ -902,6 +913,7 @@ mod tests {
         assert_eq!(objects[0].name, format!("units/{:064x}", 0));
         assert_eq!(objects.last().unwrap().name, format!("units/{:064x}", 65_536));
         assert!(objects.windows(2).all(|it| it[0].name < it[1].name));
+        assert!(objects.iter().all(|object| object.len == 1));
     }
 
     #[tokio::test]
