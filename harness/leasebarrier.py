@@ -71,7 +71,9 @@ worlds        A worker that has R and S loaded and an editor's edit of R, held b
 join          A worker started by a build in R; a build in S joins S; then S again with another
               `GEN`: the scripts of S have to run for it (the join's leases are that request's, and
               ended with it).
-once          One build (an explicit `RA_JIT_BUILD`, several requests, as the daemon sends them) of a worker
+once          (B also asks for S before it is retired, with its own `GEN`; S's script, a control that is always
+              stale, runs once for A and once for B, and B's request for R does not run it: S is executed and
+              compared to cargo's for each of the two values.) One build (an explicit `RA_JIT_BUILD`, several requests, as the daemon sends them) of a worker
               started by hand: A's first request runs R and is answered; B, another build, asks for R with
               another `GEN` and is put off; A's next request joins S and then asks R again. A script that runs
               every build with a guard that fails its second execution for one build (`ONCE_TAG`): A runs R
@@ -1358,9 +1360,21 @@ def same_build(sc, source_sha, fails):
             shutil.copy2(os.path.join(sc.dir, "w.bin"), kept_a)
         # B: another build, another value; it needs the output A holds (when A ran the script).
         env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD=B, GEN="b")
+        s_out, s_exe = os.path.join(sc.dir, "s.o"), os.path.join(sc.dir, "s.bin")
+        s_trail = os.path.join(once, "trail-s")
+        trail_now = lambda: open(s_trail).read().split("\n")[:-1] if os.path.exists(s_trail) else []
+
         def b_build():
-            # As the daemon ends a build: the worker's answer, then `retire` at once.
+            # As the daemon ends a build: the worker's answer, then `retire` at once. B's build asks for
+            # S as well, before it is over (a later request of one build): its own variables.
             result = sync(sc, sock, env_b, within=LOST)
+            if not fails and result[0] == 0:
+                # B's request for R has judged what B reads: S, which only A read, is not B's yet.
+                sc.notes["s-trail-after-b-r"] = trail_now()
+                sc.notes["b-s"] = sync(sc, sock, env_b, "--project", sc.s, "--crate", "gen_one", "--out", s_out,
+                                       "--exe", s_exe, within=LOST)
+                if os.path.exists(s_exe):
+                    shutil.copy2(s_exe, os.path.join(sc.dir, "b-s.bin"))
             sc.notes["retire-b"] = retire(sc, sock, B)
             return result
         b = in_background(b_build)
@@ -1437,6 +1451,23 @@ def same_build(sc, source_sha, fails):
         if have != sorted(want):
             sc.fail(f"each script was to run once in each build ({sorted(want)}): {have}")
         if not fails and rcb == 0:
+            trail_b = sc.notes.get("s-trail-after-b-r")
+            if trail_b != ["a A"]:
+                sc.fail(f"B's request for R was not to run S (only A read it): S's trail after it is {trail_b}")
+            bs = sc.notes.get("b-s") or (None, "")
+            if bs[0] != 0:
+                sc.fail(f"B's request for S exited {bs[0]}: {str(bs[1])[-300:]}")
+            else:
+                got = subprocess.run([os.path.join(sc.dir, "b-s.bin")], capture_output=True, text=True).stdout
+                sc.notes.setdefault("programs", {})["B-S"] = got
+                want = oracle["b"]["gen-one"]
+                strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+                if strip(got) != strip(want):
+                    sc.fail(f"B-S printed {got!r}, cargo's for GEN=b {want!r}")
+                elif got != want:
+                    sc.gaps.append(f"B-S: {got!r}, cargo's {want!r} (the warm worker's native link)")
+                if sc.notes.get("s-trail") is not None and trail_now() != ["a A", "b B"]:
+                    sc.fail(f"S was to run once for A and once for B: its trail is {trail_now()}")
             got = subprocess.run([os.path.join(sc.dir, "w.bin")], capture_output=True, text=True).stdout
             sc.notes.setdefault("programs", {})["B-R"] = got
             strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")

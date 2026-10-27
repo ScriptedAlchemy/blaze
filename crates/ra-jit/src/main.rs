@@ -2720,8 +2720,15 @@ impl Checkouts {
                 None => match known.get(&**root) {
                     Some(&changed) => changed,
                     None => {
-                        let env = (asked.is_none() || built == Some(root)).then_some(env);
-                        let changed = self.inputs.stale(root, env, build)?;
+                        // Only a checkout the request reads is judged for its build, with the
+                        // variables of the request: the scripts run, and their result is the
+                        // build's for good. Another loaded checkout is not the request's to run
+                        // scripts of, nor to load again with its variables: it is judged for the
+                        // build that asks for it, when one does.
+                        let changed = match reached(asked, built, root) {
+                            true => self.inputs.stale(root, Some(env), build)?,
+                            false => false,
+                        };
                         known.insert(root, changed);
                         changed
                     }
@@ -3008,6 +3015,13 @@ enum Overlay {
     /// in turn, so one that keeps taking long is loaded with its own crates instead.
     Quick,
     Always,
+}
+
+/// Whether a request for the project at `asked` (none when it is not loaded) reads the checkout
+/// loaded at `root`: its own, and the one `built` it shares packages with. A request for a project
+/// that is not loaded is judged against every checkout, as it joins them.
+fn reached(asked: Option<usize>, built: Option<&Path>, root: &Path) -> bool {
+    asked.is_none() || built == Some(root)
 }
 
 /// A checkout as the daemon looks at it.
@@ -10504,6 +10518,19 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_judges_the_scripts_of_the_checkouts_it_reads_and_no_other() {
+        let (r, s, base) = (Path::new("/r"), Path::new("/s"), Path::new("/base"));
+        // A project that is not loaded joins the others: every checkout is judged against it.
+        assert!(reached(None, None, r) && reached(None, None, s));
+        // A project of the checkout `r`: its own is read, and not the other loaded one.
+        assert!(reached(Some(0), Some(r), r));
+        assert!(!reached(Some(0), Some(r), s));
+        // A project that shares packages with `base`: the checkout it shares them with is read.
+        assert!(reached(Some(1), Some(base), base));
+        assert!(!reached(Some(1), Some(base), r));
+    }
 
     #[test]
     fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {
