@@ -1507,10 +1507,14 @@ What the crate fixes that this section leaves open, one line each:
 - Worker events expire subscribers against their own deadlines before accepting a terminal
   result, just as a timer does. Each subscriber receives its outcome once.
 - Worker ingress validates a whole batch before changing the stream, refusal or liveness.
-  `Stage` and `Assigned` are coordinator-owned and never worker-reportable. A lead may report
-  `Published`, `Program`, `Verdict` and one `Done` (Passed, Failed or Refused). Both lead and
-  helper may report `Output` and `Refused`; a helper may not report a job verdict. Retransmitted
-  coordinator stages, backwards stages and duplicate Done in a batch are refused too.
+  Queued, Admitted, Assigned, Compiled and Done stages and `Assigned` events are coordinator-only.
+  A lead may report forward Fetched/Loaded/Published/Linked/Tested/Reported progress; stage
+  timestamps use coordinator time and duplicate latest stages do not append again. Post-compile
+  progress requires current authoritative completion, or explicit `NoCompileWork` admission.
+  A lead may also report `Published`, `Program`, `Verdict` and one final `Done` (Passed, Failed
+  or Refused), last in its batch. Both lead and helper may report `Output` and `Refused`;
+  helper stages and job verdicts, backwards progress, reserved stages and duplicate Done are
+  refused. Accepted stage updates always go through the coordinator's stage bookkeeping.
 - `ExecutionConfig::completion` defaults to `WorkProtocol`: Passed requires completed work,
   the current lead's agreement, and the current attempt/root-epoch completion notification.
   Retained work does not bypass a replacement lead's agreement. Admission may explicitly
@@ -1555,7 +1559,9 @@ validation commands, timings, mutation checks and the original integration limit
 
 `blaze-wire::job_terminal_v2` adds a separate typed terminal response. It does not add a field or
 variant to `JobEvent` or edit `BuildSpec`. A v1 Done stream is retained for display and replay,
-but is **not** enough to decide fallback: Failed can be a reported build/test failure or NoLead.
+but is **not** enough to preserve the termination reason: Lost can be NoLead or LeadLostTwice.
+NoLead is canonical Lost in both the v1 stream and subscriber delivery, whereas a reported
+build/test failure is Failed.
 The driver must return `Jobs::terminal(execution, subscriber)` verbatim, rather than synthesizing
 a reason from Done. `Effect::SubscriberEnded` carries this same immutable response.
 
@@ -1570,7 +1576,7 @@ SubscriberTerminalV2 = { 0: ExecutionId, 1: Attempt, 2: subscriber u64,
                         3: { 0: version u32, 1: Outcome, 2: TerminationReasonV2 } }
 TerminationReasonV2 = [ discriminant, null ]
   0 Reported          -> Passed | Failed | Refused
-  1 NoLead            -> Failed
+  1 NoLead            -> Lost
   2 LeadLostTwice      -> Lost
   3 Cancelled          -> Cancelled
   4 Deadline           -> Cancelled
@@ -1585,12 +1591,14 @@ Reported outcomes are verdicts under Never/Fallback/Race, including failed tests
 Infrastructure, cancellation and timeout fail under Never and choose local work under
 Fallback/Race (Race's local arm is already running). A subscriber's own timeout remains distinct
 from the execution deadline. Old clients must fail incompatibility, not guess a fallback policy
-from a v1 Failed.
+from a v1 outcome. The unpublished local 187e2a39 draft used Failed+NoLead; this is not an
+accepted alias. A consumer of that draft needs its pinned codec and an explicit checked
+conversion to canonical Lost+NoLead, not implicit dual decoding.
 
 This terminal version is **separate** from the general wire schema and digest-domain version.
 This lane inherits schema 1; C2's independent schema-2 branch adds required workspace/config
 fields and changes typed digest/signature domains to `/v2`. Combining the branches must preserve
-C2's global version/domains, merge the isolated module export, and update BuildSpec fixture
+C2's global version/domains (including its schema-3 path work), merge the isolated module export, and update BuildSpec fixture
 literals. New terminal type names and explicit terminal version remain; this addition makes no
 promise that general schema-1 identities survive C2's change. Existing HTTP `/v1` routes and
 request-auth framing have their own versions. A general schema-1 peer requires its pinned codec,

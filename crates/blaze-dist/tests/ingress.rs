@@ -46,13 +46,17 @@ fn stage(stage: Stage) -> JobEvent {
 }
 
 fn join(e: &mut Execution, holder: &str, count: u64, tag: u8) {
+    join_at(e, holder, count, tag, 0);
+}
+
+fn join_at(e: &mut Execution, holder: &str, count: u64, tag: u8, now: u64) {
     let r = WorkJoinRequest {
         execution: e.id,
         attempt: e.attempt(),
         roots: RootSet { spec: [1; 32], roots: [tag; 32], count, index: [3; 32], inputs: [4; 32] },
         rejected: Set::new(Vec::new()),
     };
-    e.join(0, holder, &r, &mut Vec::new()).unwrap();
+    e.join(now, holder, &r, &mut Vec::new()).unwrap();
 }
 
 fn rejects_without_public_effects(e: &mut Execution, from: &str, r: WorkersEventsRequest) {
@@ -68,14 +72,14 @@ fn rejects_without_public_effects(e: &mut Execution, from: &str, r: WorkersEvent
 }
 
 #[test]
-fn worker_stages_and_assignments_never_enter_the_public_stream() {
+fn coordinator_stages_and_assignments_never_enter_from_workers() {
     for from in ["lead", "helper"] {
         for event in [
             stage(Stage::Compiled),
             stage(Stage::Done),
             stage(Stage::Queued),
             stage(Stage::Assigned),
-            stage(Stage::Loaded),
+            stage(Stage::Admitted),
             JobEvent::Assigned(AssignedEvent {
                 executor: "intruder".to_owned(),
                 attempt: Attempt(2),
@@ -86,6 +90,9 @@ fn worker_stages_and_assignments_never_enter_the_public_stream() {
             rejects_without_public_effects(&mut e, from, r);
         }
     }
+    let mut e = execution(CompletionMode::WorkProtocol);
+    let r = request(&e, vec![stage(Stage::Loaded)]);
+    rejects_without_public_effects(&mut e, "helper", r);
 }
 
 #[test]
@@ -226,7 +233,7 @@ fn terminal_delivery_retains_reason_through_wire_and_client_policy() {
         (Reason::Reported, Outcome::Passed),
         (Reason::Reported, Outcome::Failed),
         (Reason::Reported, Outcome::Refused),
-        (Reason::NoLead, Outcome::Failed),
+        (Reason::NoLead, Outcome::Lost),
         (Reason::LeadLostTwice, Outcome::Lost),
         (Reason::Cancelled, Outcome::Cancelled),
         (Reason::Deadline, Outcome::Cancelled),
@@ -283,7 +290,7 @@ fn actual_lead_loss_cancel_and_subscriber_timeout_deliver_distinct_reasons() {
 }
 
 #[test]
-fn no_lead_failed_delivery_is_not_a_completed_failed_verdict() {
+fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
     let mut admission =
         blaze_dist::admission::Admission::new(blaze_dist::admission::AdmissionConfig::default());
     let reservation = blaze_wire::Reservation { memory: 4, cpus: 4, disk: 4 };
@@ -312,7 +319,7 @@ fn no_lead_failed_delivery_is_not_a_completed_failed_verdict() {
     jobs.tick(15_001, &mut effects);
     let terminal = jobs.terminal(answer.execution, answer.subscriber).unwrap();
     assert_eq!(terminal.termination.reason, Reason::NoLead);
-    assert_eq!(terminal.termination.outcome, Outcome::Failed);
+    assert_eq!(terminal.termination.outcome, Outcome::Lost);
     let decoded = decode_terminal(&encode(terminal), &Limits::DOCUMENTED).unwrap();
     assert_eq!(
         local_action(&LocalPolicy::Fallback, &decoded.termination).unwrap(),
@@ -325,7 +332,7 @@ fn no_compile_mode_rejects_work_and_failed_ingress_does_not_renew_lead_liveness(
     let mut e = execution(CompletionMode::NoCompileWork);
     let r = WorkLeaseRequest { execution: e.id, attempt: e.attempt() };
     assert!(e.lease(0, "lead", &r, &mut Vec::new()).is_err());
-    let bad = request(&e, vec![stage(Stage::Loaded)]);
+    let bad = request(&e, vec![stage(Stage::Compiled)]);
     assert!(e.worker_events(14_999, "lead", &bad, &mut Vec::new()).is_err());
     let mut effects = Vec::new();
     e.tick(15_001, &mut effects);
@@ -406,5 +413,54 @@ fn randomized_ingress_checks_public_stream_for_10000_seeds() {
             r.attempt = e.attempt();
         }
         rejects_without_public_effects(&mut e, from, r);
+    }
+}
+
+#[test]
+fn randomized_lead_progress_is_forward_deduplicated_and_coordinator_timed() {
+    let mut g = blaze_wire::Gen::new(0x176);
+    for seed in 0..10_000 {
+        let mode = if g.below(2) == 0 {
+            CompletionMode::NoCompileWork
+        } else {
+            CompletionMode::WorkProtocol
+        };
+        let mut e = execution(mode);
+        let progress = request(&e, vec![stage(Stage::Fetched), stage(Stage::Loaded)]);
+        e.worker_events(1, "lead", &progress, &mut Vec::new()).unwrap();
+        let duplicate = request(&e, vec![stage(Stage::Loaded), stage(Stage::Loaded)]);
+        let before = e.events(0).to_vec();
+        e.worker_events(2, "lead", &duplicate, &mut Vec::new()).unwrap();
+        assert_eq!(e.events(0), before, "duplicate progress seed {seed}");
+        let backwards = request(&e, vec![stage(Stage::Fetched)]);
+        rejects_without_public_effects(&mut e, "lead", backwards);
+        if mode == CompletionMode::WorkProtocol {
+            let early = request(&e, vec![stage(Stage::Linked)]);
+            rejects_without_public_effects(&mut e, "lead", early);
+            join_at(&mut e, "lead", 0, 2, 2);
+        }
+        let progress = request(
+            &e,
+            vec![
+                stage(Stage::Published),
+                stage(Stage::Linked),
+                stage(Stage::Tested),
+                stage(Stage::Reported),
+            ],
+        );
+        e.worker_events(3, "lead", &progress, &mut Vec::new()).unwrap();
+        let public: Vec<_> = e
+            .events(0)
+            .iter()
+            .filter_map(|item| match &item.event {
+                JobEvent::Stage(s) => Some((s.stage.clone(), s.at_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(public, e.stages(), "public/bookkeeping seed {seed}");
+        assert_eq!(public.last(), Some(&(Stage::Reported, 3)));
+        let old = request(&e, vec![stage(Stage::Reported)]);
+        e.assign(4, "helper", &[], &mut Vec::new()).unwrap();
+        rejects_without_public_effects(&mut e, "lead", old);
     }
 }

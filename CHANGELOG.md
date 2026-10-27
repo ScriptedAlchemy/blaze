@@ -8,7 +8,7 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
-- Distributed job ingress reserves stages/assignments to the coordinator, validates whole
+- Distributed job ingress reserves authoritative stages/assignments to the coordinator, validates whole
   event batches, and requires authoritative current-attempt completion before success.
   Explicit no-compile admission covers verified cache-only work. An additive terminal-v2
   response preserves infrastructure and subscriber termination reasons through CBOR and

@@ -24,6 +24,8 @@ use crate::admission::{Admission, Waiting};
 use crate::work::{self, EndWhy, WorkConfig, WorkSet};
 use crate::{Millis, Refusal};
 
+mod ingress;
+
 /// An execution's timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -113,7 +115,7 @@ pub enum Effect {
     /// An item was appended to the execution's event stream.
     Event(EventItem),
     /// The lead was lost: the driver assigns a new lead (admission's choice), or ends the
-    /// execution `Failed` when there is none.
+    /// execution `Lost` when there is none.
     NeedLead,
     /// Stop an executor's process group: the agent kills it.
     Kill {
@@ -439,7 +441,7 @@ impl Execution {
     /// `POST /v1/workers/events`: a heartbeat, and events for the stream. A dead attempt's are
     /// refused. A `Done` from the lead ends the execution with its outcome; a `Refused` before
     /// it makes that outcome `Refused`, whatever the lead says, since a job is never turned
-    /// green past a refusal.
+    /// green past a refusal. The entire event batch is validated before any report is published.
     pub fn worker_events(
         &mut self,
         now: Millis,
@@ -460,41 +462,7 @@ impl Execution {
         // Validate the entire batch before it changes liveness, refusal state or the stream.
         // A rejected tail must not leave an accepted prefix in the public event log.
         let lead = self.lead.as_deref() == Some(from);
-        let mut done = None;
-        for event in &req.events {
-            match event {
-                JobEvent::Stage(_) | JobEvent::Assigned(_) => {
-                    return Err(Refusal::Malformed("coordinator-owned event".to_owned()));
-                }
-                JobEvent::Published(_) | JobEvent::Program(_) | JobEvent::Verdict(_) if !lead => {
-                    return Err(Refusal::NotHolder);
-                }
-                JobEvent::Done(d) => {
-                    if !lead {
-                        return Err(Refusal::NotHolder);
-                    }
-                    if done.is_some()
-                        || !matches!(
-                            d.outcome,
-                            Outcome::Passed | Outcome::Failed | Outcome::Refused
-                        )
-                    {
-                        return Err(Refusal::Malformed("invalid worker verdict batch".to_owned()));
-                    }
-                    if d.outcome == Outcome::Passed
-                        && self.attached().any(|s| now <= s.deadline_ms)
-                        && !self.success_ready()
-                    {
-                        return Err(Refusal::Malformed(
-                            "success before authoritative completion".to_owned(),
-                        ));
-                    }
-                    done = Some(d.outcome.clone());
-                }
-                JobEvent::Output(_) | JobEvent::Refused(_) => {}
-                _ => {}
-            }
-        }
+        let done = self.validate_events(now, lead, &req.events)?;
         self.expire_subscribers(now, out);
         if self.attached().next().is_none() {
             self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
@@ -507,6 +475,14 @@ impl Execution {
         for event in &req.events {
             match event {
                 JobEvent::Refused(_) => self.refused = true,
+                JobEvent::Stage(event) => {
+                    // Use the coordinator's clock and update the same stage view checked by
+                    // the model. Retransmission of the latest stage does not append it twice.
+                    if self.reported_stage() != Some(&event.stage) {
+                        self.stage(now, event.stage.clone(), out);
+                    }
+                    continue;
+                }
                 JobEvent::Done(_) => {
                     // Publish only the coordinator's final verdict, once. A raw Passed
                     // here could otherwise escape into replay before refusal normalization.
@@ -608,6 +584,11 @@ impl Execution {
     ) {
         if let ExecState::Ended(_) = self.state {
             return;
+        }
+        // No available replacement lead is infrastructure loss, not a compiler/test verdict.
+        // Preserve that distinction in both subscriber effects and the serialized Done event.
+        if matches!(&why, EndWhy::NoLead) {
+            outcome = Outcome::Lost;
         }
         if self.expire_subscribers(now, out) && self.attached().next().is_none() {
             outcome = Outcome::Cancelled;
@@ -724,7 +705,8 @@ pub enum LocalAction {
 /// a build error or failed test included.
 ///
 /// Unknown versions or inconsistent outcome/reason pairs are refused, never guessed from
-/// the v1 stream. `NoLead` is infrastructure even though its outcome is `Failed`.
+/// the v1 stream. `NoLead` is delivered as `Lost` in both v1 and v2, with its explicit reason
+/// retained in v2 rather than guessed from that outcome.
 pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<LocalAction, Refusal> {
     if !remote.is_valid() {
         return Err(Refusal::Malformed("invalid terminal contract".to_owned()));
@@ -810,7 +792,7 @@ impl Jobs {
     }
 
     /// Typed response for the additive v2 subscriber-terminal endpoint. A v1 Done event is
-    /// not enough to synthesize it: infrastructure and completed failures share an outcome.
+    /// not enough to synthesize it: the outcome omits the explicit termination reason.
     pub fn terminal(
         &self,
         execution: ExecutionId,
@@ -1033,7 +1015,7 @@ impl Jobs {
                             self.assignments.insert(lead, (e.assignment(), false));
                         }
                     }
-                    None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
+                    None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
                 for effect in more {

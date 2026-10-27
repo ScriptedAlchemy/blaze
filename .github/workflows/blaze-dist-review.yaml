@@ -1,0 +1,40 @@
+name: distributed protocol regressions
+
+on:
+  pull_request:
+    branches: [dist/main]
+    paths:
+      - crates/blaze-dist/**
+      - crates/blaze-wire/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/blaze-dist-review.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dist-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      BLAZE_DIST_SEEDS: "10000"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+      - name: Check protocol formatting
+        run: cargo fmt -p blaze-dist -- --check
+      - name: Test the actual protocol and wire crates
+        run: cargo test --locked -p blaze-dist -p blaze-wire -- --test-threads=2
