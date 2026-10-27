@@ -3344,7 +3344,7 @@ struct ListedCrate {
     main: Option<FunctionId>,
 }
 
-fn is_bodiless_intrinsic(db: &RootDatabase, id: FunctionId) -> bool {
+fn is_bodiless_intrinsic(db: &dyn HirDatabase, id: FunctionId) -> bool {
     let signature = hir_def::signatures::FunctionSignature::of(db, id);
     signature.flags.contains(hir_def::signatures::FnFlags::RUSTC_INTRINSIC) && !signature.has_body()
 }

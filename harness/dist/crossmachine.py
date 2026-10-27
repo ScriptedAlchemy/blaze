@@ -462,51 +462,88 @@ def warm_payload_report(work, bin_dir, machines, sources):
         ws = os.path.join(machine.checkout("warm-payload", sources["vendor-payload"]), "vendored")
         env = machine.env(bin_dir, os.path.join(machine.top, "warm-store"),
                           daemon_home("warm", machine.name))
-        env["RA_JIT_INPUT_TRACE"] = "1"
         side = Side(ws, env, True)
         previous_pids, previous_builds = None, -1
         try:
-            for step, value in [("initial", 1), ("binary-edit", 2), ("deleted", None), ("recreated", 3)]:
+            for step, value in [("initial", 1), ("binary-edit", 2), ("deleted", None),
+                                ("recreated", 3), ("remove-reader", 3), ("obsolete-deleted", None),
+                                ("reintroduce-missing", None), ("live-recreated", 4)]:
+                source = os.path.join(ws, "vendor", "fastrand", "src", "lib.rs")
+                checksum = os.path.join(ws, "vendor", "fastrand", ".cargo-checksum.json")
+                if step in ("remove-reader", "reintroduce-missing"):
+                    text = open(source).read()
+                    if step == "remove-reader":
+                        text = text.replace('include_bytes!("payload.bin")[0]', "42")
+                    else:
+                        text = text.replace("pub fn c4_payload() -> u8 { 42 }",
+                                            'pub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }')
+                    with open(source, "w") as output:
+                        output.write(text)
+                    checks = json.load(open(checksum))
+                    checks["files"]["src/lib.rs"] = hashlib.sha256(text.encode()).hexdigest()
+                    with open(checksum, "w") as output:
+                        json.dump(checks, output, sort_keys=True)
                 if value is None:
-                    os.remove(os.path.join(ws, "vendor", "fastrand", "src", "payload.bin"))
+                    payload = os.path.join(ws, "vendor", "fastrand", "src", "payload.bin")
+                    if os.path.exists(payload):
+                        os.remove(payload)
                 else:
                     vendor_payload(ws, value)
                 # No Rust source changes and no stop/restart between these builds.
                 _, built = side.cargo("build", "-p", "app", timeout=1800)
-                wait_warm(side, ws)
+                _, ready = wait_warm(side, ws)
                 status = side.cargo("status")[1].stdout
-                if value is None:
+                missing_live = step in ("deleted", "reintroduce-missing")
+                if missing_live:
                     shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
                     oracle = sh(["cargo", "build", "--offline", "--locked", "-p", "app"],
                                 cwd=ws, env=dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
                     actual, expected = None, None
-                    right = built.returncode != 0 and oracle.returncode != 0
+                    right = missing_input_failure(built.returncode, built.stderr,
+                                                  oracle.returncode, oracle.stdout, payload)
                     oracle_code = oracle.returncode
+                    oracle_log = oracle.stdout
                 else:
                     # Cargo also treats registry source replacement as immutable. A
                     # fresh oracle target is required for each binary-only edit.
                     shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
                     expected = reference(machine, bin_dir, ws, spec, env["RA_JIT_CACHE"], env["RA_JIT_HOME"])
                     actual = program_output(side.cargo("run", "-p", "app", "--", timeout=600)[1])
+                    wanted = 42 if step in ("remove-reader", "obsolete-deleted") else value
                     right = (built.returncode == 0 and actual == expected
-                             and f"vendor payload {value} caller {value + 10}" in expected[1])
+                             and f"vendor payload {wanted} caller {wanted + 10}" in expected[1])
                     oracle_code = expected[0]
+                    oracle_log = expected[2]
                 pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
                 builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
-                same_generation = (bool(pids) and "failed:" not in status
+                same_generation = (bool(pids) and "failed:" not in status and ": ready" in status
                                    and (previous_pids is None or pids == previous_pids)
                                    and builds >= previous_builds)
                 previous_pids, previous_builds = pids, builds
                 right &= same_generation
+                right &= not recognized_fallback(built.stderr) and not any(
+                    int(n) for n in re.findall(r"(\d+) by cargo", status))
                 rows.append(dict(machine=machine.name, step=step, right=right,
                                  actual=actual, expected=expected, status=status,
                                  classification=how_built(built.stderr), build_log=built.stderr,
                                  worker_log=workers_log(side), blaze_returncode=built.returncode,
                                  cargo_returncode=oracle_code, pids=pids, daemon_builds=builds,
-                                 same_generation=same_generation))
+                                 same_generation=same_generation, ready=ready, cargo_log=oracle_log))
         finally:
             side.cargo("stop")
     return rows
+
+
+def recognized_fallback(text):
+    return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
+                          r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
+
+
+def missing_input_failure(blaze_code, blaze_log, cargo_code, cargo_log, payload):
+    name = os.path.basename(payload)
+    return (blaze_code != 0 and cargo_code != 0 and not recognized_fallback(blaze_log)
+            and "could not read included input" in blaze_log and payload in blaze_log
+            and name in cargo_log and bool(re.search(r"couldn't read|could not read|No such file", cargo_log)))
 
 
 # --- one build -----------------------------------------------------------------------------------------
@@ -993,6 +1030,13 @@ def self_test():
     global DAEMON_ROOT
     DAEMON_ROOT = "/tmp/c4h-test"
     check("independent daemon homes fit the socket budget", len((daemon_home("vendor-payload", "b-solo") + "/workers/" + "f" * 16 + "/sock.new/s").encode()) < 104)
+    payload = "/fixture/src/payload.bin"
+    missing = f"error: could not read included input `{payload}`"
+    oracle = f"error: couldn't read `{payload}`: No such file"
+    check("named missing input errors pass", missing_input_failure(101, missing, 101, oracle, payload))
+    check("unrelated compiler errors fail", not missing_input_failure(101, "unrelated error", 101, oracle, payload))
+    check("missing oracle diagnostic fails", not missing_input_failure(101, missing, 101, "unrelated error", payload))
+    check("fallback beside expected error fails", not missing_input_failure(101, missing + "\nthis is `cargo build`", 101, oracle, payload))
     check("unnamed compute fails coverage", bool(fed_coverage("t", zero.replace("0 instances", "1 instances"), {}, True)))
     check("unnamed requests fail coverage", bool(fed_coverage("t", zero.replace("0 requests", "1 requests"), {}, True)))
     check("compiled functions fail despite empty log", bool(fed_coverage("t", zero.replace("0 compiled", "1 compiled"), {}, True)))
@@ -1120,9 +1164,8 @@ def main():
             print(json.dumps(rows, indent=1))
             return 1 if any(
                 not r["right"]
-                or (r["step"] != "deleted" and r["classification"] != "daemon")
-                or "building with cargo" in r["build_log"]
-                or "this build is cargo's" in r["build_log"]
+                or (r["step"] not in ("deleted", "reintroduce-missing") and r["classification"] != "daemon")
+                or recognized_fallback(r["build_log"])
                 for r in rows
             ) or watchdog.tripped else 0
         for n in names:
