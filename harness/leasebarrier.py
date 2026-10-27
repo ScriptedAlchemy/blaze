@@ -96,6 +96,9 @@ first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SP
 quick-choice  `RA_JIT_SPLIT=0`, quick overlay: a request for R is held as it enters its link (the executable was taken
               away), V's first request arrives (R is no candidate while it links), the worker settles and the link is let
               go: V is loaded on its own and judged for its variables, not read through R's world.
+selector-moves  R's manifest selects `old/build.rs`, whose first run rewrites the selector to `new/build.rs` (it succeeds for a, fails for b);
+              V's manifest is R's after that, with the same old script, dormant, and a new one that succeeds for b. One request for V, b:
+              R's loaded target is `old/build.rs` (the same name as V's selected script, in another directory): R is not V's to run.
 choice-same-stamp  R1 selects `build-old.rs` (fails for b), R2 and V `build-new.rs` (12 bytes each); R1's selector is replaced by
               R2's with the same size and the time of the last write restored (hashes and mtime ns in the ledger): R1 is not V's to
               run, and V is built from R2, as cargo builds it.
@@ -2004,6 +2007,96 @@ def choice_failing_base(sc, source_sha):
     consumption_choice(sc, source_sha, "failing-base")
 
 
+def selector_moves(sc, source_sha):
+    """R's manifest selects `old/build.rs`, which succeeds for `a`, fails for `b`, and, as a persistent effect of its first
+    run, rewrites the manifest's selector to `new/build.rs` (the workspace was parsed before: its target is the old one).
+    V's manifest is R's after that, and V has the same old script, dormant, and a new script that succeeds for `b`.
+    R is loaded under `GEN=a`; ONE request for V, `GEN=b`: V's script is `new/build.rs` (cargo builds it), and R, whose
+    loaded target is `old/build.rs` of the same name in another directory, is not V's to run."""
+    once = os.path.join(sc.dir, "once")
+    os.makedirs(once)
+    sc.target = os.path.join(sc.dir, "target-shared")
+    saved = sc.runs_log
+    paths = {name: os.path.join(sc.dir, name) for name in ("r", "v")}
+    new_rs = BUILD_RS.replace("@LOG@", saved)
+    old_rs = new_rs.replace("    // A script cargo runs every build.",
+        '    if gen_ == "b" {\n        eprintln!("the old script fails for b");\n        exit(3);\n    }\n'
+        '    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {\n'
+        '        let manifest = PathBuf::from(dir).join("Cargo.toml");\n'
+        '        let text = fs::read_to_string(&manifest).unwrap();\n'
+        '        fs::write(&manifest, text.replace("old/build.rs", "new/build.rs")).unwrap();\n'
+        '    }\n'
+        "    // A script cargo runs every build.", 1)
+    assert old_rs != new_rs
+    for name, path in paths.items():
+        sc.runs_log = saved
+        sc.project(path)
+        for sub_dir, text in (("old", old_rs), ("new", new_rs)):
+            os.makedirs(os.path.join(path, sub_dir), exist_ok=True)
+            with open(os.path.join(path, sub_dir, "build.rs"), "w") as f:
+                f.write(text)
+        select = "old/build.rs" if name == "r" else "new/build.rs"
+        manifest = open(os.path.join(path, "Cargo.toml")).read().replace('build = "build.rs"', f'build = "{select}"')
+        with open(os.path.join(path, "Cargo.toml"), "w") as f:
+            f.write(manifest)
+    sc.r = paths["r"]
+    extra = {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target, "ONCE_DIR": once, "ONCE_ONLY": "none",
+             "ONCE_BY_DIR": "1"}
+    oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"})
+    env = sc.env("a", dict(GEN="a", ONCE_TAG="load", **extra))
+    env.pop("RA_JIT_WHOLE_BUILD", None)
+    sock = os.path.join(sc.dir, "worker.sock")
+    err = open(os.path.join(sc.dir, "worker.log"), "w")
+    argv = [RA_JIT, paths["r"], "--crate", "gen_one", "--out", os.path.join(sc.dir, "w.o"), "--exe",
+            os.path.join(sc.dir, "w.bin"), "--socket", sock]
+    worker = subprocess.Popen(argv, cwd=paths["r"], env=env, stdout=subprocess.DEVNULL, stderr=err,
+                              stdin=subprocess.PIPE, start_new_session=True)
+    trail = lambda name: (open(os.path.join(once, f"trail-{name}")).read().split("\n")[:-1]
+                          if os.path.exists(os.path.join(once, f"trail-{name}")) else [])
+    h = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
+    try:
+        if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
+            return
+        log = lambda: open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        r_manifest, v_manifest = os.path.join(paths["r"], "Cargo.toml"), os.path.join(paths["v"], "Cargo.toml")
+        sc.notes["manifests"] = {"r": h(r_manifest), "v": h(v_manifest), "r-text": open(r_manifest).read().splitlines()[-4:],
+                                 "v-text": open(v_manifest).read().splitlines()[-4:]}
+        sc.notes["scripts"] = {f"{n}/{d}": h(os.path.join(paths[n], d, "build.rs")) for n in paths for d in ("old", "new")}
+        if sc.notes["manifests"]["r"] != sc.notes["manifests"]["v"]:
+            sc.fail("R's script was to rewrite its manifest to V's: " + str(sc.notes["manifests"]))
+            return
+        before = trail("r")
+        out, exe = os.path.join(sc.dir, "first.o"), os.path.join(sc.dir, "first.bin")
+        env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD="6001", GEN="b")
+        rc, said = sync(sc, sock, env_b, "--project", paths["v"], "--crate", "gen_one", "--out", out, "--exe", exe,
+                        within=LOST)
+        sc.notes["request"] = (rc, said[-300:])
+        text = log()
+        sc.notes["route"] = [l[:160] for l in text.splitlines() if l.startswith(("split ", "view:", "join "))]
+        failed_lines = [l[:300] for l in text.splitlines() if "failed:" in l and "build script" in l]
+        sc.notes["failed-lines"] = failed_lines
+        sc.notes["trails"] = {n: trail(n) for n in paths}
+        got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+        sc.notes["programs"] = {"V": got, "exe-written": os.path.exists(exe)}
+        if rc != 0:
+            sc.fail(f"V's request did not end well (rc {rc}): {said[-300:]}")
+        if any(l.startswith("b ") for l in trail("r")[len(before):]) or any("/r)" in l for l in failed_lines):
+            sc.fail(f"R's obsolete old script was run for V's request: {failed_lines} {trail('r')}")
+        if got is None:
+            sc.fail("V's program was not written")
+        else:
+            strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+            want = oracle["gen-one"]
+            if strip(got) != strip(want):
+                sc.fail(f"V printed {got!r}, cargo's {want!r}")
+            elif got != want:
+                sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+        sc.notes["retire"] = retire(sc, sock, "6001")
+        sc.timeouts()
+    finally:
+        worker.kill()
+
+
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
     which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
@@ -2095,6 +2188,7 @@ SCENARIOS = {
     "choice-edited-failing": choice_edited_failing,
     "choice-failing-base": choice_failing_base,
     "choice-same-stamp": choice_same_stamp,
+    "selector-moves": selector_moves,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,

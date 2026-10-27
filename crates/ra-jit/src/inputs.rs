@@ -95,6 +95,19 @@ enum Content {
 }
 
 impl Content {
+    /// What reading a file gave: `read` is the result of reading its bytes.
+    fn of_read(read: &std::io::Result<Vec<u8>>) -> Content {
+        match read {
+            Ok(bytes) => {
+                let mut hasher = FxHasher::default();
+                bytes.hash(&mut hasher);
+                Content::File(bytes.len() as u64, hasher.finish())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Content::Absent,
+            Err(_) => Content::Unreadable,
+        }
+    }
+
     fn of(path: &Path) -> Content {
         let metadata = match std::fs::metadata(path) {
             Ok(it) => it,
@@ -129,6 +142,16 @@ impl Structural {
         Structural { path, was }
     }
 
+    /// The file as the bytes just read of it were: what is recorded and what anything else is
+    /// told of it are then one state, not two reads.
+    fn read(path: PathBuf, read: &std::io::Result<Vec<u8>>) -> Structural {
+        let was = match std::fs::metadata(&path) {
+            Ok(it) if !it.is_file() => Content::Other,
+            _ => Content::of_read(read),
+        };
+        Structural { path, was }
+    }
+
     /// Whether the file is other than it was: by its content, read now. A file that cannot be read
     /// is other, then and now.
     fn changed(&self) -> bool {
@@ -137,13 +160,34 @@ impl Structural {
     }
 }
 
-/// The file names of `scripts`, sorted: how the script a manifest selects is told from another without a
-/// path of one form (a link, a prefix) being taken for a different script.
-fn script_names(scripts: &[PathBuf]) -> Vec<std::ffi::OsString> {
-    let mut names: Vec<_> =
-        scripts.iter().filter_map(|it| it.file_name().map(ToOwned::to_owned)).collect();
-    names.sort();
-    names
+/// A script as the file it is: the path normalized as cargo normalizes the path of a target (`.` and `..`
+/// by name), then, when it is there, the path of the file itself (a link, a prefix). Two paths of one
+/// script are told alike and two scripts of one name in two directories are not.
+fn script_identity(path: &Path) -> PathBuf {
+    let mut lexical = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            part => lexical.push(part),
+        }
+    }
+    dunce::canonicalize(&lexical).unwrap_or(lexical)
+}
+
+/// Whether the scripts the manifest at `manifest` selects, by the bytes `text` of it, are those that were
+/// loaded (`loaded`: their roots in the workspace), by the identity of each. A manifest this does not read
+/// says nothing, and nothing is claimed of it.
+fn selects_loaded_scripts(manifest: &Path, text: &str, loaded: &[PathBuf]) -> bool {
+    let Some(selected) = selected_scripts(manifest, text) else { return true };
+    let identities = |scripts: &[PathBuf]| {
+        let mut all: Vec<PathBuf> = scripts.iter().map(|it| script_identity(it)).collect();
+        all.sort();
+        all
+    };
+    identities(&selected) == identities(loaded)
 }
 
 /// The build scripts the manifest at `manifest` selects, as cargo does: `build = false` none, `true` or no key
@@ -487,19 +531,20 @@ impl Inputs {
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
-                files.push(Structural::new(manifest.to_owned()));
+                // The manifest is read once: the bytes recorded and the selection compared with the
+                // loaded targets are one state.
+                let read = std::fs::read(manifest);
+                files.push(Structural::read(manifest.to_owned(), &read));
                 // A script that appears there is run without the manifest naming it.
                 files.push(Structural::new(manifest.with_file_name("build.rs")));
-                let mut loaded: Vec<PathBuf> = cargo[package]
+                let loaded: Vec<PathBuf> = cargo[package]
                     .targets
                     .iter()
                     .filter(|&&it| matches!(cargo[it].kind, TargetKind::BuildScript))
                     .map(|&it| PathBuf::from(AsRef::<Path>::as_ref(&cargo[it].root)))
                     .collect();
-                let selected = std::fs::read_to_string(manifest)
-                    .ok()
-                    .and_then(|text| selected_scripts(manifest, &text));
-                if selected.is_some_and(|it| script_names(&it) != script_names(&loaded)) {
+                let text = read.ok().and_then(|bytes| String::from_utf8(bytes).ok());
+                if text.is_some_and(|text| !selects_loaded_scripts(manifest, &text, &loaded)) {
                     consistent = false;
                 }
             }
@@ -989,25 +1034,90 @@ mod tests {
     fn the_script_a_manifest_selects_is_read_from_its_content() {
         let dir = dir("selected");
         let manifest = dir.join("Cargo.toml");
-        let selects = |text: &str| selected_scripts(&manifest, text).map(|it| script_names(&it));
-        let name = |it: &str| vec![std::ffi::OsString::from(it)];
+        let selects = |text: &str| {
+            selected_scripts(&manifest, text).map(|it| {
+                let mut all: Vec<_> = it.iter().map(|it| script_identity(it)).collect();
+                all.sort();
+                all
+            })
+        };
+        let at = |it: &str| vec![script_identity(&dir.join(it))];
         assert_eq!(
             selects("[package]\nname = \"a\"\nbuild = \"build-new.rs\"\n"),
-            Some(name("build-new.rs"))
+            Some(at("build-new.rs"))
         );
         assert_eq!(
             selects("[package]\nname = \"a\"\nbuild = \"./x/../build-old.rs\"\n"),
-            Some(name("build-old.rs"))
+            Some(at("build-old.rs"))
         );
         assert_eq!(selects("[package]\nname = \"a\"\nbuild = false\n"), Some(Vec::new()));
-        assert_eq!(selects("[package]\nname = \"a\"\nbuild = true\n"), Some(name("build.rs")));
+        assert_eq!(selects("[package]\nname = \"a\"\nbuild = true\n"), Some(at("build.rs")));
         // No key: the script cargo finds by its name, when it is there.
         assert_eq!(selects("[package]\nname = \"a\"\n"), Some(Vec::new()));
         std::fs::write(dir.join("build.rs"), "fn main() {}\n").unwrap();
-        assert_eq!(selects("[package]\nname = \"a\"\n"), Some(name("build.rs")));
+        assert_eq!(selects("[package]\nname = \"a\"\n"), Some(at("build.rs")));
         // What is not read says nothing.
         assert_eq!(selects("not toml ="), None);
         assert_eq!(selects("[workspace]\n"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The registration's comparison of the selected scripts with the loaded: by the file each is, not by its name.
+    #[test]
+    fn the_scripts_a_manifest_selects_are_those_loaded_by_the_file_each_is() {
+        let dir = dir("identity");
+        for sub in ["old", "new", "alias-target"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("build.rs"), "fn main() {}\n").unwrap();
+        }
+        let manifest = dir.join("Cargo.toml");
+        let text = |build: &str| format!("[package]\nname = \"a\"\nbuild = \"{build}\"\n");
+        let loaded = |sub: &str| vec![dir.join(sub).join("build.rs")];
+        // The same name in another directory is another script.
+        assert!(selects_loaded_scripts(&manifest, &text("old/build.rs"), &loaded("old")));
+        assert!(!selects_loaded_scripts(&manifest, &text("new/build.rs"), &loaded("old")));
+        assert!(!selects_loaded_scripts(&manifest, &text("old/build.rs"), &loaded("new")));
+        // One script by other paths: a `.` and a `..` (cargo normalizes by name), a link to its directory.
+        assert!(selects_loaded_scripts(&manifest, &text("./new/../new/build.rs"), &loaded("new")));
+        std::os::unix::fs::symlink(dir.join("alias-target"), dir.join("alias")).unwrap();
+        assert!(selects_loaded_scripts(
+            &manifest,
+            &text("alias/build.rs"),
+            &loaded("alias-target")
+        ));
+        assert!(selects_loaded_scripts(
+            &manifest,
+            &text("alias-target/build.rs"),
+            &loaded("alias")
+        ));
+        assert!(!selects_loaded_scripts(&manifest, &text("alias/build.rs"), &loaded("old")));
+        // Several scripts and none, and what is not read.
+        assert!(!selects_loaded_scripts(
+            &manifest,
+            &text("false").replace("\"false\"", "false"),
+            &loaded("old")
+        ));
+        assert!(selects_loaded_scripts(
+            &manifest,
+            &text("false").replace("\"false\"", "false"),
+            &[]
+        ));
+        assert!(selects_loaded_scripts(&manifest, "not toml =", &loaded("old")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manifest is read once: the content recorded is the bytes the selection was read from.
+    #[test]
+    fn a_structural_file_recorded_from_the_bytes_read_is_the_state_of_those_bytes() {
+        let dir = dir("one-read");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "one\n").unwrap();
+        let read = std::fs::read(&manifest);
+        std::fs::write(&manifest, "two\n").unwrap();
+        // A file written after the bytes were read differs from what they were.
+        assert!(Structural::read(manifest.clone(), &read).changed());
+        let read = std::fs::read(&manifest);
+        assert!(!Structural::read(manifest.clone(), &read).changed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
