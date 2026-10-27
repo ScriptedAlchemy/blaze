@@ -242,6 +242,11 @@ impl SourceDatabase for RootDatabase {
     }
 
     fn depend_on_included_inputs(&self, krate: base_db::Crate) {
+        // Optimized MIR and const evaluation may embed a dependency's literal
+        // without retaining a call edge to the definition that read it.
+        for dependency in krate.transitive_deps(self) {
+            _ = self.files.included_by(self, dependency);
+        }
         _ = self.files.included_by(self, krate);
     }
 

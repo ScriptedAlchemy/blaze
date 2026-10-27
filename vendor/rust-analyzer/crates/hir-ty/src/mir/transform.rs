@@ -149,7 +149,9 @@ pub fn runtime_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body(def)?)
+    let body = run_passes(db, db.mir_body(def)?);
+    db.depend_on_included_inputs(def.krate(db));
+    body
 }
 
 /// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
