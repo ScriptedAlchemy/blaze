@@ -1,0 +1,124 @@
+name: PR12 native relink repair
+
+on:
+  push:
+    branches: [repair/pr12-native-inputs]
+    paths:
+      - .github/repairs/pr12/**
+      - .github/workflows/pr12-native-repair.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr12-native-repair
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository == 'ScriptedAlchemy/blaze' && github.ref == 'refs/heads/repair/pr12-native-inputs'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      EXPECTED_HEAD: 04721719308c41a0993df2aa2426bd85fb120d43
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '0'
+      RA_JIT_MEMORY_MAX: 5G
+      RA_JIT_OWN_BASE_MEMORY: 3G
+      RA_JIT_SPARE: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pin the reviewed PR source and apply the repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          cp -R .github/repairs/pr12 "$RUNNER_TEMP/pr12-repair"
+          actual=$(git ls-remote origin refs/heads/dist/p05w | cut -f1)
+          test "$actual" = "$EXPECTED_HEAD"
+          git fetch --no-tags --depth=1 origin "$EXPECTED_HEAD"
+          git checkout --detach "$EXPECTED_HEAD"
+          python3 "$RUNNER_TEMP/pr12-repair/apply.py" "$RUNNER_TEMP/pr12-repair/native_inputs.rs"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('harness/leasebarrier.py')
+          text = p.read_text()
+          anchor = '        expected[value] = sc.oracle("a", extra)\n    current[0] = 97\n'
+          assert text.count(anchor) == 1
+          text = text.replace(anchor, '        expected[value] = sc.oracle("a", extra)\n    if expected[97] is None or expected[98] is None or expected[97] == expected[98]:\n        sc.fail("native-only oracle did not distinguish the two archive values")\n        return\n    current[0] = 97\n')
+          p.write_text(text)
+          import ast
+          ast.parse(text)
+          PY
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+      - name: Format, audit, and commit exactly the candidate tested
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt -p ra-jit
+          cargo fmt --all -- --check
+          python3 harness/rustcsites.py
+          python3 harness/imports.py
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          allowed = {'crates/ra-jit/src/main.rs', 'crates/ra-jit/src/native_inputs.rs', 'harness/leasebarrier.py'}
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed <= allowed, changed - allowed
+          PY
+          git add crates/ra-jit/src/main.rs crates/ra-jit/src/native_inputs.rs harness/leasebarrier.py
+          git -c user.name='Zack Jackson' -c user.email='25274700+ScriptedAlchemy@users.noreply.github.com' -c commit.gpgsign=false commit -m 'fix(scripts): relink native input changes before warm-build reuse' -m 'Track generated native bytes and directives, invalidate the executable and full-build baseline before no-op reuse, regenerate the link line, and retain only successful link identities. Add strict native-only, A/B/A and failed-link/retry regressions. Follow-up to PR12 comments 6433993541 and 6434095935.'
+          candidate=$(git rev-parse HEAD)
+          echo "CANDIDATE=$candidate" >> "$GITHUB_ENV"
+          echo "RA_JIT_GIT_SHA=$candidate" >> "$GITHUB_ENV"
+          git show --stat HEAD | tee "$RUNNER_TEMP/native-evidence/commit.txt"
+          git diff "$EXPECTED_HEAD" HEAD --binary > "$RUNNER_TEMP/native-evidence/repair.patch"
+          cp crates/ra-jit/src/main.rs "$RUNNER_TEMP/native-evidence/main.rs"
+          cp crates/ra-jit/src/native_inputs.rs "$RUNNER_TEMP/native-evidence/native_inputs.rs"
+          cp harness/leasebarrier.py "$RUNNER_TEMP/native-evidence/leasebarrier.py"
+      - name: Test actual native-input and build-script modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ra-jit native_inputs::tests -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/native-evidence/native-tests.log"
+          cargo test --locked -p blaze-build-script -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/native-evidence/script-tests.log"
+      - name: Build the exact candidate for real daemon acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p ra-jit --bins 2>&1 | tee "$RUNNER_TEMP/native-evidence/release.log"
+          sha256sum target/release/ra-jit target/release/cargo-ra-jit | tee "$RUNNER_TEMP/native-evidence/binaries.sha256"
+      - name: Require native-only, A/B/A, failure/retry and two-worker correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          RA_JIT_BIN="$PWD/target/release/ra-jit" python3 -I harness/leasebarrier.py --work /tmp/bnr --source-sha "$CANDIDATE" --json "$RUNNER_TEMP/native-evidence/runtime.json" native-only link-control archive-control same-worker cross-worker failure 2>&1 | tee "$RUNNER_TEMP/native-evidence/runtime.log"
+          git diff --exit-code
+      - name: Fast-forward only the unchanged PR12 branch after every gate passes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          actual=$(git ls-remote origin refs/heads/dist/p05w | cut -f1)
+          test "$actual" = "$EXPECTED_HEAD"
+          git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin HEAD:refs/heads/dist/p05w
+          printf 'Validated and pushed %s to dist/p05w without force.\n' "$CANDIDATE" | tee "$RUNNER_TEMP/native-evidence/published.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the candidate and exact validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr12-native-repair-${{ github.run_id }}
+          path: ${{ runner.temp }}/native-evidence/
+          if-no-files-found: warn
