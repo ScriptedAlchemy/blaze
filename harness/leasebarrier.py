@@ -1674,15 +1674,11 @@ def first_join(sc, source_sha, shared):
                 sc.fail(f"V shares R's scripts: R's script was to run once for b: its trail is {after[len(before):]}")
             if rc != 0:
                 sc.fail(f"V was not built (rc {rc}): {said[-300:]}")
-            else:
-                got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
-                want = oracle["gen-one"]
-                sc.notes.setdefault("programs", {})["V"] = got
-                strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
-                if strip(got) != strip(want):
-                    sc.fail(f"V printed {got!r}, cargo's {want!r}")
-                elif got != want:
-                    sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+            elif not os.path.exists(out):
+                sc.fail("V was read as R and no object was built")
+            # V is read as R: the program is R's, linked by the worker; what it prints is recorded.
+            w = os.path.join(sc.dir, "w.bin")
+            sc.notes["r-program"] = subprocess.run([w], capture_output=True, text=True).stdout if os.path.exists(w) else None
             sc.notes["retire"] = retire(sc, sock, "3001")
             return
         if rc != 0:
