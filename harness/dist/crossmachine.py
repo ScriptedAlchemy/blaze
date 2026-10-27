@@ -487,6 +487,10 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     payload = os.path.join(ws, "vendor", "fastrand", "src", "payload.bin")
                     if os.path.exists(payload):
                         os.remove(payload)
+                    checks = json.load(open(checksum))
+                    checks["files"].pop("src/payload.bin", None)
+                    with open(checksum, "w") as output:
+                        json.dump(checks, output, sort_keys=True)
                 else:
                     vendor_payload(ws, value)
                 # No Rust source changes and no stop/restart between these builds.

@@ -618,13 +618,20 @@ mod tests {
                 Contents::default().source_hash(&db, app)
             });
             assert_ne!(first.1, second, "same database must advance included-input identity");
-            let dep = *ide_db::base_db::all_crates(&db).iter().find(|krate| {
-                krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == "dep"
-            }).unwrap();
+            let dep = *ide_db::base_db::all_crates(&db)
+                .iter()
+                .find(|krate| {
+                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == "dep"
+                })
+                .unwrap();
             let current = hir::attach_db(&db, || crate::current_input_paths(&db, dep));
             assert!(current.contains(&path));
             let replacement = "pub fn value() -> u8 { 42 }\n";
-            db.set_file_text_with_durability(files[1].file_id(&db), replacement, ide_db::base_db::salsa::Durability::HIGH);
+            db.set_file_text_with_durability(
+                files[1].file_id(&db),
+                replacement,
+                ide_db::base_db::salsa::Durability::HIGH,
+            );
             std::fs::remove_file(&payload).unwrap();
             assert!(db.reload_included_file(&path));
             let current = hir::attach_db(&db, || crate::current_input_paths(&db, dep));

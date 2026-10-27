@@ -3691,8 +3691,11 @@ fn discover_current_inputs(db: &dyn HirDatabase, krate: ide_db::base_db::Crate) 
 }
 
 fn current_input_paths(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<AbsPathBuf> {
-    let mut paths: Vec<_> = discover_current_inputs::accumulated::<ide_db::base_db::CurrentIncludedInput>(db, krate)
-        .into_iter().map(|input| input.path.clone()).collect();
+    let mut paths: Vec<_> =
+        discover_current_inputs::accumulated::<ide_db::base_db::CurrentIncludedInput>(db, krate)
+            .into_iter()
+            .map(|input| input.path.clone())
+            .collect();
     paths.sort();
     paths.dedup();
     paths
@@ -9831,9 +9834,10 @@ impl Program {
                 closure.push(krate.into());
                 for dependency in closure {
                     let required = current_input_paths(db, dependency);
-                    if let Some((path, _)) =
-                        db.included_by(dependency).into_iter()
-                            .find(|(path, bytes)| bytes.is_none() && required.contains(path))
+                    if let Some((path, _)) = db
+                        .included_by(dependency)
+                        .into_iter()
+                        .find(|(path, bytes)| bytes.is_none() && required.contains(path))
                     {
                         let said =
                             errors::of_none(&format!("could not read included input `{path}`"));
