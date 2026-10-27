@@ -534,15 +534,28 @@ output only while the output has that generation.
 
 The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
 
-1. **A build that is refused what it needs yields its leases, not its decisions.** It lets go of the leases
-   no consumer of its reads, keeps what it decided, and waits holding nothing. When it asks again, a
-   failure is its failure still, and a result is its result if the output still has the generation it is of
-   (`reacquire`); if another build ran the script meanwhile the result is of an output that is not there,
-   and the script is judged again, which is the only way to read what it left. So a script cargo runs once in
-   a build runs once, unless a build with other inputs ran it between: cargo would have run the two builds
-   one after the other, and here the second runs its scripts afresh. The build that has the admission does
-   not yield. With the admission an operation's, two loads that take R then S and S then R do not
-   interleave, and yield is for a build that asks for a group after its operation (a later join).
+1. **A build that ran a script keeps the output and the admission until it is retired; a build that only
+   found the output fresh yields.** A build that is refused what it needs lets go of the leases no consumer of
+   its reads, keeps what it decided, and waits holding nothing; when it asks again a failure is its failure
+   still and a result is its result if the output still has the generation it is of (`reacquire`). That is
+   sound for a build that *found* a script fresh and ran nothing: if another build ran it meanwhile, judging
+   it again is that build's first run of it. It is not sound for a build that *ran* the script: the output is
+   the one run of it the build has, `OUT_DIR` is persistent and cannot be copied (a copy is not the path the
+   script described, and replaying its other effects is what #5 did and was parked for), and a second run
+   re-does what the script did beside it (an external marker, a counter, a generator that reads what it left).
+   So the build that runs a script (`Writer::stands`) is an **executor**: its admission is let go by nothing
+   but its retirement (`release_admission` is a no-op for it), so it never yields, no other build is
+   admitted between its requests to wait for its output and force it to give the lease up, and a later
+   request of the build, whichever group it judges, finds its own decision. Two executors cannot interleave
+   (the second waits holding nothing), as cargo's build-directory lock has it for the whole build; builds
+   that find their scripts fresh still share the output and the admission is theirs only for an operation.
+   The cost is that a build that has to run a script excludes the other builds that have to judge one in
+   that target directory until it is over (the daemon retires a build at its answer, so that is one cargo
+   invocation). A daemon build is one worker's, so the admission of another worker cannot be waited for by
+   its own build. Not an exception: `reacquire` of a result the build *ran* whose output is not its run is an
+   error and never a second run. The build that has the admission does not yield. With the admission an
+   operation's, two loads that take R then S and S then R do not interleave, and yield is for a build that
+   found a group fresh and asks for another after its operation (a later join).
 2. **A consumer takes a `Pin` before its first read**: the consumer is counted first, so no release comes
    between, then shared leases on the world of the checkouts its program is built from (not every checkout
    loaded) and the generations looked at again. It lives with the client through the compile, the link, the
@@ -552,8 +565,17 @@ The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
    of the program would be, with its own variables: the check of the scripts judges them over the output as
    it is, and the checkout is loaded again if what they say is another. An editor's `edit` is put back with
    its text, and the checkouts are asked for as a `sync` of each program with the edit's variables; the edit
-   is taken when they are loaded. At most four times: a world that moves under every attempt is another
-   build's to finish first, and is said.
+   is taken when they are loaded.
+   **The edit waits for the recovery it queued** (`recovery.rs`): the requests that load the checkouts
+   again carry a token, and the edit is not looked at again while any is alive, so a recovery that is put
+   off (the script it runs is read by a build that is compiling) is waited for as long as that takes,
+   by the worker's sleep, and the edit is neither counted nor asked about at every turn. A recovery that has
+   ended and left the world moved again is another recovery when the output is another run's (another build
+   ran the script since: that build's progress, and every one costs the editor a recovery and not its
+   answer), and the end of the request, said, only when it is the same run's as the last (the recovery
+   loaded the world and the output is still not what it was loaded from: asking again would ask for the
+   same). There is no count of attempts. A `sync` or `patch` that comes through the check follows the same
+   rule.
 4. The load takes its owner from the request, tells the inputs what it watches only when the database has
    the checkouts, and looks at the generations of all of them before it does. A split that cannot be loaded
    again keeps its world.
@@ -564,7 +586,7 @@ The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
 
 ### Tests
 
-Component (Mac, shared target, heavy lock, watchdog): `scripts::` 32 passed. They include decisions kept
+Component (Mac, shared target, heavy lock, watchdog): `scripts::` and `recovery::` 38 passed at `4ae2a363`. They include decisions kept
 across a yield (reacquire at the same generation; superseded when another build ran it; a failure kept), two
 runs of one fingerprint as two generations (with a script that runs every build), a pin that is a consumer
 before it has its leases (a pin in flight is not released under), an operation that has the admission
@@ -588,6 +610,29 @@ Regression on the fixed build, same binary: `worlds`, `join`, `lost-wake`, `relo
 passed at `2c95ea1c`. Evidence: `p05r-evidence/generation-recovery-2c95ea1c/` (a JSON, a folder and a manifest for
 each batch, named by the batch and never overwritten).
 
+### Build-once and waiting recovery (`0e580b5b` → `600411b9`; production `4ae2a363`)
+
+The independent re-review of `0e580b5b` (Traex GPT-6.1-Sol) found two residual P1s, and gave the
+diagnosis for both: a stale edit was counted at every turn of the worker while its recovery was put off
+(four turns, then "ask again", while the build that held what it needed was compiling normally), and a
+generation change re-ran a script in a build that had already run it (the test accepted `a, b, a`).
+Both are corrected as rule 1 and rule 3 say. Linux through the daemon and a worker started by hand,
+Docker `rust:1.99.0-bookworm`, one 6 GiB container, no extra swap, own docker lock; baseline = the
+`0e580b5b` binary (`6514c23ab975…`), fixed = production `4ae2a363` (`917abb9ecd92…`), harness `600411b9`:
+
+| scenario | baseline `0e580b5b` | fixed |
+|---|---|---|
+| `once`: ONE explicit build number (`RA_JIT_BUILD`) for A's first request (runs R, answered), a request that joins S, and a third; B, another build, asks for R with another `GEN` in between and is retired at its answer, as the daemon does; a guard fails the second execution of R for A | B is put off behind A's lease, then admitted when A yields for the join; B runs R; A's join and its third request fail ("failed to run custom build command … r": the script ran twice, the guard exits 7); the worker's log has `runs build=1001` twice for R | A runs R once; B is put off behind A's admission, and has run nothing while A's build lasts; A's join and third request are answered; B runs after A's retirement; A's program and B's are cargo's (native link aside) |
+| `once-failed`: the same with a script that fails for A | the failure is A's for good; one execution; B goes on | the same (this is a control: the failure was already kept) |
+| `recovery`: A's database is of `GEN=a`, B (`GEN=b`) is held after its scripts for 8 s, an edit to A needs the script run again for `a` | the edit is looked at five times in the first instants, "failed … ask again" at once | the edit is refused once and waits; B is let go, the edit is built, with no second request, and is cargo's |
+
+Regression on the same fixed binary: `generation`, `groups`, `coab` (the opposite orders), `lost-wake`,
+`unrelated`, `reload-busy` pass. Evidence: `p05r-evidence/build-once-waiting-recovery-600411b9/` (three
+batches, each a JSON, a folder and a manifest). A first harness for `once` was wrong (a joined checkout's
+script runs with the worker's own variables, so its guard collided across builds) and is kept as the
+first batch's failure. The scenarios were not run with the daemon's own `Request::Build`; `once` sends each
+request itself with an explicit number, which is what the daemon does for the requests of one build.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
@@ -602,6 +647,13 @@ each batch, named by the batch and never overwritten).
   from a split that fails to load again; a competing writer already running when a pin is taken (component
   test only); a checkout read as another beyond the code path it shares with `overlay`; an interrupted build
   with a client that needs a group it did not judge (read: the clients give their pins up).
-- A build whose script another build ran meanwhile (the case of rule 1) runs the script again: the only
-  case of a second execution in a build, and with the build that ran it between.
+- A build whose script another build ran while it only held it fresh runs the script (its first run of
+  it). There is no case of a second execution in a build: the earlier "A/B/A" exception is gone (it was
+  the defect of the review of `0e580b5b`). What it costs is rule 1's serialization of the builds that run
+  scripts; a daemon without a retire (a hand-started worker whose builds are never retired) keeps the
+  admission of an executor for as long as the worker lives.
+- A request with no number at all (`build == 0`, a direct run without a daemon) takes the script directory's
+  lock itself, as before, and blocks on an executor's admission; in one worker that is the main loop that
+  would have to take the executor's retire. The daemon numbers every request it sends and an edit has a
+  number of its own, so it was not reached and not run.
 - Not rerun: the 42-probe `scriptedits.py` suite, P0-A, the Mac's 234.

@@ -31,7 +31,11 @@
 //!    ([`Pin`]). So nothing waits while it holds what no one is reading, and a wait is never
 //!    in a cycle: the leases a waiter holds protect a consumer that never waits.
 //! 4. The admission is let go when an attempt ends in anything but a wait, and when the build is
-//!    retired. The builds put off are asked again then.
+//!    retired. The builds put off are asked again then. A build that *ran* a script is the exception:
+//!    the output is the one run of it the build has, and no other build may be admitted to run the
+//!    script over it and force the lease to be given up, so the admission is its until it is
+//!    retired (it never yields, and no one waits for what it holds but for its end). A build that
+//!    only found the output fresh yields, and judges the script afresh, which is its first run.
 //!
 //! What a consumer reads is a **world**: the run directories of the scripts of the checkouts the
 //! database was loaded from, each with the token of the record the run left
