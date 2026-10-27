@@ -446,7 +446,7 @@ variant. A tuple is an array of its elements in order. A `Vec` marked **set** is
 of each element's encoding and has no duplicates; any other `Vec` keeps its order. Strings are
 UTF-8, at most the lengths `Hello` answers with.
 
-A digest of a value is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`,
+A digest of a value is `sha256("blaze/" ‖ name ‖ "/v2" ‖ 0x00 ‖ canonical CBOR of the value)`,
 where `name` is the type's name below. A signature is Ed25519 over the same bytes with `sig/` in
 front of the name. One value signs less than its whole encoding: a `CrateRecord`'s signature is
 over the six-field map of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record
@@ -491,7 +491,7 @@ enum SourceRef {
 
 /// A build after cargo's configuration, workspace, feature and profile resolution: what
 /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
-struct BuildSpec {                  // 0..=11
+struct BuildSpec {                  // 0..=12, schema version 2
     source: SourceRef,              // 0
     lock: Digest,                   // 1, sha256 of Cargo.lock
     units: Vec<UnitSpec>,           // 2, the resolved unit graph, in the canonical unit order
@@ -505,7 +505,21 @@ struct BuildSpec {                  // 0..=11
     cwd: String,                    // 9, relative to the workspace root
     command: Command,               // 10
     toolchain: StoreIdentity,       // 11
+    workspace_manifest: SourcePath, // 12, selected root manifest relative to SourceRef's root
 }
+
+```rust
+struct SourcePath(String);          // normalized source-relative UTF-8 path
+```
+
+`SourcePath` is normalized UTF-8 text with `/` separators (`.` for the root).
+Empty paths/components, `.` or `..` components, absolute paths, backslashes, NUL
+and drive prefixes are malformed wire inputs, not paths to normalize at execution.
+`workspace_manifest` names a file and cannot be `.`. `cwd` keeps its original
+workspace-relative meaning and is validated by the same path rules on decode.
+The selected workspace is the parent of that manifest; replay first locates it
+under the materialized source root, then joins `cwd` there and revalidates with
+the explicit saved manifest. No repository-root fallback or project-name inference.
 
 /// The canonical unit order: units sorted by the bytes of the canonical CBOR of each unit
 /// without field 5. Every field but `deps` together identifies a unit (its dependencies follow
@@ -1305,7 +1319,7 @@ exercised here, **unverified**):
 
 - **Signed records.** The server signs `CrateRecord` fields 0 to 5 with its Ed25519 key; clients
   pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The signed bytes are the six-field map of
-  those fields, without field 6, under the `sig/CrateRecord/v1` domain the schema gives every
+  those fields, without field 6, under the `sig/CrateRecord/v2` domain the schema gives every
   signature; a client checks them the same way. The namespace is in the signed bytes, so a
   `Pr` record is not a `Main` record.
 - **The epoch** (REAPI's `salt`, research 7.8). Each namespace has a current epoch, answered in
@@ -2135,6 +2149,10 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   most items in a batch, longest string (4 KiB). A decoder refuses unknown keys within a version;
   a change that adds a field is a new version; the server keeps the version before for one blaze
   release.
+  The current wire crate speaks schema 2 with required workspace-location fields and `/v2`
+  typed digest/signature domains. It does not accept schema-1 values through the schema-2
+  decoder; a retained schema-1 endpoint needs its separately pinned codec. HTTP `/v1` routes
+  and `blaze/req/v1` authentication framing remain unchanged.
 - **Errors** are one shape on every call: `{0: code, 1: message, 2: retry_after_ms or null}`, with
   HTTP status from the code's class. Codes: 1 malformed (400), 2 version (400), 3 unauthenticated
   (401), 4 not allowed (403), 5 not found (404), 6 conflict, a generation or attempt moved (409),
@@ -2372,21 +2390,23 @@ struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
     profile: ProfileSpec,            // 9
 }
 
-struct FrontEndKeyInput {            // 0..=4
+struct FrontEndKeyInput {            // 0..=5
     units: Vec<FrontEndUnit>,        // 0, in the canonical unit order
     lock: Digest,                    // 1
     cfg_rustflags: Vec<String>,      // 2, set: the rustflags that set cfg
     toolchain: StoreIdentity,        // 3
     triple: String,                  // 4
+    workspace_manifest: SourcePath, // 5
 }
 
-struct ConfigKeyInput {              // 0..=5
+struct ConfigKeyInput {              // 0..=6
     kind: u8,                        // 0, Command's discriminant
     asked: Vec<(String, String)>,    // 1, set: package name and target name
     profiles: Vec<ProfileSpec>,      // 2, each asked unit's, in the canonical unit order
     platform: Digest,                // 3
     rustflags: Vec<String>,          // 4, set
     toolchain: StoreIdentity,        // 5
+    workspace_manifest: SourcePath, // 6
 }
 
 struct JobContentInput {             // 0..=1
@@ -2774,11 +2794,11 @@ Two source-identity gaps remain before the prototype can be used to schedule wor
 currently names `HEAD` and `HEAD^{tree}` while resolution reads the working tree: changing a
 Rust body without committing can leave `BuildSpec` and `JobContent` unchanged. It needs an
 immutable snapshot of the actual source closure, including inputs outside Git's tracked
-files. Also, the wire contract lacks the Cargo workspace's location within its repository.
-Two sibling workspaces with identical package metadata but different source can have equal
-specs, and replay joins the workspace-relative `cwd` to the Git root. A repository-relative
-workspace location must enter the keyed contract and be used by materialization and replay.
-Refusing those supported local builds is not the completed C2 design.
+files. Schema version 2 now keys the selected root manifest's source-relative location
+in BuildSpec, FrontEndKeyInput and ConfigKeyInput. Sibling workspaces are distinguished
+even when package metadata matches, and relocation preserves the same logical location.
+Replay uses that location before joining workspace-relative cwd and revalidating.
+This location is not an immutable dirty/untracked/external input snapshot.
 
 Matching replay still deliberately ends at the owned-executor diagnostic; routing it through
 the existing Cargo dispatcher would add a compiler fallback. The executor, complete native

@@ -479,6 +479,7 @@ wire_types! {
     GitRef,
     RootRef,
     BuildSpec,
+    SourcePath,
     UnitSpec,
     ProfileSpec,
     LocalPolicy,
