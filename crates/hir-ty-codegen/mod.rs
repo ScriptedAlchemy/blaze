@@ -2512,9 +2512,9 @@ fn closures_of(
         .collect()
 }
 
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(copy), revisions = usize::MAX)]
+// Retain ordinary revision validation: included inputs can change without any
+// of the instance's arguments changing.
+#[salsa::tracked(returns(copy))]
 fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
@@ -2861,9 +2861,7 @@ fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Com
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(ref), revisions = usize::MAX)]
+#[salsa::tracked(returns(ref))]
 fn compiled_instance<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
