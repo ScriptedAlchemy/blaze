@@ -12,7 +12,7 @@ use std::{
     convert::Infallible,
     io::SeekFrom,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -41,6 +41,12 @@ use tokio::{
 use crate::blob::{ObjectName, hex, parse_range};
 use crate::error::{Error, failed};
 use crate::store::{Expect, Store, Verification, temporary};
+
+mod preconditions;
+mod publication;
+
+use preconditions::Condition;
+use publication::{Temporary, key_of};
 
 /// The bytes of one read of a file that is sent.
 const CHUNK: usize = 1 << 16;
@@ -348,13 +354,13 @@ impl Server {
                 .map_err(|e| failed(&format!("making {}", parent.display()), e))?;
         }
         let partial = temporary(&to);
-        let _cleanup = Temporary(partial.clone());
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
+        // Creation returns both the file and its cleanup owner from the blocking task. If
+        // this await is cancelled, dropping that task's result still removes its own file.
+        let (file, cleanup) = tokio::task::spawn_blocking(move || Temporary::create(partial))
             .await
+            .map_err(|e| failed("creating an upload staging file", e))?
             .map_err(|e| failed(&format!("writing {}", object.name), e))?;
+        let mut file = tokio::fs::File::from_std(file);
         let mut taken = 0u64;
         while let Some(frame) = body.frame().await {
             let frame =
@@ -363,7 +369,6 @@ impl Server {
             taken += data.len() as u64;
             if taken > self.limits.blob {
                 drop(file);
-                _ = tokio::fs::remove_file(&partial).await;
                 return Err(Error::too_large(format!(
                     "a blob of more than the {} bytes the server takes",
                     self.limits.blob
@@ -375,11 +380,11 @@ impl Server {
         }
         file.flush().await.map_err(|e| failed(&format!("writing {}", object.name), e))?;
         drop(file);
-        // The check reads the file back: a pack sent compressed is unpacked and hashed, which
-        // is the whole of what its name promises.
+        // Verification owns cleanup until it finishes, even if the HTTP request goes away.
         let store = self.store.clone();
         let name = object.name.clone();
-        tokio::task::spawn_blocking(move || store.put_blob_from(&name, &partial))
+        cleanup
+            .blocking(move |partial| store.put_blob_from(&name, partial))
             .await
             .map_err(|e| failed("verifying a blob", e))?
     }
@@ -424,8 +429,8 @@ impl Server {
                 Ok(answer)
             }
             Method::PUT => {
+                let condition = preconditions::parse(headers)?;
                 let bytes = self.read_whole(headers, body).await?;
-                let condition = condition(headers);
                 let expect = match &condition {
                     Condition::Any => Expect::Any,
                     Condition::None => Expect::Absent,
@@ -533,14 +538,6 @@ async fn connection(stream: TcpStream, server: Arc<Server>) -> anyhow::Result<()
 /// The body of every answer: bytes, or a file streamed from it, or nothing.
 pub type Body = BoxBody<Bytes, std::io::Error>;
 
-struct Temporary(PathBuf);
-
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn full(bytes: Vec<u8>) -> Body {
     Full::new(Bytes::from(bytes)).map_err(|never| match never {}).boxed()
 }
@@ -628,29 +625,6 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .and_then(|it| it.parse().ok())
 }
 
-/// What a `PUT` of a list says about what it read.
-enum Condition {
-    /// No condition: the write lands.
-    Any,
-    /// `If-None-Match: *`: nothing may be there.
-    None,
-    /// `If-Match: "<tag>"`: what is there must be what was read.
-    Match(String),
-}
-
-fn condition(headers: &hyper::HeaderMap) -> Condition {
-    let tag = |name: HeaderName| {
-        headers.get(name).and_then(|it| it.to_str().ok()).map(|it| it.trim_matches('"').to_owned())
-    };
-    if tag(header::IF_NONE_MATCH).as_deref() == Some("*") {
-        return Condition::None;
-    }
-    match tag(header::IF_MATCH) {
-        Some(tag) => Condition::Match(tag),
-        None => Condition::Any,
-    }
-}
-
 /// A `%XX` in a query, as its byte.
 fn unescape(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -677,42 +651,6 @@ fn sha256(bytes: &[u8]) -> Digest {
 
 fn written_ms(at: SystemTime) -> u64 {
     at.duration_since(UNIX_EPOCH).map_or(0, |it| it.as_millis() as u64)
-}
-
-/// The server's key: the seed in `<dir>/key`, or 32 fresh bytes kept there.
-///
-/// It is the key a `hello` answer carries and the one C6 signs records and capabilities with.
-/// It is made once per directory, so a server that is started again is the same server to a
-/// client that remembers it.
-fn key_of(dir: &Path) -> Result<SigningKey, Error> {
-    let at = dir.join("key");
-    match std::fs::read(&at) {
-        Ok(bytes) => {
-            let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                Error::internal(format!("{} is not the 32 bytes of a key", at.display()))
-            })?;
-            Ok(SigningKey::from_bytes(&seed))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut seed = [0u8; 32];
-            getrandom::fill(&mut seed)
-                .map_err(|e| Error::internal(format!("no randomness for the server's key: {e}")))?;
-            let partial = temporary(&at);
-            let written = (|| -> std::io::Result<()> {
-                use std::io::Write as _;
-                let mut file =
-                    std::fs::File::options().write(true).create_new(true).open(&partial)?;
-                file.write_all(&seed)?;
-                ra_jit_store::name_file_whole(&file, &partial, &at)
-            })();
-            if let Err(e) = written {
-                _ = std::fs::remove_file(&partial);
-                return Err(failed(&format!("writing {}", at.display()), e));
-            }
-            Ok(SigningKey::from_bytes(&seed))
-        }
-        Err(e) => Err(failed(&format!("reading {}", at.display()), e)),
-    }
 }
 
 /// The objects a listing answer holds, for a test.
@@ -879,6 +817,25 @@ mod tests {
             "/v1/objects?prefix=%2Fetc",
         ] {
             assert_ne!(run.request("GET", path, "", &[]).await.0, 200, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_conditions_never_overwrite_a_list() {
+        let run = Running::start().await;
+        let path = "/v1/list/manifests/default";
+        let original = b"original\n";
+        assert_eq!(run.request("PUT", path, "", original).await.0, 204);
+        for headers in [
+            "If-None-Match: \"existing\"\r\n",
+            "If-Match: unquoted\r\n",
+            "If-Match: W/\"existing\"\r\n",
+            "If-Match: \"one\"\r\nIf-Match: \"two\"\r\n",
+            "If-Match: \"one\"\r\nIf-None-Match: *\r\n",
+        ] {
+            assert_eq!(run.request("PUT", path, headers, b"replacement\n").await.0, 400);
+            let (status, _, bytes) = run.request("GET", path, "", &[]).await;
+            assert_eq!((status, bytes), (200, original.to_vec()));
         }
     }
 
