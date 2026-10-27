@@ -295,11 +295,12 @@ pub(crate) fn write(path: &Path, mut parts: Vec<(u8, [u8; KEY], Vec<u8>)>) -> io
     }
     debug_assert_eq!(header.len(), HEADER);
 
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = io::BufWriter::with_capacity(1 << 20, File::create(&temporary)?);
+    let parent = path.parent().filter(|it| !it.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Each writer owns its inode until publication. A name based only on the PID lets
+    // concurrent writes truncate one another, including after one inode has been mapped.
+    let mut temporary = tempfile::Builder::new().prefix(".front-image-").tempfile_in(parent)?;
+    let mut out = io::BufWriter::with_capacity(1 << 20, temporary.as_file_mut());
     let zeros = [0u8; PAGE];
     out.write_all(&header)?;
     out.write_all(&zeros[..index_at - HEADER])?;
@@ -314,7 +315,7 @@ pub(crate) fn write(path: &Path, mut parts: Vec<(u8, [u8; KEY], Vec<u8>)>) -> io
     }
     out.flush()?;
     drop(out);
-    std::fs::rename(&temporary, path)?;
+    temporary.persist(path).map_err(|it| it.error)?;
     Ok(end)
 }
 
@@ -378,6 +379,40 @@ mod tests {
         write(&path, vec![(0, [1; KEY], b"replacement".to_vec())]).unwrap();
         assert_eq!(&*bytes, b"a def map");
         assert_eq!(&*read(&path).unwrap().get(0, &[1; KEY]).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn concurrent_writers_publish_complete_images_and_keep_old_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = written(dir.path());
+        let previous = read(&path).unwrap().get(0, &[1; KEY]).unwrap();
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|threads| {
+            for value in 0..4 {
+                let (path, start) = (&path, &start);
+                threads.spawn(move || {
+                    let bytes = vec![value; 256 * 1024];
+                    start.wait();
+                    for _ in 0..8 {
+                        write(path, vec![(0, [1; KEY], bytes.clone())]).unwrap();
+                        // Another writer may have published by now, but the image is whole.
+                        read(path).unwrap().verify().unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(&*previous, b"a def map");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_publication_removes_the_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("directory");
+        std::fs::create_dir(&path).unwrap();
+        ra_jit_store::compiles_against("the front-end image's tests");
+        assert!(write(&path, parts()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

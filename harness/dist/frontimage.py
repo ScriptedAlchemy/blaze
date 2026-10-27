@@ -60,14 +60,17 @@ def clone(src, dst):
 def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=None):
     """One guarded run below WORK/name; the directory of what loadmem.py recorded."""
     work = os.path.join(a.work, name)
-    os.makedirs(work, exist_ok=True)
+    # Old worker logs can contain the readiness marker before this run even starts.
+    os.makedirs(work, exist_ok=False)
     if store_from:
         clone(store_from, os.path.join(work, "store.noindex"))
     cmd = [sys.executable, "-I", LOADMEM, "--td", a.td, "--blaze-bin", blaze_bin or a.blaze_bin, "--work", work,
            "--name", "r", "--cargo-home-from", a.cargo_home_from, "--target-name", "d3m.noindex",
            "--timeout", str(a.timeout),
            "--memory-every", "0.5", "--every", "0.5", "--env", f"RUSTUP_TOOLCHAIN={a.toolchain}",
-           "--env", "RA_JIT_FRONT_STATS=1"]
+           "--env", "RA_JIT_FRONT_STATS=1", "--env", "RA_JIT_FROZEN=on",
+           "--env", "RA_JIT_FRONT_IMAGE=off", "--env", "RA_JIT_FRONT_IMAGE_WATCH=0",
+           "--env", "RA_JIT_FRONT_HOLD_MS=0"]
     for kv in env:
         cmd += ["--env", kv]
     if stop:
@@ -77,10 +80,14 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
         cmd += ["--prof", "--step-mb", "2048"]
     cmd += ["--", "blaze", "build", "--locked", "-p", a.package]
     print("+", " ".join(cmd[3:]), flush=True)
-    out = sh(cmd)
-    # A daemon and a worker that got ready outlive the client; what they hold would count against
-    # the next run.
-    sh(["pkill", "-9", "-f", f"^{os.path.abspath(blaze_bin or a.blaze_bin)}/ra-jit"])
+    try:
+        out = sh(cmd)
+    finally:
+        # Stop only this run's private daemon; other lanes may use the same binary.
+        stopped = sh([os.path.join(os.path.abspath(blaze_bin or a.blaze_bin), "ra-jit"), "stop"],
+                     env=dict(os.environ, RA_JIT_HOME=os.path.join(work, "home.noindex")), timeout=20)
+        if stopped.returncode:
+            raise RuntimeError(f"could not stop the measurement daemon in {work}: {stopped.stdout}")
     with open(os.path.join(work, "loadmem.out"), "w") as kept:
         kept.write(out.stdout)
     return os.path.join(work, "r")
@@ -115,7 +122,7 @@ def parse(run):
     with open(os.path.join(run, "result.json")) as file:
         result = json.load(file)
     log = worker_log(run)
-    row = {"outcome": result.get("outcome"), "tripped": result.get("tripped"),
+    row = {"outcome": result.get("outcome"), "tripped": result.get("tripped"), "ready_logged": bool(log),
            "swap_growth_mb": result.get("peak_swap_growth_mb")}
     row["no_rustc_violation"] = no_rustc_violation(run)
     stopped = result.get("stopped_after") or {}
@@ -139,6 +146,9 @@ def parse(run):
     m = find(r"^front-end image: .* (\d+) of (\d+) pages in memory, process holds (\d*) MB")
     if m:
         row["image_pages"] = [int(m[0]), int(m[1])]
+    m = find(r"^front-end image: wrote (\d+) parts,")
+    if m:
+        row["image_written_parts"] = int(m)
     m = find(r"^frozen, of (\d+) crates: def maps of (\d+).* from the store, (\d+) written")
     if m:
         row["frozen"] = dict(crates=int(m[0]), def_maps=int(m[1]), written=int(m[2]))
@@ -152,6 +162,27 @@ def parse(run):
                      for name, *vals in re.findall(
                          r"^front-end census: ([\w, ]+?): (\d+) crates, (\d+) modules, (\d+) files, ([\d.]+) MB", log, re.M)}
     return row
+
+
+def invalid(row, arm):
+    """A ready worker is not enough: each arm must exercise the state it claims to measure."""
+    if row.get("no_rustc_violation"):
+        return "the run used an existing rustc/cargo fallback"
+    if row.get("tripped") or row.get("outcome") != "stopped":
+        return "the guarded run did not reach ready"
+    if not row.get("ready_logged") or row.get("ready_seen_s") is None:
+        return "no worker readiness evidence"
+    if any(row.get(key) is None for key in ("load_s", "resolve_s", "ready_footprint_mb", "ready_rss_mb")):
+        return "missing readiness timings or memory samples"
+    if arm == "seed" and not row.get("image_written_parts", 0):
+        return "the seed wrote no frozen parts"
+    if arm == "image" and not row.get("from_image", 0):
+        return "the image arm read no mapped parts"
+    if arm == "store" and (row.get("from_image", 0) or not row.get("parts", 0)):
+        return "the store arm did not read frozen parts exclusively from the store"
+    if arm == "off" and (row.get("parts", 0) or row.get("frozen", {}).get("def_maps", 0)):
+        return "the off arm used frozen parts"
+    return None
 
 
 def spread(values):
@@ -176,6 +207,9 @@ def main():
     ap.add_argument("--toolchain", default="1.99.0")
     ap.add_argument("--skip-build", action="store_true", help="cargo's target directory is whole already")
     a = ap.parse_args()
+    arms = a.arms.split(",")
+    if a.runs < 1 or not arms or len(arms) != len(set(arms)) or set(arms) - {"off", "store", "image"}:
+        ap.error("--runs must be positive and --arms must name distinct off, store or image arms")
     a.td, a.work = os.path.abspath(a.td), os.path.abspath(a.work)
     os.makedirs(a.work, exist_ok=True)
     image = os.path.join(a.work, "front.image")
@@ -184,7 +218,8 @@ def main():
     if not a.skip_build:
         run = loadmem(a, "build", stop=False)
         summary["build"] = parse(run) if os.path.exists(os.path.join(run, "result.json")) else None
-        if not summary["build"] or summary["build"]["outcome"] != "ok" or summary["build"]["no_rustc_violation"]:
+        if (not summary["build"] or summary["build"]["outcome"] != "ok"
+                or summary["build"]["tripped"] or summary["build"]["no_rustc_violation"]):
             print("BUILD DID NOT COMPLETE WITH BLAZE; no measurement arms:", summary["build"], flush=True)
             with open(os.path.join(a.work, "summary.json"), "w") as file:
                 json.dump(summary, file, indent=1)
@@ -193,15 +228,15 @@ def main():
         os.remove(image)
     seed = loadmem(a, "seed", env=[f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_STATS=census"])
     summary["seed"] = parse(seed)
-    if not os.path.exists(image):
-        print("NO IMAGE was written by the seed run:", json.dumps(summary["seed"]), flush=True)
+    seed_error = invalid(summary["seed"], "seed")
+    if seed_error or not os.path.exists(image):
+        print("SEED FAILED:", seed_error or "no image was written", json.dumps(summary["seed"]), flush=True)
         json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
         return 1
     summary["image_bytes"] = os.path.getsize(image)
     store = os.path.join(a.work, "seed", "store.noindex")
     env = {"off": ["RA_JIT_FROZEN=off", "RA_JIT_FRONT_STATS=census"], "store": [],
            "image": [f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_IMAGE_WATCH=500"]}
-    arms = a.arms.split(",")
     rows = {arm: [] for arm in arms}
     for n in range(1, a.runs + 1):
         for arm in arms:
@@ -228,10 +263,10 @@ def main():
               f"{spread([x.get('serve_s') for x in r])} | {spread([x.get('fetch_s') for x in r])} | "
               f"{spread([x['ready_footprint_mb'] for x in r])} | {spread([x['ready_rss_mb'] for x in r])} | "
               f"{spread([x.get('after_resolve_live_mb') for x in r])} |")
-    bad = [(arm, i) for arm in arms for i, x in enumerate(rows[arm], 1)
-           if x["outcome"] != "stopped" or x["no_rustc_violation"]]
+    bad = [(arm, i, why) for arm in arms for i, x in enumerate(rows[arm], 1) if (why := invalid(x, arm))]
+    bad += [(f"prof-{arm}", 1, why) for arm, row in summary.get("prof", {}).items() if (why := invalid(row, arm))]
     if bad:
-        print("RUNS THAT DID NOT REACH READY:", bad, flush=True)
+        print("INVALID MEASUREMENTS:", bad, flush=True)
     return 1 if bad else 0
 
 
