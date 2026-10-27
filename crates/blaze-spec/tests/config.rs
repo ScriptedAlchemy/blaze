@@ -162,14 +162,13 @@ fn a_runner_is_refused_for_the_commands_that_start_programs_through_it() {
 #[test]
 fn a_linker_is_refused_for_the_commands_that_link() {
     let config = "[target.aarch64-apple-darwin]\nlinker = \"clang\"\n";
-    for command in [Subcommand::Build, Subcommand::Test, Subcommand::Run] {
+    for command in [Subcommand::Build, Subcommand::Test, Subcommand::Run, Subcommand::Check] {
         let error = refused(config, command, &[]);
         assert_eq!(
             (error.id, error.what.as_str()),
             ("TargetLinker", "target.aarch64-apple-darwin.linker")
         );
     }
-    assert!(of(&Fixture::with_config(config), Subcommand::Check, &[]).is_ok());
     let error = refused(
         "[target.aarch64-apple-darwin.foo]\nrustc-link-lib = [\"z\"]\n",
         Subcommand::Check,

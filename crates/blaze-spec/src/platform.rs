@@ -21,14 +21,14 @@
 //!
 //! The program is the one the `cc` crate (1.4.3, which the workspace locks) would run for a
 //! build script of this triple with the host equal to the target, because blaze never
-//! cross-builds. The value is the first set and non-empty of `CC_<triple>`,
-//! `CC_<triple with `-` and `.` replaced by `_>`, `HOST_CC`, `TARGET_CC` and `CC`; `CXX` and
+//! cross-builds. The value is the first set of `CC_<triple>`,
+//! `CC_<triple with `-` and `.` replaced by `_>`, `HOST_CC` and `CC`; `CXX` and
 //! `AR` the same, with the defaults `c++` and `ar`. Read from `cc` 1.4.3 (`lib.rs:3166-3260`,
 //! `:3470-3530`, `:4078-4085`, `:4207-4222`): `target_envs` writes the triple's two names and
-//! then `HOST_CC`, because `get_is_cross_compile` is false when the host is the target. One
-//! deliberate difference: `cc` never reads `TARGET_CC` here, while a requester who sets it
-//! means it. Honouring it names the compiler the requester chose and separates two machines
-//! that would otherwise share a platform, which is the safe direction. `cc`'s default is `cc`
+//! then `HOST_CC`, because `get_is_cross_compile` is false when the host is the target.
+//! `TARGET_CC` is unused for native builds. An empty selected value is not skipped:
+//! it names no executable, rather than falling through to a lower-priority compiler.
+//! `cc`'s default is `cc`
 //! and not `gcc`: `gcc` is its name only on Solaris and illumos, which blaze does not build
 //! for (`lib.rs:3195-3207`).
 //!
@@ -364,18 +364,17 @@ fn tool(
 }
 
 /// The value of the most specific of a tool's variables, or `None` when none is set: `CC_<triple>`,
-/// `CC_<triple with - and . replaced by _>`, `HOST_CC`, `TARGET_CC`, `CC`.
+/// `CC_<triple with - and . replaced by _>`, `HOST_CC`, `CC`. Empty values are selected too.
 fn tool_value<'a>(env: &'a BTreeMap<String, String>, triple: &str, var: &str) -> Option<&'a str> {
     let underscored = triple.replace(['-', '.'], "_");
     [
         format!("{var}_{triple}"),
         format!("{var}_{underscored}"),
         format!("HOST_{var}"),
-        format!("TARGET_{var}"),
         var.to_owned(),
     ]
     .iter()
-    .find_map(|name| env.get(name.as_str()).map(String::as_str).filter(|it| !it.trim().is_empty()))
+    .find_map(|name| env.get(name.as_str()).map(String::as_str))
 }
 
 /// The tool `value` names: its program, the launcher in front of it when it has one, and the

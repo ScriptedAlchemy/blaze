@@ -50,6 +50,8 @@ pub enum Command {
 /// `Default` is what the command compiles with none of them (cargo's `CompileFilter::Default`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetFilter {
+    /// Only the selected packages' doctestable libraries, compiled without the unit-test harness.
+    pub doc_only: bool,
     /// Whether any of the flags was given. When none was, the command's defaults apply.
     pub explicit: bool,
     /// `--lib`.
@@ -449,7 +451,10 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
     let mut reachable = roots.clone();
     reachable.extend(&doctest_libraries);
     let graph = deps::build(&env, arena, &reachable)?;
-    let shared = share::share(&env, &graph, &roots, &doctest_libraries);
+    let mut shared = share::share(&env, &graph, &roots, &doctest_libraries);
+    if asked.targets.doc_only {
+        shared.roots.clone_from(&shared.doctest_libraries);
+    }
     warnings.extend(ctx.config.take_warnings());
     assemble(&env, &shared, ws.root(), &locked, warnings)
 }
@@ -502,6 +507,9 @@ fn assemble(
     // or a proc macro. The others are only for the host.
     let mut linked = vec![false; shared.units.len()];
     let mut queue: Vec<usize> = shared.roots.clone();
+    // Libraries linked by omitted doctest executables are target-reachable too.
+    // The walk still stops at proc macros and build scripts.
+    queue.extend(&shared.doctest_libraries);
     while let Some(at) = queue.pop() {
         if env.target(&shared.units[at]).for_host || linked[at] {
             continue;

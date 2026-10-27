@@ -355,13 +355,37 @@ fn tool_variables_precedence() {
     let without_host =
         vars(&[("PATH", "/usr/bin"), ("CC", "/opt/plain/cc"), ("TARGET_CC", "/opt/target/cc")]);
     let platform = exec_platform(&macos_machine(&without_host, None), &fake).unwrap();
-    assert_eq!(platform.cc.as_ref().unwrap().2, digest(b"target"));
+    assert_eq!(platform.cc.as_ref().unwrap().2, digest(b"plain"));
 
     let plain = vars(&[("PATH", "/usr/bin"), ("CC", "/opt/plain/cc")]);
     let platform = exec_platform(&macos_machine(&plain, None), &fake).unwrap();
     assert_eq!(platform.cc.as_ref().unwrap().2, digest(b"plain"));
     // `cc` is the linker, and `CC` does not name it.
     assert_eq!(platform.linker.2, digest(CLANG));
+}
+
+#[test]
+fn unused_target_cc_cannot_hide_changes_to_the_native_compiler() {
+    let env =
+        vars(&[("PATH", "/usr/bin"), ("CC", "/opt/actual/cc"), ("TARGET_CC", "/opt/unused/cc")]);
+    let first = macos().file("/opt/actual/cc", b"actual-v1").file("/opt/unused/cc", b"unused");
+    let second = macos().file("/opt/actual/cc", b"actual-v2").file("/opt/unused/cc", b"unused");
+    let a = exec_platform(&macos_machine(&env, None), &first).unwrap();
+    let b = exec_platform(&macos_machine(&env, None), &second).unwrap();
+    assert_eq!(a.cc.as_ref().unwrap().2, digest(b"actual-v1"));
+    assert_eq!(b.cc.as_ref().unwrap().2, digest(b"actual-v2"));
+    assert_ne!(digest_of(&a), digest_of(&b));
+    for var in ["CC", "CXX", "AR"] {
+        let mut empty = env.clone();
+        empty.insert(format!("{var}_{TRIPLE}"), String::new());
+        let platform = exec_platform(&macos_machine(&empty, None), &first).unwrap();
+        let tool = match var {
+            "CC" => platform.cc,
+            "CXX" => platform.cxx,
+            _ => platform.ar,
+        };
+        assert_eq!(tool, None, "empty selected {var} must not fall through");
+    }
 }
 
 #[test]

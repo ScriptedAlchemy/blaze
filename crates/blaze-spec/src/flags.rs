@@ -761,6 +761,7 @@ impl Request {
             return Err(Refusal::of(Reason::DocWithTargets, format!("--doc {selecting}")));
         }
         self.targets = TargetFilter {
+            doc_only: self.doc,
             explicit: seen.lib
                 || seen.all_targets
                 || seen.bins.all

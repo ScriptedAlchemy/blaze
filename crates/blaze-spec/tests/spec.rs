@@ -634,7 +634,7 @@ fn the_doc_tests_are_of_the_libraries_of_the_members() {
         Make::new("dep", TargetKind::Lib).registry(),
         Make::new("macro", TargetKind::ProcMacro).host(),
     ];
-    let spec = build(&fixture, Subcommand::Test, &["--doc"], units.clone(), vec![0]).unwrap();
+    let spec = build(&fixture, Subcommand::Test, &["--doc"], units.clone(), vec![1, 2]).unwrap();
     let asked: Vec<&str> = spec
         .build
         .asked

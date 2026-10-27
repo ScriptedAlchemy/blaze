@@ -234,6 +234,7 @@ impl FilterRule {
 /// cargo's `CompileFilter`: which targets of the selected packages.
 #[derive(Clone, Debug)]
 pub(super) enum Filter {
+    Doctest,
     /// The command's own set of targets.
     Default,
     Only {
@@ -247,6 +248,9 @@ pub(super) enum Filter {
 
 impl Filter {
     pub(super) fn of(flags: &TargetFilter) -> Filter {
+        if flags.doc_only {
+            return Filter::Doctest;
+        }
         if flags.all_targets {
             return Filter::Only {
                 lib: LibRule::Default,
@@ -276,6 +280,7 @@ impl Filter {
         match intent {
             Intent::Test | Intent::Check { test: true } => true,
             Intent::Build | Intent::Check { test: false } => match self {
+                Filter::Doctest => true,
                 Filter::Default => false,
                 Filter::Only { examples, tests, benches, .. } => {
                     examples.is_specific() || tests.is_specific() || benches.is_specific()
@@ -345,7 +350,7 @@ impl Generator<'_, '_> {
     /// Libraries cargo compiles for documentation tests, even when the documentation-test
     /// units themselves are not represented in this graph.
     pub(super) fn doctest_libraries(&self, arena: &mut Arena) -> Result<Vec<usize>> {
-        if self.env.intent != Intent::Test || self.filter.is_specific() {
+        if self.env.intent != Intent::Test || matches!(self.filter, Filter::Only { .. }) {
             return Ok(Vec::new());
         }
         let mut libraries = Vec::new();
@@ -560,6 +565,7 @@ impl Generator<'_, '_> {
         let intent = self.env.intent;
         let mut proposals = Vec::new();
         match self.filter {
+            Filter::Doctest => return Ok(Vec::new()),
             Filter::Default => {
                 for &pkg in self.packages {
                     for target in self.filter_default_targets(pkg) {
@@ -772,6 +778,9 @@ impl Generator<'_, '_> {
 
     /// The root units of the command.
     pub(super) fn generate_root_units(&mut self, arena: &mut Arena) -> Result<Vec<usize>> {
+        if matches!(self.filter, Filter::Doctest) {
+            return Ok(Vec::new());
+        }
         let proposals = self.create_proposals()?;
         self.proposals_to_units(arena, proposals)
     }

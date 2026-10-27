@@ -9,8 +9,8 @@
 //!
 //! A `[target.<triple>.runner]` is refused for `test` and `run` only, the commands that start a
 //! program through it: a spec carries no runner, and an executor that ran a test directly would
-//! not do what the command does. `target.<triple>.linker` is refused for the commands that link,
-//! which is every one but `check`, and `build.rustdocflags` (or `RUSTDOCFLAGS`) for the commands
+//! not do what the command does. `target.<triple>.linker` is conservatively refused for every
+//! command: even `check` can link host build scripts and proc macros. `build.rustdocflags` (or `RUSTDOCFLAGS`) for the commands
 //! that run doc tests, which blaze runs with no rustdoc flags.
 
 use std::collections::BTreeMap;
@@ -288,7 +288,7 @@ fn target_tables(
     refusals: &mut Vec<Refusal>,
 ) -> Result<(), Refusal> {
     let runs = matches!(command, Subcommand::Test | Subcommand::Run);
-    let links = command != Subcommand::Check;
+    let links = true;
     let table = config.target_cfg_triple(&host.triple).map_err(|it| rejected("[target]", it))?;
     let at = |key: &str, definition: &Definition| named(definition, key);
     if runs && let Some(runner) = &table.runner {

@@ -177,7 +177,7 @@ fn build_of(request: &Request) -> Selected {
 /// The targets the unit graph is asked for. Doc tests are of the libraries.
 fn targets_of(request: &Request, command: Subcommand) -> TargetFilter {
     if command == Subcommand::Test && request.doc {
-        return TargetFilter { explicit: true, lib: true, ..TargetFilter::default() };
+        return TargetFilter { doc_only: true, ..TargetFilter::default() };
     }
     request.targets.clone()
 }
@@ -486,9 +486,12 @@ fn asked_units(
 ) -> Result<Vec<u32>, Refusal> {
     let mut asked: Vec<usize> = Vec::new();
     if command == Subcommand::Test && request.doc {
-        for (index, unit) in graph.units.iter().enumerate() {
-            let library = unit.target.kind == TargetKind::Lib && unit.mode != Mode::Test;
-            if library && unit.package.member && !unit.for_host {
+        for &index in &graph.roots {
+            let unit = &graph.units[index];
+            let library = matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
+                && unit.mode == Mode::Build
+                && unit.target.doctest;
+            if library {
                 asked.push(index);
             }
         }

@@ -21,6 +21,7 @@ pub(super) struct Shared {
     pub units: Vec<Inner>,
     pub deps: Vec<Vec<Dep>>,
     pub roots: Vec<usize>,
+    pub doctest_libraries: Vec<usize>,
 }
 
 type Key =
@@ -52,9 +53,10 @@ pub(super) fn share(
     // These libraries are dependencies of omitted doctest units, not command roots.
     // In particular a proc macro's library keeps the host's debuginfo policy even
     // when its test executable is a root with the full test profile.
+    let mut mapped_doctests = Vec::new();
     for &library in doctest_libraries {
         let is_for_host = env.target(&graph.arena.units[library]).for_host;
-        sharing.traverse(library, is_for_host);
+        mapped_doctests.push(sharing.traverse(library, is_for_host));
     }
     let Sharing { units, deps, .. } = sharing;
 
@@ -78,6 +80,7 @@ pub(super) fn share(
             })
             .collect(),
         roots: roots.into_iter().map(|root| rank[root]).collect(),
+        doctest_libraries: mapped_doctests.into_iter().map(|unit| rank[unit]).collect(),
     }
 }
 

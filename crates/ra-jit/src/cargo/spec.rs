@@ -219,7 +219,7 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
         store: None,
     };
     let targets = if request.doc {
-        blaze_metadata::units::TargetFilter { explicit: true, lib: true, ..Default::default() }
+        blaze_metadata::units::TargetFilter { doc_only: true, ..Default::default() }
     } else {
         request.targets.clone()
     };
