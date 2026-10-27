@@ -175,6 +175,7 @@ impl Body {
             is_gen_fn,
             maps,
         );
+        db.depend_on_included_inputs(def.module(db).krate(db));
         Some((Arc::new(body), source_map))
     }
 
