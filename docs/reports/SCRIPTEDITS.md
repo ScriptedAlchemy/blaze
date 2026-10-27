@@ -828,6 +828,38 @@ registry crates, host `rust-src`, 6 GiB, no extra swap). Not shown: several cand
 placed/split roots, a candidate whose watched files change between the choice and the load, a checkout whose
 files are touched without a content change (it is not shared until it is loaded again).
 
+### The structure of a workspace is compared by content (`310d39f4` → this head)
+
+The ninth independent review found that `Inputs::describes`, and `Inputs::stale` with it, took a manifest to be as
+loaded when its size and time of last write matched. A selector replaced by one of the same size (`build-old.rs` →
+`build-new.rs`, 12 bytes each) with the time put back kept the stamp: R1's loaded metadata still selected the old
+script, `builds_alike` compared that old script (the same in all three checkouts), R1 was chosen, and its old
+script, which fails for `b`, was run for a request whose own script is the new one.
+The files a workspace's structure is read from are now `Structural`: each by its content, read again and compared
+(bytes; absent; not a file; a file that cannot be read is never equal to anything, so it certifies nothing).
+`describes` (the candidate) and `stale` (the selected checkout, which would otherwise compile from stale targets)
+use it; a file written again with the same bytes is the same (a touch is not a change). At the record
+(`Inputs::watch`, which is after the load) the script each package's manifest selects is compared by
+file name with the loaded targets: a manifest written between the load and the record marks the checkout
+inconsistent, to be loaded again. Package script freshness (cargo's rules over times) is unchanged.
+Scope: only that one property (the selected build script) is bound to the loaded metadata; the other structural files are
+compared with their content at the record, which is after the load, so a change to one of them between the load's
+read and the record is not seen (the loader does not hand over the bytes it read); script names are compared by
+file name, so the same name in another directory is not told apart. The cost is a read of the watched files (manifests,
+lock, configuration) for the selected checkout at each request and for each candidate.
+
+| Linux, split on, quick overlay; R1 `--also` R2 loaded in full under `GEN=a`; R1 selects `build-old.rs` (fails for `b`), R2 and V `build-new.rs`; R1's `Cargo.toml` replaced by R2's: size 173 → 173, mtime ns equal, hash `eb21bfa8…` → `b243d472…`; ONE request for V, `GEN=b` | baseline `310d39f4` | fixed |
+|---|---|---|
+| `choice-same-stamp` | fails with R1's message (`gen … /r1`); no V program | R1 not run; R2 judged once for `b`; V split from R2; `include=b env=b cfg=b native=98` = cargo's |
+
+On the fixed binary in the same batch: `choice-edited-failing`, `choice-edited`, `choice-stable`, `choice-failing-base` (a consumed
+base's failure is said), `quick-choice`, `first-join`, `first-join-shared`, `first-join-private`, `join`, `once`,
+`unrelated`, `worlds`, `recovery`, `reload-busy`, `lost-wake` pass. Component: the same-size, time-restored replacement
+(it fails if the content comparison is removed: mutation run), a file written again with the same bytes, restored,
+appearing, removed, unreadable (never certifies; skipped when run as a privileged user), and the selector read from the
+manifest. 52 passed with `inputs::`, `scripts::`, `recovery::`, policy, `reached` and `Sharing`. Same pinned Linux setup. The `native=97`
+of `first-join` against cargo's 98 remains a recorded gap there; no gap in the choice witnesses.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
