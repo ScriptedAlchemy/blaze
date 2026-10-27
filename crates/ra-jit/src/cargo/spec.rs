@@ -52,7 +52,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let env = std::env::vars().collect();
     let (host, identity) = host()?;
-    let source_root = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    let source_root = blaze_spec::git_path::root(&cwd).map_err(anyhow::Error::msg)?;
     let ctx = context(&cwd, &env, &host, identity, &source_root)?;
     let made = match blaze_spec::assemble::build_spec(&request, &ctx) {
         Ok(made) => made,
@@ -112,7 +112,11 @@ fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     if !output.status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    Ok(String::from_utf8(bytes)?)
 }
 
 fn oid(text: &str) -> anyhow::Result<[u8; 20]> {
@@ -242,7 +246,7 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
 fn replay(file: &Path) -> anyhow::Result<i32> {
     let given: BuildSpec =
         blaze_wire::decode(&std::fs::read(file)?, &blaze_wire::Limits::default())?;
-    let root = PathBuf::from(git(&std::env::current_dir()?, &["rev-parse", "--show-toplevel"])?);
+    let root = blaze_spec::git_path::root(&std::env::current_dir()?).map_err(anyhow::Error::msg)?;
     let (manifest, cwd) = blaze_spec::run::locations(&given, &root)?;
     let (host, identity) = host()?;
     let mut first = None;

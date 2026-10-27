@@ -31,6 +31,10 @@ Both paths are escaped byte components, preserving legal Unix colon/backslash
 names and non-UTF-8 bytes. Generation/decoding use the same validated type; native
 materialization decodes components rather than joining the escaped text. Git API
 callers must supply the actual materialized repository root.
+Native probing receives OsString values, including configured PATH and custom
+compiler wrappers, without substituting ambient variables. Logical path decoding
+uses the message budget rather than the ordinary string budget. Git path stdout
+is read as native bytes with only its line terminator removed.
 Flag refusals print `refused.what` and `refused.why` and return status 2.
 The CLI reads blaze's own answer table and installed toolchain records for host facts.
 It does not execute rustc to discover them.

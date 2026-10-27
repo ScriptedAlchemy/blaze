@@ -27,7 +27,7 @@ fn run_controls_survive_reproduction() {
             "--exact".to_owned(),
         ]));
         assert!(!candidate.args.contains(&"-v".to_owned()));
-        assert_eq!(candidate.cwd, ".");
+        assert_eq!(candidate.cwd.as_str(), ".");
     }
     assert_eq!(run::first_difference(&made.build, &made.build), None);
     let mut changed = made.build.clone();

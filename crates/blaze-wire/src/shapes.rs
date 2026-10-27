@@ -147,7 +147,7 @@ impl Wire for SourcePath {
     }
     fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
         let at = r.position();
-        Self::new(String::decode(r)?).map_err(|mut error| {
+        Self::new(r.path_text()?.to_owned()).map_err(|mut error| {
             error.at = at;
             error
         })

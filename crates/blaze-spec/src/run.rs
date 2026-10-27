@@ -63,7 +63,7 @@ pub struct Reproduction {
     /// scripts may read, as the spec has them.
     pub env: Vec<(String, String)>,
     /// The directory to run in, relative to the workspace root.
-    pub cwd: String,
+    pub cwd: blaze_wire::SourcePath,
 }
 
 impl Reproduction {
@@ -201,8 +201,7 @@ pub fn candidates(spec: &BuildSpec) -> Result<Vec<Reproduction>, Refusal> {
             args.extend(features.iter().cloned());
             args.extend(tail.iter().cloned());
             args.extend(after.iter().cloned());
-            let candidate =
-                Reproduction { command, args, env: env.clone(), cwd: spec.cwd.as_str().to_owned() };
+            let candidate = Reproduction { command, args, env: env.clone(), cwd: spec.cwd.clone() };
             if !out.contains(&candidate) {
                 out.push(candidate);
             }

@@ -267,7 +267,8 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
         let units = unit_specs(graph, &flags, &settings)?;
         let asked = asked_units(request, command, graph, &units)?;
 
-        let mut machine_env = ctx.env.clone();
+        let mut machine_env: BTreeMap<String, std::ffi::OsString> =
+            ctx.env.iter().map(|(name, value)| (name.clone(), value.into())).collect();
         let configured = opened
             .resolved
             .config_env
@@ -276,21 +277,10 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
                 let native = value
                     .materialize(opened.workspace.root())
                     .map_err(|error| Refusal::new(name, error.to_string()))?;
-                // Native compiler variables are currently UTF-8 in Machine. Other env
-                // values need not be inspected by the native probe.
-                match native.into_string() {
-                    Ok(value) => Ok(Some((name.clone(), value))),
-                    Err(_) if crate::environment::is_script_var(name, &host.triple) => {
-                        Err(Refusal::new(
-                            name,
-                            "native probe cannot yet inspect a non-UTF-8 tool variable",
-                        ))
-                    }
-                    Err(_) => Ok(None),
-                }
+                Ok((name.clone(), native))
             })
             .collect::<Result<Vec<_>, Refusal>>()?;
-        machine_env.extend(configured.into_iter().flatten());
+        machine_env.extend(configured);
         let machine =
             Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
@@ -342,6 +332,12 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             toolchain,
             workspace_manifest,
         };
+        // Validate the actual wire budget before producing a schedulable identity.
+        blaze_wire::validate_as::<BuildSpec>(
+            &blaze_wire::encode(&build),
+            &blaze_wire::Limits::DOCUMENTED,
+        )
+        .map_err(|error| Refusal::new("BuildSpec wire budget", error.to_string()))?;
         let digest = digest_of(&build);
         let front_end = front_end_key(&build, &flags, &host.triple);
         let config = config_key(&build, kind_of(command));

@@ -25,6 +25,7 @@ pub mod assemble;
 pub mod config;
 pub mod environment;
 pub mod flags;
+pub mod git_path;
 pub mod platform;
 pub mod profile;
 mod refuse;

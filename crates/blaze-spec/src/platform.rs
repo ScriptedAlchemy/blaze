@@ -190,6 +190,16 @@ const LOADERS: [&str; 4] = [
 
 /// What the platform is read from: this machine's programs and files, or canned answers.
 pub trait Probe {
+    /// Lossless native lookup. Existing text-only test probes may override this for raw bytes.
+    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
+        self.which(name.to_str()?, path.to_str()?)
+    }
+
+    /// Lossless native invocation arguments.
+    fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        let text = args.iter().map(|arg| arg.to_str()).collect::<Option<Vec<_>>>()?;
+        self.run(program, &text)
+    }
     /// `name` found in the directories of `path`, a PATH value: the first directory that holds
     /// it, and `None` when none does.
     fn which(&self, name: &str, path: &str) -> Option<std::path::PathBuf>;
@@ -209,6 +219,19 @@ pub trait Probe {
 pub struct System;
 
 impl Probe for System {
+    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
+        std::env::split_paths(path).map(|dir| dir.join(name)).find(|it| it.is_file())
+    }
+
+    fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        let output = Command::new(program).args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text += &String::from_utf8_lossy(&output.stderr);
+        Some(text)
+    }
     fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
         std::env::split_paths(path).map(|dir| dir.join(name)).find(|it| it.is_file())
     }
@@ -256,7 +279,7 @@ pub struct Machine<'a> {
     /// The target CPU and features codegen assumes.
     pub cpu: &'a str,
     /// The environment build scripts and the link see.
-    pub env: &'a std::collections::BTreeMap<String, String>,
+    pub env: &'a std::collections::BTreeMap<String, std::ffi::OsString>,
     /// `target.<triple>.linker` from cargo's configuration, if it is set.
     pub linker: Option<&'a str>,
 }
@@ -298,7 +321,7 @@ pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPla
     };
 
     let linker_value = machine.linker.map(str::trim).filter(|it| !it.is_empty()).unwrap_or("cc");
-    let linker = resolve(probe, env, linker_value).ok_or_else(|| {
+    let linker = resolve(probe, env, std::ffi::OsStr::new(linker_value)).ok_or_else(|| {
         Refusal::new(linker_value, "the linker cannot be resolved: a build cannot link without it")
     })?;
 
@@ -355,20 +378,24 @@ impl Tool {
 /// The tool a variable names, or `default` when it names none.
 fn tool(
     probe: &dyn Probe,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, std::ffi::OsString>,
     triple: &str,
     var: &str,
     default: &str,
 ) -> Option<Tool> {
     // cc selects the first present variable, then env_tool treats an empty/whitespace
     // value as absent. The caller uses its default, not another environment variable.
-    let selected = tool_value(env, triple, var).filter(|value| !value.trim().is_empty());
-    resolve(probe, env, selected.unwrap_or(default))
+    let selected = tool_value(env, triple, var).map(trim_native).filter(|value| !value.is_empty());
+    resolve(probe, env, selected.as_deref().unwrap_or(std::ffi::OsStr::new(default)))
 }
 
 /// The value of the most specific of a tool's variables, or `None` when none is set: `CC_<triple>`,
 /// `CC_<triple with - and . replaced by _>`, `HOST_CC`, `CC`. Empty values are selected too.
-fn tool_value<'a>(env: &'a BTreeMap<String, String>, triple: &str, var: &str) -> Option<&'a str> {
+fn tool_value<'a>(
+    env: &'a BTreeMap<String, std::ffi::OsString>,
+    triple: &str,
+    var: &str,
+) -> Option<&'a std::ffi::OsStr> {
     let underscored = triple.replace(['-', '.'], "_");
     [
         format!("{var}_{triple}"),
@@ -377,13 +404,18 @@ fn tool_value<'a>(env: &'a BTreeMap<String, String>, triple: &str, var: &str) ->
         var.to_owned(),
     ]
     .iter()
-    .find_map(|name| env.get(name.as_str()).map(String::as_str))
+    .find_map(|name| env.get(name.as_str()).map(|value| value.as_os_str()))
 }
 
 /// The tool `value` names: its program, the launcher in front of it when it has one, and the
 /// bytes of both.
-fn resolve(probe: &dyn Probe, env: &BTreeMap<String, String>, value: &str) -> Option<Tool> {
-    let value = value.trim();
+fn resolve(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    value: &std::ffi::OsStr,
+) -> Option<Tool> {
+    let trimmed = trim_native(value);
+    let value = trimmed.as_os_str();
     if value.is_empty() {
         return None;
     }
@@ -394,10 +426,12 @@ fn resolve(probe: &dyn Probe, env: &BTreeMap<String, String>, value: &str) -> Op
     {
         return Some(tool);
     }
-    let split = words(value);
+    let split = words_native(value);
     let (launcher, program) = match split.as_slice() {
-        [first, second, ..] if is_launcher(env, first) => (Some(first.as_str()), second.as_str()),
-        [first, ..] => (None, first.as_str()),
+        [first, second, ..] if is_launcher(env, first) => {
+            (Some(first.as_os_str()), second.as_os_str())
+        }
+        [first, ..] => (None, first.as_os_str()),
         [] => return None,
     };
     named(probe, env, Path::new(program), launcher)
@@ -406,12 +440,18 @@ fn resolve(probe: &dyn Probe, env: &BTreeMap<String, String>, value: &str) -> Op
 /// The tool of the program `program`, behind the launcher `launcher` when there is one.
 fn named(
     probe: &dyn Probe,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, std::ffi::OsString>,
     program: &Path,
-    launcher: Option<&str>,
+    launcher: Option<&std::ffi::OsStr>,
 ) -> Option<Tool> {
     let (path, bytes) = executable(probe, env, program)?;
-    let name = path.file_name()?.to_str()?.to_owned();
+    let file_name = path.file_name()?;
+    // Tool names are diagnostic text; preserve existing UTF-8 spelling. Raw-byte names
+    // get reversible escaped display text, while executable bytes remain their identity.
+    let name = match file_name.to_str() {
+        Some(name) => name.to_owned(),
+        None => blaze_wire::SourcePath::from_native(Path::new(file_name)).ok()?.as_str().to_owned(),
+    };
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     if let Some(launcher) = launcher {
@@ -425,24 +465,25 @@ fn named(
 }
 
 /// Whether `word` is a launcher `cc` skips to the compiler after it.
-fn is_launcher(env: &BTreeMap<String, String>, word: &str) -> bool {
-    let Some(stem) = Path::new(word).file_stem().and_then(|it| it.to_str()) else {
+fn is_launcher(env: &BTreeMap<String, std::ffi::OsString>, word: &std::ffi::OsStr) -> bool {
+    let Some(stem) = Path::new(word).file_stem() else {
         return false;
     };
-    LAUNCHERS.contains(&stem) || env.get(LAUNCHER_VAR).is_some_and(|it| it == stem)
+    stem.to_str().is_some_and(|stem| LAUNCHERS.contains(&stem))
+        || env.get(LAUNCHER_VAR).is_some_and(|it| it == stem)
 }
 
 /// Where `word` runs and the bytes of what runs: a shim of `/usr/bin` runs the developer
 /// directory's tool, and that tool's bytes are what name the compiler.
 fn executable(
     probe: &dyn Probe,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, std::ffi::OsString>,
     word: &Path,
 ) -> Option<(PathBuf, Vec<u8>)> {
     let (path, bytes) = if word.components().count() > 1 {
         (word.to_owned(), probe.read(word)?)
     } else {
-        let path = probe.which(&word.to_string_lossy(), env.get("PATH")?)?;
+        let path = probe.which_native(word.as_os_str(), env.get("PATH")?)?;
         let bytes = probe.read(&path)?;
         (path, bytes)
     };
@@ -472,7 +513,11 @@ fn version(probe: &dyn Probe, path: &Path) -> String {
 }
 
 /// What `xcrun --find <name>` names: the tool of the active developer directory.
-fn xcrun_find(probe: &dyn Probe, env: &BTreeMap<String, String>, name: &str) -> Option<PathBuf> {
+fn xcrun_find(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    name: &str,
+) -> Option<PathBuf> {
     let path = PathBuf::from(xcrun(probe, env, &["--find", name])?.trim());
     path.is_absolute().then_some(path)
 }
@@ -480,25 +525,32 @@ fn xcrun_find(probe: &dyn Probe, env: &BTreeMap<String, String>, name: &str) -> 
 /// What macOS's `xcrun` with `args` prints. It is named by its absolute path, so the daemon's
 /// `PATH` cannot change which one runs. `Probe::run` takes no environment, so `DEVELOPER_DIR`
 /// is passed through `/usr/bin/env`, set or unset as the machine has it.
-fn xcrun(probe: &dyn Probe, env: &BTreeMap<String, String>, args: &[&str]) -> Option<String> {
-    let mut words: Vec<String> = Vec::new();
-    match env.get("DEVELOPER_DIR").map(|it| it.trim()).filter(|it| !it.is_empty()) {
-        Some(dir) => words.push(format!("DEVELOPER_DIR={dir}")),
-        None => words.extend(["-u".to_owned(), "DEVELOPER_DIR".to_owned()]),
+fn xcrun(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    args: &[&str],
+) -> Option<String> {
+    let mut words: Vec<std::ffi::OsString> = Vec::new();
+    match env.get("DEVELOPER_DIR").filter(|it| !it.is_empty()) {
+        Some(dir) => {
+            let mut value = std::ffi::OsString::from("DEVELOPER_DIR=");
+            value.push(dir);
+            words.push(value);
+        }
+        None => words.extend(["-u".into(), "DEVELOPER_DIR".into()]),
     }
-    words.push(XCRUN.to_owned());
-    words.extend(args.iter().map(|it| (*it).to_owned()));
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    probe.run(Path::new("/usr/bin/env"), &words)
+    words.push(XCRUN.into());
+    words.extend(args.iter().map(std::ffi::OsString::from));
+    probe.run_native(Path::new("/usr/bin/env"), &words)
 }
 
 /// macOS's `sdk` field and the SDK directory its files are read from.
 fn macos_sdk(
     probe: &dyn Probe,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, std::ffi::OsString>,
     triple: &str,
 ) -> Result<((String, String, String), PathBuf), Refusal> {
-    let root = env.get("SDKROOT").map(|it| it.trim()).filter(|it| !it.is_empty());
+    let root = env.get("SDKROOT").filter(|it| !it.is_empty());
     let dir = match root {
         Some(root) => PathBuf::from(root),
         None => xcrun(probe, env, &["--show-sdk-path"])
@@ -532,20 +584,29 @@ fn macos_sdk(
             .filter(|it| !it.is_empty())
             .ok_or_else(|| Refusal::new("sdk", "xcrun --show-sdk-version names no version"))?,
     };
-    let target =
-        match env.get("MACOSX_DEPLOYMENT_TARGET").map(|it| it.trim()).filter(|it| !it.is_empty()) {
-            Some(target) => target.to_owned(),
-            None => DEPLOYMENT_TARGETS
-                .iter()
-                .find(|(it, _)| *it == triple)
-                .map(|(_, target)| (*target).to_owned())
-                .ok_or_else(|| {
-                    Refusal::new(
-                        "MACOSX_DEPLOYMENT_TARGET",
-                        format!("rustc's default deployment target for {triple} is not known"),
-                    )
-                })?,
-        };
+    let target = match env
+        .get("MACOSX_DEPLOYMENT_TARGET")
+        .map(|it| {
+            it.to_str().ok_or_else(|| {
+                Refusal::new("MACOSX_DEPLOYMENT_TARGET", "expected textual deployment version")
+            })
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|it| !it.is_empty())
+    {
+        Some(target) => target.to_owned(),
+        None => DEPLOYMENT_TARGETS
+            .iter()
+            .find(|(it, _)| *it == triple)
+            .map(|(_, target)| (*target).to_owned())
+            .ok_or_else(|| {
+                Refusal::new(
+                    "MACOSX_DEPLOYMENT_TARGET",
+                    format!("rustc's default deployment target for {triple} is not known"),
+                )
+            })?,
+    };
     Ok(((name, version, target), dir))
 }
 
@@ -562,10 +623,13 @@ fn sdk_name(dir: &Path) -> Option<String> {
 /// Linux's `libc` field: `glibc` with what `getconf` names, or `musl` with what its loader names.
 fn linux_libc(
     probe: &dyn Probe,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, std::ffi::OsString>,
 ) -> Result<(String, String), Refusal> {
     let getconf = probe
-        .which("getconf", env.get("PATH").map(String::as_str).unwrap_or_default())
+        .which_native(
+            std::ffi::OsStr::new("getconf"),
+            env.get("PATH").map(|it| it.as_os_str()).unwrap_or_default(),
+        )
         .unwrap_or_else(|| PathBuf::from("/usr/bin/getconf"));
     if let Some(out) = probe.run(&getconf, &["GNU_LIBC_VERSION"])
         && let Some(version) = glibc_version(&out)
@@ -626,6 +690,82 @@ fn native_root(probe: &dyn Probe, files: &[(String, PathBuf)]) -> Option<Digest>
         }
     }
     any.then(|| hasher.finalize().into())
+}
+
+fn trim_native(value: &std::ffi::OsStr) -> std::ffi::OsString {
+    if let Some(text) = value.to_str() {
+        return text.trim().into();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = value.as_bytes();
+        let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+        let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |at| at + 1);
+        std::ffi::OsString::from_vec(bytes[start..end].to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        value.to_owned()
+    }
+}
+
+/// Preserve raw Unix bytes while applying the same ASCII quote/escape syntax as text tools.
+fn words_native(value: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    if let Some(text) = value.to_str() {
+        return words(text).into_iter().map(Into::into).collect();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut out = Vec::new();
+        let mut word = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut started = false;
+        for &b in value.as_bytes() {
+            if escaped {
+                word.push(b);
+                escaped = false;
+                started = true;
+                continue;
+            }
+            if b == b'\\' && quote != Some(b'\'') {
+                escaped = true;
+                started = true;
+                continue;
+            }
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                } else {
+                    word.push(b);
+                }
+            } else if matches!(b, b'\'' | b'"') {
+                quote = Some(b);
+                started = true;
+            } else if b.is_ascii_whitespace() {
+                if started {
+                    out.push(std::ffi::OsString::from_vec(std::mem::take(&mut word)));
+                    started = false;
+                }
+            } else {
+                word.push(b);
+                started = true;
+            }
+        }
+        if escaped {
+            word.push(b'\\');
+        }
+        if started {
+            out.push(std::ffi::OsString::from_vec(word));
+        }
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        vec![value.to_owned()]
+    }
 }
 
 /// The words of `value`, split as a shell splits them on whitespace and quotes, so that a value

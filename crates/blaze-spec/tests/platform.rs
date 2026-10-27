@@ -83,8 +83,8 @@ fn digest(bytes: &[u8]) -> Digest {
     Sha256::digest(bytes).into()
 }
 
-fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, std::ffi::OsString> {
+    pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).into())).collect()
 }
 
 const TRIPLE: &str = "aarch64-apple-darwin";
@@ -135,11 +135,14 @@ fn xcrun<const N: usize>(args: [&str; N]) -> Vec<&str> {
     ["-u", "DEVELOPER_DIR", "/usr/bin/xcrun"].into_iter().chain(args).collect()
 }
 
-fn macos_machine<'a>(env: &'a BTreeMap<String, String>, linker: Option<&'a str>) -> Machine<'a> {
+fn macos_machine<'a>(
+    env: &'a BTreeMap<String, std::ffi::OsString>,
+    linker: Option<&'a str>,
+) -> Machine<'a> {
     Machine { triple: TRIPLE, cpu: CPU, env, linker }
 }
 
-fn macos_env() -> BTreeMap<String, String> {
+fn macos_env() -> BTreeMap<String, std::ffi::OsString> {
     vars(&[("PATH", "/usr/bin:/opt/homebrew/bin")])
 }
 
@@ -377,7 +380,7 @@ fn unused_target_cc_cannot_hide_changes_to_the_native_compiler() {
     assert_ne!(digest_of(&a), digest_of(&b));
     for var in ["CC", "CXX", "AR"] {
         let mut empty = env.clone();
-        empty.insert(format!("{var}_{TRIPLE}"), String::new());
+        empty.insert(format!("{var}_{TRIPLE}"), std::ffi::OsString::new());
         let platform = exec_platform(&macos_machine(&empty, None), &first).unwrap();
         let tool = match var {
             "CC" => platform.cc,
@@ -482,8 +485,8 @@ fn a_platform_is_a_pure_function_of_the_machine() {
 
     // A variable no field is read from does not.
     let mut home = env.clone();
-    home.insert("HOME".to_owned(), "/Users/someone-else".to_owned());
-    home.insert("SHELL".to_owned(), "/bin/zsh".to_owned());
+    home.insert("HOME".to_owned(), "/Users/someone-else".into());
+    home.insert("SHELL".to_owned(), "/bin/zsh".into());
     let four = exec_platform(&macos_machine(&home, None), &fake).unwrap();
     assert_eq!(one, four);
     assert_eq!(digest_of(&one), digest_of(&four));
@@ -493,7 +496,9 @@ fn a_platform_is_a_pure_function_of_the_machine() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::print_stderr)]
 fn the_system_probe_reads_this_machine() {
-    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let env: BTreeMap<String, std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .collect();
     let triple = if cfg!(target_os = "macos") {
         format!("{}-apple-darwin", std::env::consts::ARCH)
     } else {

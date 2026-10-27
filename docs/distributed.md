@@ -526,6 +526,11 @@ must preserve one normal component; a host that cannot represent a component
 reports a conversion error rather than silently reinterpret it. `cwd` is this
 validated type at generation and decode; its workspace-relative meaning is unchanged.
 `workspace_manifest` must end in the decoded basename `Cargo.toml`.
+SourcePath text uses the negotiated message budget (default 16 MiB), not the
+ordinary 4 KiB string budget. Escaping may triple native bytes. Typed validation
+uses a bounded canonical structural pass then per-field budgets; bytes-only
+validation retains ordinary string bounds and cannot identify path fields.
+Generation validates the wire budget before creating a schedulable identity.
 Git API contexts must supply their materialized repository root; only an intentionally
 workspace-rooted Root snapshot permits an omitted source root.
 Schema 2 replaces field 7's schema-1 string values with these explicit enum tags;

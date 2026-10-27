@@ -33,8 +33,8 @@ indefinite length, unsorted keys, a duplicate key, a float, a tag, a reserved si
 8949 section 3.3's `f8` and a byte below 32), an oversize item, trailing bytes, nesting past
 `MAX_DEPTH`. [`validate_as`] reads the bytes as a type too, so a key the schema does not have,
 a missing key, a text string that is not UTF-8, an unsorted or repeated set item and an unknown
-enum discriminant are refused by name as well. [`decode`] is that same call: it runs the
-validator's pass first, so the ordinary decoder never accepts a message the validator refuses.
+enum discriminant are refused by name as well. [`decode`] is that same call: it runs a
+bounded structural pass first and then typed field budgets (including the path exception below).
 `MAX_DEPTH` counts every item, containers and scalars alike, so a scalar inside 31 arrays is the
 deepest item a message may have.
 
@@ -104,6 +104,17 @@ blob, 4,096 items in a lookup, 65,536 in a batch, 4 KiB a string. The bytes-only
 tell a lookup's array from a batch's, so the schema's decoder holds a lookup's collection to the
 4,096 of [`Limits::lookup_items`] and every other collection to [`Limits::batch_items`]. Exactly the
 limit is accepted and one item more is refused, by name.
+
+Escaped SourcePath text has a path-specific budget of `Limits.request` (default
+16 MiB), not the ordinary string budget: valid native path bytes can triple when
+escaped. Typed decode/validate_as first validate canonical structure within the
+message budget and then enforce each field's limits. General String fields still
+have the 4 KiB limit. Bytes-only validate cannot distinguish text types and keeps
+the general string bound; use validate_as for path-bearing schema messages.
+No length-triggered allocation occurs before the bounded structural pass.
+BuildSpec generation validates the default full wire budget before producing
+its identity or writing a saved spec. Transport negotiation can set other budgets;
+budget failures are transport resource limits, not language-path restrictions.
 
 ## What is not here
 
