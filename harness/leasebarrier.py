@@ -825,14 +825,14 @@ def coab(sc, source_sha):
     sc.timeouts()
 
 
-def send_edit(home_dir, path, text):
+def send_edit(home_dir, path, text, sock="daemon.sock"):
     """An editor's `edit` of a source file, as the daemon takes it (docs/live.md): the whole text on
     one line. Its answer, or the error of not getting one."""
     import socket
     escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(WAIT)
-        s.connect(os.path.join(home_dir, "daemon.sock"))
+        s.connect(os.path.join(home_dir, sock))
         s.sendall(f"edit\t{path}\t{escaped}\n".encode())
         return s.makefile().readline().strip()
 
@@ -968,7 +968,8 @@ EDIT_BYTES = (
 )
 
 
-def edit_while_held(sc, extra, ws, pkg, build_cwd, other_cwd, other_pkg, other_gen, bytes_in_edit, label):
+def edit_while_held(sc, extra, ws, pkg, build_cwd, other_cwd, other_pkg, other_gen, bytes_in_edit, label,
+                    home_dir=None, sock="daemon.sock"):
     """An editor's edit of `ws`'s `one.rs`, held before its compile and link, while a worker of
     another `GEN` asks for the scripts of `other_cwd`: it waits for the edit."""
     import threading
@@ -976,7 +977,8 @@ def edit_while_held(sc, extra, ws, pkg, build_cwd, other_cwd, other_pkg, other_g
     text = open(path).read() + ("// an edit\n" if not bytes_in_edit else EDIT_BYTES)
     sc.arm("a", "consume")
     answer = {}
-    editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.env("a")["RA_JIT_HOME"], path, text)))
+    home_dir = home_dir or sc.env("a")["RA_JIT_HOME"]
+    editor = threading.Thread(target=lambda: answer.update(said=send_edit(home_dir, path, text, sock)))
     editor.start()
     nobody = sc.reached("a", "consume", None, within=120)
     if nobody is None:
@@ -1013,56 +1015,116 @@ def overlay(sc, source_sha):
     sc.timeouts()
 
 
+def by_hand(sc, extra):
+    """A whole-build worker started by hand (`ra-jit <R> --exe .. --socket ..`), which has R
+    loaded for its own load and serves: the way a checkout is joined (the daemon has a worker for
+    each directory a build is asked in). Its pid and log are saved with the scenario."""
+    sock = os.path.join(sc.dir, "worker.sock")
+    env = sc.env("a", dict(GEN="a", **extra))
+    env.pop("RA_JIT_WHOLE_BUILD", None)
+    err = open(os.path.join(sc.dir, "worker.log"), "w")
+    argv = [RA_JIT, sc.r, "--crate", "gen_one", "--out", os.path.join(sc.dir, "w.o"), "--exe",
+            os.path.join(sc.dir, "w.bin"), "--socket", sock]
+    worker = subprocess.Popen(argv, cwd=sc.r, env=env, stdout=subprocess.DEVNULL, stderr=err,
+                              stdin=subprocess.PIPE, start_new_session=True)
+    sc.notes["worker-pid"] = worker.pid
+    return worker, sock, env
+
+
+def sync(sc, sock, env, *flags, within=None, **vars):
+    """`ra-jit sync <socket> ..`: one request to the worker, as a client of its own. The process,
+    killed (and said so) when it does not end in `within`."""
+    env = dict(env, **vars)
+    p = subprocess.Popen([RA_JIT, "sync", sock, *flags], cwd=sc.r, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, errors="replace", stdin=subprocess.DEVNULL)
+    try:
+        out, err = p.communicate(timeout=within or WAIT)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return None, "(killed: it did not end in %ss)" % (within or WAIT)
+    return p.returncode, (out + err)
+
+
+def serving(sc, sock, env):
+    """Waits for the worker to serve: its first program built."""
+    deadline = time.time() + WAIT
+    while time.time() < deadline:
+        if os.path.exists(sock):
+            rc, said = sync(sc, sock, env, within=WAIT)
+            if rc == 0:
+                return True
+        time.sleep(1)
+    sc.fail("the worker started by hand did not serve")
+    return False
+
+
+def join_s(sc, sock, env, gen_, within=None):
+    s_out = os.path.join(sc.dir, "s.o")
+    s_exe = os.path.join(sc.dir, "s.bin")
+    return sync(sc, sock, env, "--project", sc.s, "--crate", "gen_one", "--out", s_out, "--exe", s_exe,
+                within=within, GEN=gen_)
+
+
 def worlds(sc, source_sha):
     extra = shared_projects(sc, worktrees=True)
-    A1 = sc.client("a", ("--bin", "gen-one"), cwd=sc.r, GEN="a", **extra)
-    sc.finish(A1, "A1 (R)")
-    A2 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="a", **extra)
-    sc.finish(A2, "A2 (S)")
-    for tag, p in (("R", A1), ("S", A2)):
-        if p.returncode != 0:
-            sc.fail(f"the build in {tag} exited {p.returncode}: {p.err[-600:]}")
+    worker, sock, env = by_hand(sc, extra)
+    try:
+        if not serving(sc, sock, env):
             return
-    log = sc.log_of("a")
-    sc.notes["joined"] = [l for l in log.splitlines() if l.startswith("join ")]
-    if not sc.notes["joined"]:
-        sc.fail("S was not joined to the worker that has R: the case was not exercised")
-        return
-    if len(sc.run_dirs()) < 2:
-        sc.fail(f"the scripts of R and S did not both run: {sc.run_dirs()}")
-        return
-    # S was judged last. The edit is of R.
-    nobody = edit_while_held(sc, extra, sc.r, "gen", sc.r, sc.r, "gen", "b", True, "worlds")
-    if nobody is not None:
-        pinned = [e for e in sc.events("a") if e[0] == "pins" and e[1] == nobody]
-        sc.notes["pins"] = pinned
-        if not pinned or "world=2" not in pinned[0][4]:
-            sc.fail(f"the edit did not read both groups' output: {pinned}")
-    sc.timeouts()
+        rc, said = join_s(sc, sock, env, "a")
+        if rc != 0:
+            sc.fail(f"S did not join (rc {rc}): {said[-400:]}")
+            return
+        log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        sc.notes["joined"] = [l for l in log.splitlines() if l.startswith("join ")]
+        if not sc.notes["joined"]:
+            sc.fail("S was not joined: the case was not exercised")
+            return
+        if len(sc.run_dirs()) < 2:
+            sc.fail(f"the scripts of R and S did not both run: {sc.run_dirs()}")
+            return
+        # S was judged last. The edit is of R, and it goes to the worker by hand.
+        nobody = edit_while_held(sc, extra, sc.r, "gen", sc.r, sc.r, "gen", "b", True, "worlds",
+                                 home_dir=sc.dir, sock="worker.sock")
+        if nobody is not None:
+            pinned = [e for e in sc.events("a", log + open(os.path.join(sc.dir, "worker.log"), errors="replace").read())
+                      if e[0] == "pins" and e[1] == nobody]
+            sc.notes["pins"] = pinned
+            if not pinned or "world=2" not in pinned[0][4]:
+                sc.fail(f"the edit did not read both groups' output: {pinned}")
+        sc.timeouts()
+    finally:
+        worker.kill()
 
 
 def join(sc, source_sha):
     extra = shared_projects(sc, worktrees=True)
-    one = ("--bin", "gen-one")
-    A1 = sc.client("a", one, cwd=sc.r, GEN="a", **extra)
-    sc.finish(A1, "A1 (R)")
-    A2 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="a", **extra)
-    sc.finish(A2, "A2 (S joins)")
-    for tag, p in (("R", A1), ("S", A2)):
-        if p.returncode != 0:
-            sc.fail(f"the build in {tag} exited {p.returncode}: {p.err[-600:]}")
+    worker, sock, env = by_hand(sc, extra)
+    try:
+        if not serving(sc, sock, env):
             return
-    if not any(l.startswith("join ") for l in sc.log_of("a").splitlines()):
-        sc.fail("S was not joined to the worker that has R: the case was not exercised")
-        return
-    # S again, with another value of what its script watches: it runs for this build.
-    A3 = sc.client("a", ("--bin", "gen-one"), cwd=sc.s, GEN="c", **extra)
-    sc.finish(A3, "A3 (S again)", within=LOST)
-    if A3.returncode != 0:
-        sc.fail(f"S asked again exited {A3.returncode} (what its join took is not released): {A3.err[-600:]}")
-    if "c" not in sc.runs():
-        sc.fail(f"the script of S did not run for GEN=c: {sc.runs()}")
-    sc.timeouts()
+        rc, said = join_s(sc, sock, env, "a")
+        if rc != 0:
+            sc.fail(f"S did not join (rc {rc}): {said[-400:]}")
+            return
+        log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        if not any(l.startswith("join ") for l in log.splitlines()):
+            sc.fail("S was not joined: the case was not exercised")
+            return
+        # S again, with another value of what its script watches: it runs for this request.
+        rc, said = join_s(sc, sock, env, "c", within=LOST)
+        sc.notes["again"] = (rc, said[-300:])
+        if rc != 0:
+            sc.fail(f"S asked again did not end well (rc {rc}; what its join took is not released): {said[-300:]}")
+        if "c" not in sc.runs():
+            sc.fail(f"the script of S did not run for GEN=c: {sc.runs()}")
+        sc.timeouts()
+    finally:
+        worker.kill()
 
 
 def link_control(sc, source_sha):
