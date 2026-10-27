@@ -355,8 +355,8 @@ impl<'a> World<'a> {
         }
         let mut reads = FxHashMap::default();
         let mut ids = Vec::with_capacity(serialized.len());
-        for package in &serialized {
-            let mut read = summary::read(&serde_json::to_value(package)?)?;
+        for (at, manifest) in manifests.iter().enumerate() {
+            let mut read = summary::native_manifest(manifest, locked_sources[at])?;
             let id = read.summary.package_id();
             if let Some(Some(checksum)) = locked.lock.checksums().get(&id) {
                 read.summary.set_checksum(checksum.clone());
@@ -531,8 +531,8 @@ fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<P
     let members: Vec<PathBuf> =
         ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = summary::patch_paths(root)?;
-    for (path, m) in ws.members() {
-        queue.extend(path_dependencies(&serde_json::to_value(export_package(path, m))?));
+    for (_, m) in ws.members() {
+        queue.extend(native_path_dependencies(m));
     }
     let mut seen: Vec<PathBuf> = members.clone();
     let mut read = Vec::new();
@@ -546,11 +546,19 @@ fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<P
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
             bail!("{} is a path dependency with no package", manifest_path.display());
         };
-        let json = serde_json::to_value(export_package(&manifest_path, &manifest))?;
-        queue.extend(path_dependencies(&json));
+        queue.extend(native_path_dependencies(&manifest));
         read.push(Package { manifest_path, manifest, locked_source: None });
     }
     Ok(read)
+}
+
+fn native_path_dependencies(manifest: &blaze_manifest::manifest::Manifest) -> Vec<PathBuf> {
+    manifest
+        .dependencies
+        .iter()
+        .filter(|dep| dep.source_id.is_path())
+        .filter_map(|dep| dep.source_id.url.to_file_path().ok())
+        .collect()
 }
 
 fn path_dependencies(package: &serde_json::Value) -> Vec<PathBuf> {

@@ -15,6 +15,68 @@ use url::Url;
 
 const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
 
+/// Resolver inputs from the native manifest model, not a JSON rendering of filesystem paths.
+/// Cargo metadata JSON requires UTF-8 paths; resolution itself must not inherit that restriction.
+pub(crate) fn native_manifest(
+    m: &blaze_manifest::manifest::Manifest,
+    source: Option<&str>,
+) -> Result<Read> {
+    let source_id =
+        SourceId::from_url(source.unwrap_or(&m.package_id.source_id.as_url().to_string()))?;
+    let id = blaze_resolve::PackageId::try_new(
+        &m.package_id.name,
+        &m.package_id.version.to_string(),
+        source_id,
+    )?;
+    let deps = m
+        .dependencies
+        .iter()
+        .map(|dep| {
+            let source = SourceId::from_url(&dep.source_id.as_url().to_string())?;
+            let req = dep.req.as_ref().map(ToString::to_string);
+            let mut d = Dependency::parse(&dep.name, req.as_deref(), source)?;
+            d.set_kind(match dep.kind {
+                blaze_manifest::dependency::DepKind::Normal => DepKind::Normal,
+                blaze_manifest::dependency::DepKind::Development => DepKind::Development,
+                blaze_manifest::dependency::DepKind::Build => DepKind::Build,
+            });
+            if let Some(rename) = &dep.explicit_name_in_toml {
+                d.set_explicit_name_in_toml(rename);
+            }
+            d.set_optional(dep.optional);
+            d.set_default_features(dep.default_features);
+            d.set_features(dep.features.iter().map(String::as_str));
+            d.set_platform(dep.platform.clone());
+            Ok(d)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let features = m
+        .features
+        .iter()
+        .map(|(k, v)| {
+            (
+                InternedString::new(k),
+                v.iter().map(|value| InternedString::new(&value.to_string())).collect(),
+            )
+        })
+        .collect();
+    let summary = Summary::new(id, deps, &features, m.metadata.links.as_deref(), None)?;
+    let lib = m.targets.iter().find(|t| t.is_lib());
+    Ok(Read {
+        summary,
+        lib: lib.map(|t| InternedString::new(&t.name.replace('-', "_"))),
+        proc_macro_lib: lib.is_some_and(|t| t.proc_macro),
+        any_proc_macro: m.targets.iter().any(|t| t.proc_macro),
+        build_script: m.targets.iter().any(|t| t.is_custom_build()),
+        bins: m
+            .targets
+            .iter()
+            .filter(|t| t.is_bin())
+            .map(|t| t.required_features.clone().unwrap_or_default())
+            .collect(),
+    })
+}
+
 fn str_of<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().ok_or_else(|| anyhow!("no `{key}` in a package"))
 }
