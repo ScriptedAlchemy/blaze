@@ -241,6 +241,10 @@ impl SourceDatabase for RootDatabase {
         self.files.env_is_read(krate, key);
     }
 
+    fn depend_on_included_inputs(&self, krate: base_db::Crate) {
+        _ = self.files.included_by(self, krate);
+    }
+
     fn env_is_unset(&self, krate: base_db::Crate, key: &str) {
         self.files.env_is_unset(krate, key);
     }

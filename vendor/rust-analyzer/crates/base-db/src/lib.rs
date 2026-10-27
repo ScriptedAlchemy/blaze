@@ -459,6 +459,11 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         None
     }
 
+    /// Record dependencies on the externally included inputs discovered for this crate.
+    /// Consumers retaining code across revisions call this after lowering, when the
+    /// complete read set is known. The bytes remain tracked salsa inputs.
+    fn depend_on_included_inputs(&self, _krate: Crate) {}
+
     /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing
     /// for: a file that is not source by its extension, or one outside its package, which the
     /// VFS does not load until it is asked to.

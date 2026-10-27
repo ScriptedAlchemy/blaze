@@ -2699,7 +2699,9 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
         eprintln!("input-codegen: root {:?}", func);
     }
-    tier::for_build(|| root_code(db, func, false)).map(Produced::code)
+    let code = tier::for_build(|| root_code(db, func, false)).map(Produced::code);
+    db.depend_on_included_inputs(func.krate(db));
+    code
 }
 
 /// The instance a non-generic function is compiled as under its own symbol.
@@ -2874,7 +2876,10 @@ fn compiled_instance<'db>(
     if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
         eprintln!("input-codegen: instance {:?}", instance.def);
     }
-    tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
+    let krate = env.krate;
+    let code = tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code);
+    db.depend_on_included_inputs(krate);
+    code
 }
 
 /// Whether a compile leaves LLVM's part to later ([`Produced::Pending`]): not at all, for a
