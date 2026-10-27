@@ -466,7 +466,7 @@ mod tests {
         let payload = top.join("vendor/dep/src/payload.bin");
         let fixture = format!(
             "//- {}/app.rs crate:app deps:dep\nfn caller() -> u8 {{ dep::value() + 10 }}\n\
-             //- {}/vendor/dep/src/lib.rs crate:dep\n\
+             //- {}/vendor/dep/src/lib.rs crate:dep library new_source_root:library\n\
              #[rustc_builtin_macro]\nmacro_rules! include_bytes {{ () => {{}} }}\n\
              pub fn value() -> u8 {{ include_bytes!(\"payload.bin\")[0] }}\n",
             top.display(),

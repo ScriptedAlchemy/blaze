@@ -127,6 +127,9 @@ code just because its package name, version and relative path are unchanged. The
 `vendor-edit` negative arm changes a body and its cargo checksum on B and compares B's fed
 program with B's changed oracle. Literal suffixes in `concat!(file!(), ...)` are text: only
 the relocation's leading traversal is interpreted, never dots or slashes in that suffix.
+Library body lowering discovers out-of-VFS `include_bytes!` and `include_str!` inputs before
+memoizing the identity. Those observed bytes are hashed too. `vendor-payload` changes only
+a binary payload and its checksum; the library and a dependent caller must print B's values.
 
 ## The disk store
 
