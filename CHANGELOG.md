@@ -22,16 +22,19 @@ All notable changes to ra-jit are written here. The format follows
   run the scripts (no-rustc step J). `harness/scriptedits.py` holds 42 probes of it to cargo, and
   `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole
   build. A build holds the output of the scripts it judged until it ends (`scripts/leases.rs`), and
-  a script runs once in each build whatever other builds ask in between: one admission, owned by a
-  build and kept across its put-offs, keeps all but one build out of the middle of the scripts, so
-  builds that take them in opposite orders cannot wait for each other, and a build waits only to write
-  what another still reads. A request that must wait is put off and asked again when
-  `scripts::generation` moved, never by a sleep or a deadline of the worker's main loop; a reload is put
-  off like a stale check. Every consumer has an owner: a numbered build, a request with none (its own
-  number, until it is dropped), a load no daemon started, an edit or a rebuild nobody asked for. A
-  failing script fails each request of its build with one message. `script-lease:` lines say each step,
-  and `RA_JIT_SCRIPT_BARRIER_DIR` holds a worker by files, which `harness/leasebarrier.py` drives
-  through the daemon (Linux).
+  a script runs once in each build whatever other builds ask in between. A consumer of that output (a
+  compile, a link, a detached link, an editor's edit, a rebuild nobody asked for) takes a `Pin` on the
+  world the database was loaded from, in every mode, before it reads: shared leases on the scripts of
+  every loaded checkout with the token of each run looked at again, and a world that moved is refused,
+  not read. A build that holds leases and is refused the admission or a lease yields what no consumer of
+  its reads and waits holding nothing, so builds that take script groups in opposite orders, a reader
+  that needs a group it did not judge, and builds that join checkouts cannot wait for each other or be
+  refused. A request that must wait is put off and asked again when `scripts::generation` moved, never
+  by a sleep or a deadline of the worker's main loop; a reload and a join are put off like a stale
+  check; a checkout joined later is loaded for the request that asks. A failing script fails each
+  request of its build with one message. `script-lease:` lines say each step, and
+  `RA_JIT_SCRIPT_BARRIER_DIR` holds a worker by files, which `harness/leasebarrier.py` drives through
+  the daemon (Linux).
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
