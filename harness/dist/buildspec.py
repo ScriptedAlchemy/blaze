@@ -2549,7 +2549,7 @@ def resolve(cwd, words, env):
            "7": (o["positional"] if cmd == "run" else []) + ta, "8": [], "9": 0 if o["lib"] else (2 if o["doc"] else 1)}
     command = {"check": [0, None], "build": [1, None], "test": [2, run], "run": [3, run]}[cmd]
     lock = open(os.path.join(root, "Cargo.lock"), "rb").read() if os.path.exists(os.path.join(root, "Cargo.lock")) else b""
-    script_env = sorted([k, env[k]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
+    script_env = sorted([k, [0, env[k]]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
     spec = {"0": source, "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
             "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_tags.items()),
             "8": script_env, "9": logical_path(os.path.relpath(start, root)),

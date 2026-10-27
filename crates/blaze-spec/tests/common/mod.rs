@@ -81,6 +81,15 @@ impl Fixture {
 pub struct FakeMachine;
 
 impl Probe for FakeMachine {
+    fn which_native(&self, name: &std::ffi::OsStr, _path: &std::ffi::OsStr) -> Option<PathBuf> {
+        Some(PathBuf::from("/usr/bin").join(name))
+    }
+    fn run_native(&self, p: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        self.run(p, &args.iter().map(|v| v.to_str()).collect::<Option<Vec<_>>>()?)
+    }
+    fn run_path(&self, p: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        self.run_native(p, args).map(String::into_bytes)
+    }
     fn which(&self, name: &str, _path: &str) -> Option<PathBuf> {
         Some(PathBuf::from("/usr/bin").join(name))
     }
@@ -124,6 +133,7 @@ pub fn context<'a>(
     let _ = fixture;
     Context {
         source_root: None,
+        native_env: None,
         cwd,
         env,
         host,

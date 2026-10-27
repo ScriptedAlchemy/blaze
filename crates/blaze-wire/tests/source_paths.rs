@@ -51,13 +51,13 @@ fn legacy_missing_location_unknown_fields_and_unsafe_cwd_are_refused() {
             .kind,
         ErrorKind::InvalidPath
     );
-    assert_eq!(blaze_wire::VERSION, 3);
+    assert_eq!(blaze_wire::VERSION, 4);
 }
 
 #[test]
 fn configuration_tags_are_required_and_relative_paths_are_validated() {
     use blaze_wire::ConfigEnvValue;
-    let literal = ConfigEnvValue::Literal("data".to_owned());
+    let literal = ConfigEnvValue::Literal("data".to_owned().into());
     let relative = ConfigEnvValue::WorkspaceRelative(SourcePath::new("data".to_owned()).unwrap());
     assert_ne!(blaze_wire::encode(&literal), blaze_wire::encode(&relative));
     assert_eq!(

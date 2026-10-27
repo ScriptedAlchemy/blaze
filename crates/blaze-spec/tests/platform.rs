@@ -38,6 +38,15 @@ fn run_key(program: &str, args: &[&str]) -> String {
 }
 
 impl Probe for Fake {
+    fn which_native(&self, n: &std::ffi::OsStr, p: &std::ffi::OsStr) -> Option<PathBuf> {
+        self.which(n.to_str()?, p.to_str()?)
+    }
+    fn run_native(&self, p: &Path, a: &[std::ffi::OsString]) -> Option<String> {
+        self.run(p, &a.iter().map(|v| v.to_str()).collect::<Option<Vec<_>>>()?)
+    }
+    fn run_path(&self, p: &Path, a: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        self.run_native(p, a).map(String::into_bytes)
+    }
     fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
         if Path::new(name).components().count() > 1 {
             return self.files.contains_key(name).then(|| PathBuf::from(name));

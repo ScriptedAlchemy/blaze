@@ -20,6 +20,38 @@ use std::collections::BTreeMap;
 use crate::Refusal;
 use crate::refuse::Reason;
 
+/// Collect process values losslessly. Non-UTF-8 names remain outside Cargo's named keys;
+/// values of ordinary named variables are retained without `std::env::vars` panics.
+pub fn native_process() -> BTreeMap<String, std::ffi::OsString> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .collect()
+}
+
+/// Cargo's text configuration view. Native script/probe values stay in the accompanying
+/// native map; textual compiler settings which are not textual get named errors.
+pub fn text_view(
+    native: &BTreeMap<String, std::ffi::OsString>,
+) -> Result<BTreeMap<String, String>, Refusal> {
+    let mut text = BTreeMap::new();
+    for (name, value) in native {
+        if let Some(value) = value.to_str() {
+            text.insert(name.clone(), value.to_owned());
+        } else if name == "RUSTFLAGS"
+            || name == "CARGO_ENCODED_RUSTFLAGS"
+            || name.starts_with("CARGO_BUILD_")
+            || name.starts_with("CARGO_PROFILE_")
+            || RA_JIT_CARRIED.contains(&name.as_str())
+        {
+            return Err(Refusal::new(
+                name,
+                "this compiler/configuration option requires text, not native bytes",
+            ));
+        }
+    }
+    Ok(text)
+}
+
 /// A variable refused by name, with what it does and why blaze cannot carry it.
 pub const REFUSED: &[(&str, Reason)] = &[
     ("RUSTC", Reason::EnvRustc),

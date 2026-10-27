@@ -123,6 +123,26 @@ pub struct Resolved {
     pub offline: bool,
 }
 
+/// Apply raw ambient overrides only when Cargo's `[env]` entry is not forced.
+pub fn native_overrides(
+    config: &Config,
+    resolved: &mut Resolved,
+    native: &BTreeMap<String, std::ffi::OsString>,
+) -> Result<(), Refusal> {
+    for (name, value) in &mut resolved.config_env {
+        let Some(raw) = native.get(name).filter(|v| v.to_str().is_none()) else { continue };
+        let entry = config
+            .get_cv(&ConfigKey::parse(&format!("env.{name}")))
+            .map_err(|e| rejected(name, e))?;
+        let forced = matches!(entry,Some(ConfigValue::Table(ref fields,_))
+            if matches!(fields.get("force"),Some(ConfigValue::Boolean(true,_))));
+        if !forced {
+            *value = blaze_wire::ConfigEnvValue::from_native(raw);
+        }
+    }
+    Ok(())
+}
+
 fn rejected(what: &str, error: impl std::fmt::Display) -> Refusal {
     Refusal::with(Reason::ConfigRejected, what, format!("{error:#}"))
 }
@@ -374,11 +394,11 @@ fn resolve_env(
             _ => return Err(rejected(&what, "expected a string or a table")),
         };
         if !force && let Some(set) = env.get(name) {
-            resolved.push((name.clone(), ConfigEnvValue::Literal(set.clone())));
+            resolved.push((name.clone(), ConfigEnvValue::Literal(set.clone().into())));
             continue;
         }
         if !relative {
-            resolved.push((name.clone(), ConfigEnvValue::Literal(value)));
+            resolved.push((name.clone(), ConfigEnvValue::Literal(value.into())));
             continue;
         }
         let from = paths::normalize_path(&definition.root(config.cwd()).join(&value));

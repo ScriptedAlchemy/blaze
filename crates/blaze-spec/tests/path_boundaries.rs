@@ -96,7 +96,7 @@ fn relative_ambient_override_and_forced_relative_are_distinct_and_relocatable() 
     let ambient = build_spec(&req, &ctx).unwrap();
     assert_eq!(
         ambient.build.config_env.as_slice()[0].1,
-        ConfigEnvValue::Literal("ambient".to_owned())
+        ConfigEnvValue::Literal("ambient".to_owned().into())
     );
     std::fs::write(
         cwd.join(".cargo/config.toml"),

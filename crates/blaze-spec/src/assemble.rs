@@ -79,6 +79,8 @@ pub struct Context<'a> {
     /// The requester's environment, all of it: what is refused, carried or ignored is decided
     /// here.
     pub env: &'a BTreeMap<String, String>,
+    /// Complete native process environment. Text-only callers may leave this None.
+    pub native_env: Option<&'a BTreeMap<String, std::ffi::OsString>>,
     /// The machine this blaze builds for.
     pub host: &'a Host,
     /// Which tree the spec builds.
@@ -208,6 +210,16 @@ impl Opened<'_> {
         with: impl FnOnce(&Opened<'_>) -> Result<T, Refusal>,
     ) -> Result<T, Refusal> {
         let command = request.command.unwrap_or(Subcommand::Build);
+        if let Some(native) = ctx.native_env {
+            // Known compiler overrides must not disappear merely because their value is raw.
+            for (name, reason) in environment::REFUSED {
+                if native.get(*name).is_some_and(|v| !(name.ends_with("_WRAPPER") && v.is_empty()))
+                {
+                    return Err(Refusal::of(*reason, *name));
+                }
+            }
+            environment::text_view(native)?;
+        }
         environment::check(ctx.env)?;
         let rejected = |what: &str, error: anyhow::Error| {
             Refusal::with(Reason::ConfigRejected, what, format!("{error:#}"))
@@ -222,7 +234,7 @@ impl Opened<'_> {
             .map_err(|error| rejected("the manifest", error))?;
         let workspace = Workspace::new(&manifest, &manifests)
             .map_err(|error| rejected("the workspace", error))?;
-        let resolved = config::check(
+        let mut resolved = config::check(
             &manifests.config,
             ctx.host,
             command,
@@ -230,6 +242,9 @@ impl Opened<'_> {
             workspace.root(),
             ctx.env,
         )?;
+        if let Some(native) = ctx.native_env {
+            config::native_overrides(&manifests.config, &mut resolved, native)?;
+        }
         with(&Opened { manifests: &manifests, workspace, resolved })
     }
 }
@@ -281,6 +296,17 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             })
             .collect::<Result<Vec<_>, Refusal>>()?;
         machine_env.extend(configured);
+        if let Some(native) = ctx.native_env {
+            machine_env.extend(native.iter().map(|(k, v)| (k.clone(), v.clone())));
+            for (name, value) in &opened.resolved.config_env {
+                machine_env.insert(
+                    name.clone(),
+                    value
+                        .materialize(opened.workspace.root())
+                        .map_err(|e| Refusal::new(name, e.to_string()))?,
+                );
+            }
+        }
         let machine =
             Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
@@ -324,9 +350,17 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             asked: Set::new(asked),
             profile: top,
             platform: platform_digest,
-            rustflags: flags.flags.clone(),
+            rustflags: flags.flags.iter().cloned().map(Into::into).collect(),
             config_env: Set::new(opened.resolved.config_env.clone()),
-            script_env: Set::new(environment::script_env(ctx.env, &host.triple)),
+            script_env: Set::new(
+                machine_env
+                    .iter()
+                    .filter(|(name, _)| environment::is_script_var(name, &host.triple))
+                    .map(|(name, value)| {
+                        (name.clone(), blaze_wire::ConfigEnvValue::from_native(value))
+                    })
+                    .collect(),
+            ),
             cwd,
             command: command_of(request, command),
             toolchain,
@@ -467,7 +501,7 @@ fn unit_specs(
                 ),
                 target: (kind_code(kind), unit.target.name.clone()),
                 features: Set::new(unit.features.clone()),
-                cfg: Set::new(cfg),
+                cfg: Set::new(cfg.into_iter().map(Into::into).collect()),
                 edition: unit.target.edition,
                 deps: Set::new(Vec::new()),
                 test,
@@ -650,7 +684,7 @@ fn front_end_key(build: &BuildSpec, flags: &rustflags::Rustflags, triple: &str) 
     FrontEndKey::of(&FrontEndKeyInput {
         units,
         lock: build.lock,
-        cfg_rustflags: Set::new(flags.cfg_flags()),
+        cfg_rustflags: Set::new(flags.cfg_flags().into_iter().map(Into::into).collect()),
         toolchain: build.toolchain,
         triple: triple.to_owned(),
         workspace_manifest: build.workspace_manifest.clone(),

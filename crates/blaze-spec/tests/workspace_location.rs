@@ -112,7 +112,7 @@ fn nested_explicit_parent_manifest_and_saved_replay_use_the_selected_workspace()
     for candidate in run::candidates(&saved).unwrap() {
         let mut env: BTreeMap<_, _> =
             fixture.env().into_iter().filter(|(key, _)| !run::governed(key)).collect();
-        env.extend(candidate.env);
+        env.extend(candidate.env.into_iter().map(|(k, v)| (k, v.into_string().unwrap())));
         let mut request = Request::parse(candidate.command, &candidate.args).unwrap();
         request.manifest_path = Some(manifest.clone());
         let mut ctx = context(&fixture, &env, &host, &replay_cwd);
@@ -184,7 +184,7 @@ fn saved_revalidation_covers_both_siblings_in_relocated_source() {
             let mut request = Request::parse(candidate.command, &candidate.args).unwrap();
             request.manifest_path = Some(manifest.clone());
             let mut vars = env.clone();
-            vars.extend(candidate.env);
+            vars.extend(candidate.env.into_iter().map(|(k, v)| (k, v.into_string().unwrap())));
             let mut ctx = context(&moved, &vars, &host, &cwd);
             ctx.source = back.source.clone();
             ctx.source_root = Some(&root);

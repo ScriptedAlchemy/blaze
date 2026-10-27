@@ -50,10 +50,12 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         Err(why) => return refused(&why),
     };
     let cwd = std::env::current_dir()?;
-    let env = std::env::vars().collect();
+    let native_env = blaze_spec::environment::native_process();
+    let env = blaze_spec::environment::text_view(&native_env)?;
     let (host, identity) = host()?;
     let source_root = blaze_spec::git_path::root(&cwd).map_err(anyhow::Error::msg)?;
-    let ctx = context(&cwd, &env, &host, identity, &source_root)?;
+    let mut ctx = context(&cwd, &env, &host, identity, &source_root)?;
+    ctx.native_env = Some(&native_env);
     let made = match blaze_spec::assemble::build_spec(&request, &ctx) {
         Ok(made) => made,
         Err(why) => return refused(&why),
@@ -143,6 +145,7 @@ fn context<'a>(
         .or_else(|_| git(cwd, &["rev-list", "--max-parents=0", "HEAD"]))?;
     let digest = Sha256::digest(repo.as_bytes());
     Ok(Context {
+        native_env: None,
         source_root: Some(source_root),
         cwd,
         env,
@@ -251,12 +254,14 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     let (host, identity) = host()?;
     let mut first = None;
     for candidate in blaze_spec::run::candidates(&given)? {
-        let mut env: BTreeMap<String, String> =
-            std::env::vars().filter(|(key, _)| !blaze_spec::run::governed(key)).collect();
-        env.extend(candidate.env);
+        let mut native = blaze_spec::environment::native_process();
+        native.retain(|key, _| !blaze_spec::run::governed(key));
+        native.extend(candidate.env);
+        let env = blaze_spec::environment::text_view(&native)?;
         let mut request = Request::parse(candidate.command, &candidate.args)?;
         request.manifest_path = Some(manifest.clone());
-        let ctx = context(&cwd, &env, &host, identity, &root)?;
+        let mut ctx = context(&cwd, &env, &host, identity, &root)?;
+        ctx.native_env = Some(&native);
         match blaze_spec::assemble::build_spec(&request, &ctx) {
             Ok(made) if made.build == given => {
                 // The existing dispatcher can hand cold libraries, tests and doctests to

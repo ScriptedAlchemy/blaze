@@ -119,6 +119,15 @@ fn actual_native_compiler_bytes_change_spec_and_job_with_unused_target_cc_fixed(
     use std::path::{Path, PathBuf};
     struct Compiler(&'static [u8]);
     impl Probe for Compiler {
+        fn which_native(&self, n: &std::ffi::OsStr, p: &std::ffi::OsStr) -> Option<PathBuf> {
+            common::FakeMachine.which_native(n, p)
+        }
+        fn run_native(&self, p: &Path, a: &[std::ffi::OsString]) -> Option<String> {
+            common::FakeMachine.run_native(p, a)
+        }
+        fn run_path(&self, p: &Path, a: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+            common::FakeMachine.run_path(p, a)
+        }
         fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
             common::FakeMachine.which(name, path)
         }

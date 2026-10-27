@@ -191,15 +191,12 @@ const LOADERS: [&str; 4] = [
 /// What the platform is read from: this machine's programs and files, or canned answers.
 pub trait Probe {
     /// Lossless native lookup. Existing text-only test probes may override this for raw bytes.
-    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
-        self.which(name.to_str()?, path.to_str()?)
-    }
+    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf>;
 
     /// Lossless native invocation arguments.
-    fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
-        let text = args.iter().map(|arg| arg.to_str()).collect::<Option<Vec<_>>>()?;
-        self.run(program, &text)
-    }
+    fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String>;
+    /// Successful stdout bytes for pathname queries, separate from version text.
+    fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>>;
     /// `name` found in the directories of `path`, a PATH value: the first directory that holds
     /// it, and `None` when none does.
     fn which(&self, name: &str, path: &str) -> Option<std::path::PathBuf>;
@@ -219,6 +216,10 @@ pub trait Probe {
 pub struct System;
 
 impl Probe for System {
+    fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        let output = Command::new(program).args(args).output().ok()?;
+        output.status.success().then_some(output.stdout)
+    }
     fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
         std::env::split_paths(path).map(|dir| dir.join(name)).find(|it| it.is_file())
     }
@@ -518,8 +519,27 @@ fn xcrun_find(
     env: &BTreeMap<String, std::ffi::OsString>,
     name: &str,
 ) -> Option<PathBuf> {
-    let path = PathBuf::from(xcrun(probe, env, &["--find", name])?.trim());
+    let path = xcrun_path(probe, env, &["--find", name])?;
     path.is_absolute().then_some(path)
+}
+
+fn xcrun_path(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    args: &[&str],
+) -> Option<PathBuf> {
+    let mut words = Vec::new();
+    match env.get("DEVELOPER_DIR") {
+        Some(dir) => {
+            let mut v = std::ffi::OsString::from("DEVELOPER_DIR=");
+            v.push(dir);
+            words.push(v);
+        }
+        None => words.extend(["-u".into(), "DEVELOPER_DIR".into()]),
+    }
+    words.push(XCRUN.into());
+    words.extend(args.iter().map(std::ffi::OsString::from));
+    crate::git_path::decode_line(probe.run_path(Path::new("/usr/bin/env"), &words)?).ok()
 }
 
 /// What macOS's `xcrun` with `args` prints. It is named by its absolute path, so the daemon's
@@ -553,8 +573,7 @@ fn macos_sdk(
     let root = env.get("SDKROOT").filter(|it| !it.is_empty());
     let dir = match root {
         Some(root) => PathBuf::from(root),
-        None => xcrun(probe, env, &["--show-sdk-path"])
-            .map(|it| PathBuf::from(it.trim()))
+        None => xcrun_path(probe, env, &["--show-sdk-path"])
             .filter(|it| it.is_absolute())
             .ok_or_else(|| {
                 Refusal::new(
@@ -613,7 +632,15 @@ fn macos_sdk(
 /// The name of an SDK: its directory's file name without `.sdk`, lowercased, up to its first
 /// digit.
 fn sdk_name(dir: &Path) -> Option<String> {
-    let name = dir.file_name()?.to_str()?;
+    let native_name = dir.file_name()?;
+    let escaped;
+    let name = match native_name.to_str() {
+        Some(name) => name,
+        None => {
+            escaped = blaze_wire::SourcePath::from_native(Path::new(native_name)).ok()?;
+            escaped.as_str()
+        }
+    };
     let name = name.strip_suffix(".sdk").unwrap_or(name);
     let stem: String = name.chars().take_while(|it| !it.is_ascii_digit()).collect();
     let stem = stem.trim_end_matches('.').to_ascii_lowercase();
@@ -754,9 +781,6 @@ fn words_native(value: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
                 started = true;
             }
         }
-        if escaped {
-            word.push(b'\\');
-        }
         if started {
             out.push(std::ffi::OsString::from_vec(word));
         }
@@ -765,6 +789,19 @@ fn words_native(value: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
     #[cfg(not(unix))]
     {
         vec![value.to_owned()]
+    }
+}
+
+#[cfg(test)]
+mod native_word_tests {
+    #[test]
+    fn text_and_native_supported_syntax_agree() {
+        for text in ["cc -O2", "'cc name' -g", "sccache cc", "cc \\", "cc\t\"a b\""] {
+            let a = super::words_native(std::ffi::OsStr::new(text));
+            let b: Vec<std::ffi::OsString> =
+                super::words(text).into_iter().map(Into::into).collect();
+            assert_eq!(a, b);
+        }
     }
 }
 

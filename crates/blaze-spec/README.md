@@ -35,6 +35,9 @@ Native probing receives OsString values, including configured PATH and custom
 compiler wrappers, without substituting ambient variables. Logical path decoding
 uses the message budget rather than the ordinary string budget. Git path stdout
 is read as native bytes with only its line terminator removed.
+Schema 4 gives free-form env/flag values message-sized typed budgets and preserves
+raw Unix env values as tagged bytes. Ordinary identifiers retain their string limits.
+Native probe methods are required; pathname-query stdout is bytes, not version text.
 Flag refusals print `refused.what` and `refused.why` and return status 2.
 The CLI reads blaze's own answer table and installed toolchain records for host facts.
 It does not execute rustc to discover them.

@@ -61,7 +61,7 @@ pub struct Reproduction {
     pub args: Vec<String>,
     /// The variables to set: the rustflags, blaze's backend settings and the variables build
     /// scripts may read, as the spec has them.
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(String, std::ffi::OsString)>,
     /// The directory to run in, relative to the workspace root.
     pub cwd: blaze_wire::SourcePath,
 }
@@ -238,10 +238,16 @@ fn named_targets(asked: &[&UnitSpec]) -> Vec<String> {
 
 /// The variables to set: the rustflags, the backend and MIR settings of the asked units'
 /// profile, the variables build scripts may read, and the environment a test program is given.
-fn environment(spec: &BuildSpec, test_env: Vec<(String, String)>) -> Vec<(String, String)> {
+fn environment(
+    spec: &BuildSpec,
+    test_env: Vec<(String, String)>,
+) -> Vec<(String, std::ffi::OsString)> {
     let mut env = Vec::new();
     if !spec.rustflags.is_empty() {
-        env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), spec.rustflags.join("\u{1f}")));
+        env.push((
+            "CARGO_ENCODED_RUSTFLAGS".to_owned(),
+            spec.rustflags.iter().map(|s| s.0.as_str()).collect::<Vec<_>>().join("\u{1f}"),
+        ));
     }
     let profile = &spec.profile;
     let llvm = profile.backend == 1;
@@ -252,9 +258,16 @@ fn environment(spec: &BuildSpec, test_env: Vec<(String, String)>) -> Vec<(String
         env.push(("RA_JIT_EMIT".to_owned(), emit.to_owned()));
     }
     env.push(("RA_JIT_MIR_OPT".to_owned(), profile.mir_opt.to_string()));
-    env.extend(spec.script_env.iter().cloned());
-    env.extend(test_env);
-    env
+    let mut native: Vec<_> =
+        env.into_iter().map(|(k, v)| (k, std::ffi::OsString::from(v))).collect();
+    native.extend(spec.script_env.iter().map(|(k, v)| {
+        (
+            k.clone(),
+            v.materialize(std::path::Path::new(".")).expect("generated native env representable"),
+        )
+    }));
+    native.extend(test_env.into_iter().map(|(k, v)| (k, v.into())));
+    native
 }
 
 /// What differs first between the spec a run was given and the one the tree and environment make

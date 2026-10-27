@@ -266,7 +266,7 @@ fn the_cfgs_follow_the_profile_and_the_rustflags() {
         }
         let spec =
             spec(&fixture, &env, Subcommand::Build, args, Some(&graph_of(units, vec![0]))).unwrap();
-        spec.build.units[index_of(&spec, "a") as usize].cfg.iter().cloned().collect()
+        spec.build.units[index_of(&spec, "a") as usize].cfg.iter().map(|v| v.0.clone()).collect()
     };
     let one = || vec![Make::new("a", TargetKind::Lib)];
     let dev = cfgs(&[], "", one());
@@ -529,7 +529,8 @@ fn the_script_environment_is_what_a_build_script_may_read_and_the_config_env_is_
     env.insert("CFLAGS_aarch64_apple_darwin".to_owned(), "-g".to_owned());
     env.insert("HOME".to_owned(), "/home/x".to_owned());
     let spec = spec(&fixture, &env, Subcommand::Build, &[], None).unwrap();
-    let script: Vec<(String, String)> = spec.build.script_env.iter().cloned().collect();
+    let script: Vec<(String, String)> =
+        spec.build.script_env.iter().map(|(k, v)| (k.clone(), v.text().to_owned())).collect();
     let mut want = vec![
         ("CC".to_owned(), "clang".to_owned()),
         ("CFLAGS_aarch64_apple_darwin".to_owned(), "-g".to_owned()),
@@ -538,7 +539,7 @@ fn the_script_environment_is_what_a_build_script_may_read_and_the_config_env_is_
     assert_eq!(script, want);
     assert_eq!(
         spec.build.config_env.as_slice(),
-        [("FROM_CONFIG".to_owned(), blaze_wire::ConfigEnvValue::Literal("1".to_owned()))]
+        [("FROM_CONFIG".to_owned(), blaze_wire::ConfigEnvValue::Literal("1".to_owned().into()))]
     );
 }
 

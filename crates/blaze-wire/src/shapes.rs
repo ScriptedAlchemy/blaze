@@ -9,6 +9,42 @@ use crate::cbor::Wire;
 use crate::{Digest, Named, Set};
 use crate::{wire_enum, wire_struct};
 
+/// Message-bounded free-form input text, unlike ordinary 4 KiB identifiers.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputText(pub String);
+impl From<String> for InputText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl PartialEq<str> for InputText {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+impl std::ops::Deref for InputText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+impl Wire for InputText {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        Ok(Self(r.path_text()?.to_owned()))
+    }
+}
+impl Named for InputText {
+    const NAME: &'static str = "InputText";
+}
+impl crate::vectors::Sample for InputText {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(String::sample(g))
+    }
+}
+
 /// A lossless logical path: `/` separates byte components and `.` denotes the root.
 /// Component bytes outside ASCII letters, digits, `-`, `_`, `.` use uppercase `%HH`.
 /// Escapes of safe bytes, empty/dot/parent components, decoded slash and NUL are invalid.
@@ -215,9 +251,9 @@ wire_struct! {
         3 => asked: Set<u32>,
         4 => profile: ProfileSpec,
         5 => platform: Digest,
-        6 => rustflags: Vec<String>,
+        6 => rustflags: Vec<InputText>,
         7 => config_env: Set<(String, ConfigEnvValue)>,
-        8 => script_env: Set<(String, String)>,
+        8 => script_env: Set<(String, ConfigEnvValue)>,
         9 => cwd: SourcePath,
         10 => command: Command,
         11 => toolchain: StoreIdentity,
@@ -235,8 +271,9 @@ fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
 wire_enum! {
     /// Schema 2 preserves whether configuration text is literal or a workspace-relative path.
     ConfigEnvValue {
-        Literal => 0 (String),
+        Literal => 0 (InputText),
         WorkspaceRelative => 1 (SourcePath),
+        Native => 2 (NativeValue),
     }
 }
 
@@ -247,17 +284,64 @@ impl ConfigEnvValue {
         workspace: &std::path::Path,
     ) -> Result<std::ffi::OsString, crate::Error> {
         match self {
-            Self::Literal(value) => Ok(value.into()),
+            Self::Literal(value) => Ok(value.0.clone().into()),
             Self::WorkspaceRelative(path) => Ok(workspace.join(path.to_native()?).into_os_string()),
+            Self::Native(bytes) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+                    Ok(std::ffi::OsString::from_vec(bytes.0.clone()))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(std::ffi::OsString::from(
+                        String::from_utf8(bytes.0.clone()).map_err(|_| path_error())?,
+                    ))
+                }
+            }
         }
     }
 
     /// Its logical text, for diagnostics; this alone does not preserve its semantics.
     pub fn text(&self) -> &str {
         match self {
-            Self::Literal(value) => value,
+            Self::Literal(value) => &value.0,
             Self::WorkspaceRelative(path) => path.as_str(),
+            Self::Native(_) => "<native bytes>",
         }
+    }
+
+    /// Keep UTF-8's existing text encoding, and encode other native Unix values as bytes.
+    pub fn from_native(value: &std::ffi::OsStr) -> Self {
+        if let Some(text) = value.to_str() {
+            return Self::Literal(InputText(text.to_owned()));
+        }
+        Self::Native(NativeValue(value.as_encoded_bytes().to_vec()))
+    }
+}
+
+/// Message-bounded, NUL-free native Unix environment bytes. Not an arbitrary blob.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeValue(pub Vec<u8>);
+impl Wire for NativeValue {
+    fn encode(&self, e: &mut crate::Encoder) {
+        e.bytes(&self.0);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        let bytes = r.input_bytes()?;
+        if bytes.contains(&0) {
+            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at });
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+}
+impl Named for NativeValue {
+    const NAME: &'static str = "NativeValue";
+}
+impl crate::vectors::Sample for NativeValue {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(vec![b'n', 0x80 + (g.below(128) as u8)])
     }
 }
 
@@ -267,7 +351,7 @@ wire_struct! {
         0 => package: (String, String, Digest),
         1 => target: (u8, String),
         2 => features: Set<String>,
-        3 => cfg: Set<String>,
+        3 => cfg: Set<InputText>,
         4 => edition: u16,
         5 => deps: Set<(u32, String)>,
         6 => test: bool,
@@ -384,7 +468,7 @@ impl CrateRecord {
     }
 
     /// The signature of this record under `key`: Ed25519 over
-    /// `"blaze/sig/CrateRecord/v3" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
+    /// `"blaze/sig/CrateRecord/v4" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
     /// domain separation every other signature of the schema uses.
     pub fn sign(&self, key: &ed25519_dalek::SigningKey) -> [u8; 64] {
         use ed25519_dalek::Signer as _;
@@ -790,7 +874,7 @@ wire_struct! {
         1 => version: String,
         2 => target: (u8, String),
         3 => features: Set<String>,
-        4 => cfg: Set<String>,
+        4 => cfg: Set<InputText>,
         5 => edition: u16,
         6 => deps: Set<(u32, String)>,
         7 => test: bool,
@@ -804,7 +888,7 @@ wire_struct! {
     FrontEndKeyInput {
         0 => units: Vec<FrontEndUnit>,
         1 => lock: Digest,
-        2 => cfg_rustflags: Set<String>,
+        2 => cfg_rustflags: Set<InputText>,
         3 => toolchain: StoreIdentity,
         4 => triple: String,
         5 => workspace_manifest: SourcePath,
@@ -818,7 +902,7 @@ wire_struct! {
         1 => asked: Set<(String, String)>,
         2 => profiles: Vec<ProfileSpec>,
         3 => platform: Digest,
-        4 => rustflags: Set<String>,
+        4 => rustflags: Set<InputText>,
         5 => toolchain: StoreIdentity,
         6 => workspace_manifest: SourcePath,
     }

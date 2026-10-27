@@ -481,6 +481,8 @@ wire_types! {
     BuildSpec,
     SourcePath,
     ConfigEnvValue,
+    InputText,
+    NativeValue,
     UnitSpec,
     ProfileSpec,
     LocalPolicy,

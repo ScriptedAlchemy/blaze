@@ -446,7 +446,7 @@ variant. A tuple is an array of its elements in order. A `Vec` marked **set** is
 of each element's encoding and has no duplicates; any other `Vec` keeps its order. Strings are
 UTF-8, at most the lengths `Hello` answers with.
 
-A digest of a value is `sha256("blaze/" ‖ name ‖ "/v3" ‖ 0x00 ‖ canonical CBOR of the value)`,
+A digest of a value is `sha256("blaze/" ‖ name ‖ "/v4" ‖ 0x00 ‖ canonical CBOR of the value)`,
 where `name` is the type's name below. A signature is Ed25519 over the same bytes with `sig/` in
 front of the name. One value signs less than its whole encoding: a `CrateRecord`'s signature is
 over the six-field map of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record
@@ -491,17 +491,17 @@ enum SourceRef {
 
 /// A build after cargo's configuration, workspace, feature and profile resolution: what
 /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
-struct BuildSpec {                  // 0..=12, schema version 3
+struct BuildSpec {                  // 0..=12, schema version 4
     source: SourceRef,              // 0
     lock: Digest,                   // 1, sha256 of Cargo.lock
     units: Vec<UnitSpec>,           // 2, the resolved unit graph, in the canonical unit order
     asked: Vec<u32>,                // 3, set: indexes of the units the command named
     profile: ProfileSpec,           // 4
     platform: Digest,               // 5, ExecPlatform's digest
-    rustflags: Vec<String>,         // 6, resolved from RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS
+    rustflags: Vec<InputText>,      // 6, message-bounded flags, unchanged text encoding
                                     //    and config, only flags blaze honours
     config_env: Vec<(String, ConfigEnvValue)>, // 7, set, tagged resolved configuration values (v2)
-    script_env: Vec<(String, String)>, // 8, set: variables build scripts may read, fixed
+    script_env: Vec<(String, ConfigEnvValue)>, // 8, set: fixed variables, native values preserved (v4)
     cwd: SourcePath,                // 9, relative to the workspace root, lossless byte components
     command: Command,               // 10
     toolchain: StoreIdentity,       // 11
@@ -511,9 +511,12 @@ struct BuildSpec {                  // 0..=12, schema version 3
 ```rust
 struct SourcePath(String);          // schema 3: escaped byte-component logical path
 enum ConfigEnvValue {
-    Literal(String),               // 0, [0, text], including absolute literal values
+    Literal(InputText),            // 0, [0, text], message-bounded free-form value
     WorkspaceRelative(SourcePath), // 1, [1, path], joined to the selected workspace on the worker
+    Native(NativeValue),            // 2, [2, bytes], NUL-free Unix environment bytes (v4)
 }
+struct InputText(String);           // same CBOR text, budget Limits.request, not identifier limit
+struct NativeValue(Vec<u8>);        // CBOR bytes, budget Limits.request, no NUL
 ```
 
 Schema 3 `SourcePath` losslessly escapes native component bytes. ASCII letters,
@@ -550,7 +553,7 @@ struct UnitSpec {                   // 0..=8
     target: (u8, String),           // 1, kind (0 lib, 1 bin, 2 test, 3 example, 4 bench,
                                     //    5 build script, 6 proc macro) and name
     features: Vec<String>,          // 2, set: after unification
-    cfg: Vec<String>,               // 3, set: every cfg the unit is built with
+    cfg: Vec<InputText>,            // 3, set: message-bounded cfg derived from flags
     edition: u16,                   // 4
     deps: Vec<(u32, String)>,       // 5, set: unit index and the name it is used under
     test: bool,                     // 6, cfg(test)
@@ -1340,7 +1343,7 @@ exercised here, **unverified**):
 
 - **Signed records.** The server signs `CrateRecord` fields 0 to 5 with its Ed25519 key; clients
   pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The signed bytes are the six-field map of
-  those fields, without field 6, under the `sig/CrateRecord/v3` domain the schema gives every
+  those fields, without field 6, under the `sig/CrateRecord/v4` domain the schema gives every
   signature; a client checks them the same way. The namespace is in the signed bytes, so a
   `Pr` record is not a `Main` record.
 - **The epoch** (REAPI's `salt`, research 7.8). Each namespace has a current epoch, answered in
@@ -2170,7 +2173,7 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   most items in a batch, longest string (4 KiB). A decoder refuses unknown keys within a version;
   a change that adds a field is a new version; the server keeps the version before for one blaze
   release.
-  The current wire crate speaks schema 3 with byte-component paths and `/v3`
+  The current wire crate speaks schema 4 with native environment values and `/v4`
   typed digest/signature domains. Unchanged structural types may decode old bytes:
   version negotiation and digest/signature domains gate their schema identity.
   Changed types reject incompatible layouts/paths; a retained prior-version endpoint
@@ -2405,7 +2408,7 @@ struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
     version: String,                 // 1
     target: (u8, String),            // 2
     features: Vec<String>,           // 3, set
-    cfg: Vec<String>,                // 4, set
+    cfg: Vec<InputText>,             // 4, set
     edition: u16,                    // 5
     deps: Vec<(u32, String)>,        // 6, set
     test: bool,                      // 7
@@ -2416,7 +2419,7 @@ struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
 struct FrontEndKeyInput {            // 0..=5
     units: Vec<FrontEndUnit>,        // 0, in the canonical unit order
     lock: Digest,                    // 1
-    cfg_rustflags: Vec<String>,      // 2, set: the rustflags that set cfg
+    cfg_rustflags: Vec<InputText>,   // 2, set: the rustflags that set cfg
     toolchain: StoreIdentity,        // 3
     triple: String,                  // 4
     workspace_manifest: SourcePath, // 5
@@ -2427,7 +2430,7 @@ struct ConfigKeyInput {              // 0..=6
     asked: Vec<(String, String)>,    // 1, set: package name and target name
     profiles: Vec<ProfileSpec>,      // 2, each asked unit's, in the canonical unit order
     platform: Digest,                // 3
-    rustflags: Vec<String>,          // 4, set
+    rustflags: Vec<InputText>,       // 4, set
     toolchain: StoreIdentity,        // 5
     workspace_manifest: SourcePath, // 6
 }

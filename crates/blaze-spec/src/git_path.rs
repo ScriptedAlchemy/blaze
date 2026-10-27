@@ -37,7 +37,10 @@ pub fn root(cwd: &Path) -> Result<PathBuf, String> {
         .output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
-        return Err("Git did not locate a repository root".to_owned());
+        return Err(format!(
+            "Git did not locate a repository root: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     decode_line(output.stdout)
 }
