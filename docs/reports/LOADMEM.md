@@ -405,9 +405,42 @@ generation, request or budget retries; restarting the daemon explicitly retries 
 settings are forwarded in the configuration identity; unset settings cannot inherit a stale
 daemon budget at worker/spare/checker startup. Passing the aggregate target alone does not
 evict even an idle cache; the ordinary inactivity timeout remains. The daemon reads its own
-process-wide sampler, including when the soft aggregate target is disabled. The grace window resets on recovery or an unreadable signal even while a live program
-prevents eviction. The sampler publishes critical state before purging. Every five seconds a critical pause logs the jobs
-still in flight and completed compile steps.
+process-wide sampler, including when the soft aggregate target is disabled. The grace window
+resets on recovery or an unreadable signal even while a live program prevents eviction. The
+sampler publishes critical state before purging. Every five seconds a critical pause logs the
+jobs still in flight and completed compile steps.
+
+### Current validation
+
+**Measured**, 2026-10-26, Rust sources at `f1dedc0b`, Rust 1.99.0. Crate tests passed on
+macOS AArch64 and in Linux AArch64 Docker: 28 codegen and 201 ra-jit tests on each, none
+failed. This includes the isolated startup-admission regression, partial-signal classifier,
+pressure transitions, unknown signals, one-core admission, continuous eviction grace and
+retry identity. The unchanged corpus/layout harness reports 946/948 functions from ra-jit,
+MATCH, and 0/1055 layouts different. The two existing skips are `undecided_alias_drop`'s
+`release_state` (`HasErrorType`) and `stabilized::arm::naked_const` (nonliteral asm constant).
+
+One run of the actual corpus under allocation pressure used the release compiler, one CPU
+and a 64 MiB soft target. A second process allocated 3 GiB. Actual `MemAvailable` fell from
+7,324,192,768 to 4,157,947,904 bytes, below the configured 4,639,838,208-byte reserve. Startup
+paused before loading the workspace, with 17,170,432 bytes of compiler RSS. Releasing the
+allocation raised available memory to 7,314,513,920 bytes; pressure fell to warning and
+admission resumed. The compiler reached 1,601,421,312 bytes of sampled RSS, well above the
+soft target, compiled 946 functions, and the linked output matched rustc.
+
+Compiler launch through linked-output comparison took 13.0 s, n=1, including an intentional
+two-second hold. There is no spread, baseline or speedup claim; one CPU and the shared Docker
+VM limit it. This uses actual `/proc/meminfo` and PSI with an elevated reserve. The container
+has a 6 GiB memory limit and no additional swap. [Raw result](loadmem/u7-soft-pressure-result.json)
+and [pressure transitions](loadmem/u7-soft-pressure.log).
+
+The current Linux wholeprogram run passed five cases; `c_main` was killed by the container's
+6 GiB limit (`OOMKilled=true`). It is not a full Linux wholeprogram pass. A single admitted
+function can exceed that test cap even while new jobs are paused. The final Mac release and
+runtime checks are in progress; a prior local run at `ca76c48b` passed all six cases, which
+is not a current-source full-gate result. LLVM-feature and pressure-interrupted patch
+runtime coverage, plus independent review of the replacement, remain unverified. No full
+tracedecay load was run.
 
 ### Historical hard-budget experiment
 
