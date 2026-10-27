@@ -677,8 +677,7 @@ asked with, under the request's build number, and a script that runs executed th
 as that build's: B's request for R ran S's script with A's `GEN=a`, and B's explicit later request for S with
 `GEN=b` found a `Standing` decision of `a` (no freshness look at all) and consumed `include=a`.
 `Checkouts::stale` now judges (and loads again) only the checkout the request reads and the one it shares
-packages with (`reached`); a request for a project that is not loaded still looks at every checkout, as it
-joins them. Another checkout is judged for the build that asks for it, with that request's variables, as its
+packages with (`reached`; for a project that is not loaded, see the next section). Another checkout is judged for the build that asks for it, with that request's variables, as its
 first judgment, once. Nothing is run a second time to correct the first, and no decision is keyed by
 variables. What is given up: a loaded checkout nobody asks for is not noticed to be stale (its watched files,
 its scripts) until someone does; it is not read by anyone else's program, and its world is only pinned by
@@ -694,6 +693,32 @@ Regression on the fixed binary in the same batch: `once-failed`, `recovery`, `jo
 `groups` pass; the detached recovery witness was not repeated (the change does not touch it).
 Component: `reached` for a project that is not loaded, its own checkout, and a split's base. Mac `scripts::`,
 `recovery::` and `reached` 40 passed.
+
+### A project that is not loaded judges the checkout it will share packages with (`c0a64de1` → this head)
+
+The fourth independent review found that the first version of `reached` kept one case wide: for a project
+that is not loaded yet, every loaded checkout was judged, before it was known whether the project would be a
+split of one or would load on its own. A loaded R whose script is valid for `GEN=a` and fails for `b`, and a
+request for an independent S with `GEN=b`, failed with R's script before S was reached; R could also have had
+effects of its own. `Checkouts::stale` now asks `alike(project)` (it compares files, and runs nothing) for the
+checkout the project will share packages with, and judges that one with the request's variables; a project
+that will load on its own reads no loaded checkout, and its scripts are judged when it loads, with its owner
+and its variables. A split that could not be loaded again is asked to be by the requests that read it or its base,
+and by no other. Not changed: the initial load, the first join's variables, the recovery's variables, the
+executor's admission, a loaded project's own request (`asked`). A view the daemon makes (`view_of`) needs
+`builds_alike`, as `alike` does, so the two agree; `RA_JIT_SPLIT=0` makes a project load whole although
+`alike` finds a base, and then that base is judged needlessly (as it always was).
+
+| Linux, hand-started worker, R loaded with `GEN=a` (valid for `a`, fails for `b`, keeps a trail) | baseline `c0a64de1` | fixed |
+|---|---|---|
+| `first-join`: ONE first request for S (another package and script, no relation to R), `GEN=b`, build 3001 | fails with R's message (`gena … (…/r)`); R's trail `a load, a serve, b B` | S built (`include=b env=b cfg=b`; `native=97` where cargo has 98, recorded as the native-link gap); R's trail unchanged |
+| `first-join-shared`: V, a checkout of R's repository with R's scripts (read as R) | R judged once for `b` (trail `b B`), object built | the same: the checkout it shares is still judged |
+
+`once`, `once-failed` (its join now says S's own failure, and R's is said again for R), `recovery`, `join`,
+`worlds`, `unrelated` and `groups` pass on the fixed binary (the batch before the last harness edit, same
+binary). Component: `reached` has no arm for an unknown project (40 passed with the other `scripts::` and
+`recovery::` tests). The program V prints is recorded, not asserted: the viewed request builds an object and
+the worker's executable is R's.
 
 ### What is not shown, not fixed, or wider
 
