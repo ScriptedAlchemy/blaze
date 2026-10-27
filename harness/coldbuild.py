@@ -247,6 +247,7 @@ def fixtures():
         ("member", [], "kmember", "member selected"),
         ("member/src", [], "kmember", "member selected"),
         ("member/src", ["--manifest-path", "../Cargo.toml"], "kmember", "member selected"),
+        ("", ["--manifest-path", os.path.join(members, "member", "Cargo.toml")], "kmember", "member selected"),
         ("", [], "kdefault", "default root"),
     ]:
         cwd = os.path.join(members, where)
