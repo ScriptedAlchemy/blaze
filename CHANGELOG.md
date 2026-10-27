@@ -8,14 +8,14 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
-- `RA_JIT_WORKER_MEMORY`: the most one worker, or one `ra-jit` run, may hold while it builds; by
-  default what `RA_JIT_MEMORY_MAX` lets all the workers hold. Past three quarters of it the threads
-  that compile ahead give the allocator's free pages back each second and fewer of them compile,
-  in proportion to what is left (`hir_ty_codegen::budget`); past all of it the build stops and
-  fails with `out of memory to build in: ...`. A cold tracedecay worker, which builds the whole
-  program at load and passed 30 GB, is held to it ([docs/reports/LOADMEM.md](docs/reports/LOADMEM.md),
-  section 8). Nothing is given its work instead; its client's build ends as one whose worker could
-  not load, which is no-rustc step K.
+- `RA_JIT_WORKER_MEMORY`: a soft target for a worker or `ra-jit` run, defaulting to
+  `RA_JIT_MEMORY_MAX`. Past three quarters it purges freed pages and admits fewer compile jobs,
+  never none. Exceeding it never fails a build. A process-wide OS memory-pressure monitor
+  pauses new jobs only under critical host pressure; jobs in flight finish. Persistent critical
+  pressure without progress after `RA_JIT_PRESSURE_GRACE_SECS` (60 by default) can fail
+  admission. Linux uses PSI and available memory against `RA_JIT_MEMORY_RESERVE`;
+  macOS uses memorystatus. Unknown signals are logged once. Historical hard-cap results
+  are labelled in [docs/reports/LOADMEM.md](docs/reports/LOADMEM.md), section 8.
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
@@ -452,8 +452,9 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
-- The daemon's `RA_JIT_MEMORY_MAX` stops a worker that alone holds more than it, though it is
-  busy or the one asked last: nothing else making way would bring it under.
+- `RA_JIT_MEMORY_MAX` is soft: passing it does not discard incremental caches. Persistent
+  critical host pressure can reclaim idle workers; tombstones suppress identical load retries.
+  Busy workers own their compile pause and progress grace.
 - A cold build holds less: the layout of a future and the debugger's description of it read the
   coroutine's generic body and monomorphize only the types of what it keeps across yields
   (`hir_ty::mir::held_frame`), where the database kept a copy of the whole body for every

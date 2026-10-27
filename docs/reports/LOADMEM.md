@@ -378,6 +378,7 @@ monitoring. Passing three quarters of the target purges freed pages at most once
 and reduces compile concurrency, never below one. Exceeding the target never fails a build.
 The held-frame, small-body inlinable and post-resolution give-back changes remain.
 
+Monitor startup waits for critical pressure to recover before workspace loading begins.
 One process-wide thread samples every 100 ms independently of compile jobs. macOS reads
 `kern.memorystatus_vm_pressure_level` (normal, warning, critical). Linux reads memory PSI
 `some` and `full` avg10 plus `MemAvailable`: warning means some >=10% or available <= twice
@@ -387,9 +388,9 @@ it. Unreadable signals and footprint are each logged once, and treated as unknow
 
 Warning purges and reduces concurrency. Critical pressure pauses admission of new compile
 jobs, including foreground work on one CPU, LLVM unit jobs and tier compilation. Already-running jobs finish.
-Admission resumes when pressure recovers. A build fails only after it has paused for
+Admission resumes when pressure recovers. Once the in-flight jobs drain, a build fails only after it has paused for
 `RA_JIT_PRESSURE_GRACE_SECS` (default 60), with critical pressure and no completed compile
-progress for that grace period. Finished top-level jobs count as progress as well as emitted
+progress for that grace period and no jobs still in flight. Finished top-level jobs count as progress as well as emitted
 functions, including cache hits and LLVM tier work. Pressure errors are returned outside salsa queries, so they
 do not become cached query failures. State changes and failure name host memory pressure.
 The sampler interval is not an allocation ceiling: one in-flight function can allocate
@@ -400,10 +401,13 @@ pressure persisting for the grace permits stopping an oversized idle worker. A b
 owns its pause and failure so daemon eviction cannot bypass its compile-progress grace. Pressure
 stops retain tombstones by worker configuration, checkout and build generation plus budget;
 identical requests cannot restart the same load. A changed source, build configuration,
-generation or budget retries; restarting the daemon explicitly retries as well. Worker policy
+generation, request or budget retries; restarting the daemon explicitly retries as well. Worker policy
 settings are forwarded in the configuration identity; unset settings cannot inherit a stale
-daemon budget at worker/spare/checker startup. Idle LRU
-cache eviction at the aggregate target remains.
+daemon budget at worker/spare/checker startup. Passing the aggregate target alone does not
+evict even an idle cache; the ordinary inactivity timeout remains. The daemon reads its own
+process-wide sampler, including when the soft aggregate target is disabled. The grace window resets on recovery or an unreadable signal even while a live program
+prevents eviction. The sampler publishes critical state before purging. Every five seconds a critical pause logs the jobs
+still in flight and completed compile steps.
 
 ### Historical hard-budget experiment
 
@@ -691,7 +695,7 @@ The method of attributing a heap profile to salsa ingredients is `harness/heap.p
 watchdog's rule for macOS swap (growth, not free space alone) is u1b's `harness/tracedecay.py`,
 which I read and did not copy. The first-person "I" is the session that did the work.
 
-## PR review follow-up
+## PR review follow-up at `6faf76f0`
 
 Linux pressure signals are now read independently: an unavailable PSI file no longer
 discards a critical `MemAvailable` reading, and a missing memory counter no longer discards

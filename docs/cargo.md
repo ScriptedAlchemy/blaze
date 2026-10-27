@@ -350,25 +350,28 @@ two workers, because unit tests are built with `cfg(test)` and integration tests
 
 A worker for a large workspace holds a lot of memory: 1.3 GB for ripgrep and 9.4 GB for
 dioxus-cli at the end of the agent-style edit runs in [results.md](results.md). The workers
-together hold at most half of the machine's memory, or what `RA_JIT_MEMORY_MAX` says. On
+together have a soft target of half the machine's memory, or what `RA_JIT_MEMORY_MAX` says. On
 Linux the machine's memory is the least of what it has and what the control group the daemon
-was started in allows (a container's, a CI job's, a systemd unit's). Once a
-second, over that, the daemon stops the worker asked longest ago, and the next build of its
-workspace is cargo's while a worker loads it again. A worker that is answering or loading is
-not stopped, nor is the one asked last, nor any while a program takes live edits, unless it
-alone holds more than all may: nothing else making way would bring it under.
+was started in allows (a container's, a CI job's, a systemd unit's). Exceeding a target does not
+stop a worker or discard its incremental cache. Only persistent critical host memory pressure
+permits memory eviction of idle workers. A busy worker owns its compile pause and progress;
+the daemon cannot bypass its grace. Eviction leaves a tombstone: identical loads are not
+restarted until the source, request, configuration or budget changes, or the daemon is
+explicitly restarted. The ordinary inactivity timeout remains.
 
-A worker also bounds itself while it builds. Its threads compile ahead of the object on every
-core until the worker holds three quarters of what `RA_JIT_WORKER_MEMORY` says (by default what
-all the workers may hold together); past that it gives the allocator's free pages back to the
-system each second and fewer threads compile, in proportion to what is left; past all of it the
-build stops and fails with `out of memory to build in: ...`, naming what it held. A build cannot
-let go of what it computed before it ends (each function it compiles adds to the database, about
-23 KB of it in a cold build of tracedecay, [reports/LOADMEM.md](reports/LOADMEM.md)), so fewer
-threads only slow what it holds on the way: a program that needs more than the bound to build in
-one piece is stopped, and nothing else is given its work. Its client's build then ends as one whose
-worker could not load it, with what cargo's build linked, which is step K of
-[no-rustc.md](no-rustc.md): the same end as a worker killed for its memory.
+`RA_JIT_WORKER_MEMORY` is also soft. Past three quarters of it, the process purges allocator
+free pages at most once a second and admits fewer compile jobs, never fewer than one. Past
+all of it the build keeps going. Disabling a target with `off` does not disable host monitoring.
+One process-wide sampler reads macOS memorystatus, or Linux memory PSI and `MemAvailable`,
+independently of compilation. Warning reduces threads and purges. Critical pressure pauses
+new work; in-flight jobs finish. Only a critical pause with no in-flight work and no compile
+progress for `RA_JIT_PRESSURE_GRACE_SECS` (60 seconds by default) fails admission, naming host
+memory pressure. Recovery resumes compilation. The 100 ms sampling interval is not an
+allocation ceiling: one function can allocate before the next safe admission point.
+Unreadable footprint and pressure signals are logged once and treated as unknown.
+[reports/LOADMEM.md](reports/LOADMEM.md), section 8, separates this policy from the earlier
+hard-budget experiment. No new work is handed to rustc or cargo on failure; the existing
+client outcome for a failed load remains no-rustc step K.
 
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
@@ -428,8 +431,10 @@ started it. To change one, run `cargo ra-jit stop` first.
 |---|---|---|
 | `RA_JIT_HOME` | the daemon's directory (also read by every client) | see above |
 | `RA_JIT_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
-| `RA_JIT_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
-| `RA_JIT_WORKER_MEMORY` | the most one worker (or one `ra-jit` run) may hold while it builds, a size such as `16G`, or `off`: fewer threads compile past three quarters of it, and a build that passes it is stopped | what `RA_JIT_MEMORY_MAX` says |
+| `RA_JIT_MEMORY_MAX` | soft aggregate target, a size such as `6G`, or `off`; exceeding it alone does not evict workers | half the machine's memory (on Linux, or of what its control group allows) |
+| `RA_JIT_WORKER_MEMORY` | soft process target, a size such as `16G`, or `off`; fewer threads compile past three quarters, never failure at the target | what `RA_JIT_MEMORY_MAX` says |
+| `RA_JIT_MEMORY_RESERVE` | Linux available-memory reserve; at or below it pressure is critical, within twice it warning | larger of 2 GiB and 5% of machine/container RAM |
+| `RA_JIT_PRESSURE_GRACE_SECS` | seconds to pause before failing for persistent host critical pressure without compile progress; in-flight jobs finish | 60 |
 | `RA_JIT_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `RA_JIT_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `RA_JIT_CACHE` | directory of the disk store, or `off` for none | `ra-jit/store` in the user's cache directory ([cache.md](cache.md)) |

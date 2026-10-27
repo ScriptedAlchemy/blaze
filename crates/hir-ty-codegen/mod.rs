@@ -5330,6 +5330,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Puts the `main` the C runtime calls in the object.
     fn define_start(&mut self, main: FunctionId) -> Result<()> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
         let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
         self.stitch(id, compiled)?;
@@ -6500,6 +6503,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let db = self.db;
         let known = [&self.imported_statics, &self.statics, &self.frozen_statics];
         if let Some(&data) = known.into_iter().find_map(|it| it.get(&id)) {

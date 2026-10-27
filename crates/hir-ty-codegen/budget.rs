@@ -4,6 +4,7 @@
 //! freed pages; only persistent critical host pressure can fail admission. In-flight jobs
 //! finish: this is not a bound on the allocation of a single function.
 use std::{
+    cell::Cell,
     sync::{
         Condvar, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -37,6 +38,7 @@ struct Monitor {
 /// A fake clock and signal exercise the same transitions as the monitor thread.
 struct State {
     pressure: Pressure,
+    known_pressure: bool,
     held: Option<u64>,
     stalled: Duration,
     progress: usize,
@@ -51,6 +53,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             pressure: Pressure::Normal,
+            known_pressure: false,
             held: None,
             stalled: Duration::ZERO,
             progress: 0,
@@ -81,6 +84,7 @@ impl State {
             eprintln!("build footprint unavailable: continuing without soft budget adaptation");
             self.told_held = true;
         }
+        self.known_pressure = pressure.is_some();
         let pressure = pressure.unwrap_or(Pressure::Normal);
         if pressure != self.pressure {
             eprintln!(
@@ -95,10 +99,13 @@ impl State {
         if pressure != Pressure::Critical
             || self.pressure != Pressure::Critical
             || progress != self.progress
+            || self.active != 0
         {
             self.stalled = now;
         }
-        self.failed = pressure == Pressure::Critical && now.saturating_sub(self.stalled) >= grace;
+        self.failed = pressure == Pressure::Critical
+            && self.active == 0
+            && now.saturating_sub(self.stalled) >= grace;
         if pressure != Pressure::Critical {
             self.paused = false;
         }
@@ -116,7 +123,7 @@ pub fn monitor(
     pressure: fn() -> Option<Pressure>,
     give_back: fn(),
     grace: Duration,
-) {
+) -> std::io::Result<()> {
     if MONITOR
         .set(Monitor {
             budget,
@@ -128,17 +135,47 @@ pub fn monitor(
         })
         .is_err()
     {
-        return;
+        return MONITOR
+            .get()
+            .unwrap()
+            .admit()
+            .map_err(|why| std::io::Error::other(why.to_string()));
     }
+    // Publish the first signal before callers can admit work. Sampling and purging must
+    // not be ordered the other way: a slow purge cannot delay the critical pause.
+    let monitor = MONITOR.get().unwrap();
+    monitor.state.lock().unwrap_or_else(|e| e.into_inner()).sample(
+        (monitor.pressure)(),
+        monitor.budget.and_then(|it| (it.held)()),
+        Duration::ZERO,
+        0,
+        grace,
+        monitor.budget.is_some(),
+    );
     let run = move || {
         let monitor = MONITOR.get().unwrap();
         let start = Instant::now();
         let mut purged = None;
+        let mut logged = Duration::ZERO;
         loop {
             let now = start.elapsed();
             let pressure = (monitor.pressure)();
             let held = monitor.budget.and_then(|it| (it.held)());
             let warn = pressure.is_some_and(|it| it != Pressure::Normal);
+            let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
+            let progress = super::compiled_functions().saturating_add(state.completed);
+            state.sample(pressure, held, now, progress, monitor.grace, monitor.budget.is_some());
+            if state.pressure == Pressure::Critical
+                && now.saturating_sub(logged) >= Duration::from_secs(5)
+            {
+                eprintln!(
+                    "host memory pressure: still critical; {} jobs in flight, {} compile steps completed",
+                    state.active, state.progress
+                );
+                logged = now;
+            }
+            monitor.changed.notify_all();
+            drop(state);
             if let Some(budget) = monitor.budget {
                 if (warn || held.is_some_and(|it| it > budget.most - budget.most / 4))
                     && purged.is_none_or(|at| now.saturating_sub(at) >= Duration::from_secs(1))
@@ -155,17 +192,24 @@ pub fn monitor(
                 give_back();
                 purged = Some(now);
             }
-            let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
-            let progress = super::compiled_functions().saturating_add(state.completed);
-            state.sample(pressure, held, now, progress, monitor.grace, monitor.budget.is_some());
-            monitor.changed.notify_all();
-            drop(state);
             std::thread::sleep(Duration::from_millis(100));
         }
     };
     if let Err(why) = std::thread::Builder::new().name("memory-pressure".into()).spawn(run) {
         eprintln!("host memory pressure monitor could not start: {why}");
+        return Err(why);
     }
+    // The caller starts loading its workspace after installing the monitor. That is
+    // new work too: an already-critical host must pause before those allocations begin.
+    monitor.admit().map_err(|why| std::io::Error::other(why.to_string()))
+}
+
+/// The daemon reads the same independent sampler as compilation, including with budgets off.
+pub fn host_pressure() -> Option<Pressure> {
+    MONITOR.get().and_then(|monitor| {
+        let state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.known_pressure.then_some(state.pressure)
+    })
 }
 
 pub(super) fn budget() -> Option<Budget> {
@@ -174,6 +218,9 @@ pub(super) fn budget() -> Option<Budget> {
 
 /// A transient failure is returned outside salsa queries so recovery can retry the build.
 pub(super) fn admit() -> super::Result<()> {
+    if IN_JOB.with(Cell::get) != 0 {
+        return Ok(());
+    }
     let Some(monitor) = MONITOR.get() else { return Ok(()) };
     monitor.admit()
 }
@@ -229,23 +276,32 @@ impl Monitor {
 }
 
 /// Counts top-level jobs only: recursive salsa computations do not acquire another slot.
-pub(super) struct Permit(Option<&'static Monitor>);
+pub(super) struct Permit(Option<&'static Monitor>, std::marker::PhantomData<*mut ()>);
 impl Drop for Permit {
     fn drop(&mut self) {
+        IN_JOB.with(|depth| depth.set(depth.get() - 1));
         if let Some(monitor) = self.0 {
             let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active -= 1;
-            state.completed = state.completed.saturating_add(1);
+            if !std::thread::panicking() {
+                state.completed = state.completed.saturating_add(1);
+            }
             monitor.changed.notify_all();
         }
     }
 }
+thread_local! {
+    // Foreground definitions can ask other definitions while applying relocations.
+    // Those are part of the same admitted job, not new work to pause mid-flight.
+    static IN_JOB: Cell<usize> = const { Cell::new(0) };
+}
 pub(super) fn enter() -> super::Result<Permit> {
-    let monitor = MONITOR.get();
+    let monitor = IN_JOB.with(|depth| (depth.get() == 0).then(|| MONITOR.get()).flatten());
     if let Some(monitor) = monitor {
         monitor.wait(true)?;
     }
-    Ok(Permit(monitor))
+    IN_JOB.with(|depth| depth.set(depth.get() + 1));
+    Ok(Permit(monitor, std::marker::PhantomData))
 }
 
 pub(super) fn allowed(held: u64, most: u64, threads: usize) -> usize {
@@ -301,6 +357,46 @@ mod tests {
     use super::*;
     const GB: u64 = 1 << 30;
     #[test]
+    fn monitor_startup_waits_for_critical_pressure_to_recover() {
+        const CHILD: &str = "RA_JIT_TEST_PRESSURE_STARTUP";
+        const TEST: &str = "budget::tests::monitor_startup_waits_for_critical_pressure_to_recover";
+        // A process-wide monitor is isolated from the other tests' local monitors.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        static CRITICAL: AtomicBool = AtomicBool::new(true);
+        static SAMPLED: AtomicBool = AtomicBool::new(false);
+        fn pressure() -> Option<Pressure> {
+            SAMPLED.store(true, Relaxed);
+            Some(if CRITICAL.load(Relaxed) { Pressure::Critical } else { Pressure::Normal })
+        }
+        let (sent, received) = std::sync::mpsc::channel();
+        let startup = std::thread::spawn(move || {
+            sent.send(monitor(None, pressure, || (), Duration::from_secs(60))).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !SAMPLED.load(Relaxed) {
+            assert!(Instant::now() < deadline, "startup did not sample host pressure");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        CRITICAL.store(false, Relaxed);
+        assert!(received.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        startup.join().unwrap();
+    }
+
+    #[test]
     fn soft_budget_always_allows_progress_even_on_one_core() {
         for threads in [1, 18] {
             assert_eq!(allowed(12 * GB, 16 * GB, threads), threads);
@@ -335,6 +431,7 @@ mod tests {
         for _ in 0..2 {
             state.sample(None, None, Duration::ZERO, 0, Duration::from_secs(60), true);
             assert!(state.told_pressure && state.told_held);
+            assert!(!state.known_pressure);
             assert_eq!(state.pressure, Pressure::Normal);
             assert!(!state.failed);
         }
@@ -438,5 +535,28 @@ mod tests {
         assert!(!governor.look());
         assert_eq!(governor.allowed(), 1);
         assert!(!governor.shed());
+    }
+
+    #[test]
+    fn critical_pressure_never_fails_while_a_job_is_in_flight() {
+        let mut state = State { active: 1, ..State::default() };
+        let grace = Duration::from_secs(60);
+        state.sample(Some(Pressure::Critical), None, Duration::ZERO, 0, grace, false);
+        state.sample(Some(Pressure::Critical), None, grace * 3, 0, grace, false);
+        assert!(!state.failed);
+        state.active = 0;
+        state.completed += 1;
+        state.sample(Some(Pressure::Critical), None, grace * 3, 1, grace, false);
+        state.sample(
+            Some(Pressure::Critical),
+            None,
+            grace * 4 - Duration::from_millis(1),
+            1,
+            grace,
+            false,
+        );
+        assert!(!state.failed);
+        state.sample(Some(Pressure::Critical), None, grace * 4, 1, grace, false);
+        assert!(state.failed);
     }
 }

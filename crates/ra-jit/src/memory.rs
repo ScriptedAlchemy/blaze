@@ -47,7 +47,8 @@ pub(crate) fn held_by(pid: u32) -> Option<u64> {
 /// the process to however much the machine has.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn of_the_machine() -> Option<u64> {
-    let total = kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")?;
+    let total =
+        kilobytes(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), "MemTotal:")?;
     let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let allowed = allowed_by(&groups, |file| {
         std::fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok()
@@ -338,7 +339,14 @@ pub(crate) fn bound_builds() -> anyhow::Result<()> {
         held: || held_by(std::process::id()),
         give_back,
     });
-    hir_ty_codegen::budget::monitor(budget, host_pressure, give_back, grace);
+    if most.is_none()
+        && std::env::var_os("RA_JIT_WORKER_MEMORY").is_none()
+        && std::env::var_os("RA_JIT_MEMORY_MAX").is_none()
+        && of_the_machine().is_none()
+    {
+        eprintln!("machine memory unavailable: soft budget unknown; host pressure still monitored");
+    }
+    hir_ty_codegen::budget::monitor(budget, host_pressure, give_back, grace)?;
     Ok(())
 }
 
@@ -375,7 +383,7 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
             0,
         )
     };
-    if ok != 0 {
+    if ok != 0 || size != size_of::<libc::c_int>() {
         return None;
     }
     match level {
@@ -389,7 +397,7 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
 #[cfg(target_os = "linux")]
 pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     linux_pressure(
-        &std::fs::read_to_string("/proc/meminfo").unwrap_or_default(),
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
         &std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default(),
         pressure_reserve().ok()?,
     )
@@ -411,7 +419,7 @@ fn linux_pressure(
     let avg = |name: &str| -> Option<f64> {
         let row = psi.lines().find(|line| line.starts_with(name))?;
         let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
-        value.parse::<f64>().ok().filter(|it| it.is_finite() && *it >= 0.0)
+        value.parse::<f64>().ok().filter(|it| it.is_finite() && (0.0..=100.0).contains(it))
     };
     let (some, full) = (avg("some "), avg("full "));
     // PSI can be disabled by the kernel or unavailable in a container. An unreadable
