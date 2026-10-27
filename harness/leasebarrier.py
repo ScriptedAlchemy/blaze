@@ -154,6 +154,11 @@ fn main() {
             exit(7);
         }
     }
+    // The values and tags of every run, in order, for the checkouts the guard does not fail.
+    if let Ok(once) = env::var("ONCE_DIR") {
+        let mut trail = fs::OpenOptions::new().create(true).append(true).open(format!("{once}/trail-{dir_name}")).unwrap();
+        writeln!(trail, "{gen_} {}", env::var("ONCE_TAG").unwrap_or_default()).unwrap();
+    }
     if env::var("FAIL").as_deref() == Ok("1") {
         eprintln!("script failed for {gen_}");
         exit(3);
@@ -1327,7 +1332,10 @@ def same_build(sc, source_sha, fails):
     extra = shared_projects(sc, worktrees=True)
     once = os.path.join(sc.dir, "once")
     os.makedirs(once)
-    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1")
+    # S is not guarded: the worker judges a checkout it has loaded again for every build, with the
+    # variables that checkout was asked with, so B's build runs S's script again with A's. What S's
+    # first run was is read from its trail.
+    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1", ONCE_ONLY="r")
     oracle = {g: sc.oracle(g, {"GEN_ARCHIVE": "same"}) for g in ("a", "b")}
     sc.notes["oracle"] = oracle
     # The worker's own load has a value and a tag of its own.
@@ -1419,8 +1427,13 @@ def same_build(sc, source_sha, fails):
             sc.fail(f"a build ran a script more than once: {sc.notes['runs-by-build']}")
         ran = sorted(os.listdir(once))
         sc.notes["executions"] = ran
-        want = ["r-a-A", "r-b-B"] if fails else ["r-a-A", "r-b-B", "s-a-A", "s-b-B"]
-        have = [m for m in ran if m.endswith(("-A", "-B")) and (not fails or m.startswith("r-"))]
+        want = ["r-a-A", "r-b-B"]
+        have = [m for m in ran if m.endswith(("-A", "-B"))]
+        if not fails:
+            trail = open(os.path.join(once, "trail-s")).read().split("\n") if os.path.exists(os.path.join(once, "trail-s")) else []
+            sc.notes["s-trail"] = trail
+            if not trail or trail[0] != "a A":
+                sc.fail(f"S's first run was to be A's request's (GEN=a, tag A): its trail is {trail}")
         if have != sorted(want):
             sc.fail(f"each script was to run once in each build ({sorted(want)}): {have}")
         if not fails and rcb == 0:
