@@ -8,6 +8,12 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- Distributed job ingress reserves stages/assignments to the coordinator, validates whole
+  event batches, and requires authoritative current-attempt completion before success.
+  Explicit no-compile admission covers verified cache-only work. An additive terminal-v2
+  response preserves infrastructure and subscriber termination reasons through CBOR and
+  client policy without changing this lane's BuildSpec or JobEvent.
+
 - `crates/blaze-dist`: distributed compile's work set (claimed discovery, docs/distributed.md
   section 4), an executor's side of it, executions of jobs with subscribers and attempts, and
   section 5's admission, as sans-IO state machines over `blaze-wire`'s messages, with no IO,

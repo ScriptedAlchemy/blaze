@@ -137,6 +137,11 @@ All three mutant libraries compiled, and all three runs returned a specific simu
 
 ## Limits before integration
 
+**Historical boundary at 990e6209.** The following describes that reviewed source, not the
+subsequent ingress fix. The additive terminal-v2 contract and explicit completion/worker-event
+authority rules are now described in docs/distributed.md. Real transport/client drivers remain
+unimplemented; the new codec and policy tests do not establish those integrations.
+
 `jobs::local_action` takes only an `Outcome` and treats `Failed` as a completed build/test
 verdict. `Jobs` also uses that outcome for `EndWhy::NoLead`. Consequently, calling
 `local_action(Fallback, Failed)` for a no-lead infrastructure failure would take the failure

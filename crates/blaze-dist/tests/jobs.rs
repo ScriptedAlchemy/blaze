@@ -36,6 +36,25 @@ fn subscriber(id: u64, deadline_ms: u64) -> Subscriber {
     }
 }
 
+// Deadline/verdict tests explicitly establish zero authoritative work. This is not
+// permission to infer cache-only success from a worker Done or an empty BuildSpec.
+fn complete_empty_work(e: &mut Execution, now: u64) {
+    let request = blaze_wire::WorkJoinRequest {
+        execution: e.id,
+        attempt: e.attempt(),
+        roots: blaze_wire::RootSet {
+            spec: [1; 32],
+            roots: [2; 32],
+            count: 0,
+            index: [3; 32],
+            inputs: [4; 32],
+        },
+        rejected: Set::new(Vec::new()),
+    };
+    let lead = e.lead().unwrap().to_owned();
+    e.join(now, &lead, &request, &mut Vec::new()).unwrap();
+}
+
 #[test]
 fn a_subscribers_timeout_does_not_cancel_another_subscriber() {
     let mut e = execution();
@@ -72,6 +91,7 @@ fn a_reassigned_execution_refuses_the_old_attempts_events() {
 #[test]
 fn a_refusal_never_turns_into_a_passed_result() {
     let mut e = execution();
+    complete_empty_work(&mut e, 0);
     let request = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
@@ -109,6 +129,7 @@ fn reassignment_does_not_erase_an_executions_refusal() {
     };
     e.worker_events(1, "lead", &refused, &mut Vec::new()).unwrap();
     e.assign(2, "helper", &[], &mut Vec::new()).unwrap();
+    complete_empty_work(&mut e, 2);
     let done = WorkersEventsRequest {
         execution: e.id,
         attempt: e.attempt(),
@@ -122,6 +143,7 @@ fn reassignment_does_not_erase_an_executions_refusal() {
 fn review_completion_respects_each_subscribers_deadline_without_a_tick() {
     for now in [10, 11] {
         let mut e = execution();
+        complete_empty_work(&mut e, 0);
         e.subscribe(subscriber(2, 10)).unwrap();
         let done = WorkersEventsRequest {
             execution: e.id,
@@ -410,6 +432,7 @@ fn completion_and_timer_order_preserve_each_subscribers_deadline() {
                     e.subscribe(b).unwrap();
                 }
                 e.assign(0, "lead", &[], &mut Vec::new()).unwrap();
+                complete_empty_work(&mut e, 0);
                 let request = done(&e);
                 let mut out = Vec::new();
                 if timer_first {
@@ -421,7 +444,7 @@ fn completion_and_timer_order_preserve_each_subscribers_deadline() {
                 let outcomes: Vec<_> = out
                     .iter()
                     .filter_map(|fx| match fx {
-                        Effect::SubscriberEnded { subscriber, outcome, policy } => {
+                        Effect::SubscriberEnded { subscriber, outcome, policy, .. } => {
                             Some((*subscriber, outcome.clone(), policy.clone()))
                         }
                         _ => None,
@@ -485,7 +508,11 @@ fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
             let (mut jobs, slot) = registry();
             let a = submit(&mut jobs, 1);
             jobs.tick(0, &mut Vec::new());
-            let request = done(jobs.execution(a).unwrap());
+            // This assignment-stop test needs a final verdict, not successful compile
+            // coverage. A reported build failure is a legitimate terminal verdict.
+            let mut request = done(jobs.execution(a).unwrap());
+            request.events =
+                vec![JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new() })];
             let mut out = Vec::new();
             jobs.worker_events(1, &slot, &request, &mut out).unwrap();
             let token = out
@@ -516,7 +543,9 @@ fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
                 before.phase,
                 if draining { ExecutorPhase::Draining } else { ExecutorPhase::Ready }
             );
-            let request = done(jobs.execution(b).unwrap());
+            let mut request = done(jobs.execution(b).unwrap());
+            request.events =
+                vec![JobEvent::Done(DoneEvent { outcome: Outcome::Failed, counters: Vec::new() })];
             let b_token = jobs.execution(b).unwrap().assignment();
             jobs.worker_events(7, &slot, &request, &mut Vec::new()).unwrap();
             jobs.killed(8, &slot, b_token, true);

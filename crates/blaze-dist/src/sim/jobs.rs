@@ -123,7 +123,15 @@ impl World {
             seed,
             rng,
             now: 0,
-            jobs: Jobs::new(admission, ExecutionConfig::default()),
+            // This invariant set simulates already-built jobs/test shards, not compilation.
+            // WorkProtocol success is exercised by the separate work simulator and ingress tests.
+            jobs: Jobs::new(
+                admission,
+                ExecutionConfig {
+                    completion: jobs::CompletionMode::NoCompileWork,
+                    ..ExecutionConfig::default()
+                },
+            ),
             specs,
             queue_limit,
             shadow: BTreeMap::new(),
@@ -253,6 +261,48 @@ impl World {
             19 => {
                 let gone = self.jobs.admission().reap(self.now);
                 self.dead.extend(gone);
+                Ok(())
+            }
+            20 => {
+                // Invalid ingress, including a valid prefix followed by a forged stage.
+                // Check the public stream, not only the private stage bookkeeping.
+                let running: Vec<ExecutionId> = self
+                    .leads
+                    .iter()
+                    .filter_map(|(id, lead)| {
+                        self.jobs
+                            .execution(*id)
+                            .filter(|e| {
+                                e.state() == ExecState::Running && e.attempt() == lead.attempt
+                            })
+                            .map(|_| *id)
+                    })
+                    .collect();
+                if let Some(&id) = running.get(self.rng.below(running.len().max(1) as u64) as usize)
+                {
+                    let lead = self.leads[&id].clone();
+                    let before = self.jobs.execution(id).unwrap().events(0).to_vec();
+                    let req = WorkersEventsRequest {
+                        execution: id,
+                        attempt: lead.attempt,
+                        events: vec![
+                            JobEvent::Output(blaze_wire::OutputEvent { stream: 1, bytes: vec![1] }),
+                            JobEvent::Stage(blaze_wire::StageEvent {
+                                stage: Stage::Compiled,
+                                at_ms: 0,
+                            }),
+                        ],
+                    };
+                    let mut out = Vec::new();
+                    let answer = self.jobs.worker_events(self.now, &lead.executor, &req, &mut out);
+                    let after = self.jobs.execution(id).unwrap().events(0);
+                    if answer.is_ok() || !out.is_empty() || after != before {
+                        return Err(self.violation(
+                            "ingress",
+                            "forged stage batch changed public stream".to_owned(),
+                        ));
+                    }
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -477,7 +527,20 @@ impl World {
                     let duplicate_at = at + self.rng.range(1_000, 60_000);
                     self.kills.push((duplicate_at, executor, assignment, alive));
                 }
-                jobs::Effect::SubscriberEnded { subscriber, outcome, .. } => {
+                jobs::Effect::SubscriberEnded { subscriber, outcome, terminal, policy } => {
+                    if terminal.execution != id
+                        || terminal.subscriber != subscriber
+                        || terminal.termination.outcome != outcome
+                        || !terminal.termination.is_valid()
+                        || jobs::local_action(&policy, &terminal.termination).is_err()
+                        || self.jobs.execution(id).and_then(|e| e.terminal(subscriber))
+                            != Some(&terminal)
+                    {
+                        return Err(self.violation(
+                            "terminal",
+                            "lost or invalid terminal classification".to_owned(),
+                        ));
+                    }
                     if self.left.contains(&subscriber) {
                         return Err(self.violation(
                             "subscribers",
@@ -653,6 +716,17 @@ impl World {
 
 /// Stage timestamps go forward, each stage after the one before it.
 fn stages(e: &jobs::Execution) -> Result<(), String> {
+    let public: Vec<_> = e
+        .events(0)
+        .iter()
+        .filter_map(|item| match &item.event {
+            JobEvent::Stage(s) => Some((s.stage.clone(), s.at_ms)),
+            _ => None,
+        })
+        .collect();
+    if public != e.stages() {
+        return Err(format!("{:?}: public stages bypass coordinator bookkeeping", e.id));
+    }
     let mut last: Option<(u64, Millis)> = None;
     for (stage, at) in e.stages() {
         let rank = stage.discriminant();

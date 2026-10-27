@@ -1506,6 +1506,16 @@ What the crate fixes that this section leaves open, one line each:
   release a newer assignment or finish its drain.
 - Worker events expire subscribers against their own deadlines before accepting a terminal
   result, just as a timer does. Each subscriber receives its outcome once.
+- Worker ingress validates a whole batch before changing the stream, refusal or liveness.
+  `Stage` and `Assigned` are coordinator-owned and never worker-reportable. A lead may report
+  `Published`, `Program`, `Verdict` and one `Done` (Passed, Failed or Refused). Both lead and
+  helper may report `Output` and `Refused`; a helper may not report a job verdict. Retransmitted
+  coordinator stages, backwards stages and duplicate Done in a batch are refused too.
+- `ExecutionConfig::completion` defaults to `WorkProtocol`: Passed requires completed work,
+  the current lead's agreement, and the current attempt/root-epoch completion notification.
+  Retained work does not bypass a replacement lead's agreement. Admission may explicitly
+  choose `NoCompileWork` for verified cache-only artifacts or an already-built test shard;
+  that mode rejects work calls. Empty BuildSpec or a worker Stage is not that decision.
 - Refusals keep section 8's codes, and each message starts with a stable token (`dead-lease`,
   `attempt-moved`, `not-joined`, `not-yet`, ...) that an executor reads back.
 - Admission is strict per platform: the head of `Main`'s queue first, a pull request's job only
@@ -1533,12 +1543,63 @@ terminal, from exactly one accepted result whose item is the lead's front end's,
 tail; an unknown name a conflict or `Local`; Done reached unless the lead was lost twice or no
 lead was left; a correct holder never told it is malformed. The jobs simulation checks capacity,
 `Main` first and first in first out, `Q`, platform and namespace matching, assignment identity,
-attempts, subscriber deadlines, coordinator-generated stage order and that every execution ends.
-Arbitrary worker-supplied `Stage` events are outside that stage-order check.
+attempts, subscriber deadlines, typed terminal delivery, public-stream stage order and that every
+execution ends. It injects forged worker stages and checks that rejected batches leave no prefix
+in the public stream. These jobs explicitly model `NoCompileWork`; compile coverage remains the
+work simulator's responsibility. Direct ingress tests cover both completion modes.
 `cargo test -p blaze-dist` runs 10,000 seeds of each and prints the seed of a failure with the
 command that replays it. The [review report](reports/DSM-REVIEW.md) records the regressions,
-validation commands, timings, mutation checks and the remaining client-policy classification
-limit.
+validation commands, timings, mutation checks and the original integration limits.
+
+### Additive subscriber-terminal contract, version 2
+
+`blaze-wire::job_terminal_v2` adds a separate typed terminal response. It does not add a field or
+variant to `JobEvent` or edit `BuildSpec`. A v1 Done stream is retained for display and replay,
+but is **not** enough to decide fallback: Failed can be a reported build/test failure or NoLead.
+The driver must return `Jobs::terminal(execution, subscriber)` verbatim, rather than synthesizing
+a reason from Done. `Effect::SubscriberEnded` carries this same immutable response.
+
+Proposed terminal route: `GET /v2/jobs/<execution>/subscribers/<subscriber>/terminal`.
+The HTTP body (or one existing length-delimited Unix response body) is exactly one deterministic
+CBOR map, content type `application/cbor`; no concatenated frames or JSON identities. A pending
+subscription has no terminal yet. Retries return the same record. The route's terminal-contract
+version is explicit in field 3's nested field 0, which must be 2.
+
+```
+SubscriberTerminalV2 = { 0: ExecutionId, 1: Attempt, 2: subscriber u64,
+                        3: { 0: version u32, 1: Outcome, 2: TerminationReasonV2 } }
+TerminationReasonV2 = [ discriminant, null ]
+  0 Reported          -> Passed | Failed | Refused
+  1 NoLead            -> Failed
+  2 LeadLostTwice      -> Lost
+  3 Cancelled          -> Cancelled
+  4 Deadline           -> Cancelled
+  5 SubscriberDeadline -> TimedOut
+```
+
+`decode_terminal` enforces negotiated `Limits.event` (1 MiB by default), normal schema depth
+(32), string/collection limits and canonical CBOR, including no trailing frame, unknown field
+or variant. Unsupported terminal versions and inconsistent pairs are rejected before policy.
+`local_action` now requires `TerminationV2` and returns a typed refusal for invalid contracts.
+Reported outcomes are verdicts under Never/Fallback/Race, including failed tests and refusals.
+Infrastructure, cancellation and timeout fail under Never and choose local work under
+Fallback/Race (Race's local arm is already running). A subscriber's own timeout remains distinct
+from the execution deadline. Old clients must fail incompatibility, not guess a fallback policy
+from a v1 Failed.
+
+This terminal version is **separate** from the general wire schema and digest-domain version.
+This lane inherits schema 1; C2's independent schema-2 branch adds required workspace/config
+fields and changes typed digest/signature domains to `/v2`. Combining the branches must preserve
+C2's global version/domains, merge the isolated module export, and update BuildSpec fixture
+literals. New terminal type names and explicit terminal version remain; this addition makes no
+promise that general schema-1 identities survive C2's change. Existing HTTP `/v1` routes and
+request-auth framing have their own versions. A general schema-1 peer requires its pinned codec,
+not a schema-2 decoder accepting old shapes.
+
+The codec, effect-to-response model and client-policy function are implemented and tested.
+The HTTP/Unix route, pending-response status, negotiated compatibility enforcement, and real
+client fallback/race execution still need the D1/E3 driver. No transport or client execution is
+claimed by this protocol-core test.
 
 ### Export and ingestion (re-review B, B3)
 
