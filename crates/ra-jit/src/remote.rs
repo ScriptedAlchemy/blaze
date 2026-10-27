@@ -492,7 +492,7 @@ impl Remote {
             Place::Serve(serve) => {
                 let _permit = self.traffic.permit().await?;
                 let mut missing = Vec::new();
-                for batch in wire.chunks(blaze_wire::Limits::DOCUMENTED.lookup_items as usize) {
+                for batch in wire.chunks(serve.lookup_limit()) {
                     missing.extend(serve.missing(batch).await?);
                 }
                 missing

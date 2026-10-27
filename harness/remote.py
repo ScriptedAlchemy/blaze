@@ -17,6 +17,8 @@ proxy or needs to kill the service.
                                                    a fresh machine with and without the remote
 """
 import argparse, hashlib, http.client, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -48,6 +50,19 @@ def check(what, ok, detail=""):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+def server_kind(remote):
+    return getattr(remote.server, "kind", None)
+
+
+def breaking_transfers(top, remote):
+    kind = server_kind(remote)
+    if kind == "serve":
+        serve_transfers(top, remote)
+    elif kind is not None:
+        transfers(top, remote)
+    else:
+        print("given: the transfers that break are left out: they need the proxy and a service to kill")
 
 
 def packed(data):
@@ -451,7 +466,7 @@ def configuration(top, remote, a, address, bucket):
           out.returncode != 0 and "RA_JIT_REMOTE_READONLY" in out.stderr and bucket.objects() == before, out.stderr.strip()[-80:])
     out = c.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_READONLY": "1"})
     check("and pulls", out.returncode == 0 and all(c.packs().values()) and c.packs(), out.stdout.strip())
-    if remote.server.kind == "serve":
+    if not remote.server or server_kind(remote) == "serve":
         print("  given: the checks that need a bucket's credentials, region and addressing are left out", flush=True)
         return
     shared = os.path.join(c.home, ".aws")
@@ -477,10 +492,10 @@ def configuration(top, remote, a, address, bucket):
     c.empty()
     out = c.ra_jit("cache", "pull", address + "&region=eu-west-1&path-style=true")
     check("another region and addressing by path asked for", out.returncode == 0 and c.packs(), out.stderr.strip()[-80:])
-    if remote.server.kind == "minio" and os.name == "nt":
+    if server_kind(remote) == "minio" and os.name == "nt":
         # glibc and macOS answer for every name under `localhost`; Windows asks the network.
         print("  the bucket in the name of the host: left out, Windows resolves no name under `localhost`", flush=True)
-    elif remote.server.kind == "minio":
+    elif server_kind(remote) == "minio":
         c.empty()
         remote.proxy.clear()
         by_host = address.replace("127.0.0.1", "localhost") + "&path-style=false"
@@ -1040,7 +1055,7 @@ def collected(top, remote):
     check("--dry-run says what would go and removes nothing", out.returncode == 0
           and said.get("objects that would be removed") == [3] and bucket.objects() == before
           and not remote.proxy.seen("DELETE"), out.stdout.replace("\n", "; ")[:110])
-    if remote.server.kind == "serve":
+    if server_kind(remote) == "serve":
         print("  given: a service whose two clocks disagree is left out: a cache server reads one time per file", flush=True)
     else:
         aged(3 * DAYS, one=False)
@@ -1076,7 +1091,7 @@ def collected(top, remote):
     check("a push sends again what has been there unlisted for long", out.returncode == 0
           and len(remote.proxy.seen("PUT", "/packs/")) == 1, out.stdout.strip()[:80])
 
-    if remote.server and remote.server.kind == "serve":
+    if server_kind(remote) == "serve":
         # Unlike the S3 proxy, a direct timestamp edit does not age a new upload automatically.
         aged(3 * DAYS)
     out, said = gc(a, address, "--older-than", "1d")
@@ -1199,7 +1214,7 @@ def packs_fetched(remote):
 
 def over_tls(top, remote):
     """The same service behind a certificate: what ra-jit's TLS trusts and what it does not."""
-    if remote.name != "minio" or not shutil.which("openssl"):
+    if server_kind(remote) != "minio" or not shutil.which("openssl"):
         print(f"{remote.name}: TLS is left out: it needs MinIO and openssl", flush=True)
         return
     print(f"{remote.name}: over TLS", flush=True)
@@ -1561,14 +1576,11 @@ def checks():
                 guarded(top, remote)
                 collected(top, remote)
                 spoiled(top, remote)
-                if remote.server and remote.server.kind == "serve":
-                    serve_transfers(top, remote)
-                elif remote.server:
-                    transfers(top, remote)
+                breaking_transfers(top, remote)
                 continue
             a, b, address, bucket, expected = round_trip(top, remote, remote.name, crates, target, workspace)
             configuration(top, remote, a, address, bucket)
-            if remote.server and remote.server.kind == "minio":
+            if remote.server:
                 over_tls(top, remote)
             stored(top, remote)
             guarded(top, remote)
@@ -1577,13 +1589,7 @@ def checks():
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)
-            if remote.server:
-                if remote.server.kind == "serve":
-                    serve_transfers(top, remote)
-                else:
-                    transfers(top, remote)
-            else:
-                print("given: the transfers that break are left out: they need the proxy and a service to kill")
+            breaking_transfers(top, remote)
     finally:
         for remote in remotes:
             if hasattr(remote, "stop"):
@@ -1672,6 +1678,54 @@ def measure(args):
             shutil.rmtree(top, ignore_errors=True)
 
 
+def selftest():
+    import contextlib, io
+    for kind in (None, "serve", "minio", "weed"):
+        remote = SimpleNamespace(server=None if kind is None else SimpleNamespace(kind=kind),
+                                 name="given" if kind is None else kind)
+        assert server_kind(remote) == kind
+        with mock.patch(__name__ + ".serve_transfers") as serve, \
+             mock.patch(__name__ + ".transfers") as s3, contextlib.redirect_stdout(io.StringIO()):
+            breaking_transfers("unused", remote)
+            assert serve.call_count == int(kind == "serve")
+            assert s3.call_count == int(kind in ("minio", "weed"))
+        with mock.patch(__name__ + ".shutil.which", return_value=None), \
+             mock.patch(__name__ + ".Server") as started, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            over_tls("unused", remote)
+            assert not started.called
+            assert "needs MinIO and openssl" in output.getvalue()
+        if kind != "minio":
+            with mock.patch(__name__ + ".shutil.which", return_value="/openssl"), \
+                 mock.patch(__name__ + ".Server") as started, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                over_tls("unused", remote)
+                assert not started.called
+                assert "needs MinIO and openssl" in output.getvalue()
+    # Exercise the given-remote early return through configuration, not just the helper.
+    machine = mock.Mock()
+    machine.ra_jit.return_value = SimpleNamespace(
+        returncode=0, stdout="", stderr="RA_JIT_REMOTE_READONLY")
+    machine.packs.return_value = {"a.pack": True}
+    bucket = mock.Mock()
+    bucket.objects.return_value = {}
+    remote = SimpleNamespace(name="given", server=None)
+    with mock.patch(__name__ + ".Machine", return_value=machine), \
+         mock.patch(__name__ + ".check") as checked, \
+         contextlib.redirect_stdout(io.StringIO()):
+        configuration("unused", remote, machine, "s3://given", bucket)
+        assert checked.call_count == 2
+    machine.add_pack.return_value = "a.pack"
+    remote = SimpleNamespace(name="given", server=None, proxy=None,
+                             fresh=lambda: ("s3://given", bucket))
+    with mock.patch(__name__ + ".Machine", return_value=machine), \
+         mock.patch(__name__ + ".packed", return_value=b"compressed"), \
+         mock.patch(__name__ + ".check"), contextlib.redirect_stdout(io.StringIO()) as output:
+        collected("unused", remote)
+        assert "checks that need old objects are left out" in output.getvalue()
+    print("remote.py selftest: None, serve, minio and weed dispatch passed; TLS is MinIO-only")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--measure", dest="workspace")
@@ -1684,8 +1738,11 @@ if __name__ == "__main__":
                         help="also run the checks against `ra-jit serve` on a directory of its own")
     parser.add_argument("--transfers-only", action="store_true",
                         help="run transfers, damage, signing and collection without compiler round trips")
+    parser.add_argument("--selftest", action="store_true", help="check dispatch without services or credentials")
     args = parser.parse_args()
-    if args.workspace:
+    if args.selftest:
+        selftest()
+    elif args.workspace:
         measure(args)
     else:
         SERVER = args.server

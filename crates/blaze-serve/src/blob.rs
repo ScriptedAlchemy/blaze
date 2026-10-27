@@ -52,7 +52,9 @@ impl ObjectName {
             return None;
         }
         let digest = |hex: &str| -> Option<Digest> {
-            if hex.len() != 64 || !hex.bytes().all(|it| it.is_ascii_hexdigit()) {
+            if hex.len() != 64
+                || !hex.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+            {
                 return None;
             }
             let mut out = [0u8; 32];
@@ -99,6 +101,18 @@ impl ObjectName {
 }
 
 fn project(kind: Kind, text: &str, rest: &str) -> Option<ObjectName> {
+    // Old servers used this suffix for unpublished lists. Keep those crash leftovers hidden.
+    if rest.strip_suffix(".tmp").is_some_and(|name| {
+        name.rsplit_once('.').is_some_and(|(_, stamp)| {
+            stamp.split_once('-').is_some_and(|(pid, nanos)| {
+                !pid.is_empty()
+                    && !nanos.is_empty()
+                    && pid.bytes().chain(nanos.bytes()).all(|it| it.is_ascii_digit())
+            })
+        })
+    }) {
+        return None;
+    }
     Some(ObjectName { kind, name: text.to_owned(), digest: None, project: Some(rest.to_owned()) })
 }
 

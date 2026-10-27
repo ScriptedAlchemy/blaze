@@ -8,7 +8,7 @@
 //!   to `<d>`: the name is the pack's, as `docs/cache.md` writes it, so the check unpacks.
 //! - `keys/<d>` and `units/<d>` are bytes that hash to `<d>`.
 //!
-//! A write goes to `<name>.<pid>-<nanos>.tmp` in the same directory, is synced, renamed, and
+//! A write goes to `.<name>.<pid>-<nanos>.tmp` in the same directory, is synced, renamed, and
 //! the directory synced, as the store writes its own files ([`ra_jit_store`]'s
 //! `name_file_whole`), so a partially written blob never appears under its name and a reader
 //! sees all of it or none.
@@ -73,6 +73,8 @@ pub struct Store {
     /// Publication and deletion update disk and the existence set in the same order.
     /// Conditional list writes hold this across their compare and rename.
     publication: Mutex<()>,
+    #[cfg(test)]
+    before_name: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Store {
@@ -94,6 +96,8 @@ impl Store {
             dir: dir.canonicalize()?,
             held: RwLock::new(BTreeMap::new()),
             publication: Mutex::new(()),
+            #[cfg(test)]
+            before_name: Mutex::new(None),
         };
         store.sweep_temporaries();
         store.rescan()?;
@@ -155,9 +159,8 @@ impl Store {
         self.held.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// The name a bare digest is answered by, when one of today's names carries it: `keys/`,
-    /// `units/`, `packs/<d>.pack`, `packs/<d>.pack.zst`, in that order, which is the order of
-    /// how small a thing of that name is.
+    /// The raw object named by a bare digest, in keys, units or uncompressed packs.
+    /// Compressed packs need the named route until the encoding-header protocol exists.
     pub fn name_of_digest(&self, digest: &Digest) -> Option<String> {
         let held = self.held.read().unwrap_or_else(|e| e.into_inner());
         let names = held.get(digest)?;
@@ -170,7 +173,11 @@ impl Store {
                 _ => 3,
             }
         };
-        names.iter().min_by_key(|it| order(it)).cloned()
+        names
+            .iter()
+            .filter(|name| ObjectName::parse(name).is_some_and(|it| it.kind != Kind::Packed))
+            .min_by_key(|it| order(it))
+            .cloned()
     }
 
     /// The object under `name`, or `None` when nothing is there.
@@ -355,9 +362,6 @@ impl Store {
         let mut objects = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| failed(&format!("listing {prefix}"), e))?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
             let Some(name) = entry.file_name().to_str().map(|it| match dir {
                 "" => it.to_owned(),
                 dir => format!("{dir}/{it}"),
@@ -365,6 +369,9 @@ impl Store {
                 continue;
             };
             if !name.starts_with(prefix) || ObjectName::parse(&name).is_none() {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
                 continue;
             }
             let found = entry.metadata().map_err(|e| failed(&format!("listing {prefix}"), e))?;
@@ -475,6 +482,10 @@ impl Store {
         let write = (|| -> std::io::Result<()> {
             let mut file = File::options().write(true).create_new(true).open(&partial)?;
             file.write_all(bytes)?;
+            #[cfg(test)]
+            if let Some(pause) = self.before_name.lock().unwrap().as_ref() {
+                pause();
+            }
             ra_jit_store::name_file_whole(&file, &partial, &to)
         })();
         if let Err(e) = write {
@@ -528,12 +539,11 @@ fn wrong(name: &str, got: &str, want: &str) -> Error {
     )
 }
 
-/// The name a blob is written under before it has its own: `<name>.<pid>-<nanos>.tmp`, which
-/// is a temporary file of the directory and never a name of the layout.
+/// A dot-prefixed temporary name, excluded from every kind of object in the layout.
 pub(crate) fn temporary(to: &Path) -> PathBuf {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |it| it.as_nanos());
     let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-    to.with_file_name(format!("{name}.{}-{nanos}.tmp", std::process::id()))
+    to.with_file_name(format!(".{name}.{}-{nanos}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -542,6 +552,38 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn listing_during_publication_excludes_current_and_legacy_list_temporaries() {
+        for prefix in ["manifests", "deps"] {
+            let dir = scratch();
+            let store = std::sync::Arc::new(Store::open(dir.path()).unwrap());
+            let name = format!("{prefix}/default");
+            store.put_list(&name, b"old\n", Expect::Any).unwrap();
+            let legacy = dir.path().join(format!("{prefix}/default.123-456.tmp"));
+            std::fs::write(&legacy, b"cut").unwrap();
+            let (ready, arrived) = std::sync::mpsc::channel();
+            let (resume, resumed) = std::sync::mpsc::channel();
+            *store.before_name.lock().unwrap() = Some(Box::new(move || {
+                ready.send(()).unwrap();
+                resumed.recv().unwrap();
+            }));
+            let writer = {
+                let store = store.clone();
+                let name = name.clone();
+                std::thread::spawn(move || store.put_list(&name, b"new\n", Expect::Any).unwrap())
+            };
+            arrived.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let listed = store.list(&format!("{prefix}/")).unwrap();
+            assert_eq!(listed.iter().map(|it| &it.name).collect::<Vec<_>>(), vec![&name]);
+            assert_eq!(store.read_small(&name, 100).unwrap().unwrap(), b"old\n");
+            // Model GC's list-then-read ordering across the publisher's rename.
+            resume.send(()).unwrap();
+            writer.join().unwrap();
+            assert_eq!(store.read_small(&listed[0].name, 100).unwrap().unwrap(), b"new\n");
+            assert!(store.open_blob(&format!("{prefix}/default.123-456.tmp")).is_err());
+        }
     }
 
     /// A sealed pack of `values`, laid out as `harness/packs.py` lays one out.

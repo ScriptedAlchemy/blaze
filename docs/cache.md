@@ -256,15 +256,18 @@ The server has these calls.
 
 | Call | Behavior |
 |---|---|
-| `POST /v1/hello` | Version 1 and the documented limits, encoded by `blaze-wire` in deterministic CBOR. |
+| `POST /v1/hello` | The current `blaze_wire::VERSION` and server limits, encoded by `blaze-wire` in deterministic CBOR. |
 | `POST /v1/cache/missing` | Up to 4,096 digests, answered from the existence set. The client splits larger requests. |
 | `GET`, `HEAD`, `PUT`, `DELETE /v1/blob/<name>` | Today's blob names, such as `packs/<sha256>.pack`. |
 | `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>` | Today's text lists, with content-hash ETags and conditional PUT. |
 | `GET /v1/objects?prefix=<prefix>` | A CBOR listing for remote collection. The prefix names a cache directory. |
 
 A bare `/v1/blob/<sha256>` PUT stores raw content in `units/`. GET and HEAD find the
-existing object named by that digest. Today's named paths distinguish compressed packs
-from raw content. Compressed packs are named by the uncompressed pack's digest.
+existing raw object named by that digest. A compressed-only pack is not returned by a
+bare-digest GET or HEAD. Its named `.pack.zst` route returns compressed bytes without an
+ETag for the uncompressed digest. Compressed packs are named by the uncompressed pack's
+digest. The general encoding-header protocol remains C5 work.
+Digest path names require lowercase hex to prevent case-insensitive filesystem aliases.
 
 A PUT streams to a temporary file. Verification hashes raw content or decompresses and hashes
 a compressed pack without reading the whole upload into memory. Packs must have this store's
@@ -272,6 +275,8 @@ format header. The server then syncs the file, renames it and syncs the director
 Interrupted or invalid uploads never appear under the final name. Concurrent publication and
 deletion update the disk and existence set in the same order.
 An explicit reupload replaces the whole object and refreshes its write time for collection.
+Temporary names start with a dot and never appear in listings. Legacy list temporaries with
+the old `.<pid>-<nanos>.tmp` suffix are also excluded before filesystem metadata is read.
 
 GET supports partial, open-ended and suffix byte ranges. Successful ranges return `206`
 with `Content-Range`. Invalid or unsatisfiable ranges return `416`. HEAD returns the same
@@ -285,16 +290,34 @@ Direct filesystem writers do not participate in the server's conditional-write l
 `hello` returns an Ed25519 public key persisted in `DIR/key`, a placeholder Main epoch of 1,
 and an empty identity set. C3 has no records or identity restrictions. Records, generation
 lookup, root-based collection and coordinator jobs remain separate units.
+On Unix the key seed is created with `0600` permissions. Reopening an older key fixes its mode.
 
-The `/v1` route family is not the CBOR codec version. This C3 checkout supports only the
-C1 codec, `blaze_wire::VERSION == 1`. Both peers advertise that constant and require the
-selected version to match. A future codec-2 client cannot negotiate codec 1 through this
-server. Codec changes require coordinated server and client builds with the new wire types.
-This unit does not decode old envelopes as a newer schema.
+The `/v1` route family is not the CBOR codec version. Both peers advertise
+`blaze_wire::VERSION` and require the selected version to match. This branch has the C1
+codec, currently 1, and has not integrated C2's later schemas or signing domains.
+Hello is itself schema-typed. A request with different fields fails as malformed before
+version negotiation. An unsupported version within the same envelope gets the version error.
+C2 integration must define a stable hello envelope or negotiate in headers before decoding.
+It must update the route banner, docs and codec tests together. No newer or older codec is
+silently ingested here.
+
+The client validates advertised limits against the codec's supported ceiling and uses accepted
+limits for missing batches, request bodies, bounded answers and small-object reads.
+Zero, inconsistent or unsupported larger limits are refused.
+
+Two server resource limits remain open. Idle uploads have no server-side read deadline or
+connection cap. A paused peer can retain a temporary file until disconnection or restart.
+Some filesystem work still blocks runtime workers. Large listings are not paginated.
+A response beyond the request-byte limit or 65,536 items fails with `413`, so remote
+collection cannot operate on a directory above that bound. These are follow-up designs,
+not claims of support at all scales.
 
 `python3 -I harness/remote.py --server` exercises the server alongside available S3 services.
 `--server --transfers-only` runs its transfer, damage and signing checks without compiler
 round trips. Neither command measures a speedup.
+`--selftest` checks given-S3, cache-server, MinIO and SeaweedFS dispatch without credentials.
+The TLS fixture requires MinIO and openssl. SeaweedFS retains its normal S3 checks but does
+not run the MinIO-specific TLS fixture; the harness reports that omission.
 
 ### The standard library
 

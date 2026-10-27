@@ -58,6 +58,7 @@ pub(crate) struct Serve {
     base: String,
     patience: Duration,
     traffic: Arc<Traffic>,
+    limits: Limits,
 }
 
 impl Serve {
@@ -68,6 +69,9 @@ impl Serve {
         patience: Duration,
         traffic: Arc<Traffic>,
     ) -> anyhow::Result<Serve> {
+        if spec.scheme() != "blaze+http" {
+            bail!("the cache server supports blaze+http only; TLS is not implemented");
+        }
         let host = spec.host_str().context("the address of the server names no host")?;
         let port = spec.port().context("the address of the server names no port")?;
         if !spec.username().is_empty()
@@ -82,9 +86,14 @@ impl Serve {
         }
         let base = format!("http://{host}:{port}{}", spec.path().trim_end_matches('/'));
         let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-        let serve = Serve { client, base, patience, traffic };
-        serve.hello().await?;
+        let mut serve = Serve { client, base, patience, traffic, limits: Limits::DOCUMENTED };
+        let hello = serve.hello().await?;
+        serve.limits = checked_limits(hello.limits)?;
         Ok(serve)
+    }
+
+    pub(crate) fn lookup_limit(&self) -> usize {
+        self.limits.lookup_items as usize
     }
 
     /// What tells this remote from another on this machine: where it is, and not how it is
@@ -136,6 +145,9 @@ impl Serve {
     /// request for the whole batch: what a push of five hundred packs would otherwise ask one
     /// `HEAD` at a time.
     pub(crate) async fn missing(&self, asked: &[WireDigest]) -> anyhow::Result<Vec<WireDigest>> {
+        if asked.len() > self.lookup_limit() {
+            bail!("the missing request exceeds the server's lookup limit");
+        }
         let request = CacheMissingRequest { blobs: Set::new(asked.to_vec()) };
         let body = encode(&request);
         let (status, bytes) = self
@@ -144,7 +156,7 @@ impl Serve {
         if status != StatusCode::OK {
             bail!("{} says {status}: {}", self.base, said(&bytes));
         }
-        let answer: CacheMissingAnswer = decode(&bytes, &Limits::DOCUMENTED).map_err(|e| {
+        let answer: CacheMissingAnswer = decode(&bytes, &self.limits).map_err(|e| {
             anyhow::anyhow!(
                 "`{}` answers a missing that is not the schema's: {}",
                 self.base,
@@ -186,14 +198,32 @@ impl Serve {
             }
             // What is asked for past the end is an object with nothing left: a client that has
             // the whole of a blob and asks for its rest gets the end of it, which is nothing.
-            StatusCode::RANGE_NOT_SATISFIABLE => Ok(Some(super::transfer::Body::Nothing)),
+            StatusCode::RANGE_NOT_SATISFIABLE => {
+                let len = headers
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|it| it.to_str().ok())
+                    .and_then(|it| it.strip_prefix("bytes */"))
+                    .and_then(|it| it.parse::<u64>().ok());
+                if offset == 0 || len != Some(offset) {
+                    bail!("{} sends an invalid end-of-blob range for {name}", self.base);
+                }
+                Ok(Some(super::transfer::Body::Nothing))
+            }
             StatusCode::NOT_FOUND => Ok(None),
             StatusCode::OK => {
                 bail!("{} sends the whole of {name} when asked for its rest", self.base)
             }
             // What the server refuses it refuses each time, and it says why in its answer.
             it if it.is_client_error() => {
-                let bytes = body.collect().await.map(|it| it.to_bytes()).unwrap_or_default();
+                let (_, _, bytes) = Answer {
+                    status,
+                    headers,
+                    body,
+                    patience: self.patience,
+                    most: self.limits.request as usize,
+                }
+                .whole()
+                .await?;
                 Err(Refused(format!("{} {name}: {it}: {}", self.base, said(&bytes))).into())
             }
             it => bail!("{} {name}: {it}", self.base),
@@ -209,6 +239,11 @@ impl Serve {
         most: u64,
     ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
         let path = object_path(name)?;
+        let most = most.min(if path.starts_with("/v1/blob/") {
+            self.limits.blob
+        } else {
+            u64::from(self.limits.request)
+        });
         let request = Request::builder().method(Method::GET).uri(self.address(&path));
         let answer = self.call(request, empty(), Duration::ZERO).await?;
         let (status, headers, mut body) = answer.into_parts();
@@ -219,7 +254,15 @@ impl Serve {
             return Err(TooLong { name: name.to_owned(), most }.into());
         }
         if status != StatusCode::OK {
-            let bytes = body.collect().await.map(|it| it.to_bytes()).unwrap_or_default();
+            let (_, _, bytes) = Answer {
+                status,
+                headers,
+                body,
+                patience: self.patience,
+                most: self.limits.request as usize,
+            }
+            .whole()
+            .await?;
             return Err(Refused(format!("{} {name}: {status}: {}", self.base, said(&bytes))).into());
         }
         let version = headers
@@ -274,7 +317,7 @@ impl Serve {
         if status != StatusCode::OK {
             bail!("{} does not list {prefix}: {status}", self.base);
         }
-        let answer: ObjectsAnswer = decode(&bytes, &Limits::DOCUMENTED).map_err(|e| {
+        let answer: ObjectsAnswer = decode(&bytes, &self.limits).map_err(|e| {
             anyhow::anyhow!(
                 "`{}` answers a listing that is not the schema's: {}",
                 self.base,
@@ -420,13 +463,21 @@ impl Serve {
         extra: Duration,
     ) -> anyhow::Result<Answer> {
         let request = request.body(body)?;
+        let most = if request.uri().path().starts_with("/v1/blob/") {
+            self.limits.blob
+        } else {
+            u64::from(self.limits.request)
+        };
+        if hyper::body::Body::size_hint(request.body()).upper().is_some_and(|len| len > most) {
+            bail!("the request exceeds the server's advertised limit");
+        }
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         let patience = self.patience + extra;
         let answer = tokio::time::timeout(patience, self.client.request(request))
             .await
             .with_context(|| format!("no answer for {patience:?} from {}", self.base))?
             .with_context(|| format!("asking {}", self.base))?;
-        Ok(Answer::of(answer, patience))
+        Ok(Answer::of(answer, patience, self.limits.request as usize))
     }
 }
 
@@ -436,12 +487,13 @@ struct Answer {
     headers: hyper::HeaderMap,
     body: Incoming,
     patience: Duration,
+    most: usize,
 }
 
 impl Answer {
-    fn of(answer: Response<Incoming>, patience: Duration) -> Answer {
+    fn of(answer: Response<Incoming>, patience: Duration, most: usize) -> Answer {
         let (parts, body) = answer.into_parts();
-        Answer { status: parts.status, headers: parts.headers, body, patience }
+        Answer { status: parts.status, headers: parts.headers, body, patience, most }
     }
 
     fn into_parts(self) -> (StatusCode, hyper::HeaderMap, Incoming) {
@@ -456,13 +508,34 @@ impl Answer {
                 .await
                 .context("the server's answer stalled")??
         {
-            if bytes.len().saturating_add(chunk.len()) > Limits::DOCUMENTED.request as usize {
+            if bytes.len().saturating_add(chunk.len()) > self.most {
                 bail!("the server's answer exceeds the advertised request limit");
             }
             bytes.extend_from_slice(&chunk);
         }
         Ok((self.status, self.headers, bytes))
     }
+}
+
+fn checked_limits(limits: Limits) -> anyhow::Result<Limits> {
+    let ceiling = Limits::DOCUMENTED;
+    if limits.request == 0
+        || limits.request > ceiling.request
+        || limits.event == 0
+        || limits.event > ceiling.event
+        || limits.blob == 0
+        || limits.blob > ceiling.blob
+        || limits.lookup_items == 0
+        || limits.lookup_items > ceiling.lookup_items
+        || limits.batch_items == 0
+        || limits.batch_items > ceiling.batch_items
+        || limits.lookup_items > limits.batch_items
+        || limits.string == 0
+        || limits.string > ceiling.string
+    {
+        bail!("the server advertised invalid or unsupported wire limits");
+    }
+    Ok(limits)
 }
 
 /// The platform a `hello` carries. C3's server serves every platform and refuses none; the
@@ -589,4 +662,352 @@ fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::{collections::VecDeque, sync::Mutex};
+    use tokio::net::TcpListener;
+
+    type Reply = (StatusCode, Vec<(&'static str, String)>, Vec<u8>);
+
+    struct Fake {
+        url: Url,
+        task: tokio::task::JoinHandle<()>,
+        requests: Arc<Mutex<Vec<(String, Option<String>, Vec<u8>)>>>,
+    }
+
+    impl Fake {
+        async fn start(hello: Vec<u8>, replies: Vec<Reply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url =
+                Url::parse(&format!("blaze+http://{}", listener.local_addr().unwrap())).unwrap();
+            let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (hello, replies, requests) = (hello.clone(), replies.clone(), seen.clone());
+                    connections.spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let (hello, replies, requests) =
+                                (hello.clone(), replies.clone(), requests.clone());
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+                                let range = parts
+                                    .headers
+                                    .get(header::RANGE)
+                                    .map(|it| it.to_str().unwrap().to_owned());
+                                requests.lock().unwrap().push((
+                                    parts.uri.to_string(),
+                                    range,
+                                    bytes,
+                                ));
+                                let (status, headers, body) = if parts.uri.path() == "/v1/hello" {
+                                    (StatusCode::OK, Vec::new(), hello)
+                                } else {
+                                    replies
+                                        .lock()
+                                        .unwrap()
+                                        .pop_front()
+                                        .expect("a scripted response")
+                                };
+                                let mut response = Response::builder().status(status);
+                                for (key, value) in headers {
+                                    response = response.header(key, value);
+                                }
+                                Ok::<_, std::convert::Infallible>(
+                                    response.body(Full::new(Bytes::from(body))).unwrap(),
+                                )
+                            }
+                        });
+                        _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            Self { url, task, requests }
+        }
+
+        async fn client(&self) -> anyhow::Result<Serve> {
+            Serve::open(&self.url, Duration::from_secs(2), Arc::new(Traffic::new(4))).await
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn hello(limits: Limits) -> HelloAnswer {
+        HelloAnswer {
+            version: VERSION,
+            key: [0; 32],
+            epochs: Set::new(Vec::new()),
+            identities: Set::new(Vec::new()),
+            limits,
+        }
+    }
+
+    fn reply(status: StatusCode, bytes: Vec<u8>) -> Reply {
+        (status, Vec::new(), bytes)
+    }
+
+    #[tokio::test]
+    async fn client_refuses_https_before_any_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = super::super::Remote::open("blaze+https://127.0.0.1:1", dir.path())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("TLS is not implemented"));
+        let url = Url::parse("blaze+https://127.0.0.1:1").unwrap();
+        assert!(
+            Serve::open(&url, Duration::from_secs(1), Arc::new(Traffic::new(1)))
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("blaze+http only")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_wrong_hello_version_and_malformed_envelope() {
+        let mut wrong = hello(Limits::DOCUMENTED);
+        wrong.version = VERSION + 1;
+        let fake = Fake::start(encode(&wrong), Vec::new()).await;
+        assert!(fake.client().await.err().unwrap().to_string().contains("speaks version"));
+        let fake = Fake::start(b"\xa1\x00".to_vec(), Vec::new()).await;
+        assert!(fake.client().await.err().unwrap().to_string().contains("not the schema"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_invalid_hello_limits() {
+        let d = Limits::DOCUMENTED;
+        let invalid = [
+            Limits { request: 0, ..d },
+            Limits { request: d.request + 1, ..d },
+            Limits { blob: 0, ..d },
+            Limits { blob: d.blob + 1, ..d },
+            Limits { lookup_items: 0, ..d },
+            Limits { lookup_items: d.lookup_items + 1, ..d },
+            Limits { batch_items: 0, ..d },
+            Limits { batch_items: d.batch_items + 1, ..d },
+            Limits { lookup_items: 2, batch_items: 1, ..d },
+            Limits { event: 0, ..d },
+            Limits { event: d.event + 1, ..d },
+            Limits { string: 0, ..d },
+            Limits { string: d.string + 1, ..d },
+        ];
+        for limits in invalid {
+            let fake = Fake::start(encode(&hello(limits)), Vec::new()).await;
+            assert!(
+                fake.client().await.err().unwrap().to_string().contains("wire limits"),
+                "{limits:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_uses_negotiated_lookup_request_and_blob_limits() {
+        let limits = Limits { request: 256, blob: 16, lookup_items: 2, ..Limits::DOCUMENTED };
+        let answer = CacheMissingAnswer { missing: Set::new(vec![[1; 32]]) };
+        let fake = Fake::start(
+            encode(&hello(limits)),
+            vec![
+                reply(StatusCode::OK, encode(&answer)),
+                reply(StatusCode::OK, vec![0; 257]),
+                reply(StatusCode::OK, vec![0; 17]),
+            ],
+        )
+        .await;
+        let client = fake.client().await.unwrap();
+        assert_eq!(client.lookup_limit(), 2);
+        assert!(client.missing(&[[1; 32], [2; 32], [3; 32]]).await.is_err());
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        assert_eq!(client.missing(&[[1; 32], [2; 32]]).await.unwrap(), vec![[1; 32]]);
+        assert!(client.read_small("manifests/default", 1024).await.err().unwrap().is::<TooLong>());
+        let name =
+            format!("units/{}", [1; 32].iter().map(|it| format!("{it:02x}")).collect::<String>());
+        assert!(client.read_small(&name, 1024).await.err().unwrap().is::<TooLong>());
+        assert!(client.write_small("manifests/default", vec![0; 257], None).await.is_err());
+        assert_eq!(fake.requests.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unasked_missing_digest_and_bounded_answer_overflow() {
+        let limits = Limits { request: 256, ..Limits::DOCUMENTED };
+        let wrong = CacheMissingAnswer { missing: Set::new(vec![[9; 32]]) };
+        let fake = Fake::start(
+            encode(&hello(limits)),
+            vec![reply(StatusCode::OK, encode(&wrong)), reply(StatusCode::OK, vec![0; 257])],
+        )
+        .await;
+        let client = fake.client().await.unwrap();
+        assert!(client.missing(&[[1; 32]]).await.err().unwrap().to_string().contains("not asked"));
+        assert!(client.missing(&[[1; 32]]).await.err().unwrap().to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn remote_missing_batches_use_the_negotiated_lookup_limit() {
+        let limits = Limits { lookup_items: 2, ..Limits::DOCUMENTED };
+        let empty = encode(&CacheMissingAnswer { missing: Set::new(Vec::new()) });
+        let fake = Fake::start(
+            encode(&hello(limits)),
+            vec![
+                reply(StatusCode::OK, empty.clone()),
+                reply(StatusCode::OK, empty.clone()),
+                reply(StatusCode::OK, empty),
+            ],
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let remote = super::super::Remote::open(fake.url.as_str(), dir.path()).await.unwrap();
+        let asked: Vec<_> = (0..5).map(|at| super::super::Digest::from_wire([at; 32])).collect();
+        assert!(remote.missing(&asked).await.unwrap().is_empty());
+        let sizes: Vec<_> = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|(_, _, bytes)| decode::<CacheMissingRequest>(bytes, &limits).unwrap().blobs.len())
+            .collect();
+        assert_eq!(sizes, [2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn client_checks_partial_start_and_416_end_before_accepting_a_body() {
+        let partial = |range: &str| {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                vec![("content-range", range.to_owned())],
+                b"rest".to_vec(),
+            )
+        };
+        let end = |range: &str| {
+            (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                vec![("content-range", range.to_owned())],
+                Vec::new(),
+            )
+        };
+        let fake = Fake::start(
+            encode(&hello(Limits::DOCUMENTED)),
+            vec![
+                partial("bytes 1-7/8"),
+                partial("bytes 4-7/8"),
+                end("bytes */2"),
+                end("bytes */4"),
+                reply(StatusCode::RANGE_NOT_SATISFIABLE, Vec::new()),
+            ],
+        )
+        .await;
+        let client = fake.client().await.unwrap();
+        let name = format!("units/{}", "01".repeat(32));
+        assert!(client.read_from(&name, 4).await.is_err());
+        let mut body = client.read_from(&name, 4).await.unwrap().unwrap();
+        assert_eq!(body.next().await.unwrap().unwrap(), b"rest");
+        assert!(client.read_from(&name, 4).await.is_err());
+        let mut body = client.read_from(&name, 4).await.unwrap().unwrap();
+        assert!(body.next().await.unwrap().is_none());
+        assert!(client.read_from(&name, 4).await.is_err());
+        for (_, range, _) in fake.requests.lock().unwrap().iter().skip(1) {
+            assert_eq!(range.as_deref(), Some("bytes=4-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_reads_a_manifest_replaced_between_listing_and_fetch_and_keeps_real_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = "manifests/default.123-456.tmp";
+        std::fs::write(dir.path().join("old"), b"cut").unwrap();
+        let server =
+            Arc::new(blaze_serve::Server::open(&blaze_serve::Config::at(dir.path(), 0)).unwrap());
+        let store = server.store();
+        store.put_list("manifests/default", b"", blaze_serve::Expect::Any).unwrap();
+        std::fs::write(dir.path().join(legacy), b"cut").unwrap();
+        let names = store.list("manifests/").unwrap();
+        assert_eq!(names.len(), 1);
+        let listing = blaze_serve::ObjectsAnswer {
+            objects: vec![blaze_serve::ListedObject {
+                name: names[0].name.clone(),
+                len: names[0].len,
+                written_ms: 0,
+            }],
+        };
+        store.put_list("manifests/default", b"\n", blaze_serve::Expect::Any).unwrap();
+        let current = store.read_small("manifests/default", 100).unwrap().unwrap();
+        let empty_listing = encode(&blaze_serve::ObjectsAnswer { objects: Vec::new() });
+        let fake = Fake::start(
+            encode(&hello(Limits::DOCUMENTED)),
+            vec![
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, encode(&listing)),
+                reply(StatusCode::OK, current.clone()),
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, encode(&listing)),
+                reply(StatusCode::OK, current.clone()),
+                reply(StatusCode::OK, empty_listing.clone()),
+            ],
+        )
+        .await;
+        let client = fake.client().await.unwrap();
+        let place = super::super::Place::Serve(Box::new(client));
+        let remote = super::super::Remote {
+            turns: super::super::Turns::of(dir.path(), &place.name()),
+            place,
+            traffic: Arc::new(Traffic::new(4)),
+            patience: Duration::from_secs(2),
+            read_only: false,
+            trust: super::super::tests::taking_unsigned(),
+            object_max: 1024,
+        };
+        let ages = super::super::collect::Ages {
+            unlisted: Duration::from_secs(86400),
+            listed: None,
+            dry: true,
+        };
+        let result = super::super::collect::collect(&remote, &ages).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!fake.requests.lock().unwrap().iter().any(|(path, _, _)| path.contains("123-456")));
+        let fake = Fake::start(
+            encode(&hello(Limits::DOCUMENTED)),
+            vec![
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, encode(&listing)),
+                reply(StatusCode::OK, current),
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, empty_listing.clone()),
+                reply(StatusCode::OK, empty_listing),
+                reply(StatusCode::OK, encode(&listing)),
+                reply(StatusCode::NOT_FOUND, Vec::new()),
+            ],
+        )
+        .await;
+        let client = fake.client().await.unwrap();
+        let place = super::super::Place::Serve(Box::new(client));
+        let remote = super::super::Remote {
+            turns: super::super::Turns::of(dir.path(), &place.name()),
+            place,
+            traffic: Arc::new(Traffic::new(4)),
+            patience: Duration::from_secs(2),
+            read_only: false,
+            trust: super::super::tests::taking_unsigned(),
+            object_max: 1024,
+        };
+        let error = super::super::collect::collect(&remote, &ages).await.unwrap_err();
+        assert!(error.to_string().contains("went away while it was read"));
+    }
 }
