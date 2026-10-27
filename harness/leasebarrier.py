@@ -1238,7 +1238,9 @@ def generation(sc, source_sha):
     if not said.startswith("ok"):
         sc.fail(f"the edit of A was answered {said!r}: a world that moved is loaded again for it")
         return
-    # The edit is spliced into the executable the worker linked, not the copy the client installed.
+    # The edit is spliced into the executable the worker linked, not the copy the client
+    # installed, when the edits have stopped for a moment.
+    time.sleep(2)
     spliced = os.path.join(sc.ws, "target", "ra-jit", "whole", "gen-one")
     got = sc.program("gen-one", spliced)
     sc.notes["edited-a"] = [got, want]
