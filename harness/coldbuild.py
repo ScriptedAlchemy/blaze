@@ -167,13 +167,10 @@ pub extern "C" fn main() -> i32 {
                     assert reference.returncode == 0, reference.stderr[-3000:]
                     program = os.path.join(ws, "target", "debug", "cold_c_main")
                     if label == "declined" and os.path.exists(program):
-                        # Remove the image so the remembered baseline cannot write its
-                        # redirects. This exercises the declined-splice full link,
-                        # independently of whether adding a function itself can be spliced.
-                        os.remove(program)
-                        # A Mach-O splice can restore its cached file. A non-executable at
-                        # the same path must instead reject the splice and be fully linked.
-                        with open(program, "wb") as executable:
+                        # The daemon splices its whole image, not the installed copy.
+                        # Replacing it with a non-executable must decline the splice.
+                        image = os.path.join(ws, "target", "ra-jit", "whole", "cold_c_main")
+                        with open(image, "wb") as executable:
                             executable.write(b"not an executable\n")
                     ran, _ = blaze(ws, env, "build")
                     ok = (ran.returncode == 0 and os.path.exists(program)
