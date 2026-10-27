@@ -2064,8 +2064,9 @@ manifest has to be matched against recordings:
 4. A manifest that holds in full is the pass's. The test is skipped and the report says so:
    "skipped: passed under the same inputs at abc1234". If none holds, or the test is marked
    `external` or `no-cache`, it runs.
-5. A passing run publishes its manifest and the verdict together; a failing run, or a run that
-   needed a retry, publishes nothing.
+5. A passing terminal result publishes its manifest and verdict together, including a success
+   after retries, which retains the `Flaky` verdict. A terminal failure publishes nothing.
+   Any job-level policy that rejects flaky results is separate from cache eligibility.
 
 ### Runtime bundles and shards
 
