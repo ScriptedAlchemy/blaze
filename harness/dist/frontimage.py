@@ -29,12 +29,21 @@ resolving (its own timers), what reading the parts took, and what it held when i
 physical footprint on macOS, which leaves out a mapped file's clean pages, and the resident set,
 which counts them).
 """
-import argparse, json, os, re, shutil, statistics, subprocess, sys, tempfile
+import argparse, importlib.util, json, os, re, shutil, statistics, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOADMEM = os.path.join(os.path.dirname(HERE), "loadmem.py")
 READY = r"front-end ready"
 UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
+RUNTIME_ROOT = "/tmp"  # Short, portable, and deliberately independent of TMPDIR.
+
+
+def archive_runtime(home, run):
+    """Collect again after stop, using exactly the collector's archive rules."""
+    spec = importlib.util.spec_from_file_location("frontimage_loadmem", LOADMEM)
+    collector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(collector)
+    collector.archive_logs(collector.runtime_logs(home), home, os.path.join(run, "logs"))
 
 def arm_env(arm, image):
     """Timed arms never run the all-workspace attribution census."""
@@ -75,7 +84,7 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
         clone(store_from, os.path.join(work, "store.noindex"))
     # macOS's staging socket appends /daemon.sock.new/s. Artifact paths can be
     # arbitrarily long; runtime homes must not inherit that nesting or TMPDIR.
-    runtime = tempfile.mkdtemp(prefix=".fi-", dir=getattr(a, "runtime_root", "/Users/bytedance/code"))
+    runtime = tempfile.mkdtemp(prefix=".fi-", dir=getattr(a, "runtime_root", RUNTIME_ROOT))
     with open(os.path.join(work, "runtime-home.txt"), "w") as file:
         file.write(runtime + "\n")
     cmd = [sys.executable, "-I", LOADMEM, "--td", a.td, "--blaze-bin", blaze_bin or a.blaze_bin, "--work", work,
@@ -95,17 +104,34 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
         cmd += ["--prof", "--step-mb", "2048"]
     cmd += ["--", "blaze", "build", "--locked", "-p", a.package]
     print("+", " ".join(cmd[3:]), flush=True)
+    out = None
+    error = None
     try:
         out = sh(cmd)
+        if out.returncode:
+            error = f"loadmem collector exited {out.returncode}: {out.stdout}"
+    except Exception as why:
+        error = f"loadmem collector failed: {why}"
     finally:
         # Stop only this run's private daemon; other lanes may use the same binary.
-        stopped = sh([os.path.join(os.path.abspath(blaze_bin or a.blaze_bin), "ra-jit"), "stop"],
-                     env=dict(os.environ, RA_JIT_HOME=runtime), timeout=20)
-        if stopped.returncode:
-            raise RuntimeError(f"could not stop daemon in {runtime}; home retained: {stopped.stdout}")
+        try:
+            stopped = sh([os.path.join(os.path.abspath(blaze_bin or a.blaze_bin), "ra-jit"), "stop"],
+                         env=dict(os.environ, RA_JIT_HOME=runtime), timeout=20)
+            if stopped.returncode:
+                raise RuntimeError(f"daemon stop exited {stopped.returncode}: {stopped.stdout}")
+            # Logs written during stop are evidence too. Never delete the only copy.
+            archive_runtime(runtime, os.path.join(work, "r"))
+        except Exception as why:
+            error = f"{error + '; ' if error else ''}{why}"
+        if out is not None:
+            with open(os.path.join(work, "loadmem.out"), "w") as kept:
+                kept.write(out.stdout)
+        if error:
+            message = f"{error}; runtime home retained: {runtime}"
+            with open(os.path.join(work, "runtime-error.txt"), "w") as kept:
+                kept.write(message + "\n")
+            raise RuntimeError(message)
         shutil.rmtree(runtime)
-    with open(os.path.join(work, "loadmem.out"), "w") as kept:
-        kept.write(out.stdout)
     return os.path.join(work, "r")
 
 
@@ -213,6 +239,21 @@ def spread(values):
     return f"{mean:.2f} ({min(values):.2f}-{max(values):.2f})" if mean < 100 else f"{mean:.0f} ({min(values):.0f}-{max(values):.0f})"
 
 
+def finish_summary(summary):
+    bad = [(arm, i, why) for arm, rows in summary["arms"].items()
+           for i, row in enumerate(rows, 1) if (why := invalid(row, arm))]
+    bad += [(f"prof-{arm}", 1, why) for arm, row in summary.get("prof", {}).items()
+            if (why := invalid(row, arm))]
+    summary["valid"] = not bad
+    summary["invalid_measurements"] = bad
+    return bad
+
+
+def coverage(row):
+    """Accepted mapped / attempted mapped / total installed; not full-image coverage."""
+    return f"{row.get('image_accepted', 0)}/{row.get('image_attempted', 0)}/{row.get('parts', 0)}"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--td", required=True, help="the checkout (a fixture of harness/dist/fixtures.toml)")
@@ -226,7 +267,7 @@ def main():
     ap.add_argument("--arms", default="off,store,image")
     ap.add_argument("--toolchain", default="1.99.0")
     ap.add_argument("--skip-build", action="store_true", help="cargo's target directory is whole already")
-    ap.add_argument("--runtime-root", default="/Users/bytedance/code",
+    ap.add_argument("--runtime-root", default=RUNTIME_ROOT,
                     help="short directory for private temporary daemon homes (not artifact storage)")
     a = ap.parse_args()
     arms = a.arms.split(",")
@@ -236,7 +277,7 @@ def main():
     os.makedirs(a.work, exist_ok=True)
     image = os.path.join(a.work, "front.image")
     summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {},
-               "comparison": comparison_kind(arms)}
+               "comparison": comparison_kind(arms), "valid": False, "invalid_measurements": ["incomplete"]}
 
     if not a.skip_build:
         run = loadmem(a, "build", stop=False)
@@ -273,20 +314,21 @@ def main():
             run = loadmem(a, f"prof-{arm}", env=env[arm], store_from=store, prof=True, blaze_bin=os.path.abspath(a.prof_bin))
             summary["prof"][arm] = parse(run)
             summary["prof"][arm]["dir"] = run
+    bad = finish_summary(summary)
     json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
 
-    print(f"\n{a.package}: {summary['comparison']}; mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
-    print("| arm | ready seen s | load s | resolve s | serve s | reading parts s | ready footprint MB | ready rss MB | live MB |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print(f"\n{a.package}: {summary['comparison']}, valid={summary['valid']}; mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
+    print("Coverage is mapped accepted/attempted/total installed per run; partial mapped use is not full image service.")
+    print("| arm | resolved crates (mean, range) | mapped accepted/attempted/total by run | ready seen s | load s | resolve s | serve s | reading parts s | ready footprint MB | ready rss MB | live MB |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     for arm in arms:
         r = rows[arm]
-        print(f"| {arm} | {spread([x['ready_seen_s'] for x in r])} | "
+        print(f"| {arm} | {spread([x['crates'] for x in r])} | {', '.join(coverage(x) for x in r)} | "
+              f"{spread([x['ready_seen_s'] for x in r])} | "
               f"{spread([x['load_s'] for x in r])} | {spread([x['resolve_s'] for x in r])} | "
               f"{spread([x.get('serve_s') for x in r])} | {spread([x.get('fetch_s') for x in r])} | "
               f"{spread([x['ready_footprint_mb'] for x in r])} | {spread([x['ready_rss_mb'] for x in r])} | "
               f"{spread([x.get('after_resolve_live_mb') for x in r])} |")
-    bad = [(arm, i, why) for arm in arms for i, x in enumerate(rows[arm], 1) if (why := invalid(x, arm))]
-    bad += [(f"prof-{arm}", 1, why) for arm, row in summary.get("prof", {}).items() if (why := invalid(row, arm))]
     if bad:
         print("INVALID MEASUREMENTS:", bad, flush=True)
     return 1 if bad else 0

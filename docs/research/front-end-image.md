@@ -265,11 +265,21 @@ and explains three daemon startup failures: its staging socket path
 `seed/home.noindex/daemon.sock.new/s` was 105 bytes, exceeding macOS SUN_LEN. The earlier
 client message about an absent log did not diagnose the cause. This path-length failure
 is distinct from build-script codegen's block-switch error and subsequent rustc fallback.
-The driver now allocates per-run short private homes under `--runtime-root` (default
-`/Users/bytedance/code`), independent of long artifacts and TMPDIR. `loadmem.py --home`
-preflights the actual staging path. Runtime homes are removed after private-daemon stop;
-on stop failure they are retained with an actionable error. Logs remain in the artifact tree.
-Subset `--arms` runs are explicitly labelled diagnostic, not complete comparative acceptance.
+The driver allocates per-run short private homes under `--runtime-root` (portable Unix
+default `/tmp`), independent of long artifacts and TMPDIR. Tests supply their own temporary
+parent rather than assuming a personal directory exists. `loadmem.py --home` preflights
+the actual staging path. Collection failures propagate rather than being swallowed.
+After private-daemon stop, runtime logs are collected again to include stop-time evidence.
+Runtime homes are removed only if the collector, stop and final archive all succeed;
+otherwise the home and `runtime-home.txt` are retained with `runtime-error.txt`.
+The client log is identified by its exact artifact path, not a `/logs/` substring:
+runtime roots containing `logs` still archive daemon and worker evidence.
+Subset `--arms` runs are labelled diagnostic, not complete comparative acceptance.
+The JSON includes explicit `valid` and `invalid_measurements` fields; an invalid invocation
+with all arm names is not accepted just because its comparison type says comparative.
+The table reports resolved-crate counts and mapped accepted/attempted/total-installed
+parts per run. Positive accepted usage proves only partial mapping; image misses can still
+use the cloned store or normal resolution. No benefit is established by those counts.
 
 ## Deviations
 

@@ -76,7 +76,7 @@ class FrontImageTests(unittest.TestCase):
         driver = module("frontimage")
         with tempfile.TemporaryDirectory() as work:
             args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
-                                   timeout=30, toolchain="1.99.0", package="example")
+                                   timeout=30, toolchain="1.99.0", package="example", runtime_root=work)
             with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")) as sh:
                 driver.loadmem(args, "image", env=["RA_JIT_FRONT_IMAGE=/chosen.image"])
                 run, stop = sh.call_args_list
@@ -158,7 +158,8 @@ class FrontImageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             artifacts = Path(work) / ("long-artifacts-" * 12)
             args = SimpleNamespace(work=str(artifacts), td=work, blaze_bin="/shared/bin",
-                                   cargo_home_from=work, timeout=30, toolchain="1.99.0", package="selected")
+                                   cargo_home_from=work, timeout=30, toolchain="1.99.0", package="selected",
+                                   runtime_root=work)
             homes = []
             with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")) as sh:
                 for arm in ("off", "store", "image"):
@@ -177,7 +178,7 @@ class FrontImageTests(unittest.TestCase):
         workspace = {"selected": ["dependency"], "dependency": [], "unrelated": []}
         with tempfile.TemporaryDirectory() as work:
             args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
-                                   timeout=30, toolchain="1.99.0", package="selected")
+                                   timeout=30, toolchain="1.99.0", package="selected", runtime_root=work)
             coverage = []
             with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")) as sh:
                 for arm in ("off", "store", "image"):
@@ -198,6 +199,104 @@ class FrontImageTests(unittest.TestCase):
         with mock.patch.object(watchdog, "DARWIN", True):
             with self.assertRaisesRegex(ValueError, "use --home"):
                 watchdog.check_runtime_home("/" + "x" * 104)
+
+    def test_portable_default_ignores_tmpdir(self):
+        driver = module("frontimage")
+        self.assertEqual(driver.RUNTIME_ROOT, "/tmp")
+        with tempfile.TemporaryDirectory() as work:
+            args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                   timeout=30, toolchain="1.99.0", package="selected")
+            with mock.patch.dict(driver.os.environ, {"TMPDIR": "/nonexistent/personal/path"}), \
+                 mock.patch.object(driver.tempfile, "mkdtemp", return_value=work + "/runtime") as create, \
+                 mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")), \
+                 mock.patch.object(driver.shutil, "rmtree"):
+                driver.loadmem(args, "image")
+            self.assertEqual(create.call_args.kwargs["dir"], "/tmp")
+
+    def test_collector_failure_and_stop_failure_preserve_home_and_diagnosis(self):
+        driver = module("frontimage")
+        for collector_code, stop_code in ((1, 0), (0, 1)):
+            with self.subTest(collector=collector_code, stop=stop_code), tempfile.TemporaryDirectory() as work:
+                args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                       timeout=30, toolchain="1.99.0", package="selected", runtime_root=work)
+                def run(cmd, **kwargs):
+                    if "--home" in cmd:
+                        home = Path(cmd[cmd.index("--home") + 1])
+                        (home / "daemon.log").write_text("105-byte staging socket diagnosis\n")
+                        return SimpleNamespace(returncode=collector_code, stdout="collector output")
+                    return SimpleNamespace(returncode=stop_code, stdout="stop output")
+                with mock.patch.object(driver, "sh", side_effect=run):
+                    with self.assertRaisesRegex(RuntimeError, "runtime home retained"):
+                        driver.loadmem(args, "image")
+                artifact = Path(work) / "image"
+                home = Path((artifact / "runtime-home.txt").read_text().strip())
+                self.assertTrue(home.is_dir())
+                self.assertIn("105-byte", (home / "daemon.log").read_text())
+                self.assertTrue((artifact / "runtime-error.txt").exists())
+                if stop_code == 0:
+                    self.assertIn("105-byte", (artifact / "r/logs/daemon.log").read_text())
+
+    def test_logs_component_and_stop_time_logs_are_archived_before_removal(self):
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            parent = Path(work) / "logs"
+            parent.mkdir()
+            args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                   timeout=30, toolchain="1.99.0", package="selected", runtime_root=str(parent))
+            def run(cmd, **kwargs):
+                if "--home" in cmd:
+                    home = Path(cmd[cmd.index("--home") + 1])
+                    (home / "daemon.log").write_text("startup\n")
+                else:
+                    home = Path(kwargs["env"]["RA_JIT_HOME"])
+                    with (home / "daemon.log").open("a") as file:
+                        file.write("stop-time evidence\n")
+                    worker = home / "workers/one"
+                    worker.mkdir(parents=True)
+                    (worker / "log").write_text("worker evidence\n")
+                return SimpleNamespace(returncode=0, stdout="")
+            with mock.patch.object(driver, "sh", side_effect=run):
+                driver.loadmem(args, "image")
+            artifact = Path(work) / "image"
+            self.assertIn("stop-time evidence", (artifact / "r/logs/daemon.log").read_text())
+            self.assertEqual((artifact / "r/logs/workers_one_log").read_text(), "worker evidence\n")
+            self.assertFalse(Path((artifact / "runtime-home.txt").read_text().strip()).exists())
+
+    def test_archive_copy_failure_is_propagated_and_home_retained(self):
+        watchdog = module("loadmem", Path(__file__).parents[1] / "loadmem.py")
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            home = Path(work) / "logs/runtime"
+            home.mkdir(parents=True)
+            source = home / "daemon.log"
+            source.write_text("original diagnosis")
+            client = Path(work) / "artifacts/logs/client.log"
+            with mock.patch.object(watchdog.shutil, "copyfile", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(RuntimeError, "could not archive"):
+                    watchdog.archive_logs([str(client), str(source)], str(home), work + "/destination", str(client))
+            self.assertEqual(source.read_text(), "original diagnosis")
+            args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                   timeout=30, toolchain="1.99.0", package="selected", runtime_root=work)
+            with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")), \
+                 mock.patch.object(driver, "archive_runtime", side_effect=RuntimeError("copy failed")):
+                with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                    driver.loadmem(args, "image")
+            retained = Path((Path(work) / "image/runtime-home.txt").read_text().strip())
+            self.assertTrue(retained.exists())
+
+    def test_summary_json_validity_and_partial_coverage(self):
+        driver = module("frontimage")
+        row = dict(outcome="stopped", tripped=None, ready_logged=True, ready_seen_s=1,
+                   load_s=0.5, resolve_s=0.2, ready_footprint_mb=100, ready_rss_mb=140,
+                   image_accepted=1, image_attempted=2, parts=10, crates=42)
+        summary = {"comparison": "comparative", "arms": {"image": [dict(row, image_accepted=0)]}}
+        self.assertTrue(driver.finish_summary(summary))
+        self.assertFalse(json.loads(json.dumps(summary))["valid"])
+        self.assertTrue(summary["invalid_measurements"])
+        summary["arms"]["image"] = [row]
+        self.assertFalse(driver.finish_summary(summary))
+        self.assertTrue(summary["valid"])
+        self.assertEqual(driver.coverage(row), "1/2/10")
 
 
 if __name__ == "__main__":

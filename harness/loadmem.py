@@ -124,6 +124,30 @@ def check_runtime_home(home):
                          f"{staging}; use --home with a shorter private directory")
 
 
+def runtime_logs(home):
+    """The daemon and worker logs belonging to this private runtime home."""
+    found = []
+    for pattern in ("workers", "spares"):
+        root = os.path.join(home, pattern)
+        for dirpath, _, files in os.walk(root) if os.path.isdir(root) else []:
+            found += [os.path.join(dirpath, f) for f in files if f == "log"]
+    daemon = os.path.join(home, "daemon.log")
+    return found + ([daemon] if os.path.exists(daemon) else [])
+
+
+def archive_logs(paths, home, destination, client_log=None):
+    """Archive runtime evidence, including stop-time logs. Copy failures are fatal."""
+    os.makedirs(destination, exist_ok=True)
+    for path in paths:
+        if client_log is not None and os.path.abspath(path) == os.path.abspath(client_log):
+            continue  # Already in the artifact directory; unrelated /logs/ paths are not skipped.
+        dest = os.path.join(destination, os.path.relpath(path, home).replace(os.sep, "_"))
+        try:
+            shutil.copyfile(path, dest)
+        except OSError as error:
+            raise RuntimeError(f"could not archive {path} to {dest}: {error}; retain runtime home {home}") from error
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--td", required=True, help="the checkout to build")
@@ -206,13 +230,7 @@ def main():
     daemons = set()
 
     def logs():
-        found = [os.path.join(out, "logs", "client.log")]
-        for pattern in ("workers", "spares"):
-            root = os.path.join(home, pattern)
-            for dirpath, _, files in os.walk(root) if os.path.isdir(root) else []:
-                found += [os.path.join(dirpath, f) for f in files if f == "log"]
-        daemon = os.path.join(home, "daemon.log")
-        return found + ([daemon] if os.path.exists(daemon) else [])
+        return [os.path.join(out, "logs", "client.log")] + runtime_logs(home)
 
     def tail(total):
         for path in logs():
@@ -326,19 +344,21 @@ def main():
         result["wall_s"] = round(time.time() - t0, 1)
         result["last_mb"] = round(last_total)
         tail(last_total)
-        for path in logs():
-            if "/logs/" not in path:
-                dest = os.path.join(out, "logs", os.path.relpath(path, home).replace(os.sep, "_"))
-                try:
-                    shutil.copyfile(path, dest)
-                except OSError:
-                    pass
+        collection_error = None
+        try:
+            archive_logs(logs(), home, os.path.join(out, "logs"), os.path.join(out, "logs", "client.log"))
+        except RuntimeError as error:
+            collection_error = str(error)
+        result["collection_ok"] = collection_error is None
+        result["collection_error"] = collection_error
         with open(os.path.join(out, "result.json"), "w") as file:
             json.dump(result, file, indent=1)
         client_log.close()
         series.close()
         phases.close()
         print(json.dumps(result), flush=True)
+        if collection_error:
+            raise RuntimeError(collection_error)
 
 
 if __name__ == "__main__":
