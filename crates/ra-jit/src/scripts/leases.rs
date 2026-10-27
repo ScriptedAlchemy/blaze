@@ -156,66 +156,76 @@ pub(crate) fn anonymous() -> u64 {
 /// so under the lock that registrations are made under, so that a build that asks as the last
 /// one's watch ends gets a watch of its own.
 pub(crate) fn watch(path: &Path, build: u64) {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = {
-        let mut map = interest();
-        let map = map.get_or_insert_with(HashMap::default);
-        match map.get_mut(path) {
-            Some(registration) => {
-                registration.owners.insert(build);
-                return;
-            }
-            None => {
-                let id = NEXT.fetch_add(1, Ordering::SeqCst);
-                let owners = HashSet::from([build]);
-                map.insert(path.to_owned(), Registration { id, owners });
-                id
-            }
-        }
-    };
-    let path = path.to_owned();
-    std::thread::spawn(move || watching(&path, id));
+    if let Some(id) = register(path, build) {
+        let path = path.to_owned();
+        std::thread::spawn(move || watching(&path, id));
+    }
 }
+
+/// Registers `build` as waiting for `path`. A watch whose thread has to be started is `Some`.
+fn register(path: &Path, build: u64) -> Option<u64> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut map = interest();
+    let map = map.get_or_insert_with(HashMap::default);
+    match map.get_mut(path) {
+        Some(registration) => {
+            registration.owners.insert(build);
+            None
+        }
+        None => {
+            let id = NEXT.fetch_add(1, Ordering::SeqCst);
+            map.insert(path.to_owned(), Registration { id, owners: HashSet::from([build]) });
+            Some(id)
+        }
+    }
+}
+
+/// Whether the watch `id` of `path` ends: when the file is free (`freed`), or when no build is
+/// left that asked. Decided, and its entry removed, under the lock that registrations are
+/// made under, and only if the entry is this watch's: a build that registered since keeps
+/// the watch it joined, and one that registered after the entry was removed has a new one.
+fn ends(path: &Path, id: u64, freed: bool) -> bool {
+    let mut map = interest();
+    let map = map.get_or_insert_with(HashMap::default);
+    let Some(registration) = map.get(path).filter(|it| it.id == id) else { return true };
+    if !freed && !registration.owners.is_empty() {
+        return false;
+    }
+    map.remove(path);
+    true
+}
+
+/// The longest a watch waits between two looks at its file, in microseconds: a quarter of a second,
+/// less in the tests that put its decisions under every scheduling there is.
+static WATCH_PAUSE_MAX: AtomicU64 = AtomicU64::new(250_000);
 
 /// The thread of the watch `id` of `path`.
 fn watching(path: &Path, id: u64) {
-    let ends = |freed: bool| {
-        let mut map = interest();
-        let map = map.get_or_insert_with(HashMap::default);
-        let mine = map.get(path).is_some_and(|it| it.id == id);
-        // Nobody left to wake: ends with the entry, if it is still empty.
-        if !freed && map.get(path).is_some_and(|it| it.id == id && !it.owners.is_empty()) {
-            return false;
-        }
-        if mine {
-            map.remove(path);
-        }
-        true
-    };
     let Ok(file) = open(path) else {
-        ends(false);
+        ends(path, id, false);
         return;
     };
-    let mut pause = Duration::from_millis(10);
+    let most = || Duration::from_micros(WATCH_PAUSE_MAX.load(Ordering::SeqCst));
+    let mut pause = Duration::from_millis(10).min(most());
     loop {
         match file.try_lock() {
             Ok(()) => {
                 let _ = file.unlock();
-                ends(true);
+                ends(path, id, true);
                 moved();
                 return;
             }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(_)) => {
-                ends(false);
+                ends(path, id, false);
                 return;
             }
         }
-        if ends(false) {
+        if ends(path, id, false) {
             return;
         }
         std::thread::sleep(pause);
-        pause = (pause * 2).min(Duration::from_millis(250));
+        pause = (pause * 2).min(most());
     }
 }
 
@@ -1091,7 +1101,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&s);
     }
 
-    /// The window the review named: the last build that asked for a file retires, the thread
+    /// The interleavings of the window, one at a time: the exit is decided on an empty set of
+    /// builds and a build registers before it is carried out; and the entry is removed and a build
+    /// registers, and the watch that was ending makes its late exit.
+    #[test]
+    fn an_exit_decided_on_no_builds_leaves_the_entry_of_one_that_registered_since() {
+        let x = dir("ends-x");
+        let held = x.join(FILE);
+        let first = register(&held, 1).unwrap();
+        // Its build retires: nobody is left, and the thread has not looked yet.
+        interest().as_mut().unwrap().get_mut(&held).unwrap().owners.clear();
+        // A build asks for the file now: it joins the watch there is.
+        assert_eq!(register(&held, 2), None);
+        // The thread looks: a build is there, and it goes on.
+        assert!(!ends(&held, first, false));
+        assert_eq!(interest().as_ref().unwrap().get(&held).unwrap().owners.len(), 1);
+        // The other order. Nobody is left and the thread ends and removes its entry.
+        interest().as_mut().unwrap().get_mut(&held).unwrap().owners.clear();
+        assert!(ends(&held, first, false));
+        assert!(interest().as_ref().unwrap().get(&held).is_none());
+        // A build asks: it has a watch of its own, with a thread to start.
+        let second = register(&held, 3).unwrap();
+        assert_ne!(first, second);
+        // A late exit of the first (its file was free) removes nothing of the second's.
+        assert!(ends(&held, first, true));
+        assert_eq!(interest().as_ref().unwrap().get(&held).unwrap().id, second);
+        // The second ends when the file is free.
+        assert!(ends(&held, second, true));
+        assert!(interest().as_ref().unwrap().get(&held).is_none());
+        let _ = std::fs::remove_dir_all(&x);
+    }
+
+    /// The window the review named, with threads: the last build that asked for a file retires, the thread
     /// that watches it decides to end, a build asks for the same file, and the thread ends. The
     /// build that asked is woken when the file is free, whichever way the threads are scheduled.
     #[test]
@@ -1100,6 +1141,8 @@ mod tests {
         let holder = Leases::default();
         runs(&holder, 1, &base, &x, "one");
         let held = x.join(FILE);
+        // The watch looks again every few microseconds, so that it is awake for the rounds.
+        WATCH_PAUSE_MAX.store(100, Ordering::SeqCst);
         let first = 100;
         watch(&held, first);
         for round in 0..200u64 {
@@ -1119,6 +1162,7 @@ mod tests {
                 .and_then(|it| it.get(&held))
                 .map(|it| it.owners.iter().copied().collect::<Vec<_>>())
         };
+        WATCH_PAUSE_MAX.store(250_000, Ordering::SeqCst);
         assert_eq!(owners(), Some(vec![last]), "the watch of the build that is left was lost");
         // The holder lets go: the thread that has the entry sees the file free and ends it.
         holder.retire(1);
