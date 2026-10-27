@@ -384,7 +384,16 @@ fn unused_target_cc_cannot_hide_changes_to_the_native_compiler() {
             "CXX" => platform.cxx,
             _ => platform.ar,
         };
-        assert_eq!(tool, None, "empty selected {var} must not fall through");
+        let baseline = exec_platform(&macos_machine(&macos_env(), None), &first).unwrap();
+        let default_tool = match var {
+            "CC" => baseline.cc,
+            "CXX" => baseline.cxx,
+            _ => baseline.ar,
+        };
+        assert_eq!(
+            tool, default_tool,
+            "empty selected {var} uses default, not lower-priority variables"
+        );
     }
 }
 

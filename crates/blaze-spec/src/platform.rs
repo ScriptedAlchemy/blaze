@@ -27,7 +27,7 @@
 //! `:3470-3530`, `:4078-4085`, `:4207-4222`): `target_envs` writes the triple's two names and
 //! then `HOST_CC`, because `get_is_cross_compile` is false when the host is the target.
 //! `TARGET_CC` is unused for native builds. An empty selected value is not skipped:
-//! it names no executable, rather than falling through to a lower-priority compiler.
+//! cc's `env_tool` discards it and uses the default tool, not a lower-priority variable.
 //! `cc`'s default is `cc`
 //! and not `gcc`: `gcc` is its name only on Solaris and illumos, which blaze does not build
 //! for (`lib.rs:3195-3207`).
@@ -360,7 +360,10 @@ fn tool(
     var: &str,
     default: &str,
 ) -> Option<Tool> {
-    resolve(probe, env, tool_value(env, triple, var).unwrap_or(default))
+    // cc selects the first present variable, then env_tool treats an empty/whitespace
+    // value as absent. The caller uses its default, not another environment variable.
+    let selected = tool_value(env, triple, var).filter(|value| !value.trim().is_empty());
+    resolve(probe, env, selected.unwrap_or(default))
 }
 
 /// The value of the most specific of a tool's variables, or `None` when none is set: `CC_<triple>`,
