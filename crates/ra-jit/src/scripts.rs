@@ -19,9 +19,10 @@
 //! two clients that ask at once are two builds.
 //!
 //! What a build judged, and the output it judged, last as long as the build ([`leases`]): the
-//! build holds a lease on each script's run directory until the daemon retires it, so a build
-//! that must run the script again waits for the builds that read its output, and what one
-//! build's compile and link read is what its own run or fresh record said.
+//! build holds a lease on each script's run directory until it is retired, a build that must run
+//! the script again waits for the builds that read its output, and only one build at a time is
+//! mid-way through the scripts (the admission). A request that has to wait is put off ([`Busy`])
+//! and asked again when [`generation`] has moved.
 
 use std::sync::atomic::Ordering::SeqCst;
 use std::{
