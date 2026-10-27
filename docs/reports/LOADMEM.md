@@ -412,13 +412,22 @@ jobs still in flight and completed compile steps.
 
 ### Current validation
 
-**Measured**, 2026-10-26, Rust sources at `f1dedc0b`, Rust 1.99.0. Crate tests passed on
-macOS AArch64 and in Linux AArch64 Docker: 28 codegen and 201 ra-jit tests on each, none
-failed. This includes the isolated startup-admission regression, partial-signal classifier,
-pressure transitions, unknown signals, one-core admission, continuous eviction grace and
-retry identity. The unchanged corpus/layout harness reports 946/948 functions from ra-jit,
-MATCH, and 0/1055 layouts different. The two existing skips are `undecided_alias_drop`'s
-`release_state` (`HasErrorType`) and `stabilized::arm::naked_const` (nonliteral asm constant).
+**Measured**, 2026-10-26, runtime sources at `f1dedc0b`, Rust 1.99.0, Cranelift. All runs
+are n=1; these are validation results, with no speedup claim.
+
+| Platform | Codegen tests | ra-jit tests | Corpus from ra-jit | Layout differences | Whole programs |
+|---|---:|---:|---:|---:|---|
+| macOS AArch64 | 28 passed | 201 passed | 949/951, MATCH | 0/1261, cold store | 6/6 same |
+| Linux AArch64, Docker | 28 passed | 201 passed | 946/948, MATCH | 0/1055 | 5 same; `c_main` failed, container OOM |
+
+This includes startup admission, partial-signal classification, pressure transitions,
+unknown signals, one-core admission, continuous eviction grace and retry identity. The
+corpus keeps its two known skips: `undecided_alias_drop`'s `release_state` (`HasErrorType`)
+and `stabilized::arm::naked_const` (nonliteral asm constant). The Mac layout run uses a fresh
+store: the first run after the pressure probe reused compiled entries and compared only 17
+types, so it was repeated cold. The full wholeprogram and corpus harnesses were unchanged.
+The inherited independent baseline at `f619b310` reported 194 ra-jit tests and four budget
+tests passed, with 19 codegen tests filtered (23 total); it did not run all 23 codegen tests.
 
 One run of the actual corpus under allocation pressure used the release compiler, one CPU
 and a 64 MiB soft target. A second process allocated 3 GiB. Actual `MemAvailable` fell from
@@ -434,13 +443,21 @@ VM limit it. This uses actual `/proc/meminfo` and PSI with an elevated reserve. 
 has a 6 GiB memory limit and no additional swap. [Raw result](loadmem/u7-soft-pressure-result.json)
 and [pressure transitions](loadmem/u7-soft-pressure.log).
 
-The current Linux wholeprogram run passed five cases; `c_main` was killed by the container's
-6 GiB limit (`OOMKilled=true`). It is not a full Linux wholeprogram pass. A single admitted
-function can exceed that test cap even while new jobs are paused. The final Mac release and
-runtime checks are in progress; a prior local run at `ca76c48b` passed all six cases, which
-is not a current-source full-gate result. LLVM-feature and pressure-interrupted patch
-runtime coverage, plus independent review of the replacement, remain unverified. No full
-tracedecay load was run.
+The Linux container's saved state records `OOMKilled=true` under its 6 GiB cap. This is not
+a full Linux wholeprogram pass. An admitted function can exceed that test cap while new jobs
+are paused. The native Mac run passed all six cases without a watchdog trip. Its separate
+startup probe interposed the child process's OS signal and CPU count, held a bounded 128 MiB
+allocation, observed a pause before workspace loading, recovered and matched rustc output.
+It did not drive the shared Mac into real critical pressure.
+
+These runs establish single-process startup/compile admission and the listed regression
+gates. Runtime pressure-interrupted patch publication, aggregate pressure/eviction across
+daemon workers, dedicated generic-coroutine old/new and semantic-debug differentials, and
+LLVM-feature/runtime coverage remain open. Corpus layout equality is not exhaustive
+coroutine certification. The [review at `6faf76f0`](https://github.com/ScriptedAlchemy/blaze/pull/7#pullrequestreview-5660468000)
+reported older focused tests and Linux x86-64 type-checking; its fixes are preserved, and
+those author checks are distinct from the runtime results above. No full tracedecay load
+was run, and no aggregate-worker pressure certification is claimed.
 
 ### Historical hard-budget experiment
 
