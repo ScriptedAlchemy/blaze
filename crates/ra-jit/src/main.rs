@@ -2307,7 +2307,7 @@ fn load(
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
-    checkouts.add(projects, &mut db, &mut vfs, load_owner())?;
+    checkouts.add(projects, &mut db, &mut vfs, load_owner(), None)?;
     Ok((db, vfs, checkouts))
 }
 
@@ -2565,12 +2565,13 @@ impl Checkouts {
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
         owner: u64,
+        env: Option<&BTreeMap<String, String>>,
     ) -> anyhow::Result<()> {
         // All the checkouts' scripts are judged under one admission, which no other build is
         // between the groups of.
         let mut operation = scripts::operation(owner);
         for attempt in 1.. {
-            match self.add_once(projects, db, vfs, owner) {
+            match self.add_once(projects, db, vfs, owner, env) {
                 // Each time the groups are judged again, over the output as it is now.
                 Err(error) if error.downcast_ref::<scripts::Stale>().is_some() && attempt < 16 => {
                     eprintln!(
@@ -2594,6 +2595,7 @@ impl Checkouts {
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
         owner: u64,
+        env: Option<&BTreeMap<String, String>>,
     ) -> anyhow::Result<()> {
         let mut world = scripts::World::new();
         // What is watched of each, which is not told to the inputs until the database has them.
@@ -2623,9 +2625,10 @@ impl Checkouts {
             let said =
                 if Some(project) == projects.first() { self.scripts_said.take() } else { None };
             // Loaded for `owner`, whose scripts the load runs, with the variables of the process
-            // that asked for it.
+            // that asked for it: the request's own when a checkout joins a worker that is running
+            // (`env`), and the process whose build started the worker for its first load.
             let build = owner;
-            let load_env = scripts::load_env();
+            let load_env = env.cloned().unwrap_or_else(scripts::load_env);
             let (workspace, told, own) = workspace_at(
                 project,
                 &self.cargo_config,
@@ -6547,7 +6550,7 @@ struct Client {
     recovery: recovery::Recovery,
     /// Held by the requests that load a world again for another: the recovery is over when the
     /// last is dropped ([`recovery::Recovery::under_way`]).
-    _recovering: Option<Arc<()>>,
+    _recovering: Option<Arc<recovery::Token>>,
 }
 
 impl Client {
@@ -6602,6 +6605,8 @@ impl Drop for Client {
         // The request is over, answered or not: what it read of the scripts' output is free.
         if self.own_build {
             scripts::release(self.build);
+            // A test holds a request here, with its owner released and its token not yet gone.
+            scripts::barrier::hold("released", self.build);
         }
     }
 }
@@ -7188,13 +7193,14 @@ fn load_owner() -> u64 {
 fn join(
     project: &Path,
     owner: u64,
+    env: Option<&BTreeMap<String, String>>,
     checkouts: &mut Checkouts,
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
     let read_from = SystemTime::now();
-    checkouts.add(&[project], db, tree.vfs(), owner)?;
+    checkouts.add(&[project], db, tree.vfs(), owner, env)?;
     watch_loaded(db, tree, files, read_from);
     Ok(())
 }
@@ -7712,7 +7718,9 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
-        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs, load_owner()) {
+        if let Err(why) =
+            self.checkouts.add(projects, &mut self.db, &mut self.vfs, load_owner(), None)
+        {
             eprintln!("spare: not used: {why:#}");
             return None;
         }
@@ -8927,9 +8935,17 @@ fn run_holding(
                         Some(project) if view.is_none() => {
                             builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
+                            // The scripts of the checkout run with the variables of the
+                            // request that joins it, as those of a checkout loaded do.
+                            let asked: BTreeMap<String, String> = stream
+                                .env
+                                .iter()
+                                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                                .collect();
                             let joined = join(
                                 project,
                                 stream.build,
+                                (!asked.is_empty()).then_some(&asked),
                                 &mut checkouts,
                                 &mut db,
                                 &mut tree,
@@ -9131,7 +9147,8 @@ fn run_holding(
                     let world = checkouts.world_for(&programs, &owners);
                     if let Err(stale) = edited.client.read(&world) {
                         scripts::barrier::event("refused", edited.client.build, &stale.to_string());
-                        let Some(recovery) = edited.client.recovery.moved(&stale) else {
+                        let Some(recovery) = edited.client.recovery.moved(&stale, scripts::wake)
+                        else {
                             let _ = writeln!(&edited.client, "failed: {stale}; ask again");
                             continue;
                         };
@@ -9207,7 +9224,7 @@ fn run_holding(
                     let asks = matches!(request, Request::Sync | Request::Patch);
                     if asks
                         && client.env.iter().next().is_some()
-                        && client.recovery.moved(&stale).is_some()
+                        && client.recovery.advances(&stale)
                     {
                         builds.waiting.push_back((request, target, client));
                         builds.again = true;

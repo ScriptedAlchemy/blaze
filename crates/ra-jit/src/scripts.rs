@@ -51,7 +51,7 @@ use serde_json::json;
 /// Where below the target directory the scripts are compiled and run.
 const DIR: &str = "ra-jit/build-scripts";
 
-pub(crate) use leases::{Busy, Stale, anonymous, generation, set_waker, watch};
+pub(crate) use leases::{Busy, Stale, anonymous, generation, set_waker, wake, watch};
 use leases::{Leases, Refused};
 
 /// What this process's builds judged and hold.

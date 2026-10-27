@@ -15,6 +15,13 @@
 //!   other a recovery and not the request its answer), and is the end of the request when it
 //!   is the same run's (the recovery loaded the world and the output is still not what it was
 //!   loaded from: asking again would ask for the same).
+//!
+//! A recovery that ends is **told to the worker after it has ended**: the token is a [`Token`],
+//! whose last owner to go calls `wake` once the count of owners is already zero. The requests
+//! that carry it end on threads of their own (a link that is detached from the turn ends by itself,
+//! and an answer that succeeds sends the loop nothing), and a wake they make before their token
+//! goes (the release of their owner) is one the loop can take while the recovery is still under
+//! way, and sleep on.
 
 use std::{
     path::PathBuf,
@@ -23,11 +30,23 @@ use std::{
 
 use crate::scripts::Stale;
 
+/// The token of a recovery under way. It wakes the worker when the last of its owners is gone.
+pub(crate) struct Token {
+    wake: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        // The strong count is zero already: the recovery is over for whoever looks now.
+        (self.wake)();
+    }
+}
+
 /// What a request remembers of the recoveries it waited for.
 #[derive(Default)]
 pub(crate) struct Recovery {
     /// The recovery under way: it lasts as long as any of the requests that carry its token.
-    asked: Weak<()>,
+    asked: Weak<Token>,
     /// The script and the run the last recovery that ended found the output of.
     last: Option<(PathBuf, Option<u64>)>,
 }
@@ -38,16 +57,29 @@ impl Recovery {
         self.asked.strong_count() > 0
     }
 
-    /// The world moved: `Some(token)` if the request asks for a recovery, which is over when the
-    /// last holder of the token is dropped; `None` if the last recovery was of this very
-    /// output, and another would be the same.
-    pub(crate) fn moved(&mut self, stale: &Stale) -> Option<Arc<()>> {
+    /// The world moved: whether a recovery is to be asked for. Not when the last recovery was of
+    /// this very output, and another would be the same.
+    pub(crate) fn advances(&mut self, stale: &Stale) -> bool {
         let now = (stale.run_dir.clone(), stale.found);
         if self.last.as_ref() == Some(&now) {
-            return None;
+            return false;
         }
         self.last = Some(now);
-        let token = Arc::new(());
+        true
+    }
+
+    /// The same, for a request that waits for the requests it queues: `Some(token)` if it asks
+    /// for a recovery, which is over when the last holder of the token is dropped, and then `wake`
+    /// is called.
+    pub(crate) fn moved(
+        &mut self,
+        stale: &Stale,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Option<Arc<Token>> {
+        if !self.advances(stale) {
+            return None;
+        }
+        let token = Arc::new(Token { wake: Box::new(wake) });
         self.asked = Arc::downgrade(&token);
         Some(token)
     }
@@ -55,6 +87,8 @@ impl Recovery {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     fn stale(dir: &str, found: u64) -> Stale {
@@ -65,11 +99,13 @@ mod tests {
         }
     }
 
+    fn quiet() {}
+
     #[test]
     fn a_recovery_is_under_way_until_every_request_that_carries_it_is_gone() {
         let mut recovery = Recovery::default();
         assert!(!recovery.under_way());
-        let token = recovery.moved(&stale("r", 1)).unwrap();
+        let token = recovery.moved(&stale("r", 1), quiet).unwrap();
         let second = token.clone();
         assert!(recovery.under_way());
         drop(token);
@@ -81,16 +117,45 @@ mod tests {
     #[test]
     fn a_world_that_moved_again_is_another_recovery_and_the_same_run_is_the_end() {
         let mut recovery = Recovery::default();
-        drop(recovery.moved(&stale("r", 1)).unwrap());
+        drop(recovery.moved(&stale("r", 1), quiet).unwrap());
         // Over; another build ran the script meanwhile: a new recovery, however many there are.
         for found in 2..40 {
-            drop(recovery.moved(&stale("r", found)).unwrap());
+            drop(recovery.moved(&stale("r", found), quiet).unwrap());
         }
         // Over; the output is the run it was the last time: asking again asks for the same.
-        assert!(recovery.moved(&stale("r", 39)).is_none());
+        assert!(recovery.moved(&stale("r", 39), quiet).is_none());
         // Another script is another thing to recover.
-        assert!(recovery.moved(&stale("s", 39)).is_some());
-        assert!(recovery.moved(&Stale { found: None, ..stale("s", 0) }).is_some());
-        assert!(recovery.moved(&Stale { found: None, ..stale("s", 0) }).is_none());
+        assert!(recovery.moved(&stale("s", 39), quiet).is_some());
+        assert!(recovery.moved(&Stale { found: None, ..stale("s", 0) }, quiet).is_some());
+        assert!(recovery.moved(&Stale { found: None, ..stale("s", 0) }, quiet).is_none());
+        assert!(!recovery.advances(&Stale { found: None, ..stale("s", 0) }));
+        assert!(recovery.advances(&stale("s", 41)));
+    }
+
+    /// The order the worker needs: a request that ends releases its owner (a wake, which the loop
+    /// may take at once), then drops its token; the wake of the token is made by the last owner,
+    /// and after the recovery is over for anyone who looks.
+    #[test]
+    fn the_last_owner_of_a_recovery_wakes_the_worker_after_the_recovery_is_over() {
+        let mut recovery = Recovery::default();
+        // What the worker's loop sees at each wake: whether the recovery is under way.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Weak::<Token>::new()));
+        let wake = {
+            let (seen, asked) = (seen.clone(), asked.clone());
+            move || {
+                let under_way = asked.lock().unwrap().strong_count() > 0;
+                seen.lock().unwrap().push(under_way);
+            }
+        };
+        let first = recovery.moved(&stale("r", 1), wake).unwrap();
+        *asked.lock().unwrap() = Arc::downgrade(&first);
+        let second = first.clone();
+        assert!(recovery.under_way());
+        drop(first);
+        assert!(seen.lock().unwrap().is_empty(), "a request that is not the last wakes no one");
+        drop(second);
+        assert_eq!(*seen.lock().unwrap(), [false], "once, and when it is over");
+        assert!(!recovery.under_way());
     }
 }

@@ -4,7 +4,7 @@ blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of 
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
 scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, coab, internal,
-           groups, overlay, worlds, join, once, once-failed, recovery, link-control, archive-control
+           groups, overlay, worlds, join, once, once-failed, recovery, recovery-detached, link-control, archive-control
            (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
@@ -82,6 +82,9 @@ recovery      A's database is of one run of a script, another worker (B) runs it
               its scripts for longer than the worker takes turns, and an editor's edit to A needs the world
               restored: the edit is neither failed nor asked about at every turn while B works, and is
               built when B ends, with no second request.
+recovery-detached  `recovery` with a checkout read as another, so that the builds are detached and their links end
+              on a thread of their own: the request that carries the recovery is held after its owner is released
+              and before its token is gone, and the edit has to be answered when it goes, with no other request.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -135,8 +138,7 @@ fn main() {
     // A script that fails the second time it runs for one value, in one package: the extra
     // execution of a build is an effect that is not undone by anything that follows.
     let dir_name = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).file_name().unwrap().to_string_lossy().into_owned();
-    // ONCE_ONLY names the one checkout whose script is guarded (a joined checkout's script runs with
-    // the worker's own variables, whichever request asks).
+    // ONCE_ONLY names the one checkout whose script is guarded (every checkout is, without it).
     let guarded = env::var("ONCE_ONLY").map(|it| it == dir_name).unwrap_or(true);
     if let (Ok(once), true) = (env::var("ONCE_DIR"), guarded) {
         // Named for the package, or with ONCE_BY_DIR for the checkout it is in (two checkouts of
@@ -1325,7 +1327,7 @@ def same_build(sc, source_sha, fails):
     extra = shared_projects(sc, worktrees=True)
     once = os.path.join(sc.dir, "once")
     os.makedirs(once)
-    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1", ONCE_ONLY="r")
+    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1")
     oracle = {g: sc.oracle(g, {"GEN_ARCHIVE": "same"}) for g in ("a", "b")}
     sc.notes["oracle"] = oracle
     # The worker's own load has a value and a tag of its own.
@@ -1382,7 +1384,8 @@ def same_build(sc, source_sha, fails):
         if not fails and not os.path.exists(s_out):
             sc.fail("A's join of S built no object")
         if not fails and (rc2 == 0 and rc3 == 0):
-            for tag, exe, want in (("A-R", kept_a, oracle["a"]["gen-one"]),):
+            # S's first run is the request's: GEN=a, whatever the worker was started with.
+            for tag, exe, want in (("A-R", kept_a, oracle["a"]["gen-one"]), ("A-S", s_exe, oracle["a"]["gen-one"])):
                 got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
                 sc.notes.setdefault("programs", {})[tag] = got
                 if got is None:
@@ -1416,9 +1419,8 @@ def same_build(sc, source_sha, fails):
             sc.fail(f"a build ran a script more than once: {sc.notes['runs-by-build']}")
         ran = sorted(os.listdir(once))
         sc.notes["executions"] = ran
-        want = ["r-a-A", "r-b-B"] if fails else ["r-a-A", "r-b-B", "s-a-A"]
-        have = [m for m in ran if m.endswith(("-A", "-B"))]
-        want = [m for m in want if m.startswith("r-")]
+        want = ["r-a-A", "r-b-B"] if fails else ["r-a-A", "r-b-B", "s-a-A", "s-b-B"]
+        have = [m for m in ran if m.endswith(("-A", "-B")) and (not fails or m.startswith("r-"))]
         if have != sorted(want):
             sc.fail(f"each script was to run once in each build ({sorted(want)}): {have}")
         if not fails and rcb == 0:
@@ -1500,6 +1502,65 @@ def recovery(sc, source_sha):
         sc.gaps.append(f"A's edited program printed {got!r}, cargo's {want!r} (the warm worker's native link)")
     sc.notes["refused"] = [e for e in sc.events("a") if e[0] == "refused"]
     sc.timeouts()
+
+
+def recovery_detached(sc, source_sha):
+    """The recovery of `recovery`, with a checkout that is read as another (a worktree V of S's, with
+    S's script) so that every build the worker takes is detached: its link ends on a thread of its
+    own and sends the loop nothing. The request that carries the recovery is held after its owner is
+    released (the wake the loop takes while the recovery is under way) and before its token is gone;
+    the edit has to be answered when it goes, with no other request."""
+    import threading
+    extra = shared_projects(sc, worktrees=True)
+    v = os.path.join(sc.dir, "v")
+    subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", "worktree", "add", "-q", "-b",
+                    "third", v], cwd=sc.r, capture_output=True, check=True)
+    shutil.copy2(os.path.join(sc.s, "build.rs"), os.path.join(v, "build.rs"))
+    extra = dict(extra, RA_JIT_OVERLAY="1")
+    worker, sock, env = by_hand(sc, extra, gen_="a")
+    try:
+        if not serving(sc, sock, env):
+            return
+        rc, said = join_s(sc, sock, env, "a")
+        if rc != 0:
+            sc.fail(f"S did not join (rc {rc}): {said[-400:]}")
+            return
+        rc, said = sync(sc, sock, env, "--project", v, "--crate", "gen_one", "--out", os.path.join(sc.dir, "v.o"),
+                        "--exe", os.path.join(sc.dir, "v.bin"), within=LOST)
+        log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        sc.notes["view-lines"] = [l for l in log.splitlines() if l.startswith("view:")]
+        if rc != 0 or not sc.notes["view-lines"]:
+            sc.fail(f"V was not read as S (rc {rc}): the case was not exercised: {said[-300:]}")
+            return
+        # Another process runs R's script for another GEN: the worker's world of R moves.
+        B = sc.client("b", ("--bin", "gen-one"), cwd=sc.r, GEN="b", **extra)
+        sc.finish(B, "B", within=LOST)
+        if B.returncode != 0:
+            sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+            return
+        sc.arm("a", "released")
+        path = os.path.join(sc.r, "src", "one.rs")
+        text = open(path).read() + "// an edit\n"
+        answer = {}
+        editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.dir, path, text, "worker.sock")))
+        editor.start()
+        held = sc.reached("a", "released", None, within=120)
+        if held is None:
+            return
+        sc.disarm("a", "released")
+        # The loop takes the wake the release made, finds the recovery under way, and sleeps.
+        time.sleep(float(os.environ.get("LEASEBARRIER_RECOVERY_HOLD", "8")) / 2)
+        if "said" in answer:
+            sc.fail(f"the edit was answered {answer['said']!r} while its recovery's request was held")
+        sc.release("a", "released", held)
+        editor.join(LOST)
+        sc.notes["edit-said"] = answer.get("said")
+        if editor.is_alive() or not str(answer.get("said")).startswith("ok"):
+            sc.fail(f"the edit was not answered ok after its recovery ended, with no other request: {answer.get('said')!r}")
+        sc.notes["refused"] = [e for e in worker_events(sc) if e[0] == "refused"]
+        sc.timeouts()
+    finally:
+        worker.kill()
 
 
 def unrelated(sc, source_sha):
@@ -1584,6 +1645,7 @@ SCENARIOS = {
     "once": once_ran,
     "once-failed": once_failed,
     "recovery": recovery,
+    "recovery-detached": recovery_detached,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,

@@ -140,6 +140,12 @@ pub(crate) fn set_waker(wake: impl Fn() + Send + Sync + 'static) {
     let _ = WAKER.set(Box::new(wake));
 }
 
+/// Something that may be waited for has moved, as far as the caller says: the worker's main loop
+/// is woken. For an end that no release of a lease makes (a recovery whose last request is gone).
+pub(crate) fn wake() {
+    moved();
+}
+
 fn moved() {
     GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(wake) = WAKER.get() {
