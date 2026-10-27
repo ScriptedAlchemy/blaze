@@ -21,6 +21,8 @@ use crate::admission::{Admission, Waiting};
 use crate::work::{self, EndWhy, WorkConfig, WorkSet};
 use crate::{Millis, Refusal};
 
+mod ingress;
+
 /// An execution's timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -92,7 +94,7 @@ pub enum Effect {
     /// An item was appended to the execution's event stream.
     Event(EventItem),
     /// The lead was lost: the driver assigns a new lead (admission's choice), or ends the
-    /// execution `Failed` when there is none.
+    /// execution `Lost` when there is none.
     NeedLead,
     /// Stop an executor's process group: the agent kills it.
     Kill {
@@ -406,7 +408,7 @@ impl Execution {
     /// `POST /v1/workers/events`: a heartbeat, and events for the stream. A dead attempt's are
     /// refused. A `Done` from the lead ends the execution with its outcome; a `Refused` before
     /// it makes that outcome `Refused`, whatever the lead says, since a job is never turned
-    /// green past a refusal.
+    /// green past a refusal. The entire event batch is validated before any report is published.
     pub fn worker_events(
         &mut self,
         now: Millis,
@@ -429,8 +431,9 @@ impl Execution {
             self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
             return Ok(WorkersEventsAnswer::CANCEL);
         }
-        self.heard.insert(from.to_owned(), now);
         let lead = self.lead.as_deref() == Some(from);
+        self.validate_events(lead, &req.events)?;
+        self.heard.insert(from.to_owned(), now);
         if lead {
             self.lead_heard = now;
         }
@@ -438,6 +441,14 @@ impl Execution {
         for event in &req.events {
             match event {
                 JobEvent::Refused(_) => self.refused = true,
+                JobEvent::Stage(event) => {
+                    // Use the coordinator's clock and update the same stage view checked by
+                    // the model. Retransmission of the latest stage does not append it twice.
+                    if self.reported_stage() != Some(&event.stage) {
+                        self.stage(now, event.stage.clone(), out);
+                    }
+                    continue;
+                }
                 JobEvent::Done(d) if lead => {
                     // Publish only the coordinator's final verdict, once. A raw Passed
                     // here could otherwise escape into replay before refusal normalization.
@@ -532,6 +543,11 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return;
         }
+        // No available replacement lead is infrastructure loss, not a compiler/test verdict.
+        // Preserve that distinction in both subscriber effects and the serialized Done event.
+        if matches!(&why, EndWhy::NoLead) {
+            outcome = Outcome::Lost;
+        }
         if self.expire_subscribers(now, out) && self.attached().next().is_none() {
             outcome = Outcome::Cancelled;
             why = EndWhy::Deadline;
@@ -606,16 +622,11 @@ pub enum LocalAction {
     Fail,
 }
 
-/// The action for an already classified remote outcome under `policy`. `Passed`, `Failed`
-/// and `Refused` are taken as verdicts; other outcomes fail under `Never` and build locally
-/// under `Fallback`. `Race` was building locally from the start, and the first verdict wins,
-/// a build error or failed test included.
-///
-/// This helper cannot distinguish a completed build/test failure from an infrastructure
-/// failure: both currently use `Outcome::Failed`, including [`EndWhy::NoLead`]. Before
-/// client integration, the policy decision must preserve the termination reason and
-/// distinguish these cases; passing a no-lead failure here would incorrectly take it as
-/// a verdict instead of starting the fallback build.
+/// The action for a remote outcome under `policy`. `Passed`, `Failed` and `Refused` are
+/// completed verdicts; infrastructure loss (including no available replacement lead) is
+/// delivered as `Lost`, not `Failed`, before either subscriber or wire delivery. Other
+/// outcomes fail under `Never` and build locally under `Fallback`. `Race` was building
+/// locally from the start, and the first verdict wins, a build error or failed test included.
 pub fn local_action(policy: &LocalPolicy, remote: &Outcome) -> LocalAction {
     let verdict = matches!(remote, Outcome::Passed | Outcome::Failed | Outcome::Refused);
     match policy {
@@ -911,7 +922,7 @@ impl Jobs {
                             self.assignments.insert(lead, (e.assignment(), false));
                         }
                     }
-                    None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
+                    None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
                 for effect in more {
