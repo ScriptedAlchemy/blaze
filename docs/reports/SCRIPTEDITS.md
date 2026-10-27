@@ -883,15 +883,38 @@ agree; none; a manifest not read), the manifest recorded from the bytes read, wi
 the file name fails the identity test. Same pinned Linux setup. Capture limit unchanged: apart from the selected scripts, structural files are
 bound to their content at the record, which is after the load.
 
+### The flags for rustc of a script's compile, an explicit `--target`, and the whole failure message (`0958842` → this head)
+
+Three blockers that were named, closed in small steps with cargo as the oracle.
+
+- **Flags.** `host_flags` only keyed the script's compile: the owned compiler was given none of RUSTFLAGS' `--cfg`, so a script
+  reading `cfg!(hostflag)` saw the wrong thing. `apply_flags` orders what changes a crate into its description (`--cfg x` and
+  `--cfg=x`, `-C debug-assertions[=yes|no|on|off]`, joined or not; `--check-cfg` changes no program); every other flag is
+  named on stderr (`build scripts: not applied to blaze's compile of …`) and not applied. Not claimed: that the compile honours `-C panic`,
+  `overflow-checks`, `-L`/`-l` or the rest.
+- **Explicit target.** `--target`/`CARGO_BUILD_TARGET` naming the host is cargo's cross build: the scripts and proc macros get none of
+  the flags, the program's units do, artifacts are under `target/<triple>`, and the script runs with the target's flags in
+  `CARGO_ENCODED_RUSTFLAGS`. `Asked.explicit_target` (from `Selection.target`) and `Runner.cross` carry it.
+- **The whole failure message.** A reply is one line and the client read one; cargo's message of a failed script has several (the cause, the script's
+  stdout and stderr). The worker escapes it onto one line (`failed_reply`), the daemon and the sync client read it back (`unfailed`).
+
+| Linux, `RUSTFLAGS="--cfg hostflag"`, a script that prints `cfg!(hostflag)` and its `CARGO_ENCODED_RUSTFLAGS` | baseline `eed39779` | fixed |
+|---|---|---|
+| `hostflags`, no `--target` | `saw=no` (cargo: `saw=yes`) | `saw=yes flags=--cfg hostflag target-cfg=true` = cargo's |
+| `hostflags`, `--target <host>` | `saw=no` (equal to cargo's only because no flag was applied at all) | `saw=no flags=--cfg hostflag target-cfg=true` = cargo's, in `target/<triple>/debug` |
+| `once-failed`: the script prints `script failed for a` on stderr | the client gets `failed to run custom build command …` only | the cause and `script failed for a` arrive |
+
+`first-join`, `join`, `once`, `choice-stable`, `first-join-private`, `reload-busy` and `lost-wake` pass on the fixed binary in their batches.
+Component: `apply_flags` (cfg both forms, debug-assertions values, what is named and does not eat the next flag), the one-line failure round trip.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
   the old archive's. It is recorded as a gap by the harness. **Not fixed: a named blocker** (a cloud candidate
   for it is separate and was not incorporated).
-- **Inherited, outside this change, a blocker and not an accepted limit:** the script's compile keys
-  `host_flags` but the owned compiler is not given `--cfg` (or the other flags), and explicit
-  `--target <host>` is taken for none.
-- A failing script's client message is its first line (a reply is one line).
+- **Host flags (partly closed, see "The flags for rustc of a script's compile"):** `--cfg` and `-C debug-assertions` of the flags
+  a script's compile gets are applied and an explicit `--target <host>` is cargo's cross build; the other flags (codegen options,
+  lints, search paths) are named on stderr and **not** applied.
 - **Not run at runtime:** the recovery of a stale world for a request that is not an edit (a `sync` that
   loses the race between the check and the pin; component and read only); an edit whose program is built
   from a split that fails to load again; a competing writer already running when a pin is taken (component
