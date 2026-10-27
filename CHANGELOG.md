@@ -36,7 +36,7 @@ All notable changes to ra-jit are written here. The format follows
   read under the lease (the fingerprint says what a run was made from, not which run left the output), a
   consumer's world is of generations, and a world that moved is loaded again through the ordinary check of
   the scripts, with an edit's text and variables kept; a build that yields keeps its decisions, so a script
-  cargo runs once in a build runs once, and a build that ran a script keeps its output and the admission until it is retired, so no other build can make it run the script again (a build that only found the output fresh yields as before); an editor's edit whose world moved waits for the recovery it queued and is not counted at every turn; a request's judging of all its checkouts has one admission. `script-lease:` lines say each step, and
+  cargo runs once in a build runs once, and a build that ran a script keeps its output and the admission until it is retired, so no other build can make it run the script again (a build that only found the output fresh yields as before); an editor's edit whose world moved waits for the recovery it queued, is not counted at every turn, and is woken when the last request of that recovery is gone; a checkout that joins a running worker runs its first scripts with the joining request's variables; a request's judging of all its checkouts has one admission. `script-lease:` lines say each step, and
   `RA_JIT_SCRIPT_BARRIER_DIR` holds a worker by files, which `harness/leasebarrier.py` drives through
   the daemon (Linux).
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,

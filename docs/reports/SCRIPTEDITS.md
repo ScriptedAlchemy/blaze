@@ -550,7 +550,9 @@ The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
    (the second waits holding nothing), as cargo's build-directory lock has it for the whole build; builds
    that find their scripts fresh still share the output and the admission is theirs only for an operation.
    The cost is that a build that has to run a script excludes the other builds that have to judge one in
-   that target directory until it is over (the daemon retires a build at its answer, so that is one cargo
+   that target directory until it is over: a build that has already decided its scripts reads on, but a build
+   that arrives, even one that would find everything fresh, takes the admission before it judges anything and
+   waits for the executor (`Runner::begin`); no throughput or latency was measured (the daemon retires a build at its answer, so that is one cargo
    invocation). A daemon build is one worker's, so the admission of another worker cannot be waited for by
    its own build. Not an exception: `reacquire` of a result the build *ran* whose output is not its run is an
    error and never a second run. The build that has the admission does not yield. With the admission an
@@ -578,7 +580,10 @@ The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
    rule.
 4. The load takes its owner from the request, tells the inputs what it watches only when the database has
    the checkouts, and looks at the generations of all of them before it does. A split that cannot be loaded
-   again keeps its world.
+   again keeps its world. **A checkout that joins a running worker is loaded with the variables of the
+   request that joins it** (`Checkouts::add`'s `env`), its first run of the scripts and its `Own`; the
+   startup variables (`scripts::load_env`) are for the first load only. A build's first run of a joined group
+   is then the world it asked for, which a `Standing` decision keeps for its later requests.
 5. A request that must wait is put off (`Busy`) and asked again when `scripts::generation()` is not what it
    was when the request was **read, before the stale check**. A file of another process is watched by a
    thread for each **registration**: it ends its own and no other, under the lock registrations are made
@@ -628,10 +633,43 @@ Docker `rust:1.99.0-bookworm`, one 6 GiB container, no extra swap, own docker lo
 
 Regression on the same fixed binary: `generation`, `groups`, `coab` (the opposite orders), `lost-wake`,
 `unrelated`, `reload-busy` pass. Evidence: `p05r-evidence/build-once-waiting-recovery-600411b9/` (three
-batches, each a JSON, a folder and a manifest). A first harness for `once` was wrong (a joined checkout's
-script runs with the worker's own variables, so its guard collided across builds) and is kept as the
-first batch's failure. The scenarios were not run with the daemon's own `Request::Build`; `once` sends each
+batches, each a JSON, a folder and a manifest). A first harness for `once` was wrong (it guarded a
+joined checkout's script, which the worker re-judges for every build) and is kept as the first batch's
+failure. The tested production `4ae2a363` and the published `d592dd49` differ only in comment lines of
+`scripts/leases.rs`: the executable logic is unchanged, the files are not byte-identical. The scenarios were not run with the daemon's own `Request::Build`; `once` sends each
 request itself with an explicit number, which is what the daemon does for the requests of one build.
+
+### The recovery's end wakes the worker, and a joined checkout runs with its request's variables (`d592dd49` → this head)
+
+The second independent review (of `d592dd49`) closed the two original P1s in their tested lifecycles and found
+two more, both reproduced by the fixtures below.
+
+- **The end of a recovery had no wake after it.** The token was an `Arc<()>`; a request that ends releases its
+  owner first (`scripts::release`, a wake) and drops its token fields after. A detached link ends on a thread of
+  its own and a success sends the loop nothing, so the loop could take the release's wake while the recovery was
+  still under way, sleep, and the token be gone afterwards with no event: the editor waited for ever. The token is
+  now a `recovery::Token`, whose last owner calls `scripts::wake` once the count of owners is already zero (a
+  level: `Recovery::under_way` is false when the wake is called). It does not depend on how the request ends
+  (an answer, an error, a cancel, an owner that is not its own). Component: the production token and a callback
+  record `under_way` at the wake (once, and false); removing the wake fails it. The Sync/Patch recovery does not
+  take a token (`Recovery::advances`).
+- **A checkout that joins a running worker ran its first scripts with the startup variables.** `Checkouts::add`
+  took `scripts::load_env()` whatever the owner: A's request `GEN=a` joined S and S's first run was `GEN=load`
+  (`include=load env=load cfg=other native=108`, where cargo says `a a a 97`), and A's `Standing` decision kept
+  it. The request's variables are passed through `join`, `add` and `add_once`; the first load keeps the startup's.
+  Observed, not changed: the worker judges a checkout it has loaded again for every build, with the variables
+  that checkout was last asked with, so B's build runs S's script again with A's variables. S's script
+  runs once in each build; the variables are the checkout's own.
+
+| scenario (Linux, hand-started worker, Docker `rust:1.99.0-bookworm`) | baseline `d592dd49` (+ the `released` barrier hook, nothing else) | fixed |
+|---|---|---|
+| `recovery-detached`: a checkout V read as S (`RA_JIT_OVERLAY=1`), so every build is detached; B changes the file R's script watches; an edit to R; the recovery request is held after its owner is released and before its token goes (one worker pid, one request) | the edit is never answered (one `barrier-released`, then nothing, `LEASEBARRIER_LOST=60`) | the edit is answered ok, no other request |
+| `once` (A's `GEN=a` request, then the join of S): A-S is **executed** | `gen-one include=load env=load cfg=other native=108`; S's trail is `load load` | `include=a env=a cfg=a native=97` = cargo's; S's trail starts `a A` |
+
+Regression on the fixed binary in the same batches: `once`, `once-failed`, `recovery`, `join`, `worlds`,
+`unrelated`, `groups` pass. A first attempt of `recovery-detached` ran the recovery as `ok unchanged` on the main loop and
+could not reach the detached link; it is kept, not counted. Evidence: further batches in
+`p05r-evidence/build-once-waiting-recovery-600411b9/`, with the binaries.
 
 ### What is not shown, not fixed, or wider
 
