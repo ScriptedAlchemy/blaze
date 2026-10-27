@@ -1013,9 +1013,8 @@ impl World {
         for effect in fx {
             match effect {
                 jobs::Effect::NeedLead => self.reassign()?,
-                jobs::Effect::Kill(id) => {
-                    if let Some(at) = self.nodes.iter().position(|n| n.id == id) {
-                        let attempt = self.nodes[at].attempt;
+                jobs::Effect::Kill { executor, attempt } => {
+                    if let Some(at) = self.nodes.iter().position(|n| n.id == executor) {
                         self.carry(at, Kind::Kill { to: at, attempt });
                     }
                 }

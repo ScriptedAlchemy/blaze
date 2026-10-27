@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
     JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
-    Reservation, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
+    Reservation, SourceRef, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
 };
 
@@ -85,8 +85,14 @@ pub enum Effect {
     /// The lead was lost: the driver assigns a new lead (admission's choice), or ends the
     /// execution `Failed` when there is none.
     NeedLead,
-    /// Stop an executor's process group: the agent kills it.
-    Kill(String),
+    /// Stop this attempt's process group on an executor. A delayed kill must not stop a
+    /// newer assignment on the same executor.
+    Kill {
+        /// The executor.
+        executor: String,
+        /// The assignment to stop, within this execution.
+        attempt: Attempt,
+    },
     /// A subscriber is done with the execution: its own outcome and policy.
     SubscriberEnded {
         /// The subscriber.
@@ -121,6 +127,7 @@ pub struct Execution {
     subscribers: BTreeMap<u64, Subscriber>,
     events: Vec<EventItem>,
     stages: Vec<(Stage, Millis)>,
+    compiled: Option<(Attempt, u64)>,
     refused: bool,
     state: ExecState,
 }
@@ -152,6 +159,7 @@ impl Execution {
             subscribers: BTreeMap::from([(first.id, first)]),
             events: Vec::new(),
             stages: Vec::new(),
+            compiled: None,
             refused: false,
             state: ExecState::Queued,
         };
@@ -266,12 +274,13 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
         }
+        let previous_attempt = self.attempt;
         if self.lead.is_some() || self.work.is_some() {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
         for old in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             if old != lead && !helpers.contains(&old) {
-                out.push(Effect::Kill(old));
+                out.push(Effect::Kill { executor: old, attempt: previous_attempt });
             }
         }
         self.lead = Some(lead.to_owned());
@@ -450,17 +459,7 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return;
         }
-        let late: Vec<u64> =
-            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
-        for id in late {
-            let subscriber = self.subscribers.get_mut(&id).expect("attached");
-            subscriber.state = SubscriberState::TimedOut;
-            out.push(Effect::SubscriberEnded {
-                subscriber: id,
-                outcome: Outcome::TimedOut,
-                policy: subscriber.policy.clone(),
-            });
-        }
+        self.expire_subscribers(now, out);
         if self.attached().next().is_none() {
             // The latest deadline passed: the execution ends, its coverage not claimed.
             return self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
@@ -472,7 +471,7 @@ impl Execution {
         if self.lead.is_some() && now > self.lead_heard + window {
             let lost = self.lead.take().expect("lead");
             self.lost.insert(lost.clone());
-            out.push(Effect::Kill(lost));
+            out.push(Effect::Kill { executor: lost, attempt: self.attempt });
             self.losses += 1;
             if self.losses >= 2 {
                 return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
@@ -490,18 +489,34 @@ impl Execution {
 
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
     fn after_work(&mut self, now: Millis, out: &mut Vec<Effect>) {
-        if self.work.as_ref().is_some_and(WorkSet::is_done)
-            && !self.stages.iter().any(|(s, _)| *s == Stage::Compiled)
+        if let Some(work) = &self.work
+            && work.is_done()
+            && work.lead_joined()
+            && self.compiled != Some((self.attempt, work.root_epoch()))
         {
+            // A replacement lead must first check the retained root set. It then gets its
+            // own notification, including when a changed root list reopened completed work.
+            self.compiled = Some((self.attempt, work.root_epoch()));
             self.stage(now, Stage::Compiled, out);
         }
     }
 
     /// Ends the execution: the work set drops its leases, every executor is stopped, and every
-    /// attached subscriber gets the outcome.
-    pub fn end(&mut self, now: Millis, outcome: Outcome, why: EndWhy, out: &mut Vec<Effect>) {
+    /// attached subscriber gets the outcome. Deadlines apply even when a completion arrives
+    /// before the driver's next timer tick.
+    pub fn end(
+        &mut self,
+        now: Millis,
+        mut outcome: Outcome,
+        mut why: EndWhy,
+        out: &mut Vec<Effect>,
+    ) {
         if let ExecState::Ended(_) = self.state {
             return;
+        }
+        if self.expire_subscribers(now, out) && self.attached().next().is_none() {
+            outcome = Outcome::Cancelled;
+            why = EndWhy::Deadline;
         }
         self.state = ExecState::Ended(outcome.clone());
         if let Some(work) = &mut self.work {
@@ -512,9 +527,27 @@ impl Execution {
         self.finish(now, outcome, out);
     }
 
+    /// Detaches subscribers whose own deadlines have passed, once, before either a timer or
+    /// a final result can report an outcome to them.
+    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect>) -> bool {
+        let late: Vec<u64> =
+            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
+        let expired = !late.is_empty();
+        for id in late {
+            let subscriber = self.subscribers.get_mut(&id).expect("attached");
+            subscriber.state = SubscriberState::TimedOut;
+            out.push(Effect::SubscriberEnded {
+                subscriber: id,
+                outcome: Outcome::TimedOut,
+                policy: subscriber.policy.clone(),
+            });
+        }
+        expired
+    }
+
     fn finish(&mut self, now: Millis, outcome: Outcome, out: &mut Vec<Effect>) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
-            out.push(Effect::Kill(executor));
+            out.push(Effect::Kill { executor, attempt: self.attempt });
         }
         for subscriber in self.subscribers.values_mut() {
             if subscriber.state == SubscriberState::Attached {
@@ -555,10 +588,16 @@ pub enum LocalAction {
     Fail,
 }
 
-/// The action for a remote outcome under `policy`. `Never` fails on anything but a remote
-/// verdict; `Fallback` builds locally after the deadline or a remote failure that is not a
-/// verdict (a build error or a failed test is a result, not retried); `Race` was building
-/// locally from the start, and the first to finish wins, a failure included.
+/// The action for an already classified remote outcome under `policy`. `Passed`, `Failed`
+/// and `Refused` are taken as verdicts; other outcomes fail under `Never` and build locally
+/// under `Fallback`. `Race` was building locally from the start, and the first verdict wins,
+/// a build error or failed test included.
+///
+/// This helper cannot distinguish a completed build/test failure from an infrastructure
+/// failure: both currently use `Outcome::Failed`, including [`EndWhy::NoLead`]. Before
+/// client integration, the policy decision must preserve the termination reason and
+/// distinguish these cases; passing a no-lead failure here would incorrectly take it as
+/// a verdict instead of starting the fallback build.
 pub fn local_action(policy: &LocalPolicy, remote: &Outcome) -> LocalAction {
     let verdict = matches!(remote, Outcome::Passed | Outcome::Failed | Outcome::Refused);
     match policy {
@@ -595,9 +634,17 @@ pub struct Jobs {
     executions: BTreeMap<ExecutionId, Execution>,
     running: BTreeMap<JobContent, ExecutionId>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
-    pr_latest: BTreeMap<u64, ExecutionId>,
+    pr_jobs: BTreeMap<u64, PrJobs>,
     next_execution: u64,
     next_subscriber: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PrJobs {
+    /// The source of the most recently submitted revision; platforms and profiles may differ.
+    source: SourceRef,
+    /// Live executions of this pull request, including older revisions kept by subscribers.
+    executions: BTreeMap<ExecutionId, SourceRef>,
 }
 
 impl Jobs {
@@ -609,7 +656,7 @@ impl Jobs {
             executions: BTreeMap::new(),
             running: BTreeMap::new(),
             platforms: BTreeMap::new(),
-            pr_latest: BTreeMap::new(),
+            pr_jobs: BTreeMap::new(),
             next_execution: 1,
             next_subscriber: 1,
         }
@@ -637,7 +684,8 @@ impl Jobs {
 
     /// `POST /v1/jobs`, with the reservation the server measured for its lead. An equal
     /// `JobContent` running already is joined, not started again. A pull request's new push
-    /// cancels its previous execution when nothing else subscribes to it.
+    /// cancels earlier-source executions when nothing else subscribes to them. Platform,
+    /// command and profile variants of the same source run together.
     pub fn submit(
         &mut self,
         now: Millis,
@@ -690,9 +738,35 @@ impl Jobs {
         self.executions.insert(id, execution);
         self.running.insert(content, id);
         self.platforms.insert(id, (req.spec.platform, need));
-        if let Namespace::Pr(pr) = &req.namespace {
-            if let Some(previous) = self.pr_latest.insert(pr.n, id)
-                && let Some(old) = self.executions.get(&previous)
+        self.pr_submitted(now, req, id, out);
+        Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
+    }
+
+    fn pr_submitted(
+        &mut self,
+        now: Millis,
+        req: &JobRequest,
+        id: ExecutionId,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) {
+        let Namespace::Pr(pr) = &req.namespace else { return };
+        let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
+            source: req.spec.source.clone(),
+            executions: BTreeMap::new(),
+        });
+        jobs.executions.insert(id, req.spec.source.clone());
+        if jobs.source == req.spec.source {
+            return;
+        }
+        jobs.source = req.spec.source.clone();
+        let previous: Vec<_> = jobs
+            .executions
+            .iter()
+            .filter(|(_, source)| **source != req.spec.source)
+            .map(|(&id, _)| id)
+            .collect();
+        for previous in previous {
+            if let Some(old) = self.executions.get(&previous)
                 && !matches!(old.state(), ExecState::Ended(_))
                 && old.attached().count() == 1
             {
@@ -700,7 +774,6 @@ impl Jobs {
                 let _ = self.unsubscribe(now, previous, only, out);
             }
         }
-        Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
     }
 
     /// `DELETE /v1/jobs/<execution>/subscribers/<id>`.
@@ -736,9 +809,25 @@ impl Jobs {
     /// The agent stopped `executor`'s job processes after a kill: `alive` says whether the
     /// executor itself is still there (an execution ended) or gone (it had died). Only now is
     /// its reservation returned, so a lead presumed lost but still running holds its share.
-    pub fn killed(&mut self, now: Millis, executor: &str, alive: bool) {
+    /// The acknowledgement names the killed assignment: a duplicate or late one cannot free
+    /// a newer execution or attempt on the same executor.
+    pub fn killed(
+        &mut self,
+        now: Millis,
+        executor: &str,
+        execution: ExecutionId,
+        attempt: Attempt,
+        alive: bool,
+    ) {
+        if self
+            .admission
+            .executor(executor)
+            .is_none_or(|slot| slot.busy != Some((execution, attempt)))
+        {
+            return;
+        }
         if alive {
-            self.admission.finished(now, executor);
+            self.admission.finished(now, executor, execution, attempt);
         } else {
             self.admission.lost(now, executor);
         }
@@ -782,8 +871,9 @@ impl Jobs {
                 let e = self.executions.get_mut(&id).expect("present");
                 match self.admission.idle_for(&namespace, &platform, &need, &except) {
                     Some(lead) => {
-                        self.admission.take(&lead, id);
-                        let _ = e.assign(now, &lead, &[], &mut more);
+                        if e.assign(now, &lead, &[], &mut more).is_ok() {
+                            self.admission.take(&lead, id, e.attempt());
+                        }
                     }
                     None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
                 }
@@ -799,6 +889,11 @@ impl Jobs {
                 self.running.remove(&e.content);
             }
             self.admission.dequeue(id);
+            if let Namespace::Pr(pr) = &e.namespace
+                && let Some(jobs) = self.pr_jobs.get_mut(&pr.n)
+            {
+                jobs.executions.remove(&id);
+            }
         }
     }
 }

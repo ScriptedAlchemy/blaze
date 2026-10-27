@@ -251,7 +251,8 @@ pub enum Effect {
         /// The other's.
         other: Digest,
     },
-    /// An entry exported under a name that became a conflict: the lead bans it.
+    /// An entry exported under a name that became a conflict or was rejected by the lead:
+    /// the lead bans it.
     ExportInvalidated {
         /// The name.
         name: WorkName,
@@ -455,6 +456,16 @@ impl WorkSet {
         self.phase == Phase::Done
     }
 
+    /// The root-list epoch, advanced when a lead replaces the list the work was counted on.
+    pub fn root_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether this attempt's lead has joined with its own root set.
+    pub fn lead_joined(&self) -> bool {
+        self.holders.contains_key(&self.lead)
+    }
+
     /// How the execution ended, if it ended before its compile phase was done.
     pub fn ended(&self) -> Option<EndWhy> {
         match self.phase {
@@ -587,6 +598,19 @@ impl WorkSet {
                 self.fixed = Some(req.roots.clone());
                 out.push(Effect::Fixed { roots: req.roots.clone() });
             }
+        }
+        // Helpers may discover and even finish names before the lead loads. Its rejection
+        // list applies to those provisional findings too, including entries already sealed.
+        for name in &self.rejected {
+            let Some(slot) = self.names.get_mut(name) else { continue };
+            if let Slot::Done(Terminal::Committed {
+                outcome: ItemOutcome::Exported(entry), ..
+            }) = &slot.state
+            {
+                out.push(Effect::ExportInvalidated { name: *name, entry: entry.entry });
+            }
+            self.waiting.remove(name);
+            slot.state = Slot::Done(Terminal::Tail(TailWhy::Rejected));
         }
         self.check_done(out);
     }
@@ -778,11 +802,15 @@ impl WorkSet {
         if req.lease.holder != from {
             return Err(Refusal::NotHolder);
         }
+        if req.lease.attempt != self.attempt {
+            return Err(Refusal::AttemptMoved);
+        }
         let generation = req.lease.generation;
         let by = Commit { holder: from.to_owned(), generation, seq: req.seq };
         let key = (from.to_owned(), generation, req.seq);
         let digest = blaze_wire::digest_of(req);
-        // A result committed before gets the same answer, whatever happened since.
+        // A result committed in this attempt gets the same answer after its lease ended.
+        // An earlier attempt must not replay or keep a newly joined holder alive.
         if let Some((committed, answer)) = self.replies.get(&key) {
             if *committed != digest {
                 return Err(Refusal::SeqReused);
@@ -797,9 +825,6 @@ impl WorkSet {
         }
         if let Phase::Ended(_) = self.phase {
             return Err(Refusal::Ended);
-        }
-        if req.lease.attempt != self.attempt {
-            return Err(Refusal::AttemptMoved);
         }
         // The fence: only the holder's live lease commits. A result of a dead generation is
         // refused whole, `found` and `unnamed` included, so it registers no names.
@@ -920,9 +945,11 @@ impl WorkSet {
         let Some(state) = self.names.get(&name).map(|slot| slot.state.clone()) else { return };
         match state {
             Slot::Held(generation) if generation == by.generation => {}
-            Slot::Done(Terminal::Tail(TailWhy::Conflict)) => {
-                // It became a conflict while held: the outcome is not taken, and an entry
-                // exported under it is banned.
+            Slot::Done(Terminal::Tail(TailWhy::Conflict | TailWhy::Rejected)) => {
+                // It became a conflict or was rejected while held: the outcome is not
+                // taken, and an entry exported under it is banned. Acknowledge that the
+                // name must be dropped even when this result could not resolve it.
+                conflicts.insert(name);
                 if let ItemOutcome::Exported(entry) = &item.outcome {
                     out.push(Effect::ExportInvalidated { name, entry: entry.entry });
                 }

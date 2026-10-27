@@ -1,7 +1,7 @@
 //! Admission order and reservations, independent of randomized job scheduling.
 
 use blaze_dist::admission::{Admission, AdmissionConfig, Waiting};
-use blaze_wire::{ExecutionId, Namespace, PrNamespace, Reservation};
+use blaze_wire::{Attempt, ExecutionId, Namespace, PrNamespace, Reservation};
 
 fn reservation(memory: u64) -> Reservation {
     Reservation { memory, cpus: memory as u32, disk: memory }
@@ -58,7 +58,7 @@ fn rebuild_waits_for_the_old_busy_builders_reservation() {
     assert_eq!(a.used("machine").memory, 4);
     a.admit(3);
     assert_eq!(a.used("machine").memory, 4);
-    a.finished(4, &builder);
+    a.finished(4, &builder, ExecutionId(1), Attempt(1));
     assert_eq!(a.used("machine").memory, 4);
     a.check().unwrap();
 }
@@ -69,7 +69,7 @@ fn a_draining_rebuild_waits_even_when_another_executor_frees_room() {
     a.add_machine("machine", [1; 32], reservation(8));
     let builder = a.add_builder(0, "machine", reservation(4)).unwrap();
     let neighbor = a.add_builder(0, "machine", reservation(4)).unwrap();
-    a.take(&builder, ExecutionId(1));
+    a.take(&builder, ExecutionId(1), Attempt(1));
     assert!(a.rebuild(1, &builder, reservation(4)).is_none());
     a.lost(2, &neighbor);
     a.admit(3);
@@ -78,7 +78,19 @@ fn a_draining_rebuild_waits_even_when_another_executor_frees_room() {
         a.executors().filter(|e| e.phase == blaze_dist::admission::ExecutorPhase::Ready).count(),
         0,
     );
-    a.finished(4, &builder);
+    a.finished(4, &builder, ExecutionId(1), Attempt(1));
     assert_eq!(a.used("machine").memory, 4);
     a.check().unwrap();
+}
+
+#[test]
+fn an_old_attempts_completion_does_not_release_the_current_assignment() {
+    let mut a = Admission::new(AdmissionConfig::default());
+    a.add_machine("machine", [1; 32], reservation(4));
+    let builder = a.add_builder(0, "machine", reservation(4)).unwrap();
+    a.take(&builder, ExecutionId(1), Attempt(2));
+    a.finished(1, &builder, ExecutionId(1), Attempt(1));
+    assert_eq!(a.executor(&builder).unwrap().busy, Some((ExecutionId(1), Attempt(2))));
+    a.finished(2, &builder, ExecutionId(1), Attempt(2));
+    assert_eq!(a.executor(&builder).unwrap().busy, None);
 }
