@@ -55,5 +55,5 @@ mod store;
 pub use blob::{Kind, ObjectName, Range, parse_range};
 pub use error::{Error, ErrorCode};
 pub use list::{ListedObject, ObjectsAnswer};
-pub use server::{Body, Config, Server, listed, serve, serve_on};
+pub use server::{Body, Config, Resources, Server, listed, serve, serve_on};
 pub use store::{Expect, Listed, Store, Verification};

@@ -106,7 +106,7 @@ impl Store {
             #[cfg(test)]
             before_stat: Mutex::new(None),
         };
-        store.sweep_temporaries();
+        store.sweep_temporaries(std::time::Duration::from_secs(3600))?;
         store.rescan()?;
         Ok(store)
     }
@@ -403,7 +403,7 @@ impl Store {
     /// Removes the temporary files of writes that were stopped, once they are older than the
     /// hour a remote's collection gives an object: a write that is in flight when this runs is
     /// younger than that, and no request is in flight when the store is opened.
-    fn sweep_temporaries(&self) {
+    pub(crate) fn sweep_temporaries(&self, older_than: std::time::Duration) -> Result<(), Error> {
         for sub in ["", "packs", "keys", "units", "manifests", "deps"] {
             let at = if sub.is_empty() { self.dir.clone() } else { self.dir.join(sub) };
             let Ok(entries) = std::fs::read_dir(&at) else { continue };
@@ -426,12 +426,24 @@ impl Store {
                     .ok()
                     .and_then(|it| it.modified().ok())
                     .and_then(|it| it.elapsed().ok())
-                    .is_some_and(|it| it > std::time::Duration::from_secs(60 * 60));
+                    .is_some_and(|it| it > older_than);
                 if old {
-                    _ = std::fs::remove_file(entry.path());
+                    let file = match File::options().read(true).write(true).open(entry.path()) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    match file.try_lock() {
+                        Ok(()) => {
+                            _ = std::fs::remove_file(entry.path());
+                        }
+                        Err(std::fs::TryLockError::WouldBlock) => {}
+                        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// Checks that `bytes` are what `object`'s name says, and says how.
@@ -493,6 +505,7 @@ impl Store {
         let partial = temporary(&to);
         let write = (|| -> std::io::Result<()> {
             let mut file = File::options().write(true).create_new(true).open(&partial)?;
+            file.try_lock().map_err(std::io::Error::from)?;
             file.write_all(bytes)?;
             #[cfg(test)]
             if let Some(pause) = self.before_name.lock().unwrap().as_ref() {
