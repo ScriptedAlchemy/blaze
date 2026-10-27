@@ -1031,7 +1031,7 @@ def groups(sc, source_sha):
         if got != want[name]:
             sc.fail(f"{tag} (direct): printed {got!r}, the oracle's {want[name]!r}")
         sc.notes.setdefault("programs", {})[tag] = got
-    ran = sorted(os.listdir(extra["ONCE_DIR"]))
+    ran = sorted(it for it in os.listdir(extra["ONCE_DIR"]) if not it.startswith("trail-"))
     sc.notes["executions"] = ran
     if ran != ["gena-a", "gena-b", "genb-a", "genb-b"]:
         sc.fail(f"each script was to run once for each build: {ran}")
@@ -1529,7 +1529,12 @@ def recovery_detached(sc, source_sha):
     subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", "worktree", "add", "-q", "-b",
                     "third", v], cwd=sc.r, capture_output=True, check=True)
     shutil.copy2(os.path.join(sc.s, "build.rs"), os.path.join(v, "build.rs"))
-    extra = dict(extra, RA_JIT_OVERLAY="1")
+    # The script reads the value from a file it watches: one fingerprint, other output. B's run of it
+    # leaves the world the recovery loads, which is not the program's: the recovery rebuilds and links.
+    extra = dict(extra, RA_JIT_OVERLAY="1", GEN_FROM_FILE="1")
+    for checkout in (sc.r, sc.s, v):
+        with open(os.path.join(checkout, "value.txt"), "w") as f:
+            f.write("a\n")
     worker, sock, env = by_hand(sc, extra, gen_="a")
     try:
         if not serving(sc, sock, env):
@@ -1545,8 +1550,11 @@ def recovery_detached(sc, source_sha):
         if rc != 0 or not sc.notes["view-lines"]:
             sc.fail(f"V was not read as S (rc {rc}): the case was not exercised: {said[-300:]}")
             return
-        # Another process runs R's script for another GEN: the worker's world of R moves.
-        B = sc.client("b", ("--bin", "gen-one"), cwd=sc.r, GEN="b", **extra)
+        # Another process runs R's script over the file, changed: the worker's world of R moves.
+        time.sleep(1.2)
+        with open(os.path.join(sc.r, "value.txt"), "w") as f:
+            f.write("b\n")
+        B = sc.client("b", ("--bin", "gen-two"), cwd=sc.r, **extra)
         sc.finish(B, "B", within=LOST)
         if B.returncode != 0:
             sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
