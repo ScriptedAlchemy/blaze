@@ -91,10 +91,16 @@ whether a worker keeps the literal or joins the selected workspace path.
 
 Config values additionally support `[2, native_bytes]` and script env values use
 the same tags. NUL-free native bytes preserve raw Unix values without replacement.
-Literal values and individual rustflags/cfg values are InputText: unchanged CBOR
+Literal environment values are NUL-free EnvText; individual rustflags/cfg values
+are InputText: unchanged CBOR
 text, bounded by Limits.request rather than the 4 KiB identifier limit.
 The raw-byte variant and tagged script-env representation require schema 4;
 text budget changes alone do not change encoding.
+Native tags are canonical only for non-UTF-8, NUL-free values. Valid UTF-8 uses
+Literal. Environment map names are nonempty, exclude `=`/NUL, and may appear
+only once. Ambient script_env does not admit WorkspaceRelative origins; config
+values remain in config_env and are materialized only for local probing/execution.
+This prevents materialized checkout paths from entering portable script identities.
 
 This crate speaks schema 4 only. Prior versions require a separately pinned codec at
 the transport negotiation boundary; this implementation does not advertise it or
