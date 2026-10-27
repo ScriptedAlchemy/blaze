@@ -249,9 +249,10 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
     if store.is_none() && image.is_none() {
         return served;
     }
+    let keys = std::mem::take(&mut served.keys);
     for (index, part) in Part::ALL.into_iter().enumerate() {
         let mut maps = FxHashMap::default();
-        for (&krate, key) in &served.keys {
+        for (&krate, key) in &keys {
             // A part is read only with the def map it was found from.
             if part != Part::DefMap && !served.served[0].contains(&krate) {
                 continue;
@@ -276,6 +277,7 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
         }
         part.set(db, maps);
     }
+    served.keys = keys;
     if let Some(image) = &image {
         front_image::watch(image);
     }
