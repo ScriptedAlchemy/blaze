@@ -486,6 +486,13 @@ mod tests {
                  default-members = ['default']\nresolver = '2'\n",
             ),
             (
+                "Cargo.lock",
+                "version = 4\n\
+                 [[package]]\nname = 'kdefault'\nversion = '0.1.0'\ndependencies = ['kparts']\n\
+                 [[package]]\nname = 'kmember'\nversion = '0.1.0'\ndependencies = ['kparts']\n\
+                 [[package]]\nname = 'kparts'\nversion = '0.1.0'\n",
+            ),
+            (
                 "default/Cargo.toml",
                 "[package]\nname = 'kdefault'\nversion = '0.1.0'\nedition = '2021'\n\
                  [dependencies]\nkparts = { path = '../parts', features = ['default-member'] }\n",
