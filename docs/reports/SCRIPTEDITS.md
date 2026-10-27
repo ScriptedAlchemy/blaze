@@ -544,18 +544,35 @@ build still reads, which cargo does for every build.
   directory would prevent it and was not done.
 - A worker blocks its main loop while it waits for another worker's build.
 
-### Tests
+### Tests (measured, Mac, 2026-10-27)
 
-`scripts/leases.rs` (5, the lease rules with two lease sets standing for two processes) and
-`scripts/tests.rs` (5 new): an A/B/A counter test with an always-stale script, the same with a
-failing script, a cross-worker test that a judgment that stands is not mistaken for another
-worker's later output, one that fresh builds share, and a two-process barrier test: worker A's
-script is done, worker B (a second process, another `GEN`) asks and is held, A reads its own
-generated file, `cfg`, `rustc-env`, `-l` and `-L`, A is retired, B runs and finds its own. They run
-the real runner, run and record files, and a shell script as the build script; compiling the script
-is the one part left out.
+`scripts/leases.rs` has 5 tests (the lease rules, with two lease sets standing for two processes;
+`flock` conflicts between open descriptions as it does between processes). `scripts/tests.rs` has
+5 new tests and one helper test: an A/B/A counter test with an always-stale script (B is put off
+while A reads, A's second request runs nothing, B then runs once), the same with a failing script
+(A's failure is delivered unchanged by each later request and the script is not run again), a
+cross-worker test that a judgment that stands is not taken for the output another worker wrote
+after it, one that builds that find a script fresh read it together while a build that must run it
+waits for both, and a two-process barrier test: worker A's script is done, worker B (a second
+process, another `GEN`) asks and is held, A reads its own generated file, `cfg`, `rustc-env`,
+`-l` and `-L`, A is retired, B runs and finds its own. They run the real runner, run and record
+files and a shell script as the build script; compiling the script is the one part left out.
+
+| Command (`CARGO_TARGET_DIR` shared, heavy lock, watchdog, `RUST_BACKTRACE=0`) | Result |
+|---|---|
+| `cargo +1.99.0 test -p ra-jit --bin ra-jit scripts::` | 19 passed (the 10 from before and 9 new, helper included), 0.8 s |
+| `cargo +1.99.0 test --no-fail-fast -p ra-jit` | 234 passed, 0 failed |
+| `cargo +1.99.0 test -p blaze-build-script` | 47 passed, 2 failed: `a_non_utf8_checkout_is_still_listed_from_git` and `git_listed_paths_do_not_need_to_be_utf8`, `EILSEQ` from creating a non-UTF-8 file name on APFS. Not changed here; they passed on Linux in the review above. |
+| `cargo +1.99.0 fmt --all -- --check` | passed |
+
+Mutation check (once, not committed): with the lease protection removed and a build's judgment
+kept for the last build only (the behaviour before this change), the A/B/A counter test and the
+failing-script test fail and the others pass, as the cross-process tests rest on `flock` alone.
+This is the old behaviour restated, not the old code run.
 
 ### Not run
 
-The same barrier through two real workers (daemon, load, compile, link) needs the Linux whole
-build, which this Mac cannot run (#255). It is not claimed.
+The same barrier through two real workers (daemon, load, compile, link) needs the Linux whole build,
+which this Mac cannot run (#255); the `retire` message from the daemon to the worker and the main
+loop's putting a request off were typechecked and are read, not exercised. The 42-probe
+`scriptedits.py` suite and the P0-A audit were not rerun for this change. Not claimed.
