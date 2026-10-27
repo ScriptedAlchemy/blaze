@@ -180,7 +180,7 @@ def compare_macros(fixture, a_log, b_log):
                 if "env" in differing:
                     ours, theirs = a_envs.get(a.get("env"), {}), b_envs.get(c.get("env"), {})
                     names = sorted(n for n in set(ours) | set(theirs) if ours.get(n) != theirs.get(n))
-                    bits.append("environment " + ", ".join(f"{n} ({ours.get(n)!r} on A, {theirs.get(n)!r} on B)" for n in names[:4]))
+                    bits.append("environment " + ", ".join(f"{n} (value hash {ours.get(n)!r} on A, {theirs.get(n)!r} on B)" for n in names[:4]))
                 if "cwd" in differing:
                     bits.append("current directory")
                 if "dylib" in differing:

@@ -321,10 +321,28 @@ fn short(bytes: &[u8]) -> String {
     Sha256::digest(bytes)[..8].iter().map(|it| format!("{it:02x}")).collect()
 }
 
-/// The environment of a call as its key has it: a line for each variable, with the places taken
-/// out of its value.
+/// A diagnostic fingerprint for each variable. Values may hold credentials; naming which
+/// variable differs between machines needs its digest, not its contents in a shared log.
 fn env_text(env: &[(&str, std::borrow::Cow<'_, str>)]) -> String {
-    env.iter().map(|(name, value)| format!("{name}={}\n", value.replace('\n', " "))).collect()
+    env.iter().map(|(name, value)| format!("{name}={}\n", short(value.as_bytes()))).collect()
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::env_text;
+
+    #[test]
+    fn environment_diagnostics_fingerprint_values_without_printing_them() {
+        let text = env_text(&[("TOKEN", "private-token-value".into())]);
+        assert!(text.starts_with("TOKEN="));
+        assert!(!text.contains("private-token-value"));
+        assert_eq!(text, env_text(&[("TOKEN", "private-token-value".into())]));
+        assert_ne!(
+            env_text(&[("VALUE", "first\nsecond".into())]),
+            env_text(&[("VALUE", "first second".into())]),
+            "a newline changes the environment key too"
+        );
+    }
 }
 
 /// The environment of a call, once for each: its parts as the key has them, which say which

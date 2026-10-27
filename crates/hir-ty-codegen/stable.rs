@@ -399,25 +399,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         if let Some(built) = self.library.as_ref().and_then(|it| it.stored(&path)) {
             return Some(built);
         }
-        let home = self.cargo_home.as_deref();
-        if home != Some(super::CARGO_HOME) {
-            if super::moved(&path, super::CARGO_HOME, "").is_some() {
-                return None;
-            }
-            if let Some(there) = home.and_then(|home| super::moved(&path, home, super::CARGO_HOME))
-            {
-                return Some(there);
-            }
-        }
-        if let Some(root) = self.checkout.as_deref().filter(|it| *it != super::CHECKOUT) {
-            if super::names_checkout(&path) {
-                return None;
-            }
-            if let Some(there) = super::stored_as(&path, root) {
-                return Some(there);
-            }
-        }
-        Some(path)
+        super::relocate::stored_path(&path, self.cargo_home.as_deref(), self.checkout.as_deref())
     }
 
     fn miss<T>(&self, why: &'static str) -> Option<T> {

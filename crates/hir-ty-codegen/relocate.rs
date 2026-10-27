@@ -78,6 +78,42 @@ pub fn names_checkout(path: &str) -> bool {
     path.strip_prefix(CHECKOUT).is_some_and(|it| it.starts_with('/'))
 }
 
+/// Select a stored namespace once. In particular, a cargo path just rewritten to `/cargo`
+/// must not then be treated as a local path beside a checkout under `/cargo/registry`.
+pub(super) fn stored_path(
+    path: &str,
+    cargo_home: Option<&str>,
+    checkout: Option<&str>,
+) -> Option<String> {
+    if super::moved(path, super::CARGO_HOME, "").is_some() {
+        return (cargo_home == Some(super::CARGO_HOME)).then(|| path.to_owned());
+    }
+    if let Some(there) = cargo_home.and_then(|home| super::moved(path, home, super::CARGO_HOME)) {
+        return Some(there);
+    }
+    if names_checkout(path) {
+        return (checkout == Some(CHECKOUT)).then(|| path.to_owned());
+    }
+    Some(checkout.and_then(|root| stored_as(path, root)).unwrap_or_else(|| path.to_owned()))
+}
+
+/// Interpret the stored namespace before substituting the local directory. Local paths can
+/// themselves start with a reserved name; they are the result, not another stored reference.
+pub(super) fn local_path(
+    path: &str,
+    cargo_home: Option<&str>,
+    checkout: Option<&str>,
+) -> Option<String> {
+    if names_checkout(path) {
+        let root = checkout?;
+        return if root == CHECKOUT { Some(path.to_owned()) } else { read_as(path, root) };
+    }
+    if super::moved(path, super::CARGO_HOME, "").is_some() {
+        return super::moved(path, super::CARGO_HOME, cargo_home?);
+    }
+    Some(path.to_owned())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -158,5 +194,54 @@ mod tests {
             );
             assert_eq!(read_as(&stored, "/home/a/repo/ws").unwrap(), text);
         }
+    }
+
+    #[test]
+    fn a_path_is_rebound_once_even_when_the_local_directory_has_a_reserved_prefix() {
+        let home = Some("/home/a/.cargo");
+        assert_eq!(
+            local_path("/checkout/src/lib.rs", home, Some("/cargo/repo")).as_deref(),
+            Some("/cargo/repo/src/lib.rs")
+        );
+        assert_eq!(
+            local_path("/checkout/../shared/lib.rs", None, Some("/cargo/repo")).as_deref(),
+            Some("/cargo/shared/lib.rs")
+        );
+        assert_eq!(
+            local_path(
+                "/cargo/registry/src/dep/lib.rs",
+                Some("/checkout/cargo"),
+                Some("/local/repo")
+            )
+            .as_deref(),
+            Some("/checkout/cargo/registry/src/dep/lib.rs")
+        );
+        assert_eq!(
+            stored_path(
+                "/home/a/.cargo/registry/src/dep/lib.rs",
+                home,
+                Some("/cargo/registry/repo")
+            )
+            .as_deref(),
+            Some("/cargo/registry/src/dep/lib.rs")
+        );
+        assert_eq!(
+            stored_path(
+                "/cargo/registry/src/dep/lib.rs",
+                Some("/cargo"),
+                Some("/cargo/registry/repo")
+            )
+            .as_deref(),
+            Some("/cargo/registry/src/dep/lib.rs")
+        );
+    }
+
+    #[test]
+    fn stored_names_need_the_directory_they_name() {
+        assert_eq!(local_path("/cargo/registry/src/x", None, Some("/home/a/repo")), None);
+        assert_eq!(local_path("/checkout/src/x", Some("/home/a/.cargo"), None), None);
+        assert_eq!(stored_path("/cargo/registry/src/x", Some("/home/a/.cargo"), None), None);
+        assert_eq!(stored_path("/checkout/src/x", None, None), None);
+        assert_eq!(stored_path("src/x", None, None).as_deref(), Some("src/x"));
     }
 }
