@@ -32,7 +32,11 @@ All notable changes to ra-jit are written here. The format follows
   refused. A request that must wait is put off and asked again when `scripts::generation` moved, never
   by a sleep or a deadline of the worker's main loop; a reload and a join are put off like a stale
   check; a checkout joined later is loaded for the request that asks. A failing script fails each
-  request of its build with one message. `script-lease:` lines say each step, and
+  request of its build with one message. A run has a generation of its own, written as it begins and
+  read under the lease (the fingerprint says what a run was made from, not which run left the output), a
+  consumer's world is of generations, and a world that moved is loaded again through the ordinary check of
+  the scripts, with an edit's text and variables kept; a build that yields keeps its decisions, so a script
+  cargo runs once in a build runs once; a request's judging of all its checkouts has one admission. `script-lease:` lines say each step, and
   `RA_JIT_SCRIPT_BARRIER_DIR` holds a worker by files, which `harness/leasebarrier.py` drives through
   the daemon (Linux).
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,

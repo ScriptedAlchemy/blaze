@@ -564,12 +564,14 @@ The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
 
 ### Tests
 
-Component (Mac, shared target, heavy lock, watchdog): `scripts::` 31 passed. They include decisions kept
+Component (Mac, shared target, heavy lock, watchdog): `scripts::` 32 passed. They include decisions kept
 across a yield (reacquire at the same generation; superseded when another build ran it; a failure kept), two
 runs of one fingerprint as two generations (with a script that runs every build), a pin that is a consumer
 before it has its leases (a pin in flight is not released under), an operation that has the admission
-for all its groups, the watcher retire/re-register window (200 rounds, then one wake), and the earlier
-tests. Mutation check: the old watcher shape (decide, then remove unconditionally) fails the window test.
+for all its groups, the watcher's retire / re-register / late-exit orders, one at a time (`register` and `ends` are two
+functions under one lock; dropping the empty-set check fails the test, and so does dropping the "only my
+entry" check; a threaded stress of the same window passes with either dropped, so it is not the gate), and the
+earlier tests.
 
 Linux through the daemon (`harness/leasebarrier.py`; Docker `rust:1.99.0-bookworm`, one 6 GiB container, no
 extra swap, own docker lock). Baseline = `ae31fc5c` as published; fixed = production code `2c95ea1c`
