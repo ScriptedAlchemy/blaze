@@ -2389,6 +2389,13 @@ impl Checkouts {
             if self.splits[at].is_some() || !sharing.allows(base) {
                 return None;
             }
+            // `builds_alike` reads the targets of the workspace as it was loaded: a checkout whose
+            // manifests or configuration changed since says nothing sure of which scripts it selects
+            // now, and is no checkout to read another through. Loading it again to see runs its
+            // scripts, for a project that does not read them.
+            if !self.inputs.describes(base) {
+                return None;
+            }
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
             for part in inside.components().rev() {

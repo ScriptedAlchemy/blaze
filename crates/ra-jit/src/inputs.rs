@@ -438,6 +438,17 @@ impl Inputs {
         }
     }
 
+    /// Whether what the workspace loaded at `root` says of itself (its packages, its targets, which
+    /// script each selects) is what its manifests and configuration say now. Nothing is run to say it:
+    /// the files the load read are looked at. A checkout that is not watched has said nothing that
+    /// could be out of date.
+    pub(crate) fn describes(&self, root: &Path) -> bool {
+        self.checkouts
+            .iter()
+            .find(|it| it.root == root)
+            .is_none_or(|it| !it.files.iter().any(Watched::changed))
+    }
+
     /// What the scripts of the checkout at `root` said when the last check ran them, when the
     /// workspace loaded is not what they said.
     pub(crate) fn ready(
@@ -779,6 +790,30 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_checkout_describes_itself_only_while_the_files_it_was_loaded_from_are_as_they_were() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-describes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"a\"\nbuild = \"build.rs\"\n").unwrap();
+        let mut inputs = Inputs::default();
+        // A checkout that is not watched has said nothing that could be out of date.
+        assert!(inputs.describes(&dir));
+        inputs.checkouts.push(Checkout {
+            root: dir.clone(),
+            files: vec![Watched::new(manifest.clone(), false)],
+            flags: Vec::new(),
+            scripts: None,
+        });
+        assert!(inputs.describes(&dir));
+        // The manifest selects another script: what the loaded targets say is not what it says.
+        std::fs::write(&manifest, "[package]\nname = \"a\"\nbuild = \"build-new.rs\"\n").unwrap();
+        assert!(!inputs.describes(&dir));
+        assert!(inputs.describes(&dir.join("elsewhere")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ra-jit-inputs-{name}-{}", std::process::id()));
