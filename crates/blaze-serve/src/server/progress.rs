@@ -70,7 +70,7 @@ impl AsyncWrite for ProgressIo {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match Pin::new(&mut self.stream).poll_flush(cx) {
             Poll::Ready(result) => {
-                self.pending = None;
+                // TCP flush is a no-op and cannot count as progress on a blocked write.
                 Poll::Ready(result)
             }
             Poll::Pending => self.stalled(cx),
