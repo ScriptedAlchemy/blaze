@@ -483,6 +483,11 @@ mod tests {
     }
 
     #[test]
+    fn included_bytes_advance_mir_in_one_database() {
+        check_payload_owner("pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }", false);
+    }
+
+    #[test]
     fn lazy_const_and_type_owners_discover_payloads_before_any_identity_lookup() {
         for body in [
             "#[repr(u8)] enum E { X = include_bytes!(\"payload.bin\")[0] } pub fn value() -> u8 { E::X as u8 }",
@@ -587,6 +592,9 @@ mod tests {
             let new_bodies = hir::attach_db(&db, || bodies(&db));
             if body.contains("pub fn value() -> u8 { include_bytes!") {
                 assert_ne!(old_bodies, new_bodies, "lowered body must depend on included bytes");
+            }
+            if body.contains("-> &'static [u8; 1]") {
+                assert!(!old_bodies[0].1.starts_with("Err"), "{}", old_bodies[0].1);
                 assert_ne!(old_bodies[0].1, new_bodies[0].1, "MIR must depend on included bytes");
             }
             let second = hir::attach_db(&db, || {
