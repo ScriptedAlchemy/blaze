@@ -567,7 +567,7 @@ mod tests {
             let (resume, resumed) = std::sync::mpsc::channel();
             *store.before_name.lock().unwrap() = Some(Box::new(move || {
                 ready.send(()).unwrap();
-                resumed.recv().unwrap();
+                resumed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             }));
             let writer = {
                 let store = store.clone();
