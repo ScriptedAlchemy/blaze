@@ -42,7 +42,7 @@ Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 
 ## Digests and signatures
 
-A digest is `sha256("blaze/" ‖ name ‖ "/v2" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
+A digest is `sha256("blaze/" ‖ name ‖ "/v3" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
 the type's name; a signature is Ed25519 over the same bytes with `sig/` in front of the name. The
 domain separation means a `WorkKey`'s and a `JobContentInput`'s bytes never collide even when their
 encodings do, and a signature can never be replayed as a digest or as another type's. [`digest_input`]
@@ -86,7 +86,7 @@ Decoded slash/NUL, empty/dot/parent components and noncanonical escapes are reje
 cwd is SourcePath at generation and decode. Manifest basename must be Cargo.toml.
 Missing location fields and unknown fields are rejected, not defaulted.
 Field 7's config values are now `[0, literal_text]` or `[1, workspace_relative_path]`.
-The old string encoding is invalid in schema 2. The serialized tag determines
+The old untagged config string encoding is invalid in schemas 2 and 3. The serialized tag determines
 whether a worker keeps the literal or joins the selected workspace path.
 
 This crate speaks schema 3 only. Prior versions require a separately pinned codec at
