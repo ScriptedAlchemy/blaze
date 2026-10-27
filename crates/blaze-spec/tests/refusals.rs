@@ -313,7 +313,7 @@ fn cases() -> Vec<Case> {
             Reason::TargetLinker,
             "linker",
             config("[target.aarch64-apple-darwin]\nlinker = \"l\"\n", Build, &[]),
-            config("[target.aarch64-apple-darwin]\nlinker = \"l\"\n", Check, &[]),
+            config("[target.x86_64-unknown-linux-gnu]\nlinker = \"l\"\n", Check, &[]),
         ),
         case(
             Reason::TargetLinks,
