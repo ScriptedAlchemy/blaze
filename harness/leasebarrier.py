@@ -115,6 +115,8 @@ choice-edited R1 and R2 loaded in full (`--also`, GEN=a, splitting on), R1's man
               which is judged.
 first-join-shared  The same with V, a checkout of R's repository with R's scripts: V reads R's scripts, which are
               judged for `b` (the trail says so), and fail as cargo's would.
+link-strict, archive-strict  link-control and archive-control as A, B, A, each build compared with cargo's, a mismatch fails (no gap).
+native-only   Only the native archive's bytes change (97, 98, 97), then a corrupted archive, its restoration with size and time kept, and a no-op.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -2211,14 +2213,14 @@ def unrelated(sc, source_sha):
         worker.kill()
 
 
-def link_control(sc, source_sha):
+def link_control(sc, source_sha, strict=False):
     """No concurrency, no barrier: GEN=a, then GEN=b, a static library named for the value. Not
     about leases: whether a warm worker, which finds only the script's output changed, links the
     program with the library that output names."""
     sc.project()
     expected = {"a": sc.oracle("a"), "b": sc.oracle("b")}
     sc.project()
-    for gen_ in ("a", "b"):
+    for gen_ in (("a", "b", "a") if strict else ("a", "b")):
         p = sc.client("a", GEN=gen_)
         sc.finish(p, gen_)
         if p.returncode != 0:
@@ -2227,18 +2229,23 @@ def link_control(sc, source_sha):
         for name in PROGRAMS:
             got = sc.program(name)
             if got != (expected[gen_] or {}).get(name):
-                sc.gaps.append(f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}")
+                said = f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}"
+                sc.fail(said) if strict else sc.gaps.append(said)
     sc.notes["gap-count"] = len(sc.gaps)
 
 
-def archive_control(sc, source_sha):
+def link_strict(sc, source_sha):
+    link_control(sc, source_sha, True)
+
+
+def archive_control(sc, source_sha, strict=False):
     """No concurrency: GEN=a, then GEN=c, with a static archive of one name whose contents
     change. Not about leases; it says whether blaze relinks a program whose archive changed."""
     sc.project()
     extra = {"GEN_ARCHIVE": "same"}
     expected = {"a": sc.oracle("a", extra), "c": sc.oracle("c", extra)}
     sc.project()
-    for gen_ in ("a", "c"):
+    for gen_ in (("a", "c", "a") if strict else ("a", "c")):
         p = sc.client("a", GEN=gen_, **extra)
         sc.finish(p, gen_)
         if p.returncode != 0:
@@ -2247,8 +2254,76 @@ def archive_control(sc, source_sha):
         for name in PROGRAMS:
             got = sc.program(name)
             if got != (expected[gen_] or {}).get(name):
-                sc.gaps.append(f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}")
+                said = f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}"
+                sc.fail(said) if strict else sc.gaps.append(said)
     sc.notes["gap-count"] = len(sc.gaps)
+
+
+def archive_strict(sc, source_sha):
+    archive_control(sc, source_sha, True)
+
+
+def native_only(sc, source_sha):
+    """Same Rust inputs, directives and archive path; only the native archive's bytes change (the script reads them from a file):
+    97, 98, 97 as three builds of one worker, each compared with cargo's; then the archive is corrupted (a build that must not
+    be accepted as unchanged), restored with its size and time put back (and must link again), and a no-op build neither relinks
+    nor runs the script. Credit: the shape of this scenario is that of the prepared repair/pr12-native-inputs (7fc32028)."""
+    original = sc.project
+    current = [97]
+
+    def project(ws=None, config=None, pkg="gen"):
+        original(ws, config, pkg)
+        ws = ws or sc.ws
+        script = os.path.join(ws, "build.rs")
+        text = open(script).read()
+        text = text.replace("let value = gen_.bytes().next().unwrap_or(b'?') as i32;",
+                            'let value: i32 = fs::read_to_string("native-value.txt").unwrap().trim().parse().unwrap();')
+        text = text.replace('println!("cargo:rerun-if-env-changed=GEN");',
+                            'println!("cargo:rerun-if-env-changed=GEN");\n    println!("cargo:rerun-if-changed=native-value.txt");')
+        with open(script, "w") as f:
+            f.write(text)
+        with open(os.path.join(ws, "native-value.txt"), "w") as f:
+            f.write(str(current[0]))
+
+    sc.project = project
+    extra = {"GEN_ARCHIVE": "same"}
+    expected = {}
+    for value in (97, 98):
+        current[0] = value
+        expected[value] = sc.oracle("a", extra)
+    current[0] = 97
+    sc.project()
+    for index, value in enumerate((97, 98, 97)):
+        with open(os.path.join(sc.ws, "native-value.txt"), "w") as f:
+            f.write(str(value))
+        p = sc.client("a", GEN="a", **extra)
+        sc.finish(p, f"native-{index}-{value}")
+        if p.returncode != 0:
+            sc.fail(f"native-only {value}: rc={p.returncode}: {p.err[-600:]}")
+            return
+        sc.check_programs(f"native-{index}", sc.keep(f"native-{index}"), expected[value], "a")
+    archive = os.path.join(sc.run_dir(), "libgen.a")
+    valid, stamp = open(archive, "rb").read(), os.stat(archive).st_mtime_ns
+    with open(archive, "wb") as f:
+        f.write(b"not a native archive")
+    failed = sc.client("a", GEN="a", **extra)
+    sc.finish(failed, "broken-native-link")
+    if failed.returncode == 0:
+        sc.fail("a corrupt native archive was accepted as an unchanged successful build")
+    with open(archive, "wb") as f:
+        f.write(valid)
+    os.utime(archive, ns=(stamp, stamp))
+    retry = sc.client("a", GEN="a", **extra)
+    sc.finish(retry, "restored-native-link")
+    if retry.returncode != 0:
+        sc.fail(f"native restore after a failed link: rc={retry.returncode}: {retry.err[-600:]}")
+    sc.check_programs("native-restored", sc.keep("native-restored"), expected[97], "a")
+    runs = sc.runs()
+    noop = sc.client("a", GEN="a", **extra)
+    sc.finish(noop, "native-noop")
+    if noop.returncode != 0 or sc.runs() != runs:
+        sc.fail("a no-op build failed or ran the build script")
+    sc.check_programs("native-noop", sc.keep("native-noop"), expected[97], "a")
 
 
 SCENARIOS = {
@@ -2279,6 +2354,9 @@ SCENARIOS = {
     "worlds": worlds,
     "join": join,
     "archive-control": archive_control,
+    "link-strict": link_strict,
+    "archive-strict": archive_strict,
+    "native-only": native_only,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
     "cross-worker": lambda sc, sha: same_or_cross(sc, True, sha),
