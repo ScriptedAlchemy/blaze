@@ -568,8 +568,22 @@ mod tests {
                 (dep_hash, app_hash)
             });
             let path = paths::AbsPathBuf::assert_utf8(payload.clone());
+            let bodies = |db: &RootDatabase| {
+                let dep = *ide_db::base_db::all_crates(db).iter().find(|krate| {
+                    krate.extra_data(db).display_name.as_ref().unwrap().to_string() == "dep"
+                }).unwrap();
+                let declared = crate::declared_in(db, dep.into());
+                declared.functions.iter().map(|&id| {
+                    format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into()))
+                }).collect::<Vec<_>>()
+            };
+            let old_bodies = hir::attach_db(&db, || bodies(&db));
             std::fs::write(&payload, [byte + 10]).unwrap();
             assert!(db.reload_included_file(&path));
+            let new_bodies = hir::attach_db(&db, || bodies(&db));
+            if body.contains("pub fn value() -> u8 { include_bytes!") {
+                assert_ne!(old_bodies, new_bodies, "lowered body must depend on included bytes");
+            }
             let second = hir::attach_db(&db, || {
                 let crates = ide_db::base_db::all_crates(&db);
                 let app = *crates
