@@ -71,6 +71,9 @@ pub struct Host {
 /// What a spec is made in: where the command ran, with what, and the facts about this blaze that
 /// the command's flags and files cannot say.
 pub struct Context<'a> {
+    /// Materialized root of `source` (Git repository root, or the Root snapshot).
+    /// None means the selected workspace itself is the declared source root.
+    pub source_root: Option<&'a Path>,
     /// The directory the command was run in, absolute.
     pub cwd: &'a Path,
     /// The requester's environment, all of it: what is refused, carried or ignored is decided
@@ -276,6 +279,10 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
 
         let root = opened.workspace.root();
         let cwd = relative_cwd(ctx.cwd, root)?;
+        let source_root = ctx.source_root.unwrap_or(root);
+        let manifest = relative_cwd(opened.workspace.root_manifest(), source_root)?;
+        let workspace_manifest = blaze_wire::SourcePath::new(manifest)
+            .map_err(|error| Refusal::new("workspace manifest", error.to_string()))?;
         let lock: Digest = Sha256::digest(&graph.lock).into();
         let toolchain = ctx.toolchain;
 
@@ -292,6 +299,7 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             cwd,
             command: command_of(request, command),
             toolchain,
+            workspace_manifest,
         };
         let digest = digest_of(&build);
         let front_end = front_end_key(&build, &flags, &host.triple);
@@ -617,6 +625,7 @@ fn front_end_key(build: &BuildSpec, flags: &rustflags::Rustflags, triple: &str) 
         cfg_rustflags: Set::new(flags.cfg_flags()),
         toolchain: build.toolchain,
         triple: triple.to_owned(),
+        workspace_manifest: build.workspace_manifest.clone(),
     })
 }
 
@@ -632,5 +641,6 @@ fn config_key(build: &BuildSpec, kind: u8) -> ConfigKey {
         platform: build.platform,
         rustflags: Set::new(build.rustflags.clone()),
         toolchain: build.toolchain,
+        workspace_manifest: build.workspace_manifest.clone(),
     })
 }

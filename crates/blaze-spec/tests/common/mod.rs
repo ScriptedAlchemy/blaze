@@ -123,6 +123,7 @@ pub fn context<'a>(
 ) -> Context<'a> {
     let _ = fixture;
     Context {
+        source_root: None,
         cwd,
         env,
         host,

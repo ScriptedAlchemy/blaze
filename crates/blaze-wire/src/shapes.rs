@@ -9,6 +9,56 @@ use crate::cbor::Wire;
 use crate::{Digest, Named, Set};
 use crate::{wire_enum, wire_struct};
 
+/// A normalized UTF-8 path within the declared source root. `/` separates components;
+/// `.` denotes that root. No empty, dot, parent, backslash or NUL components are allowed.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourcePath(String);
+
+impl SourcePath {
+    /// Validates a portable source-relative path without canonicalizing malformed input.
+    pub fn new(path: String) -> Result<Self, crate::Error> {
+        if path != "."
+            && (path.is_empty()
+                || path.split('/').any(|part| {
+                    part.is_empty()
+                        || part == "."
+                        || part == ".."
+                        || part.contains(['\\', '\0', ':'])
+                }))
+        {
+            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
+        }
+        Ok(Self(path))
+    }
+
+    /// The normalized logical path, never an absolute checkout path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Wire for SourcePath {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        Self::new(String::decode(r)?).map_err(|mut error| {
+            error.at = at;
+            error
+        })
+    }
+}
+
+impl Named for SourcePath {
+    const NAME: &'static str = "SourcePath";
+}
+impl crate::vectors::Sample for SourcePath {
+    fn sample(g: &mut crate::vectors::Gen) -> Self {
+        Self(format!("workspace-{}/Cargo.toml", g.below(100)))
+    }
+}
+
 wire_struct! {
     /// What the native side of a build is: everything outside blaze that changes what is linked or
     /// how a program runs. An executor serves a job only on an equal platform.
@@ -54,6 +104,7 @@ wire_struct! {
     /// A build after cargo's configuration, workspace, feature and profile resolution: what
     /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
     BuildSpec {
+        validate validate_build_paths,
         0 => source: SourceRef,
         1 => lock: Digest,
         2 => units: Vec<UnitSpec>,
@@ -66,7 +117,16 @@ wire_struct! {
         9 => cwd: String,
         10 => command: Command,
         11 => toolchain: StoreIdentity,
+        12 => workspace_manifest: SourcePath,
     }
+}
+
+fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
+    SourcePath::new(spec.cwd.clone())?;
+    if spec.workspace_manifest.as_str() == "." {
+        return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
+    }
+    Ok(())
 }
 
 wire_struct! {
@@ -192,7 +252,7 @@ impl CrateRecord {
     }
 
     /// The signature of this record under `key`: Ed25519 over
-    /// `"blaze/sig/CrateRecord/v1" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
+    /// `"blaze/sig/CrateRecord/v2" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
     /// domain separation every other signature of the schema uses.
     pub fn sign(&self, key: &ed25519_dalek::SigningKey) -> [u8; 64] {
         use ed25519_dalek::Signer as _;
@@ -615,6 +675,7 @@ wire_struct! {
         2 => cfg_rustflags: Set<String>,
         3 => toolchain: StoreIdentity,
         4 => triple: String,
+        5 => workspace_manifest: SourcePath,
     }
 }
 
@@ -627,6 +688,7 @@ wire_struct! {
         3 => platform: Digest,
         4 => rustflags: Set<String>,
         5 => toolchain: StoreIdentity,
+        6 => workspace_manifest: SourcePath,
     }
 }
 

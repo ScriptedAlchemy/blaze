@@ -93,7 +93,7 @@ DEFAULT_BIN = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target", "rele
 # The five digests the contract prints, and what `spec` is made of (docs/distributed.md, "Data shapes").
 DIGESTS = ("spec", "platform", "front_end", "config", "job_content")
 SPEC_FIELDS = ("source", "lock", "units", "asked", "profile", "platform", "rustflags", "config_env",
-               "script_env", "cwd", "command", "toolchain")
+               "script_env", "cwd", "command", "toolchain", "workspace_manifest")
 UNIT_FIELDS = ("package", "target", "features", "cfg", "edition", "deps", "test", "host", "profile")
 PROFILE_FIELDS = ("name", "opt_level", "debug", "debug_assertions", "overflow_checks", "panic", "strip",
                   "split_debuginfo", "backend", "mir_opt", "backend_opt", "backend_emit")
@@ -2531,7 +2531,7 @@ def resolve(cwd, words, env):
     spec = {"0": source, "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
             "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_env.items()),
             "8": script_env, "9": "" if os.path.relpath(start, root) == "." else os.path.relpath(start, root),
-            "10": command, "11": sha("toolchain")}
+            "10": command, "11": sha("toolchain"), "12": os.path.relpath(os.path.join(root, "Cargo.toml"), checkout)}
     spec_digest = sha("spec" + canon(spec))
     digests = {"spec": spec_digest, "platform": plat_digest, "front_end": sha("front" + canon([docs, spec["1"], rustflags])),
                "config": sha("config" + canon([cmd, sorted(canon(docs[index[k]]) for k in asked), top, plat_digest, rustflags])),
@@ -2731,7 +2731,7 @@ def main():
         except Refused as r:
             sys.stderr.write("blaze: %s: %s\n" % (r.what, r.why))
             return 1
-        for i, name in enumerate(["source", "lock", "units", "asked", "profile", "platform", "rustflags", "config_env", "script_env", "cwd", "command", "toolchain"]):
+        for i, name in enumerate(["source", "lock", "units", "asked", "profile", "platform", "rustflags", "config_env", "script_env", "cwd", "command", "toolchain", "workspace_manifest"]):
             if canon(res["spec"][str(i)]) != canon(saved["spec"][str(i)]):
                 sys.stderr.write("blaze: the tree does not match the spec: %s\n" % name)
                 return 2

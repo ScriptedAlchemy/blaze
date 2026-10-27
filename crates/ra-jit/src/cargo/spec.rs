@@ -52,7 +52,8 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let env = std::env::vars().collect();
     let (host, identity) = host()?;
-    let ctx = context(&cwd, &env, &host, identity)?;
+    let source_root = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    let ctx = context(&cwd, &env, &host, identity, &source_root)?;
     let made = match blaze_spec::assemble::build_spec(&request, &ctx) {
         Ok(made) => made,
         Err(why) => return refused(&why),
@@ -130,6 +131,7 @@ fn context<'a>(
     env: &'a BTreeMap<String, String>,
     host: &'a Host,
     identity: StoreIdentity,
+    source_root: &'a Path,
 ) -> anyhow::Result<Context<'a>> {
     // A checkout without origin (including a local fixture) still has a stable repository
     // identity: its initial commit, not the absolute path it happens to live at.
@@ -137,6 +139,7 @@ fn context<'a>(
         .or_else(|_| git(cwd, &["rev-list", "--max-parents=0", "HEAD"]))?;
     let digest = Sha256::digest(repo.as_bytes());
     Ok(Context {
+        source_root: Some(source_root),
         cwd,
         env,
         host,
@@ -240,15 +243,16 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     let given: BuildSpec =
         blaze_wire::decode(&std::fs::read(file)?, &blaze_wire::Limits::default())?;
     let root = PathBuf::from(git(&std::env::current_dir()?, &["rev-parse", "--show-toplevel"])?);
-    let cwd = root.join(&given.cwd);
+    let (manifest, cwd) = blaze_spec::run::locations(&given, &root)?;
     let (host, identity) = host()?;
     let mut first = None;
     for candidate in blaze_spec::run::candidates(&given)? {
         let mut env: BTreeMap<String, String> =
             std::env::vars().filter(|(key, _)| !blaze_spec::run::governed(key)).collect();
         env.extend(candidate.env);
-        let request = Request::parse(candidate.command, &candidate.args)?;
-        let ctx = context(&cwd, &env, &host, identity)?;
+        let mut request = Request::parse(candidate.command, &candidate.args)?;
+        request.manifest_path = Some(manifest.to_string_lossy().into_owned());
+        let ctx = context(&cwd, &env, &host, identity, &root)?;
         match blaze_spec::assemble::build_spec(&request, &ctx) {
             Ok(made) if made.build == given => {
                 // The existing dispatcher can hand cold libraries, tests and doctests to

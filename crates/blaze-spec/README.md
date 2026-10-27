@@ -24,6 +24,9 @@ ra-jit cargo spec --run FILE
 
 The first command prints a JSON rendering for people, or cargo-shaped unit graph JSON.
 `--out` writes canonical CBOR. JSON is not an execution format or an identity input.
+Schema 2 keys the selected workspace root manifest relative to the materialized
+source root. `cwd` remains workspace-relative. Replay locates that manifest first;
+sibling workspaces cannot alias merely because their package metadata matches.
 Flag refusals print `refused.what` and `refused.why` and return status 2.
 The CLI reads blaze's own answer table and installed toolchain records for host facts.
 It does not execute rustc to discover them.

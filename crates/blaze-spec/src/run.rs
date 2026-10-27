@@ -17,6 +17,20 @@ use blaze_wire::{BuildSpec, Command, UnitSpec};
 use crate::Refusal;
 use crate::flags::Subcommand;
 
+/// Locate the saved workspace manifest and workspace-relative cwd in a materialized source.
+/// No repository-root fallback or package-name inference is used.
+pub fn locations(
+    spec: &BuildSpec,
+    source_root: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Refusal> {
+    let cwd = blaze_wire::SourcePath::new(spec.cwd.clone())
+        .map_err(|error| Refusal::new("cwd", error.to_string()))?;
+    let manifest = source_root.join(spec.workspace_manifest.as_str());
+    let workspace =
+        manifest.parent().ok_or_else(|| Refusal::new("workspace manifest", "has no parent"))?;
+    Ok((manifest.clone(), workspace.join(cwd.as_str())))
+}
+
 /// One way of saying a spec as a cargo command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reproduction {
@@ -234,6 +248,9 @@ pub fn first_difference(given: &BuildSpec, made: &BuildSpec) -> Option<String> {
     }
     if given.toolchain != made.toolchain {
         return Some("toolchain: this blaze is not the one that made the spec".to_owned());
+    }
+    if given.workspace_manifest != made.workspace_manifest {
+        return Some("workspace_manifest: the selected workspace is not the spec's".to_owned());
     }
     if given.lock != made.lock {
         return Some("lock: Cargo.lock is not the one the spec names".to_owned());

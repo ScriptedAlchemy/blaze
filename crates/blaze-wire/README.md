@@ -42,7 +42,7 @@ Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 
 ## Digests and signatures
 
-A digest is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
+A digest is `sha256("blaze/" ‖ name ‖ "/v2" ‖ 0x00 ‖ canonical CBOR of the value)`, where `name` is
 the type's name; a signature is Ed25519 over the same bytes with `sig/` in front of the name. The
 domain separation means a `WorkKey`'s and a `JobContentInput`'s bytes never collide even when their
 encodings do, and a signature can never be replayed as a digest or as another type's. [`digest_input`]
@@ -72,6 +72,22 @@ cargo run -p blaze-wire --example write_golden
 byte strings as lowercase hex, sets as arrays, and an enum as the wire's two-element array
 (`[discriminant, payload]`, `Namespace::Main` as `[0,null]`). It is never the wire and nothing's
 identity is taken from it.
+
+## Schema version 2
+
+Version 2 requires `BuildSpec.workspace_manifest` (field 12), a normalized path
+relative to the declared source root, and carries it in FrontEndKeyInput (5) and
+ConfigKeyInput (6). `cwd` remains relative to that workspace's directory. These
+are not absolute checkout paths or replacements for the source Git tree.
+SourcePath decoding rejects non-normalized paths; BuildSpec decoding also checks cwd.
+Missing location fields and unknown fields are rejected, not defaulted.
+
+This crate speaks schema 2 only. Version 1 requires a separately pinned codec at
+the transport negotiation boundary; this implementation does not advertise it or
+silently interpret its records as version 2. Every typed digest/signature domain
+is now `/v2`; golden vectors were regenerated. `/v1` HTTP routes and the
+`blaze/req/v1` request-authentication framing are transport contracts, unchanged.
+No version-1 cache identity can be reused as a version-2 typed digest.
 
 ## Limits
 

@@ -728,6 +728,8 @@ pub enum ErrorKind {
     },
     /// A text string that is not UTF-8.
     BadUtf8,
+    /// A logical source-relative path that is not normalized or escapes its root.
+    InvalidPath,
     /// Bytes after the one item a message is.
     TrailingBytes,
     /// Nesting past [`MAX_DEPTH`].
@@ -755,6 +757,7 @@ impl ErrorKind {
             ErrorKind::OversizeItem { .. } => "oversize item",
             ErrorKind::UnexpectedType { .. } => "unexpected type",
             ErrorKind::BadUtf8 => "text that is not UTF-8",
+            ErrorKind::InvalidPath => "invalid source-relative path",
             ErrorKind::TrailingBytes => "bytes after the item",
             ErrorKind::TooDeep => "nesting too deep",
         }
@@ -1144,7 +1147,7 @@ impl Wire for Bytes {
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
-        $name:ident { $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
+        $name:ident { $(validate $validator:path,)? $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1179,7 +1182,9 @@ macro_rules! wire_struct {
                     };
                 )*
                 r.map_end()?;
-                Ok($name { $($field),* })
+                let value = $name { $($field),* };
+                $($validator(&value)?;)?
+                Ok(value)
             }
         }
 
@@ -1190,7 +1195,7 @@ macro_rules! wire_struct {
         impl $crate::vectors::Sample for $name {
             fn sample(g: &mut $crate::vectors::Gen) -> Self {
                 $name {
-                    $($field: $crate::vectors::Sample::sample(g)),*
+                    $($field: $crate::wire_struct!(@sample $field, g)),*
                 }
             }
         }
@@ -1199,6 +1204,9 @@ macro_rules! wire_struct {
         <[()]>::len(&[$($crate::wire_struct!(@one $field)),*])
     };
     (@one $field:ident) => { () };
+    // BuildSpec's workspace-relative cwd is a normalized path, not arbitrary text.
+    (@sample cwd, $g:ident) => { ".".to_owned() };
+    (@sample $field:ident, $g:ident) => { $crate::vectors::Sample::sample($g) };
 }
 
 /// A schema type's enum: the two-element array `[discriminant, payload]`, the payload the payload
