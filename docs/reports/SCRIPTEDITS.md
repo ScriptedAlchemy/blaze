@@ -773,6 +773,35 @@ The container's HTTPS to crates.io was intercepted in this session, so the Linux
 crates of `Cargo.lock` as `cargo vendor --locked` wrote them on the Mac (mounted read-only) and the host's
 `rust-src` component; the failed batches before that are kept.
 
+### The choice is the request's, over the view and the join (`cc92886c` → this head)
+
+The seventh independent review found the choice kept only as a filter on the view: `add_once`, the split
+fallback of the join, chose `alike(V)` again, after the check had reloaded a checkout and so changed the loaded
+metadata `builds_alike` compares. With R1 and R2 loaded in full and R1's manifest made R2's (V's) before V's request,
+R1 was the checkout V was alike when the request was checked (its loaded manifest still selected `build.rs`, and
+the unused `build.rs` was the same), so R1 was reloaded and its new script judged for `b`; R1's new script then
+differs from V's, R2 became the checkout V is alike, the view of it was refused, and the join split V from R2,
+whose `a` scripts were not judged: V's program had `a`'s directives.
+The choice is now a typed state, `Sharing` (`Open` for a load that is not a request's join: the first, with `--also`, and
+a loaded project; `Alone`; `From(root)`), made once by `Checkouts::sharing` before the check, and given to `stale`
+(the checkout to judge), to `view_of` and to the join (`add`, `add_once`): `alike_by` finds only among the checkouts
+it allows. A choice that no longer holds loads the project on its own, with the request's owner and variables, which
+is legal. Nothing is run twice or keyed by variables; the first load is untouched.
+
+| Linux, split on, quick overlay; R1 and R2 loaded in full under `GEN=a` (no `split` line); R1's manifest made R2's; ONE request for V, `GEN=b`, build 5001 | baseline `cc92886c` | fixed |
+|---|---|---|
+| route | `split …/v` (from R2) | `join …/v` on its own |
+| trails gained | R1 `b B`, R2 none, V none | R1 `b B`, R2 none, V `b B` |
+| V's program | `include=a env=a cfg=a native=97` (cargo: `b b b 98`) | `include=b env=b cfg=b native=98` = cargo's |
+| control, no edit | V split from R2, R2 judged once for `b`, V `b b b 98` | the same |
+
+`quick-choice`, `first-join`, `first-join-shared`, `first-join-private` and `join` pass on the fixed binary in the same
+batch. Component: `Sharing::allows` / `judged` (open, alone, from one root; another root supplies nothing), with the
+other `scripts::`, `recovery::`, policy and `reached` tests: 42 passed. The Linux build and run need a pinned setup that the
+product does not do for itself: the registry crates of `Cargo.lock` from `cargo vendor --locked` (read-only), the host's
+`rust-src` for the toolchain, in a 6 GiB container (no extra swap), under the docker lock. Not shown: several candidates,
+mixed placed/split roots, root-changing reloads, intervening source edits.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
