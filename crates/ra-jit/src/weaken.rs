@@ -226,7 +226,7 @@ impl Drop for Replaced {
 }
 
 /// Makes a copy of the object at `base` with definitions also present in the patch made
-/// weak. ELF changes only global definitions replaced by global definitions; Mach-O also
+/// weak. Only strong external patch definitions replace the base's definitions; Mach-O also
 /// handles the strong C main that `ours` deliberately retains. `None` when nothing changes.
 /// It is linked after the patch
 /// with nothing said of duplicates ([`crate::cargo::plan::whole_link_args`]): the patch's
@@ -251,7 +251,10 @@ pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<Option<Repl
         if symbol_table(&patch).is_none() || symbol_table(&bytes).is_none() {
             return Ok(None);
         }
-        let names: FxHashSet<_> = defined(&patch).into_iter().collect();
+        let names = macho_defined(&patch);
+        if names.is_empty() {
+            return Ok(None);
+        }
         let original = bytes.clone();
         weaken_but(
             &mut bytes,
@@ -298,6 +301,17 @@ fn replacement_file(base: &Path) -> std::io::Result<(Replaced, std::fs::File)> {
     let path = PathBuf::from(path);
     let file = std::fs::File::options().read(true).write(true).create_new(true).open(&path)?;
     Ok((Replaced { path }, file))
+}
+
+/// Strong external definitions in a Mach-O patch. A weak definition must give way to an
+/// existing strong one, rather than make both weak and let command-line order choose.
+fn macho_defined(data: &[u8]) -> FxHashSet<&[u8]> {
+    use object::{Object as _, ObjectSymbol as _};
+    let Ok(file) = object::File::parse(data) else { return FxHashSet::default() };
+    file.symbols()
+        .filter(|symbol| symbol.is_definition() && symbol.is_global() && !symbol.is_weak())
+        .filter_map(|symbol| symbol.name_bytes().ok())
+        .collect()
 }
 
 /// The names a 64-bit little-endian ELF object defines with global binding: the ones another
@@ -349,7 +363,8 @@ fn elf_symbols(data: &[u8]) -> Option<ElfSymbols<'_>> {
 mod tests {
     use object::write::{Mangling, Object, Symbol, SymbolSection};
     use object::{
-        Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+        Architecture, BinaryFormat, Endianness, FileFlags, SectionKind, SymbolFlags, SymbolKind,
+        SymbolScope,
     };
 
     use super::*;
@@ -378,6 +393,29 @@ mod tests {
                 kind: SymbolKind::Text,
                 scope: SymbolScope::Dynamic,
                 weak: false,
+                section: SymbolSection::Section(text),
+                flags: SymbolFlags::None,
+            });
+        }
+        object.write().unwrap()
+    }
+
+    /// Mach-O definitions with explicit bindings, in independently coalescible atoms.
+    fn macho(functions: &[(&str, &[u8; 4], bool)]) -> Vec<u8> {
+        let mut object =
+            Object::new(BinaryFormat::MachO, Architecture::Aarch64, Endianness::Little);
+        object.set_mangling(Mangling::None);
+        object.flags = FileFlags::MachO { flags: object::macho::MH_SUBSECTIONS_VIA_SYMBOLS };
+        let text = object.add_section(b"__TEXT".to_vec(), b"__text".to_vec(), SectionKind::Text);
+        for &(name, bytes, weak) in functions {
+            let offset = object.append_section_data(text, bytes, 4);
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: offset,
+                size: 4,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak,
                 section: SymbolSection::Section(text),
                 flags: SymbolFlags::None,
             });
@@ -459,17 +497,17 @@ mod tests {
         assert!(replaced_offsets(b"not an object", &names).is_empty());
     }
 
-    /// `ld.lld`, which links the ELF objects of a test on any host: the toolchain's, which
-    /// the cargo that built the test is of, or one on the path. Nothing in the test runs rustc.
-    fn lld() -> Option<std::process::Command> {
+    /// An lld driver, which links the test's objects on any host: the toolchain's, which the
+    /// cargo that built the test is of, or one on the path. Nothing in the test runs rustc.
+    fn lld(name: &str) -> Option<std::process::Command> {
         let from_cargo = option_env!("CARGO").map(PathBuf::from).and_then(|cargo| {
             let sysroot = cargo.canonicalize().ok()?.parent()?.parent()?.to_owned();
-            let lld = crate::link::lld_dir(&sysroot)?.join("ld.lld");
-            Some((lld, Some(sysroot)))
+            let lld = crate::link::lld_dir(&sysroot)?.join(name);
+            lld.is_file().then_some((lld, Some(sysroot)))
         });
         let on_path = || {
-            Some((PathBuf::from("ld.lld"), None))
-                .filter(|_| std::process::Command::new("ld.lld").arg("--version").output().is_ok())
+            Some((PathBuf::from(name), None))
+                .filter(|_| std::process::Command::new(name).arg("--version").output().is_ok())
         };
         let (lld, sysroot) = from_cargo.or_else(on_path)?;
         let mut command = std::process::Command::new(lld);
@@ -483,7 +521,7 @@ mod tests {
     /// What lld says of linking `objects` in this order into an executable that starts at
     /// `entry`, with nothing said of duplicate definitions, and the executable if it linked.
     fn linked(objects: &[&Path], out: &Path) -> Result<Vec<u8>, String> {
-        let ran = lld()
+        let ran = lld("ld.lld")
             .expect("an ld.lld")
             .args(["-e", "entry"])
             .args(crate::cargo::plan::whole_link_args(false, out).unwrap())
@@ -495,6 +533,23 @@ mod tests {
         match ran.status.success() {
             true => Ok(std::fs::read(out).unwrap()),
             false => Err(String::from_utf8_lossy(&ran.stderr).into_owned()),
+        }
+    }
+
+    /// A freestanding Mach-O executable needs no SDK or native host to check link selection.
+    fn macho_linked(objects: &[&Path], out: &Path) -> Result<Vec<u8>, String> {
+        let ran = lld("ld64.lld")
+            .expect("an ld64.lld")
+            .args(["-arch", "arm64", "-platform_version", "macos", "11.0", "11.0", "-e", "_main"])
+            .args(objects)
+            .arg("-o")
+            .arg(out)
+            .output()
+            .unwrap();
+        if ran.status.success() {
+            Ok(std::fs::read(out).unwrap())
+        } else {
+            Err(String::from_utf8_lossy(&ran.stderr).into_owned())
         }
     }
 
@@ -510,7 +565,7 @@ mod tests {
 
     #[test]
     fn a_whole_builds_link_keeps_the_patch_and_the_linkers_other_errors() {
-        if lld().is_none() {
+        if lld("ld.lld").is_none() {
             eprintln!("skipped: no ld.lld to link with");
             return;
         }
@@ -582,6 +637,48 @@ mod tests {
         let path = copy.path().to_owned();
         drop(copy);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_macho_patch_preserves_strong_definitions_and_other_duplicate_errors() {
+        if lld("ld64.lld").is_none() {
+            eprintln!("skipped: no ld64.lld to link with");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let mut original =
+            macho(&[("_main", b"BASE", false), ("___ra_jit_global_alloc", b"ALOC", false)]);
+        ours(&mut original);
+        let base = write("base.o", &original);
+        let patch = write(
+            "patch.o",
+            &macho(&[("_main", b"PTCH", false), ("___ra_jit_global_alloc", b"WEAK", true)]),
+        );
+        let first = write("first.o", &macho(&[("_clash", b"ONE.", false)]));
+        let second = write("second.o", &macho(&[("_clash", b"TWO.", false)]));
+        let out = dir.path().join("exe");
+        let said = macho_linked(&[&patch, &base], &out).unwrap_err();
+        assert!(said.contains("duplicate symbol: _main"), "{said}");
+        let copy = replaced(&base, &patch).unwrap().unwrap();
+        for inputs in [[patch.as_path(), copy.path()], [copy.path(), patch.as_path()]] {
+            let linked = macho_linked(&inputs, &out).unwrap();
+            assert_eq!(code_of(&linked, "_main"), b"PTCH");
+            assert_eq!(code_of(&linked, "___ra_jit_global_alloc"), b"ALOC");
+        }
+        let said = macho_linked(&[&patch, copy.path(), &first, &second], &out).unwrap_err();
+        assert!(said.contains("duplicate symbol: _clash"), "{said}");
+        assert!(!said.contains("duplicate symbol: _main"), "{said}");
+        assert_eq!(std::fs::read(&base).unwrap(), original);
+
+        // Weak definitions in a patch cannot overrule the whole object's strong ones.
+        let weak = write("weak.o", &macho(&[("_main", b"WEAK", true)]));
+        assert_eq!(code_of(&macho_linked(&[&weak, &base], &out).unwrap(), "_main"), b"BASE");
+        assert!(replaced(&base, &weak).unwrap().is_none());
     }
 
     #[test]
