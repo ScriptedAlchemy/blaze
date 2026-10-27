@@ -51,7 +51,7 @@ use serde_json::json;
 /// Where below the target directory the scripts are compiled and run.
 const DIR: &str = "ra-jit/build-scripts";
 
-pub(crate) use leases::{Busy, anonymous, generation, set_waker, watch};
+pub(crate) use leases::{Busy, Stale, anonymous, generation, set_waker, watch};
 use leases::{Leases, Refused};
 
 /// What this process's builds judged and hold.
@@ -70,11 +70,34 @@ pub(crate) fn release(build: u64) {
     LEASES.retire(build);
 }
 
-/// Has `build`, a consumer that judged no script itself (an edit, a rebuild nobody asked for),
-/// hold the output of the scripts this process last judged while it compiles and links, for as
-/// long as it lives. A script that is being run is waited for; nothing else is.
-pub(crate) fn hold_loaded(build: u64) -> Result<usize, String> {
-    LEASES.hold_loaded(build)
+/// The scripts a database was loaded from: the run directory of each, with the token of the run
+/// it was loaded from (the hash of the record the run left, [`token_of`]).
+pub(crate) type World = Vec<(PathBuf, u64)>;
+
+/// The token of the run in `run_dir`: what its record says now, or `None` when there is none.
+pub(crate) fn token_of(run_dir: &Path) -> Option<u64> {
+    let record: Fingerprint =
+        serde_json::from_slice(&std::fs::read(run_dir.join("blaze-run.json")).ok()?).ok()?;
+    Some(record.hash())
+}
+
+/// One consumer of `build` reading the output of a world, until it is dropped: a compile or a
+/// link, with the errors and the link that is detached from the request.
+pub(crate) struct Pin {
+    build: u64,
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        LEASES.unpin(self.build);
+    }
+}
+
+/// Has `build` read `world`: its shared leases are taken before anything is read, and a world
+/// that moved since the database was loaded from it is [`Stale`] and held for nothing.
+pub(crate) fn pin(build: u64, world: &[(PathBuf, u64)]) -> Result<Pin, Stale> {
+    LEASES.pin(build, world)?;
+    Ok(Pin { build })
 }
 
 /// The number of the load of a process that no daemon's build started, made once.
@@ -164,6 +187,8 @@ pub(crate) struct Own {
     pub(crate) host: String,
     pub(crate) target: String,
     pub(crate) packages: FxHashMap<String, bool>,
+    /// The scripts the workspace was loaded from, with the token of each run: set when it is.
+    pub(crate) world: World,
 }
 
 impl Own {
@@ -190,7 +215,7 @@ impl Own {
 pub(crate) fn run(
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<project_model::WorkspaceBuildScripts> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
     run_with(&LEASES, workspace, asked)
 }
 
@@ -198,16 +223,19 @@ fn run_with(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<project_model::WorkspaceBuildScripts> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
     let deferrable = DEFERRABLE.load(std::sync::atomic::Ordering::SeqCst);
-    let said = retrying(deferrable, || attempt(leases, workspace, asked));
-    said
+    retrying(asked.build, deferrable, || attempt(leases, workspace, asked))
 }
 
 /// The result of `once`, asked again for as long as it waits for another process, unless the
 /// caller `defers` that. The admission a build has is kept across the wait, and let go by the
 /// attempt that ends in anything else ([`attempt`]).
-fn retrying<T>(defers: bool, mut once: impl FnMut() -> Result<T, Attempt>) -> anyhow::Result<T> {
+fn retrying<T>(
+    build: u64,
+    defers: bool,
+    mut once: impl FnMut() -> Result<T, Attempt>,
+) -> anyhow::Result<T> {
     loop {
         match once() {
             Ok(done) => return Ok(done),
@@ -219,7 +247,7 @@ fn retrying<T>(defers: bool, mut once: impl FnMut() -> Result<T, Attempt>) -> an
                 }
                 busy => {
                     if let Busy::Elsewhere { path } = &busy {
-                        watch(path);
+                        watch(path, build);
                     }
                     return Err(anyhow::Error::new(busy));
                 }
@@ -259,9 +287,13 @@ fn attempt(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<project_model::WorkspaceBuildScripts, Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
     let said = pass(leases, workspace, asked);
-    if !matches!(said, Err(Attempt::Busy(_))) {
+    if matches!(said, Err(Attempt::Busy(_))) {
+        // A build that waits holds nothing that is not read: what it holds, a build that has
+        // the admission and waits for it, or one that waits for what it holds, would wait for.
+        leases.yield_world(asked.build);
+    } else {
         leases.release_admission(asked.build);
     }
     said
@@ -271,9 +303,9 @@ fn pass(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<project_model::WorkspaceBuildScripts, Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
-        return Ok(project_model::WorkspaceBuildScripts::default());
+        return Ok((project_model::WorkspaceBuildScripts::default(), World::new()));
     };
     let target: &Path = cargo.target_directory().as_ref();
     // A request that names no build judges and runs inside one critical section, as one that
@@ -314,8 +346,9 @@ fn pass(
             .to_string(),
         );
     }
-    leases.set_loaded(runner.judged.clone());
-    Ok(project_model::WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str)))
+    let said =
+        project_model::WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
+    Ok((said, runner.judged.clone()))
 }
 
 /// A script that ran, or whose last run stands.
@@ -350,7 +383,7 @@ struct Runner<'a> {
     base: PathBuf,
     done: FxHashMap<(Package, bool), Result<Arc<Done>, String>>,
     /// The run directories of the scripts this pass judged.
-    judged: Vec<PathBuf>,
+    judged: World,
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
 }
@@ -520,7 +553,7 @@ impl<'a> Runner<'a> {
         let run_dir = blaze_build_script::run::run_dir(&probe).to_owned();
         match self.leases.judged(self.asked.build, &run_dir) {
             Some(Ok(done)) => {
-                self.judged.push(run_dir);
+                self.judged.push((run_dir, done.fingerprint));
                 return Ok(Some(done));
             }
             Some(Err(failed)) => return Err(failed),
@@ -646,7 +679,7 @@ impl<'a> Runner<'a> {
             }
             None => self.leases.record(build, &run_dir, Ok(done.clone())),
         }
-        self.judged.push(run_dir);
+        self.judged.push((run_dir, done.fingerprint));
         Ok(done)
     }
 

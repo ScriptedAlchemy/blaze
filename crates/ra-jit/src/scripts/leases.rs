@@ -24,11 +24,22 @@
 //!    retired. Nothing it waits for waits for it: a reader is a build that has judged all its
 //!    scripts, and its later requests are answered from what it kept (judgments are immutable
 //!    results, by (build, run directory)) and need no admission and no lease.
-//! 3. A build that holds leases and finds it needs the admission (its scripts changed within the
-//!    build) is refused at once and does not wait, as it would hold what the build that has the
-//!    admission waits for.
+//! 3. A build that holds leases and is refused the admission or a lease it needs (a script
+//!    group it did not judge before, a script a reader of another build holds) **yields**: it lets
+//!    go of what it holds that no consumer of its is reading, and forgets what it judged, and then
+//!    waits holding nothing. If one of its consumers is reading, it lets go when the last ends
+//!    ([`Pin`]). So nothing waits while it holds what no one is reading, and a wait is never
+//!    in a cycle: the leases a waiter holds protect a consumer that never waits.
 //! 4. The admission is let go when an attempt ends in anything but a wait, and when the build is
 //!    retired. The builds put off are asked again then.
+//!
+//! What a consumer reads is a **world**: the run directories of the scripts of the checkouts the
+//! database was loaded from, each with the token of the record the run left
+//! (`blaze-run.json`) when the build judged it. A consumer takes its [`Pin`] on the world of
+//! the database it reads, before its first read: shared leases on all of it, and the tokens are
+//! looked at again, so that a database loaded from one output is never read together with
+//! another's. A world that moved is not read: the request is answered that it did, and the
+//! next judges again.
 //!
 //! Waits are not here: [`Busy`] is the answer, and the caller puts the request off. The worker
 //! asks again when [`generation`] has moved since it began: a retirement, an admission let go and
@@ -37,8 +48,9 @@
 //!
 //! Every consumer of a script's output has an owner: a numbered build, the request's own
 //! anonymous number ([`anonymous`], released when the request is dropped), or the load of a
-//! process that has no daemon (its first program is built under it). A request that names no
-//! build (`build == 0` below) keeps nothing.
+//! process that has no daemon (its first program is built under it; a checkout joined later is
+//! loaded for the request that asked). A request that names no build (`build == 0` below)
+//! keeps nothing.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -137,26 +149,29 @@ pub(crate) fn anonymous() -> u64 {
     NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
-/// The files of other processes that are being watched for being freed.
-static WATCHING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
-
 /// Moves [`generation`] when `path`, held by another process, is free to be taken: a thread
-/// of its own polls it, so that the worker's main loop does not.
-pub(crate) fn watch(path: &Path) {
-    let mut watching = WATCHING.lock().unwrap_or_else(|it| it.into_inner());
-    if !watching.get_or_insert_with(HashSet::default).insert(path.to_owned()) {
+/// of its own polls it, so that the worker's main loop does not. It is for `build` and ends
+/// when no build that asked is left, however long the file stays held.
+pub(crate) fn watch(path: &Path, build: u64) {
+    let new = {
+        let mut map = interest();
+        let owners = map.get_or_insert_with(HashMap::default).entry(path.to_owned()).or_default();
+        let new = owners.is_empty();
+        owners.insert(build);
+        new
+    };
+    if !new {
         return;
     }
-    drop(watching);
     let path = path.to_owned();
     std::thread::spawn(move || {
-        let _ = wait(&path, None);
-        WATCHING
-            .lock()
-            .unwrap_or_else(|it| it.into_inner())
-            .get_or_insert_with(HashSet::default)
-            .remove(&path);
-        moved();
+        let wanted =
+            || interest().as_ref().and_then(|it| it.get(&path)).is_some_and(|it| !it.is_empty());
+        let freed = wait_while(&path, None, &wanted).is_ok_and(|ended| !ended);
+        interest().get_or_insert_with(HashMap::default).remove(&path);
+        if freed {
+            moved();
+        }
     });
 }
 
@@ -164,6 +179,16 @@ pub(crate) fn watch(path: &Path) {
 /// end, as cargo waits for the build directory. A message every half minute says what is waited
 /// for. It takes the file and gives it back: the attempt that follows takes it again.
 pub(super) fn wait(path: &Path, within: Option<Duration>) -> Result<(), String> {
+    wait_while(path, within, &|| true).map(|_| ())
+}
+
+/// [`wait`] for as long as `wanted` says someone is waiting for it: `Ok(true)` when it ended
+/// because nobody was, `Ok(false)` when the file was free.
+fn wait_while(
+    path: &Path,
+    within: Option<Duration>,
+    wanted: &dyn Fn() -> bool,
+) -> Result<bool, String> {
     let file = open(path).map_err(|it| match it {
         Refused::Failed(why) => why,
         Refused::Busy(busy) => busy.to_string(),
@@ -175,10 +200,13 @@ pub(super) fn wait(path: &Path, within: Option<Duration>) -> Result<(), String> 
         match file.try_lock() {
             Ok(()) => {
                 let _ = file.unlock();
-                return Ok(());
+                return Ok(false);
             }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(err)) => return Err(err.to_string()),
+        }
+        if !wanted() {
+            return Ok(true);
         }
         let waited = began.elapsed();
         if within.is_some_and(|it| waited >= it) {
@@ -208,9 +236,18 @@ struct State {
     held: HashMap<(u64, PathBuf), File>,
     /// The admissions, by the file: the build that has it and the lock.
     admission: HashMap<PathBuf, (u64, File)>,
-    /// The run directories of the scripts the process last judged: what its loaded workspace
-    /// reads, which a build that judged nothing itself reads as well.
-    loaded: Vec<PathBuf>,
+    /// How many consumers of each build are reading its output now ([`Pin`]s).
+    consumers: HashMap<u64, usize>,
+    /// The builds that yielded while a consumer of theirs was reading: they let go when it ends.
+    yielding: HashSet<u64>,
+}
+
+/// The files of other processes that builds wait for, and which builds: a watch ends when none
+/// of them is left.
+static INTEREST: Mutex<Option<HashMap<PathBuf, HashSet<u64>>>> = Mutex::new(None);
+
+fn interest() -> std::sync::MutexGuard<'static, Option<HashMap<PathBuf, HashSet<u64>>>> {
+    INTEREST.lock().unwrap_or_else(|it| it.into_inner())
 }
 
 impl Leases {
@@ -241,18 +278,13 @@ impl Leases {
             }
             None => {}
         }
-        let reading = state.held.keys().any(|it| it.0 == build);
         let file = open(&path)?;
         match file.try_lock() {
             Ok(()) => {
+                state.yielding.remove(&build);
                 state.admission.insert(path, (build, file));
                 Ok(())
             }
-            Err(std::fs::TryLockError::WouldBlock) if reading => Err(Refused::Failed(
-                "the build scripts of this build changed while it was reading their output, \
-                 and another build is running scripts: ask again"
-                    .to_owned(),
-            )),
             Err(std::fs::TryLockError::WouldBlock) => Err(Busy::Elsewhere { path }.into()),
             Err(std::fs::TryLockError::Error(err)) => Err(Refused::Failed(err.to_string())),
         }
@@ -335,15 +367,7 @@ impl Leases {
     /// How many leases it held.
     pub(super) fn retire(&self, build: u64) -> usize {
         let mut state = self.state();
-        state.judged.retain(|(it, _), _| *it != build);
-        let held: Vec<_> = state.held.keys().filter(|(it, _)| *it == build).cloned().collect();
-        let released = held.len();
-        for key in held {
-            if let Some(file) = state.held.remove(&key) {
-                // An unlock, not a close: a process forked meanwhile may hold the description.
-                let _ = file.unlock();
-            }
-        }
+        let released = release_world(&mut state, build);
         let admitted: Vec<_> =
             state.admission.iter().filter(|it| it.1.0 == build).map(|it| it.0.clone()).collect();
         for path in admitted {
@@ -351,42 +375,109 @@ impl Leases {
                 let _ = file.unlock();
             }
         }
+        state.consumers.remove(&build);
+        state.yielding.remove(&build);
         drop(state);
+        if let Some(map) = interest().as_mut() {
+            map.values_mut().for_each(|it| _ = it.remove(&build));
+        }
         moved();
         released
     }
 
-    /// The run directories of the scripts the last attempt judged.
-    pub(super) fn set_loaded(&self, run_dirs: Vec<PathBuf>) {
-        self.state().loaded = run_dirs;
+    /// `build` is refused what it waits for: it lets go of what it holds that no consumer of its
+    /// is reading, and of what it judged, so that it waits holding nothing; with a consumer
+    /// reading, it does when the last ends. Not the build that has the admission: what it holds
+    /// is what the readers it waits for wait for nothing of. Whether it let go now.
+    pub(super) fn yield_world(&self, build: u64) -> bool {
+        if build == 0 {
+            return false;
+        }
+        let mut state = self.state();
+        if state.admission.values().any(|it| it.0 == build) {
+            return false;
+        }
+        let holds = state.held.keys().any(|it| it.0 == build)
+            || state.judged.keys().any(|it| it.0 == build);
+        if !holds {
+            return false;
+        }
+        if state.consumers.get(&build).is_some_and(|it| *it > 0) {
+            state.yielding.insert(build);
+            return false;
+        }
+        release_world(&mut state, build);
+        drop(state);
+        moved();
+        true
     }
 
-    /// Has `build`, a consumer that judged nothing, hold the output of the scripts the process
-    /// last judged, waiting for a script that is running: shared, so as to wait for nothing a
-    /// reader holds. A reader never waits for the admission, so this cannot be waited on by one.
-    pub(super) fn hold_loaded(&self, build: u64) -> Result<usize, String> {
+    /// Has `build` read the output of the scripts of `world`, each with the token of the run
+    /// it was loaded from: shared leases on all of it, taken before anything is read, and the
+    /// tokens looked at after. A script that is running is waited for, which it ends by itself.
+    /// A world that moved since is [`Stale`], and nothing of it is held for this call.
+    pub(super) fn pin(&self, build: u64, world: &[(PathBuf, u64)]) -> Result<(), Stale> {
         if build == 0 {
-            return Ok(0);
+            return Ok(());
         }
-        let dirs: Vec<PathBuf> = {
-            let state = self.state();
-            let held = |dir: &PathBuf| state.held.contains_key(&(build, dir.clone()));
-            state.loaded.iter().filter(|dir| !held(dir)).cloned().collect()
-        };
-        let mut taken = 0;
-        for dir in dirs {
-            let path = dir.join(FILE);
-            let file = open(&path).map_err(|it| match it {
-                Refused::Failed(why) => why,
-                Refused::Busy(busy) => busy.to_string(),
-            })?;
-            file.lock_shared().map_err(|it| format!("{}: {it}", path.display()))?;
-            if let Some(old) = self.state().held.insert((build, dir), file) {
-                let _ = old.unlock();
+        let mut taken = Vec::new();
+        let mut failed = None;
+        for (dir, token) in world {
+            let key = (build, dir.clone());
+            let held = self.state().held.contains_key(&key);
+            if !held {
+                let path = dir.join(FILE);
+                let file = match open(&path) {
+                    Ok(it) => it,
+                    Err(why) => {
+                        failed = Some(Stale { run_dir: dir.clone(), why: format!("{why:?}") });
+                        break;
+                    }
+                };
+                if let Err(err) = file.lock_shared() {
+                    failed = Some(Stale { run_dir: dir.clone(), why: err.to_string() });
+                    break;
+                }
+                if let Some(old) = self.state().held.insert(key.clone(), file) {
+                    let _ = old.unlock();
+                }
+                taken.push(key);
             }
-            taken += 1;
+            if super::token_of(dir) != Some(*token) {
+                failed = Some(Stale { run_dir: dir.clone(), why: "it was run again".to_owned() });
+                break;
+            }
         }
-        Ok(taken)
+        if let Some(stale) = failed {
+            let mut state = self.state();
+            for key in taken {
+                if let Some(file) = state.held.remove(&key) {
+                    let _ = file.unlock();
+                }
+            }
+            return Err(stale);
+        }
+        *self.state().consumers.entry(build).or_default() += 1;
+        Ok(())
+    }
+
+    /// One consumer of `build` is done reading.
+    pub(super) fn unpin(&self, build: u64) {
+        if build == 0 {
+            return;
+        }
+        let mut state = self.state();
+        let Some(count) = state.consumers.get_mut(&build) else { return };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        state.consumers.remove(&build);
+        if state.yielding.remove(&build) {
+            release_world(&mut state, build);
+            drop(state);
+            moved();
+        }
     }
 
     /// The builds that hold something, for the tests.
@@ -405,6 +496,40 @@ impl Leases {
         builds
     }
 }
+
+/// What a build judged and the leases it holds, let go. How many leases.
+fn release_world(state: &mut State, build: u64) -> usize {
+    state.judged.retain(|(it, _), _| *it != build);
+    let held: Vec<_> = state.held.keys().filter(|(it, _)| *it == build).cloned().collect();
+    let released = held.len();
+    for key in held {
+        if let Some(file) = state.held.remove(&key) {
+            // An unlock, not a close: a process forked meanwhile may hold the description.
+            let _ = file.unlock();
+        }
+    }
+    released
+}
+
+/// A world that moved since the database was loaded from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stale {
+    pub(crate) run_dir: PathBuf,
+    pub(crate) why: String,
+}
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the output of the build script in {} is not what the database was loaded from ({})",
+            self.run_dir.display(),
+            self.why
+        )
+    }
+}
+
+impl std::error::Error for Stale {}
 
 fn open(path: &Path) -> Result<File, Refused> {
     if let Some(parent) = path.parent() {
@@ -463,6 +588,8 @@ impl Drop for Writer<'_> {
 mod tests {
     use std::time::Duration;
 
+    use blaze_build_script::fresh::Fingerprint;
+
     use super::*;
 
     fn dir(test: &str) -> PathBuf {
@@ -472,11 +599,20 @@ mod tests {
         dir
     }
 
-    fn done(out: &Path) -> Arc<Done> {
+    /// The record a run leaves, and its token.
+    fn record(run_dir: &Path, marker: &str) -> u64 {
+        let fingerprint = Fingerprint { rustc: marker.to_owned(), ..Default::default() };
+        std::fs::create_dir_all(run_dir).unwrap();
+        std::fs::write(run_dir.join("blaze-run.json"), serde_json::to_vec(&fingerprint).unwrap())
+            .unwrap();
+        fingerprint.hash()
+    }
+
+    fn done(out: &Path, token: u64) -> Arc<Done> {
         Arc::new(Done {
             out_dir: out.to_owned(),
             output: Default::default(),
-            fingerprint: 0,
+            fingerprint: token,
             made: None,
             links: None,
         })
@@ -490,10 +626,13 @@ mod tests {
         }
     }
 
-    /// A script run by `build` that stands: its admission, its run, its lease.
-    fn runs(leases: &Leases, build: u64, base: &Path, run_dir: &Path) {
+    /// A script run by `build` that stands: its admission, its run, its lease. Its token.
+    fn runs(leases: &Leases, build: u64, base: &Path, run_dir: &Path, marker: &str) -> u64 {
         leases.admit(build, base).unwrap();
-        leases.writer(build, run_dir).unwrap().stands(done(run_dir)).unwrap();
+        let writer = leases.writer(build, run_dir).unwrap();
+        let token = record(run_dir, marker);
+        writer.stands(done(run_dir, token)).unwrap();
+        token
     }
 
     #[test]
@@ -512,16 +651,18 @@ mod tests {
     }
 
     #[test]
-    fn another_processs_admission_is_waited_for_and_a_reader_does_not_wait_for_it() {
+    fn another_processs_admission_is_waited_for_and_never_a_failure_of_a_reader() {
         let (base, x) = (dir("elsewhere-admission"), dir("elsewhere-admission-x"));
         let (first, second) = (Leases::default(), Leases::default());
         first.admit(1, &base).unwrap();
         assert!(matches!(busy(second.admit(2, &base)), Busy::Elsewhere { .. }));
         assert!(wait(&base.join(ADMISSION), Some(Duration::from_millis(60))).is_err());
-        // A build that reads output must not wait for the admission of another, which waits for
-        // its output in turn: it is told so at once.
+        // A build that reads output and needs the admission of another is put off like any,
+        // not refused: it yields what it holds and waits for it.
         second.hold(2, &x).unwrap();
-        assert!(matches!(second.admit(2, &base), Err(Refused::Failed(_))));
+        assert!(matches!(busy(second.admit(2, &base)), Busy::Elsewhere { .. }));
+        assert!(second.yield_world(2), "it reads nothing now, so it lets go");
+        assert!(second.builds().is_empty());
         first.release_admission(1);
         wait(&base.join(ADMISSION), Some(Duration::from_secs(5))).unwrap();
         let _ = std::fs::remove_dir_all(&base);
@@ -533,7 +674,7 @@ mod tests {
         let (base, x) = (dir("judged"), dir("judged-x"));
         let leases = Leases::default();
         assert!(leases.judged(1, &x).is_none());
-        runs(&leases, 1, &base, &x);
+        runs(&leases, 1, &base, &x, "one");
         let first = leases.judged(1, &x).unwrap().unwrap();
         // Another build asks to run it: it is held, so it is put off, and the result stands.
         leases.release_admission(1);
@@ -552,9 +693,7 @@ mod tests {
     fn what_moves_is_seen_by_a_request_that_slept_on_the_generation_it_read() {
         let (base, x) = (dir("generation"), dir("generation-x"));
         let leases = Leases::default();
-        runs(&leases, 1, &base, &x);
-        // A request reads the generation, is put off, and the build it waits for ends before it
-        // is queued: it sees that the generation is not the one it read.
+        runs(&leases, 1, &base, &x, "one");
         let read = generation();
         leases.retire(1);
         assert_ne!(generation(), read);
@@ -566,55 +705,163 @@ mod tests {
         let _ = std::fs::remove_dir_all(&x);
     }
 
+    /// The review's multi-group sequence: a build holds the group it judged, another build owns
+    /// the admission and waits for what the first reads, and the first needs another group. In
+    /// one process it was a wait without end; in two, a refusal.
     #[test]
-    fn a_consumer_that_judged_nothing_holds_what_was_last_judged_until_it_is_released() {
-        let (base, x) = (dir("loaded"), dir("loaded-x"));
+    fn a_reader_that_needs_another_group_yields_what_it_holds_and_the_writer_goes_on() {
+        let (base, r, s) = (dir("growth"), dir("growth-r"), dir("growth-s"));
+        for processes in [false, true] {
+            let _ = std::fs::remove_dir_all(&r);
+            let (reader, writer) = match processes {
+                false => (Arc::new(Leases::default()), None),
+                true => (Arc::new(Leases::default()), Some(Leases::default())),
+            };
+            let writer_side = writer.as_ref().unwrap_or(&reader);
+            // M judged R and its admission is over: it holds R.
+            runs(&reader, 1, &base, &r, "r1");
+            reader.release_admission(1);
+            // W owns the admission and must run R, which M reads: it waits.
+            writer_side.admit(2, &base).unwrap();
+            let waiting = busy(writer_side.writer(2, &r));
+            assert!(matches!(waiting, Busy::Process { .. } | Busy::Elsewhere { .. }));
+            // M's next request needs another group: the admission is W's, and M is put off,
+            // not failed. M reads nothing at the moment, so it lets go of R and waits.
+            let refused = busy(reader.admit(1, &base));
+            assert!(matches!(refused, Busy::Process { .. } | Busy::Elsewhere { .. }));
+            assert!(reader.yield_world(1));
+            assert!(reader.judged(1, &r).is_none() && !reader.builds().contains(&1));
+            // W goes on, and ends; M asks again and gets the admission.
+            let token = record(&r, "r2");
+            writer_side.writer(2, &r).unwrap().stands(done(&r, token)).unwrap();
+            writer_side.release_admission(2);
+            reader.admit(1, &base).unwrap();
+            reader.release_admission(1);
+            writer_side.retire(2);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Two direct loads with `--also` in opposite orders over one target directory: each
+    /// judged its first group and needs the second, which the other judged.
+    #[test]
+    fn opposite_group_orders_both_finish_whoever_holds_what() {
+        let (base, r, s) = (dir("opposite"), dir("opposite-r"), dir("opposite-s"));
+        let (a, b) = (Leases::default(), Leases::default());
+        // A judged R, B judged S; each let go of the admission between its groups.
+        runs(&a, 1, &base, &r, "r-a");
+        a.release_admission(1);
+        runs(&b, 2, &base, &s, "s-b");
+        b.release_admission(2);
+        // A's second group is S: B reads it, so A waits, and keeps the admission.
+        a.admit(1, &base).unwrap();
+        assert!(matches!(busy(a.writer(1, &s)), Busy::Elsewhere { .. }));
+        assert!(!a.yield_world(1), "it has the admission: what it holds is waited for by no one");
+        // B's second group is R: the admission is A's, so B is put off (no failure), and it
+        // yields S, which A waits for.
+        assert!(matches!(busy(b.admit(2, &base)), Busy::Elsewhere { .. }));
+        assert!(b.yield_world(2));
+        // A goes on and ends; B follows over what A left: R is read by A, so it waits for A.
+        let token = record(&s, "s-a");
+        a.writer(1, &s).unwrap().stands(done(&s, token)).unwrap();
+        a.release_admission(1);
+        b.admit(2, &base).unwrap();
+        b.hold(2, &s).unwrap();
+        assert!(matches!(busy(b.writer(2, &r)), Busy::Elsewhere { .. }));
+        a.retire(1);
+        let token = record(&r, "r-b");
+        b.writer(2, &r).unwrap().stands(done(&r, token)).unwrap();
+        b.release_admission(2);
+        b.retire(2);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn a_consumer_reads_nothing_it_has_not_pinned_and_a_build_that_yields_waits_for_its_end() {
+        let (base, x) = (dir("pin"), dir("pin-x"));
         let leases = Leases::default();
-        runs(&leases, 1, &base, &x);
-        leases.set_loaded(vec![x.clone()]);
-        leases.retire(1);
-        // The request that carries no build has one of its own.
-        let own = anonymous();
-        assert_eq!(leases.hold_loaded(own).unwrap(), 1);
-        assert_eq!(leases.hold_loaded(own).unwrap(), 0);
+        let token = runs(&leases, 1, &base, &x, "one");
+        leases.release_admission(1);
+        let world = vec![(x.clone(), token)];
+        leases.pin(1, &world).unwrap();
+        // Another build is put off; the one that holds lets go only when its consumer is done.
         leases.admit(2, &base).unwrap();
-        assert!(matches!(busy(leases.writer(2, &x)), Busy::Process { .. }));
-        leases.retire(own);
+        assert!(matches!(busy(leases.writer(2, &x)), Busy::Process { build: 1, .. }));
+        assert!(!leases.yield_world(1), "a consumer reads it");
+        assert!(matches!(busy(leases.writer(2, &x)), Busy::Process { build: 1, .. }));
+        leases.unpin(1);
         leases.writer(2, &x).unwrap();
+        assert!(leases.builds().iter().all(|it| *it != 1));
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&x);
     }
 
-    /// The review's opposite orders: C reads X; A runs Y and then wants X; B finds X fresh and
-    /// wants Y. With the admission B holds nothing while A waits, and neither waits for the other.
     #[test]
-    fn builds_that_take_the_scripts_in_opposite_orders_cannot_wait_for_each_other() {
-        let (base, x, y) = (dir("coab"), dir("coab-x"), dir("coab-y"));
-        let (c, a, b) = (Leases::default(), Leases::default(), Leases::default());
-        // C reads X, and its build goes on.
-        runs(&c, 1, &base, &x);
-        c.release_admission(1);
-        // A runs Y, then must run X, which C reads: A waits, and keeps the admission.
-        a.admit(2, &base).unwrap();
-        a.writer(2, &y).unwrap().stands(done(&y)).unwrap();
-        assert!(matches!(busy(a.writer(2, &x)), Busy::Elsewhere { .. }));
-        // B would find X fresh and want Y: it cannot even begin, and holds nothing.
-        assert!(matches!(busy(b.admit(3, &base)), Busy::Elsewhere { .. }));
-        assert!(b.builds().is_empty());
-        // C ends: A goes on, and ends.
-        c.retire(1);
-        a.writer(2, &x).unwrap().stands(done(&x)).unwrap();
-        a.release_admission(2);
-        // B begins: X is held by A and it reads it too, and Y it must run waits for A's build to
-        // end, with nothing else waiting for B.
-        b.admit(3, &base).unwrap();
-        b.hold(3, &x).unwrap();
-        assert!(matches!(busy(b.writer(3, &y)), Busy::Elsewhere { .. }));
-        a.retire(2);
-        b.writer(3, &y).unwrap().stands(done(&y)).unwrap();
-        b.release_admission(3);
+    fn a_world_that_moved_is_not_read_and_holds_nothing() {
+        let (base, x) = (dir("moved"), dir("moved-x"));
+        let leases = Leases::default();
+        let token = runs(&leases, 1, &base, &x, "one");
+        leases.release_admission(1);
+        leases.retire(1);
+        // An anonymous consumer of the database loaded from the first run.
+        let world = vec![(x.clone(), token)];
+        let reader = anonymous();
+        leases.pin(reader, &world).unwrap();
+        leases.unpin(reader);
+        leases.retire(reader);
+        // Another worker ran the script again meanwhile: the database is not of this output.
+        record(&x, "two");
+        let stale = leases.pin(reader, &world).unwrap_err();
+        assert_eq!(stale.run_dir, x);
+        assert!(leases.builds().is_empty(), "nothing is held for a world that is refused");
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&x);
-        let _ = std::fs::remove_dir_all(&y);
+    }
+
+    #[test]
+    fn a_script_that_is_running_is_waited_for_and_what_it_left_is_then_looked_at() {
+        let (base, x) = (dir("running"), dir("running-x"));
+        let leases = Arc::new(Leases::default());
+        let token = record(&x, "one");
+        leases.admit(2, &base).unwrap();
+        let writer = leases.writer(2, &x).unwrap();
+        let reader = {
+            let (leases, world) = (leases.clone(), vec![(x.clone(), token)]);
+            std::thread::spawn(move || leases.pin(7, &world))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!reader.is_finished(), "a script is running: the consumer waits for it");
+        let after = record(&x, "two");
+        writer.stands(done(&x, after)).unwrap();
+        let stale = reader.join().unwrap().unwrap_err();
+        assert_eq!(stale.run_dir, x, "and finds it is not the output its database is of");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&x);
+    }
+
+    #[test]
+    fn a_watch_ends_when_no_build_that_asked_is_left() {
+        let (base, x) = (dir("watch"), dir("watch-x"));
+        let leases = Leases::default();
+        runs(&leases, 1, &base, &x, "one");
+        let held = x.join(FILE);
+        let other = Leases::default();
+        // Another process reads it: a build waits for it and a thread watches.
+        assert!(matches!(busy(other.writer(2, &x)), Busy::Elsewhere { .. }));
+        watch(&held, 2);
+        assert!(interest().as_ref().is_some_and(|it| it.contains_key(&held)));
+        // The build that asked is retired; the file is held still, and the watch ends.
+        other.retire(2);
+        let began = Instant::now();
+        while interest().as_ref().is_some_and(|it| it.contains_key(&held)) {
+            assert!(began.elapsed() < Duration::from_secs(5), "the watch outlived its build");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&x);
     }
 }

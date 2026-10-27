@@ -91,6 +91,10 @@ struct Scripts {
     /// workspace is stale until it is loaded again, and that load takes what they said and does
     /// not run them again.
     ready: Option<WorkspaceBuildScripts>,
+    /// The scripts the workspace loaded was loaded from, with the token of each run, which
+    /// whoever reads its output holds ([`crate::scripts::pin`]); and the same for `ready`.
+    world: crate::scripts::World,
+    ready_world: Option<crate::scripts::World>,
     /// In the whole build, what blaze's runs of the scripts were asked for with: blaze compiles
     /// and runs them, deciding as cargo does which run again (`crate::scripts`), and no cargo
     /// is asked.
@@ -424,6 +428,7 @@ impl Inputs {
             // The workspace is read again whole, and the scripts run for it.
             if let Some(scripts) = &mut checkout.scripts {
                 scripts.ready = None;
+                scripts.ready_world = None;
             }
             return Ok(true);
         }
@@ -435,9 +440,27 @@ impl Inputs {
 
     /// What the scripts of the checkout at `root` said when the last check ran them, when the
     /// workspace loaded is not what they said.
-    pub(crate) fn ready(&self, root: &Path) -> Option<WorkspaceBuildScripts> {
+    pub(crate) fn ready(
+        &self,
+        root: &Path,
+    ) -> Option<(WorkspaceBuildScripts, crate::scripts::World)> {
         let checkout = self.checkouts.iter().find(|it| it.root == root)?;
-        checkout.scripts.as_ref()?.ready.clone()
+        let scripts = checkout.scripts.as_ref()?;
+        Some((scripts.ready.clone()?, scripts.ready_world.clone().unwrap_or_default()))
+    }
+
+    /// The scripts every workspace that is loaded was loaded from, with the token of each run:
+    /// what a build reads of the output when it reads the database.
+    pub(crate) fn world(&self) -> crate::scripts::World {
+        let mut world: crate::scripts::World = self
+            .checkouts
+            .iter()
+            .filter_map(|it| it.scripts.as_ref())
+            .flat_map(|it| it.world.iter().cloned())
+            .collect();
+        world.sort();
+        world.dedup();
+        world
     }
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
@@ -510,7 +533,17 @@ impl Scripts {
         if scripts.is_empty() && variables.is_empty() && own.is_none() {
             return None;
         }
-        Some(Scripts { workspace: workspace.clone(), config, scripts, variables, ready: None, own })
+        let world = own.as_ref().map(|it| it.world.clone()).unwrap_or_default();
+        Some(Scripts {
+            workspace: workspace.clone(),
+            config,
+            scripts,
+            variables,
+            ready: None,
+            world,
+            ready_world: None,
+            own,
+        })
     }
 
     /// Runs the scripts again where cargo would for a process with `env`, or with `None`
@@ -534,7 +567,7 @@ impl Scripts {
                 Some(env) => env.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
                 None => own.env.clone(),
             };
-            let said = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
+            let (said, world) = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
             let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind
             else {
                 return Ok(false);
@@ -542,6 +575,9 @@ impl Scripts {
             let other = said != *loaded;
             if other {
                 self.ready = Some(said);
+                self.ready_world = Some(world);
+            } else {
+                self.world = world;
             }
             return Ok(other);
         }

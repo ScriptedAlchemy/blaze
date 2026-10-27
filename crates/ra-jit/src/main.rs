@@ -2299,13 +2299,14 @@ fn load(
         load_config,
         selection,
         inputs: inputs::Inputs::default(),
+        unloaded: FxHashSet::default(),
         debug: Vec::new(),
         beside,
         scripts_said,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
-    checkouts.add(projects, &mut db, &mut vfs)?;
+    checkouts.add(projects, &mut db, &mut vfs, load_owner())?;
     Ok((db, vfs, checkouts))
 }
 
@@ -2326,6 +2327,10 @@ struct Checkouts {
     load_config: LoadCargoConfig,
     /// What the checkouts loaded in full were loaded from besides their source.
     inputs: inputs::Inputs,
+    /// The checkouts that read as another (a split) whose workspace could not be loaded again
+    /// after the one they share was: they are the world they were, not the fallback one, and
+    /// are loaded again at the next request.
+    unloaded: FxHashSet<usize>,
     /// Which build of each project is loaded.
     selection: plan::Selection,
     /// For each of `roots`, what its plan says of the program as a whole.
@@ -2549,13 +2554,38 @@ impl Checkouts {
         })
     }
 
-    /// Loads the checkouts of `projects` into `db`, next to those there are.
+    /// Loads the checkouts of `projects` into `db`, next to those there are, for `owner`: the
+    /// build, or the request, whose output of their build scripts it reads. The scripts of all
+    /// of them are looked at again before the database has them, and a world that moved
+    /// meanwhile (a build that yielded what it held to wait for another group) is loaded again.
     fn add(
         &mut self,
         projects: &[&Path],
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
+        owner: u64,
     ) -> anyhow::Result<()> {
+        for attempt in 1.. {
+            match self.add_once(projects, db, vfs, owner) {
+                Err(error) if error.downcast_ref::<scripts::Stale>().is_some() && attempt < 16 => {
+                    eprintln!(
+                        "load: the scripts' output moved while it was loaded, again: {error}"
+                    );
+                }
+                done => return done,
+            }
+        }
+        unreachable!("the loop ends in a return")
+    }
+
+    fn add_once(
+        &mut self,
+        projects: &[&Path],
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+        owner: u64,
+    ) -> anyhow::Result<()> {
+        let mut world = scripts::World::new();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
@@ -2580,13 +2610,9 @@ impl Checkouts {
             // Cargo's lines are of the build of the project asked for first.
             let said =
                 if Some(project) == projects.first() { self.scripts_said.take() } else { None };
-            // Loaded for the build that started the worker, whose scripts the load runs, with the
-            // variables of the process that asked for it.
-            let build = std::env::var(cargo::daemon::LOAD_BUILD).ok();
-            let build = build.and_then(|it| it.parse().ok()).unwrap_or(0);
-            // A load that no daemon's build started has the scripts' output for its own, until
-            // its first program is compiled and linked (`ra-jit --exe`, a worker run by hand).
-            let build = if build == 0 { scripts::load_build() } else { build };
+            // Loaded for `owner`, whose scripts the load runs, with the variables of the process
+            // that asked for it.
+            let build = owner;
             let load_env = scripts::load_env();
             let (workspace, told, own) = workspace_at(
                 project,
@@ -2616,10 +2642,17 @@ impl Checkouts {
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
             let config = &self.cargo_config;
+            world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
             self.inputs.watch(&root, &workspace, config, &FxHashMap::default(), build, own);
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
+            scripts::barrier::hold("group", owner);
         }
+        // What the database is about to be loaded from is what the scripts left: the leases of
+        // a group a build gave up to wait for another are taken again, and the tokens looked at.
+        world.sort();
+        world.dedup();
+        scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.roots.extend(roots);
         self.splits.extend(splits);
@@ -2648,6 +2681,10 @@ impl Checkouts {
         let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
         for (at, (_, root)) in self.roots.iter().enumerate() {
+            if self.unloaded.contains(&at) {
+                stale.push(at);
+                continue;
+            }
             let changed = match &self.splits[at] {
                 Some(split) => asked == Some(at) && !self.builds_alike(&split.base, root),
                 None => match known.get(&**root) {
@@ -2701,7 +2738,13 @@ impl Checkouts {
                         self.place(at, workspace, debug, &config, &given, build, own);
                         continue;
                     }
-                    Err(error) => failed = Err(error),
+                    // Not the fallback: it is a world nothing was loaded from. This one stays
+                    // what it was, and is asked to be loaded again.
+                    Err(error) => {
+                        self.unloaded.insert(at);
+                        failed = Err(error);
+                        continue;
+                    }
                 }
             }
             let own = self.differing(base, &over);
@@ -2733,7 +2776,10 @@ impl Checkouts {
         let given = self.inputs.variables(&root, env);
         config.extra_env.extend(given.clone());
         // The scripts the check for this build ran are not run again for the load.
-        let ready = self.inputs.ready(&root);
+        let (ready, ready_world) = match self.inputs.ready(&root) {
+            Some((ready, world)) => (Some(ready), Some(world)),
+            None => (None, None),
+        };
         let asked: BTreeMap<String, String> =
             env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
         let (workspace, debug, own) = workspace_at(
@@ -2746,6 +2792,12 @@ impl Checkouts {
             ready,
             Some((&asked, build)),
         )?;
+        let own = own.map(|mut own| {
+            if let Some(world) = ready_world {
+                own.world = world;
+            }
+            own
+        });
         Ok((workspace, debug, config, given, own))
     }
 
@@ -2762,6 +2814,7 @@ impl Checkouts {
         own: Option<scripts::Own>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
+        self.unloaded.remove(&at);
         self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
@@ -3029,6 +3082,7 @@ fn workspace_at(
                 packages: ids
                     .filter_map(|id| plan.package(id).map(|it| (id.clone(), it.for_target)))
                     .collect(),
+                world: Vec::new(),
             });
         }
         if let Some(beside) = beside {
@@ -3069,9 +3123,13 @@ fn workspace_at(
             }
             // The whole build's scripts are blaze's to compile and run, with no cargo.
             (None, _, _) if own.is_some() => {
-                let own = own.as_ref().expect("the whole build's ask");
+                let ask = own.as_ref().expect("the whole build's ask");
                 let build = asked.map_or(0, |it| it.1);
-                scripts::run(&workspace, &own.asked(&own.env, build))?
+                let (said, world) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
+                if let Some(own) = own.as_mut() {
+                    own.world = world;
+                }
+                said
             }
             (None, kind, _) => {
                 if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
@@ -6455,15 +6513,27 @@ struct Client {
     build: u64,
     /// Whether `build` is the request's own, and ends with it.
     own_build: bool,
+    /// The client reading the output of the scripts of the database ([`scripts::pin`]) for as
+    /// long as it lives: the compile, the link, the errors and the link that is detached.
+    pin: Option<scripts::Pin>,
 }
 
 impl Client {
     /// A client of the build `build`, or when that is `0` of one of its own.
     fn of(stream: UnixStream, env: ide_db::base_db::Env, build: u64) -> Client {
         match build {
-            0 => Client { stream, env, build: scripts::anonymous(), own_build: true },
-            build => Client { stream, env, build, own_build: false },
+            0 => Client { stream, env, build: scripts::anonymous(), own_build: true, pin: None },
+            build => Client { stream, env, build, own_build: false, pin: None },
         }
+    }
+
+    /// Has the client read the output of `world`, before it reads any.
+    fn read(&mut self, world: &scripts::World) -> Result<(), scripts::Stale> {
+        if self.pin.is_none() {
+            self.pin = Some(scripts::pin(self.build, world)?);
+            scripts::barrier::event("pins", self.build, &format!("world={}", world.len()));
+        }
+        Ok(())
     }
 
     /// A client that hears nothing: the one a build the daemon asks for itself answers.
@@ -7046,17 +7116,29 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     Ok(())
 }
 
+/// Who the load of a worker that starts is for: the build of the daemon's that started it, or
+/// when no daemon did (a process run by hand), a number of its own that its first program is
+/// built under. A checkout that joins later is loaded for the request that asks for it.
+fn load_owner() -> u64 {
+    std::env::var(cargo::daemon::LOAD_BUILD)
+        .ok()
+        .and_then(|it| it.parse().ok())
+        .filter(|&it| it != 0)
+        .unwrap_or_else(scripts::load_build)
+}
+
 /// Loads the checkout of `project` into the database of a daemon that is running, and
 /// watches its files.
 fn join(
     project: &Path,
+    owner: u64,
     checkouts: &mut Checkouts,
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
     let read_from = SystemTime::now();
-    checkouts.add(&[project], db, tree.vfs())?;
+    checkouts.add(&[project], db, tree.vfs(), owner)?;
     watch_loaded(db, tree, files, read_from);
     Ok(())
 }
@@ -7574,7 +7656,7 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
-        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs) {
+        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs, load_owner()) {
             eprintln!("spare: not used: {why:#}");
             return None;
         }
@@ -8284,11 +8366,7 @@ fn run_holding(
             }
             // The scripts of the load are judged, and its program is compiled and linked next:
             // that is what the build that started this process holds their output for.
-            let loaded_for = std::env::var(cargo::daemon::LOAD_BUILD)
-                .ok()
-                .and_then(|it| it.parse().ok())
-                .unwrap_or_else(scripts::load_build);
-            scripts::barrier::hold("consume", loaded_for);
+            scripts::barrier::hold("consume", load_owner());
             let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
             // An `include!` in a body is first seen when the body is compiled.
             if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -8787,13 +8865,29 @@ fn run_holding(
                         Some(project) if view.is_none() => {
                             builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
-                            let joined =
-                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                            let joined = join(
+                                project,
+                                stream.build,
+                                &mut checkouts,
+                                &mut db,
+                                &mut tree,
+                                &mut files,
+                            );
                             eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
                             joined
                         }
                         _ => Ok(()),
                     };
+                    // A script group of the joined checkout that another build holds is waited
+                    // for: the checkout is not placed until it is loaded whole.
+                    if let Err(error) = &joined
+                        && error.downcast_ref::<scripts::Busy>().is_some()
+                    {
+                        scripts::barrier::event("put-off", stream.build, &format!("join: {error}"));
+                        builds.put_off(generation);
+                        later.push((request, asked, stream));
+                        continue;
+                    }
                     if let Some(view) = view {
                         looked.insert(view.base, view.over);
                     }
@@ -8996,6 +9090,22 @@ fn run_holding(
                 // Not asleep when a build that held what a request waits for ended meanwhile.
                 let moved = builds.busy_since.is_some_and(|it| it != scripts::generation());
                 builds.stuck = clients.is_empty() && !interrupt && !moved;
+                if clients.is_empty() {
+                    continue;
+                }
+                // Whatever is built reads the output of the database's scripts, in every mode
+                // there is to build: the clients read it from here on, the numbered ones with
+                // what their builds hold, an edit or a rebuild nobody asked for with what they
+                // take now. A world that moved is not read.
+                let world = checkouts.inputs.world();
+                clients.retain_mut(|(_, (_, _, client))| match client.read(&world) {
+                    Ok(()) => true,
+                    Err(stale) => {
+                        scripts::barrier::event("refused", client.build, &stale.to_string());
+                        let _ = writeln!(&*client, "failed: {stale}; ask again");
+                        false
+                    }
+                });
                 if clients.is_empty() {
                     continue;
                 }
@@ -9369,14 +9479,10 @@ fn run_holding(
                     tests_now: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
-                // The builds whose scripts this program is compiled and linked from, and the
-                // clients that judged none of them (an edit, a rebuild nobody asked for), which
-                // hold the output the process last judged for as long as they live.
+                // The builds whose scripts this program is compiled and linked from.
                 let mut consumes: Vec<u64> = clients.iter().map(|it| it.2.build).collect();
                 consumes.sort();
                 consumes.dedup();
-                let judged_none: Vec<u64> =
-                    clients.iter().filter(|it| it.2.own_build).map(|it| it.2.build).collect();
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
@@ -9405,17 +9511,6 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
-                    for build in judged_none {
-                        match scripts::hold_loaded(build) {
-                            Ok(0) => {}
-                            Ok(held) => scripts::barrier::event(
-                                "holds",
-                                build,
-                                &format!("loaded scripts={held}"),
-                            ),
-                            Err(why) => eprintln!("build scripts: the output is not held: {why}"),
-                        }
-                    }
                     for build in consumes {
                         scripts::barrier::hold("consume", build);
                     }
@@ -9459,7 +9554,12 @@ fn run_holding(
                         let (db, listed, paths, edit) =
                             (solving::Handle::of(&db), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
+                        let reads: Vec<u64> =
+                            clients.iter().filter(|it| it.0 == at).map(|it| it.1.2.build).collect();
                         let build = scope.spawn(move || {
+                            for build in reads {
+                                scripts::barrier::hold("consume", build);
+                            }
                             db.solve(|db| {
                                 let answer =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

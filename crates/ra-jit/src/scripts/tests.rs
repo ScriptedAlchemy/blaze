@@ -435,6 +435,8 @@ fn a_script_runs_once_in_each_build_whatever_the_other_builds_did_between_its_re
     let always = [("ALWAYS", "1")];
     let a1 = pkg.request(&leases, 1, "a", &always).unwrap();
     assert_eq!(pkg.generated(&a1), "a");
+    // The token a consumer of this output holds is the record the run left.
+    assert_eq!(token_of(a1.out_dir.parent().unwrap()), Some(a1.fingerprint));
     assert_eq!(pkg.runs(), ["a"]);
     // B asks while A reads the output: it does not write over it and is put off.
     assert_eq!(why(pkg.request(&leases, 2, "b", &always)), Err("busy 1".to_owned()));
@@ -557,7 +559,7 @@ fn the_second_worker_of_the_barrier_test() {
     let leases = Leases::default();
     std::fs::write(base.join("b-asks"), "").unwrap();
     // As `run` asks: put off for a worker's build, and asked again once it is over.
-    let done = retrying(false, || pkg.request(&leases, 7, "b", &[("ALWAYS", "1")])).unwrap();
+    let done = retrying(7, false, || pkg.request(&leases, 7, "b", &[("ALWAYS", "1")])).unwrap();
     std::fs::write(base.join("b-ran"), pkg.generated(&done)).unwrap();
     assert_eq!(done.output.cfgs, ["gen_b"]);
     assert_eq!(done.output.library_links, ["static=gen_b"]);

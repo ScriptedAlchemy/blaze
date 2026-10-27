@@ -4,7 +4,7 @@ blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of 
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
 scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, coab, internal,
-           link-control, archive-control     (all, by default)
+           groups, overlay, worlds, join, link-control, archive-control     (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -51,6 +51,17 @@ coab          Three daemons over one project and target directory and the review
 internal      An editor's `edit` of a source file, which the worker builds for a client that names no
               build. It is held before its compile and link while another worker, with another
               `GEN`, asks for the scripts; it must wait.
+groups        Two direct runs (`ra-jit <R> --also <S>` and `ra-jit <S> --also <R>`), the same target
+              directory, another `GEN` for each: each has judged its first script group and holds
+              it when the other needs it. Both have to be built (neither is refused).
+overlay       `internal` with `RA_JIT_OVERLAY=1` (which builds without the background path) and an
+              edit that reads the generated file with `include_bytes!`.
+worlds        A worker that has R and S loaded and an editor's edit of R, held before its compile
+              and link: another worker's `GEN` for R's scripts has to wait (the edit reads R's
+              output, not the last script group that was judged, S's).
+join          A worker started by a build in R; a build in S joins S; then S again with another
+              `GEN`: the scripts of S have to run for it (the join's leases are that request's, and
+              ended with it).
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -117,17 +128,17 @@ fn main() {
 '''
 
 MANIFEST = '''[package]
-name = "gen"
+name = "@PKG@"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "gen-one"
+name = "@PKG@-one"
 path = "src/one.rs"
 
 [[bin]]
-name = "gen-two"
+name = "@PKG@-two"
 path = "src/two.rs"
 '''
 
@@ -159,17 +170,19 @@ class Scenario:
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir)
         self.ws = os.path.join(self.dir, "ws")
+        self.target = os.path.join(self.ws, "target")
         self.runs_log = os.path.join(self.dir, "runs.log")
         self.failures, self.notes, self.timeline, self.gaps = [], {}, [], []
         self.daemons = []
 
     # -- the project and the oracle
-    def project(self, ws=None, config=None):
+    def project(self, ws=None, config=None, pkg="gen"):
         ws = ws or self.ws
         os.makedirs(os.path.join(ws, "src"), exist_ok=True)
-        for name, text in {"Cargo.toml": MANIFEST, "build.rs": BUILD_RS.replace("@LOG@", self.runs_log),
-                           "src/one.rs": PROGRAM.replace("@NAME@", "gen-one"),
-                           "src/two.rs": PROGRAM.replace("@NAME@", "gen-two")}.items():
+        for name, text in {"Cargo.toml": MANIFEST.replace("@PKG@", pkg),
+                           "build.rs": BUILD_RS.replace("@LOG@", self.runs_log),
+                           "src/one.rs": PROGRAM.replace("@NAME@", f"{pkg}-one"),
+                           "src/two.rs": PROGRAM.replace("@NAME@", f"{pkg}-two")}.items():
             with open(os.path.join(ws, name), "w") as f:
                 f.write(text)
         if config is not None:
@@ -179,12 +192,12 @@ class Scenario:
         open(self.runs_log, "w").close()
         subprocess.run(["cargo", "generate-lockfile"], cwd=ws, env=self.env("x"), capture_output=True, check=True)
 
-    def oracle(self, gen_, extra=None, config=None):
+    def oracle(self, gen_, extra=None, config=None, pkg="gen"):
         """What cargo's build gives for `GEN=gen_`: the output each program must have."""
         ws = os.path.join(self.dir, "oracle-ws")
         shutil.rmtree(ws, ignore_errors=True)
         saved, self.runs_log = self.runs_log, os.path.join(self.dir, "oracle-runs.log")
-        self.project(ws, config)
+        self.project(ws, config, pkg)
         self.runs_log = saved
         env = dict(self.env("oracle"), GEN=gen_, CARGO_TARGET_DIR=os.path.join(self.dir, "oracle-target"), **(extra or {}))
         env.pop("RA_JIT_WHOLE_BUILD", None)
@@ -193,7 +206,7 @@ class Scenario:
             self.fail(f"the oracle (cargo, GEN={gen_}) did not build: {ran.stderr[-400:]}")
             return None
         out = {}
-        for name in PROGRAMS:
+        for name in (f"{pkg}-one", f"{pkg}-two"):
             out[name] = subprocess.run([os.path.join(self.dir, "oracle-target", "debug", name)],
                                        capture_output=True, text=True).stdout
         return out
@@ -213,9 +226,9 @@ class Scenario:
         env.update(extra or {})
         return env
 
-    def client(self, home, args=(), **env):
+    def client(self, home, args=(), cwd=None, **env):
         """A `cargo ra-jit build` that starts now: its process, and when it started."""
-        p = subprocess.Popen(["cargo", "ra-jit", "build", *args], cwd=self.ws, env=self.env(home, env),
+        p = subprocess.Popen(["cargo", "ra-jit", "build", *args], cwd=cwd or self.ws, env=self.env(home, env),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
                              stdin=subprocess.DEVNULL)
         p.started = time.time_ns() // 1000
@@ -320,8 +333,19 @@ class Scenario:
 
     # -- what the output is
     def run_dir(self):
-        found = glob.glob(os.path.join(self.ws, "target", "ra-jit", "build-scripts", "debug", "build", "gen-*", "out"))
+        found = self.run_dirs()
         return found[0] if found else None
+
+    def run_dirs(self):
+        """The `OUT_DIR` of every group's script below the target directory."""
+        return sorted(glob.glob(os.path.join(self.target, "ra-jit", "build-scripts", "debug", "build", "gen*-*", "out")))
+
+    def hash_all(self):
+        h = hashlib.sha256()
+        for d in self.run_dirs():
+            h.update(d.encode())
+            h.update(tree_hash(d).encode())
+        return h.hexdigest()
 
     def runs(self):
         return open(self.runs_log).read().split()
@@ -363,7 +387,7 @@ class Scenario:
         """For WATCH seconds the output the script wrote is what it was, and no script ran."""
         runs, end = len(self.runs()), time.time() + WATCH
         while time.time() < end:
-            now = tree_hash(self.run_dir()) if self.run_dir() else None
+            now = self.hash_all()
             if now != before:
                 self.fail(f"{what}: the output of the script changed while it was held")
                 return
@@ -436,7 +460,7 @@ def same_or_cross(sc, cross, source_sha):
     sc.disarm(a_home, "consume")
     sc.arm(a_home, "retire")
     sc.timeline.append((time.time_ns() // 1000, f"A (build {ba}) held at consume ({a_home})"))
-    held = tree_hash(sc.run_dir())
+    held = sc.hash_all()
     sc.notes["a-output-hash"] = held
     if sc.runs() != ["a"]:
         sc.fail(f"A's script did not run once before the barrier: {sc.runs()}")
@@ -614,7 +638,7 @@ def reload_busy(sc, source_sha):
     os.makedirs(os.path.join(sc.ws, ".cargo"), exist_ok=True)
     with open(os.path.join(sc.ws, ".cargo", "config.toml"), "w") as f:
         f.write(CONFIG_B)
-    held_hash = tree_hash(sc.run_dir())
+    held_hash = sc.hash_all()
     B = sc.client("a", GEN="a", **extra)
     put = sc.wait_event("a", "put-off", within=60)
     sc.notes["b-put-off"] = put
@@ -657,7 +681,7 @@ def direct(sc, source_sha):
         A.kill()
         return
     sc.disarm("a", "consume")
-    held = tree_hash(sc.run_dir())
+    held = sc.hash_all()
     B = run("B", "b", "b")
     sc.unchanged(held, "B (direct) asking while A (direct) is held before its compile and link", B)
     if B.poll() is not None:
@@ -831,7 +855,7 @@ def internal(sc, source_sha):
     if nobody is None:
         return
     sc.disarm("a", "consume")
-    held = tree_hash(sc.run_dir())
+    held = sc.hash_all()
     B = sc.client("b", one, GEN="b", **extra)
     sc.notes["b-waits"] = sc.wait_event("b", "waits")
     sc.unchanged(held, "B asking while an edit is held before its compile and link", B)
@@ -853,6 +877,170 @@ def internal(sc, source_sha):
     if not mine:
         sc.fail("the edit's build did not log that it holds the scripts' output (a build with no number "
                 "holds nothing in the binary under test)")
+    sc.timeouts()
+
+
+def shared_projects(sc):
+    """Two projects of other names (so that neither is the other's split) that build in one
+    target directory. Their scripts are two groups."""
+    sc.r, sc.s = os.path.join(sc.dir, "r"), os.path.join(sc.dir, "s")
+    sc.target = os.path.join(sc.dir, "target-shared")
+    saved = sc.runs_log
+    sc.project(sc.r, pkg="gena")
+    sc.runs_log = saved
+    sc.project(sc.s, pkg="genb")
+    return {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target}
+
+
+def direct_run(sc, tag, project, also, crate, gen_, home, extra):
+    env = sc.env(home, dict(GEN=gen_, **extra))
+    env.pop("RA_JIT_WHOLE_BUILD", None)
+    exe, obj = os.path.join(sc.dir, f"{tag}.bin"), os.path.join(sc.dir, f"{tag}.o")
+    err = open(os.path.join(sc.dir, f"direct-{tag}.err"), "w")
+    argv = [RA_JIT, project, *(["--also", also] if also else []), "--crate", crate, "--out", obj, "--exe", exe]
+    p = subprocess.Popen(argv, cwd=project, env=env, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
+    p.exe, p.errfile, p.started = exe, err.name, time.time_ns() // 1000
+    return p
+
+
+def groups(sc, source_sha):
+    extra = shared_projects(sc)
+    exp_a, exp_b = sc.oracle("a", extra, pkg="gena"), sc.oracle("b", extra, pkg="genb")
+    sc.arm("a", "group")
+    sc.arm("b", "group")
+    A = direct_run(sc, "A", sc.r, sc.s, "gena_one", "a", "a", extra)
+    ba = sc.reached("a", "group", A)
+    B = direct_run(sc, "B", sc.s, sc.r, "genb_one", "b", "b", extra)
+    bb = sc.reached("b", "group", B)
+    if ba is None or bb is None:
+        A.kill()
+        B.kill()
+        return
+    # Each judged the group it was asked for first and holds it: A has R's, B has S's.
+    sc.notes["held"] = sc.hash_all()
+    sc.disarm("a", "group")
+    sc.disarm("b", "group")
+    sc.release("a", "group", ba)
+    sc.release("b", "group", bb)
+    for tag, p in (("A", A), ("B", B)):
+        try:
+            p.wait(timeout=LOST)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            sc.fail(f"{tag} (direct) did not end in {LOST:.0f}s: it waits for the other, which waits for it")
+        sc.timeline.append((time.time_ns() // 1000, f"direct {tag} ended rc={p.returncode}"))
+        if p.returncode != 0:
+            sc.fail(f"{tag} (direct) exited {p.returncode}: {open(p.errfile, errors='replace').read()[-500:]}")
+    for tag, p, want, name in (("A", A, exp_a, "gena-one"), ("B", B, exp_b, "genb-one")):
+        got = subprocess.run([p.exe], capture_output=True, text=True).stdout if os.path.exists(p.exe) else None
+        if got != want[name]:
+            sc.fail(f"{tag} (direct): printed {got!r}, the oracle's {want[name]!r}")
+        sc.notes.setdefault("programs", {})[tag] = got
+    sc.notes["direct-events"] = {t: sc.events(t, open(p.errfile, errors="replace").read())
+                                 for t, p in (("a", A), ("b", B))}
+    sc.timeouts()
+
+
+EDIT_BYTES = (
+    '\nstatic GENERATED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gen.rs"));\n'
+    '#[used]\nstatic KEEP: &[&[u8]] = &[GENERATED];\n'
+)
+
+
+def edit_while_held(sc, extra, ws, pkg, build_cwd, other_cwd, other_pkg, other_gen, bytes_in_edit, label):
+    """An editor's edit of `ws`'s `one.rs`, held before its compile and link, while a worker of
+    another `GEN` asks for the scripts of `other_cwd`: it waits for the edit."""
+    import threading
+    path = os.path.join(ws, "src", "one.rs")
+    text = open(path).read() + ("// an edit\n" if not bytes_in_edit else EDIT_BYTES)
+    sc.arm("a", "consume")
+    answer = {}
+    editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.env("a")["RA_JIT_HOME"], path, text)))
+    editor.start()
+    nobody = sc.reached("a", "consume", None, within=120)
+    if nobody is None:
+        return None
+    sc.disarm("a", "consume")
+    held = sc.hash_all()
+    B = sc.client("b", ("--bin", f"{other_pkg}-one"), cwd=other_cwd, GEN=other_gen, **extra)
+    sc.notes[f"{label}-b-waits"] = sc.wait_event("b", "waits")
+    sc.unchanged(held, f"B asking while {label} is held before its compile and link", B)
+    if B.poll() is not None:
+        sc.fail(f"B ended ({B.returncode}) while the edit was held")
+    sc.release("a", "consume", nobody)
+    editor.join(WAIT)
+    sc.notes[f"{label}-edit-said"] = answer.get("said")
+    if not str(answer.get("said", "")).startswith("ok"):
+        sc.fail(f"the edit was answered {answer.get('said')!r}")
+    sc.finish(B, "B", within=LOST)
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+    return nobody
+
+
+def overlay(sc, source_sha):
+    extra = {"GEN_ARCHIVE": "same", "RA_JIT_OVERLAY": "1"}
+    sc.project()
+    A1 = sc.client("a", ("--bin", "gen-one"), GEN="a", **extra)
+    sc.finish(A1, "A1")
+    if A1.returncode != 0:
+        sc.fail(f"the first build exited {A1.returncode}: {A1.err[-600:]}")
+        return
+    nobody = edit_while_held(sc, extra, sc.ws, "gen", sc.ws, sc.ws, "gen", "b", True, "overlay")
+    if nobody is not None and not any(e[0] in ("pins", "holds") and e[1] == nobody for e in sc.events("a")):
+        sc.fail("the edit's build did not log that it reads the scripts' output")
+    sc.timeouts()
+
+
+def worlds(sc, source_sha):
+    extra = shared_projects(sc)
+    A1 = sc.client("a", ("--bin", "gena-one"), cwd=sc.r, GEN="a", **extra)
+    sc.finish(A1, "A1 (R)")
+    A2 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="a", **extra)
+    sc.finish(A2, "A2 (S)")
+    for tag, p in (("R", A1), ("S", A2)):
+        if p.returncode != 0:
+            sc.fail(f"the build in {tag} exited {p.returncode}: {p.err[-600:]}")
+            return
+    log = sc.log_of("a")
+    sc.notes["joined"] = [l for l in log.splitlines() if l.startswith("join ")]
+    if not sc.notes["joined"]:
+        sc.fail("S was not joined to the worker that has R: the case was not exercised")
+        return
+    if len(sc.run_dirs()) < 2:
+        sc.fail(f"the scripts of R and S did not both run: {sc.run_dirs()}")
+        return
+    # S was judged last. The edit is of R.
+    nobody = edit_while_held(sc, extra, sc.r, "gena", sc.r, sc.r, "gena", "b", True, "worlds")
+    if nobody is not None:
+        pinned = [e for e in sc.events("a") if e[0] == "pins" and e[1] == nobody]
+        sc.notes["pins"] = pinned
+        if not pinned or "world=2" not in pinned[0][4]:
+            sc.fail(f"the edit did not read both groups' output: {pinned}")
+    sc.timeouts()
+
+
+def join(sc, source_sha):
+    extra = shared_projects(sc)
+    one = ("--bin", "gena-one")
+    A1 = sc.client("a", one, cwd=sc.r, GEN="a", **extra)
+    sc.finish(A1, "A1 (R)")
+    A2 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="a", **extra)
+    sc.finish(A2, "A2 (S joins)")
+    for tag, p in (("R", A1), ("S", A2)):
+        if p.returncode != 0:
+            sc.fail(f"the build in {tag} exited {p.returncode}: {p.err[-600:]}")
+            return
+    if not any(l.startswith("join ") for l in sc.log_of("a").splitlines()):
+        sc.fail("S was not joined to the worker that has R: the case was not exercised")
+        return
+    # S again, with another value of what its script watches: it runs for this build.
+    A3 = sc.client("a", ("--bin", "genb-one"), cwd=sc.s, GEN="c", **extra)
+    sc.finish(A3, "A3 (S again)", within=LOST)
+    if A3.returncode != 0:
+        sc.fail(f"S asked again exited {A3.returncode} (what its join took is not released): {A3.err[-600:]}")
+    if "c" not in sc.runs():
+        sc.fail(f"the script of S did not run for GEN=c: {sc.runs()}")
     sc.timeouts()
 
 
@@ -902,6 +1090,10 @@ SCENARIOS = {
     "direct": direct,
     "coab": coab,
     "internal": internal,
+    "groups": groups,
+    "overlay": overlay,
+    "worlds": worlds,
+    "join": join,
     "archive-control": archive_control,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
