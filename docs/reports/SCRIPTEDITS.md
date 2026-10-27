@@ -490,119 +490,116 @@ or P0-D, nor replace the 42-case runtime suite or the platform checks required f
 
 ## What a build holds of a script (leases)
 
-Review `5661429749` of `91d58995` found two request-lifetime faults in the runner above; the
-independent reviews of `ac24007a` and `04d69ce7` found eight more, the last four of them in the
-design this section described before (a lease for each build, on the scripts it judged last).
-This section is the design that answers all of them, what ran of it, and what it does not do.
-**Whether they are fixed is for the review to say**; each claim is marked **read** (from the code),
-**measured** (a run, with its source) or **not run**.
+Review `5661429749` of `91d58995` found two request-lifetime faults in the runner above; independent
+reviews of `ac24007a`, `04d69ce7` and `ae31fc5c` found twelve more, the last four in the design this
+section described before (a world of tokens, and a build that yields forgets what it judged). This is the
+design that answers all of them, what ran of it, and what it does not do. **Whether they are fixed is for
+the review to say**; each claim is marked **read** (from the code), **measured** (a run, with its source)
+or **not run**.
 
 ### The lifecycle (read)
 
 - A **build** is one `Request::Build` to the daemon (`next_build`), several requests to the worker
-  (`RA_JIT_BUILD=<n>`, one per program), over when the daemon has the last answer. Two clients that
-  ask at once are two builds.
-- A script is judged by the worker's main loop in `Checkouts::stale`, in `reload` (a changed
-  configuration file makes the next request run it), in `join` (a checkout the worker has not seen)
-  and in the load, which loads one or several checkouts (`add`: `--also`).
-- What reads a script's output after `run` returns: the vfs (`include!`), the compile (`OUT_DIR`,
-  `rustc-env`, cfgs, a body's `include_bytes!`) and the link (`-L`, `-l`). **Every build of a
-  program is a reader, in every mode** (the background thread, `RA_JIT_OVERLAY=1`, a checkout read
-  as another, a link detached from the request), and not only the requests that named a build: a
-  direct `ra-jit --exe` run, an editor's `edit`, a rebuild nobody asked for, a checkout joined later.
-- `OUT_DIR` is persistent and its path is observable. A copy at another path is not the output the
-  script described, and replaying a script's other effects is what #5 did and was parked for. So the
-  output is protected where it is.
+  (`RA_JIT_BUILD=<n>`, one per program). A script is judged by the worker's main loop in
+  `Checkouts::stale` (every loaded checkout, one `run` each), in `reload`, in `join` and in the load
+  (`add`: `--also`), and it reads in every mode there is to build in: the background thread,
+  `RA_JIT_OVERLAY=1`, a checkout read as another, a link detached from the request; and not only for
+  requests that named a build (a direct `ra-jit --exe`, an editor's `edit`, a rebuild nobody asked for).
+- `OUT_DIR` is persistent and its path is observable. A copy at another path is not the output the script
+  described, and replaying a script's other effects is what #5 did and was parked for. So the output is
+  protected where it is. A script may have effects beside `OUT_DIR` that nothing undoes: a script cargo
+  runs once in a build runs once in it.
 
 ### The design (read)
 
-Cargo holds the build directory's lock for the whole build. The runner holds three things instead:
+Cargo holds the build directory's lock for the whole build. The runner holds, instead:
 
-- the **admission**, the script directory's transaction lock (`.lock`), owned by a *build* and kept
-  across its put-offs: it is taken before a script the build has no judgment of is touched, so one
-  build at a time is mid-way through the scripts;
-- a **lease** on each script's run directory (`flock` on `blaze-lease`), shared by the builds that read
-  the output, exclusive for the one that writes it;
-- a **world** for each loaded checkout: the run directories of its scripts, each with the **token** of
-  the record the run left (`blaze-run.json`), as the database was loaded from them.
+- the **admission**, the script directory's transaction lock (`.lock`), owned by a *build* and by an
+  **operation** of it: a request's judging of every checkout (`stale`, `reload`, `join`) or a load's
+  (`add`, all its checkouts) has it from the first script to the last, however many `run`s that is, and
+  keeps it across the times it is put off. No build is between the groups of another;
+- a **lease** on each script's run directory (`flock` on `blaze-lease`), shared by the builds that read the
+  output and exclusive for the one that writes it;
+- a **decision** for each script a build judged, immutable and kept until the build is retired: a failure
+  for good, and a result with the **generation** of the run it is of;
+- a **world** for each loaded checkout: the run directories of its scripts, each with the generation of the
+  run the database was loaded from.
 
-The rules (`scripts/leases.rs`):
+A **generation** (`blaze-generation` beside `out/`, so not in `OUT_DIR`) is a number a run writes as it
+begins, and a fresh judgment reads under the lease. It is not the fingerprint, which says what a run was
+made from (a watched file by its path, not its contents or time): two runs of one fingerprint (a watched
+file edited, a script that runs every build, one that is not deterministic) leave different output, and a
+run that fails leaves what it likes. A world and a result are of a generation, and are the same as the
+output only while the output has that generation.
 
-1. A reader never needs the admission to read again: what a build judged is kept as an immutable result
-   by (build, run directory), and its later requests are answered from it.
-2. **A build that holds leases and is refused what it needs (the admission, a lease) yields.** It lets
-   go of what no consumer of its is reading, forgets what it judged, and waits holding nothing; if a
-   consumer is reading, it lets go when the last ends. A wait is therefore never in a cycle: what a
-   waiter holds protects a consumer, and a consumer never waits. This is what lets a reader that
-   needs a script group it did not judge (a later join, `--also` in the other order) go on, and what
-   makes two loads that take R then S and S then R both finish. The build that has the admission does not
-   yield: what it holds is waited for by no one, and the builds it waits for yield.
-3. **A consumer takes a `Pin` before its first read**, in every mode (`Client::read`, once, where the
-   requests of a turn are accepted): shared leases on all of the world of every loaded checkout, and
-   the tokens looked at again. It lives with the client: through the compile, the link, the errors and
-   a link detached from the request. A world that moved is **refused**: the client is answered that it
-   did, nothing is read, and the next request judges again. There is no log-and-go-on.
-4. The load takes its owner from the request (`add(.., owner)`, `join(.., stream.build)`), not from the
-   process: the build that started the worker, the process's own number for one run by hand (released
-   after its first program), the request's own number for a checkout joined later (released when the
-   request is dropped). A load of several checkouts looks at the tokens of all of them before the
-   database has them, and loads again if one moved while it gave up a group.
-5. A reload that loads several checkouts prepares them all before it places one; a split that cannot
-   be loaded again keeps the world it had (it is not replaced by the fallback) and is asked again.
-6. A request that must wait is put off (`Busy`), and asked again when `scripts::generation()` is not
-   what it was when the request was **read, before the stale check**; a file of another process is
-   watched by a thread that ends with the builds that asked for it. The worker's main loop sleeps
-   through no wait.
+The rules (`scripts/leases.rs`, `scripts.rs`, `main.rs`):
+
+1. **A build that is refused what it needs yields its leases, not its decisions.** It lets go of the leases
+   no consumer of its reads, keeps what it decided, and waits holding nothing. When it asks again, a
+   failure is its failure still, and a result is its result if the output still has the generation it is of
+   (`reacquire`); if another build ran the script meanwhile the result is of an output that is not there,
+   and the script is judged again, which is the only way to read what it left. So a script cargo runs once in
+   a build runs once, unless a build with other inputs ran it between: cargo would have run the two builds
+   one after the other, and here the second runs its scripts afresh. The build that has the admission does
+   not yield. With the admission an operation's, two loads that take R then S and S then R do not
+   interleave, and yield is for a build that asks for a group after its operation (a later join).
+2. **A consumer takes a `Pin` before its first read**: the consumer is counted first, so no release comes
+   between, then shared leases on the world of the checkouts its program is built from (not every checkout
+   loaded) and the generations looked at again. It lives with the client through the compile, the link, the
+   errors and a link detached from the request, and not while the request waits to be built again (an
+   interrupted build puts its clients back with no pin).
+3. **A world that moved is loaded again, not refused.** The request is put back to be asked for as a request
+   of the program would be, with its own variables: the check of the scripts judges them over the output as
+   it is, and the checkout is loaded again if what they say is another. An editor's `edit` is put back with
+   its text, and the checkouts are asked for as a `sync` of each program with the edit's variables; the edit
+   is taken when they are loaded. At most four times: a world that moves under every attempt is another
+   build's to finish first, and is said.
+4. The load takes its owner from the request, tells the inputs what it watches only when the database has
+   the checkouts, and looks at the generations of all of them before it does. A split that cannot be loaded
+   again keeps its world.
+5. A request that must wait is put off (`Busy`) and asked again when `scripts::generation()` is not what it
+   was when the request was **read, before the stale check**. A file of another process is watched by a
+   thread for each **registration**: it ends its own and no other, under the lock registrations are made
+   under, so a build that asks as the last one retires has a watch.
 
 ### Tests
 
-Component (Mac, shared target, heavy lock, watchdog): `scripts::` 24 passed. They include the multi-group
-sequences (a reader that needs another group while a writer has the admission, in one process and in two;
-opposite group orders; a consumer's pin before a build yields; a world that moved is refused and holds
-nothing; a running script is waited for and what it left is then looked at; a watch ends with its
-builds) over two lease sets standing for two processes, and the earlier A/B/A, failure and two-process
-tests over the real runner.
+Component (Mac, shared target, heavy lock, watchdog): `scripts::` 31 passed. They include decisions kept
+across a yield (reacquire at the same generation; superseded when another build ran it; a failure kept), two
+runs of one fingerprint as two generations (with a script that runs every build), a pin that is a consumer
+before it has its leases (a pin in flight is not released under), an operation that has the admission
+for all its groups, the watcher retire/re-register window (200 rounds, then one wake), and the earlier
+tests. Mutation check: the old watcher shape (decide, then remove unconditionally) fails the window test.
 
 Linux through the daemon (`harness/leasebarrier.py`; Docker `rust:1.99.0-bookworm`, one 6 GiB container, no
-extra swap, own docker lock; the `5G`/`3G` memory settings are inside it, a guard of the test, not a
-product limit). Each scenario ran on the binary of `04d69ce7` with only barrier hooks added (a
-*baseline*, no fix) and on the fixed build (digest `d4a519ce8d73…`, the same in every batch):
+extra swap, own docker lock). Baseline = `ae31fc5c` as published; fixed = production code `2c95ea1c`
+(binary sha256 `c8f00791eda2…` in every batch):
 
-| scenario | what it holds apart | baseline `04d69ce7`+hooks | fixed |
-|---|---|---|---|
-| `groups` | two direct runs, `--also` in opposite orders, one target directory, another `GEN` each | A exits: "the build scripts of this build changed while it was reading their output, and another build is running scripts: ask again" | both built; each program is cargo's; B waited for A's group and A for B's, neither refused |
-| `overlay` | `RA_JIT_OVERLAY=1` (builds without the background thread), an editor's edit that `include_bytes!`s the generated file, held before its compile and link | B rewrites the output while the edit is held | B logs `waits`; the edit logs `pins world=1` |
-| `worlds` | a worker that has R and S loaded (S joined) and an edit of R, held; another worker's `GEN` for R | B rewrites R's output (the edit held only the last group judged, S's) | B waits; the edit logs `pins world=2` |
-| `join` | a worker started by hand, S joined by `ra-jit sync --project`, then S again with another `GEN` | the second request never ends (its join's leases belong to a number that no one releases) | it ends and the script of S ran for the new value |
-| `lost-wake`, `reload-busy`, `coab`, `direct`, `internal`, `same-worker`, `cross-worker` | the earlier scenarios | fixed in the batches before (below) | pass |
+| scenario | baseline `ae31fc5c` | fixed |
+|---|---|---|
+| `generation`: another worker runs the script again over a file it watches (one fingerprint), then an edit to A reads the generated file in a body | the edit prints `include=b env=a cfg=a` (the new payload with the old world); cargo prints `b b b` | `b b b`, as cargo's; the world was refused and loaded again (`refused` in the log), the edit taken |
+| `unrelated`: S's world moved, an edit to R | refused: "not what the database was loaded from … ask again" | built |
+| `groups`: two direct runs, `--also` in opposite orders, scripts that run every build, a guard that fails the second execution of one for one value | A fails: "script ran twice: gena-a" | each script ran once for each build (4 executions); both built; programs = cargo's |
 
-Batches and sources: the fixed build passed `groups`, `overlay`, `lost-wake`, `reload-busy`, `coab`,
-`direct`, `same-worker`, `cross-worker` on source `8d696a6a`; `internal`, `groups`, `overlay` again on
-`8fd30ff7`; `join` on `b2f6ecc4`; `worlds` and `join` again on `4a6bd18e`. The production code is
-`55cf3a45` in all of them (their binaries have one digest); the later commits are the harness. Also on
-Linux at `55cf3a45`: `blaze-build-script` untouched 49 passed, `scripts::` 24 passed. Evidence:
-`p05r-evidence/consumer-world-8d696a6a/` (see its `PROVENANCE.md`: a JSON is overwritten by the next
-batch, the logs and the `b*-*.json` copies are what was kept).
+Regression on the fixed build, same binary: `worlds`, `join`, `lost-wake`, `reload-busy`, `overlay`, `internal` pass.
+`scripts::` 31 and `blaze-build-script` (unchanged) are as in the table above on the Mac; on Linux `scripts::` 31
+passed at `2c95ea1c`. Evidence: `p05r-evidence/generation-recovery-2c95ea1c/` (a JSON, a folder and a manifest for
+each batch, named by the batch and never overwritten).
 
 ### What is not shown, not fixed, or wider
 
-- **A warm worker does not relink for a library the script now names** (`link-control`,
-  `archive-control` and B in `same-worker`, `lost-wake`, `reload-busy`): B's include, variable and `cfg`
-  are `b`'s but `native` is A's, exit 0. It happens with no second build and on `91d58995`. Recorded as
-  gaps by the harness, not passes, and **not fixed here: a named blocker** (a cloud candidate for it is
-  under review and was not incorporated).
+- **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
+  the old archive's. It is recorded as a gap by the harness. **Not fixed: a named blocker** (a cloud candidate
+  for it is separate and was not incorporated).
 - **Inherited, outside this change, a blocker and not an accepted limit:** the script's compile keys
   `host_flags` but the owned compiler is not given `--cfg` (or the other flags), and explicit
   `--target <host>` is taken for none.
 - A failing script's client message is its first line (a reply is one line).
-- **Not run at runtime:** a reload whose split cannot be loaded again (read: it keeps its old world and
-  is asked again); a competing writer that is running when the pin is taken (component test only); the
-  pin of a program's own checkout rather than of every loaded one (it takes all, which can make a worker
-  wait for a checkout it does not read); a checkout read as another (`viewed`) beyond the code path it
-  shares with `overlay`.
-- A build that yields forgets what it judged, so a script that runs on every build (cargo's
-  `rerun-if-changed` of a file that is not there) can run twice in that build when it yielded. A build
-  that does not yield, or that finds nothing to wait for, runs it once.
-- A worker whose daemon never sends `retire` holds the build's leases until it ends (the daemon asks
-  until the worker hears or ends: one thread for each build, not bounded further).
+- **Not run at runtime:** the recovery of a stale world for a request that is not an edit (a `sync` that
+  loses the race between the check and the pin; component and read only); an edit whose program is built
+  from a split that fails to load again; a competing writer already running when a pin is taken (component
+  test only); a checkout read as another beyond the code path it shares with `overlay`; an interrupted build
+  with a client that needs a group it did not judge (read: the clients give their pins up).
+- A build whose script another build ran meanwhile (the case of rule 1) runs the script again: the only
+  case of a second execution in a build, and with the build that ran it between.
 - Not rerun: the 42-probe `scriptedits.py` suite, P0-A, the Mac's 234.
