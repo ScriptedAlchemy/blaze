@@ -281,6 +281,51 @@ The table reports resolved-crate counts and mapped accepted/attempted/total-inst
 parts per run. Positive accepted usage proves only partial mapping; image misses can still
 use the cloned store or normal resolution. No benefit is established by those counts.
 
+An atomic `summary.json` with `status=incomplete`, `valid=false` and `comparable=false`
+is published before any run. Finished arm rows are checkpointed. Collector errors and
+interrupts publish `failed` or `interrupted` instead of leaving an unmarked invocation.
+`cleanup.json` records collector/stop exits and available source client/daemon PIDs.
+Post-stop archival is attempted even when stop fails; any error retains the owned home.
+Comparable rows must match the requested workload, source digest and resolved-crate count,
+and include every requested round. The resolved count does not prove identical resolved
+root identities: those IDs are not exposed by this prototype's log. This limitation is
+explicit in JSON and printed output. Full-image semantics are never inferred from partial
+accepted usage; no minimum 100% mapping rule is added.
+
+For a retained home, first read `runtime-home.txt`, `runtime-error.txt`, `cleanup.json`
+and the archived logs. Use the same recorded binary and `RA_JIT_HOME` to stop that private
+daemon; confirm recorded processes have exited (PID reuse must be considered). Copy any
+remaining runtime logs into the artifact directory before deleting only that owned home.
+Never delete other `.fi-*` homes by glob, and do not remove a home while its processes run.
+Evidence collection failure is not repaired merely by deleting the directory.
+
+## Next executable measurement gate
+
+The script-free `hello` project in `harness/dist/fixtures.toml` is a candidate small
+fixture (Rust library/binary, no declared dependencies or build script). That source fact
+does not prove blaze-only compilation: std/toolchain and driver behavior remain involved.
+No current D3m binary bundle is accepted as compatible with future PR12/C4 native compiler
+fixes; the retained debug bundle predates those fixes. Do not repeat ripgrep or pressure
+until the coordinator supplies a reviewed compatible combined source/bundle and evidence
+that build scripts and the daemon compile/run without recognized rustc fallback.
+
+Then record the combined source SHA, fixture source digest, toolchain, binary hashes and
+native compiler acceptance evidence. Fetch/write hello at the pinned fixture contents,
+build/copy the six sibling binaries under the heavy lock/watchdog, and run:
+
+```sh
+with-heavy-lock.sh d3m-measure python3 -I -B harness/dist/frontimage.py \
+  --td /path/to/hello --package hello --blaze-bin /path/to/reviewed/bin \
+  --work /path/to/new-unique-artifacts --cargo-home-from /path/to/cargo-home \
+  --runs 3 --arms off,store,image --runtime-root /tmp
+```
+
+The driver requires a blaze-only completed build, nonempty seed, accepted image usage and
+same-session matching workload/counts. If hello has no frozen dependency slice, diagnose
+that miss rather than waive the gate; choose a reviewed script-free dependency fixture next.
+Report run count, range and limiter, partial mapped coverage and heap-decoded limits.
+This would be small-fixture evidence, not ripgrep/tracedecay scale or a speedup claim.
+
 ## Deviations
 
 The lock queue prevented the predecessor's full build and fixture measurements before its

@@ -29,7 +29,7 @@ resolving (its own timers), what reading the parts took, and what it held when i
 physical footprint on macOS, which leaves out a mapped file's clean pages, and the resident set,
 which counts them).
 """
-import argparse, importlib.util, json, os, re, shutil, statistics, subprocess, sys, tempfile
+import argparse, hashlib, importlib.util, json, os, re, shutil, statistics, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOADMEM = os.path.join(os.path.dirname(HERE), "loadmem.py")
@@ -106,10 +106,16 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
     print("+", " ".join(cmd[3:]), flush=True)
     out = None
     error = None
+    interrupted = False
+    cleanup = {"collector_exit": None, "stop_exit": None, "runtime_home": runtime}
     try:
         out = sh(cmd)
+        cleanup["collector_exit"] = out.returncode
         if out.returncode:
             error = f"loadmem collector exited {out.returncode}: {out.stdout}"
+    except KeyboardInterrupt:
+        interrupted = True
+        error = "loadmem collector interrupted"
     except Exception as why:
         error = f"loadmem collector failed: {why}"
     finally:
@@ -117,12 +123,33 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
         try:
             stopped = sh([os.path.join(os.path.abspath(blaze_bin or a.blaze_bin), "ra-jit"), "stop"],
                          env=dict(os.environ, RA_JIT_HOME=runtime), timeout=20)
+            cleanup["stop_exit"] = stopped.returncode
             if stopped.returncode:
                 raise RuntimeError(f"daemon stop exited {stopped.returncode}: {stopped.stdout}")
-            # Logs written during stop are evidence too. Never delete the only copy.
+        except (Exception, KeyboardInterrupt) as why:
+            interrupted |= isinstance(why, KeyboardInterrupt)
+            error = f"{error + '; ' if error else ''}stop failed: {why}"
+        # Even a failed stop may have written useful diagnostics. Collection does
+        # not imply that the process is stopped or that its home may be removed.
+        try:
             archive_runtime(runtime, os.path.join(work, "r"))
-        except Exception as why:
+        except (Exception, KeyboardInterrupt) as why:
+            interrupted |= isinstance(why, KeyboardInterrupt)
             error = f"{error + '; ' if error else ''}{why}"
+        cleanup["error"] = error
+        result_path = os.path.join(work, "r", "result.json")
+        if os.path.exists(result_path):
+            try:
+                with open(result_path) as collected:
+                    result = json.load(collected)
+                cleanup["source_client_pid"] = result.get("client_pid")
+                cleanup["source_daemon_pids"] = result.get("daemon_pids", [])
+                cleanup["source_exit"] = result.get("exit")
+            except (OSError, ValueError) as why:
+                error = f"{error + '; ' if error else ''}unreadable collector provenance: {why}"
+                cleanup["error"] = error
+        with open(os.path.join(work, "cleanup.json"), "w") as kept:
+            json.dump(cleanup, kept, indent=1)
         if out is not None:
             with open(os.path.join(work, "loadmem.out"), "w") as kept:
                 kept.write(out.stdout)
@@ -130,6 +157,8 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
             message = f"{error}; runtime home retained: {runtime}"
             with open(os.path.join(work, "runtime-error.txt"), "w") as kept:
                 kept.write(message + "\n")
+            if interrupted:
+                raise KeyboardInterrupt(message)
             raise RuntimeError(message)
         shutil.rmtree(runtime)
     return os.path.join(work, "r")
@@ -167,6 +196,7 @@ def parse(run):
     row = {"outcome": result.get("outcome"), "tripped": result.get("tripped"), "ready_logged": bool(log),
            "swap_growth_mb": result.get("peak_swap_growth_mb")}
     row["no_rustc_violation"] = no_rustc_violation(run)
+    row["workload"] = {"td": result.get("td"), "command": result.get("command")}
     stopped = result.get("stopped_after") or {}
     row.update(ready_footprint_mb=stopped.get("footprint_mb"), ready_rss_mb=stopped.get("rss_mb"))
     row["ready_seen_s"] = stopped.get("ready_seen_s")
@@ -244,7 +274,19 @@ def finish_summary(summary):
            for i, row in enumerate(rows, 1) if (why := invalid(row, arm))]
     bad += [(f"prof-{arm}", 1, why) for arm, row in summary.get("prof", {}).items()
             if (why := invalid(row, arm))]
+    if "requested_arms" in summary:
+        for arm in summary["requested_arms"]:
+            if len(summary["arms"].get(arm, [])) != summary["runs"]:
+                bad.append((arm, 0, "missing requested rounds"))
+    identities = {(json.dumps(row.get("workload"), sort_keys=True), row.get("crates"))
+                  for rows in summary["arms"].values() for row in rows}
+    if len(identities) != 1 or any(row.get("crates") is None or not row.get("workload")
+                                 for rows in summary["arms"].values() for row in rows):
+        bad.append(("coverage", 0, "requested arms differ in workload or resolved-crate count"))
     summary["valid"] = not bad
+    summary["comparable"] = not bad and summary["comparison"] == "comparative"
+    summary["mapping_scope"] = "partial accepted mapping; not full-image semantic state"
+    summary["coverage_limiter"] = "resolved count and requested workload only; exact resolved-root IDs unavailable"
     summary["invalid_measurements"] = bad
     return bad
 
@@ -252,6 +294,33 @@ def finish_summary(summary):
 def coverage(row):
     """Accepted mapped / attempted mapped / total installed; not full-image coverage."""
     return f"{row.get('image_accepted', 0)}/{row.get('image_attempted', 0)}/{row.get('parts', 0)}"
+
+
+def write_summary(work, summary):
+    """Replace the progress record atomically; an interrupt leaves the preceding record."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=work, prefix=".summary-", delete=False) as file:
+        temporary = file.name
+        try:
+            json.dump(summary, file, indent=1)
+            file.flush()
+            os.replace(temporary, os.path.join(work, "summary.json"))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def source_digest(root):
+    """Rust sources/manifests, excluding generated targets and VCS state."""
+    digest = hashlib.sha256()
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in ("target", ".git"))
+        for name in sorted(files):
+            if name.endswith(".rs") or name in ("Cargo.toml", "Cargo.lock"):
+                path = os.path.join(base, name)
+                digest.update(os.path.relpath(path, root).encode() + b"\0")
+                with open(path, "rb") as file:
+                    digest.update(file.read())
+    return digest.hexdigest()
 
 
 def main():
@@ -277,7 +346,29 @@ def main():
     os.makedirs(a.work, exist_ok=True)
     image = os.path.join(a.work, "front.image")
     summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {},
-               "comparison": comparison_kind(arms), "valid": False, "invalid_measurements": ["incomplete"]}
+               "requested_arms": arms,
+               "comparison": comparison_kind(arms), "valid": False, "comparable": False,
+               "status": "incomplete", "invalid_measurements": ["incomplete"]}
+    write_summary(a.work, summary)
+    try:
+        summary["source_digest"] = source_digest(a.td)
+        result = run_measurements(a, arms, image, summary)
+        if source_digest(a.td) != summary["source_digest"]:
+            summary["valid"] = summary["comparable"] = False
+            summary["invalid_measurements"].append(("source", 0, "source changed during invocation"))
+            result = 1
+        summary["status"] = "complete" if result == 0 else "failed"
+        write_summary(a.work, summary)
+        return result
+    except (Exception, KeyboardInterrupt) as error:
+        summary.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                       valid=False, comparable=False, error=f"{type(error).__name__}: {error}")
+        write_summary(a.work, summary)
+        raise
+
+
+def run_measurements(a, arms, image, summary):
+    """Mutate the published progress object so failures preserve finished arms too."""
 
     if not a.skip_build:
         run = loadmem(a, "build", stop=False)
@@ -285,8 +376,7 @@ def main():
         if (not summary["build"] or summary["build"]["outcome"] != "ok"
                 or summary["build"]["tripped"] or summary["build"]["no_rustc_violation"]):
             print("BUILD DID NOT COMPLETE WITH BLAZE; no measurement arms:", summary["build"], flush=True)
-            with open(os.path.join(a.work, "summary.json"), "w") as file:
-                json.dump(summary, file, indent=1)
+            write_summary(a.work, summary)
             return 1
     if os.path.exists(image):
         os.remove(image)
@@ -295,17 +385,19 @@ def main():
     seed_error = invalid(summary["seed"], "seed")
     if seed_error or not os.path.exists(image):
         print("SEED FAILED:", seed_error or "no image was written", json.dumps(summary["seed"]), flush=True)
-        json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
+        write_summary(a.work, summary)
         return 1
     summary["image_bytes"] = os.path.getsize(image)
     store = os.path.join(a.work, "seed", "store.noindex")
     env = {arm: arm_env(arm, image) for arm in ("off", "store", "image")}
     rows = {arm: [] for arm in arms}
+    summary["arms"] = rows
     for n in range(1, a.runs + 1):
         for arm in arms:
             run = loadmem(a, f"{arm}-{n}", env=env[arm], store_from=store)
             row = parse(run)
             rows[arm].append(row)
+            write_summary(a.work, summary)
             print(arm, n, json.dumps(row), flush=True)
     summary["arms"] = rows
     if a.prof_bin:
@@ -315,10 +407,11 @@ def main():
             summary["prof"][arm] = parse(run)
             summary["prof"][arm]["dir"] = run
     bad = finish_summary(summary)
-    json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
+    write_summary(a.work, summary)
 
     print(f"\n{a.package}: {summary['comparison']}, valid={summary['valid']}; mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
     print("Coverage is mapped accepted/attempted/total installed per run; partial mapped use is not full image service.")
+    print(summary["coverage_limiter"])
     print("| arm | resolved crates (mean, range) | mapped accepted/attempted/total by run | ready seen s | load s | resolve s | serve s | reading parts s | ready footprint MB | ready rss MB | live MB |")
     print("|---|---|---|---|---|---|---|---|---|---|---|")
     for arm in arms:

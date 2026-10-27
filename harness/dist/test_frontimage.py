@@ -288,7 +288,8 @@ class FrontImageTests(unittest.TestCase):
         driver = module("frontimage")
         row = dict(outcome="stopped", tripped=None, ready_logged=True, ready_seen_s=1,
                    load_s=0.5, resolve_s=0.2, ready_footprint_mb=100, ready_rss_mb=140,
-                   image_accepted=1, image_attempted=2, parts=10, crates=42)
+                   image_accepted=1, image_attempted=2, parts=10, crates=42,
+                   workload={"td": "/fixture", "command": ["blaze", "build", "-p", "selected"]})
         summary = {"comparison": "comparative", "arms": {"image": [dict(row, image_accepted=0)]}}
         self.assertTrue(driver.finish_summary(summary))
         self.assertFalse(json.loads(json.dumps(summary))["valid"])
@@ -297,6 +298,64 @@ class FrontImageTests(unittest.TestCase):
         self.assertFalse(driver.finish_summary(summary))
         self.assertTrue(summary["valid"])
         self.assertEqual(driver.coverage(row), "1/2/10")
+
+    def test_production_main_publishes_failure_and_interrupt_before_any_arm(self):
+        driver = module("frontimage")
+        for failure in (RuntimeError("collector failed"), KeyboardInterrupt("cancelled")):
+            with self.subTest(kind=type(failure).__name__), tempfile.TemporaryDirectory() as work:
+                argv = ["frontimage", "--td", work, "--package", "selected", "--blaze-bin", "/shared/bin",
+                        "--work", str(Path(work) / "artifacts"), "--cargo-home-from", work]
+                def launch(*args, **kwargs):
+                    initial = json.loads((Path(work) / "artifacts/summary.json").read_text())
+                    self.assertFalse(initial["valid"])
+                    self.assertEqual(initial["status"], "incomplete")
+                    raise failure
+                with mock.patch.object(driver.sys, "argv", argv), mock.patch.object(driver, "loadmem", side_effect=launch):
+                    with self.assertRaises(type(failure)):
+                        driver.main()
+                summary = json.loads((Path(work) / "artifacts/summary.json").read_text())
+                self.assertEqual(summary["status"], "interrupted" if isinstance(failure, KeyboardInterrupt) else "failed")
+                self.assertFalse(summary["valid"])
+                self.assertFalse(summary["comparable"])
+
+    def test_interrupt_and_failed_stop_still_archive_and_retain_provenance(self):
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                   timeout=30, toolchain="1.99.0", package="selected", runtime_root=work)
+            def run(cmd, **kwargs):
+                if "--home" in cmd:
+                    home = Path(cmd[cmd.index("--home") + 1])
+                    (home / "daemon.log").write_text("startup diagnosis")
+                    artifact = Path(work) / "image/r"
+                    artifact.mkdir()
+                    (artifact / "result.json").write_text(json.dumps({"client_pid": 123, "daemon_pids": [456], "exit": -2}))
+                    raise KeyboardInterrupt("collector cancelled")
+                with (Path(kwargs["env"]["RA_JIT_HOME"]) / "daemon.log").open("a") as log:
+                    log.write("\nstop failed diagnosis")
+                return SimpleNamespace(returncode=7, stdout="stop failed")
+            with mock.patch.object(driver, "sh", side_effect=run):
+                with self.assertRaises(KeyboardInterrupt):
+                    driver.loadmem(args, "image")
+            artifact = Path(work) / "image"
+            self.assertIn("stop failed diagnosis", (artifact / "r/logs/daemon.log").read_text())
+            cleanup = json.loads((artifact / "cleanup.json").read_text())
+            self.assertEqual(cleanup["stop_exit"], 7)
+            self.assertEqual(cleanup["source_client_pid"], 123)
+            self.assertEqual(cleanup["source_daemon_pids"], [456])
+            self.assertTrue(Path(cleanup["runtime_home"]).exists())
+
+    def test_mismatched_workloads_or_resolved_counts_are_not_comparable(self):
+        driver = module("frontimage")
+        row = dict(outcome="stopped", tripped=None, ready_logged=True, ready_seen_s=1, load_s=1,
+                   resolve_s=1, ready_footprint_mb=100, ready_rss_mb=100, crates=2,
+                   workload={"td": "/fixture", "command": ["blaze", "build", "-p", "selected"]})
+        for other in (dict(row, crates=3), dict(row, workload={"command": ["blaze", "build", "-p", "unrelated"]})):
+            summary = {"comparison": "comparative", "arms": {"off": [row], "store": [dict(other, parts=3)],
+                                                              "image": [dict(row, parts=3, image_accepted=1)]}}
+            self.assertTrue(driver.finish_summary(summary))
+            self.assertFalse(summary["comparable"])
+            self.assertFalse(summary["valid"])
 
 
 if __name__ == "__main__":

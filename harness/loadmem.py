@@ -221,6 +221,7 @@ def main():
     client = subprocess.Popen(command, cwd=td, env=env, stdout=client_log, stderr=subprocess.STDOUT,
                               start_new_session=True)
     result = {"command": command, "td": td, "blaze_bin": blaze_bin, "started": time.strftime("%FT%T"),
+              "client_pid": client.pid, "runtime_home": home,
               "watchdog_mb": a.watchdog_mb, "marks": {}, "tripped": None, "peak_mb": 0, "peak_client_mb": 0,
               "swap_start_mb": round(swap_start), "guard": {k: env[k] for k in GUARD}}
     seen_lines = {}  # log path -> bytes read
@@ -339,6 +340,7 @@ def main():
         if client.poll() is None:
             kill(descendants(ps_table(), [client.pid]))
         result["exit"] = client.poll()
+        result["daemon_pids"] = sorted(daemons)
         result["outcome"] = ("watchdog-killed" if result["tripped"] else "stopped" if result.get("stopped_after")
                              else "ok" if client.returncode == 0 else "failed")
         result["wall_s"] = round(time.time() - t0, 1)
