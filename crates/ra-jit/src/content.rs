@@ -574,7 +574,11 @@ mod tests {
                 }).unwrap();
                 let declared = crate::declared_in(db, dep.into());
                 declared.functions.iter().map(|&id| {
-                    format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into()))
+                    use hir_ty::db::HirDatabase as _;
+                    (
+                        format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into())),
+                        format!("{:?}", db.runtime_mir_body(id.into())),
+                    )
                 }).collect::<Vec<_>>()
             };
             let old_bodies = hir::attach_db(&db, || bodies(&db));
@@ -583,6 +587,7 @@ mod tests {
             let new_bodies = hir::attach_db(&db, || bodies(&db));
             if body.contains("pub fn value() -> u8 { include_bytes!") {
                 assert_ne!(old_bodies, new_bodies, "lowered body must depend on included bytes");
+                assert_ne!(old_bodies[0].1, new_bodies[0].1, "MIR must depend on included bytes");
             }
             let second = hir::attach_db(&db, || {
                 let crates = ide_db::base_db::all_crates(&db);
