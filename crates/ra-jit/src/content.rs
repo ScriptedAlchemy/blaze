@@ -474,7 +474,27 @@ mod tests {
         );
         let hash = |byte: u8| {
             std::fs::write(&payload, [byte]).unwrap();
-            let (db, _) = RootDatabase::with_many_files(&fixture);
+            let (mut db, files) = RootDatabase::with_many_files(&fixture);
+            // WithFixture uses virtual paths. Replace the file sets with real paths so
+            // included_file resolves the on-disk payload through its production reader.
+            let mut change = ide_db::ChangeWithProcMacros::default();
+            let mut app_files = vfs::file_set::FileSet::default();
+            let mut dep_files = vfs::file_set::FileSet::default();
+            app_files.insert(
+                files[0].file_id(&db),
+                vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(top.join("app.rs"))),
+            );
+            dep_files.insert(
+                files[1].file_id(&db),
+                vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(
+                    top.join("vendor/dep/src/lib.rs"),
+                )),
+            );
+            change.set_roots(vec![
+                ide_db::base_db::SourceRoot::new_local(app_files),
+                ide_db::base_db::SourceRoot::new_library(dep_files),
+            ]);
+            db.apply_change(change);
             hir::attach_db(&db, || {
                 let crates = ide_db::base_db::all_crates(&db);
                 let find = |name: &str| {
