@@ -2321,7 +2321,7 @@ def native_only(sc, source_sha, proxy=None):
         text = text.replace('println!("cargo:rerun-if-env-changed=GEN");',
                             'println!("cargo:rerun-if-env-changed=GEN");\n    println!("cargo:rerun-if-changed=native-value.txt");')
         if proxy:
-            script = {
+            proxy_script = {
                 "input": 'format!("INPUT({})\\n", out.join("libgen.a").display())',
                 "group": 'format!("GROUP(AS_NEEDED({}))\\n", out.join("libgen.a").display())',
                 "include": 'format!("INCLUDE {}\\n", out.join("included").display())',
@@ -2329,7 +2329,7 @@ def native_only(sc, source_sha, proxy=None):
             extra_script = ('fs::write(out.join("included"), format!("INPUT({})\\n", out.join("libgen.a").display())).unwrap();'
                             if proxy == "include" else "")
             text = text.replace('println!("cargo:rustc-link-lib=static={lib}");',
-                                f'{extra_script}\n    fs::write(out.join("libproxy.so"), {script}).unwrap();\n'
+                                f'{extra_script}\n    fs::write(out.join("libproxy.so"), {proxy_script}).unwrap();\n'
                                 '    println!("cargo:rustc-link-lib=proxy");')
         with open(script, "w") as f:
             f.write(text)
@@ -2382,6 +2382,7 @@ def native_only(sc, source_sha, proxy=None):
     sc.finish(noop, "native-noop")
     if noop.returncode != 0 or sc.runs() != runs:
         sc.fail("a no-op build failed or ran the build script")
+    sc.check_programs("native-noop", sc.keep("native-noop"), expected[97], "a")
 
 
 def native_request_env(sc, source_sha):
@@ -2427,7 +2428,6 @@ def native_request_env(sc, source_sha):
                 sc.fail(f"LIBRARY_PATH={name}: {program} printed {got!r}, cargo's {want!r}")
     if sc.runs():
         sc.fail("a native-only request ran a build script")
-    sc.check_programs("native-noop", sc.keep("native-noop"), expected[97], "a")
 
 
 SCENARIOS = {
