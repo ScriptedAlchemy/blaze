@@ -31,6 +31,8 @@ static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Digest>>> =
 struct Inputs {
     directives: Vec<Vec<u8>>,
     paths: BTreeSet<PathBuf>,
+    search: BTreeSet<PathBuf>,
+    cwd: PathBuf,
     opaque: bool,
 }
 
@@ -99,10 +101,11 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
     // Use the real native link builder, including attribute-declared libraries and ordering.
     // Do not put the Rust objects this build writes into its own input fingerprint.
     let command = crate::link::command(db, &roots, &[], sysroot, binary)?;
-    inputs.link_inputs(&command, &cwd, &out_dirs);
+    let env = crate::link::Environment::of(db);
+    inputs.link_inputs_env(&command, &cwd, &out_dirs, &env);
     for name in ["LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH"] {
         let mut field = name.as_bytes().to_vec();
-        match std::env::var_os(name) {
+        match env.get(name) {
             Some(value) => {
                 field.push(1);
                 field.extend_from_slice(value.as_encoded_bytes());
@@ -126,7 +129,20 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
 impl Inputs {
     /// Track named native candidates, not every file in a search directory. Missing earlier
     /// candidates matter too: creating one can change which library the linker selects.
+    #[cfg(test)]
     fn link_inputs(&mut self, command: &str, cwd: &Path, out_dirs: &BTreeSet<PathBuf>) {
+        let env = crate::link::Environment::of(&RootDatabase::default());
+        self.link_inputs_env(command, cwd, out_dirs, &env);
+    }
+
+    fn link_inputs_env(
+        &mut self,
+        command: &str,
+        cwd: &Path,
+        out_dirs: &BTreeSet<PathBuf>,
+        env: &crate::link::Environment,
+    ) {
+        self.cwd = cwd.to_owned();
         self.directives.push(command.as_bytes().to_vec());
         let Some(words) = shlex::split(command) else {
             self.opaque = true;
@@ -141,7 +157,7 @@ impl Inputs {
             })
             .collect();
         let mut search = out_dirs.clone();
-        if let Some(paths) = std::env::var_os("LIBRARY_PATH") {
+        if let Some(paths) = env.get("LIBRARY_PATH") {
             search.extend(std::env::split_paths(&paths).map(|path| cwd.join(path)));
         }
         let mut frameworks = BTreeSet::new();
@@ -192,6 +208,10 @@ impl Inputs {
                 | "-order_file" => match next() {
                     Some(path) => {
                         self.paths.insert(cwd.join(path));
+                        // A full linker script can change the linker's implicit search,
+                        // sysroot and output rules. Until those rules are interpreted in
+                        // full, it links legally but does not advertise a reusable key.
+                        self.opaque |= matches!(word.as_str(), "-T" | "--script");
                     }
                     None => self.opaque = true,
                 },
@@ -219,6 +239,7 @@ impl Inputs {
                         .map(|(_, path)| path);
                     if let Some(file) = file {
                         self.paths.insert(cwd.join(file));
+                        self.opaque |= word.starts_with("--script=");
                     } else if !word.starts_with('-') {
                         let path = cwd.join(word);
                         let native = path.extension().is_some_and(|ext| {
@@ -234,6 +255,7 @@ impl Inputs {
                 }
             }
         }
+        self.search = search.clone();
         for dir in search {
             for name in &libraries {
                 if let Some(name) = name.strip_prefix(':') {
@@ -324,7 +346,7 @@ impl Inputs {
         frame(&mut hash, &(self.paths.len() as u64).to_le_bytes());
         for path in &self.paths {
             frame(&mut hash, path.as_os_str().as_encoded_bytes());
-            hash_path(path, &mut hash, &mut BTreeSet::new())?;
+            hash_path(path, &mut hash, &mut BTreeSet::new(), &self.cwd, &self.search, false)?;
         }
         Ok(hash.finalize().into())
     }
@@ -335,7 +357,14 @@ fn frame(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+fn hash_path(
+    path: &Path,
+    hash: &mut Sha256,
+    active: &mut BTreeSet<PathBuf>,
+    cwd: &Path,
+    search: &BTreeSet<PathBuf>,
+    script: bool,
+) -> io::Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -349,7 +378,7 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
         let target = fs::read_link(path)?;
         frame(hash, target.as_os_str().as_encoded_bytes());
         match path.canonicalize() {
-            Ok(target) => return hash_path(&target, hash, active),
+            Ok(target) => return hash_path(&target, hash, active, cwd, search, script),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 frame(hash, b"missing-target");
                 return Ok(());
@@ -363,6 +392,10 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
         frame(hash, &(meta.permissions().mode() & 0o7777).to_le_bytes());
     }
     if meta.is_file() {
+        let real = path.canonicalize()?;
+        if !active.insert(real.clone()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "native input script cycle"));
+        }
         frame(hash, b"file");
         let mut file_hash = Sha256::new();
         let mut file = fs::File::open(path)?;
@@ -375,6 +408,50 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
             file_hash.update(&buffer[..read]);
         }
         frame(hash, &file_hash.finalize());
+        // A library named .so can be a GNU ld script rather than an ELF object.
+        // Discover its dependency closure at each digest, including commit-time rehash.
+        // Unknown textual link rules are opaque: legal full links remain available.
+        if script
+            || path.file_name().is_some_and(|name| name.to_string_lossy().contains(".so"))
+            || path.extension().is_some_and(|ext| ext == "ld")
+        {
+            let bytes = fs::read(path)?;
+            if !bytes.starts_with(b"\x7fELF") {
+                let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+                let dependencies = script_inputs(text)?;
+                let mut dirs = search.clone();
+                dirs.insert(cwd.to_owned());
+                if let Some(parent) = path.parent() {
+                    dirs.insert(parent.to_owned());
+                }
+                for (dependency, included_script) in dependencies {
+                    let mut candidates = BTreeSet::new();
+                    if dependency.starts_with('=') || dependency.starts_with("$SYSROOT") {
+                        return Err(io::Error::other("native linker script sysroot is opaque"));
+                    }
+                    if let Some(name) = dependency.strip_prefix("-l") {
+                        for dir in &dirs {
+                            if let Some(exact) = name.strip_prefix(':') {
+                                candidates.insert(dir.join(exact));
+                            } else {
+                                candidates.insert(dir.join(format!("lib{name}.so")));
+                                candidates.insert(dir.join(format!("lib{name}.a")));
+                            }
+                        }
+                    } else if Path::new(&dependency).is_absolute() {
+                        candidates.insert(PathBuf::from(&dependency));
+                    } else {
+                        candidates.extend(dirs.iter().map(|dir| dir.join(&dependency)));
+                    }
+                    frame(hash, dependency.as_bytes());
+                    for candidate in candidates {
+                        frame(hash, candidate.as_os_str().as_encoded_bytes());
+                        hash_path(&candidate, hash, active, cwd, &dirs, included_script)?;
+                    }
+                }
+            }
+        }
+        active.remove(&real);
         return Ok(());
     }
     if !meta.is_dir() {
@@ -393,10 +470,100 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
     frame(hash, &(entries.len() as u64).to_le_bytes());
     for entry in entries {
         frame(hash, entry.file_name().as_encoded_bytes());
-        hash_path(&entry.path(), hash, active)?;
+        hash_path(&entry.path(), hash, active, cwd, search, false)?;
     }
     active.remove(&real);
     Ok(())
+}
+
+/// The dependency-only GNU ld script grammar. Other commands can change linker search
+/// or layout and are deliberately opaque, not guessed. Quoted paths and comments follow
+/// ld's token boundaries; an incomplete script never provides a reusable key.
+fn script_inputs(text: &str) -> io::Result<Vec<(String, bool)>> {
+    let bad = || io::Error::other("native linker script grammar is opaque");
+    let mut tokens = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ch if ch.is_whitespace() || ch == ',' || ch == ';' => {}
+            '(' | ')' => tokens.push(ch.to_string()),
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = '\0';
+                loop {
+                    let next = chars.next().ok_or_else(bad)?;
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            '"' => {
+                let mut token = String::new();
+                loop {
+                    match chars.next().ok_or_else(bad)? {
+                        '"' => break,
+                        ch => token.push(ch),
+                    }
+                }
+                tokens.push(token);
+            }
+            ch => {
+                let mut token = ch.to_string();
+                while chars
+                    .peek()
+                    .is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, '(' | ')' | ',' | ';'))
+                {
+                    token.push(chars.next().unwrap());
+                }
+                tokens.push(token);
+            }
+        }
+    }
+    let mut inputs = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        match tokens[at].as_str() {
+            "INCLUDE" => {
+                at += 1;
+                let file = tokens.get(at).ok_or_else(bad)?;
+                if matches!(file.as_str(), "(" | ")") {
+                    return Err(bad());
+                }
+                inputs.push((file.clone(), true));
+                at += 1;
+            }
+            "INPUT" | "GROUP" => {
+                at += 1;
+                if tokens.get(at).map(String::as_str) != Some("(") {
+                    return Err(bad());
+                }
+                at += 1;
+                let mut depth = 1;
+                while depth != 0 {
+                    let token = tokens.get(at).ok_or_else(bad)?;
+                    at += 1;
+                    match token.as_str() {
+                        ")" => depth -= 1,
+                        "AS_NEEDED" => {
+                            if tokens.get(at).map(String::as_str) != Some("(") {
+                                return Err(bad());
+                            }
+                            at += 1;
+                            depth += 1;
+                        }
+                        "(" => return Err(bad()),
+                        file => inputs.push((file.to_owned(), false)),
+                    }
+                }
+            }
+            _ => return Err(bad()),
+        }
+    }
+    if inputs.is_empty() {
+        return Err(bad());
+    }
+    Ok(inputs)
 }
 
 #[cfg(test)]
@@ -408,6 +575,7 @@ mod tests {
             directives: vec![b"rustc-link-lib=static=generated".to_vec()],
             paths: BTreeSet::from([path.to_owned()]),
             opaque: false,
+            ..Inputs::default()
         }
     }
 
@@ -435,6 +603,64 @@ mod tests {
         let before = inputs.digest().unwrap();
         fs::write(dir.path().join("first/libvalue.a"), b"A").unwrap();
         assert_ne!(inputs.digest().unwrap(), before);
+    }
+
+    #[test]
+    fn linker_scripts_hash_input_group_and_included_archive_closures() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dir.path().join("libproxy.so");
+        let archive = dir.path().join("impl.a");
+        let include = dir.path().join("inner");
+        fs::write(&archive, b"A").unwrap();
+        for script in
+            ["INPUT(impl.a)", "/* GNU ld script */ GROUP( AS_NEEDED(impl.a) )", "INCLUDE inner"]
+        {
+            fs::write(&proxy, script).unwrap();
+            fs::write(&include, "INPUT(impl.a)").unwrap();
+            let tracked = inputs(&proxy);
+            let before = tracked.digest().unwrap();
+            fs::write(&archive, b"B").unwrap();
+            assert_ne!(tracked.digest().unwrap(), before, "{script}");
+            fs::write(&archive, b"A").unwrap();
+            assert_eq!(tracked.digest().unwrap(), before, "{script}");
+        }
+        fs::write(&include, "INPUT(other.a)").unwrap();
+        let tracked = inputs(&proxy);
+        let before = tracked.digest().unwrap();
+        fs::write(dir.path().join("other.a"), b"C").unwrap();
+        assert_ne!(tracked.digest().unwrap(), before);
+        fs::write(&include, "INCLUDE libproxy.so").unwrap();
+        assert!(tracked.digest().is_err(), "an included script cycle cannot be reused");
+        fs::write(&proxy, "SEARCH_DIR(\"elsewhere\") INPUT(impl.a)").unwrap();
+        assert!(tracked.digest().is_err(), "uninterpreted search rules are opaque");
+    }
+
+    #[test]
+    fn native_search_and_identity_use_the_request_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join("libchoice.a"), b"A").unwrap();
+        fs::write(b.join("libchoice.a"), b"B").unwrap();
+        let mut db = RootDatabase::default();
+        let request = |path: &Path| {
+            [("LIBRARY_PATH".to_owned(), path.display().to_string())].into_iter().collect()
+        };
+        ide_db::base_db::set_process_env(&mut db, request(&a));
+        let first = crate::link::Environment::of(&db);
+        ide_db::base_db::set_process_env(&mut db, request(&b));
+        let second = crate::link::Environment::of(&db);
+        let mut input_a = Inputs::default();
+        input_a.link_inputs_env("cc -lchoice -o program", dir.path(), &BTreeSet::new(), &first);
+        let mut input_b = Inputs::default();
+        input_b.link_inputs_env("cc -lchoice -o program", dir.path(), &BTreeSet::new(), &second);
+        assert!(input_a.paths.contains(&a.join("libchoice.a")));
+        assert!(!input_a.paths.contains(&b.join("libchoice.a")));
+        assert!(input_b.paths.contains(&b.join("libchoice.a")));
+        assert!(!input_b.paths.contains(&a.join("libchoice.a")));
+        assert_ne!(input_a.digest().unwrap(), input_b.digest().unwrap());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, ffi::OsString};
 
 use anyhow::{Context, bail};
 use hir::Crate;
@@ -16,6 +17,54 @@ use ide_db::base_db::{self, CrateOrigin, LangCrateOrigin};
 use rustc_hash::FxHashSet;
 
 pub(crate) mod split;
+
+/// The request's linker environment, captured once per operation. Clearing the command's
+/// environment also honors variables absent in a request; process-global mutation would
+/// race detached links and scripts.
+#[derive(Clone, Debug)]
+pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+
+impl Environment {
+    pub(crate) fn of(db: &RootDatabase) -> Self {
+        let vars = match base_db::ProcessEnv::try_get(db) {
+            Some(env) => env.vars(db).iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            None => std::env::vars_os().collect(),
+        };
+        Self(vars)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&std::ffi::OsStr> {
+        self.0.get(std::ffi::OsStr::new(name)).map(OsString::as_os_str)
+    }
+
+    pub(crate) fn apply(&self, command: &mut Command) {
+        command.env_clear().envs(&self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_command_retains_its_request_and_unsets_worker_variables() {
+        let mut db = RootDatabase::default();
+        let request =
+            |value: &str| [("LIBRARY_PATH".to_owned(), value.to_owned())].into_iter().collect();
+        base_db::set_process_env(&mut db, request("a"));
+        let first = Environment::of(&db);
+        base_db::set_process_env(&mut db, request("b"));
+        let second = Environment::of(&db);
+        for (env, want) in [(first, "a"), (second, "b")] {
+            let mut command = Command::new("/usr/bin/printenv");
+            command.env("BLAZE_LINK_LEAK", "worker");
+            env.apply(&mut command);
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("LIBRARY_PATH={want}\n"));
+        }
+    }
+}
 
 /// Links `objects` into the executable `exe`, with the native libraries of the crates `program`
 /// links. A shared library instead when `exports` names what it exports: the rest of it is
@@ -86,6 +135,7 @@ pub(crate) struct Line {
     before: Vec<String>,
     after: Vec<String>,
     apple: bool,
+    env: Environment,
 }
 
 impl Line {
@@ -111,12 +161,13 @@ impl Line {
         }
         after.extend(native.args);
         after.extend(target.trailing());
-        Ok(Line { before, after, apple: target.apple })
+        Ok(Line { before, after, apple: target.apple, env: Environment::of(db) })
     }
 
     /// Links `objects` into the executable `exe`. How long `cc` took.
     pub(crate) fn link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
         let mut cmd = Command::new("cc");
+        self.env.apply(&mut cmd);
         cmd.args(&self.before);
         for &object in objects {
             if split::is_archive(&leading_bytes(object)?) {

@@ -5240,6 +5240,7 @@ impl std::error::Error for RustcLinkedLost {}
 #[expect(clippy::too_many_arguments)]
 fn link(
     cmd: Option<&str>,
+    env: &link::Environment,
     splice: Option<&Path>,
     patch: Option<&Path>,
     object: &Path,
@@ -5432,10 +5433,10 @@ fn link(
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
         Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
-            run_link(reached, start, &declined)?;
+            run_link(reached, env, start, &declined)?;
             reached
         }
-        _ => match (run_link(cmd, start, &declined), reached.as_deref()) {
+        _ => match (run_link(cmd, env, start, &declined), reached.as_deref()) {
             (Err(why), Some(reached))
                 if why
                     .downcast_ref::<LinkFailed>()
@@ -5443,7 +5444,7 @@ fn link(
             {
                 lock(&REACHED_ONLY).insert(cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
-                run_link(reached, Instant::now(), again)?;
+                run_link(reached, env, Instant::now(), again)?;
                 reached
             }
             (linked, _) => {
@@ -5457,7 +5458,7 @@ fn link(
     {
         cargo::plan::write_headerpad(binary, pad)?;
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
-        run_link(cmd, Instant::now(), &again)?;
+        run_link(cmd, env, Instant::now(), &again)?;
     }
     drop(reading);
     if let (Some(binary), Some(patch)) = (splice, patch) {
@@ -5486,8 +5487,10 @@ fn packs_whole(args: &Args) -> bool {
 
 /// Runs the link command `cmd` and says how long it took since `start` and how it ended, with
 /// `note` after.
-fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
-    let linked = shell(cmd).output()?;
+fn run_link(cmd: &str, env: &link::Environment, start: Instant, note: &str) -> anyhow::Result<()> {
+    let mut command = shell(cmd);
+    env.apply(&mut command);
+    let linked = command.output()?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr).into_owned();
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
@@ -8631,6 +8634,7 @@ fn run_holding(
             report_stats(&known.stats);
             link(
                 args.link_cmd.as_deref(),
+                &link::Environment::of(&db),
                 args.splice.as_deref(),
                 args.patch.as_deref(),
                 &args.out,
@@ -9006,17 +9010,6 @@ fn run_holding(
                             continue;
                         }
                     }
-                    // Script directives and Rust crate identity can stay the same while a
-                    // native archive changes. Check this before either no-op fast path.
-                    if native_inputs::stale(&db, &programs) {
-                        if !clients.is_empty() {
-                            later.push((request, asked, stream));
-                            continue;
-                        }
-                        builds.settle(&mut db, &mut programs)?;
-                        native_inputs::invalidate(&db, &mut programs);
-                        lock(&as_built).clear();
-                    }
                     // One build is for one process: its variables are what `env!` reads.
                     if process::differs(&db, &stream.env) {
                         if !clients.is_empty() {
@@ -9033,6 +9026,18 @@ fn run_holding(
                             listed.touch(&db, Some(&reading));
                             lock(&as_built).clear();
                         }
+                    }
+                    // Read native inputs with the admitted request's environment too.
+                    // Script directives and Rust crate identity can stay the same while
+                    // library search selects another archive. Check before no-op reuse.
+                    if native_inputs::stale(&db, &programs) {
+                        if !clients.is_empty() {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        builds.settle(&mut db, &mut programs)?;
+                        native_inputs::invalidate(&db, &mut programs);
+                        lock(&as_built).clear();
                     }
                     given_up.extend(lock(&unlinked).drain(..));
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
@@ -9982,9 +9987,11 @@ fn run_holding(
             let (as_built, object) = (as_built.clone(), out.clone());
             let packs = packs_whole(&programs[at].args);
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
+            let link_env = link::Environment::of(&db);
             let linked = std::thread::spawn(move || {
                 let failed = link(
                     link_cmd.as_deref(),
+                    &link_env,
                     splice.as_deref(),
                     spliced.as_deref(),
                     &object,
@@ -10548,8 +10555,19 @@ impl Program {
             let (over_rustc, onto) = (known.stats.over_rustc, known.stats.onto_rustcs);
             begin_link();
             let packs = packs_whole(args);
-            let unlinked =
-                link(cmd, splice, patch, &args.out, patched, over_rustc, onto, defer, packs).err();
+            let unlinked = link(
+                cmd,
+                &link::Environment::of(db),
+                splice,
+                patch,
+                &args.out,
+                patched,
+                over_rustc,
+                onto,
+                defer,
+                packs,
+            )
+            .err();
             if let Some(lost) =
                 unlinked.as_ref().and_then(|it| it.downcast_ref::<RustcLinkedLost>())
             {

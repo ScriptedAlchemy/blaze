@@ -2303,7 +2303,7 @@ def archive_strict(sc, source_sha):
     archive_control(sc, source_sha, True)
 
 
-def native_only(sc, source_sha):
+def native_only(sc, source_sha, proxy=None):
     """Same Rust inputs, directives and archive path; only the native archive's bytes change (the script reads them from a file):
     97, 98, 97 as three builds of one worker, each compared with cargo's; then the archive is corrupted (a build that must not
     be accepted as unchanged), restored with its size and time put back (and must link again), and a no-op build neither relinks
@@ -2320,6 +2320,17 @@ def native_only(sc, source_sha):
                             'let value: i32 = fs::read_to_string("native-value.txt").unwrap().trim().parse().unwrap();')
         text = text.replace('println!("cargo:rerun-if-env-changed=GEN");',
                             'println!("cargo:rerun-if-env-changed=GEN");\n    println!("cargo:rerun-if-changed=native-value.txt");')
+        if proxy:
+            script = {
+                "input": 'format!("INPUT({})\\n", out.join("libgen.a").display())',
+                "group": 'format!("GROUP(AS_NEEDED({}))\\n", out.join("libgen.a").display())',
+                "include": 'format!("INCLUDE {}\\n", out.join("included").display())',
+            }[proxy]
+            extra_script = ('fs::write(out.join("included"), format!("INPUT({})\\n", out.join("libgen.a").display())).unwrap();'
+                            if proxy == "include" else "")
+            text = text.replace('println!("cargo:rustc-link-lib=static={lib}");',
+                                f'{extra_script}\n    fs::write(out.join("libproxy.so"), {script}).unwrap();\n'
+                                '    println!("cargo:rustc-link-lib=proxy");')
         with open(script, "w") as f:
             f.write(text)
         with open(os.path.join(ws, "native-value.txt"), "w") as f:
@@ -2333,6 +2344,7 @@ def native_only(sc, source_sha):
         expected[value] = sc.oracle("a", extra)
     current[0] = 97
     sc.project()
+    hashes = []
     for index, value in enumerate((97, 98, 97)):
         with open(os.path.join(sc.ws, "native-value.txt"), "w") as f:
             f.write(str(value))
@@ -2342,6 +2354,13 @@ def native_only(sc, source_sha):
             sc.fail(f"native-only {value}: rc={p.returncode}: {p.err[-600:]}")
             return
         sc.check_programs(f"native-{index}", sc.keep(f"native-{index}"), expected[value], "a")
+        if proxy:
+            hashes.append({name: sha256(os.path.join(sc.run_dir(), name))
+                           for name in ("libproxy.so", "gen.rs")})
+    if proxy:
+        sc.notes["unchanged-proxy-and-rust"] = hashes
+        if any(h != hashes[0] for h in hashes):
+            sc.fail("the witness changed the proxy script or Rust include, not just its archive")
     archive = os.path.join(sc.run_dir(), "libgen.a")
     valid, stamp = open(archive, "rb").read(), os.stat(archive).st_mtime_ns
     with open(archive, "wb") as f:
@@ -2363,6 +2382,51 @@ def native_only(sc, source_sha):
     sc.finish(noop, "native-noop")
     if noop.returncode != 0 or sc.runs() != runs:
         sc.fail("a no-op build failed or ran the build script")
+
+
+def native_request_env(sc, source_sha):
+    """Two identical-source requests through one daemon resolve an attribute native
+    library from different LIBRARY_PATH directories. No script reexecution is involved."""
+    original = sc.project
+    for name, value in (("a", 97), ("b", 98)):
+        root = os.path.join(sc.dir, "libs-" + name)
+        os.makedirs(root)
+        with open(os.path.join(root, "choice.c"), "w") as f:
+            f.write(f"int choice(void) {{ return {value}; }}\n")
+        subprocess.run(["cc", "-c", os.path.join(root, "choice.c"), "-o", os.path.join(root, "choice.o")],
+                       check=True, capture_output=True)
+        subprocess.run(["ar", "rcs", os.path.join(root, "libchoice.a"), os.path.join(root, "choice.o")],
+                       check=True, capture_output=True)
+
+    def project(ws=None, config=None, pkg="gen"):
+        original(ws, config, pkg)
+        ws = ws or sc.ws
+        manifest = open(os.path.join(ws, "Cargo.toml")).read().replace('build = "build.rs"', "build = false")
+        with open(os.path.join(ws, "Cargo.toml"), "w") as f:
+            f.write(manifest)
+        for source in ("one", "two"):
+            with open(os.path.join(ws, "src", source + ".rs"), "w") as f:
+                f.write('#[link(name="choice", kind="static")]\nextern "C" { fn choice() -> i32; }\n'
+                        'fn main() { println!("choice={}", unsafe { choice() }); }\n')
+
+    sc.project = project
+    expected = {name: sc.oracle("a", {"LIBRARY_PATH": os.path.join(sc.dir, "libs-" + name)})
+                for name in ("a", "b")}
+    sc.project()
+    for name in ("a", "b", "a"):
+        p = sc.client("a", LIBRARY_PATH=os.path.join(sc.dir, "libs-" + name))
+        sc.finish(p, "library-path-" + name)
+        if p.returncode != 0:
+            sc.fail(f"LIBRARY_PATH={name}: rc={p.returncode}: {p.err[-600:]}")
+            return
+        for program in PROGRAMS:
+            got = sc.program(program)
+            want = (expected[name] or {}).get(program)
+            sc.notes.setdefault("programs", {})[f"{name}/{program}"] = {"got": got, "want": want}
+            if got != want:
+                sc.fail(f"LIBRARY_PATH={name}: {program} printed {got!r}, cargo's {want!r}")
+    if sc.runs():
+        sc.fail("a native-only request ran a build script")
     sc.check_programs("native-noop", sc.keep("native-noop"), expected[97], "a")
 
 
@@ -2398,6 +2462,10 @@ SCENARIOS = {
     "link-strict": link_strict,
     "archive-strict": archive_strict,
     "native-only": native_only,
+    "native-script-input": lambda sc, sha: native_only(sc, sha, "input"),
+    "native-script-group": lambda sc, sha: native_only(sc, sha, "group"),
+    "native-script-include": lambda sc, sha: native_only(sc, sha, "include"),
+    "native-request-env": native_request_env,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
     "cross-worker": lambda sc, sha: same_or_cross(sc, True, sha),
