@@ -523,7 +523,7 @@ fn checked_limits(limits: Limits) -> anyhow::Result<Limits> {
         || limits.request > ceiling.request
         || limits.event == 0
         || limits.event > ceiling.event
-        || limits.blob == 0
+        || limits.blob < 32
         || limits.blob > ceiling.blob
         || limits.lookup_items == 0
         || limits.lookup_items > ceiling.lookup_items
@@ -797,6 +797,7 @@ mod tests {
             Limits { request: 0, ..d },
             Limits { request: d.request + 1, ..d },
             Limits { blob: 0, ..d },
+            Limits { blob: 31, ..d },
             Limits { blob: d.blob + 1, ..d },
             Limits { lookup_items: 0, ..d },
             Limits { lookup_items: d.lookup_items + 1, ..d },
@@ -819,14 +820,14 @@ mod tests {
 
     #[tokio::test]
     async fn client_uses_negotiated_lookup_request_and_blob_limits() {
-        let limits = Limits { request: 256, blob: 16, lookup_items: 2, ..Limits::DOCUMENTED };
+        let limits = Limits { request: 256, blob: 64, lookup_items: 2, ..Limits::DOCUMENTED };
         let answer = CacheMissingAnswer { missing: Set::new(vec![[1; 32]]) };
         let fake = Fake::start(
             encode(&hello(limits)),
             vec![
                 reply(StatusCode::OK, encode(&answer)),
                 reply(StatusCode::OK, vec![0; 257]),
-                reply(StatusCode::OK, vec![0; 17]),
+                reply(StatusCode::OK, vec![0; 65]),
             ],
         )
         .await;
