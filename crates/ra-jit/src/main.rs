@@ -5984,7 +5984,7 @@ impl WatchedFile {
                 mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
             });
             if std::env::var_os("RA_JIT_STATS").is_some() {
-                eprintln!("included-watch: registered {}", path.display());
+                eprintln!("included-watch: registered {path}");
             }
             changed |= db.reload_included_file(&path);
         }

@@ -492,7 +492,9 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     oracle_code = expected[0]
                 pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
                 builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
-                same_generation = bool(pids) and (previous_pids is None or pids == previous_pids) and builds >= previous_builds
+                same_generation = (bool(pids) and "failed:" not in status
+                                   and (previous_pids is None or pids == previous_pids)
+                                   and builds >= previous_builds)
                 previous_pids, previous_builds = pids, builds
                 right &= same_generation
                 rows.append(dict(machine=machine.name, step=step, right=right,
