@@ -473,18 +473,89 @@ passed afterward. That evidence does not overturn the hybrid mode's earlier fail
 
 ### Remaining limits found by reading the code
 
-- `scripts::JUDGED` remembers only the last build for each run directory. Interleaved requests
-  from multi-target builds A, B, then A can therefore judge and run A's every-build script again.
-  For an impure script this can change its output, not only add work. No end-to-end reproduction
-  of this interleaving was run in this review.
-- The target-directory lock ends when `scripts::run` returns. It protects the script cache
-  transaction, but does not reserve the resulting `OUT_DIR` through the consuming compilation.
-  Another build using the same run directory can replace generated files after that return.
-  Per-build result lifetime and publication need a further correction before concurrent builds
-  can be claimed isolated throughout compilation.
+Two of the three limits this review found were fixed afterwards, by [the build-scoped
+leases](#what-a-build-holds-of-a-script-leases); the third stands.
+
+- ~~`scripts::JUDGED` remembers only the last build for each run directory.~~ Fixed: what a build
+  judged is kept by (build, run directory) until the build is retired.
+- ~~The target-directory lock ends when `scripts::run` returns, so another build can replace the
+  generated files before the first build's compile and link read them.~~ Fixed: a lease on the
+  run directory lasts until the build is retired.
 - A graph containing a proc macro still takes the existing Cargo check path, which runs its
   scripts too; the direct runner also refuses a build dependency that is a proc macro. These
   remain the no-rustc step J gap described above. This review added no compiler fallback.
 
 The review's tests establish the corrections listed here. They do not establish the whole of P0-A
 or P0-D, nor replace the 42-case runtime suite or the platform checks required for landing.
+
+## What a build holds of a script (leases)
+
+Review of `91d58995` (2026-10-26/27) found two request-lifetime faults in the runner above. Both
+are fixed in `scripts/leases.rs`; this section says what the lifecycle is, what was chosen and
+what is **read**, **measured** (here, on the Mac, `RUST_BACKTRACE=0`) and **not run**.
+
+### The lifecycle (read)
+
+- A **build** is one `Request::Build` to the daemon (`next_build`). It is several requests to the
+  worker, one per program (`Worker::ask`, `RA_JIT_BUILD=<n>`), and is over when the daemon has
+  the worker's last answer (`built`). Two clients that ask at once are two builds.
+- A script is judged in the worker's main loop by `Checkouts::stale` (`Scripts::changed`, which
+  calls `scripts::run`) and by the load (`workspace_at`). `stale` runs before the loop settles the
+  builds under way, so a request of build B could rewrite an `OUT_DIR` that build A's compile and
+  link had still to read.
+- What reads a script's output after `run` returns: the vfs (the files `include!` names), the
+  compile (`OUT_DIR`, `rustc-env`, cfgs) and the link (`rustc-link-search` and `-lib` name files
+  in `OUT_DIR`). All of them are inside the build.
+- `OUT_DIR` is persistent and its path is observable: cargo runs a script again in the same
+  directory, the script may read what its last run left, and the path is in what the script
+  prints and generates. A copy of the output at another path is not the output the script
+  described, and replaying a script's other effects is what #5 did and was parked for.
+
+### What was chosen
+
+Cargo's own answer is to hold the build directory's lock for the whole build. The runner takes
+that per script and shares it among the builds that only read:
+
+- a build that judges a script takes a **shared lease** on its run directory (`flock` on
+  `blaze-lease`, under the transaction lock) and keeps it until `retire`;
+- a build that must run the script takes the lease **exclusively**, runs, and takes it shared
+  again before it lets the transaction lock go, so no other run is between;
+- what a build judged is kept by (build, run directory): once judged, a script is not judged or
+  run again in that build, whatever other builds did between its requests, and a failure is kept
+  with its message and delivered by each request;
+- the daemon sends `retire <build>` to the worker once the client has its answer; a worker that
+  ends releases its leases with its descriptors;
+- a run that finds the lease held by another build **of the same worker** is put off
+  (`scripts::Busy`; the main loop asks again after `Event::Retired`), because only that build's
+  end frees it; one held by **another worker** is waited for outside the transaction lock
+  (default 600 s, `RA_JIT_SCRIPT_LEASE_WAIT_SECS`), as cargo waits for the build directory.
+
+Concurrency kept: builds that find a script fresh (the same watched values) read its output
+together and wait for nothing. A build waits only when it must write the output that another
+build still reads, which cargo does for every build.
+
+### What it does not do
+
+- A request that names no build (`build == 0`) keeps nothing: it is judged afresh and holds only
+  the transaction lock, as before. The daemon always names one.
+- If a worker never hears `retire` (daemon killed between answer and message) its leases last
+  until it ends, and other workers wait for the deadline and fail with a message. Two workers that
+  each hold a script the other must run also wait for the deadline: ordering the scripts by run
+  directory would prevent it and was not done.
+- A worker blocks its main loop while it waits for another worker's build.
+
+### Tests
+
+`scripts/leases.rs` (5, the lease rules with two lease sets standing for two processes) and
+`scripts/tests.rs` (5 new): an A/B/A counter test with an always-stale script, the same with a
+failing script, a cross-worker test that a judgment that stands is not mistaken for another
+worker's later output, one that fresh builds share, and a two-process barrier test: worker A's
+script is done, worker B (a second process, another `GEN`) asks and is held, A reads its own
+generated file, `cfg`, `rustc-env`, `-l` and `-L`, A is retired, B runs and finds its own. They run
+the real runner, run and record files, and a shell script as the build script; compiling the script
+is the one part left out.
+
+### Not run
+
+The same barrier through two real workers (daemon, load, compile, link) needs the Linux whole
+build, which this Mac cannot run (#255). It is not claimed.
