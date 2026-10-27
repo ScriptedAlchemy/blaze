@@ -462,6 +462,7 @@ def warm_payload_report(work, bin_dir, machines, sources):
         ws = os.path.join(machine.checkout("warm-payload", sources["vendor-payload"]), "vendored")
         env = machine.env(bin_dir, os.path.join(machine.top, "warm-store"),
                           daemon_home("warm", machine.name))
+        env["RA_JIT_INPUT_TRACE"] = "1"
         side = Side(ws, env, True)
         previous_pids, previous_builds = None, -1
         try:

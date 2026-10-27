@@ -2696,6 +2696,9 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_root").entered();
+    if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
+        eprintln!("input-codegen: root {:?}", func);
+    }
     tier::for_build(|| root_code(db, func, false)).map(Produced::code)
 }
 
@@ -2868,6 +2871,9 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
+    if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
+        eprintln!("input-codegen: instance {:?}", instance.def);
+    }
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
 
