@@ -2494,20 +2494,27 @@ impl Checkouts {
             return None;
         }
         // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
-        whole.into_iter().find_map(|(loaded, base)| {
-            let inside = loaded.strip_prefix(base).ok()?;
-            let mut over = project.clone();
-            for part in inside.components().rev() {
-                if over.file_name() != Some(part.as_os_str()) {
-                    return None;
-                }
-                over.pop();
-            }
-            let alike = (overlay == Overlay::Always || quick(base, &over))
-                && self.builds_alike(base, &over);
-            alike.then(|| View { base: base.clone(), over, project: loaded.clone() })
+        let (at, over) = self.alike(&project)?;
+        let (loaded, base) = &self.roots[at];
+        viewing(overlay, quick(base, &over)).then(|| View {
+            base: base.clone(),
+            over,
+            project: loaded.clone(),
         })
+    }
+
+    /// The loaded checkout a project that is not loaded will be read through when it is asked for:
+    /// the one it is read as (`view_of`) or splits packages with (`add_once`), as the policy
+    /// allows either, and none when it will load on its own. Nothing is run to say it.
+    fn sharing(
+        &self,
+        project: &Path,
+        overlay: Overlay,
+        quick: &dyn Fn(&Path, &Path) -> bool,
+    ) -> Option<usize> {
+        let (at, over) = self.alike(project)?;
+        let viewed = viewing(overlay, quick(&self.roots[at].1, &over));
+        sharing_allowed(viewed, splitting()).then_some(at)
     }
 
     /// The checkout that the one at `root` has packages of, when it has.
@@ -2604,7 +2611,7 @@ impl Checkouts {
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
-        let share = std::env::var_os("RA_JIT_SPLIT").is_none_or(|it| it != "0");
+        let share = splitting();
         for project in projects {
             if share && let Some((base, over)) = self.alike(project) {
                 let own = self.differing(base, &over);
@@ -2700,17 +2707,23 @@ impl Checkouts {
         project: &Path,
         env: &ide_db::base_db::Env,
         build: u64,
+        overlay: Overlay,
+        quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> anyhow::Result<Vec<usize>> {
         let project = dunce::canonicalize(project).ok();
         let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
         // The checkout whose scripts the build reads: the project's own (the one it shares
-        // packages with, for a split), or, for a project that is not loaded, the one it will
-        // share packages with when it is (`alike`, which only compares files), if any. A project
-        // that will be loaded on its own reads no checkout that is loaded: its own scripts are
-        // judged when it is, with its own owner and variables.
+        // packages with, for a split), or, for a project that is not loaded, the one it will be
+        // read as or share packages with when it is (`sharing`, which only compares files, by the
+        // policy that will decide it), if any. A project that will be loaded on its own reads no
+        // checkout that is loaded: its own scripts are judged when it is, with its own owner and
+        // variables.
         let built = match asked {
             Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
-            None => project.as_ref().and_then(|it| self.alike(it)).map(|(at, _)| &self.roots[at].1),
+            None => {
+                let sharing = project.as_ref().and_then(|it| self.sharing(it, overlay, quick));
+                sharing.map(|at| &self.roots[at].1)
+            }
         };
         let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
@@ -3027,6 +3040,51 @@ enum Overlay {
     /// in turn, so one that keeps taking long is loaded with its own crates instead.
     Quick,
     Always,
+}
+
+/// Whether a checkout that is not loaded shares the packages it has alike with a loaded one when
+/// it is (`RA_JIT_SPLIT=0` turns that off).
+fn splitting() -> bool {
+    std::env::var_os("RA_JIT_SPLIT").is_none_or(|it| it != "0")
+}
+
+/// Whether a checkout that is file-alike to a loaded one is read as it: always, or when it is quick
+/// (`quick`), and never when overlays are off.
+fn viewing(overlay: Overlay, quick: bool) -> bool {
+    overlay != Overlay::Never && (overlay == Overlay::Always || quick)
+}
+
+/// Whether a file-alike checkout is read through the loaded one at all: as a view of it, or split from it.
+fn sharing_allowed(viewed: bool, splitting: bool) -> bool {
+    viewed || splitting
+}
+
+/// What it takes for a checkout to be read as a loaded one quickly (`Overlay::Quick`): the
+/// checkouts built whole, and whether files are loaded that nothing watches yet.
+struct Quick {
+    pending: bool,
+    built: Vec<PathBuf>,
+}
+
+impl Quick {
+    fn of(
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        programs: &[Program],
+        running: &Builds,
+    ) -> Quick {
+        let built = programs
+            .iter()
+            .enumerate()
+            .filter(|(at, it)| it.whole.is_some() && !running.running.contains_key(at))
+            .map(|(_, it)| it.args.checkout.to_path_buf())
+            .collect();
+        Quick { pending: WatchedFile::unwatched(files, db), built }
+    }
+
+    fn allows(&self, base: &Path, over: &Path, given_up: &FxHashSet<PathBuf>) -> bool {
+        !self.pending && self.built.iter().any(|it| it == base) && !given_up.contains(over)
+    }
 }
 
 /// Whether a request reads the checkout loaded at `root`, when `built` is the one whose scripts it
@@ -8764,7 +8822,10 @@ fn run_holding(
                     let generation = scripts::generation();
                     // The scripts of all the checkouts are judged under one admission.
                     let mut operation = scripts::operation(stream.build);
-                    match checkouts.stale(project, &stream.env, stream.build) {
+                    given_up.extend(lock(&unlinked).drain(..));
+                    let quick = Quick::of(&files, &db, &programs, &builds);
+                    let quick = |base: &Path, over: &Path| quick.allows(base, over, &given_up);
+                    match checkouts.stale(project, &stream.env, stream.build, overlay, &quick) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
                             later.push((request, asked, stream));
@@ -8863,18 +8924,9 @@ fn run_holding(
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
                             // What a checkout reads is known once a build of it is over.
-                            let pending = WatchedFile::unwatched(&files, &db);
-                            let built: Vec<&Path> = programs
-                                .iter()
-                                .enumerate()
-                                .filter(|(at, it)| {
-                                    it.whole.is_some() && !builds.running.contains_key(at)
-                                })
-                                .map(|(_, it)| &*it.args.checkout)
-                                .collect();
-                            let quick = |base: &Path, over: &Path| {
-                                !pending && built.contains(&base) && !given_up.contains(over)
-                            };
+                            let quick = Quick::of(&files, &db, &programs, &builds);
+                            let quick =
+                                |base: &Path, over: &Path| quick.allows(base, over, &given_up);
                             checkouts.view_of(project, overlay, &quick)
                         }
                         None => {
@@ -10530,6 +10582,24 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_alike_checkout_is_read_through_a_loaded_one_by_the_policy_that_will_do_it() {
+        use Overlay::{Always, Never, Quick};
+        // (overlay, quick, splitting) -> does the checkout read the loaded one's scripts?
+        for (overlay, quick, split, reads) in [
+            (Never, true, false, false),  // both off: it loads on its own
+            (Never, true, true, true),    // split
+            (Quick, true, false, true),   // viewed
+            (Quick, false, false, false), // not quick, no split: on its own
+            (Quick, false, true, true),   // split takes it
+            (Always, false, false, true),
+            (Always, false, true, true),
+        ] {
+            let viewed = viewing(overlay, quick);
+            assert_eq!(sharing_allowed(viewed, split), reads, "{quick} {split}");
+        }
+    }
 
     #[test]
     fn a_request_judges_the_scripts_of_the_checkouts_it_reads_and_no_other() {

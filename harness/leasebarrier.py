@@ -90,6 +90,9 @@ recovery-detached  `recovery` with a checkout read as another, so that the build
 first-join    A worker started by hand with R loaded (`GEN=a`; its script is valid for `a`, fails for `b`, and
               keeps a trail), and ONE first request for S, another package that R does not consume, with `GEN=b`
               and a build number of its own: S is built as cargo builds it and R's script is not run for `b`.
+first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SPLIT=0` and `RA_JIT_OVERLAY=0`, and a script that
+              fails for `b` in R's directory only: V is read through R by neither policy, so R's script is not run
+              for it, V's own is, and V is built, as cargo builds it.
 first-join-shared  The same with V, a checkout of R's repository with R's scripts: V reads R's scripts, which are
               judged for `b` (the trail says so), and fail as cargo's would.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
@@ -128,6 +131,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ONCE_BY_DIR");
     println!("cargo:rerun-if-env-changed=ONCE_ONLY");
     println!("cargo:rerun-if-env-changed=FAIL_PKG_VALUE");
+    println!("cargo:rerun-if-env-changed=FAIL_DIR_VALUE");
     // The value is the variable's, or the content of a file that the script watches: the same
     // fingerprint (a watched path) for a run that leaves other output.
     let gen_ = match env::var("GEN_FROM_FILE").as_deref() {
@@ -170,6 +174,14 @@ fn main() {
     // "<package>:<value>": the script of that package fails for that value (valid for the others).
     if let Ok(spec) = env::var("FAIL_PKG_VALUE") {
         if spec == format!("{}:{gen_}", env::var("CARGO_PKG_NAME").unwrap()) {
+            eprintln!("script failed for {spec}");
+            exit(3);
+        }
+    }
+    // "<directory>:<value>": the script fails for that value in the checkout of that name only (a
+    // script may depend on where it is: its manifest directory).
+    if let Ok(spec) = env::var("FAIL_DIR_VALUE") {
+        if spec == format!("{dir_name}:{gen_}") {
             eprintln!("script failed for {spec}");
             exit(3);
         }
@@ -1630,7 +1642,7 @@ def recovery_detached(sc, source_sha):
         worker.kill()
 
 
-def first_join(sc, source_sha, shared):
+def first_join(sc, source_sha, shared, private=False):
     """A worker started by hand with R loaded (`GEN=a`), whose script is valid for `a` and fails for
     `b` and keeps a trail of its runs. ONE first request for a project that is not loaded, with `GEN=b`
     and a build number of its own, no wake and no restart.
@@ -1642,6 +1654,12 @@ def first_join(sc, source_sha, shared):
     os.makedirs(once)
     extra = shared_projects(sc, worktrees=shared)
     extra = dict(extra, ONCE_DIR=once, ONCE_ONLY="none", ONCE_BY_DIR="1")
+    if private:
+        # V is file-alike to R (the same bytes) and read through R by neither policy: its script is its
+        # own, and fails for `b` in R's directory only.
+        extra["FAIL_DIR_VALUE"] = "r:b"
+        extra["RA_JIT_SPLIT"] = "0"
+        extra["RA_JIT_OVERLAY"] = "0"
     if shared:
         v = os.path.join(sc.dir, "v")
         subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", "worktree", "add", "-q",
@@ -1668,6 +1686,26 @@ def first_join(sc, source_sha, shared):
         sc.notes["r-trail-after"] = after
         log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
         sc.notes["failed-lines"] = [l[:200] for l in log.splitlines() if "failed:" in l and "build script" in l]
+        if private:
+            v_trail = os.path.join(once, "trail-v")
+            sc.notes["v-trail"] = open(v_trail).read().split("\n")[:-1] if os.path.exists(v_trail) else []
+            if after != before:
+                sc.fail(f"R's script was run for the request of V, which neither policy reads through R: {before} -> {after}")
+            if rc != 0:
+                sc.fail(f"V (its own script succeeds) was not built (rc {rc}): {said[-300:]}")
+            elif sc.notes["v-trail"] != ["b B"]:
+                sc.fail(f"V's own script was to run once, for b: its trail is {sc.notes['v-trail']}")
+            else:
+                got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+                want = oracle["gen-one"]
+                sc.notes.setdefault("programs", {})["V"] = got
+                strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+                if strip(got) != strip(want):
+                    sc.fail(f"V printed {got!r}, cargo's {want!r}")
+                elif got != want:
+                    sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+            sc.notes["retire"] = retire(sc, sock, "3001")
+            return
         if shared:
             # V reads R's scripts: R is judged for `b`, once, and V is built from it.
             if after[len(before):] != ["b B"]:
@@ -1706,6 +1744,10 @@ def first_join_independent(sc, source_sha):
 
 def first_join_shared(sc, source_sha):
     first_join(sc, source_sha, True)
+
+
+def first_join_private(sc, source_sha):
+    first_join(sc, source_sha, True, private=True)
 
 
 def unrelated(sc, source_sha):
@@ -1793,6 +1835,7 @@ SCENARIOS = {
     "recovery-detached": recovery_detached,
     "first-join": first_join_independent,
     "first-join-shared": first_join_shared,
+    "first-join-private": first_join_private,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,
