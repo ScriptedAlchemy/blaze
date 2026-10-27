@@ -138,15 +138,11 @@ mod dylib_identity_tests {
 }
 
 impl Dylib {
-    /// The one dylib at `path`: the macros of a dylib share its hash.
+    /// Snapshot the bytes for this loaded library generation. A process-global
+    /// pathname cache outlives replacements and would key new expanders as old code.
     fn at(path: &AbsPath) -> Arc<Dylib> {
-        static DYLIBS: Mutex<Option<FxHashMap<AbsPathBuf, Arc<Dylib>>>> = Mutex::new(None);
-        let mut dylibs = DYLIBS.lock().unwrap_or_else(|it| it.into_inner());
-        let dylibs = dylibs.get_or_insert_default();
-        let dylib = dylibs.entry(path.to_path_buf());
-        dylib
-            .or_insert_with(|| Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::new() }))
-            .clone()
+        let hash = std::fs::read(path).ok().map(|bytes| Sha256::digest(bytes).into());
+        Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::from(hash) })
     }
 
     fn hash(&self) -> Option<&[u8; KEY]> {

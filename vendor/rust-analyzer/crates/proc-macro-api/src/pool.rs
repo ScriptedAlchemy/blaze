@@ -53,8 +53,9 @@ impl ProcMacroServerPool {
         let _span = tracing::info_span!("ProcMacroServer::load_dylib").entered();
 
         let dylib_path = Arc::new(dylib.path.clone());
-        let dylib_last_modified =
-            std::fs::metadata(dylib_path.as_path()).ok().and_then(|m| m.modified().ok());
+        use sha2::{Digest as _, Sha256};
+        let dylib_content =
+            std::fs::read(dylib_path.as_path()).ok().map(|bytes| Sha256::digest(bytes).into());
 
         let (first, rest) = self.workers.split_first().expect("worker pool must not be empty");
 
@@ -78,7 +79,7 @@ impl ProcMacroServerPool {
                 name: name.into(),
                 kind,
                 dylib_path: dylib_path.clone(),
-                dylib_last_modified,
+                dylib_content,
             })
             .collect())
     }

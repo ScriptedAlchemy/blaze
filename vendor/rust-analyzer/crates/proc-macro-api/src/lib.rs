@@ -24,7 +24,7 @@ pub mod transport;
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
 use span::{ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
-use std::{fmt, io, sync::Arc, time::SystemTime};
+use std::{fmt, io, sync::Arc};
 
 use crate::{
     bidirectional_protocol::SubCallback, pool::ProcMacroServerPool, process::ProcMacroServerProcess,
@@ -113,7 +113,7 @@ pub struct ProcMacro {
     dylib_path: Arc<AbsPathBuf>,
     name: Box<str>,
     kind: ProcMacroKind,
-    dylib_last_modified: Option<SystemTime>,
+    dylib_content: Option<[u8; 32]>,
 }
 
 impl Eq for ProcMacro {}
@@ -122,7 +122,7 @@ impl PartialEq for ProcMacro {
         self.name == other.name
             && self.kind == other.kind
             && self.dylib_path == other.dylib_path
-            && self.dylib_last_modified == other.dylib_last_modified
+            && self.dylib_content == other.dylib_content
     }
 }
 

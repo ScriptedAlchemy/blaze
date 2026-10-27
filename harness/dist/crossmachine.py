@@ -545,6 +545,48 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
+def macro_content_report(work, bin_dir, machines, sources):
+    from cargo_ra_jit import Side, program_output, wait_warm
+    machine = machines[0]
+    ws = os.path.join(machine.checkout("macro-content", sources["macros"]), "macros")
+    source = os.path.join(ws, "derive/src/lib.rs")
+    text = open(source).read().replace("{name} was described", "{name} was described ONE")
+    with open(source, "w") as output:
+        output.write(text)
+    env = machine.env(bin_dir, os.path.join(machine.top, "macro-store"), daemon_home("pm", "a"),
+                      FIXTURES["macros"].get("env"))
+    side = Side(ws, env, True)
+    rows = []
+    previous_pids, previous_builds = None, -1
+    try:
+        for step in ("initial", "same-size-restored-mtime"):
+            before = os.stat(source)
+            old_digest = hashlib.sha256(open(source, "rb").read()).hexdigest()
+            if step != "initial":
+                text = text.replace("described ONE", "described TWO")
+                with open(source, "w") as output:
+                    output.write(text)
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            _, built = side.cargo("build", "-p", "app")
+            _, ready = wait_warm(side, ws)
+            status = side.cargo("status")[1].stdout
+            actual = program_output(side.cargo("run", "-p", "app")[1])
+            shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
+            expected = reference(machine, bin_dir, ws, FIXTURES["macros"], env["RA_JIT_CACHE"], env["RA_JIT_HOME"])
+            pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
+            builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
+            generation = valid_worker_generation(status, ready, pids, previous_pids, builds, previous_builds)
+            previous_pids, previous_builds = pids, builds
+            rows.append(dict(step=step, right=actual == expected and generation and not recognized_fallback(built.stderr),
+                             actual=actual, expected=expected, build_log=built.stderr, status=status, pids=pids,
+                             worker_log=workers_log(side), old_sha256=old_digest,
+                             source_sha256=hashlib.sha256(open(source, "rb").read()).hexdigest(),
+                             same_size=os.stat(source).st_size == before.st_size,
+                             same_mtime=os.stat(source).st_mtime_ns == before.st_mtime_ns))
+    finally:
+        side.cargo("stop")
+    return rows
+
 def nonfunction_report(work, bin_dir, machines, sources):
     """Drive newly introduced const/discriminant includes through actual requests."""
     from cargo_ra_jit import Side, program_output, wait_warm
@@ -1187,6 +1229,7 @@ def main():
     p.add_argument("--warm-payload", action="store_true",
                    help="same-daemon binary payload edit/delete/recreate on two checkout paths")
     p.add_argument("--warm-nonfunction", action="store_true")
+    p.add_argument("--warm-macro-content", action="store_true")
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
     p.add_argument("--watchdog-mb", type=int, default=24 * 1024)
@@ -1202,7 +1245,7 @@ def main():
     if a.remote or a.b_docker:
         sys.exit("--remote and --b-docker belong to unit C5 (a server remote, a machine of another libc); "
                  "crossmachine.py has a directory remote and two machines of this host")
-    names = ["vendor-payload"] if a.warm_payload or a.warm_nonfunction else (ALL if a.all else a.fixtures)
+    names = ["macros"] if a.warm_macro_content else (["vendor-payload"] if a.warm_payload or a.warm_nonfunction else (ALL if a.all else a.fixtures))
     if not names:
         p.error("name a fixture, or --all")
     unknown = [n for n in names if n not in FIXTURES]
@@ -1245,12 +1288,13 @@ def main():
                  f"machine B: home {b_m.home}\n           checkouts {b_m.checkouts}")
         if a.reference_only:
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
-        if a.warm_payload or a.warm_nonfunction:
-            rows = (nonfunction_report if a.warm_nonfunction else warm_payload_report)(work, bin_dir, (a_m, b_m), sources)
+        if a.warm_payload or a.warm_nonfunction or a.warm_macro_content:
+            runner = macro_content_report if a.warm_macro_content else (nonfunction_report if a.warm_nonfunction else warm_payload_report)
+            rows = runner(work, bin_dir, (a_m, b_m), sources)
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
                 json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
             print(json.dumps(rows, indent=1))
-            if a.warm_nonfunction:
+            if a.warm_nonfunction or a.warm_macro_content:
                 return 1 if any(not row["right"] for row in rows) or watchdog.tripped else 0
             return 1 if any(
                 not r["right"]

@@ -2327,7 +2327,7 @@ fn load(
 /// A file of a checkout that was compared with the one it is in a loaded checkout: the size
 /// and the time of the last write of both, and whether the two were alike. They are not read
 /// again until one is written.
-type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, SystemTime), bool)>>;
+type Compared = std::sync::Mutex<FxHashMap<PathBuf, ([u8; 32], [u8; 32], bool)>>;
 
 /// The checkouts the daemon has loaded.
 struct Checkouts {
@@ -2803,6 +2803,7 @@ fn package_alike(
     nested: &FxHashSet<&Path>,
     compared: &Compared,
 ) -> bool {
+    use sha2::Digest as _;
     let Ok(inside) = dir.strip_prefix(base) else { return true };
     let theirs = over.join(inside);
     let skipped = |inside: &Path, name: &std::ffi::OsStr| {
@@ -2826,21 +2827,19 @@ fn package_alike(
             if path.is_dir() {
                 return package_alike(&path, base, over, nested, compared);
             }
-            let written = |path: &Path| {
-                let file = std::fs::metadata(path).ok()?;
-                Some((file.len(), file.modified().ok()?))
-            };
-            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
+            let (Ok(our_bytes), Ok(their_bytes)) = (std::fs::read(&path), std::fs::read(&their)) else {
                 return false;
             };
-            if ours.0 != theirs.0 {
+            if our_bytes.len() != their_bytes.len() {
                 return false;
             }
+            let ours: [u8; 32] = sha2::Sha256::digest(&our_bytes).into();
+            let theirs: [u8; 32] = sha2::Sha256::digest(&their_bytes).into();
             let known = compared.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
             if let Some((_, _, alike)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
                 return alike;
             }
-            let alike = match (std::fs::read(&path), std::fs::read(&their)) {
+            let alike = match (Ok::<_, std::io::Error>(our_bytes), Ok::<_, std::io::Error>(their_bytes)) {
                 (Ok(ours), Ok(theirs)) => {
                     // Code that asks where its package is does not say the same in two
                     // checkouts.
