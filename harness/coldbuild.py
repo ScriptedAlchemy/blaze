@@ -171,6 +171,10 @@ pub extern "C" fn main() -> i32 {
                         # redirects. This exercises the declined-splice full link,
                         # independently of whether adding a function itself can be spliced.
                         os.remove(program)
+                        # A Mach-O splice can restore its cached file. A non-executable at
+                        # the same path must instead reject the splice and be fully linked.
+                        with open(program, "wb") as executable:
+                            executable.write(b"not an executable\n")
                     ran, _ = blaze(ws, env, "build")
                     ok = (ran.returncode == 0 and os.path.exists(program)
                           and not cargo_built(os.path.join(ws, "target"))

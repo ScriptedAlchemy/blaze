@@ -225,13 +225,15 @@ impl Drop for Replaced {
     }
 }
 
-/// Makes a copy of the ELF object at `base` with the definitions of the names the ELF object
-/// at `patch` defines too made weak. `None` when nothing is replaced. It is linked after the patch
+/// Makes a copy of the object at `base` with definitions also present in the patch made
+/// weak. ELF changes only global definitions replaced by global definitions; Mach-O also
+/// handles the strong C main that `ours` deliberately retains. `None` when nothing changes.
+/// It is linked after the patch
 /// with nothing said of duplicates ([`crate::cargo::plan::whole_link_args`]): the patch's
 /// definition is the strong one and stays wherever it is on the line, and a name the patch
 /// does not define stays as the object has it, so that a second definition of it from a
 /// library is the linker's error. Only the bindings of those symbols change; a file that is
-/// no ELF object, or a patch that defines nothing, is not touched.
+/// neither an ELF nor Mach-O object, or a patch that defines nothing, is not touched.
 ///
 /// Never weaken the base in place: successive patches need different definitions, a failed
 /// link must not change the base, and outputs can be hard links to the same whole object.
@@ -244,7 +246,26 @@ pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<Option<Repl
         Ok(read == head.len() && head == *b"\x7fELF")
     };
     if !is_elf(patch)? || !is_elf(base)? {
-        return Ok(None);
+        let patch = std::fs::read(patch)?;
+        let mut bytes = std::fs::read(base)?;
+        if symbol_table(&patch).is_none() || symbol_table(&bytes).is_none() {
+            return Ok(None);
+        }
+        let names: FxHashSet<_> = defined(&patch).into_iter().collect();
+        let original = bytes.clone();
+        weaken_but(
+            &mut bytes,
+            |name, _| {
+                if names.contains(name) { Made::Weak } else { Made::Kept }
+            },
+        );
+        if bytes == original {
+            return Ok(None);
+        }
+        let (copy, mut file) = replacement_file(base)?;
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        return Ok(Some(copy));
     }
     let patch = std::fs::read(patch)?;
     let names = elf_defined(&patch);
@@ -258,13 +279,7 @@ pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<Option<Repl
     if offsets.is_empty() {
         return Ok(None);
     }
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut copy = base.as_os_str().to_owned();
-    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    copy.push(format!(".{}.{}.replaced", std::process::id(), next));
-    let path = PathBuf::from(copy);
-    let mut file = std::fs::File::options().read(true).write(true).create_new(true).open(&path)?;
-    let copy = Replaced { path };
+    let (copy, mut file) = replacement_file(base)?;
     std::io::copy(&mut original, &mut file)?;
     // SAFETY: this is the link's private copy and no other code writes or maps it.
     let mut object = unsafe { memmap2::MmapMut::map_mut(&file)? };
@@ -273,6 +288,16 @@ pub(crate) fn replaced(base: &Path, patch: &Path) -> std::io::Result<Option<Repl
     }
     object.flush()?;
     Ok(Some(copy))
+}
+
+fn replacement_file(base: &Path) -> std::io::Result<(Replaced, std::fs::File)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut path = base.as_os_str().to_owned();
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.push(format!(".{}.{}.replaced", std::process::id(), next));
+    let path = PathBuf::from(path);
+    let file = std::fs::File::options().read(true).write(true).create_new(true).open(&path)?;
+    Ok((Replaced { path }, file))
 }
 
 /// The names a 64-bit little-endian ELF object defines with global binding: the ones another
@@ -539,6 +564,24 @@ mod tests {
         duplicate(&said, "clash");
         // With either library alone it links, so the error is theirs.
         assert!(linked(&[&empty, &base, &second], &out).is_ok());
+    }
+
+    #[test]
+    fn a_c_main_replaced_on_macho_keeps_the_original_object_strong() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.o");
+        let patch = dir.path().join("patch.o");
+        let mut bytes = object();
+        ours(&mut bytes);
+        assert_eq!(made(&bytes)[0], (false, false));
+        std::fs::write(&base, &bytes).unwrap();
+        std::fs::write(&patch, object()).unwrap();
+        let copy = replaced(&base, &patch).unwrap().unwrap();
+        assert_eq!(made(&std::fs::read(copy.path()).unwrap())[0], (false, true));
+        assert_eq!(std::fs::read(&base).unwrap(), bytes);
+        let path = copy.path().to_owned();
+        drop(copy);
+        assert!(!path.exists());
     }
 
     #[test]
