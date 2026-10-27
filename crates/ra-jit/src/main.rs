@@ -2307,7 +2307,7 @@ fn load(
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
-    checkouts.add(projects, &mut db, &mut vfs, load_owner(), None)?;
+    checkouts.add(projects, &mut db, &mut vfs, load_owner(), None, &Sharing::Open)?;
     Ok((db, vfs, checkouts))
 }
 
@@ -2376,12 +2376,17 @@ impl Checkouts {
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
+        self.alike_by(project, &Sharing::Open)
+    }
+
+    /// The same, among the loaded checkouts `sharing` allows.
+    fn alike_by(&self, project: &Path, sharing: &Sharing) -> Option<(usize, PathBuf)> {
         let project = dunce::canonicalize(project).ok()?;
         // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
         project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
-            if self.splits[at].is_some() {
+            if self.splits[at].is_some() || !sharing.allows(base) {
                 return None;
             }
             let inside = loaded.strip_prefix(base).ok()?;
@@ -2485,6 +2490,7 @@ impl Checkouts {
         project: &Path,
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
+        sharing: &Sharing,
     ) -> Option<View> {
         let project = dunce::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
@@ -2494,7 +2500,7 @@ impl Checkouts {
             return None;
         }
         // One that shares packages with another has those where the other is.
-        let (at, over) = self.alike(&project)?;
+        let (at, over) = self.alike_by(&project, sharing)?;
         let (loaded, base) = &self.roots[at];
         viewing(overlay, quick(base, &over)).then(|| View {
             base: base.clone(),
@@ -2511,14 +2517,17 @@ impl Checkouts {
         project: &Path,
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
-    ) -> Option<PathBuf> {
-        let project = dunce::canonicalize(project).ok()?;
+    ) -> Sharing {
+        let Ok(project) = dunce::canonicalize(project) else { return Sharing::Alone };
         if self.roots.iter().any(|(it, _)| *it == project) {
-            return None;
+            return Sharing::Open;
         }
-        let (at, over) = self.alike(&project)?;
+        let Some((at, over)) = self.alike(&project) else { return Sharing::Alone };
         let viewed = viewing(overlay, quick(&self.roots[at].1, &over));
-        sharing_allowed(viewed, splitting()).then(|| self.roots[at].1.clone())
+        match sharing_allowed(viewed, splitting()) {
+            true => Sharing::From(self.roots[at].1.clone()),
+            false => Sharing::Alone,
+        }
     }
 
     /// The checkout that the one at `root` has packages of, when it has.
@@ -2577,12 +2586,13 @@ impl Checkouts {
         vfs: &mut vfs::Vfs,
         owner: u64,
         env: Option<&BTreeMap<String, String>>,
+        sharing: &Sharing,
     ) -> anyhow::Result<()> {
         // All the checkouts' scripts are judged under one admission, which no other build is
         // between the groups of.
         let mut operation = scripts::operation(owner);
         for attempt in 1.. {
-            match self.add_once(projects, db, vfs, owner, env) {
+            match self.add_once(projects, db, vfs, owner, env, sharing) {
                 // Each time the groups are judged again, over the output as it is now.
                 Err(error) if error.downcast_ref::<scripts::Stale>().is_some() && attempt < 16 => {
                     eprintln!(
@@ -2607,6 +2617,7 @@ impl Checkouts {
         vfs: &mut vfs::Vfs,
         owner: u64,
         env: Option<&BTreeMap<String, String>>,
+        sharing: &Sharing,
     ) -> anyhow::Result<()> {
         let mut world = scripts::World::new();
         // What is watched of each, which is not told to the inputs until the database has them.
@@ -2614,10 +2625,12 @@ impl Checkouts {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
-        // A checkout like a loaded one shares the packages they have alike, unless told not to.
+        // A checkout like a loaded one shares the packages they have alike, unless told not to, or
+        // unless the request that joins it chose to read it through another checkout, or none
+        // (`sharing`): only the checkout whose scripts were judged for it supplies its packages.
         let share = splitting();
         for project in projects {
-            if share && let Some((base, over)) = self.alike(project) {
+            if share && let Some((base, over)) = self.alike_by(project, sharing) {
                 let own = self.differing(base, &over);
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
@@ -2718,7 +2731,7 @@ impl Checkouts {
         // The checkout whose scripts the build reads: the project's own (the one it shares
         // packages with, for a split), or, for a project that is not loaded, the one chosen to be
         // read through (`shares`, from `Checkouts::sharing`; nothing else is accepted later, see
-        // `judged_view`), if any. A project that will be loaded on its own reads no
+        // `Sharing`), if any. A project that will be loaded on its own reads no
         // checkout that is loaded: its own scripts are judged when it is, with its own owner and
         // variables.
         let built = match asked {
@@ -3061,12 +3074,39 @@ fn sharing_allowed(viewed: bool, splitting: bool) -> bool {
     viewed || splitting
 }
 
-/// Whether a view of a checkout as a loaded one may be taken: the loaded one is the project's own,
-/// or the one whose scripts were judged for the request. What the worker settles and turns between
-/// the judgment and the view can make a base quick that was not, and its scripts were not run for
-/// this request's variables: the project is then loaded on its own.
-fn judged_view(view: &View, judged: Option<&Path>) -> bool {
-    view.base == view.over || judged == Some(view.base.as_path())
+/// Which loaded checkout a project that is not loaded is read through, as the check of the request that
+/// asks for it decided it, once, before it judged the scripts of that checkout: by a view of it, and by
+/// the packages it shares with it when it is loaded. What the worker settles and turns, or the files
+/// that change meanwhile, can make another checkout the one the files then say: its scripts were not
+/// run for this request, and the project is loaded on its own instead.
+#[derive(Clone, Debug, PartialEq)]
+enum Sharing {
+    /// Nothing is decided: a load that is not a request's join (the first, with `--also`), and a
+    /// project that is loaded.
+    Open,
+    /// The check judged no loaded checkout for the request: it loads on its own.
+    Alone,
+    /// The check judged the scripts of the checkout at this root: no other supplies its packages.
+    From(PathBuf),
+}
+
+impl Sharing {
+    /// Whether the loaded checkout at `root` may supply packages to the project.
+    fn allows(&self, root: &Path) -> bool {
+        match self {
+            Sharing::Open => true,
+            Sharing::Alone => false,
+            Sharing::From(from) => from == root,
+        }
+    }
+
+    /// The checkout whose scripts were judged.
+    fn judged(&self) -> Option<&Path> {
+        match self {
+            Sharing::From(from) => Some(from),
+            _ => None,
+        }
+    }
 }
 
 /// What it takes for a checkout to be read as a loaded one quickly (`Overlay::Quick`): the
@@ -7295,13 +7335,14 @@ fn join(
     project: &Path,
     owner: u64,
     env: Option<&BTreeMap<String, String>>,
+    sharing: &Sharing,
     checkouts: &mut Checkouts,
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
     let read_from = SystemTime::now();
-    checkouts.add(&[project], db, tree.vfs(), owner, env)?;
+    checkouts.add(&[project], db, tree.vfs(), owner, env, sharing)?;
     watch_loaded(db, tree, files, read_from);
     Ok(())
 }
@@ -7819,9 +7860,14 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
-        if let Err(why) =
-            self.checkouts.add(projects, &mut self.db, &mut self.vfs, load_owner(), None)
-        {
+        if let Err(why) = self.checkouts.add(
+            projects,
+            &mut self.db,
+            &mut self.vfs,
+            load_owner(),
+            None,
+            &Sharing::Open,
+        ) {
             eprintln!("spare: not used: {why:#}");
             return None;
         }
@@ -8843,13 +8889,13 @@ fn run_holding(
                     // The checkout a project that is not loaded is read through is chosen here,
                     // once, and its scripts are judged for the request; a view chosen later, after
                     // the worker has settled and the variables are turned, is accepted only if it
-                    // is this one (`judged_view`).
-                    let shares = {
+                    // is this one (`Sharing`, which the view and the join are given).
+                    let sharing = {
                         let quick = Quick::of(&files, &db, &programs, &builds);
                         let quick = |base: &Path, over: &Path| quick.allows(base, over, &given_up);
                         checkouts.sharing(project, overlay, &quick)
                     };
-                    match checkouts.stale(project, &stream.env, stream.build, shares.as_deref()) {
+                    match checkouts.stale(project, &stream.env, stream.build, sharing.judged()) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
                             later.push((request, asked, stream));
@@ -8951,9 +8997,7 @@ fn run_holding(
                             let quick = Quick::of(&files, &db, &programs, &builds);
                             let quick =
                                 |base: &Path, over: &Path| quick.allows(base, over, &given_up);
-                            checkouts
-                                .view_of(project, overlay, &quick)
-                                .filter(|it| judged_view(it, shares.as_deref()))
+                            checkouts.view_of(project, overlay, &quick, &sharing)
                         }
                         None => {
                             let base = programs[0].args.checkout.clone();
@@ -9050,6 +9094,7 @@ fn run_holding(
                                 project,
                                 stream.build,
                                 (!asked.is_empty()).then_some(&asked),
+                                &sharing,
                                 &mut checkouts,
                                 &mut db,
                                 &mut tree,
@@ -10629,20 +10674,18 @@ mod tests {
     }
 
     #[test]
-    fn a_view_is_taken_only_of_the_checkout_whose_scripts_were_judged_for_the_request() {
-        let view = |base: &str, over: &str| View {
-            base: PathBuf::from(base),
-            over: PathBuf::from(over),
-            project: PathBuf::from(base),
-        };
-        // A project that is loaded is its own view, whatever was judged.
-        assert!(judged_view(&view("/r", "/r"), None));
-        // The base became quick after the check (a link ended while the worker settled): its
-        // scripts were not judged for this request, and the view is not taken.
-        assert!(!judged_view(&view("/r", "/v"), None));
-        // The base that was judged is taken, and no other.
-        assert!(judged_view(&view("/r", "/v"), Some(Path::new("/r"))));
-        assert!(!judged_view(&view("/r", "/v"), Some(Path::new("/base"))));
+    fn a_project_is_read_through_only_the_checkout_whose_scripts_were_judged_for_the_request() {
+        let (r1, r2) = (Path::new("/r1"), Path::new("/r2"));
+        // A load that is not a request's join, or a loaded project: nothing is decided.
+        assert!(Sharing::Open.allows(r1) && Sharing::Open.allows(r2));
+        assert_eq!(Sharing::Open.judged(), None);
+        // The check judged no checkout: the project loads on its own, by view or by split.
+        assert!(!Sharing::Alone.allows(r1) && !Sharing::Alone.allows(r2));
+        // The check judged `r1`: its metadata may change so that `r2` is the one that is alike
+        // then, and `r2`, whose scripts were not judged, supplies nothing.
+        let from = Sharing::From(r1.to_owned());
+        assert!(from.allows(r1) && !from.allows(r2));
+        assert_eq!(from.judged(), Some(r1));
     }
 
     #[test]

@@ -96,6 +96,11 @@ first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SP
 quick-choice  `RA_JIT_SPLIT=0`, quick overlay: a request for R is held as it enters its link (the executable was taken
               away), V's first request arrives (R is no candidate while it links), the worker settles and the link is let
               go: V is loaded on its own and judged for its variables, not read through R's world.
+choice-edited R1 and R2 loaded in full (`--also`, GEN=a, splitting on), R1's manifest made R2's (V's) before V's one request
+              `GEN=b`: R1 is the checkout V is alike when the request is checked (its loaded metadata is old), is
+              reloaded and judged, and then R2 is the one V is alike, unjudged: V has to be on its own, or read
+              through the judged one, and b's build, not R2's `a`. `choice-stable`: no edit, V is split from R2,
+              which is judged.
 first-join-shared  The same with V, a checkout of R's repository with R's scripts: V reads R's scripts, which are
               judged for `b` (the trail says so), and fail as cargo's would.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
@@ -1834,6 +1839,109 @@ def quick_choice(sc, source_sha):
         worker.kill()
 
 
+def consumption_choice(sc, source_sha, edited):
+    """R1 and R2 loaded in full, `--also`, `GEN=a`, splitting on. R1's manifest selects `build.rs`, R2's and V's
+    select `build-new.rs` (the same bytes in R2 and V, a comment more in R1's); every checkout has the same,
+    unused `build.rs`. With `edited`, R1's manifest is made R2's before V's ONE request, `GEN=b`: R1's loaded
+    metadata still says `build.rs`, so R1 is the first checkout V is alike when the request is checked, and the
+    check reloads R1 and judges its new script; once R1's `build-new.rs` is the one loaded, R2 is the checkout
+    V is alike, and R2's scripts were not judged. V has to be loaded on its own, or read through the checkout
+    that was judged, and be b's build, not R2's a. Without `edited`, V is alike R2 throughout: R2 is judged
+    and V is read through it (the control)."""
+    once = os.path.join(sc.dir, "once")
+    os.makedirs(once)
+    sc.target = os.path.join(sc.dir, "target-shared")
+    saved = sc.runs_log
+    paths = {name: os.path.join(sc.dir, name) for name in ("r1", "r2", "v")}
+    for name, path in paths.items():
+        sc.runs_log = saved
+        sc.project(path)
+        with open(os.path.join(path, "build-new.rs"), "w") as f:
+            f.write(BUILD_RS.replace("@LOG@", sc.runs_log) + ("// R1's own\n" if name == "r1" else ""))
+        if name != "r1":
+            manifest = open(os.path.join(path, "Cargo.toml")).read().replace('build = "build.rs"', 'build = "build-new.rs"')
+            with open(os.path.join(path, "Cargo.toml"), "w") as f:
+                f.write(manifest)
+    sc.r = paths["r1"]
+    extra = {"GEN_ARCHIVE": "same", "CARGO_TARGET_DIR": sc.target, "ONCE_DIR": once, "ONCE_ONLY": "none",
+             "ONCE_BY_DIR": "1"}
+    oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"})
+    env = sc.env("a", dict(GEN="a", ONCE_TAG="load", **extra))
+    env.pop("RA_JIT_WHOLE_BUILD", None)
+    sock = os.path.join(sc.dir, "worker.sock")
+    err = open(os.path.join(sc.dir, "worker.log"), "w")
+    argv = [RA_JIT, paths["r1"], "--also", paths["r2"], "--crate", "gen_one", "--out", os.path.join(sc.dir, "w.o"),
+            "--exe", os.path.join(sc.dir, "w.bin"), "--socket", sock]
+    worker = subprocess.Popen(argv, cwd=paths["r1"], env=env, stdout=subprocess.DEVNULL, stderr=err,
+                              stdin=subprocess.PIPE, start_new_session=True)
+    sc.notes["worker-pid"] = worker.pid
+    trail = lambda name: (open(os.path.join(once, f"trail-{name}")).read().split("\n")[:-1]
+                          if os.path.exists(os.path.join(once, f"trail-{name}")) else [])
+    try:
+        if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
+            return
+        log = lambda: open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        sc.notes["loaded-before"] = {n: trail(n) for n in paths}
+        if any(l.startswith("split ") for l in log().splitlines()):
+            sc.fail("R2 was loaded as a split of R1: the setup is not R1 and R2 in full")
+        if not trail("r1") or not trail("r2"):
+            sc.fail(f"R1 and R2 were to run their scripts when they were loaded: {sc.notes['loaded-before']}")
+        before = {n: trail(n) for n in paths}
+        m = lambda n: hashlib.sha256(open(os.path.join(paths[n], "Cargo.toml"), "rb").read()).hexdigest()[:12]
+        sc.notes["manifests-before"] = {n: m(n) for n in paths}
+        if edited:
+            shutil.copy2(os.path.join(paths["r2"], "Cargo.toml"), os.path.join(paths["r1"], "Cargo.toml"))
+        sc.notes["manifests-after"] = {n: m(n) for n in paths}
+        out, exe = os.path.join(sc.dir, "first.o"), os.path.join(sc.dir, "first.bin")
+        env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD="5001", GEN="b")
+        rc, said = sync(sc, sock, env_b, "--project", paths["v"], "--crate", "gen_one", "--out", out, "--exe", exe,
+                        within=LOST)
+        sc.notes["request"] = (rc, said[-300:])
+        sc.notes["trails-after"] = {n: trail(n) for n in paths}
+        text = log()
+        sc.notes["route"] = [l[:160] for l in text.splitlines() if l.startswith(("split ", "view:", "join "))]
+        sc.notes["failed-lines"] = [l[:200] for l in text.splitlines() if "failed:" in l and "build script" in l]
+        gained = {n: trail(n)[len(before[n]):] for n in paths}
+        sc.notes["gained"] = gained
+        got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+        sc.notes["programs"] = {"V": got, "exe-written": os.path.exists(exe)}
+        if rc != 0:
+            sc.fail(f"V's request did not end well (rc {rc}): {said[-300:]}")
+        if edited:
+            if gained["r2"]:
+                sc.fail(f"R2, whose scripts are not the ones judged, was run: {gained['r2']}")
+            if gained["r1"] != ["b B"]:
+                sc.fail(f"R1's new script was to be judged once, for b: {gained['r1']}")
+            # V is on its own (its script ran for b), or read through R1 (judged for b): never R2's a.
+            if got is None:
+                sc.fail("V's program was not written: it cannot be said to be b's build")
+            else:
+                strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+                want = oracle["gen-one"]
+                if strip(got) != strip(want):
+                    sc.fail(f"V printed {got!r}, cargo's {want!r}")
+                elif got != want:
+                    sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+        else:
+            # The control: V is read through R2, which the check judged for b, and R1 is left alone.
+            if gained["r2"] != ["b B"] or gained["r1"]:
+                sc.fail(f"R2 was to be judged once for b and R1 left alone: {gained}")
+            if not any(l.startswith("split ") and "/v" in l for l in sc.notes["route"]):
+                sc.fail(f"V was to be split from R2: {sc.notes['route']}")
+        sc.notes["retire"] = retire(sc, sock, "5001")
+        sc.timeouts()
+    finally:
+        worker.kill()
+
+
+def choice_edited(sc, source_sha):
+    consumption_choice(sc, source_sha, True)
+
+
+def choice_stable(sc, source_sha):
+    consumption_choice(sc, source_sha, False)
+
+
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
     which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
@@ -1921,6 +2029,8 @@ SCENARIOS = {
     "first-join-shared": first_join_shared,
     "first-join-private": first_join_private,
     "quick-choice": quick_choice,
+    "choice-edited": choice_edited,
+    "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,
