@@ -19,6 +19,7 @@ mod live;
 mod macro_list;
 mod memory;
 mod mirdump;
+mod native_inputs;
 mod outline;
 mod plan;
 mod process;
@@ -4672,10 +4673,9 @@ fn link_executable(
 }
 
 /// What a whole build's daemon links the program at `--exe` with and splices its edits into:
-/// G's line. `None` when it is not one, or has it already.
+/// G's line, regenerated from the current native directives before every link.
 fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(String, PathBuf)>> {
-    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some() && args.link_cmd.is_none())
-    else {
+    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some()) else {
         return Ok(None);
     };
     let mut program = Vec::new();
@@ -8999,6 +8999,17 @@ fn run_holding(
                             continue;
                         }
                     }
+                    // Script directives and Rust crate identity can stay the same while a
+                    // native archive changes. Check this before either no-op fast path.
+                    if native_inputs::stale(&db, &programs) {
+                        if !clients.is_empty() {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        builds.settle(&mut db, &mut programs)?;
+                        native_inputs::invalidate(&db, &mut programs);
+                        lock(&as_built).clear();
+                    }
                     // One build is for one process: its variables are what `env!` reads.
                     if process::differs(&db, &stream.env) {
                         if !clients.is_empty() {
@@ -10354,6 +10365,18 @@ impl Program {
             None => (link_cmd, splice),
         };
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
+        // Capture the effective output's identity, not another checkout's or alias's. Recheck
+        // here too: a native input may have changed after the request was admitted.
+        let native_link = native_inputs::begin(db, args);
+        if native_link.as_ref().is_some_and(|link| link.changed()) {
+            if let Some(binary) = args.splice.as_ref().or(args.exe.as_ref()) {
+                native_inputs::forget_binary(binary);
+            }
+            known.forget_base();
+            *whole = None;
+            unbuilt.stale = true;
+            unbuilt.unlinked = true;
+        }
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
@@ -10607,6 +10630,12 @@ impl Program {
         write_reach(db, listed, args, failed.is_none());
         if let Some(why) = failed {
             return Ok(Err(why));
+        }
+        // A failed, compile-only or deferred link never publishes a reusable native identity.
+        if link_it && !defer {
+            if let Some(native_link) = native_link {
+                native_link.commit()?;
+            }
         }
         // What the caller has to load to be up to date: the functions that differ from the
         // first object when the edit could be a patch, and all of them when it could not.
