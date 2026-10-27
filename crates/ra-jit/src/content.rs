@@ -643,7 +643,9 @@ mod tests {
                 "#[rustc_builtin_macro]\nmacro_rules! include_bytes { () => {} }\n#[cfg(any())] pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }",
             ] {
                 db.set_file_text_with_durability(
-                    files[1].file_id(&db), source, ide_db::base_db::salsa::Durability::HIGH,
+                    files[1].file_id(&db),
+                    source,
+                    ide_db::base_db::salsa::Durability::HIGH,
                 );
                 hir::attach_db(&db, || {
                     crate::current_input_paths(&db, dep);
@@ -657,9 +659,15 @@ mod tests {
             }
             let new_source = "#[rustc_builtin_macro]\nmacro_rules! include_bytes { () => {} }\npub fn value() -> &'static [u8; 1] { include_bytes!(\"new-missing.bin\") }";
             db.set_file_text_with_durability(
-                files[1].file_id(&db), new_source, ide_db::base_db::salsa::Durability::HIGH,
+                files[1].file_id(&db),
+                new_source,
+                ide_db::base_db::salsa::Durability::HIGH,
             );
-            assert!(!db.included_by(dep).iter().any(|(path, _)| path.as_str().ends_with("new-missing.bin")));
+            assert!(
+                !db.included_by(dep)
+                    .iter()
+                    .any(|(path, _)| path.as_str().ends_with("new-missing.bin"))
+            );
             hir::attach_db(&db, || {
                 // Normal source/body discovery registers a new missing input before
                 // the fast validation probe. An empty historical map is not an
@@ -667,7 +675,9 @@ mod tests {
                 crate::declared_in(&db, dep.into());
                 assert_eq!(
                     crate::missing_input_of(&db, dep),
-                    Some(paths::AbsPathBuf::assert_utf8(top.join("vendor/dep/src/new-missing.bin")))
+                    Some(paths::AbsPathBuf::assert_utf8(
+                        top.join("vendor/dep/src/new-missing.bin")
+                    ))
                 );
             });
             first

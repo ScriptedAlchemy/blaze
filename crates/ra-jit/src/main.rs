@@ -3707,8 +3707,10 @@ fn missing_required_input(
     observations: Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)>,
     current: impl FnOnce() -> Vec<AbsPathBuf>,
 ) -> Option<AbsPathBuf> {
-    let missing: Vec<_> =
-        observations.into_iter().filter_map(|(path, bytes)| bytes.is_none().then_some(path)).collect();
+    let missing: Vec<_> = observations
+        .into_iter()
+        .filter_map(|(path, bytes)| bytes.is_none().then_some(path))
+        .collect();
     if missing.is_empty() {
         return None;
     }
@@ -10413,19 +10415,18 @@ fn main() {}
         assert_eq!(*lock(&held), 2);
     }
 }
-    #[test]
-    fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate() {
-        let path = AbsPathBuf::assert_utf8(PathBuf::from("/fixture/payload.bin"));
-        let calls = std::cell::Cell::new(0);
-        let discover = || {
-            calls.set(calls.get() + 1);
-            vec![path.clone()]
-        };
-        assert_eq!(missing_required_input(vec![], discover), None);
-        assert_eq!(missing_required_input(vec![(path.clone(), Some(vec![1].into()))], discover), None);
-        assert_eq!(calls.get(), 0);
-        assert_eq!(missing_required_input(vec![(path.clone(), None)], discover), Some(path.clone()));
-        assert_eq!(calls.get(), 1);
-        assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
-    }
-
+#[test]
+fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate() {
+    let path = AbsPathBuf::assert_utf8(PathBuf::from("/fixture/payload.bin"));
+    let calls = std::cell::Cell::new(0);
+    let discover = || {
+        calls.set(calls.get() + 1);
+        vec![path.clone()]
+    };
+    assert_eq!(missing_required_input(vec![], discover), None);
+    assert_eq!(missing_required_input(vec![(path.clone(), Some(vec![1].into()))], discover), None);
+    assert_eq!(calls.get(), 0);
+    assert_eq!(missing_required_input(vec![(path.clone(), None)], discover), Some(path.clone()));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
+}
