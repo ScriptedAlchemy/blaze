@@ -1,4 +1,5 @@
 //! Native Unix names, source context consistency and tagged configuration boundaries.
+#![cfg(unix)]
 mod common;
 use blaze_spec::{
     assemble::build_spec,
