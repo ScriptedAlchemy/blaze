@@ -1780,8 +1780,13 @@ def quick_choice(sc, source_sha):
         os.remove(os.path.join(sc.dir, "w.bin"))
         sc.arm("a", "linking")
         said = {}
-        r_req = threading.Thread(target=lambda: said.update(r=sync(sc, sock, dict(env, ONCE_TAG="A", RA_JIT_BUILD="4001"),
-                                                                    within=LOST)))
+        def r_build():
+            # As the daemon ends a build: the worker's answer, then `retire` (R's request ran R's script: its
+            # build holds the scripts' admission until then).
+            said["r"] = sync(sc, sock, dict(env, ONCE_TAG="A", RA_JIT_BUILD="4001"), within=LOST)
+            said["retire-r"] = retire(sc, sock, "4001")
+
+        r_req = threading.Thread(target=r_build)
         r_req.start()
         held = sc.reached("a", "linking", None, within=120)
         if held is None:
@@ -1811,8 +1816,8 @@ def quick_choice(sc, source_sha):
             sc.fail(f"V's request did not end well: {rv}")
         if sc.notes["view-lines"]:
             sc.fail(f"V was read through R, whose scripts were not judged for b: {sc.notes['view-lines']}")
-        if trail(r_trail) != before:
-            sc.fail(f"R's script ran for the request of V: {before} -> {trail(r_trail)}")
+        if any(line.startswith("b ") for line in trail(r_trail)):
+            sc.fail(f"R's script ran for b, the request of V's variables: {trail(r_trail)}")
         if sc.notes["v-trail"] != ["b B"]:
             sc.fail(f"V's own script was to run once, for b: its trail is {sc.notes['v-trail']}")
         got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
@@ -1823,7 +1828,7 @@ def quick_choice(sc, source_sha):
             sc.fail(f"V printed {got!r}, cargo's {want!r}")
         elif got != want:
             sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
-        sc.notes["retire"] = (retire(sc, sock, "4001"), retire(sc, sock, "4002"))
+        sc.notes["retire"] = retire(sc, sock, "4002")
         sc.timeouts()
     finally:
         worker.kill()
