@@ -359,8 +359,10 @@ impl Generator<'_, '_> {
                     } else {
                         UnitFor::new_test()
                     };
-                    let at = self.new_unit(arena, pkg, at, CMode::Build)?;
-                    let mut library = arena.units[at].clone();
+                    // Apply the host profile before interning. Profile equality ignores
+                    // deferred debuginfo, so a provisional Build unit could otherwise
+                    // absorb this one and lose the marker Sharing needs to weaken it.
+                    let mut library = self.make_unit(pkg, at, CMode::Build)?;
                     library.profile = self.env.profile(pkg, unit_for);
                     libraries.push(arena.intern(library));
                 }
@@ -382,6 +384,11 @@ impl Generator<'_, '_> {
         target_at: usize,
         initial_mode: CMode,
     ) -> Result<usize> {
+        Ok(arena.intern(self.make_unit(pkg, target_at, initial_mode)?))
+    }
+
+    /// Construct the complete unit before its caller chooses when to intern it.
+    fn make_unit(&self, pkg: PackageId, target_at: usize, initial_mode: CMode) -> Result<Inner> {
         let target = &self.targets(pkg)[target_at];
         let mode = match initial_mode {
             CMode::Test if is_example(target) && !self.filter.is_specific() && !target.tested => {
@@ -406,14 +413,14 @@ impl Generator<'_, '_> {
             UnitFor::new_normal()
         };
         let profile = self.env.profile(pkg, unit_for);
-        Ok(arena.intern(Inner {
+        Ok(Inner {
             pkg,
             target: target_at,
             profile,
             kind: Kind::Target.for_target(target),
             mode,
             features,
-        }))
+        })
     }
 
     fn filter_default_targets(&self, pkg: PackageId) -> Vec<usize> {

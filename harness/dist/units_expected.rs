@@ -3,7 +3,8 @@
 //! which `tests/units.rs` compares blaze's unit graph with. cargo runs here and nowhere else:
 //! the library and its tests never run it.
 //!
-//! usage: units_expected [FIXTURE]...      (no name: every fixture)
+//! usage: cargo run -p blaze-metadata --example units_expected -- [FIXTURE]...
+//! (no name: every fixture)
 //!
 //! Each fixture is copied to a scratch directory and run there with a `CARGO_HOME` of its own,
 //! `--locked` and `--offline`, so that its hand-written `Cargo.lock` is checked and nothing is

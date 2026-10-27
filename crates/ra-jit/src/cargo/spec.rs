@@ -209,7 +209,7 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
             packages: &request.packages,
             workspace: request.workspace,
             excludes: &request.excludes,
-            dev_units: request.command == Some(Subcommand::Test) || request.targets.explicit,
+            dev_units: request.needs_dev_dependencies(),
         }),
         platform: Some(blaze_metadata::TargetPlatform {
             triple: &ctx.host.triple,

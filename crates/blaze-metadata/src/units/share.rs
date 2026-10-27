@@ -35,7 +35,12 @@ struct Sharing<'g> {
     index: FxHashMap<Key, Vec<usize>>,
 }
 
-pub(super) fn share(env: &Env<'_>, graph: &Graph, roots: &[usize]) -> Shared {
+pub(super) fn share(
+    env: &Env<'_>,
+    graph: &Graph,
+    roots: &[usize],
+    doctest_libraries: &[usize],
+) -> Shared {
     let mut sharing = Sharing {
         graph,
         memo: FxHashMap::default(),
@@ -44,6 +49,13 @@ pub(super) fn share(env: &Env<'_>, graph: &Graph, roots: &[usize]) -> Shared {
         index: FxHashMap::default(),
     };
     let roots: Vec<usize> = roots.iter().map(|&root| sharing.traverse(root, false)).collect();
+    // These libraries are dependencies of omitted doctest units, not command roots.
+    // In particular a proc macro's library keeps the host's debuginfo policy even
+    // when its test executable is a root with the full test profile.
+    for &library in doctest_libraries {
+        let is_for_host = env.target(&graph.arena.units[library]).for_host;
+        sharing.traverse(library, is_for_host);
+    }
     let Sharing { units, deps, .. } = sharing;
 
     // The units in cargo's order; those that differ only in their dependencies in the order
@@ -100,11 +112,12 @@ impl Sharing<'_> {
         if is_for_host && profile.debuginfo.is_deferred() {
             // A probe: whether there is a unit with the debuginfo the target would give it.
             let canonical = profile.debuginfo.finalize();
+            // Cargo probes `to_host`, the explicit target triple before sharing, even
+            // for proc macros. Probing the source's Host kind instead would find the
+            // deferred unit itself: profile equality ignores the deferred marker.
             let mut probe = Inner { kind: Kind::Target, ..source.clone() };
             probe.profile = profile.clone();
             probe.profile.debuginfo = canonical;
-            // A proc macro is already Host before sharing. Cargo's explicit target probe
-            // only matches a runtime unit, not the deferred host unit itself.
             profile.debuginfo =
                 if graph.arena.find(&probe).is_some() { canonical } else { canonical.weaken() };
         }

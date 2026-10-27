@@ -13,6 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# A developer-only Cargo oracle lives with the harnesses, outside the compiler code.
+[[example]]
+name = "units_expected"
+path = "../../harness/dist/units_expected.rs"
+
 [dependencies]
 anyhow.workspace = true
 rustc-hash.workspace = true

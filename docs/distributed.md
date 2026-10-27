@@ -1,6 +1,6 @@
 # Distributed cache, compile and tests
 
-2026-10-26, revision 3.1. Status: design, nothing built. Written against the fork's `dist/main` at
+2026-10-26, revision 3.2. Status: design, nothing built. Written against the fork's `dist/main` at
 `f9b5da46` (code as at `c8e5f6a8` plus u5's memory instruments; line numbers are those of
 `f9b5da46`) and tracedecay at `d79de82273`. Each claim is marked **read** (in a source we read,
 or measured by us), **reported** (a document or someone says so, not re-checked here) or
@@ -22,12 +22,24 @@ every finding of both re-reviews its status. It also takes in two reports writte
 edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
 under verification).
 
-**Revision 3.1** (this one) applies the fixes of one focused check of revision 3 (`9875c09b`),
+**Revision 3.2** (this one) applies the owner's scope ruling of 2026-10-26: the program gives
+tracedecay what Bazel with NativeLink gives it for Rust today, and nothing beyond. It adds the
+section [Scope: parity with Bazel and NativeLink](#scope-parity-with-bazel-and-nativelink), marks
+the pieces the ruling drops "out of scope (owner, 2026-10-26)" where they stand (the sandbox and
+kernel enforcement of section 0, the isolation and capability design of section 2, the strict
+test contract of section 6) and keeps only their parity remainder in the units. The design text of
+a dropped piece stays as a record (in full in sections 0 and 2, summarised in section 6);
+no unit builds it and no acceptance line depends on it.
+Findings whose resolution needed a dropped piece carry the status "accepted at parity (owner scope
+ruling)" in [appendix A](#appendix-a-review-findings). Nothing else of the design changed.
+
+**Revision 3.1** applies the fixes of one focused check of revision 3 (`9875c09b`),
 which judged the no-rustc boundary not workable as stated (B1) and the work key and retention
 (B2), the exporter (B3) and the first-unit gate (D0) workable with fixes. Its findings carry the
 ids `c3-B1.1` to `c3-D0.4`, tagged where each is fixed and in [appendix
-A](#check-3-the-focused-check-of-revision-3). The boundary now claims only what a kernel
-or a profile can enforce: blaze never delegates Rust compilation, a worker exposes no host
+A](#check-3-the-focused-check-of-revision-3). (Revision 3.2 drops the boundary altogether, see
+above.) The boundary then claimed only what a kernel
+or a profile could enforce: blaze never delegates Rust compilation, a worker exposes no host
 toolchain, a job executes only approved code, and an in-process compiler is stated out of scope
 (section 0). Work is named by a total key with a stated retention contract (section 4). The
 exporter's context and the accepted closure are specified (section 4). GP is two stages with
@@ -41,10 +53,12 @@ Revision 2 took in the measurement of blaze on tracedecay
 
 The goal: blaze gives tracedecay a distributed cache, distributed compile and distributed tests
 for Rust on Linux x86-64 and macOS arm64, good enough that tracedecay drops NativeLink for its
-Rust build and test actions there. Bazel keeps Windows, JS, Python, Clippy and the release and
-dist (thin LTO) builds. Workers run blaze, never rustc ([no-rustc.md](no-rustc.md)).
+Rust build and test actions there, and no more than NativeLink gives it (see the scope section).
+Bazel keeps Windows, JS, Python, Clippy and the release and dist (thin LTO) builds. Workers run
+blaze, never rustc ([no-rustc.md](no-rustc.md)).
 
-Three decisions of the program's owner bind this design:
+Three decisions of the program's owner bind this design, and a fourth, the scope, has its own
+section after them:
 
 - **Distributed compile is required.** It means one build's compile work split across machines,
   not only whole jobs moved onto a fleet machine. A gate that fails changes how it is done, never
@@ -61,6 +75,78 @@ Three decisions of the program's owner bind this design:
 - **Heavy runs are serialised** by one lock on the development Mac; no dev host is reachable from
   it. Which gates can run where is part of each gate ([section 11](#11-gates)).
 
+## Scope: parity with Bazel and NativeLink
+
+**The ruling (owner, 2026-10-26).** The program adds nothing beyond what Bazel with NativeLink
+already gives tracedecay for Rust. Where an earlier revision of this document asked for more, the
+more is out of scope until the owner asks for it. A piece that is out of scope is marked "out of
+scope (owner, 2026-10-26)" where it stands; its text is kept as a record of what was designed, and
+no unit builds it.
+
+**In scope (parity):**
+
+- **A remote cache:** blobs, a per-crate lookup (blaze's own, since nothing blaze compiles can use
+  NativeLink's entries, section 3), and GC with disk bounds on every tier.
+- **Distributed compile:** one build's compile work split across machines (section 4). Bazel did
+  this per action; blaze does it per batch of its own ahead loop. Required, never optional
+  (standing order 13).
+- **Remote test execution with cached results as Bazel's `cache_test_results=auto` caches them:**
+  a pass is reused when the test's declared inputs are the same; a test carries an opt-out marker
+  (Bazel's `external` and `no-cache` tags) and always runs; a failure is never cached; flaky tests
+  are retried as `flaky_test_attempts` retries them (section 6).
+- **A scheduler** with leases, retries, priority and capacity, as NativeLink's (section 5).
+- **The access model of today:** tracedecay's `docs/ci-remote-builds.md` read at `d79de82273`
+  (**read**). The server and the workers are reachable only on the tailnet; Tailscale ACLs, by
+  tag, say who may reach what (the CI tag `tag:bazel-ci` reaches the cache and execution ports of
+  the coordinator host and nothing else, and registers no worker); GitHub-hosted runners join
+  the tailnet through the official Tailscale action with a GitHub OIDC identity that Tailscale
+  checks (issuer, repository id, actor id, workflow file, audience), as today; fork pull
+  requests are excluded and build with no remote and no fleet credentials. blaze adds no
+  authentication of its own above that.
+- **blaze compiling with itself.** blaze never hands its compile work to rustc, rustdoc or a cargo
+  that runs them ([no-rustc.md](no-rustc.md)). This is how blaze compiles, not a sandbox, and it
+  stays: the spawn rule for blaze's own children, the answerer for compiler probes and the audit
+  that counts compiler execs in blaze's own run. So does the build-script runner that takes
+  `cargo check` out of the whole build (P0.5, unit p05r).
+
+**Out of scope, unless the owner later asks:**
+
+- **Sandboxing or kernel enforcement against job code:** section 0's process-tree boundary, the
+  exec store, Landlock, seccomp, the Seatbelt profile and the negative compiler fixtures. What job
+  code (a test, a build script, a proc macro) runs is not policed beyond what Bazel did; a test
+  that needs a toolchain declares it, as Bazel's `rust_test` runfiles did.
+- **Per-executor OS users and disposable pull-request executors** (section 2's isolation rules).
+- **App-level OIDC capabilities, `Main` and `Pr(n)` cache namespaces, server-signed records,
+  epochs and trusted `Main` publishers** (section 2's capability, records and epoch parts).
+- **A test contract stricter than Bazel's:** the always-run effect classifier, audit mode and
+  sampling of cache hits, and the recording of what a test read (section 6's rules 1 and 2).
+
+**What the dropped pieces would have protected against, and the accepted risk.** They would have
+kept code from a pull request (its build scripts, proc macros and tests) from changing what a
+build of `master` later uses: by writing the shared cache, by reading another job's files or a
+worker's credentials on a shared worker, or by running a compiler of its own. Under parity pull-request
+code runs on shared workers as the worker's user, and can write the shared cache, as it can with
+NativeLink today (research 7.8: NativeLink serves `master` and pull requests from one instance).
+**This is an accepted risk, equal to today's setup, by the owner's ruling.** Its limits are the
+access model above: only the owner's own same-repository runs and the fleet's nodes reach the server.
+
+**What parity means for the rest of this document.**
+
+- The wire schema of section 8 and "Data shapes" is as unit C1 landed it. `Capability`, the
+  record signature, `epoch` and `Namespace::Pr` stay in it as types; at parity the server
+  issues no capabilities, signs nothing, runs one namespace (`Main`, epoch 0) that every
+  permitted peer reads and writes, and does not require the credential headers of section 8. The schema's `role`, `trust` and
+  sandbox-policy fields (an executor's `trust`, a `TestBaseKey`'s sandbox policy version) are
+  constants at parity. Unit C3's acceptance says so for the server.
+- "Trusted builder" and "pull-request executor" in sections 4 and 5 name a worker kept warm on
+  `master` and a worker warm on a pull request's last push: warm front ends and memory sizing.
+  The words no longer mean a separate user, sandbox or publication right.
+- A request's principal is the tailnet peer. Who may write is Tailscale's ACL, not a record's
+  signature (unit C6, reduced to that).
+- Executors run jobs in a work directory as NativeLink workers do (units E1, E2, reduced).
+- Phase 2's isolation tests, the adversarial harness and every acceptance line that needed them are
+  gone; the findings they settled are in appendix A as "accepted at parity".
+
 ## Short version
 
 - **Phase 0 comes first: blaze builds tracedecay.** G0 measured a no-go on macOS arm64: the
@@ -71,22 +157,18 @@ Three decisions of the program's owner bind this design:
   salsa revision with every memo kept; `RA_JIT_MEMORY_MAX` does not bound a busy or last-asked
   worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure that before any
   distributed code depends on it, each closing a measurable predicate.
-- **rustc is kept out by a process-tree boundary, not by a check at one call.** blaze never
-  delegates Rust compilation, a worker exposes no host Rust toolchain to a job, and a job executes
-  only immutable trusted native tools and binaries and libraries blaze built, denied by default.
-  A worker and every process under it (build scripts, proc-macro servers, linkers, native tools,
-  tests) runs inside an OS boundary in which the toolchain is absent or unreadable and the kernel
-  refuses to run or map a file that is not approved: `noexec` mounts, an exec store and a seccomp
-  filter that rejects other ABIs on Linux, a Seatbelt allow-list on macOS. A worker that cannot
-  install it does not start. It does not claim that job code cannot implement or bring its own
-  compiler in-process; that is out of its scope (section 0, c3-B1.1). blaze's own spawns go through
-  one API as a second layer; negative fixtures try every way around both.
-- **Trust has three roles.** Trusted `Main` builders that never run pull-request code and are the
-  only principals that publish to `Main`; per-pull-request executors created from trusted
-  read-only inputs, isolated by user and sandbox, kept for that pull request's pushes only and
-  destroyed after; a control plane whose credentials no job can read. Capabilities are short,
-  bound to a job, a namespace and a source commit the server verified through GitHub's API, not
-  through claims GitHub does not issue. Signed records carry an epoch.
+- **blaze never hands its compile work to rustc; that is a rule about blaze, not a sandbox.**
+  Every process blaze itself starts goes through one spawn API that refuses a compiler, a cargo
+  subcommand that compiles and a `RUSTC` that names one; compiler questions of build scripts
+  (`-vV`, `autocfg`, `version_check`) are answered by blaze; an audit counts compiler execs in
+  blaze's own run. What job code (a test, a build script, a proc macro) runs is not policed beyond
+  what Bazel did. The process-tree boundary of section 0 (`noexec` mounts, an exec store, a seccomp
+  filter, a Seatbelt allow-list) is **out of scope (owner, 2026-10-26)**.
+- **Trust is the access model of today, not a new one.** The server and workers sit on the
+  tailnet; Tailscale ACLs by tag say who may reach them; GitHub-hosted runners join through the
+  Tailscale action with a GitHub OIDC identity; fork pull requests are excluded. The
+  capability, namespace, signed-record, epoch and per-executor-user design of section 2 is **out
+  of scope (owner, 2026-10-26)**, an accepted risk equal to today's NativeLink setup.
 - **Distributed compile splits the build's own ahead loop into batches, over identical front
   ends.** A whole build compiles ahead from a queue of roots and the generic instances compiled
   functions name (`ObjectCodegen::compile_ahead`, `hir-ty-codegen/mod.rs:5479`); LOADMEM shows
@@ -108,23 +190,27 @@ Three decisions of the program's owner bind this design:
 - **The front end is what costs.** In u1's one tracedecay load, loading, resolving and expanding
   took 120 to 210 s (**read**, TRACEDECAY.md, two runs, contended); the resolution peak is 11.0
   to 13.1 GB live and 7.0 to 9.0 GB after it (**read**, LOADMEM.md, two runs, contended). So an
-  executor pays only if its front end is warm or shared: trusted builders are warm on `master`, a
-  pull request's executors stay warm for its later pushes, and a front-end image of the dependency
+  executor pays only if its front end is warm or shared: builders are kept warm on `master`, a
+  worker keeps its front end for the pushes that follow, and a front-end image of the dependency
   layer (#274) is mapped read-only instead of loaded.
-- **Tests are cached only when every input is declared or recorded.** A test that reaches time,
-  randomness (including `HashMap`'s seed), threads, sockets, unlisted processes or unlisted
-  foreign code always runs. Failures are never cached. An audit mode runs everything uncached and
-  revokes caching for any test whose cached pass it contradicts. tracedecay's flake policy
-  (fail) is kept.
-- **Admission reserves measured memory and CPU** per executor and per job, `Main` first, a bounded
-  queue, and stage timestamps on every job so a queue always has a named limiter. CPU and memory
-  never enter a key. Disk is bounded on every tier, each with a default, a command and a check.
+- **Tests are cached as Bazel's `cache_test_results=auto` caches them.** A pass is reused when
+  the test's declared inputs (its program, its runtime bundle, its arguments and declared
+  environment, the platform) are the same. A test marked `external` or `no-cache` always runs.
+  Failures are never cached. Flaky tests retry as `flaky_test_attempts` retries them. tracedecay's
+  flake policy (fail) stays the owner's gate. The stricter contract of earlier revisions (the
+  always-run effect classifier, audit mode, sampling) is **out of scope (owner, 2026-10-26)**.
+- **Admission reserves measured memory and CPU** per executor and per job, master builds first
+  (priority), a bounded queue, and stage timestamps on every job so a queue always has a named
+  limiter. CPU and memory never enter a key. Disk is bounded on every tier, each with a default,
+  a command and a check.
 - **The wire request carries a resolved `BuildSpec`**: the unit graph after cargo's
   configuration and feature resolution, the profile, flags, environment, working directory, the
   run options of a test, and a digest of the native toolchain. A request blaze cannot honour is
   refused before it is scheduled.
 - **Plan.** Thirty units in six phases, and one more (S4) if the owner chooses it: Phase 0
-  (blaze builds tracedecay), the wire and the cache, trust and execution, distributed compile (its
+  (blaze builds tracedecay), the wire and the cache, execution and jobs (E1 and E2 reduced to
+  executors that run jobs in a work directory, C6 to the tailnet's access model, T1 to Bazel's
+  test-cache rules), distributed compile (its
   first unit, D0, the two-process prototype; D2, smaller helpers, only if measurement asks), tests,
   the CI switch. Each lands alone with a goal, files, acceptance and one verify command that
   checks all of it; acceptance lines that settle a review finding carry its id, as `[rb-M6]`. Owner-operated steps in tracedecay's own CI are listed apart from the units.
@@ -328,22 +414,19 @@ run each, hybrid.
 
 ## The rules this design keeps
 
-- **No rustc, enforced on the process tree.** blaze today reaches cargo and rustc from several
-  places: a cold build dispatches to cargo (`cargo/mod.rs:265-285`), `by` starts `cargo build` or
-  `cargo test --no-run` (`cargo/state.rs:490-504`), the wrapper runs the compiler
+- **blaze never hands its compile work to rustc.** blaze today reaches cargo and rustc from
+  several places: a cold build dispatches to cargo (`cargo/mod.rs:265-285`), `by` starts `cargo
+  build` or `cargo test --no-run` (`cargo/state.rs:490-504`), the wrapper runs the compiler
   (`cargo/wrapper.rs:150-151`), a build script blaze cannot build is left to rustc. Each is a
-  `no-rustc` bug. And a check at blaze's own `Command::new` would not be the boundary: processes
-  are started from other crates and by raw `execve` (re-review B, B1, lists them), and build
-  scripts, proc macros, linker wrappers and tests start their own. So Phase 0 installs a
-  process-tree boundary in which no host toolchain is reachable and only approved code runs, with a
-  spawn API as a second layer and an audit with negative fixtures ([the
-  boundary](#the-no-rustc-boundary-p0-as-mechanism)). The guarantee is that blaze never delegates
-  Rust compilation and that sanctioned toolchains are unavailable to job code; it is not a claim
-  that a test, build script or proc macro cannot implement its own compiler.
-  In worker mode it cannot be turned off, a worker that cannot install it does not start, and a
-  refused process fails the job if the job needed it. A job is never turned green by cargo.
-  `RA_JIT_RUSTC_BASE=0` does not disable cargo's dispatch (review A B1; it only stops patching a
-  rustc-built base, `main.rs:3686-3695`), so revision 1's reliance on it is dropped.
+  `no-rustc` bug. Processes are also started from other crates and by raw `execve` (re-review B,
+  B1, lists them). So Phase 0 routes every spawn of blaze's own through one API that refuses a
+  compiler, answers compiler questions itself, and audits blaze's own run ([the
+  rule](#the-no-rustc-rule-p0-as-mechanism)). The process-tree boundary earlier revisions put under
+  it, which denied job code a toolchain, is **out of scope (owner, 2026-10-26)**: what a test, build
+  script or proc macro runs is not policed beyond what Bazel did. In worker mode the rule cannot be
+  turned off and a job is never turned green by cargo. `RA_JIT_RUSTC_BASE=0` does not disable
+  cargo's dispatch (review A B1; it only stops patching a rustc-built base, `main.rs:3686-3695`),
+  so revision 1's reliance on it is dropped.
 - **Measurement before claims.** Every gate runs at least three times per arm, in one session, on
   the named machine, with median, spread and a limiter named from the phase lines
   (`RA_JIT_STATS`) or the job's stage timestamps. No ratio without a same-session baseline.
@@ -755,7 +838,7 @@ result is written into [reports/TRACEDECAY.md](reports/TRACEDECAY.md) by the uni
 
 | Predicate | Measured as | Bar | Where |
 |---|---|---|---|
-| **P0-A, no rustc** | the process-tree boundary's audit (every exec in the worker's tree, allowed or denied, with its parent chain), the stand-ins of `harness/norustc.py`, and the provenance record of every Rust code artifact the build links or loads; cold isolated target, store and daemon home | **positive:** `tracedecay-cli` cold build, first edit, test-binary build and run, macro expansion and a doctest succeed with 0 compiler execs in the tree and every Rust artifact of blaze's origin, on both platforms; **negative:** each fixture of the boundary's list (below) ends with the outcome that list states: refused with a named refusal and the build failing only where it needed the refused file, or, for an in-process compiler, run and recorded as out of scope (c3-B1.1) | this Mac; Linux at scale |
+| **P0-A, no rustc** | the audit of blaze's own run (every exec in the daemon's and worker's tree with its parent chain), the stand-ins of `harness/norustc.py`, and the provenance record of every Rust code artifact the build links or loads; cold isolated target, store and daemon home | **positive:** `tracedecay-cli` cold build, first edit, test-binary build and run, macro expansion and a doctest succeed with 0 compiler execs started by blaze itself and every Rust artifact of blaze's origin, on both platforms; **negative:** each fixture of the rule's list (below) ends in a named refusal by blaze's own spawn API and the build failing only where it needed the refused spawn. The kernel and profile enforcement against job code, and the fixtures that tried it, are **out of scope (owner, 2026-10-26)** | this Mac; Linux at scale |
 | **P0-B, memory bounded** | footprint (macOS) or `RssAnon` plus `RssFile` (Linux) of every worker and of each executor's whole process tree, 1 s samples; the daemon's log | with `RA_JIT_MEMORY_MAX=M`, the workers together hold at most 1.05 M for no more than 2 s in any state (loading, busy, last asked), and no single worker passes it; a worker stopped by the bound fails its build with the bound's message, and the build does not go to cargo; the harness watchdog never fires. Measured on `tracedecay-cli` at the guard's 16G, the case G0 failed | this Mac |
 | **P0-C, tracedecay fits** | the same samples through a cold load, then 20 edit/undo pairs (memory.md M1) | a loaded `tracedecay-cli` worker holds at most 16 GB footprint on macOS arm64 at ready and after 20 pairs, so a guarded run completes; Linux's number recorded beside it | this Mac; Linux at scale |
 | **P0-D, edits are the daemon's** | `blaze status` and the build logs: 5 runs, each of the three edit kinds of TRACEDECAY.md and its revert, after one cold and one warm build that are not counted | 30 of 30 counted builds (5 × 3 × an edit and its revert) `Finished ... [ra-jit]`, 0 `building with cargo`; the CLI's build script rerun when its watched inputs change and its new output used (G0's 18 failures are background, not this denominator; re-review B N2) | this Mac |
@@ -772,7 +855,7 @@ What is decided here, and why:
   reason; `compile_ahead` checks the budget before each job and, past it, ends the batch, hands what
   it compiled on and releases its memos. `over()` is also changed so a worker alone over the ceiling
   is not exempt, and the ceiling stays what the daemon's workers hold together. In worker mode the
-  stop fails the job; locally the daemon tells the user, as it does today, and the no-rustc boundary
+  stop fails the job; locally the daemon tells the user, as it does today, and the no-rustc rule
   decides what happens next. Unit P0.3, which the program's unit u7-bound is implementing.
 - **The worker gets smaller by LOADMEM's ranked fixes, then memory.md's list**: the bounded batch
   (above), MIR that is not kept once an instance has code, eviction during resolution, the type GC
@@ -787,8 +870,8 @@ What is decided here, and why:
   `pnpm` in an empty `OUT_DIR` and prints 61 lines of its own there, so every edit went to cargo; it
   is blaze's bug, and tracedecay needs no change. PR #5 reruns in a copy and compares what cargo
   reads. A script whose cargo-read output differs between two runs on the same inputs is still
-  marked impure, run once per build in the sandbox where there is one, its latest output used, and
-  its run never shared across machines (section 1). Unit P0.5 lands PR #5 with its verifier's
+  marked impure, run once per build, its latest output used (recording its reads where blaze's
+  existing sandbox does, #147), and its run never shared across machines (section 1). Unit P0.5 lands PR #5 with its verifier's
   findings fixed.
 - **The standard library's writable statics are blaze's on macOS** (#255): `CLEANUP`,
   `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE` have no rustc symbol in the toolchain's
@@ -801,7 +884,7 @@ What is decided here, and why:
 
 Distributed units depend on Phase 0's predicates by name in the plan below.
 
-### The no-rustc boundary (P0-A's mechanism)
+### The no-rustc rule (P0-A's mechanism)
 
 Re-review B (B1) showed that a gate on blaze's own `Command::new` is not "every process blaze
 starts": `sandbox.rs:643,682` forks and calls `execve` itself; `blaze-build-script` runs scripts and
@@ -810,11 +893,66 @@ tools (`run.rs:39,79-84`, `main.rs:104-107`); the vendored `proc-macro-api` star
 (`build_dependencies.rs:442-464,492-494,580-582`) and `cargo metadata` (`cargo_workspace.rs`);
 `asm.rs:1088-1096` runs an assembler; `blaze-registry/src/git.rs:212,463,487` runs git, which can run
 configured helpers; `whole.rs:322-331` runs the built program; `main.rs` links through `sh -c`;
-`answers.rs:165-166` still falls back to the real rustc. And descendants (build scripts, proc
-macros, linker wrappers, tests) start what they like. The boundary is therefore the process tree,
-in three layers.
+`answers.rs:165-166` still falls back to the real rustc. Descendants of a job (build scripts, proc
+macros, linker wrappers, tests) start what they like; policing them is out of scope (owner,
+2026-10-26, below). The rule is therefore about every process blaze itself starts, and has two
+parts and an audit.
 
-1. **The tree reaches no Rust toolchain and runs only code blaze approved** (the boundary
+1. **Blaze's own spawns go through one API**, `crates/blaze-spawn` (new, small): it gives a named error for a known
+   compiler, refuses cargo subcommands that compile (`build`, `check`, `test`, `run`, `rustc`, `doc`, `bench`, `install`, `fix`, `clippy`, `miri`), `cargo
+   metadata` without `--no-deps`, a cargo alias that expands to one of those (read from cargo's
+   config), an external `cargo-*` subcommand, and a `RUSTC`, `RUSTC_WRAPPER` or
+   `RUSTC_WORKSPACE_WRAPPER` that names a compiler, before the spawn, with a named error. Every
+   spawn site above goes through it, the vendored ones by one hook in `stdx::process` and
+   `proc-macro-api`. It is the rule's enforcement, with the audit: it gives a named error before any
+   exec, and covers a cold dispatch that never reaches one. `harness/spawnsites.py` lists every
+   process-creating call (`Command::new`, `libc::{fork, vfork, execve, execvp, posix_spawn*}`) in
+   `crates/` and `vendor/rust-analyzer` and fails on one outside `blaze-spawn` that
+   `harness/dist/spawn-allow.toml` does not list with its reason.
+2. **Compiler questions are blaze's.** A build script's `RUSTC` and `RUSTDOC` point at blaze's
+   answerer (`ra-jit-rustc`, `answers/own.rs`), which answers `-vV`, `--print` and `--version`
+   itself and checks the probe programs of `autocfg`, `version_check` and `rustversion` with blaze's
+   own front end; the fallback to the real rustc (`answers.rs:165-166`) is removed. A question it
+   cannot answer fails the probe with a named error, never by asking rustc.
+3. **The audit and provenance (re-review B, M5; reduced to blaze's own run).** Zero compiler
+   execs in an audited interval does not prove the build was blaze's: a warm target or store, a
+   rustc-built base executable, script executable or macro library would let a hybrid build pass.
+   So P0-A runs with a cold isolated target, store and daemon home; the build records the origin
+   and digest of every Rust code artifact and macro server it links or loads; and the audit fails
+   on any origin that is not blaze's. The audit's sources are the spawn API's log of every spawn
+   blaze makes, the counts of the stand-in `rustc`, `rustdoc` and `cargo` of `harness/norustc.py`
+   on `PATH` and as `RUSTC`, `RUSTDOC` and `CARGO`, and `harness/spawnsites.py`'s static list of
+   every process-creating call. The paths that reach rustc-built artifacts today are removed in
+   worker mode: `own_macro.rs:49-73` (the toolchain's macro server when a shipped one is absent)
+   and `:86-119` (the rustc-built macro library after a failed own build), the symbol files
+   `main.rs:7739-7746` loads, and `whole.rs:37-47`, which makes Build and Run whole but not Test
+   and Check. "0 compiler execs" is the oracle for blaze's own run only; it is not a claim about
+   what a test, build script or proc macro does, which is not policed beyond what Bazel did.
+
+**Fixtures of the rule** (`harness/dist/fixtures/norustc/`, both platforms), each ending with a
+named refusal from blaze's own spawn API or answerer, 0 compiler execs started by blaze, and the
+build failing only where it needed what was refused: a project whose model needs `cargo check
+--compile-time-deps` (project-model, `build_dependencies.rs:442-464`); `cargo metadata` without
+`--no-deps`; a cargo alias `b = "build"` and `cargo b` asked of blaze's own spawn; a `cargo-foo`
+plugin asked of it; `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and `RUSTC` naming a compiler; a
+cold dispatch that would reach cargo; a probe question the answerer cannot answer. Positive
+fixtures: the CLI's build script running `pnpm`; `autocfg`, `version_check` and `rustversion`
+probes answered by blaze; a C dependency built with `cc`; a blaze-built test program run, a
+blaze-built proc-macro library loaded; tracedecay's 107 build scripts, each run by blaze.
+
+#### Out of scope (owner, 2026-10-26): the process-tree boundary
+
+Revisions 3 and 3.1 put a boundary under the rule: an OS boundary around the worker and every
+process under it, in which the host toolchain is absent or unreadable and the kernel refuses to run
+or map a file that is not approved (Linux: `noexec` mounts, an exec store, Landlock, seccomp; macOS:
+a Seatbelt allow-list), failing closed. The owner ruled that out: it is sandboxing against job
+code, which Bazel with NativeLink never gave tracedecay (see [the scope
+section](#scope-parity-with-bazel-and-nativelink)). **No unit builds anything below and no
+acceptance line depends on it.** It is kept as a record, and as the place to start if the owner
+asks for it later. Its text refers to "the boundary", "the exec store", "approved code" and
+"promotion"; none of these exist at parity.
+
+- **The tree reaches no Rust toolchain and runs only code blaze approved** (the boundary
    itself). It is in place before the worker loads anything: on a fleet machine the agent sets it
    up as it starts the executor (on Linux the agent, which creates the executor's user, creates its
    namespaces, E1); locally the daemon installs it on itself. Every descendant inherits it and
@@ -945,36 +1083,8 @@ in three layers.
      the superset rule says it must behave as under cargo; the audit reports it. This is why
      tracedecay's tests that run rustc or cargo need the owner's `rustc-tests` gate (section 6).
      The security of what a pull request runs is section 2's isolation, not this boundary's.
-2. **Blaze's own spawns go through one API**, `crates/blaze-spawn` (new, small): it resolves the
-   executable against the approved set, gives a named error for a known compiler, refuses cargo subcommands that compile (`build`,
-   `check`, `test`, `run`, `rustc`, `doc`, `bench`, `install`, `fix`, `clippy`, `miri`), `cargo
-   metadata` without `--no-deps`, a cargo alias that expands to one of those (read from cargo's
-   config), an external `cargo-*` subcommand, and a `RUSTC`, `RUSTC_WRAPPER` or
-   `RUSTC_WORKSPACE_WRAPPER` that names a compiler, before the spawn, with a named error. Every
-   spawn site above goes through it, the vendored ones by one hook in `stdx::process` and
-   `proc-macro-api`. It is not the boundary; it gives a named error before the boundary's denial,
-   and covers a cold dispatch that never reaches an exec. `harness/spawnsites.py` lists every
-   process-creating call (`Command::new`, `libc::{fork, vfork, execve, execvp, posix_spawn*}`) in
-   `crates/` and `vendor/rust-analyzer` and fails on one outside `blaze-spawn` that
-   `harness/dist/spawn-allow.toml` does not list with its reason.
-3. **Compiler questions are blaze's.** A build script's `RUSTC` and `RUSTDOC` point at blaze's
-   answerer (`ra-jit-rustc`, `answers/own.rs`), which answers `-vV`, `--print` and `--version`
-   itself and checks the probe programs of `autocfg`, `version_check` and `rustversion` with blaze's
-   own front end; the fallback to the real rustc (`answers.rs:165-166`) is removed. A question it
-   cannot answer fails the probe with a named error, never by asking rustc.
 
-**Provenance (re-review B, M5).** Zero execs in the audited interval does not prove the build was
-blaze's: a warm target or store, rustc-built sysroot libraries, a rustc-built base executable,
-script executable or macro library would let a hybrid build pass. So P0-A runs with a cold
-isolated target, store and daemon home; the boundary denies reads of the rustc-built libraries;
-the build records the origin and digest of every Rust code artifact and macro server it links or
-loads; and the audit fails on any origin that is not blaze's. The paths that reach rustc-built
-artifacts today are removed in worker mode: `own_macro.rs:49-73` (the toolchain's macro server when
-a shipped one is absent) and `:86-119` (the rustc-built macro library after a failed own build),
-the symbol files `main.rs:7739-7746` loads, and `whole.rs:37-47`, which makes Build and Run whole
-but not Test and Check.
-
-**Negative fixtures** (`harness/dist/fixtures/norustc/`, both platforms). Two kinds, with the
+**Negative fixtures of the dropped boundary** (`harness/dist/fixtures/norustc/`, both platforms, not built). Two kinds, with the
 outcome each is expected to have under the guarantee above (c3-B1.1).
 
 *Host toolchain and delegation, refused:* a build script that runs rustc by absolute path; a copy
@@ -1003,8 +1113,9 @@ record, not a count of execs: a library mapped into an approved process has no e
 | **bytes brought in**: a non-host compiler's bytes in a fixture, loaded by the job's own in-process loader (anonymous memory, no file mapping, no exec) | runs, **out of scope**, recorded | same |
 | **inherited descriptor**: the parent opens the host's rustc and starts the worker | the worker's `close_range` leaves no such descriptor; `fexecve` of its number fails with `EBADF` | the descriptor is closed by the same step; `file-map-executable` is denied if it is not |
 
-**Positive fixtures:** the CLI's build script running `pnpm`; `autocfg`, `version_check` and
-`rustversion` probes answered by blaze; a C dependency built with `cc`; a blaze-built test
+
+*Positive fixtures of the dropped boundary, record:* the CLI's build script running `pnpm`;
+`autocfg`, `version_check` and `rustversion` probes answered by blaze; a C dependency built with `cc`; a blaze-built test
 program run through `CARGO_BIN_EXE_*` from the exec store; a blaze-built proc-macro library
 mapped from it; a build script that compiles a C probe and runs it, and one that builds and
 runs a `protoc`, each passing through the promotion path, which is a bug of the path if one does
@@ -1049,6 +1160,46 @@ metadata). Cross-host identities that let Linux compile for macOS (not known to 
 code; no phase needs it).
 
 ## 2. Trust
+
+### The access model (parity)
+
+This is the whole of trust at parity: the model tracedecay runs today for NativeLink
+(`docs/ci-remote-builds.md` at `d79de82273`, **read**), with `ra-jit serve` and the agents where
+NativeLink's coordinator and workers are.
+
+- **Reach is the tailnet's.** `ra-jit serve` and the agents listen on the tailnet address only, no
+  public listener. Who may connect to what is a Tailscale grant by tag. The CI tag may reach only
+  the server's API port on the coordinator host, plus what it reaches today; it gets no SSH and
+  no agent registration. Fleet nodes carry their own tag and reach the server and one another.
+  Write access (publish, submit a job, cancel one) is therefore limited to CI and fleet nodes by
+  the ACL, as it is today, and blaze does not check it again.
+- **Hosted runners join as they do today.** A GitHub-hosted runner joins the tailnet through the
+  official Tailscale action with a GitHub OIDC identity that Tailscale validates (issuer
+  `https://token.actions.githubusercontent.com`, `repository_id`, `actor_id`, `workflow_ref`,
+  audience), restricted to the CI tag, as `TS_BAZEL_CLIENT_ID` is configured now. blaze does not
+  read the token.
+- **Fork pull requests are excluded.** The workflow does not give them the tailnet or fleet
+  credentials, and GitHub's fork approval policy stays `all_external_contributors`; a fork run
+  builds with no remote. Approving a fork run does not enroll its author. blaze needs nothing
+  more to refuse them, since a fork cannot reach the server.
+- **The principal is the tailnet peer.** A request carries no capability and no signature at
+  parity, and the server serves one namespace (section "Scope"). Who ran a job is read from the
+  job's own record and the tailnet's logs.
+- **What this does not do,** as today: it does not keep code of a same-repository pull request,
+  once the owner's workflow runs it on a fleet node, from writing the shared cache or reading
+  what the worker's user can read. That is the accepted risk of the scope section.
+
+### Out of scope (owner, 2026-10-26): isolation, capabilities, namespaces, signed records
+
+Everything from "Threat model" to the end of this section, except the fork bullet marked below, is
+the design of revisions 1 to 3.1 for the case where pull-request code on shared workers is
+untrusted: separate `Main` and `Pr(n)` namespaces, a trusted-builder role that never runs pull-request
+code, per-pull-request executors under their own OS user and sandbox, app-level capabilities
+verified against GitHub's OIDC and REST API, server-signed records with epochs, and audit
+rebuilds. The owner ruled it out as more than Bazel with NativeLink gave tracedecay. **No unit builds
+it and no acceptance line depends on it;** it is kept as a record. Where later sections name
+"`Main`", "`Pr(n)`", a capability, an epoch or a trusted builder, they name this record's terms;
+the parity reading is given where it matters.
 
 ### Threat model
 
@@ -1138,8 +1289,8 @@ exercised here, **unverified**):
 
 - **Fork pull requests** get no tailnet and do not call the server, as today, and run blaze
   hosted-only with no remote; a call would be refused anyway, as the head repository differs. That
-  is one policy; revision 1's "forks get read-only claims" is withdrawn (review B M3). Unit C6 tests
-  that a fork's run is refused.
+  is one policy; revision 1's "forks get read-only claims" is withdrawn (review B M3). **In
+  scope:** this is the access model's fork rule above, and needs no server check at parity.
 - **Capabilities** are `Capability` values signed by the server, valid for one execution and
   attempt, at most until the job's deadline, for the listed operations. The agent receives the
   executor's capability and uses it outside the sandbox; the executor never sees it. A trusted
@@ -1184,7 +1335,8 @@ tables above; it also hosts the coordinator. The `S3`, directory and `https` pla
 everyone else. What it adds over a bucket, each from research section 7:
 
 - **Batch lookup** of a build's `CrateKey`s in one request, answered with the latest record of
-  each in the namespaces the capability may read, `Pr(n)` before `Main`.
+  each in the namespace the server serves (at parity one, `Main`; the record's `Pr(n)` before `Main`
+  order is out of scope).
 - **Completeness** (NativeLink's `completeness_checking`): a record is answered with only the
   packs the server holds; one that names a missing pack is answered without it and the pack's
   absence is logged.
@@ -1192,7 +1344,10 @@ everyone else. What it adds over a bucket, each from research section 7:
 - **Verification on write**: a blob is hashed before it is kept.
 - **Success only**: only a job that finished publishes records; a failed job's packs are not
   named by any record and are collected.
-- **Namespaces, capabilities and signing** (section 2), and **GC by live roots** (below).
+- **One namespace, no capabilities and no signing at parity** (section 2's access model: the
+  tailnet's ACL decides who may write), and **GC by live roots** (below). The server and the
+  records are as unit C1 landed them; the server fills the namespace as `Main`, epoch 0, and leaves
+  a record's signature unset.
 
 **Rejected.** MinIO behind the `S3` place as the fleet's server (one GET per record, bucket
 credentials on runners, policy that cannot see a GitHub identity, a collector someone has to
@@ -1225,8 +1380,9 @@ collects by the entries builds used.
   live when the `used` blob of a live root names it.
 - **Live roots, by configuration, not by commit** (re-review A N1): roots are grouped by
   `ConfigKey`, the `BuildSpec` without its source and lock, so one configuration's builds across
-  commits are one history. Live: in `Main`, the roots of the last 20 `master` commits of each
-  `ConfigKey`; in every namespace, every root written in the last 14 days.
+  commits are one history. Live: the roots of the last 20 `master` commits of each `ConfigKey`;
+  every root written in the last 14 days, a pull request's included (at parity there is one
+  namespace, so a pull request's roots are not collected apart).
 - **Compaction makes generations smaller.** When the live entries of a crate's newest generation
   are under half of its packs' bytes, the collector writes exactly the crate's live entries (the
   union of the live roots' `used` lists for it) into fresh packs and publishes generation g' with
@@ -1234,19 +1390,19 @@ collects by the entries builds used.
   replaces maps to g'. A root that names g is then served g' (which holds every entry the root
   used); g's record and every pack no live generation names are dead.
 - **Leases and pins:** a running job's lookups pin the generations they answered, and an
-  execution pins every blob its executors upload under its capability, from the upload to the
+  execution pins every blob its executors upload under its execution id, from the upload to the
   execution's end (section 4), until the job ends or its deadline passes; GC skips pinned
   generations and blobs, and a remap does not unpin. No eviction retry is needed (research, the adopt table's row 21).
 - **Budget:** `--max` bytes with a low-water mark at 80%. Past `--max`, the server collects
-  dead data, then live `Pr(n)` namespaces idle longest, then `Main` roots older than the last 20
-  commits of their `ConfigKey`; it never collects a pinned generation or pack. If live data alone
-  passes `--max`, the server says so and stops accepting `Pr(n)` publishes before it evicts live
-  `Main` data.
+  dead data, then roots outside the last 20 `master` commits of their `ConfigKey`, least recently
+  written first; it never collects a pinned generation or pack. If live
+  data alone passes `--max`, the server says so and stops accepting publishes before it evicts a
+  `master` root.
 - **Scheduling:** collection runs in the server every hour and when a publish crosses the budget,
   not by hand. A blob no generation names and no execution pins is removed after at least two
   hours (`collect.rs`'s grace) after its last pin ended, checked again right before removal.
-- `Pr(n)` is dropped by `DELETE /v1/ns/pr/<n>` from a `pull_request: closed` workflow or 14 days
-  after its last write.
+- A pull request's roots expire 14 days after their last write; the per-namespace delete of the
+  record's `Pr(n)` (`DELETE /v1/ns/pr/<n>`) is out of scope.
 - Records of an identity the server no longer serves are dead after 7 days.
 
 ## 4. Distributed compile
@@ -1610,9 +1766,9 @@ works" is broader than the evidence: Linux AArch64 has CI for Cranelift, LLVM an
 (support.md), and `cargo blaze` there is unverified, so a whole-build success in Docker is
 **unverified** until the preflight has passed. `proto.py --preflight` runs the exact path D0
 needs, on the platform it names: a hello-world whole build with the standard library linked, a
-two-process export and import of one function, and the boundary's own probe; it fails closed,
-naming what is missing (user namespaces, `noexec` mounts, seccomp user notification, the
-filter's ABI check), because Docker being installed proves none of them.
+two-process export and import of one function, and the spawn API's own probe (a refused compiler
+spawn); it fails closed, naming what is missing (the pinned image, the standard library, the
+native linker inputs, the cgroup budget), because Docker being installed proves none of them.
 
 **Capacity of two front ends (c3-D0.2).** P0-C's bar is one worker at 16 GB footprint; two
 residents of that size would need 32 GB before any child, so "wait for P0-C" is not a
@@ -1665,8 +1821,8 @@ raised or lowered to make it fit, and a capacity failure is never recorded as a 
    **unverified**, to be replaced by D0's measurement). A run in which the helper's results were
    refused, lost or unused and the lead compiled the rest fails with "serial fallback", whatever
    the output and digests say.
-6. *No rustc.* 0 compiler execs and a provenance record with no rustc-built artifact, in both
-   trees (P0-A's boundary on both processes).
+6. *No rustc.* 0 compiler execs started by blaze and a provenance record with no rustc-built
+   artifact, in both trees (P0-A's rule on both processes).
 7. *Reported.* The lead's tail by reason; each process's peak footprint and, on the Mac, the
    aggregate series.
 
@@ -1710,7 +1866,8 @@ where codegen is large and front ends are warm or shared:
   (cache.md), so their functions compile again until per-item keys (#344) land;
 - **a lock-file change**: the dependency layer's instances compile again;
 - **the first push of a pull request** whose executors start from the image;
-- **a cold `Main` build of a new commit range** after the cache was disowned (an epoch bump).
+- **a cold `Main` build of a new commit range** after the cache was emptied (a new blaze identity, section 1; the epoch bump of section 2's record
+  is out of scope).
 
 Gate GD measures these on tracedecay, not on a body edit (which compiles a few functions). If the
 common cold first push must gain too, the front end has to be shared or distributed by crate; D3's
@@ -1791,8 +1948,8 @@ the reason. A helper that misses them loses only its lease. `LocalPolicy`:
 the smaller hosted VM"), `Fallback` (build locally after the deadline or a remote failure),
 `Race` (build locally from the start, per job, never per function). Under `Race` the first to
 finish wins, but a first-finishing failure fails the job, as Bazel's dynamic execution does
-(research 7.4), so local and remote differences surface. Locally, every policy runs inside the
-same no-rustc boundary.
+(research 7.4), so local and remote differences surface. Locally, every policy runs under the
+same no-rustc rule.
 
 ## 5. Admission and scheduling
 
@@ -1811,7 +1968,8 @@ same no-rustc boundary.
   inside blaze by `RA_JIT_MEMORY_MAX`, which bounds what the daemon's workers hold together and is
   passed, unchanged, to every blaze child (own-script and own-macro compiles) through an immutable
   worker context rather than the environment `own_script.rs:253-280` clears (re-review B, M6).
-- **Order.** `Main` before pull requests, then first in, first out. A pull request's next push
+- **Order (priority).** `master` builds before pull requests, then first in, first out, as
+  NativeLink's priority orders its queue. A pull request's next push
   cancels its previous job's execution if nothing else subscribes to it.
 - **Bounded queue.** At most `Q` executions waiting per platform (default 32); past it, `POST
   /v1/jobs` answers `busy` with a retry time and the requester follows its `LocalPolicy`.
@@ -1826,11 +1984,12 @@ same no-rustc boundary.
   enter an entry key, a `CrateKey`, a `JobContent` or a `TestKey`. (In Bazel `cpu_count` is in
   every Rust action's key, research 7.7.)
 - **Platforms.** A job runs on an executor whose `ExecPlatform` digest is its spec's. Linux
-  x86-64 on Ubuntu-main and the Linux desktop; macOS arm64 on the Mac Studio. A pull request's
-  macOS leg runs on a hosted macOS runner with `Main` reads until unit E2 isolates pull-request
-  executors on the Mac Studio; its platform digest differs from the Mac Studio's (the SDK skew of
-  `docs/ci-remote-builds.md:10-12`), so it shares function entries (same triple and identity) but
-  not programs or test verdicts.
+  x86-64 on Ubuntu-main and the Linux desktop; macOS arm64 on the Mac Studio. macOS jobs go
+  only to macOS executors and Linux jobs never to the Mac Studio, as today. A pull request's macOS
+  leg stays on its hosted macOS runner with no remote, as today; were the owner to join it later,
+  its platform digest would differ from the Mac Studio's (the SDK skew of
+  `docs/ci-remote-builds.md:10-12`), so it would share function entries (same triple and
+  identity) but not programs or test verdicts.
 - **Gate GB, the burst** (owner-operated): K concurrent pull-request jobs, K = 1, 3, 6, of the
   same three edit kinds, against NativeLink's fleet build of the same commits, in one session,
   3 runs per arm; push-to-verdict p50 and p95, and each wait named by stage. Bar: p95 no worse
@@ -1839,51 +1998,66 @@ same no-rustc boundary.
 
 ## 6. Distributed tests
 
-### What is cached: the contract
+### What is cached: the contract (parity: Bazel's)
 
-A pass is reused only when everything that could change the verdict was declared or recorded
-and is the same. Bazel caches passes under a declared-input key and limits the damage with an
-`external` tag, `--runs_per_test`, and never caching failures (research 7.10); blaze's key is
-recorded rather than declared, so its contract is stricter:
+A result is reused as Bazel's `--cache_test_results=auto`, its default, reuses it
+(research 7.10, **reported** here, read there): a test reruns only when its declared inputs changed. The key is what
+the test action declares: the test program, its declared runfiles (here the `RuntimeBundle`), its
+arguments, its declared environment and the platform. Time, randomness and thread scheduling are
+not in it, as in Bazel (**unverified**, inferred from what an action holds).
 
-1. **Statically closed.** The test's reach (`RA_JIT_TESTS=affected`'s analysis) touches none of:
-   time (`Instant`, `SystemTime`, `sleep`, timeouts), randomness (`getrandom`, `RandomState` and so
-   every default `HashMap`/`HashSet`), threads and synchronisation with timeouts, sockets
-   including loopback, process spawn other than the bundle's programs, foreign functions not in
-   the platform's C library, environment reads outside `RunSpec.env`. Today the classifier leaves
-   time, randomness, threads and locks out on purpose (`fncache.rs:315-318`); unit T1 adds them as
-   reasons to always run, not as reasons to cache.
-2. **Dynamically recorded.** On Linux the test ran in the sandbox, which recorded every path it
-   looked up, including failed lookups, with content, mode, length and link targets, and it wrote
-   only its temporary directory. The recorded set is its `InputManifest`. `/proc`, `/sys` and `/dev`
-   are not recorded (`sandbox.rs:64-67`), so a test that reads them always runs.
-3. **Not marked.** The owner's test manifest may mark tests always-run, like Bazel's `external`.
-4. **On macOS** there is no recording until unit E2's sandbox exists: only tests that pass rule 1
-   and read no file at all are cacheable; the rest always run.
-5. **Failures are never cached.** A failure is reported and the next run runs the test.
+1. **Declared inputs.** The `TestKey` is the digest of the program, the test's name, the
+   `RunSpec`, the platform and the `RuntimeBundle`'s digest, with each declared file's digest,
+   mode and length in the `InputManifest`. Nothing is recorded by running the test; a file a test
+   reads that its bundle does not declare is not in the key, as with an undeclared read under
+   Bazel. A test that needs a toolchain declares it as `rust_test`'s runfiles did.
+2. **An opt-out marker.** A test the owner's manifest tags `external` or `no-cache` (Bazel's
+   names) always runs. So does a test run with `--runs_per_test` above 1.
+3. **Failures are never cached.** A failure is reported, and the next run runs the test: "a
+   previous failure always reruns", as Bazel does, "as otherwise we can get stuck forever in the
+   event of a flaky failure" (research/bazel-nativelink.md, citing `TestConfiguration.java:169-183`; **reported** here, read
+   there).
+4. **Flaky retries as Bazel's.** A test runs once, or up to three times when the manifest marks it
+   `flaky`, as `--flaky_test_attempts=default` runs it (research/bazel-nativelink.md, citing
+   `ExecutionOptions.java:240-252`; **reported** here, read there); one that needed more than one attempt is reported FLAKY, and its pass is not cached
+   (whether Bazel caches such a result is **unverified**; not caching it costs only a rerun). What
+   a FLAKY test does to the job is the owner's `flake-policy` gate below.
 
-Anything else always runs. How many of tracedecay's tests the contract caches is measured, not
-assumed (gate GT): if `RandomState` alone makes most tests uncacheable, the next step is to seed
-it per test in the sandbox from a digest of `TestBaseKey` (domain-separated, so the seed is not
-part of what it keys), and to measure again. Time is not virtualised: tests that read the clock
-always run.
+How many of tracedecay's tests the contract caches is measured (gate GT), not assumed. Time is not
+virtualised and `HashMap`'s seed is not fixed: a test that reads either and passes is cached like any
+other passing test, as under Bazel, and the owner's `no-cache` marker is the remedy for a test that
+should not be.
+
+### Out of scope (owner, 2026-10-26): the stricter contract
+
+Earlier revisions held blaze's recorded key to a stricter contract than Bazel's declared one: an
+always-run classifier over a test's reach (time, randomness, threads, sockets, unlisted spawns,
+foreign calls outside a short list, unlisted environment), the sandbox's record of every path a
+test read as its manifest, no caching at all on macOS without that record, an audit mode that ran
+everything uncached daily and revoked any cached pass it contradicted, and random sampling of 5%
+of cache hits. The owner ruled it out as more than Bazel gave tracedecay. **No unit builds it and no
+acceptance line depends on it.** The old rules were *statically
+closed* (the reach touches no time, randomness, thread, socket, unlisted spawn, foreign call or
+environment read; unit T1 added them as reasons to always run), *dynamically recorded*, *not
+marked* and *on macOS*, and an idea to seed `RandomState` per test; revision 3.1's text of them is
+in this file's history before the scope ruling.
 
 ### Finding a pass on a machine that did not run it
 
-A fresh machine cannot compute a `TestKey` before it runs the test: the key holds what the run
-read (review B M6). So:
+A machine computes the `TestKey` before it runs the test, from what it has (contract rule 1), so no
+manifest has to be matched against recordings:
 
-1. The machine computes the `TestBaseKey` from what it has before running: the test program's
-   digest, the test's name, the `RunSpec`, the platform, the sandbox policy and the
-   `RuntimeBundle`'s digest.
-2. It asks `POST /v1/results/lookup` with the base keys and the namespaces it may read, `Pr(n)`
-   then `Main`. The answer lists, per base key, the passes kept with their manifests.
-3. For each manifest it checks every observation against its own bundle and files: same digest,
-   mode and length; absent paths still absent; links the same. Paths are logical (`$CHECKOUT`,
-   `$OUT_DIR/<unit>`, `$BUNDLE`), resolved on each machine.
-4. A manifest that holds in full makes the `TestKey`, which is the pass's. The test is skipped and
-   the report says so: "skipped: passed under the same inputs at abc1234". If none holds, it runs.
-5. A run publishes its manifest blob and, if it passed, the verdict, together.
+1. The machine computes the `TestKey`: the test program's digest, the test's name, the `RunSpec`,
+   the platform and the `RuntimeBundle`'s digest.
+2. It asks `POST /v1/results/lookup` with the key in the namespace the server serves (at parity,
+   one). The answer lists the passes kept for it with their manifests.
+3. It checks the manifest's declared files against its own bundle: same digest, mode and length.
+   Paths are logical (`$CHECKOUT`, `$OUT_DIR/<unit>`, `$BUNDLE`), resolved on each machine.
+4. A manifest that holds in full is the pass's. The test is skipped and the report says so:
+   "skipped: passed under the same inputs at abc1234". If none holds, or the test is marked
+   `external` or `no-cache`, it runs.
+5. A passing run publishes its manifest and the verdict together; a failing run, or a run that
+   needed a retry, publishes nothing.
 
 ### Runtime bundles and shards
 
@@ -1900,29 +2074,32 @@ read (review B M6). So:
 
 - tracedecay's policy stays: a failure fails the job; `retries = 1` with `flaky-result = "fail"`
   is the nextest file's, and changing it is the owner's decision. Revision 1's "an unchanged flaky
-  test does not fail" is withdrawn (review B M10).
-- **Audit mode.** A scheduled run on `master` (daily) runs every test uncached and compares it
-  with the cached verdicts of the same `TestBaseKey`s. A test whose cached pass the audit
-  contradicts loses caching (it is marked always-run until a person clears it), and the report
-  names it. Besides the daily run, 5% of cache hits in every job are run anyway, picked at random.
+  test does not fail" is withdrawn (review B M10). Attempts are Bazel's (contract rule 4); what a
+  test that needed a retry does to the job is the `flake-policy` gate, default fail.
+- **Audit mode and sampling are out of scope (owner, 2026-10-26)**: a daily uncached run of every
+  test with revocation of caching, and 5% of cache hits run anyway. Bazel did neither.
 
 ### Tests that run rustc or cargo: an owner gate
 
-Three of tracedecay's tests run rustc or cargo and assert what they print (above). A worker runs
-blaze, never rustc ([no-rustc.md](no-rustc.md)), so on a blaze executor the boundary of section 0 denies those
-execs and these tests cannot pass there. Revision 2 kept them on Bazel as if that were this design's
-choice; re-review A called it a regression of the Rust replacement's scope (b-M8). It is the
-owner's: the `rustc-tests` gate, open, with three options.
+Three of tracedecay's tests run rustc or cargo themselves and assert what they print. A worker
+runs blaze, never rustc ([no-rustc.md](no-rustc.md)), and the owner's ruling does not police job
+code: nothing at parity denies those execs on a blaze executor, and a test that needs a toolchain
+declares it in its bundle as Bazel's `rust_test` runfiles did. Revision 2 kept them on Bazel as if
+that were this design's choice; re-review A called it a regression of the Rust replacement's scope
+(b-M8). Where they run is the owner's: the `rustc-tests` gate, open, with four options.
 
 - **Keep them on Bazel** (the gate's default until the owner answers). S2's inventory marks each
   such test "stays on Bazel"; GS requires it executed and passing on Bazel and absent from blaze's
   side; it is not counted as missing.
+- **Declared toolchain.** They run on blaze executors with the toolchain in their bundle, as under
+  Bazel. The rustc that runs is the test's own program's behaviour, not blaze compiling (the
+  superset rule), and it puts rustc runs on the fleet; whether the owner wants that is the gate's
+  question. No unit is needed beyond T3's bundles.
 - **The compatibility lane.** blaze gives these tests a `rustc` and a `cargo` on their `PATH`
   that are blaze: `cargo` is `cargo-blaze`, `rustc` is blaze's answerer extended to a
   diagnostics front end that checks a file and prints rustc-compatible diagnostics, built from
-  blaze's own front end. The tests then run on blaze executors inside the boundary (whose
-  approved set holds blaze's own shims, by digest). Whether the tests' asserted output is
-  matched is measured per test; a test whose output blaze cannot match stays on Bazel by name.
+  blaze's own front end, placed in the tests' bundle by digest. Whether the tests' asserted output
+  is matched is measured per test; a test whose output blaze cannot match stays on Bazel by name.
   This is a unit the owner can ask for (S4 below), not part of the default plan.
 - **Change the tests**: the owner's repository, the owner's call.
 
@@ -1935,8 +2112,8 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 | Local store | LRU by pack within `RA_JIT_CACHE_MAX`, a tenth of free disk, 256 MiB to 32 GiB (`ra-jit-store/src/lib.rs:89-96`), run automatically | unchanged | as today | `blaze store collect` (exists as `StoreDir::collect`; C7 gives it a command) | `harness/storeguards.py`, plus C7's identity case |
 | Stale identity, local | packs of an old blaze identity stay until LRU reaches them | packs no record or root of the current identity names are collected first | on every collect | `blaze store collect --stale` | C7: upgrade the binary, collect, old identity's packs gone, the new identity's build compiles what it must |
 | Target directory | unmanaged; blaze's is 23.0 to 27.3 GB against cargo's 14.2 GB on tracedecay (TRACEDECAY.md), up to 3.9 times cargo's elsewhere (biome 42.5 GB against 11.0, benchmarks.md) | blaze's own files in it (its objects, programs, `.ra-jit-*` records) within `BLAZE_TARGET_MAX`, oldest program first, never the running program's | 2 times the size cargo's own build leaves, measured at the first build | `blaze clean --keep-latest` | C7: twenty builds of moving commits stay within the bound; P0.7 explains the extra 8.9 to 13.1 GB first |
-| Cache server | none (revision 1: GC by roots) | section 3's GC: `--max`, low-water 80%, roots by generation, leases, completeness, hourly | `--max` 70% of the server's disk | `ra-jit serve collect --dry-run` | C7: 30 `master` commits and 10 closed pull requests with new generic instances each, within budget, the last 20 roots hit, obsolete instances gone |
-| Executors | — | a pull-request executor's directories are deleted with it; a trusted builder's worktree is one path, moved by edits, and its daemon unloads checkouts that are gone (memory.md item 3) | at executor end | `blaze-agent prune` | E1: after 10 pull requests opened and closed, no executor directory, user or process left |
+| Cache server | none (revision 1: GC by roots) | section 3's GC: `--max`, low-water 80%, roots by generation, leases, completeness, hourly | `--max` 70% of the server's disk | `ra-jit serve collect --dry-run` | C7: 30 `master` commits and 10 pull requests with new generic instances each, within budget, the last 20 roots hit, obsolete instances gone |
+| Executors | — | an executor's work directory is deleted when its job ends; a builder's worktree is one path, moved by edits, and its daemon unloads checkouts that are gone (memory.md item 3) | at job end | `blaze-agent prune` | E1: after 10 jobs, no work directory or process left |
 | Stale identity, server | — | records of identities not served are dead after 7 days | | `ra-jit serve collect` | C7 |
 
 ## 8. Wire protocol
@@ -2339,7 +2516,7 @@ tooling and the report form, the owner runs it and the report unit records it).
 | **G3, one job** | E3's switch | a warm lead against Bazel's fleet job, same commits: body edit in a leaf crate, body edit in the `tracedecay` crate, signature edit in a crate many depend on | push to verdicts faster than Bazel's fleet job for each, 5 runs each | fleet |
 | **GB, the burst** | S3's blocking step | section 5 | section 5 | fleet |
 | **GD, distributed compile** | D4 closes; S3's blocking step | section 4 | section 4; a failure changes how, by section 4's list | Mac and Docker (two executors, small fixtures); Linux; fleet (tracedecay) |
-| **GT, tests** | T2's switch to skipping | tracedecay's suite: share of tests cacheable under the contract; then 20 runs of an unchanged commit with audits; then adversarial changes (a fixture's mode, a removed file, an environment variable, a clock-reading test, a child tool) | 0 cached passes the uncached audit contradicts; every adversarial change runs the affected test; the share cacheable recorded | Mac; Linux; fleet for the suite |
+| **GT, tests** | T2's switch to skipping | tracedecay's suite under the parity contract (section 6): share of tests cacheable; then 20 runs of an unchanged commit; then changes to a declared input (a bundle file's content or mode, an argument, a declared environment variable) and a `no-cache`-marked test | every run of an unchanged commit skips each cacheable test whose declared inputs are unchanged; every change to a declared input runs the affected test; a marked test always runs; a failure is never skipped; the share cacheable recorded | Mac; Linux; fleet for the suite |
 | **G6, requests per build** | C5 | server counters | one lookup request per build; 0 per-function requests; server CPU per job recorded | Mac |
 | **GS, shadow** | the owner's removal of Bazel's Rust paths | two weeks of shadow mode on `master` and pull requests, against S2's inventory | every inventoried test executed or validly skipped (its cached pass's manifest held) on blaze's side with Bazel's verdict, every test the inventory keeps on Bazel executed there, or each difference filed and fixed; 0 missing or extra (re-review A, b-M10) | fleet |
 
@@ -2370,7 +2547,7 @@ under `harness/dist/`, the crates `blaze-wire`, `blaze-serve` and `blaze-dist`,
 `crates/ra-jit/src/worker.rs`, `crates/ra-jit/src/remote/serve.rs` and
 `docs/reports/DIST-SHADOW.md` are new, made by the unit that first names them; every other path
 exists at `f9b5da46`; so do `crates/blaze-spawn`, `crates/hir-ty-codegen/export.rs`,
-`crates/ra-jit/src/sandbox/macos.rs` and `harness/spawnsites.py` once their units make them.
+and `harness/spawnsites.py` once their units make them.
 "Depends" names units and the Phase 0 predicates a unit needs met. A unit after Phase 0 whose
 acceptance runs tracedecay needs P0-H on that platform. A Phase 0 unit never depends on the
 predicate it remediates or on P0-H, which P0.8 establishes from them; its own tracedecay runs are
@@ -2397,104 +2574,52 @@ limit and recorded. From the reviews:
 Verify: `python3 -I harness/tracedecay.py --td ~/work/hello --predicate P0-A --expect-fail &&
 python3 -I harness/tracedecay.py --self-test`. Where: Mac.
 
-**P0.2 The no-rustc boundary.** Goal: P0-A's mechanism, as section 0 specifies it: the process-tree
-boundary (Linux mount namespace with `noexec` mutable mounts, the exec store and a seccomp filter
-that rejects other ABIs; macOS Seatbelt allow-list), installed by the worker on itself and failing
-closed; `crates/blaze-spawn` for every spawn site of `crates/` and the vendored launchers; blaze's
-answerer for compiler probes, with `answers.rs`'s fallback removed; provenance records. Files:
-`crates/blaze-spawn` (new), `crates/ra-jit/src/sandbox.rs` (exec authorised by the kernel, not by
-`CONTINUE` at `:810-829`; the ABI check at `:695-705`; `execveat` with an empty path at `:835-858`;
-no_new_privs and the dropped capabilities; the tree-wide namespace; the exec store), a new
-`crates/ra-jit/src/sandbox/macos.rs`,
+**P0.2 The no-rustc rule.** Goal: P0-A's mechanism, as section 0 specifies it: `crates/blaze-spawn`
+for every spawn site of `crates/` and the vendored launchers; blaze's answerer for compiler
+probes, with `answers.rs`'s fallback removed; the audit and provenance records of blaze's own run.
+**Out of scope (owner, 2026-10-26)** and not in this unit: the process-tree boundary of section 0
+(the mount namespace, `noexec` mounts, the exec store, Landlock, the seccomp filter and its ABI
+check, the Seatbelt profile, `sandbox.rs`'s exec authorisation and the macOS sandbox file), the
+negative compiler fixtures that tried it and the racing-exec harness. Files: `crates/blaze-spawn`
+(new),
 `crates/ra-jit/src/{main,answers,link,splice,shipped,stub,socket,doctest,test_harness}.rs`,
 `crates/ra-jit/src/cargo/{mod,state,wrapper,script,daemon,run,whole,own_script,own_macro,client}.rs`,
 `crates/ra-jit/src/bin/{ra-jit-rustc,cargo-blaze}.rs`, `crates/blaze-build-script/src/{main,run}.rs`,
 `crates/hir-ty-codegen/{asm,fncache}.rs`, `crates/ra-jit-store/src/lib.rs`,
 `crates/blaze-registry/src/git.rs`, one hook each in `vendor/rust-analyzer/crates/stdx/src/process.rs`
 and `proc-macro-api/src/process.rs`, `harness/spawnsites.py`, `harness/dist/spawn-allow.toml`,
-`harness/dist/execrace.py`, `harness/dist/fixtures/norustc/`. Depends: P0.1. Acceptance: with deny, a project blaze cannot build
-without cargo fails before any spawn, naming the reason; `spawnsites.py` passes; the audit counts
-0 compiler execs on hello-world on Linux (Docker), where the whole build works. From the reviews:
-- [rb-B1] "Audit actual descendant execution with absolute-path compiler, renamed executable,
-  shell/linker wrapper, script/proc-macro/test spawning cargo, and cargo aliases/plugins. Gate P0-A
-  on those negative fixtures and fail closed where enforcement cannot be provided." Checked by:
-  every negative fixture of section 0 on Linux (Docker) and macOS ends with the outcome section 0
-  states for it (a named refusal and 0 compiler execs, or, for the in-process fixtures, run and
-  recorded as out of scope); a worker started where the boundary cannot be installed (a Docker container
-  without user namespaces; `sandbox_init` made to fail) exits naming why; the positive fixtures
-  (`pnpm` from a build script, `autocfg`, `version_check` and `rustversion` probes, a `cc` build)
-  pass.
-- [a-B1] "gating Command::new inside ra-jit does not mediate other crates or execs made by job
-  descendants; PATH stand-ins do not audit absolute compiler execs." Checked by: the fixtures
-  above that exec by absolute path, from a descendant and from `blaze-build-script`, `asm.rs` and
-  the vendored launchers.
+`harness/dist/fixtures/norustc/`. Depends: P0.1. Acceptance: with deny, a project blaze cannot
+build without cargo fails before any spawn, naming the reason; `spawnsites.py` passes; the audit
+counts 0 compiler execs started by blaze on hello-world on Linux (Docker), where the whole build
+works. From the reviews (the parts that needed the dropped boundary are in appendix A as accepted
+at parity):
+- [rb-B1] parity remainder. "Audit actual descendant execution with absolute-path compiler,
+  renamed executable, shell/linker wrapper, script/proc-macro/test spawning cargo, and cargo
+  aliases/plugins." What parity keeps is blaze's own spawns; a job's descendants are not policed.
+  Checked by: every fixture of section 0's rule (project-model's `cargo check --compile-time-deps`,
+  `cargo metadata` without `--no-deps`, a cargo alias, a `cargo-foo` plugin, `RUSTC_WRAPPER` and
+  `RUSTC` naming a compiler, a cold dispatch, an unanswerable probe) ends in a named refusal from
+  blaze's spawn API or answerer, 0 compiler execs started by blaze, and the build failing only where
+  it needed the refused spawn; the positive fixtures (`pnpm` from a build script, `autocfg`,
+  `version_check` and `rustversion` probes, a `cc` build) pass.
+- [a-B1] parity remainder. "gating Command::new inside ra-jit does not mediate other crates or
+  execs made by job descendants; PATH stand-ins do not audit absolute compiler execs." Checked by:
+  fixtures that make blaze's own code spawn a compiler by absolute path, from `blaze-build-script`,
+  `asm.rs`, `blaze-registry/src/git.rs` and the vendored launchers, are each refused by name; a
+  spawn outside `blaze-spawn` that `spawn-allow.toml` does not list fails `spawnsites.py`. A
+  compiler a job's own descendant starts is not checked.
 - [rb-M5] "Require successful cold CLI build, first edit, test-binary construction/execution, macro
   expansion and doctest on both platforms; expected refusal is only a separate negative fixture.
   Explicitly assign the missing proc-macro/test/check paths before P0-H can close." Checked by: the
   provenance audit (cold isolated target, store and daemon home; every Rust artifact linked or
-  loaded recorded with origin and digest; reads of rustc-built libraries denied) passes on
-  hello-world and ripgrep here, and on `tracedecay-cli` in P0.8; `own_macro.rs`'s two fallbacks and
-  the loaded symbol files are gone in worker mode, and `whole.rs` makes Test and Check whole as it
-  does Build and Run, each with a test.
-- [c3-B1.1] "The denylist knowingly admits compilers that are not in the host manifest ... Add
-  pre-staged non-host toolchain, modified/renamed compiler+driver, explicit dynamic-loader,
-  library-loading and interpreter fixtures; zero execs alone is not an oracle for library
-  compilation." Checked by: the fixtures of section 0's table, each with its stated outcome on
-  Linux (Docker) and macOS. Refused rows: the file is not executed or mapped, the audit names the
-  refusal (errno, file, process chain), the provenance record holds no foreign artifact, and the
-  build fails only where it needed the file. For the library-loading fixture the oracle is the
-  failed mapping, and a fixture whose audit shows 0 execs but whose library mapped fails the
-  unit. Out-of-scope rows (an in-process compiler in a test, a build script and a proc macro; an
-  interpreter implementing one; bytes brought in): the job runs, the harness records "out of
-  scope: in-process compilation", and the unit fails if the docs or the harness report a
-  guarantee the table does not give. The declared-toolchain row is refused by the declaration
-  check; a bundle that declares a compiler the check does not recognise is approved, and the
-  fixture records that as the row's stated outcome, since a bundle is the owner's act and not a
-  job's. The positive fixtures pass,
-  including the C probe and the `protoc` through the promotion path; the list of tracedecay's
-  107 build scripts and of the `-sys` crates that execute a file they wrote is recorded, each with
-  the promotion route it takes.
-- [c3-B1.2] "Linux must not approve mutable exec arguments and then CONTINUE ... Negative tests
-  need a racing path/buffer replacement, fd-based exec and compat-ABI bypass." Checked by, on
-  Linux (Docker's aarch64 VM here; the live x86-64 compat call needs a Linux x86-64 host, the
-  owner's `linux-host` gate), with the supervisor's `CONTINUE` for an exec removed from the code
-  (`spawnsites.py` fails on a `CONTINUE` reply in an exec path):
-  1. *racing replacement*: one thread rewrites an `execve` pathname buffer between an approved
-     binary and a pre-staged compiler while another loops the call, and a second variant swaps a
-     symlink; 100,000 iterations per variant (a starting value, **unverified**), 3 runs: 0 executions of unapproved bytes (counted by
-     a marker the compiler writes on start), every attempt on the compiler refused by the kernel;
-  2. *fd-based exec*: `execveat(fd, "", AT_EMPTY_PATH)` and `fexecve` on an fd opened on a job's
-     compiler (refused, `EACCES`), on a memfd with and without `MFD_NOEXEC_SEAL` (refused; the
-     call without the flag is rejected by the filter), on a deleted file (refused), on an
-     approved tool (runs), and on a descriptor of the host toolchain inherited from the parent
-     (`EBADF`, as `close_range` left none);
-  3. *compat ABI*: a static binary that issues `execve` through `int 0x80` and through an `x32`
-     number (`nr | 0x40000000`) on x86-64 is killed with the arch named; the filter program is also
-     run in a BPF interpreter over `seccomp_data` for every `AUDIT_ARCH_*` value and the x32 bit,
-     and only the native arch with a native number is allowed. That interpreter run is the test
-     wherever the live call cannot run: Apple cores have no AArch32, so on the Docker VM here the
-     live row is reported `unsupported: no compat ABI`, not passed, until a host that has the ABI
-     runs it;
-  4. *unresolvable target*: an unreadable pointer, a path over `PATH_MAX` and an exec while the
-     audit sink is full are each denied with `EACCES`, never continued;
-  5. *privilege and storage*: a job that tries to remount its worktree `exec`, `unshare` a user
-     namespace, `ptrace` a sibling or call `pivot_root` is refused with the capability or
-     syscall named, `/proc/self/status` shows `NoNewPrivs: 1` and an empty effective
-     capability set before the first job instruction, and a script and an interpreter case
-     (`./drive.sh` refused, `sh drive.sh` run) behave as section 0, step 4, says.
-  The macOS counterparts (a rename, a hard link and a symlink into an allowed subpath; a pre-opened
-  descriptor and an already mapped image of a forbidden file; an unsandboxed service the job
-  asks over XPC to run a file; a failed second `sandbox_init`) are in the same unit, and
-  **verified for the narrow case only**: on this Mac (macOS 26.6.2, arm64) a self-applied profile
-  denying `process-exec` and `file-read-data` was inherited by a `/bin/sh` child and its
-  grandchild, and a second `sandbox_init` could not remove it (**read**, u2-check3, one run). The
-  production profile, the `file-map-executable` rule, the audit's delivery and the future
-  releases are P0.2's to check (c3-B1.3).
+  loaded recorded with origin and digest) passes on hello-world and ripgrep here, and on
+  `tracedecay-cli` in P0.8; `own_macro.rs`'s two fallbacks and the loaded symbol files are gone in
+  worker mode, and `whole.rs` makes Test and Check whole as it does Build and Run, each with a
+  test.
 
 Verify: `cargo test -p blaze-spawn -p ra-jit spawn && python3 -I harness/spawnsites.py && python3 -I
 harness/tracedecay.py --td ~/work/hello --predicate P0-A --linux-docker && python3 -I
-harness/tracedecay.py --predicate P0-A --fixtures norustc && python3 -I harness/dist/execrace.py
---linux-docker`. Where: Mac, Docker.
+harness/tracedecay.py --predicate P0-A --fixtures norustc`. Where: Mac, Docker.
 
 **P0.3 A loading worker is bounded.** Goal: P0-B. The worker checks its own footprint during
 load and its build, and past `RA_JIT_MEMORY_MAX` stops with "the worker holds N MB, over the N MB
@@ -2538,13 +2663,15 @@ harness/tracedecay.py --predicate P0-C --runs 3`.
 Where: Mac. If 16 GB is not reached, the unit lands what it reached and the owner decides between
 the Linux host and a higher bar (open questions).
 
-**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D. Lands PR #5 (unit u8,
+**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D: the build-script runner of unit
+p05r, which takes `cargo check` out of the whole build and stays in scope. Lands PR #5 (unit u8,
 `dist/u8-buildscript`): the rerun in a copy of cargo's `OUT_DIR`, comparing the lines cargo reads,
 with its verifier's findings fixed (directory times kept in the copy, symlinks into the original
 not written through, the baseline digest taken before the rerun, invalid UTF-8 lines ignored as
 cargo ignores them). Then a script whose cargo-read output differs between two runs on the same
-inputs is marked impure instead of refused: run once per build (in the sandbox on Linux, recording
-its reads), its latest output used, as cargo does; never shared across machines. Files:
+inputs is marked impure instead of refused: run once per build (recording its reads where blaze's
+existing sandbox does, #147), its latest output used, as cargo does; never shared across
+machines. Files:
 `crates/ra-jit/src/cargo/script.rs` (`rerun_into`, `run_key`), `crates/blaze-build-script`,
 `harness/scriptrerun.py`. Depends: P0.1. Acceptance: a fixture script that prints a list of files git
 tracks and runs a tool that prints its own lines into an empty `OUT_DIR`: an edit is the daemon's,
@@ -2633,12 +2760,41 @@ name; whether the deployment target changes a function's code is recorded. From 
 
 Verify: `cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
 
+Review status of the C2 prototype: the Linux Rust 1.99.0 tests of `blaze-spec`,
+`blaze-metadata` and `blaze-wire` pass (197 tests, including the test over all 317 recorded
+Cargo unit graphs). The graph now keeps proc-macro doctest libraries under their host/build
+profile, and a normal check and test check of the same library or binary remain distinct.
+The host debuginfo-sharing probe uses Cargo's explicit target kind, including for proc macros,
+so a build-only unit cannot match itself and incorrectly retain the runtime debug level.
+A custom test harness receives `cfg(test)` without acquiring the libtest harness. A clean
+`cargo +1.99.0 check --locked --tests -p ra-jit` also passes on Linux, including the CLI and
+test targets. These checks do not establish local execution acceptance or the macOS gate.
+
+Two source-identity gaps remain before the prototype can be used to schedule work. The CLI
+currently names `HEAD` and `HEAD^{tree}` while resolution reads the working tree: changing a
+Rust body without committing can leave `BuildSpec` and `JobContent` unchanged. It needs an
+immutable snapshot of the actual source closure, including inputs outside Git's tracked
+files. Also, the wire contract lacks the Cargo workspace's location within its repository.
+Two sibling workspaces with identical package metadata but different source can have equal
+specs, and replay joins the workspace-relative `cwd` to the Git root. A repository-relative
+workspace location must enter the keyed contract and be used by materialization and replay.
+Refusing those supported local builds is not the completed C2 design.
+
+Matching replay still deliberately ends at the owned-executor diagnostic; routing it through
+the existing Cargo dispatcher would add a compiler fallback. The executor, complete native
+input closure and local execution differential remain pending, and C2 stays draft.
+
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's
 `manifests/`; a client place `Place::Serve` (`blaze+http://host:port`). Push, pull, lazy and the
-keeper work through it unchanged. Files: `crates/blaze-serve`, `crates/ra-jit/src/remote.rs`,
+keeper work through it unchanged. At parity (the scope section) it serves one namespace to every
+tailnet peer with no credential. Files: `crates/blaze-serve`, `crates/ra-jit/src/remote.rs`,
 `crates/ra-jit/src/remote/serve.rs`, `harness/remote.py`. Depends: C1. Acceptance: `remote.py`'s
-round trip, damage, signing and kill checks pass against the server as a third leg. Verify:
+round trip, damage, signing and kill checks pass against the server as a third leg; every call of
+section 8 that carries a capability or an agent signature in the schema is served without one
+(no `Blaze-Capability` header, no signature), answers in the one namespace `Main` at epoch 0, and
+leaves a record's signature unset, with a test for each; the server listens on the address it is
+given and `--listen` on a non-tailnet address is the operator's choice, not a check. Verify:
 `python3 -I harness/remote.py --server`. Where: Mac.
 
 **C4 Content-only keys across machines.** Goal: section 1's table, diagnosed and fixed.
@@ -2681,23 +2837,23 @@ answered without it. From the reviews:
 Verify: `python3 -I harness/dist/crossmachine.py --all --remote server && python3 -I
 harness/dist/crossmachine.py --remote server --b-docker`. Where: Mac, Docker.
 
-**C6 Trust: identities, capabilities, namespaces.** Goal: section 2's server side. OIDC
-verification against a configured JWKS, the GitHub API lookups, capabilities, roles, `Main` and
-`Pr(n)`, epochs, the forced rebuild, fork refusal. `harness/dist/github.py` is a fake issuer and
-API. Files: `crates/blaze-serve/src/auth.rs`, `policy.rs`, `github.rs`,
-`crates/ra-jit/src/remote/signed.rs`, `harness/dist/github.py`, `harness/dist/auth.py`.
-Depends: C5. Acceptance: a pull request's token cannot publish `Main` or `Pr(other)`; a `Main`
-token with a `SourceRef` not on `master` is refused; a wrong workflow, audience, issuer, expired,
-replayed (`jti`) or unsigned token is refused; a fork's run is refused; an enrolled agent cannot
-publish without a capability or cancel another's job; a record of an old epoch is refused after a
-bump; a `Pr` record replayed as `Main` is refused. From the reviews:
-- [ra-N2] "Exempt auth and document exact credential transport plus the separate
-  worker-enrollment authentication method." Checked by: `auth` succeeds without a capability; every
-  other call without `Blaze-Capability` (or, for the agent's own two, without a valid
-  `Blaze-Signature`) is refused 401; an agent signature replayed, dated 61 s off or by an
-  unregistered key is refused; an agent's signature alone cannot publish, cancel or delete.
+**C6 Trust: the tailnet's access model.** Goal: section 2's access model, which is today's
+(`docs/ci-remote-builds.md`), and nothing more. Reduced by the scope ruling: **out of scope
+(owner, 2026-10-26)** are OIDC verification against a JWKS, the GitHub API lookups, capabilities,
+roles, `Main` and `Pr(n)`, epochs, the forced rebuild, signed records and the fake issuer
+(`harness/dist/github.py`, `auth.py`, `signed.rs`, `policy.rs`, `github.rs`). What remains: the
+server and the agent listen on the tailnet address only (an option, default the tailnet address
+when one exists and loopback otherwise); the deployment notes (`harness/dist/ci/README.md`'s access
+section) state the Tailscale grants of section 2 and the owner step that adds them (write access
+is limited to CI and fleet nodes by ACL, as it is today); the CI client of S1 does nothing for a
+fork run. Files: `crates/blaze-serve/src/main.rs` (the listen address),
+`harness/dist/ci/README.md`. Depends: C3. Acceptance: the server started with no `--listen` binds
+the tailnet address, or loopback when the host has none, and says which, and a test checks both
+cases; the README lists the grant for the CI tag and the grant for the fleet tag by port, and
+states that Bazel's own grants need no change. From the reviews: [ra-N2] is accepted at parity
+(appendix A): there is no credential to transport.
 
-Verify: `cargo test -p blaze-serve && python3 -I harness/dist/auth.py`. Where: Mac.
+Verify: `cargo test -p blaze-serve listen`. Where: Mac.
 
 **C7 GC and disk on every tier.** Goal: sections 3 and 7. Roots by `ConfigKey` with used-entry
 lists, compaction with remapping, leases and pins, budget with low-water mark, hourly collection,
@@ -2723,26 +2879,34 @@ directory bound and the stale identity case of section 7. From the reviews:
 
 Verify: `python3 -I harness/dist/gc.py && python3 -I harness/dist/disk.py`. Where: Mac.
 
-### Phase 2: trust on the workers, and jobs
+### Phase 2: executors and jobs
 
-**E1 Agents and executors, Linux.** Goal: section 2's roles and isolation rules 1 to 6 on Linux.
-`blaze-agent` runs as the control plane's user, keeps trusted builders warm on `master`, creates a
-pull request's executor (a fresh user, the whole-job sandbox, the trusted store and image read-only,
-an overlay), uploads its outbox with the job's capability, destroys it. Lifecycle as a sans-IO state
-machine in `crates/blaze-dist`. Files: `crates/blaze-dist`, `crates/ra-jit/src/worker.rs`,
-`crates/ra-jit/src/sandbox.rs`, `crates/blaze-serve` (executor registry). Depends: C6, P0-A, P0-B.
-Acceptance, the adversarial test (review B B1): a pull request's job overwrites a known entry in
-every store it can reach, plants files in every directory it can write, tries to read the agent's
-and builder's credentials and to signal other processes; then a `Main` job runs on the same machine:
-its program and its published records are byte-identical to a clean run's, no credential was read,
-and nothing of the pull request's executor remains. Verify: `cargo test -p blaze-dist && python3 -I
-harness/dist/adversary.py --linux-docker`. Where: Docker; Linux.
+**E1 Agents and executors, Linux.** Goal: workers as NativeLink's are, on Linux. Reduced by the
+scope ruling: **out of scope (owner, 2026-10-26)** are section 2's isolation rules 1 to 6 (a fresh OS
+user per executor, the whole-job sandbox, the trusted store and image mounted read-only, an
+overlay, an unreadable credential, the destroyed pull-request executor) and the adversarial
+test. What remains: `blaze-agent` registers with the server, long-polls for work, starts an
+executor for a job in a work directory under the agent's work root (its own worktree, target
+directory and temporary directory), runs it as one process group, kills the group at the job's end,
+on cancellation and on the deadline, uploads its outputs and deletes the work directory. It keeps
+builders warm on `master`. Lifecycle as a sans-IO state machine in `crates/blaze-dist`. Files:
+`crates/blaze-dist`, `crates/ra-jit/src/worker.rs`, `crates/blaze-serve` (executor registry).
+Depends: C3, P0-A, P0-B. Acceptance: the lifecycle's transitions as sans-IO tests (register,
+assign, start, finish, cancel, deadline, agent restart); a job runs in
+`<work-root>/<execution>/<attempt>` and nothing of the job is written outside it and the store; a
+cancelled job, a job past its deadline and a finished one each leave no process of the group and
+no work directory; after an agent restart `blaze-agent prune` removes the work directories
+of jobs the agent no longer knows; after 10 jobs nothing is left. Verify: `cargo test -p blaze-dist
+&& python3 -I harness/dist/executors.py --linux-docker`. Where: Docker; Linux.
 
-**E2 Executors on macOS.** Goal: isolation rules 1 to 6 on macOS: a user per executor and a
-Seatbelt profile; a pull request's macOS jobs on the Mac Studio after this. Files:
-`crates/ra-jit/src/sandbox.rs` (macOS), `crates/blaze-dist`, `crates/ra-jit/src/worker.rs`.
-Depends: E1, P0-E. Acceptance: E1's adversarial test on macOS; a Linux job is never given to a
-macOS executor. Verify: `python3 -I harness/dist/adversary.py`. Where: Mac.
+**E2 Executors on macOS.** Goal: the same on macOS: the agent on the Mac Studio runs jobs in a work
+directory as E1 does. **Out of scope (owner, 2026-10-26):** a user per executor and the Seatbelt
+profile, and with them a pull request's macOS jobs on the Mac Studio as an isolation question; the
+macOS pull-request leg stays on its hosted runner as today (section 5). Files:
+`crates/blaze-dist`, `crates/ra-jit/src/worker.rs`. Depends: E1, P0-E. Acceptance: E1's lifecycle
+test on macOS; a macOS job is given only to a macOS executor and a Linux job is never given to
+one (checked by `ExecPlatform` matching). Verify: `python3 -I harness/dist/executors.py`. Where:
+Mac.
 
 **E3 Jobs.** Goal: warm remote jobs end to end, review A M6. `RA_JIT_DIST=URL` makes `cargo blaze
 build|test` send its `BuildSpec`; content id, execution id, attempt, subscribers; events with
@@ -2807,7 +2971,7 @@ canonical order), `crates/blaze-dist` (new),
 `crates/ra-jit/src/worker.rs` (new; the local driver), `crates/ra-jit/src/main.rs`,
 `crates/ra-jit-store/src/lib.rs` (import of a pack), `harness/dist/proto.py` (`--platform`,
 `--stage`, `--preflight`, `--capacity`), `harness/dist/fixtures/dist/`. Depends: P0.3 (u7's
-batch), P0.2 (the boundary on both processes), C1 and C2 (the wire types and the `BuildSpec` the
+batch), P0.2 (blaze's spawn rule on both processes), C1 and C2 (the wire types and the `BuildSpec` the
 work calls carry); P0.6 for the Mac arm of GP-fixtures (Docker until then); for GP-full, P0-H on
 macOS (so P0-E and P0-B with it) and the capacity preflight (c3-D0 prerequisites). Acceptance:
 GP-fixtures: GP's bar (section 4) on `demo/mid` and `demo/real`, 3 recorded runs each; GP-full:
@@ -2912,8 +3076,8 @@ each process's peak footprint. From the reviews:
   Checked by: `proto.py --platform macos|linux-docker --stage fixtures|tracedecay|all` builds and
   names `BIN_MAC` and `BIN_LINUX_AARCH64` as section 4 says; `--preflight` runs hello-world, a
   whole build with the standard library, and a two-process export and import on the platform, and
-  on a Docker run with the namespaces or seccomp removed it exits non-zero naming them; the
-  stage statuses print as `closed`, `pending (needs ...)` or `failed`, and `--stage all` never
+  on a Docker run without the pinned image's standard library or linker inputs it exits non-zero
+  naming them; the stage statuses print as `closed`, `pending (needs ...)` or `failed`, and `--stage all` never
   reports `closed` for `tracedecay` while a prerequisite is unmet; three runs of each required
   arm are recorded, and D1's verify refuses to start without a report holding both stages
   `closed`.
@@ -3011,10 +3175,11 @@ roadmap.md section 5's: a part whose mapping and validation costs more than rebu
 rebuilt. Files: a new crate under `vendor/rust-analyzer/crates/` for the image of front-end state,
 `crates/ra-jit/src/main.rs`, `crates/blaze-dist`. Depends: D1. Acceptance: nushell's warm start from
 the image against from the store, 3 runs each, same session; two executors on one machine mapping
-one image hold less together than two loading it (`RssAnon`, Linux); a pull request's executor that
-maps the image cannot change it (E1's adversarial test, image added). Verify: `python3 -I
-harness/warmstart.py --image && python3 -I harness/dist/adversary.py --image --linux-docker`. Where:
-Mac; Docker.
+one image hold less together than two loading it (`RssAnon`, Linux); the image is mapped
+read-only, and a write through an executor's mapping fails (a test of the mapping code; this is
+the mapping's flags, not isolation against job code). Verify: `python3 -I
+harness/warmstart.py --image && python3 -I harness/dist/executors.py --image --linux-docker`.
+Where: Mac; Docker.
 
 **D4 Gate GD.** Goal: section 4's gate, measured and acted on. `harness/dist/measure.py` runs
 GD's scenarios at 1, 2 and 3 executors, interleaved, n ≥ 3, with spread and limiter; if a bar
@@ -3035,38 +3200,33 @@ Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and Docker 
 
 ### Phase 4: tests
 
-**T1 The cacheability contract.** Goal: section 6's rules 1 to 5. The reach classifier marks time,
-randomness, threads, sockets, unlisted spawns, foreign code and unlisted environment as always-run
-reasons; an always-run attribute from the owner's manifest; failures never cached; audit mode
-(`RA_JIT_TESTS=audit`) and 5% sampling. Files: `crates/hir-ty-codegen/fncache.rs`,
-`crates/ra-jit/src/cargo/affected.rs`, `harness/dist/fixtures/tests`. Depends: P0-A. Acceptance:
-a fixture of tests that read the clock, use a `HashMap`, sleep, open a loopback socket, spawn an
-unlisted tool, read an unlisted variable, and one pure test: only the pure one is skipped on a
-second run; audit runs all; a test whose cached pass the audit contradicts loses caching. From
-the reviews:
-- [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
-  unknown effects instead of assuming libc is closed." Checked by: the classifier allows a foreign
-  call only from a listed set of C library functions known to read no machine state (string,
-  memory and math functions); every other foreign call, `getpid`, `uname`, `gethostname`,
-  `sysconf`, `sched_getaffinity` among them, and every child program, listed or not, makes a test
-  always-run; fixtures for each are always run on the second pass.
-
+**T1 The cacheability contract (Bazel's).** Goal: section 6's rules 1 to 4: results cached as
+`cache_test_results=auto` caches them. Reduced by the scope ruling: **out of scope (owner,
+2026-10-26)** are the reach classifier that marks time, randomness, threads, sockets, unlisted
+spawns, foreign code and unlisted environment as always-run reasons, audit mode
+(`RA_JIT_TESTS=audit`) and 5% sampling. What remains: the key is the declared inputs; an
+`external` or `no-cache` marker from the owner's manifest makes a test always run; failures are
+never cached; flaky attempts as `flaky_test_attempts`. Files: `crates/ra-jit/src/cargo/affected.rs`,
+`harness/dist/fixtures/tests`. Depends: none. Acceptance: a fixture of tests, run twice: a pure
+test and a test that reads the clock and passes are each skipped the second time (as under Bazel);
+a change to a declared input (an argument, a declared environment variable, a bundle file's
+content or mode) runs the test; a test marked `external` and one marked `no-cache` run both
+times; a failing test runs again and is never served from the cache, and a later pass of it is
+cached; a test marked `flaky` that fails once and passes is run at most three times, reported
+FLAKY and not cached, and an unmarked one is run once; `--runs_per_test 2` is not cached.
 Verify: `python3 -I harness/testselect.py && python3 -I harness/dist/tests.py --contract`. Where:
-Mac; Docker for the sandbox.
+Mac. From the reviews: [b-B2] is accepted at parity (appendix A).
 
-**T2 Passes across machines.** Goal: `TestBaseKey`, `InputManifest` with metadata and absent
-paths, logical paths, the server's results index and lookup by namespace, validation on B;
-`tests-reach` and `tests-passed` out of the target directory; `CARGO_BIN_EXE_*` by content.
-Files: `crates/ra-jit/src/cargo/affected.rs`, `sandboxed.rs`, `crates/ra-jit-store`,
-`crates/blaze-serve/src/results.rs`, `harness/dist/crossmachine.py`. Depends: T1, C5, C6.
-Acceptance: a test that passed on A is skipped on B, which never ran it; changing a read file's
-content or mode on B, creating a path A found absent, or changing an environment variable makes
-B run it; a `Pr(n)` pass never answers a `Main` lookup. From the reviews:
-- [b-B2] "changing only observed mtime/uid/errno leaves File observations equal" Checked by: a
-  test that reads a file's mtime or owner, or branches on a failed lookup's errno, either records
-  that in its observation (`File` gains `mtime` and `uid` when the test asked `stat` for them;
-  `Absent` keeps its errno) or is always-run; changing only the mtime, the owner or the error kind
-  on B makes B run it.
+**T2 Passes across machines.** Goal: `TestKey` and `InputManifest` of declared files (the bundle's
+digests, modes and lengths; nothing recorded by running), logical paths, the server's results
+index and lookup, validation on B; `tests-reach` and `tests-passed` out of the target directory;
+`CARGO_BIN_EXE_*` by content. Files: `crates/ra-jit/src/cargo/affected.rs`, `crates/ra-jit-store`,
+`crates/blaze-serve/src/results.rs`, `harness/dist/crossmachine.py`. Depends: T1, C5.
+Acceptance: a test that passed on A is skipped on B, which never ran it; changing a declared
+file's content or mode on B, an argument, or a declared environment variable makes B run it; a
+test marked `no-cache` runs on B; a failure on A is never served to B. From the reviews: [b-B2]
+(the metadata and error-kind observations of a recorded read set) is accepted at parity
+(appendix A).
 
 Verify: `python3 -I harness/dist/crossmachine.py --tests`. Where: Docker; Linux.
 
@@ -3074,18 +3234,23 @@ Verify: `python3 -I harness/dist/crossmachine.py --tests`. Where: Docker; Linux.
 shards by recorded duration; tracedecay's flake policy (fail) kept. Files: `crates/blaze-dist`,
 `crates/blaze-serve/src/jobs.rs`, `crates/ra-jit/src/cargo/affected.rs`. Depends: T2, E3.
 Acceptance: a helper runs a test that needs a generated `OUT_DIR` file and a support tool not on
-the host's `PATH`; a test needing an undeclared tool fails naming it; a deliberately flaky test
-fails the job, as nextest's `flaky-result = "fail"` would. Verify:
+the host's `PATH`; a test that uses a tool its bundle does not declare, on a helper that does not have the tool,
+fails naming it (a tool the helper happens to have is not policed, as on NativeLink's workers); a
+deliberately flaky test is reported FLAKY and fails the job under the `flake-policy` default, as
+nextest's `flaky-result = "fail"` would. Verify:
 `python3 -I harness/dist/tests.py --bundles`. Where: Mac, Docker.
 
 ### Phase 5: the switch in tracedecay's CI
 
-**S1 The CI client.** Goal: what a tracedecay workflow calls: join the tailnet, fetch an OIDC token,
-`POST /v1/auth`, run `cargo blaze test` with `RA_JIT_DIST` and `LocalPolicy=never`, publish nothing
-itself, print the stage timestamps. Files: `harness/dist/ci/blaze-ci.sh`,
-`harness/dist/ci/README.md`. Depends: E3, T3, P0-H on both platforms. Acceptance: against the fake
-GitHub of C6 and a local server, a pull-request run and a `master` run do what section 2 grants; a
-fork run is refused. Verify: `bash harness/dist/ci/blaze-ci.sh --self-test`. Where: Mac.
+**S1 The CI client.** Goal: what a tracedecay workflow calls: join the tailnet with the Tailscale
+action as today, run `cargo blaze test` with `RA_JIT_DIST` and `LocalPolicy=never`, publish nothing
+itself, print the stage timestamps; a fork run, which has no tailnet, builds with no remote and
+never calls the server. No token fetch and no `POST /v1/auth` at parity (section 2's access model).
+Files: `harness/dist/ci/blaze-ci.sh`, `harness/dist/ci/README.md`. Depends: E3, T3, P0-H on both
+platforms. Acceptance: against a local server, a pull-request run and a `master` run submit their
+jobs and print the stage timestamps; a run with no tailnet address (a fork's) makes no call to the
+server and builds with no remote. Verify: `bash harness/dist/ci/blaze-ci.sh --self-test`. Where:
+Mac.
 
 **S2 The test inventory and comparison.** Goal: review B M10. `harness/dist/ci/inventory.py`
 lists every Rust test target, feature variant, custom harness, doctest and generated fixture
@@ -3123,9 +3288,10 @@ Where: fleet by the owner.
 **S4 The compatibility lane for tests that run rustc or cargo (only if the owner chooses it at
 the `rustc-tests` gate).** Goal: section 6's second option: `cargo-blaze` as `cargo` and blaze's
 answerer, extended to check a file and print rustc-compatible diagnostics, as `rustc` on those
-tests' `PATH`, allowed by the boundary by digest. Files: `crates/ra-jit/src/bin/ra-jit-rustc.rs`,
+tests' `PATH`, in their bundle by digest. Files: `crates/ra-jit/src/bin/ra-jit-rustc.rs`,
 `crates/ra-jit/src/answers/own.rs`, `harness/dist/ci/inventory.py`. Depends: P0-A, T3. Acceptance:
-tracedecay's three tests run on a blaze executor with 0 compiler execs; each passes, or is named as
+tracedecay's three tests run on a blaze executor with no exec of a real
+rustc or cargo (the shims are blaze's); each passes, or is named as
 staying on Bazel with the diagnostic it could not match. Verify: `python3 -I harness/dist/tests.py
 --compat`. Where: Mac.
 
@@ -3136,7 +3302,10 @@ named:
 
 1. Add `#![recursion_limit = "256"]` to `tracedecay-code-index-runtime` (before P0.8).
 2. Grant a Linux host for P0-G (the `linux-host` gate).
-3. Deploy `ra-jit serve` and agents on the fleet; set Bazel's reserve `B` (after E4).
+3. Deploy `ra-jit serve` and agents on the fleet, on the tailnet only; add a Tailscale grant that
+   lets `tag:bazel-ci` reach the server's API port on the coordinator host and nothing else, and
+   give fleet nodes their own tag (the access model, section 2); set Bazel's reserve `B` (after
+   E4).
 4. Add the `rust-blaze` workflow in shadow mode (after S1).
 5. Make it blocking (after G2, G3, GB, GD and GT).
 6. Remove `linux-test`'s fleet shard and the macOS Rust tests from Bazel; narrow
@@ -3148,8 +3317,10 @@ named:
 
 - **#344, per-item keys** (blaze-next): unchanged functions keep their keys across an edit. Until
   it lands, G2's bar is the affected closure, and signature edits are GD's best case.
-- **#147, scripts and macros in the sandbox with read recording**: C4 keys by it on Linux; on macOS,
-  E2's sandbox records nothing, so impure scripts and macros run again there.
+- **#147, scripts and macros in the sandbox with read recording**: C4 keys by it on Linux, where
+  blaze's existing sandbox records reads; on macOS nothing records them, so impure scripts and
+  macros run again there. This is #147's existing sandbox, not the enforcement the scope ruling
+  drops.
 - **#271, the Merkle VFS**: `SourceRef::Root` replaces commits; an executor takes a job as a
   transaction instead of a checkout.
 
@@ -3162,8 +3333,8 @@ them; it does not decide them.
 |---|---|---|---|
 | `linux-host` | SSH to Ubuntu-main or the 64 GB desktop, or a larger Docker VM, for Linux at tracedecay scale? | none: Linux checks stay small, in the 8 GB Docker VM | P0-G, P0.8, D2's inventory |
 | `bazel-reserve` | how much of Ubuntu-main stays with Bazel and NativeLink | measure first: 32 cores and 64 GB reserved | section 4's memory table (`B` = 64 GB), E4 |
-| `pr-isolation` | user and sandbox per pull-request executor, or microVMs? | user and sandbox now, microVM later if a sandbox escape matters | section 2, E1, E2 |
-| `rustc-tests` | tracedecay's tests that run rustc or cargo: keep on Bazel, blaze's compatibility lane, or change the tests? | keep on Bazel | section 6, S2's inventory, GS; S4 only if chosen |
+| `pr-isolation` | user and sandbox per pull-request executor, or microVMs? | **withdrawn by the scope ruling** (owner, 2026-10-26): none; parity runs jobs in a work directory as NativeLink workers do | section 2 (record), E1, E2 |
+| `rustc-tests` | tracedecay's tests that run rustc or cargo: keep on Bazel, run on blaze executors with the toolchain declared as under Bazel, blaze's compatibility lane, or change the tests? | keep on Bazel | section 6, S2's inventory, GS; S4 only if chosen |
 | `flake-policy` | keep nextest's "flaky fails" for the blaze job? | keep | section 6, T3 |
 | `rules-rust-js` | does Rust built for JS and Python tests stay on rules_rust? | yes | section 10 |
 | `td-recursion` | add `#![recursion_limit = "256"]` to `tracedecay-code-index-runtime`? | the owner applies it; blaze runs patch it in throwaway worktrees until then | every tracedecay run |
@@ -3183,16 +3354,14 @@ they stay in Docker (this design's default)?
 - Whether blaze's codegen gives byte-identical entries for the same key on two machines (C5), and
   whether two processes with different interning orders name every root and instance alike (D0).
   Section 4's first stage rests on the second.
-- Seatbelt on macOS 26 (c3-B1.3): **verified for one narrow probe** (u2-check3, macOS 26.6.2,
-  arm64, one run): a profile a process applied to itself with `sandbox_init` was inherited by a
-  child and a grandchild for `process-exec` and `file-read-data`, and a second `sandbox_init`
-  could not remove it. **Not verified:** the production allow-list, `file-map-executable`, the
-  audit's delivery, an already mapped image or pre-opened descriptor of a forbidden file, an
-  unsandboxed service the job asks to run a file (launchd, XPC), sandbox extensions, and later
-  releases; P0.2 tests each, installs the profile before the job can acquire a forbidden resource
-  (Seatbelt enforces at acquisition), and fails closed;
-  whether the fleet's Linux kernels allow unprivileged user namespaces, `noexec` mounts in them,
-  seccomp user notification, `memfd_noexec` and Landlock (P0.2 fails closed where they do not).
+- Seatbelt on macOS 26 (c3-B1.3), **out of scope (owner, 2026-10-26)**: the sandbox and kernel
+  enforcement it checked is not built. One narrow probe was **verified** before the ruling
+  (u2-check3, macOS 26.6.2, arm64, one run): a profile a process applied to itself with
+  `sandbox_init` was inherited by a child and a grandchild for `process-exec` and
+  `file-read-data`, and a second `sandbox_init` could not remove it. Nothing else of the
+  boundary was checked, and nothing now needs to be: no unit tests the production allow-list,
+  `file-map-executable`, user namespaces, `noexec` mounts, seccomp user notification,
+  `memfd_noexec` or Landlock.
 - Whether two tracedecay front ends fit under the guard's 24 GB at once (GP-full's capacity
   preflight, D0), and how many functions tracedecay's whole build compiles (LOADMEM stopped at
   640,000). No run has measured `-p tracedecay --lib` as two processes, and nothing has measured
@@ -3219,7 +3388,10 @@ itself ([Check 3](#check-3-the-focused-check-of-revision-3), below).
 Statuses: **resolved** (re-review A found it resolved at revision 2; nothing changed); **fixed in
 doc** (this revision changes the design; where); **moved to acceptance** (the unit's acceptance
 line, tagged with the id, quotes the finding and says how it is checked, so the code settles it);
-**owner gate** (the owner's decision, with its default). A row can be fixed in the doc and carry
+**owner gate** (the owner's decision, with its default). **accepted at parity (owner scope ruling)** (revision 3.2: the finding's
+resolution depended on a piece the owner's ruling of 2026-10-26 drops, so no unit settles it, and
+the risk it named is accepted as equal to today's Bazel with NativeLink setup; the one line says
+what is dropped and what stays; the earlier status follows it). A row can be fixed in the doc and carry
 an acceptance line too. A finding fixed in the doc with no acceptance line is one no code can
 check (a dependency rule, an arithmetic or a provenance label in this document).
 
@@ -3227,27 +3399,27 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 
 | Finding | Re-review A | Revision 3 | Where |
 |---|---|---|---|
-| a-B1, spawn gate over job descendants | partly | **fixed in doc**: a process-tree boundary replaces the spawn gate; **moved to acceptance**: P0.2 [a-B1] | section 0, "The no-rustc boundary"; P0.2 |
-| a-B2, PR and Main isolation | resolved | resolved | section 2; E1, E2 |
+| a-B1, spawn gate over job descendants | partly | **accepted at parity (owner scope ruling, 2026-10-26)**: the descendant-execution part needed the process-tree boundary and is dropped; what stays is blaze's own spawns (P0.2 [a-B1], parity remainder); earlier status: **fixed in doc**: a process-tree boundary replaces the spawn gate; **moved to acceptance**: P0.2 [a-B1] | section 0, "The no-rustc boundary"; P0.2 |
+| a-B2, PR and Main isolation | resolved | **accepted at parity (owner scope ruling, 2026-10-26)**: its isolation (a user and sandbox per executor, E1, E2) is dropped; pull-request code runs on shared workers as it does under NativeLink today, an accepted risk equal to today's; earlier status: resolved | section 2; E1, E2 |
 | a-M1, fleet sizes and queue | resolved | resolved | "What tracedecay runs today"; sections 5, 9 |
 | a-M2, provenance of retained numbers | partly | **fixed in doc**: "n not stated" marks every quoted number without a run count; the nushell rows; **moved to acceptance**: S3 [a-M2] | header; "Numbers kept from revision 1"; S3 |
 | a-M3, Phase 0 ownership and gating | partly | **fixed in doc**: no Phase 0 unit depends on P0-H or on the predicate it remediates (with ra-N3) | Phase plan preamble; section 11 |
 | a-M4, wire schema | partly | **fixed in doc** in part: credentials and capability transport, `ops` bits, `JobContent` bytes, the work calls; **moved to acceptance**: C1 [a-M4] for every endpoint's and enum variant's payload struct | "Data shapes"; section 8; C1 |
-| a-M5, remote test keys | resolved | resolved | section 6; T1, T2 |
+| a-M5, remote test keys | resolved | **accepted at parity (owner scope ruling, 2026-10-26)**: the remote-test key was recorded under the stricter contract; parity keys by declared inputs as Bazel does (T1, T2 as reduced); earlier status: resolved | section 6; T1, T2 |
 | a-M6, job identities and subscribers | partly | **moved to acceptance**: E3 [a-M6]; the job request's deadline, policy and test timeout are the subscriber's | section 8; E3 |
 | a-M7, codegen dataflow | partly | **fixed in doc**: the lead's store-hydrated assembly keeps patch tracking; **moved to acceptance**: D0 [a-M7] | section 4, "Export and ingestion"; D0 |
 | a-M8, where gates run | resolved | resolved | section 11 |
 | a-M9, rollout and the GC's root producer | partly | **moved to acceptance**: E3 [a-M9], the lead writes its `RootManifest` | E3 |
 | a-m1, 760 packages | resolved | resolved | "What tracedecay runs today" |
 | a-m2, verify commands | partly | **moved to acceptance**: P0.7 [a-m2] and S2 [a-m2], with their verify commands changed | P0.7; S2 |
-| b-B1, signing oracle | resolved | resolved | section 2 |
-| b-B2, test cache inputs | partly | **moved to acceptance**: T1 [b-B2] (unknown effects always run), T2 [b-B2] (metadata and errno observed) | T1; T2 |
+| b-B1, signing oracle | resolved | **accepted at parity (owner scope ruling, 2026-10-26)**: the signing oracle was closed by capabilities and signed records, which are dropped; the server signs nothing at parity and the tailnet's ACL decides who writes; earlier status: resolved | section 2 |
+| b-B2, test cache inputs | partly | **accepted at parity (owner scope ruling, 2026-10-26)**: unknown effects always-run (T1) and observed metadata and errno (T2) belong to the stricter contract and are dropped; Bazel keys by declared inputs with the same blind spots, and the `no-cache` marker is the remedy; earlier status: **moved to acceptance**: T1 [b-B2] (unknown effects always run), T2 [b-B2] (metadata and errno observed) | T1; T2 |
 | b-M1, distribution, not relocation | resolved | resolved | sections 4, 5 |
 | b-M2, slot memory | resolved | resolved | sections 0, 4, 5 |
-| b-M3, OIDC claims and forks | resolved | resolved | section 2; C6 |
+| b-M3, OIDC claims and forks | resolved | **accepted at parity (owner scope ruling, 2026-10-26)**: the OIDC claims and GitHub lookups are dropped; the fork rule stays, as today: fork runs get no tailnet and build with no remote; earlier status: resolved | section 2; C6 |
 | b-M4, cargo semantics on the wire | partly | **fixed in doc**: `UnitSpec.host`, a per-unit `profile`, `ProfileSpec.backend` and `mir_opt`; **moved to acceptance**: C2 [b-M4] | "Data shapes"; C2 |
 | b-M5, cross-machine reuse and platform | partly | **moved to acceptance**: C2 [b-M5] (native tool digests), C5 [b-M5] (platform fields in the entry key, another host) | C2; C5 |
-| b-M6, read-set index and bundles | resolved | resolved | section 6; T2, T3 |
+| b-M6, read-set index and bundles | resolved | **accepted at parity (owner scope ruling, 2026-10-26)**: the read-set index (recorded reads) is dropped with the contract; runtime bundles by digest stay (T3); earlier status: resolved | section 6; T2, T3 |
 | b-M7, completeness and liveness | partly | **fixed in doc**: the `Local` outcome, outcomes that are not verdicts, one fencing rule; **moved to acceptance**: D0 [b-M7], D1 [b-M7] | section 4, "The protocol"; D0; D1 |
 | b-M8, tests that run rustc; nightly | regressed | **fixed in doc** as an **owner gate**: `rustc-tests`, default "keep on Bazel", with the compatibility lane (S4) as an option; the descendant-exec audit is P0.2's [rb-B1] | section 6; section 10; open questions; S2; S4 |
 | b-M9, GC roots | not resolved | **fixed in doc**: GC by the entries builds used, compaction with a remap, retention by `ConfigKey`; **moved to acceptance**: C7 [b-M9] | section 3, "GC"; "Data shapes"; C7 |
@@ -3258,7 +3430,7 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 | Finding | Severity | Revision 3 | Where |
 |---|---|---|---|
 | ra-N1, retention keyed by a changing source; no remap | major | **fixed in doc**: `ConfigKey`; the remap is compaction's commit point; **moved to acceptance**: C7 [ra-N1] | section 3; "Data shapes"; C7 |
-| ra-N2, authentication bootstrap | major | **fixed in doc**: `auth` exempt, capability and agent-signature headers; **moved to acceptance**: C6 [ra-N2] | section 8; C6 |
+| ra-N2, authentication bootstrap | major | **accepted at parity (owner scope ruling, 2026-10-26)**: there is no capability or agent-signature credential to bootstrap; C6's parity remainder is the tailnet's access model; earlier status: **fixed in doc**: `auth` exempt, capability and agent-signature headers; **moved to acceptance**: C6 [ra-N2] | section 8; C6 |
 | ra-N3, Phase 0 gate cycle | major | **fixed in doc**: Phase 0 units never depend on P0-H or their own predicate | Phase plan preamble; section 11 |
 | ra-N4, the watchdog is not the stated guard | major | **fixed in doc**: the guard's three rules over the whole tree; no lowered bounds on the Mac; **moved to acceptance**: P0.1 [ra-N4], P0.3 [ra-N4] | "Three decisions"; P0-B; P0.1; P0.3 |
 | ra-N5, batch outcomes and fencing disagree | major | **fixed in doc**: a result of a dead lease generation is refused whole; no outcome is a verdict; **moved to acceptance**: D1 [ra-N5] | section 4, "The protocol"; D1 |
@@ -3269,14 +3441,14 @@ check (a dependency rule, an arithmetic or a provenance label in this document).
 
 | Finding | Severity | Revision 3 | Where |
 |---|---|---|---|
-| rb-B1, the no-rustc boundary is not a process tree | blocker | **fixed in doc**: the boundary (Linux mount namespace and kernel-enforced exec, macOS Seatbelt allow-list, fail closed), the spawn API, the answerer, negative fixtures; **narrowed in revision 3.1** (c3-B1.1): it claims no more than blaze never delegating Rust compilation, no host toolchain exposed and only approved code run, and no longer that a compiler denylist stops job-supplied compilers; **moved to acceptance**: P0.2 [rb-B1], [c3-B1.1], [c3-B1.2] | section 0; "The rules this design keeps"; P0.2 |
+| rb-B1, the no-rustc boundary is not a process tree | blocker | **accepted at parity (owner scope ruling, 2026-10-26)**: the process-tree boundary is dropped; blaze's own spawn rule stays (P0.2 [rb-B1], parity remainder: blaze's own spawns, not a job's descendants); earlier status: **fixed in doc**: the boundary (Linux mount namespace and kernel-enforced exec, macOS Seatbelt allow-list, fail closed), the spawn API, the answerer, negative fixtures; **narrowed in revision 3.1** (c3-B1.1): it claims no more than blaze never delegating Rust compilation, no host toolchain exposed and only approved code run, and no longer that a compiler denylist stops job-supplied compilers; **moved to acceptance**: P0.2 [rb-B1], [c3-B1.1], [c3-B1.2] | section 0; "The rules this design keeps"; P0.2 |
 | rb-B2, a work item cannot rebuild an instance | blocker | **fixed in doc**: claimed discovery over identical front ends, nothing of an instance on the wire; the lossless descriptor as a second stage; **moved to acceptance**: D0 [rb-B2] (names alike across interning orders), D2 [rb-B2] (the descriptor's round trip); refined in revision 3.1 (c3-B2.1 to c3-B2.3) | section 4, "Moving work between processes"; D0; D2 |
 | rb-B3, no portable entries; warm assembly does not consume them | blocker | **fixed in doc**: the exporter, the store-hydrated lead, the compile-query count; **moved to acceptance**: D0 [rb-B3]; refined in revision 3.1 (c3-B3.1 to c3-B3.3) | section 4, "Export and ingestion"; D0 |
 | rb-M1, cache hits do not expand coverage | major | **fixed in doc**: `FromStore` is a usable closure in pinned packs; found names commit with their finder; **moved to acceptance**: D0 [rb-M1] | section 4, "The protocol"; D0 |
 | rb-M2, dependency-only helpers | major | **fixed in doc**: home is not the defining crate; the first stage holds whole front ends; GD's memory step; **moved to acceptance**: D2 [rb-M2] | "What blaze has today"; section 4; D2 |
 | rb-M3, lease expiry and fencing | major | **fixed in doc**: the fencing table, a progress timeout, at-least-once compute with exactly-once accounting, pins from upload; **moved to acceptance**: D1 [rb-M3] | section 4, "The protocol"; section 3; D1 |
 | rb-M4, overlap and GD's hidden cost | major | **fixed in doc**: no lead seed; GD's bar is end to end; the identity scenario counts its front ends; **moved to acceptance**: D4 [rb-M4] | section 4; D4 |
-| rb-M5, P0-A audits execution, not provenance | major | **fixed in doc**: P0-A's positive and provenance bars; **moved to acceptance**: P0.2 [rb-M5] | section 0; P0.2 |
+| rb-M5, P0-A audits execution, not provenance | major | **accepted at parity (owner scope ruling, 2026-10-26)**: in part: the provenance audit stays for blaze's own run (P0.2 [rb-M5]); the denial of reads of rustc-built libraries by the boundary is dropped; earlier status: **fixed in doc**: P0-A's positive and provenance bars; **moved to acceptance**: P0.2 [rb-M5] | section 0; P0.2 |
 | rb-M6, aggregate memory and executor trees | major | **fixed in doc**: P0-B is aggregate and per tree; section 5 enforces on the tree; **moved to acceptance**: P0.3 [rb-M6], E4 [rb-M6] | section 0; section 5; P0.3; E4 |
 | rb-M7, eager refusals fail the job | major | **fixed in doc**: the seam is the build's own loop; a failure is speculative and the lead decides; **moved to acceptance**: D0 [rb-M7] | section 4; D0 |
 | rb-N1, the 20% headroom not used | minor | **fixed in doc**: 70 GB, two executors at B = 64 GB | section 4, "Memory per machine" |
@@ -3293,9 +3465,9 @@ A row can be both.
 
 | Finding | Check 3 | Revision 3.1 | Unit | Where |
 |---|---|---|---|---|
-| c3-B1.1, the denylist admits compilers not in the host manifest | B1, not workable | **fixed in doc**: the claim narrowed to what is enforceable (blaze never delegates Rust compilation; no host toolchain exposed; approved code only, deny by default); in-process and brought-in compilers stated out of scope; the denylist kept as a diagnostic; **moved to unit acceptance**: the fixture table with expected outcomes | P0.2 [c3-B1.1] | section 0; P0-A; P0.2 |
-| c3-B1.2, approve then `CONTINUE` | B1 | **fixed in doc**: exec authorised by the kernel over `noexec` mutable mounts, an exec store, Landlock, no exec-able memfd; `execveat`/`fexecve`, scripts and interpreters explicit; unknown ABIs killed, unresolvable targets denied; `no_new_privs` and dropped capabilities; **moved to unit acceptance**: racing replacement, fd-based exec, compat-ABI, unresolvable target, mutable-storage tests | P0.2 [c3-B1.2] | section 0, Linux steps 1 to 7; P0.2 |
-| c3-B1.3, Seatbelt inheritance on macOS 26 | B1, not the blocker | **fixed in doc**: marked verified for one narrow probe only; the production profile, `file-map-executable`, audit delivery, pre-opened descriptors, mapped images, service delegation and later releases stay to test, the profile installed before acquisition, fail closed; **moved to unit acceptance** | P0.2 [c3-B1.2] (macOS counterparts), [c3-B1.1] | section 0 macOS; section 2; "Not checked"; P0.2 |
+| c3-B1.1, the denylist admits compilers not in the host manifest | B1, not workable | **accepted at parity (owner scope ruling, 2026-10-26)**: the boundary, the compiler fixture table and the narrowed guarantee are dropped with it; no unit checks them; earlier status: **fixed in doc**: the claim narrowed to what is enforceable (blaze never delegates Rust compilation; no host toolchain exposed; approved code only, deny by default); in-process and brought-in compilers stated out of scope; the denylist kept as a diagnostic; **moved to unit acceptance**: the fixture table with expected outcomes | P0.2 [c3-B1.1] | section 0; P0-A; P0.2 |
+| c3-B1.2, approve then `CONTINUE` | B1 | **accepted at parity (owner scope ruling, 2026-10-26)**: kernel-authorised exec, the exec store, Landlock, the racing, fd-based, compat-ABI and privilege tests are dropped; no unit checks them; earlier status: **fixed in doc**: exec authorised by the kernel over `noexec` mutable mounts, an exec store, Landlock, no exec-able memfd; `execveat`/`fexecve`, scripts and interpreters explicit; unknown ABIs killed, unresolvable targets denied; `no_new_privs` and dropped capabilities; **moved to unit acceptance**: racing replacement, fd-based exec, compat-ABI, unresolvable target, mutable-storage tests | P0.2 [c3-B1.2] | section 0, Linux steps 1 to 7; P0.2 |
+| c3-B1.3, Seatbelt inheritance on macOS 26 | B1, not the blocker | **accepted at parity (owner scope ruling, 2026-10-26)**: the Seatbelt profile and its production checks are dropped; the one narrow probe stays recorded in "Not checked"; earlier status: **fixed in doc**: marked verified for one narrow probe only; the production profile, `file-map-executable`, audit delivery, pre-opened descriptors, mapped images, service delegation and later releases stay to test, the profile installed before acquisition, fail closed; **moved to unit acceptance** | P0.2 [c3-B1.2] (macOS counterparts), [c3-B1.1] | section 0 macOS; section 2; "Not checked"; P0.2 |
 | c3-B2.1, a name is not a total, environment-safe identity | B2 | **fixed in doc**: `WorkKey` (unit, stable name, environment fingerprint) and `Edge` for unnameable requests, `tuple` digests, a conflict rule, a total root order, the same distinction for store keys; **moved to unit acceptance** | D0 [c3-B2.1]; C5 [c3-B2.1] | "Data shapes"; section 4, "Moving work between processes"; D0; C5 |
 | c3-B2.2, finder retention | B2 | **fixed in doc**: lifetime, identity-pinning and lease contract; `Lost`; returned ranges and names; lead-loss row; **moved to unit acceptance** | D0 [c3-B2.2] | section 4, "Finder retention", "The protocol" steps 2, 5, 9; D0 |
 | c3-B2.3, root agreement is an admission check, not a liveness proof | B2 | **fixed in doc**: three agreements distinguished; `inputs` digest and shared impure outputs; the lead's `RootSet` authoritative, a disagreeing early helper fenced; progress timeout from the grant and retry bound; liveness stated as termination with a result or a named failure, the deadline not a `Done`; **moved to unit acceptance**: sans-IO transition tests in D0, HTTP faults stay D1 | D0 [c3-B2.3]; D1 [rb-M3] | section 4, "The protocol" steps 1, 9, 10; D0 |
@@ -3328,6 +3500,12 @@ A row can be both.
   14 of the rows; the other three (exactly-once, what a batch end lacks, D0's prerequisites) are
   statements this document settles, each exercised by a line above. B1.3 is a verification note,
   not a defect: its probe is recorded and the rest is P0.2's.
+- Revision 3.2 (the scope ruling) changes 13 rows to "accepted at parity": a-B1, a-B2, a-M5, b-B1,
+  b-B2, b-M3, b-M6, ra-N2, rb-B1, rb-M5 (in part), c3-B1.1, c3-B1.2 and c3-B1.3. The counts above
+  are those of revisions 3 and 3.1 and are not recomputed. Tagged acceptance lines removed:
+  P0.2 [c3-B1.1] and [c3-B1.2], T1 [b-B2], T2 [b-B2]; reduced to their parity remainder: P0.2
+  [rb-B1], [a-B1] and [rb-M5], and C6 (with [ra-N2] noted as accepted). Findings whose units are
+  kept whole (the D0 to D4, C1 to C5, C7, S1 to S3 lines) are unchanged.
 
 ## Appendix B: the research edits
 
@@ -3336,12 +3514,12 @@ docs/distributed.md":
 
 | # | Edit | Applied in |
 |---|---|---|
-| 1 | Trust: NativeLink mixes `master` and pull requests; `Main` only from slots that never ran pull-request code; disposable pull-request state | "What tracedecay runs today"; section 2 |
+| 1 | Trust: NativeLink mixes `master` and pull requests; `Main` only from slots that never ran pull-request code; disposable pull-request state | "What tracedecay runs today"; section 2. Out of scope (owner, 2026-10-26): parity keeps NativeLink's mixing as an accepted risk |
 | 2 | Job identity split; cancel when the last subscriber leaves | "Data shapes"; section 8; E3 |
 | 3 | Admission by reservations, `Main` first, stage timestamps, no CPU or memory in keys | section 5; E4 |
-| 4 | Tests: Bazel's precedent and limits, always-run, audit, failures never cached, read set with the verdict, runtime bundle, flake exemption the owner's | section 6; T1 to T3 |
+| 4 | Tests: Bazel's precedent and limits, always-run, audit, failures never cached, read set with the verdict, runtime bundle, flake exemption the owner's | section 6; T1 to T3. Revision 3.2 keeps Bazel's precedent, the opt-out marker, failures never cached and the runtime bundle; always-run classification, audit and the recorded read set are out of scope (owner, 2026-10-26) |
 | 5 | GC by record generation, completeness, leases | section 3; C7 |
-| 6 | Epoch in signed records; forced rebuild of one crate | section 2 "Records, epochs and repair" |
+| 6 | Epoch in signed records; forced rebuild of one crate | section 2 "Records, epochs and repair". Out of scope (owner, 2026-10-26) |
 | 7 | `cpu_count` in keys, one instance `main`, client uploads, plaintext gRPC, 5.2 GB inputs | "What tracedecay runs today" |
 | 8 | The 200 s pole **unverified**; the run was a release build | section 9 |
 | 9 | REAPI: the verdict and reasons of 7.9 | section 3 |

@@ -35,9 +35,10 @@ The arms:
                 fixed identity and date: a spec names a commit). Each case is a command (words,
                 environment, optional edits of the fixture) with an expectation against another
                 case: `same`, `changed`, or `refused:<what>`. Every expectation has the reason in
-                cargo's semantics beside it. A case that edits the fixture is a different commit,
-                so its `source` differs by construction: it is compared on the spec JSON without
-                `source` (the "fingerprint"), and the table says so.
+                cargo's semantics beside it. Configuration edits are committed and compared on the
+                spec JSON without `source` (the "fingerprint"), and the table says so. Source cases
+                compare the complete spec and job identity: a body edit, including an uncommitted
+                one, and selecting either of two sibling workspaces must name the actual inputs.
   units (8)     `ra-jit cargo spec --unit-graph <command>` against `cargo +<toolchain> <command>
                 --unit-graph -Z unstable-options` (RUSTC_BOOTSTRAP=1, --locked --offline), as sets of
                 units keyed by package, target, mode, features, platform and profile with the
@@ -307,10 +308,10 @@ def fingerprint(spec):
     return sha256(canon({k: v for k, v in spec.items() if k not in ("0", "source")}))
 
 
-def changed_fields(a, b):
-    """The top-level fields of the spec (but `source`) in which two renderings differ."""
+def changed_fields(a, b, compare_source=False):
+    """The top-level fields in which two renderings differ, optionally including `source`."""
     a, b = unwrap(a), unwrap(b)
-    return {name for name in SPEC_FIELDS if name != "source"
+    return {name for name in SPEC_FIELDS if (compare_source or name != "source")
             and canon(spec_field(a, name)) != canon(spec_field(b, name))}
 
 
@@ -325,8 +326,10 @@ class Case:
             "llvm:same" / "llvm:changed" (as the case `llvm_of` is: if that was refused for
             RA_JIT_BACKEND this one has to be too, else the second word).
     vs:     the case compared with (the fixture's `base` when None).
-    edits:  edits of the fixture before the command; the case is then another commit, and is
-            compared without its `source`.
+    edits:  edits of the fixture before the command; committed unless `commit_edits` is false.
+    compare_source: compare the complete spec, including `source`, for source identity cases.
+            Otherwise two different sources are compared without `source`, so configuration
+            edits can state exactly which settings change.
     only:   the top-level spec fields that may differ from `vs` (the others have to be equal).
     touches: fields that must be among those that differ.
     also:   more relations: ("same"|"differs"|"platform-same"|"platform-differs"|"job-differs"|
@@ -339,7 +342,7 @@ class Case:
 
     def __init__(self, name, words, why, expect="same", vs=None, env=None, edits=(), cwd="", local=False,
                  only=None, touches=(), also=(), asked_pkgs=None, check=None, lexpect=(), relocate=False,
-                 units=None, llvm_of=None, skip=None):
+                 units=None, llvm_of=None, skip=None, commit_edits=True, compare_source=False):
         self.name = name
         self.words = shlex.split(words) if isinstance(words, str) else list(words)
         self.why = why
@@ -347,6 +350,7 @@ class Case:
         self.only, self.touches, self.also, self.asked_pkgs = only, tuple(touches), list(also), asked_pkgs
         self.check, self.lexpect, self.relocate, self.units, self.llvm_of = check, list(lexpect), relocate, units, llvm_of
         self.skip = skip  # fn(ctx) -> reason or None
+        self.commit_edits, self.compare_source = commit_edits, compare_source
         self.fixture = None
 
     @property
@@ -1003,6 +1007,61 @@ def native_cases():
     return cases
 
 
+# 8. source identity -------------------------------------------------------------------------------
+
+SOURCE = {
+    "Cargo.toml": pkg_manifest("source"),
+    "Cargo.lock": lock_text([("source", [])]),
+    "src/lib.rs": "pub fn value() -> u32 { 1 }\n",
+    **GITIGNORE,
+}
+
+
+def source_cases():
+    body = [("replace", "src/lib.rs", "{ 1 }", "{ 2 }")]
+    return [
+        Case("base", "build", "the committed source tree", expect="base", compare_source=True),
+        Case("committed-body", "build", "a body edit changes source and job identity without changing the unit graph",
+             expect="changed", edits=body, compare_source=True,
+             also=[("job-differs", "base"), ("platform-same", "base")]),
+        Case("dirty-body", "build", "an uncommitted body edit must not reuse HEAD's spec or job identity",
+             expect="changed", edits=body, commit_edits=False, compare_source=True,
+             also=[("job-differs", "base"), ("platform-same", "base")]),
+        Case("moved-dirty-body", "build", "the same uncommitted inputs at another path have the same source identity",
+             expect="same", vs="dirty-body", edits=body, commit_edits=False, compare_source=True, relocate=True),
+    ]
+
+
+# 9. two Cargo workspaces in one Git checkout -------------------------------------------------------
+
+NESTED = dict(GITIGNORE)
+for _workspace, _value in (("one", 1), ("two", 2)):
+    NESTED.update({
+        f"{_workspace}/Cargo.toml": pkg_manifest("nested", "\n[workspace]\n"),
+        f"{_workspace}/Cargo.lock": lock_text([("nested", [])]),
+        f"{_workspace}/src/lib.rs": f"pub fn value() -> u32 {{ {_value} }}\n"
+                                  f"#[test]\nfn workspace_{_workspace}() {{ assert_eq!(value(), {_value}); }}\n",
+    })
+
+
+def nested_cases():
+    return [
+        Case("base", "test", "the first workspace is below the Git root; replay from the checkout root must select it",
+             expect="base", cwd="one", compare_source=True, local=True,
+             lexpect=[("test", "workspace_one", "ok"), ("no-test", "workspace_two"), ("exit", 0)]),
+        Case("sibling", "test", "the same Git commit, package names and lockfile select different source in the sibling workspace",
+             expect="changed", cwd="two", compare_source=True, local=True,
+             also=[("job-differs", "base"), ("platform-same", "base")],
+             lexpect=[("test", "workspace_two", "ok"), ("no-test", "workspace_one"), ("exit", 0)]),
+        Case("below-sibling", "test", "a directory below the sibling workspace must be replayed below that workspace",
+             expect="changed", vs="sibling", cwd="two/src", compare_source=True, only={"cwd"},
+             touches=["cwd"], local=True,
+             lexpect=[("test", "workspace_two", "ok"), ("no-test", "workspace_one"), ("exit", 0)]),
+        Case("moved", "test", "relocating the Git checkout preserves the selected nested workspace's identity",
+             expect="same", cwd="one", compare_source=True, relocate=True),
+    ]
+
+
 def fixtures():
     return [
         Fixture("basic", BASIC, basic_cases()),
@@ -1012,6 +1071,8 @@ def fixtures():
         Fixture("envcfg", ENVCFG, envcfg_cases()),
         Fixture("profiles", PROFILES, profiles_cases()),
         Fixture("native", NATIVE, native_cases(), setup=native_setup, skip=native_skip),
+        Fixture("source", SOURCE, source_cases()),
+        Fixture("nested", NESTED, nested_cases()),
     ]
 
 
@@ -1171,18 +1232,19 @@ class CaseResult:
 class Delta:
     """How one spec differs from another."""
 
-    def __init__(self, a, b):
+    def __init__(self, a, b, compare_source=False):
         self.same_source = canon(spec_field(a.spec, "source")) == canon(spec_field(b.spec, "source"))
         self.fp_same = fingerprint(a.spec) == fingerprint(b.spec)
         self.digest_same = a.digest == b.digest
         self.platform_same = (a.digests or {}).get("platform") == (b.digests or {}).get("platform")
         self.job_same = (a.digests or {}).get("job_content") == (b.digests or {}).get("job_content")
-        self.fields = changed_fields(a.spec, b.spec)
-        # On one source the digest and the rendering must agree; on two the digest differs by
-        # construction and the rendering without `source` is what is compared.
-        self.same = self.digest_same if self.same_source else self.fp_same
+        self.fields = changed_fields(a.spec, b.spec, compare_source=compare_source)
+        # Configuration comparisons leave differing sources out. Source identity comparisons
+        # include them, so a source-only fix cannot be mistaken for an unchanged spec.
+        self.same = self.digest_same if compare_source or self.same_source else self.fp_same
+        rendering_same = canon(a.spec) == canon(b.spec) if compare_source else self.fp_same
         self.inconsistent = None
-        if self.same_source and self.digest_same != self.fp_same:
+        if (compare_source or self.same_source) and self.digest_same != rendering_same:
             self.inconsistent = ("the spec digests are equal and the JSON renderings differ in "
                                  + ", ".join(sorted(self.fields)) if self.digest_same else
                                  "the spec digests differ and the JSON renderings are equal")
@@ -1463,7 +1525,7 @@ class Ctx:
 
     def tree(self, case):
         """The directory of the checkout the case runs in: the base's, or a copy of it with the case's
-        edits committed, or a copy at another path."""
+        edits (committed unless requested otherwise), or a copy at another path."""
         key = (case.fixture.name, case.name)
         if key in self.trees:
             return self.trees[key]
@@ -1478,7 +1540,7 @@ class Ctx:
         shutil.copytree(base, dest, symlinks=True)
         for edit in case.edits:
             apply_edit(dest, edit)
-        if case.edits:
+        if case.edits and case.commit_edits:
             commit_all(dest, "case " + case.name)
         self.trees[key] = dest
         return dest
@@ -1563,8 +1625,8 @@ class Ctx:
             if ref is None or ref.error or ref.refused:
                 fails.append(f"it is compared with {case.vs or 'base'}, which made no spec")
                 return observed, fails
-            delta = Delta(res, ref)
-            fp = "" if delta.same_source else "*"
+            delta = Delta(res, ref, compare_source=case.compare_source)
+            fp = "" if case.compare_source or delta.same_source else "*"
             if delta.inconsistent:
                 fails.append(delta.inconsistent)
             if exp == "same":
@@ -1588,7 +1650,7 @@ class Ctx:
             if mate is None or mate.error or mate.refused:
                 fails.append(f"{relation} {name}: that case made no spec")
                 continue
-            d = Delta(res, mate)
+            d = Delta(res, mate, compare_source=case.compare_source)
             ok = {"same": d.same, "differs": not d.same, "platform-same": d.platform_same,
                   "platform-differs": not d.platform_same, "job-differs": not d.job_same,
                   "units-equal": canon(spec_field(res.spec, "units")) == canon(spec_field(mate.spec, "units")),
@@ -1875,8 +1937,8 @@ def print_report(ctx, reported):
         last = fx
         print(line(r))
     print()
-    print("`changed(...)` names the top-level fields of the spec that differ. * : the case edits the fixture, so it is")
-    print("another commit and is compared on the spec without its `source`.")
+    print("`changed(...)` names the top-level fields of the spec that differ. * : different sources are compared")
+    print("without `source` for a configuration comparison. Source identity cases compare the complete spec.")
     for name, why in ctx.skipped.items():
         print(f"skipped {name}: {why}")
     if args.no_cargo:
@@ -1939,6 +2001,7 @@ def json_results(ctx, reported, fails):
         observed, spec_fails = ctx.judged.get(case.full, (None, []))
         cases.append({
             "case": case.full, "words": case.words, "env": case.env, "edits": len(case.edits), "cwd": case.cwd,
+            "commit_edits": case.commit_edits, "compare_source": case.compare_source,
             "expect": case.expect, "vs": case.vs or ("base" if case.expect != "base" else None), "why": case.why,
             "skipped": ctx.skipped.get(case.full) or ctx.skipped.get(case.fixture.name),
             "observed": observed, "failures": [f for f in spec_fails],
@@ -1956,7 +2019,7 @@ def list_cases(fixture_list):
             vs = f" vs {case.vs}" if case.vs and case.expect != "base" else ""
             env = " ".join(f"{k}={v}" for k, v in case.env.items())
             cwd = f" (in {case.cwd})" if case.cwd else ""
-            edit = " [edits]" if case.edits else ""
+            edit = (" [committed edits]" if case.commit_edits else " [uncommitted edits]") if case.edits else ""
             print(f"  {case.name:24} {case.expect}{vs:22} {env + ' ' if env else ''}cargo spec {' '.join(case.words)}{cwd}{edit}"
                   f"{'  [local]' if case.local else ''}\n  {'':24} {case.why}")
 
@@ -2241,6 +2304,28 @@ def closure(defs, names):
     return out
 
 
+def source_ref(root):
+    """A test-double snapshot of these path-only fixtures, not blaze's source implementation."""
+    def git(*args):
+        return subprocess.check_output(["git", "-C", root, *args])
+    checkout = git("rev-parse", "--show-toplevel").decode().strip()
+    committed = [0, {"0": 1, "1": git("rev-parse", "HEAD").decode().strip(),
+                     "2": git("rev-parse", "HEAD^{tree}").decode().strip()}]
+    dirty = git("status", "--porcelain=v1", "--untracked-files=all")
+    if BUG == "dirty-source-refused" and dirty:
+        raise Refused("source", "uncommitted inputs unsupported")
+    if BUG == "head-only-source" or BUG == "sibling-source-same" and root != checkout:
+        return committed, checkout
+    if not dirty and root == checkout:
+        return committed, checkout
+    # A Root names the selected workspace's files by content. This models the intended identity
+    # contract only; the real snapshot transport and nested Git workspace schema remain work.
+    names = sorted(set(git("ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ".").decode().split("\0")) - {""})
+    snapshot = [[name, sha(open(os.path.join(root, name), "rb").read())
+                 if os.path.isfile(os.path.join(root, name)) else None] for name in names]
+    return [1, {"0": sha(canon(snapshot))}], checkout
+
+
 def resolve(cwd, words, env):
     o = parse_words(words)
     if BUG == "verbose-changes" and o["verbose"]:
@@ -2255,6 +2340,8 @@ def resolve(cwd, words, env):
     if o["manifest"]:
         nearest = os.path.dirname(os.path.abspath(os.path.join(start, o["manifest"])))
     while not os.path.exists(os.path.join(nearest, "Cargo.toml")):
+        if os.path.dirname(nearest) == nearest:
+            raise Refused("manifest", "no Cargo.toml above the working directory")
         nearest = os.path.dirname(nearest)
     root = nearest
     d = nearest
@@ -2397,8 +2484,7 @@ def resolve(cwd, words, env):
         doc = unit_doc(units[k])
         doc["5"] = sorted([index[b], name] for a, b, name in edges if a == k and b in index)
         docs.append(doc)
-    git_head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    git_tree = subprocess.run(["git", "-C", root, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    source, checkout = source_ref(root)
     config_env = {}
     d = start
     chain = []
@@ -2442,7 +2528,7 @@ def resolve(cwd, words, env):
     command = {"check": [0, None], "build": [1, None], "test": [2, run], "run": [3, run]}[cmd]
     lock = open(os.path.join(root, "Cargo.lock"), "rb").read() if os.path.exists(os.path.join(root, "Cargo.lock")) else b""
     script_env = sorted([k, env[k]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
-    spec = {"0": [0, {"0": 1, "1": git_head, "2": git_tree}], "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
+    spec = {"0": source, "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
             "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_env.items()),
             "8": script_env, "9": "" if os.path.relpath(start, root) == "." else os.path.relpath(start, root),
             "10": command, "11": sha("toolchain")}
@@ -2453,7 +2539,8 @@ def resolve(cwd, words, env):
     summary = {"command": cmd, "asked": sorted("%s@0.1.0:%s:%s" % (units[k]["pkg"], ["lib", "bin", "test", "example", "bench", "build-script", "proc-macro"][units[k]["kind"]], units[k]["name"]) for k in asked),
                "units": len(docs)}
     return {"spec": spec, "digests": digests, "summary": summary, "platform": plat, "units": units, "root": root,
-            "opts": o, "asked": asked, "config_env": config_env, "start": start}
+            "opts": o, "asked": asked, "config_env": config_env, "start": start,
+            "checkout_cwd": os.path.relpath(start, checkout)}
 
 
 CAPTURED = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_BACKEND", "RA_JIT_OPT", "RA_JIT_EMIT", "RA_JIT_MIR_OPT", "CC", "CXX", "AR",
@@ -2637,7 +2724,8 @@ def main():
         words = list(saved["words"])
         if BUG == "spec-run-drops-no-run":
             words = [w for w in words if w != "--no-run"]
-        cwd = os.path.join(os.getcwd(), saved["cwd"]) if saved["cwd"] and not os.getcwd().endswith(saved["cwd"]) else os.getcwd()
+        checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+        cwd = os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"])
         try:
             res = resolve(cwd, words, env)
         except Refused as r:
@@ -2668,7 +2756,9 @@ def main():
             return 2
         if out:
             with open(out, "w") as f:
-                json.dump({"words": words, "env": captured_env(env), "cwd": res["spec"]["9"], "spec": res["spec"]}, f)
+                # As with saved words/environment, this auxiliary path models reproduction in
+                # the test double; it does not assert that the current wire has this information.
+                json.dump({"words": words, "env": captured_env(env), "cwd": res["checkout_cwd"], "spec": res["spec"]}, f)
         print(json.dumps({"refused": None, "digests": res["digests"], "summary": res["summary"], "spec": res["spec"], "platform": res["platform"]}))
         return 0
     try:
@@ -2857,6 +2947,14 @@ def self_test_spec_reading(t):
     a, b = {"0": 1, "2": [1], "9": ""}, {"0": 2, "2": [2], "9": ""}
     t.check(changed_fields(a, b) == {"units"} and fingerprint(a) != fingerprint(b) and fingerprint({"0": 1, "2": [1]}) == fingerprint({"0": 5, "2": [1]}),
             "two specs are told apart by field, and by a fingerprint that leaves the source out")
+    before = argparse.Namespace(spec={"0": 1, "2": [1]}, digest="before", digests={})
+    after = argparse.Namespace(spec={"0": 2, "2": [1]}, digest="after", digests={})
+    full = Delta(before, after, compare_source=True)
+    t.check(Delta(before, after).same and not full.same and full.fields == {"source"} and not full.inconsistent,
+            "source identity cases count source-only changes while configuration comparisons still omit them")
+    after.digest = before.digest
+    t.check(Delta(before, after, compare_source=True).inconsistent is not None,
+            "a changed source rendering with an unchanged spec digest is caught")
     t.check(unwrap({"BuildSpec": {"0": 1}}) == {"0": 1}, "blaze-wire's `{\"BuildSpec\": ...}` wrapper is taken off")
     t.check(lock_text([("b", []), ("a", ["b"])]).startswith("# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"a\""),
             "a Cargo.lock is written in name order")
@@ -2880,6 +2978,35 @@ def run_fixture_checks(t):
             if c.local and c.expect in ("refused",):
                 problems.append(f"{c.full} is refused and local")
     t.check(not problems, f"{sum(len(f.cases) for f in fixtures())} cases of {len(fixtures())} fixtures are coherent", "; ".join(problems))
+
+
+def self_test_source_trees(t, tmp):
+    """Check the materialized reproducers, without starting a fake or a real compiler."""
+    print("source identity fixtures:")
+    ctx = Ctx.__new__(Ctx)  # These filesystem methods need no executor or watchdog.
+    ctx.work, ctx.trees = os.path.join(tmp, "source-trees"), {}
+    source = Fixture("source", SOURCE, source_cases())
+    base = ctx.tree(source.base())
+    dirty = ctx.tree(source.by_name["dirty-body"])
+    committed = ctx.tree(source.by_name["committed-body"])
+    moved = ctx.tree(source.by_name["moved-dirty-body"])
+    body = lambda path: open(os.path.join(path, "src/lib.rs")).read()
+    t.check(git(base, "rev-parse", "HEAD") == git(dirty, "rev-parse", "HEAD")
+            and body(base) != body(dirty) and git(dirty, "status", "--porcelain")
+            and not git(base, "status", "--porcelain"),
+            "the dirty-body case changes Rust bytes while preserving HEAD and the clean base")
+    t.check(git(base, "rev-parse", "HEAD") != git(committed, "rev-parse", "HEAD")
+            and body(committed) == body(dirty) and not git(committed, "status", "--porcelain"),
+            "the committed-body case changes HEAD with the same body edit")
+    t.check(dirty != moved and body(dirty) == body(moved)
+            and git(dirty, "rev-parse", "HEAD") == git(moved, "rev-parse", "HEAD"),
+            "the relocated dirty case preserves its inputs and HEAD")
+    nested = ctx.tree(Fixture("nested", NESTED, nested_cases()).base())
+    same = lambda path: open(os.path.join(nested, "one", path)).read() == open(os.path.join(nested, "two", path)).read()
+    t.check(same("Cargo.toml") and same("Cargo.lock") and not same("src/lib.rs")
+            and not os.path.exists(os.path.join(nested, "Cargo.toml"))
+            and git(os.path.join(nested, "one"), "rev-parse", "HEAD") == git(os.path.join(nested, "two"), "rev-parse", "HEAD"),
+            "sibling workspaces share a Git commit and package metadata, but select different Rust source")
 
 
 def oracle_available():
@@ -2956,6 +3083,7 @@ def self_test(args):
     run_fixture_checks(t)
     tmp = tempfile.mkdtemp(prefix="rj-bs-self-", dir="/tmp")
     try:
+        self_test_source_trees(t, tmp)
         if oracle_available():
             self_test_oracle(t, tmp)
         else:
@@ -2975,7 +3103,9 @@ def self_test(args):
             status, ctx, reported, fails = run_harness(fake_args(fake, no_local=False, no_cargo=not cargo, json=out_json))
         t.check(status == 0 and not fails, "every case of every fixture, in every arm, meets its expectation", "; ".join(f"{c} [{a}] {w}" for c, a, w in fails[:6]))
         data = json.load(open(out_json))
-        t.check(len(data["cases"]) == sum(len(f.cases) for f in fixtures()) - sum(1 for c in ctx.skipped if "/" in c) and data["ok"],
+        expected_cases = {c.full for f in fixtures() for c in f.cases}
+        t.check(len(data["cases"]) == len(expected_cases)
+                and {c["case"] for c in data["cases"]} == expected_cases and data["ok"],
                 "--json has every case", str(len(data["cases"])))
         t.check(sum(1 for c in data["cases"] if c["observed"] and c["observed"].startswith("refused")) >= 14 and
                 any(c["case"] == "profiles/llvm" and c["observed"].startswith("refused: RA_JIT_BACKEND") for c in data["cases"]),
@@ -2985,6 +3115,13 @@ def self_test(args):
                     str(collections.Counter((c["units"] or {}).get("status") for c in data["cases"])))
         t.check(sum(1 for c in data["cases"] if c["local"] and c["local"]["status"] == "match") >= 12, "the local arm ran its cases and found them equal",
                 str(collections.Counter((c["local"] or {}).get("status") for c in data["cases"])))
+        identity = {c["case"]: c for c in data["cases"]}
+        t.check(all(identity[name]["observed"].startswith("changed") for name in
+                    ("source/committed-body", "source/dirty-body", "nested/sibling"))
+                and identity["source/moved-dirty-body"]["observed"] == "same"
+                and all(identity[name]["local"]["status"] == "match" for name in
+                        ("nested/base", "nested/sibling", "nested/below-sibling")),
+                "the test double changes source/job identity and reproduces both nested workspaces; this is not a real CLI pass")
         if ctx.audit is not None:
             dispatched = sum((l["dispatched"]["command"] or {}).get("cargo", 0) for l in ctx.locals.values())
             t.check(dispatched >= len(ctx.locals), "cargo dispatched is counted by the stand-in and not a failure", str(dispatched))
@@ -3014,6 +3151,10 @@ def self_test(args):
                 ("nofailfast-same", ["basic/no-fail-fast", "failfast"], False, "wanted a different spec"),
                 ("no-lto-refusal", ["profiles/lto-thin"], False, "wanted a refusal"),
                 ("pkg-override-all", ["profiles/pkg-opt1"], False, "the units whose profile differs"),
+                ("head-only-source", ["source/dirty-body"], False, "wanted a different spec"),
+                ("dirty-source-refused", ["source/dirty-body"], False, "a spec was wanted"),
+                ("sibling-source-same", ["nested/sibling"], False, "wanted a different spec"),
+                ("replay-git-root", ["nested/base"], True, "spec run"),
                 ("spec-run-drops-no-run", ["basic/no-run"], True, "spec run"),
                 ("unit-features", ["basic/base"], False, "features")]
         for bug, only, local, wanted in bugs:
