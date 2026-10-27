@@ -112,9 +112,10 @@ impl Sharing<'_> {
         if is_for_host && profile.debuginfo.is_deferred() {
             // A probe: whether there is a unit with the debuginfo the target would give it.
             let canonical = profile.debuginfo.finalize();
-            // The explicit host kind is Host for proc macros already; changing it to
-            // Target misses a canonical proc-macro root shared with a runtime dependency.
-            let mut probe = source.clone();
+            // Cargo probes `to_host`, the explicit target triple before sharing, even
+            // for proc macros. Probing the source's Host kind instead would find the
+            // deferred unit itself: profile equality ignores the deferred marker.
+            let mut probe = Inner { kind: Kind::Target, ..source.clone() };
             probe.profile = profile.clone();
             probe.profile.debuginfo = canonical;
             profile.debuginfo =
