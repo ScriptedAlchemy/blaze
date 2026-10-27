@@ -126,6 +126,7 @@ impl Line {
             }
         }
         cmd.args(&self.after).arg("-o").arg(exe);
+        eprintln!("link line: {cmd:?}");
         let start = Instant::now();
         let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
         if !ran.status.success() {
