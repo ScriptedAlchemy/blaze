@@ -406,7 +406,13 @@ impl Store {
     pub(crate) fn sweep_temporaries(&self, older_than: std::time::Duration) -> Result<(), Error> {
         for sub in ["", "packs", "keys", "units", "manifests", "deps"] {
             let at = if sub.is_empty() { self.dir.clone() } else { self.dir.join(sub) };
-            let Ok(entries) = std::fs::read_dir(&at) else { continue };
+            let entries = match std::fs::read_dir(&at) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!("blaze-serve: janitor cannot list {}: {error}", at.display());
+                    continue;
+                }
+            };
             for entry in entries.flatten() {
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
                 let temporary = name.strip_suffix(".tmp").is_some_and(|name| {
@@ -421,6 +427,9 @@ impl Store {
                 if !temporary {
                     continue;
                 }
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
                 let old = entry
                     .metadata()
                     .ok()
@@ -431,14 +440,32 @@ impl Store {
                     let file = match File::options().read(true).write(true).open(entry.path()) {
                         Ok(file) => file,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(e) => return Err(e.into()),
+                        Err(error) => {
+                            eprintln!(
+                                "blaze-serve: janitor cannot open {}: {error}; left untouched",
+                                entry.path().display()
+                            );
+                            continue;
+                        }
                     };
                     match file.try_lock() {
                         Ok(()) => {
-                            _ = std::fs::remove_file(entry.path());
+                            if let Err(error) = std::fs::remove_file(entry.path())
+                                && error.kind() != std::io::ErrorKind::NotFound
+                            {
+                                eprintln!(
+                                    "blaze-serve: janitor cannot remove {}: {error}",
+                                    entry.path().display()
+                                );
+                            }
                         }
                         Err(std::fs::TryLockError::WouldBlock) => {}
-                        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                        Err(std::fs::TryLockError::Error(error)) => {
+                            eprintln!(
+                                "blaze-serve: janitor cannot lock {}: {error}; left untouched",
+                                entry.path().display()
+                            );
+                        }
                     }
                 }
             }
@@ -579,6 +606,26 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_stale_file_is_left_untouched_without_failing_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let store = Store::open(dir.path()).unwrap();
+        let path = store.dir().join("units/.foreign.123-456-1.tmp");
+        std::fs::write(&path, b"foreign leftover").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = File::open(&path).is_err();
+        let result = store.sweep_temporaries(std::time::Duration::ZERO);
+        if unreadable {
+            assert!(path.exists());
+        }
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(result.is_ok());
     }
 
     #[test]
