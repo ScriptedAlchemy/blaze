@@ -2,5 +2,5 @@
 # caching as blaze has it (docs/distributed.md, section 6). `cache` has the tests whose passes are
 # reused or not; `flaky` has one that fails on its first attempt.
 [workspace]
-members = ["cache", "flaky"]
+members = ["cache", "flaky", "tree"]
 resolver = "2"

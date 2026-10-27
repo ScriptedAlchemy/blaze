@@ -1853,6 +1853,8 @@ inferred from what an action holds). Unit T1 holds blaze to that:
    every test. The test is what `RA_JIT_TESTS=affected` already keys it by: its code and what its
    code reaches, which is finer than Bazel's key (the whole test binary) and was there before this
    design.
+   Directory boundaries are part of the typed tree digest. Declared inherited environment
+   values are forwarded to Linux sandboxed tests, with configured command overrides preserved.
 2. **Opt out.** `no_cache` and `external` in the same file name tests that run every time, as
    Bazel's tags do. A name is a libtest name, `package/name`, or either with a `*` at an end.
    A manifest that cannot be read opts every test out, and a key it does not have is refused.

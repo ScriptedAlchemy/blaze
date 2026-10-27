@@ -174,6 +174,7 @@ pub(crate) fn tests(
     let mut failed = Vec::new();
     let (mut left, mut always_run) = (0, 0);
     let sandbox = sandboxed::wanted(affected::on());
+    let declared_env = affected::declared_env(state);
     let attempts = affected::attempts(state);
     if let Some(Err(why)) = &sandbox {
         say::fallback(
@@ -188,7 +189,8 @@ pub(crate) fn tests(
         let mut running = format!("{unit}{} ({shown})", source.display());
         let mut picked = Vec::new();
         let mut command = test_command(state, test)?;
-        let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
+        let sandbox_env =
+            matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command, &declared_env));
         let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
         let pick = affected::pick(asked, state, test, identity.as_deref(), &command);
         if let Pick::Some { names: Some(names), total, .. } = &pick {

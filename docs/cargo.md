@@ -233,6 +233,11 @@ records (macOS) while that is the same, which is Bazel's trust in a declaration 
 that does not has them run every time there, as above. A file that cannot be read opts every
 test out. A test that failed is not kept as a pass, whatever its code goes back to.
 
+Declared directories use a typed tree digest with child counts, length-prefixed names and
+independent child digests: moving a file while leaving an empty directory changes the key.
+On Linux, declared `env` names are forwarded through the existing sandbox filter too.
+Values explicitly set on the test command override inherited values, as they do outside it.
+
 `RA_JIT_FLAKY_TEST_ATTEMPTS` is how many times a test that fails is run in all (Bazel's
 `--flaky_test_attempts`): a number, or `default` for three of a test under `flaky` and one of
 the others, which it is when it is not set. Only the tests that failed run again, `Retrying` says

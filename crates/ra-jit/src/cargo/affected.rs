@@ -46,6 +46,11 @@ pub(crate) const MANIFEST: &str = "blaze-tests.toml";
 /// manifest marks `flaky` and one for the others.
 pub(crate) const ATTEMPTS: &str = "RA_JIT_FLAKY_TEST_ATTEMPTS";
 
+/// Additional inherited variables the owner declares for the sandboxed test environment.
+pub(crate) fn declared_env(state: &State) -> Vec<String> {
+    Manifest::read(&state.root).0.map(|it| it.env).unwrap_or_default()
+}
+
 /// The attempts of a test marked `flaky`, as Bazel gives it.
 const FLAKY_ATTEMPTS: usize = 3;
 
@@ -406,27 +411,40 @@ fn test_threads(trailing: &[String]) -> Option<&str> {
     None
 }
 
-/// Hashes what is at `path`: nothing, a file's bytes, or a directory's names and what is in them.
+/// A typed tree encoding: counted directories, length-prefixed names, and fixed-size child
+/// digests. File bytes are independently digested, so they cannot encode directory boundaries.
 fn feed(hash: &mut Sha256, path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else { return hash.update(b"absent") };
+    let Ok(meta) = std::fs::metadata(path) else { return hash.update([0]) };
     if meta.is_dir() {
-        hash.update(b"dir");
-        let mut names: Vec<_> = std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .filter_map(|it| it.ok().map(|it| it.file_name()))
-            .collect();
+        let names = std::fs::read_dir(path).and_then(|entries| {
+            entries.map(|entry| entry.map(|it| it.file_name())).collect::<std::io::Result<Vec<_>>>()
+        });
+        let Ok(mut names) = names else { return hash.update([3]) };
+        hash.update([1]);
         names.sort();
+        hash.update((names.len() as u64).to_le_bytes());
         for name in names {
+            hash.update((name.as_encoded_bytes().len() as u64).to_le_bytes());
             hash.update(name.as_encoded_bytes());
-            hash.update([0]);
-            feed(hash, &path.join(name));
+            let mut child = Sha256::new();
+            feed(&mut child, &path.join(name));
+            hash.update(child.finalize());
         }
     } else {
-        hash.update(b"file");
+        hash.update([2]);
         match std::fs::File::open(path) {
-            Ok(mut file) => _ = std::io::copy(&mut file, hash),
-            Err(_) => hash.update(b"unreadable"),
+            Ok(mut file) => {
+                let mut content = Sha256::new();
+                match std::io::copy(&mut file, &mut content) {
+                    Ok(len) => {
+                        hash.update([0]);
+                        hash.update(len.to_le_bytes());
+                        hash.update(content.finalize());
+                    }
+                    Err(_) => hash.update([1]),
+                }
+            }
+            Err(_) => hash.update([1]),
         }
     }
 }
@@ -565,6 +583,18 @@ mod tests {
             "the effective test environment is keyed"
         );
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_file_out_of_a_directory_changes_the_declared_key() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-tree-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("d/a")).unwrap();
+        std::fs::write(dir.join("d/a/b"), "hello").unwrap();
+        let declared = manifest("data = [\"d\"]");
+        let before = declared.given(&dir, &[], &Command::new("test"));
+        std::fs::rename(dir.join("d/a/b"), dir.join("d/b")).unwrap();
+        assert_ne!(before, declared.given(&dir, &[], &Command::new("test")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

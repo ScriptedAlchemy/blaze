@@ -107,6 +107,7 @@ class Run:
     def __init__(self, code, out):
         self.code, self.out = code, out
         self.outcomes = RAN.findall(out)
+        self.terminal = dict(self.outcomes)
         self.ran = {name for name, _ in self.outcomes}
         # Retry output includes a failure followed by a pass of the same test. Its final
         # outcome, not whether it ever failed, decides the job's result.
@@ -170,12 +171,12 @@ class Harness:
             raise SystemExit(f"THE WATCHDOG KILLED THE RUN: {self.watchdog.tripped}")
         return Run(proc.returncode, out)
 
-    def warm(self, package, positional=()):
+    def warm(self, package, positional=(), extra=None):
         """Runs until the daemon serves the build, as testselect.py does, and once more: the
         daemon's first build of the tests is one in which each is new to it."""
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
-            run = self.cargo("all" if positional else "affected", package, positional=positional)
+            run = self.cargo("all" if positional else "affected", package, positional=positional, extra=extra)
             if run.code != 0:
                 raise SystemExit(f"the tests failed before any edit:\n{run.out[-3000:]}")
             if "[ra-jit]" in run.out:
@@ -184,7 +185,7 @@ class Harness:
         else:
             raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {self.home}\n{run.out[-4000:]}")
         if not positional:
-            self.cargo("affected", package)
+            self.cargo("affected", package, extra=extra)
 
     def check(self, what, verdict):
         self.total += 1
@@ -192,12 +193,18 @@ class Harness:
         print(f"{what:62} {verdict}", flush=True)
         return verdict == "ok"
 
-    def verdict(self, run, expected, passes, says=()):
-        if "[ra-jit]" not in run.out:
+    def verdict(self, run, expected, passes, says=(), served=True, failed=None):
+        if failed is None and (passes or len(expected) == 1):
+            failed = NONE if passes else expected
+        if served and "[ra-jit]" not in run.out:
             return "NOT SERVED BY THE DAEMON"
         if run.ran != expected:
             extra, missing = sorted(run.ran - expected), sorted(expected - run.ran)
             return f"RAN {', '.join(extra) or 'nothing more'}; DID NOT RUN {', '.join(missing) or '-'}"
+        if any(run.terminal.get(name) not in ("ok", "FAILED") for name in expected):
+            return "EXPECTED EXECUTED TEST WAS IGNORED"
+        if failed is not None and run.failed != failed:
+            return f"WRONG TERMINAL FAILURES: {sorted(run.failed)}"
         if (run.code == 0) != passes or bool(run.failed) == passes:
             return f"ENDED {run.code} WITH {', '.join(sorted(run.failed)) or 'no test'} FAILED"
         if unsaid := [it for it in says if not re.search(it, run.out, re.M)]:
@@ -216,12 +223,39 @@ class Harness:
             if what == "configured declared environment" and "[ra-jit]" not in run.out:
                 # Cargo configuration invalidates the whole build state. The cold build
                 # must rerun every test; warm its replacement state before checking reuse.
-                verdict = "ok" if run.ran == expected and run.code == 0 else "COLD CONFIGURATION BUILD DID NOT RERUN"
+                verdict = self.verdict(run, expected, passes, says, served=False)
                 self.check(what, verdict)
                 self.warm("cache")
             else:
                 self.check(what, self.verdict(run, expected, passes, says))
+        self.regressions()
         self.flaky()
+
+    def regressions(self):
+        poison = {"T1_DECLARED": "poison"}
+        run = self.cargo("affected", "cache", extra=poison)
+        self.check("declared inherited poison fails its assertion",
+                   self.verdict(run, ALL, False, failed={"tests::reads_env"}))
+        run = self.cargo("affected", "cache", extra=poison)
+        self.check("poison failure is never reused",
+                   self.verdict(run, {"tests::reads_env"}, False, failed={"tests::reads_env"}))
+        self.write(".cargo/config.toml", '[env]\nT1_DECLARED = { value = "forced", force = true }\n')
+        run = self.cargo("affected", "cache", extra=poison)
+        self.check("forced configuration overrides inherited poison",
+                   self.verdict(run, ALL, True, served=False, failed=NONE))
+
+        self.write("blaze-tests.toml", 'data = ["tree/d"]\n')
+        off = {"RA_JIT_SANDBOX": "off"}
+        self.warm("tree", extra=off)
+        self.check("unchanged directory tree pass is reused",
+                   self.verdict(self.cargo("affected", "tree", extra=off), NONE, True))
+        os.rename(os.path.join(self.ws, "tree/d/a/b"), os.path.join(self.ws, "tree/d/b"))
+        run = self.cargo("affected", "tree", extra={"RA_JIT_SANDBOX": "off"})
+        self.check("directory move with empty child reruns and fails",
+                   self.verdict(run, {"tests::nested_file"}, False, failed={"tests::nested_file"}))
+        run = self.cargo("affected", "tree", extra={"RA_JIT_SANDBOX": "off"})
+        self.check("directory move failure is not cached",
+                   self.verdict(run, {"tests::nested_file"}, False, failed={"tests::nested_file"}))
 
     def flaky(self):
         """A test that fails on its first attempt: retried while the manifest or the environment
@@ -248,7 +282,7 @@ class Harness:
         self.edit("flaky/data.txt", "declared", "declared again")
         os.remove(attempts)
         run = self.cargo("affected", "flaky", verbose=True, extra=dict(off, RA_JIT_FLAKY_TEST_ATTEMPTS="1"))
-        verdict = self.verdict(run, both, False)
+        verdict = self.verdict(run, both, False, failed={"tests::flaky_once"})
         if verdict == "ok" and ("Retrying" in run.out or run.failed != {"tests::flaky_once"}):
             verdict = "RETRIED OR FAILED THE WRONG TEST"
         self.check("one attempt asked for: it fails", verdict)
@@ -259,7 +293,8 @@ class Harness:
         self.edit("flaky/data.txt", "declared again", "mixed failures")
         os.remove(attempts)
         run = self.cargo("affected", "flaky", verbose=True, extra=off)
-        verdict = self.verdict(run, both, False, [r"Retrying .*\(attempt 2\)", r"Flaky .*tests::flaky_once"])
+        verdict = self.verdict(run, both, False, [r"Retrying .*\(attempt 2\)", r"Flaky .*tests::flaky_once"],
+                               failed={"tests::steady"})
         if verdict == "ok" and [end for name, end in run.outcomes if name == "tests::flaky_once"] != ["FAILED", "ok"]:
             verdict = "THE NON-FLAKY FAILURE BLOCKED THE FLAKY RETRY"
         self.check("a non-flaky failure does not block a flaky retry", verdict)
@@ -343,6 +378,15 @@ def self_test():
     retried = Run(0, "test a ... FAILED\ntest b ... FAILED\ntest a ... ok\n")
     if retried.failed != {"b"}:
         wrong.append("a passed retry was counted as a final failure")
+    h = Harness.__new__(Harness)
+    for out, passes in (("test a ... ignored\n", True), ("test a ... FAILED\n", True),
+                        ("test a ... ok\n", False)):
+        for served in (True, False):
+            run = Run(0, "[ra-jit]\n" + out)
+            if h.verdict(run, {"a"}, passes, served=served) == "ok":
+                wrong.append("ignored/inconsistent terminal outcome accepted")
+    if h.verdict(Run(1, "[ra-jit]\ntest a ... FAILED\n"), {"a"}, False, failed={"b"}) == "ok":
+        wrong.append("wrong failing test accepted")
     for at in SAYS:
         if not 0 <= at < len(CACHE) or "opt" not in CACHE[at][0]:
             wrong.append(f"SAYS names step {at}, which is not one that opts a test out")
