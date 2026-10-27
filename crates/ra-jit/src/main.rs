@@ -9083,7 +9083,10 @@ fn run_holding(
             eprintln!("included-watch: changed={}, sources={}", included.len(), sources.len());
         }
         for path in included {
-            db.reload_included_file(&path);
+            let reloaded = db.reload_included_file(&path);
+            if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
+                eprintln!("included-reload: path={path}, changed={reloaded}");
+            }
         }
         // Invalidate memoized code/listings only after the tracked input revision
         // advances, so patch bases cannot recapture the old included bytes.
