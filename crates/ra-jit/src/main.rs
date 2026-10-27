@@ -2703,16 +2703,28 @@ impl Checkouts {
     ) -> anyhow::Result<Vec<usize>> {
         let project = dunce::canonicalize(project).ok();
         let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
-        // The checkout whose variables are those of the build: any, when it is not loaded.
+        // The checkout whose scripts the build reads: the project's own (the one it shares
+        // packages with, for a split), or, for a project that is not loaded, the one it will
+        // share packages with when it is (`alike`, which only compares files), if any. A project
+        // that will be loaded on its own reads no checkout that is loaded: its own scripts are
+        // judged when it is, with its own owner and variables.
         let built = match asked {
             Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
-            None => None,
+            None => project.as_ref().and_then(|it| self.alike(it)).map(|(at, _)| &self.roots[at].1),
         };
         let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
         for (at, (_, root)) in self.roots.iter().enumerate() {
             if self.unloaded.contains(&at) {
-                stale.push(at);
+                // A split that could not be loaded again is asked to be, by a request that reads
+                // it or the checkout it shares packages with, and by no other.
+                let reads = asked == Some(at)
+                    || self.splits[at]
+                        .as_ref()
+                        .is_some_and(|it| built.is_some_and(|b| *b == it.base));
+                if reads {
+                    stale.push(at);
+                }
                 continue;
             }
             let changed = match &self.splits[at] {
@@ -2725,7 +2737,7 @@ impl Checkouts {
                         // build's for good. Another loaded checkout is not the request's to run
                         // scripts of, nor to load again with its variables: it is judged for the
                         // build that asks for it, when one does.
-                        let changed = match reached(asked, built.map(|it| it.as_path()), root) {
+                        let changed = match reached(built.map(|it| it.as_path()), root) {
                             true => self.inputs.stale(root, Some(env), build)?,
                             false => false,
                         };
@@ -3017,11 +3029,11 @@ enum Overlay {
     Always,
 }
 
-/// Whether a request for the project at `asked` (none when it is not loaded) reads the checkout
-/// loaded at `root`: its own, and the one `built` it shares packages with. A request for a project
-/// that is not loaded is judged against every checkout, as it joins them.
-fn reached(asked: Option<usize>, built: Option<&Path>, root: &Path) -> bool {
-    asked.is_none() || built == Some(root)
+/// Whether a request reads the checkout loaded at `root`, when `built` is the one whose scripts it
+/// reads: its own checkout, or the one it shares packages with, and none when it reads no
+/// loaded checkout (a project that will be loaded on its own).
+fn reached(built: Option<&Path>, root: &Path) -> bool {
+    built == Some(root)
 }
 
 /// A checkout as the daemon looks at it.
@@ -10522,14 +10534,14 @@ mod tests {
     #[test]
     fn a_request_judges_the_scripts_of_the_checkouts_it_reads_and_no_other() {
         let (r, s, base) = (Path::new("/r"), Path::new("/s"), Path::new("/base"));
-        // A project that is not loaded joins the others: every checkout is judged against it.
-        assert!(reached(None, None, r) && reached(None, None, s));
-        // A project of the checkout `r`: its own is read, and not the other loaded one.
-        assert!(reached(Some(0), Some(r), r));
-        assert!(!reached(Some(0), Some(r), s));
+        // A project of the checkout `r`, or one that will share packages with it: its is read.
+        assert!(reached(Some(r), r));
+        assert!(!reached(Some(r), s));
         // A project that shares packages with `base`: the checkout it shares them with is read.
-        assert!(reached(Some(1), Some(base), base));
-        assert!(!reached(Some(1), Some(base), r));
+        assert!(reached(Some(base), base));
+        assert!(!reached(Some(base), r));
+        // A project that will be loaded on its own reads no checkout that is loaded.
+        assert!(!reached(None, r) && !reached(None, s));
     }
 
     #[test]
