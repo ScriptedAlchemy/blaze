@@ -202,9 +202,9 @@ class Scenario:
         env.update(extra or {})
         return env
 
-    def client(self, home, **env):
+    def client(self, home, args=(), **env):
         """A `cargo ra-jit build` that starts now: its process, and when it started."""
-        p = subprocess.Popen(["cargo", "ra-jit", "build"], cwd=self.ws, env=self.env(home, env),
+        p = subprocess.Popen(["cargo", "ra-jit", "build", *args], cwd=self.ws, env=self.env(home, env),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
                              stdin=subprocess.DEVNULL)
         p.started = time.time_ns() // 1000
@@ -536,12 +536,12 @@ LOST = float(os.environ.get("LEASEBARRIER_LOST", "120"))
 CONFIG_B = '[env]\nGEN = { value = "b", force = true }\n'
 
 
-def settled_a(sc, extra):
+def settled_a(sc, extra, args=()):
     """A (GEN=a) built and answered, its retire held at the worker: the window in which A's
     build is over for its client and the worker has not heard it."""
     sc.project()
     sc.arm("a", "retire")
-    A = sc.client("a", GEN="a", **extra)
+    A = sc.client("a", args, GEN="a", **extra)
     sc.finish(A, "A")
     if A.returncode != 0:
         sc.fail(f"A's build exited {A.returncode}: {A.err[-600:]}")
@@ -553,12 +553,14 @@ def settled_a(sc, extra):
 def lost_wake(sc, source_sha):
     extra = {"GEN_ARCHIVE": "same"}
     exp_b = sc.oracle("b", extra)
-    held = settled_a(sc, extra)
+    # One program, so one request of B's: no other request is there to wake the worker.
+    one = ("--bin", "gen-one")
+    held = settled_a(sc, extra, one)
     if held is None:
         return
     A, ba = held
     sc.arm("a", "deferred")
-    B = sc.client("a", GEN="b", **extra)
+    B = sc.client("a", one, GEN="b", **extra)
     bb = sc.reached("a", "deferred", B)
     if bb is None:
         sc.finish(B, "B", 5)
@@ -573,7 +575,13 @@ def lost_wake(sc, source_sha):
     if B.returncode != 0:
         sc.fail(f"B's build exited {B.returncode} (a request nothing woke is killed, not ended): {B.err[-600:]}")
         return
-    sc.check_programs("B", {}, exp_b, "b", gap_native=ord("a"))
+    got = sc.program("gen-one")
+    want = exp_b["gen-one"]
+    stale = want.replace(f"native={ord('b')}", f"native={ord('a')}")
+    if got == stale:
+        sc.gaps.append(f"B: gen-one linked the library of the build before: {got!r}, cargo's {want!r}")
+    elif got != want:
+        sc.fail(f"B: gen-one printed {got!r}, the oracle's {want!r}")
     if sc.runs() != ["a", "b"]:
         sc.fail(f"the script ran {sc.runs()}, once for each build, 'a' then 'b'")
     sc.timeouts()
