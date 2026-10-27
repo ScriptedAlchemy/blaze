@@ -98,6 +98,18 @@ def worker_log(run):
     return best
 
 
+def no_rustc_violation(run):
+    """Existing fallback bugs invalidate measurements, even when the client exits zero."""
+    logs = os.path.join(run, "logs")
+    for name in os.listdir(logs) if os.path.isdir(logs) else []:
+        with open(os.path.join(logs, name), errors="replace") as file:
+            text = file.read()
+        if ("this build is cargo's" in text or "rustc compiles the build script" in text
+                or "rustc compiles the proc macro" in text):
+            return True
+    return False
+
+
 def parse(run):
     """What one run says: the worker's timers and counts, and what loadmem.py saw of its footprint."""
     with open(os.path.join(run, "result.json")) as file:
@@ -105,6 +117,7 @@ def parse(run):
     log = worker_log(run)
     row = {"outcome": result.get("outcome"), "tripped": result.get("tripped"),
            "swap_growth_mb": result.get("peak_swap_growth_mb")}
+    row["no_rustc_violation"] = no_rustc_violation(run)
     stopped = result.get("stopped_after") or {}
     row.update(ready_footprint_mb=stopped.get("footprint_mb"), ready_rss_mb=stopped.get("rss_mb"))
     row["ready_seen_s"] = stopped.get("ready_seen_s")
@@ -171,6 +184,11 @@ def main():
     if not a.skip_build:
         run = loadmem(a, "build", stop=False)
         summary["build"] = parse(run) if os.path.exists(os.path.join(run, "result.json")) else None
+        if not summary["build"] or summary["build"]["outcome"] != "ok" or summary["build"]["no_rustc_violation"]:
+            print("BUILD DID NOT COMPLETE WITH BLAZE; no measurement arms:", summary["build"], flush=True)
+            with open(os.path.join(a.work, "summary.json"), "w") as file:
+                json.dump(summary, file, indent=1)
+            return 1
     if os.path.exists(image):
         os.remove(image)
     seed = loadmem(a, "seed", env=[f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_STATS=census"])
@@ -210,7 +228,8 @@ def main():
               f"{spread([x.get('serve_s') for x in r])} | {spread([x.get('fetch_s') for x in r])} | "
               f"{spread([x['ready_footprint_mb'] for x in r])} | {spread([x['ready_rss_mb'] for x in r])} | "
               f"{spread([x.get('after_resolve_live_mb') for x in r])} |")
-    bad = [(arm, i) for arm in arms for i, x in enumerate(rows[arm], 1) if x["outcome"] != "stopped"]
+    bad = [(arm, i) for arm in arms for i, x in enumerate(rows[arm], 1)
+           if x["outcome"] != "stopped" or x["no_rustc_violation"]]
     if bad:
         print("RUNS THAT DID NOT REACH READY:", bad, flush=True)
     return 1 if bad else 0

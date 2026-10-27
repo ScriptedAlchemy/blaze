@@ -49,6 +49,16 @@ class FrontImageTests(unittest.TestCase):
         self.assertEqual(driver.spread([None]), "-")
         self.assertEqual(driver.spread([1, 2, 3]), "2.00 (1.00-3.00)")
 
+    def test_existing_fallback_is_not_a_successful_measurement(self):
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / "logs").mkdir()
+            (root / "logs" / "client.log").write_text(
+                "ra-jit: bug: this build is cargo's, which ra-jit is never to do\n"
+            )
+            self.assertTrue(driver.no_rustc_violation(work))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -234,6 +234,26 @@ No fixture measurement or speedup is claimed until the guarded driver completes.
 The predecessor's four image tests passed only in a stub crate; that was not integration
 validation. The resumed tests add corruption fallback, duplicate keys and old-map lifetime.
 
+**Read, resumed integration checks:** `cargo +1.99.0 check -p ra-jit` passed.
+`cargo +1.99.0 test -p ra-jit front_image` passed 7/7 tests, 6.01 s;
+`cargo +1.99.0 test -p hir-def frozen` passed 8/8, 0.02 s. These are correctness
+checks, not performance samples. The guarded session peaked at 2,339 MB and did not trip.
+An initial census crate-ID type error was fixed before these passes.
+
+The following release build failed with missing dependency APIs, including this change's
+`Bytes` and existing `hir::interned_counts` and `live_solver_caches`. The successful
+debug check/tests see those APIs. Stale or mixed shared-target artifacts are a hypothesis,
+not a proven cause. No release-based fixture result is available from that attempt.
+
+A subsequent debug build also saw those missing APIs. Refreshing the three affected
+source timestamps **inside the heavy lock**, without changing content or deleting shared
+artifacts, made the debug binary build (53.04 s). This supports the stale-target hypothesis.
+The guarded ripgrep attempt then failed to produce a worker image: the initial build hit
+its 300 s timeout; a seed attempt exited zero after existing build-script and daemon-start
+fallback bugs, not after reaching front-end readiness. No arm ran and no timing or memory
+comparison is valid. The harness now rejects those fallback logs explicitly. No new
+fallback path was added. The guard peaked at 5,495 MB with no memory/swap trip.
+
 ## Deviations
 
 The lock queue prevented the predecessor's full build and fixture measurements before its
@@ -256,8 +276,9 @@ python3 -I harness/dist/frontimage.py --help
 python3 -I harness/dist/frontimage_pressure.py --help
 ```
 
-The full build script uses `CARGO_TARGET_DIR=/Users/bytedance/code/blaze-targets/shared`,
-copies binaries to `d3m/bin/sol-resume`, then runs release image and frozen tests.
+The build script uses `CARGO_TARGET_DIR=/Users/bytedance/code/blaze-targets/shared`,
+runs debug workspace and image/frozen checks, then builds release and copies binaries
+to `d3m/bin/sol-resume` if that succeeds.
 For real-project runs, hold the heavy lock around `frontimage.py`; it runs every blaze
 client/daemon under `loadmem.py`'s footprint/swap watchdog and stops them between arms.
 For container pressure, hold `with-docker-lock.sh`; the driver rejects a container over
