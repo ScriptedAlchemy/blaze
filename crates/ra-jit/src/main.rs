@@ -6922,6 +6922,9 @@ static LINKING: Mutex<usize> = Mutex::new(0);
 thread_local! {
     /// Whether the build on this thread is one of [`LINKING`].
     static LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The numbered builds the build on this thread is for, which a test holds as it begins to
+    /// link (`RA_JIT_SCRIPT_BARRIER_DIR`; nothing without it).
+    static LINK_FOR: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Called before a build links, which it does not once an interruption has begun: it then
@@ -6936,7 +6939,11 @@ fn begin_link() {
         std::panic::resume_unwind(Box::new(ide_db::base_db::salsa::Cancelled::PendingWrite));
     }
     *linking += 1;
+    drop(linking);
     LINKS.set(true);
+    for build in LINK_FOR.with_borrow(Clone::clone) {
+        scripts::barrier::hold("linking", build);
+    }
 }
 
 /// After a build on this thread is over: it holds up no interruption.
@@ -9716,6 +9723,7 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    LINK_FOR.with_borrow_mut(|it| it.clone_from(&consumes));
                     for build in consumes {
                         scripts::barrier::hold("consume", build);
                     }
