@@ -207,6 +207,10 @@ pub(crate) struct Asked<'a> {
     /// The triple of the machine the scripts run on, and of the one the build is for.
     pub(crate) host: &'a str,
     pub(crate) target: &'a str,
+    /// Whether `--target` (or `CARGO_BUILD_TARGET`) was said, even if it names the host: cargo then
+    /// builds for a target, and the scripts and proc macros, which are the host's, get none of the
+    /// flags for rustc that the target's units get.
+    pub(crate) explicit_target: bool,
     /// The packages the build has and whether they are built for the target, rather than
     /// only for the host; `None` for every package, treated as a target package.
     pub(crate) packages: Option<&'a FxHashMap<String, bool>>,
@@ -248,6 +252,7 @@ pub(crate) struct Own {
     pub(crate) config: Vec<String>,
     pub(crate) host: String,
     pub(crate) target: String,
+    pub(crate) explicit_target: bool,
     pub(crate) packages: FxHashMap<String, bool>,
     /// The scripts the workspace was loaded from, with the token of each run: set when it is.
     pub(crate) world: World,
@@ -263,6 +268,7 @@ impl Own {
             config: &self.config,
             host: &self.host,
             target: &self.target,
+            explicit_target: self.explicit_target,
             packages: Some(&self.packages),
         }
     }
@@ -442,6 +448,8 @@ struct Runner<'a> {
     /// The flags for rustc of the target's units and of the host's.
     flags: Vec<String>,
     host_flags: Vec<String>,
+    /// Whether the build is for a target, as cargo says it: `--target` was said, or the target is not the host.
+    cross: bool,
     /// `[env]`, as it applies.
     config_env: BTreeMap<String, String>,
     target_cfgs: Vec<String>,
@@ -488,10 +496,11 @@ impl<'a> Runner<'a> {
             .collect();
         let flags = rustflags(&ctx.config, asked.target, rustc_cfg)?;
         // Without `--target` the scripts are compiled with the target's flags; with it, with
-        // none (cargo's `target-applies-to-host`).
-        let host_flags = match asked.target == asked.host {
-            true => flags.clone(),
-            false => Vec::new(),
+        // none (cargo's `target-applies-to-host`), the host being named or not.
+        let cross = asked.explicit_target || asked.target != asked.host;
+        let host_flags = match cross {
+            false => flags.clone(),
+            true => Vec::new(),
         };
         let target: &Path = cargo.target_directory().as_ref();
         // A version string is shared by different builds of blaze. A compiler change must
@@ -523,6 +532,7 @@ impl<'a> Runner<'a> {
             host_cfgs,
             flags,
             host_flags,
+            cross,
             config_env,
             profiles,
             rustc,
@@ -773,7 +783,7 @@ impl<'a> Runner<'a> {
 
     /// The kind of the build's own units: the host's, or the target's.
     fn kind(&self, for_host: bool) -> CompileKind {
-        match for_host || self.asked.target == self.asked.host {
+        match for_host || !self.cross {
             true => CompileKind::Host,
             false => CompileKind::Target(self.asked.target.to_owned()),
         }
@@ -825,7 +835,7 @@ impl<'a> Runner<'a> {
         };
         let mut artifacts = target_dir.to_owned();
         let mut runs = self.base.clone();
-        if target != self.asked.host {
+        if self.cross && !for_host {
             artifacts.push(target);
             runs.push(target);
         }
@@ -1097,8 +1107,19 @@ impl<'a> Runner<'a> {
         let mut cfg: Vec<String> =
             data.active_features.iter().map(|it| format!("feature={it:?}")).collect();
         cfg.sort();
-        if profile.debug_assertions {
+        // The flags the host's units are compiled with: `--cfg` and `-C debug-assertions` change what
+        // the crate is; the others are noted.
+        let applied = apply_flags(&self.host_flags);
+        for note in &applied.ignored {
+            eprintln!("build scripts: not applied to blaze's compile of {name}: {note}");
+        }
+        if applied.debug_assertions.unwrap_or(profile.debug_assertions) {
             cfg.push("debug_assertions".to_owned());
+        }
+        for extra in applied.cfgs {
+            if !cfg.contains(&extra) {
+                cfg.push(extra);
+            }
         }
         let package_dir: &Path = data.manifest.parent().as_ref();
         let manifest: &Path = data.manifest.as_ref();
@@ -1147,6 +1168,72 @@ impl<'a> Runner<'a> {
             deps: Vec::new(),
         })
     }
+}
+
+/// What the flags for rustc a crate is compiled with say that blaze's compile applies.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Applied {
+    /// `--cfg`, as `rustc --cfg` takes it (`name`, `name="value"`).
+    cfgs: Vec<String>,
+    /// `-C debug-assertions`, when it is said.
+    debug_assertions: Option<bool>,
+    /// What is said and not applied: codegen options, lints, search paths, anything else. A line each.
+    ignored: Vec<String>,
+}
+
+/// The flags for rustc as cargo orders them for a crate, in the effect they have on what blaze compiles: `--cfg`
+/// (both `--cfg x` and `--cfg=x`) and `-C debug-assertions` (both `-C x` and `-Cx`, `yes`, `no`, `on`, `off`,
+/// none for yes); `--check-cfg` and the lints change no program; the rest is named in `ignored`, not
+/// silently dropped.
+fn apply_flags(flags: &[String]) -> Applied {
+    let mut applied = Applied::default();
+    let mut at = 0;
+    while at < flags.len() {
+        let flag = flags[at].as_str();
+        at += 1;
+        let mut value =
+            |applied: &mut Applied, name: &str, joined: Option<&str>| -> Option<String> {
+                match joined {
+                    Some(it) => Some(it.to_owned()),
+                    None => {
+                        let next = flags.get(at).cloned();
+                        at += 1;
+                        if next.is_none() {
+                            applied.ignored.push(format!("{name} has no value"));
+                        }
+                        next
+                    }
+                }
+            };
+        if flag == "--cfg" || flag.starts_with("--cfg=") {
+            if let Some(it) = value(&mut applied, "--cfg", flag.strip_prefix("--cfg=")) {
+                applied.cfgs.push(it);
+            }
+        } else if flag == "-C" || flag.starts_with("-C") && flag.len() > 2 {
+            let Some(option) =
+                value(&mut applied, "-C", flag.strip_prefix("-C").filter(|it| !it.is_empty()))
+            else {
+                continue;
+            };
+            let (name, setting) = match option.split_once('=') {
+                Some((name, setting)) => (name, Some(setting)),
+                None => (option.as_str(), None),
+            };
+            if name == "debug-assertions" {
+                applied.debug_assertions =
+                    Some(!matches!(setting, Some("no" | "n" | "off" | "false")));
+            } else {
+                applied.ignored.push(format!("-C {option}"));
+            }
+        } else if flag == "--check-cfg" {
+            at += 1;
+        } else if let Some(rest) = flag.strip_prefix("--check-cfg=") {
+            let _ = rest;
+        } else {
+            applied.ignored.push(flag.to_owned());
+        }
+    }
+    applied
 }
 
 /// The variables cargo sets for rustc, which a description sets for each crate and its

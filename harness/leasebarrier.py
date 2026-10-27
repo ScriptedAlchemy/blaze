@@ -96,6 +96,9 @@ first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SP
 quick-choice  `RA_JIT_SPLIT=0`, quick overlay: a request for R is held as it enters its link (the executable was taken
               away), V's first request arrives (R is no candidate while it links), the worker settles and the link is let
               go: V is loaded on its own and judged for its variables, not read through R's world.
+hostflags     RUSTFLAGS="--cfg hostflag" with no `--target` and with `--target <the host>`: the scripts are compiled with the flags
+              in the first and not in the second (the script prints `cfg!(hostflag)` and `CARGO_ENCODED_RUSTFLAGS`), and
+              the program's crate has them in both. Cargo is the oracle.
 selector-moves  R's manifest selects `old/build.rs`, whose first run rewrites the selector to `new/build.rs` (it succeeds for a, fails for b);
               V's manifest is R's after that, with the same old script, dormant, and a new one that succeeds for b. One request for V, b:
               R's loaded target is `old/build.rs` (the same name as V's selected script, in another directory): R is not V's to run.
@@ -2104,6 +2107,79 @@ def selector_moves(sc, source_sha):
         worker.kill()
 
 
+HOSTFLAGS_BUILD_RS = r"""fn main() {
+    // What the script is compiled with (cfg!), and what cargo says the target's flags are when it runs.
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    let saw = if cfg!(hostflag) { "yes" } else { "no" };
+    println!("cargo:rustc-env=HOSTFLAG_SAW={saw}");
+    let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default().replace('\x1f', " ");
+    println!("cargo:rustc-env=SCRIPT_RUSTFLAGS={flags}");
+    println!("cargo:rustc-check-cfg=cfg(hostflag)");
+}
+"""
+
+HOSTFLAGS_PROGRAM = r"""fn main() {
+    println!("saw={} flags={} target-cfg={}", env!("HOSTFLAG_SAW"), env!("SCRIPT_RUSTFLAGS"), cfg!(hostflag));
+}
+"""
+
+
+def hostflags(sc, source_sha):
+    """The flags for rustc cargo gives a build script's compile. With RUSTFLAGS and no `--target`, the scripts are
+    compiled with them (`cfg!(hostflag)` is true in the script); with `--target`, even the host's triple, they are
+    not, and the script still runs with the target's flags in `CARGO_ENCODED_RUSTFLAGS`; the program's crate has them
+    either way. The program prints what the script saw. Cargo is the oracle, built in a directory of its own."""
+    host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout, re.M)[1]
+    sc.notes["host"] = host
+    flags = "--cfg hostflag"
+
+    def project(ws):
+        sc.project(ws)
+        for name, text in (("build.rs", HOSTFLAGS_BUILD_RS), ("src/one.rs", HOSTFLAGS_PROGRAM),
+                           ("src/two.rs", HOSTFLAGS_PROGRAM)):
+            with open(os.path.join(ws, name), "w") as f:
+                f.write(text)
+
+    for mode, args in (("plain", ()), ("explicit", ("--target", host))):
+        want_dir = os.path.join(sc.dir, f"oracle-{mode}")
+        shutil.rmtree(want_dir, ignore_errors=True)
+        project(want_dir)
+        env = dict(sc.env("oracle"), RUSTFLAGS=flags, CARGO_TARGET_DIR=os.path.join(want_dir, "target"))
+        env.pop("RA_JIT_WHOLE_BUILD", None)
+        ran = subprocess.run(["cargo", "build", "--bin", "gen-one", *args], cwd=want_dir, env=env,
+                             capture_output=True, text=True, timeout=WAIT)
+        if ran.returncode != 0:
+            sc.fail(f"{mode}: the oracle (cargo) did not build: {ran.stderr[-400:]}")
+            continue
+        sub = os.path.join("target", host, "debug") if args else os.path.join("target", "debug")
+        want = subprocess.run([os.path.join(want_dir, sub, "gen-one")], capture_output=True, text=True).stdout
+        ws = os.path.join(sc.dir, f"ws-{mode}")
+        shutil.rmtree(ws, ignore_errors=True)
+        project(ws)
+        client_env = dict(sc.env(mode), RUSTFLAGS=flags)
+        p = subprocess.Popen(["cargo", "ra-jit", "build", "--bin", "gen-one", *args], cwd=ws, env=client_env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+                             stdin=subprocess.DEVNULL)
+        if mode not in sc.daemons:
+            sc.daemons.append(mode)
+        try:
+            out, err = p.communicate(timeout=WAIT)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            sc.fail(f"{mode}: the client did not end")
+            continue
+        with open(os.path.join(sc.dir, f"client-{mode}.err"), "w") as f:
+            f.write(err)
+        if p.returncode != 0:
+            sc.fail(f"{mode}: the build exited {p.returncode}: {err[-500:]}")
+            continue
+        exe = os.path.join(ws, sub, "gen-one")
+        got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+        sc.notes.setdefault("programs", {})[mode] = {"got": got, "want": want}
+        if got != want:
+            sc.fail(f"{mode}: the program printed {got!r}, cargo's {want!r}")
+
+
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
     which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
@@ -2196,6 +2272,7 @@ SCENARIOS = {
     "choice-failing-base": choice_failing_base,
     "choice-same-stamp": choice_same_stamp,
     "selector-moves": selector_moves,
+    "hostflags": hostflags,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,

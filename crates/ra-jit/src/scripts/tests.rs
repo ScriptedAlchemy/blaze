@@ -188,6 +188,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         config: &[],
         host: "x86_64-unknown-linux-gnu",
         target: "aarch64-unknown-linux-gnu",
+        explicit_target: true,
         packages: Some(&packages),
     };
     // The installed toolchain's identity selects checked-in cfg answers. No executable is
@@ -382,6 +383,7 @@ impl Fixture {
             config: &[],
             host: HOST,
             target: HOST,
+            explicit_target: false,
             packages: Some(&packages),
         };
         let mut runner =
@@ -768,4 +770,36 @@ fn a_failure_is_the_builds_for_good_whether_it_yielded_or_not() {
     leases.retire(2);
     leases.retire(1);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn the_flags_for_rustc_a_crate_is_compiled_with_are_applied_where_they_change_the_crate() {
+    let flags = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+    let applied =
+        apply_flags(&flags(&["--cfg", "hostflag", "--cfg=other", "--cfg", "feature=\"x\""]));
+    assert_eq!(applied.cfgs, ["hostflag", "other", "feature=\"x\""]);
+    assert!(applied.ignored.is_empty() && applied.debug_assertions.is_none());
+    // `-C debug-assertions`, joined or not, with its values.
+    for (given, want) in [
+        (&["-C", "debug-assertions=no"][..], false),
+        (&["-Cdebug-assertions=off"], false),
+        (&["-C", "debug-assertions=yes"], true),
+        (&["-Cdebug-assertions"], true),
+    ] {
+        assert_eq!(apply_flags(&flags(given)).debug_assertions, Some(want), "{given:?}");
+    }
+    // What changes no crate is named and not applied, and it does not take the next flag with it.
+    let applied = apply_flags(&flags(&[
+        "-C",
+        "opt-level=3",
+        "--check-cfg",
+        "cfg(x)",
+        "-Wunused",
+        "--cfg",
+        "kept",
+    ]));
+    assert_eq!(applied.cfgs, ["kept"]);
+    assert_eq!(applied.ignored, ["-C opt-level=3", "-Wunused"]);
+    // A flag with no value says so.
+    assert_eq!(apply_flags(&flags(&["--cfg"])).ignored, ["--cfg has no value"]);
 }
