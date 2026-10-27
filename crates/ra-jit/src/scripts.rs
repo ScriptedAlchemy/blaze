@@ -728,6 +728,8 @@ impl<'a> Runner<'a> {
                 let printed = match ran {
                     Ok(printed) => printed,
                     Err(failed) => {
+                        // The client's reply is one line: the log has all of it, as cargo's output has.
+                        eprintln!("build script of {}: failed: {failed}", data.name);
                         held.failed(failed.clone());
                         return Err(failed);
                     }
