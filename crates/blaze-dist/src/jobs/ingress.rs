@@ -139,15 +139,28 @@ mod tests {
     #[test]
     fn coordinator_stages_and_assignment_cannot_be_injected() {
         for from in ["lead", "helper"] {
-            for reserved in [Stage::Queued, Stage::Admitted, Stage::Assigned, Stage::Compiled, Stage::Done] {
+            for reserved in [
+                Stage::Queued,
+                Stage::Admitted,
+                Stage::Assigned,
+                Stage::Compiled,
+                Stage::Done,
+            ] {
                 let mut execution = execution();
                 let before = execution.events(0).to_vec();
-                assert_eq!(send(&mut execution, from, vec![stage(reserved)]), Err(Refusal::NotHolder));
+                assert_eq!(
+                    send(&mut execution, from, vec![stage(reserved)]),
+                    Err(Refusal::NotHolder)
+                );
                 assert_eq!(execution.events(0), before.as_slice());
             }
             let mut execution = execution();
-            let assignment = AssignedEvent { executor: "other".into(), attempt: execution.attempt() };
-            assert_eq!(send(&mut execution, from, vec![JobEvent::Assigned(assignment)]), Err(Refusal::NotHolder));
+            let assignment =
+                AssignedEvent { executor: "other".into(), attempt: execution.attempt() };
+            assert_eq!(
+                send(&mut execution, from, vec![JobEvent::Assigned(assignment)]),
+                Err(Refusal::NotHolder)
+            );
         }
     }
 
@@ -180,7 +193,13 @@ mod tests {
         let request = WorkJoinRequest {
             execution: execution.id,
             attempt: execution.attempt(),
-            roots: RootSet { spec: [1; 32], roots: [2; 32], count: 0, index: [3; 32], inputs: [4; 32] },
+            roots: RootSet {
+                spec: [1; 32],
+                roots: [2; 32],
+                count: 0,
+                index: [3; 32],
+                inputs: [4; 32],
+            },
             rejected: Set::new(Vec::new()),
         };
         execution.join(1, "lead", &request, &mut Vec::new()).unwrap();
@@ -208,17 +227,33 @@ mod tests {
             effect,
             Effect::SubscriberEnded { outcome: Outcome::Lost, .. }
         )));
-        let verdict = execution.events(0).iter().find_map(|item| match &item.event {
-            JobEvent::Done(done) => Some(done),
-            _ => None,
-        }).unwrap();
-        let decoded: DoneEvent = blaze_wire::decode(
-            &blaze_wire::encode(verdict), &blaze_wire::Limits::default(),
-        ).unwrap();
+        let verdict = execution
+            .events(0)
+            .iter()
+            .find_map(|item| match &item.event {
+                JobEvent::Done(done) => Some(done),
+                _ => None,
+            })
+            .unwrap();
+        let decoded: DoneEvent =
+            blaze_wire::decode(&blaze_wire::encode(verdict), &blaze_wire::Limits::default())
+                .unwrap();
         assert_eq!(decoded.outcome, Outcome::Lost);
-        assert_eq!(super::super::local_action(&LocalPolicy::Fallback, &decoded.outcome), LocalAction::BuildLocally);
-        assert_eq!(super::super::local_action(&LocalPolicy::Never, &decoded.outcome), LocalAction::Fail);
-        assert_eq!(super::super::local_action(&LocalPolicy::Race, &decoded.outcome), LocalAction::BuildLocally);
-        assert_eq!(super::super::local_action(&LocalPolicy::Fallback, &Outcome::Failed), LocalAction::Take);
+        assert_eq!(
+            super::super::local_action(&LocalPolicy::Fallback, &decoded.outcome),
+            LocalAction::BuildLocally
+        );
+        assert_eq!(
+            super::super::local_action(&LocalPolicy::Never, &decoded.outcome),
+            LocalAction::Fail
+        );
+        assert_eq!(
+            super::super::local_action(&LocalPolicy::Race, &decoded.outcome),
+            LocalAction::BuildLocally
+        );
+        assert_eq!(
+            super::super::local_action(&LocalPolicy::Fallback, &Outcome::Failed),
+            LocalAction::Take
+        );
     }
 }
