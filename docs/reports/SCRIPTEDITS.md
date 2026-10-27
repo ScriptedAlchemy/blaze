@@ -560,7 +560,7 @@ files and a shell script as the build script; compiling the script is the one pa
 
 | Command (`CARGO_TARGET_DIR` shared, heavy lock, watchdog, `RUST_BACKTRACE=0`) | Result |
 |---|---|
-| `cargo +1.99.0 test -p ra-jit --bin ra-jit scripts::` | 19 passed (the 10 from before and 9 new, helper included), 0.8 s |
+| `cargo +1.99.0 test -p ra-jit --bin ra-jit scripts::` | 19 passed (the 8 from before and 11 new, the barrier test's helper included), 0.8 s |
 | `cargo +1.99.0 test --no-fail-fast -p ra-jit` | 234 passed, 0 failed |
 | `cargo +1.99.0 test -p blaze-build-script` | 47 passed, 2 failed: `a_non_utf8_checkout_is_still_listed_from_git` and `git_listed_paths_do_not_need_to_be_utf8`, `EILSEQ` from creating a non-UTF-8 file name on APFS. Not changed here; they passed on Linux in the review above. |
 | `cargo +1.99.0 fmt --all -- --check` | passed |
