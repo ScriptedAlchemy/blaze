@@ -16,7 +16,9 @@ All notable changes to ra-jit are written here. The format follows
   ends and dropped findings, and checks the protocol's invariants (exclusive leases, fencing,
   exactly-once accounting with every item terminal or `Local`, unknown names never dropped,
   progress, `Main` first, reservations within capacity) over 10,000 seeds each; a failure prints
-  the seed that replays it.
+  the seed that replays it. Kill acknowledgments name their execution and attempt, so stale
+  duplicates cannot free a reused or draining slot. Worker completion expires subscribers
+  before awarding outcomes; timer delivery order does not change their deadlines.
 
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the

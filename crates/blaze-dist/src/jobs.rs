@@ -77,6 +77,15 @@ pub enum ExecState {
     Ended(Outcome),
 }
 
+/// Identity of one assignment on an executor. A stop and its acknowledgment must name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssignmentToken {
+    /// The execution assigned to the slot.
+    pub execution: ExecutionId,
+    /// Its attempt, including reassignments within the same execution.
+    pub attempt: Attempt,
+}
+
 /// What an execution asks its driver to do, or tells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -86,7 +95,12 @@ pub enum Effect {
     /// execution `Failed` when there is none.
     NeedLead,
     /// Stop an executor's process group: the agent kills it.
-    Kill(String),
+    Kill {
+        /// The executor to stop.
+        executor: String,
+        /// Stop only this assignment, never a newer one on the same executor.
+        assignment: AssignmentToken,
+    },
     /// A subscriber is done with the execution: its own outcome and policy.
     SubscriberEnded {
         /// The subscriber.
@@ -167,6 +181,11 @@ impl Execution {
     /// Its current attempt.
     pub fn attempt(&self) -> Attempt {
         self.attempt
+    }
+
+    /// The token used by the driver to fence assignment stops and acknowledgments.
+    pub fn assignment(&self) -> AssignmentToken {
+        AssignmentToken { execution: self.id, attempt: self.attempt }
     }
 
     /// The current attempt's lead.
@@ -266,12 +285,13 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
         }
+        let previous = self.assignment();
         if self.lead.is_some() || self.work.is_some() {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
         for old in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             if old != lead && !helpers.contains(&old) {
-                out.push(Effect::Kill(old));
+                out.push(Effect::Kill { executor: old, assignment: previous });
             }
         }
         self.lead = Some(lead.to_owned());
@@ -402,6 +422,10 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
+        self.expire_subscribers(now, out);
+        if matches!(self.state, ExecState::Ended(_)) {
+            return Ok(WorkersEventsAnswer::CANCEL);
+        }
         self.heard.insert(from.to_owned(), now);
         let lead = self.lead.as_deref() == Some(from);
         if lead {
@@ -450,6 +474,33 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return;
         }
+        self.expire_subscribers(now, out);
+        if self.state != ExecState::Running {
+            return;
+        }
+        let window = self.config.heartbeat_ms * self.config.missed_heartbeats;
+        if self.lead.is_some() && now > self.lead_heard + window {
+            let lost = self.lead.take().expect("lead");
+            self.lost.insert(lost.clone());
+            out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
+            self.losses += 1;
+            if self.losses >= 2 {
+                return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
+            }
+            out.push(Effect::NeedLead);
+            return;
+        }
+        if let Some(work) = &mut self.work {
+            let mut log = Vec::new();
+            work.tick(now, &mut log);
+            out.extend(log.into_iter().map(Effect::Work));
+        }
+        self.after_work(now, out);
+    }
+
+    // Shared by timer and worker-event transitions: delivery order cannot award an
+    // expired subscriber a successful result. The protocol uses strictly past deadline.
+    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect>) {
         let late: Vec<u64> =
             self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
         for id in late {
@@ -465,27 +516,6 @@ impl Execution {
             // The latest deadline passed: the execution ends, its coverage not claimed.
             return self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
         }
-        if self.state != ExecState::Running {
-            return;
-        }
-        let window = self.config.heartbeat_ms * self.config.missed_heartbeats;
-        if self.lead.is_some() && now > self.lead_heard + window {
-            let lost = self.lead.take().expect("lead");
-            self.lost.insert(lost.clone());
-            out.push(Effect::Kill(lost));
-            self.losses += 1;
-            if self.losses >= 2 {
-                return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
-            }
-            out.push(Effect::NeedLead);
-            return;
-        }
-        if let Some(work) = &mut self.work {
-            let mut log = Vec::new();
-            work.tick(now, &mut log);
-            out.extend(log.into_iter().map(Effect::Work));
-        }
-        self.after_work(now, out);
     }
 
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
@@ -514,7 +544,7 @@ impl Execution {
 
     fn finish(&mut self, now: Millis, outcome: Outcome, out: &mut Vec<Effect>) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
-            out.push(Effect::Kill(executor));
+            out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
         for subscriber in self.subscribers.values_mut() {
             if subscriber.state == SubscriberState::Attached {
@@ -596,6 +626,7 @@ pub struct Jobs {
     running: BTreeMap<JobContent, ExecutionId>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
     pr_latest: BTreeMap<u64, ExecutionId>,
+    assignments: BTreeMap<String, (AssignmentToken, bool)>,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -610,6 +641,7 @@ impl Jobs {
             running: BTreeMap::new(),
             platforms: BTreeMap::new(),
             pr_latest: BTreeMap::new(),
+            assignments: BTreeMap::new(),
             next_execution: 1,
             next_subscriber: 1,
         }
@@ -736,7 +768,18 @@ impl Jobs {
     /// The agent stopped `executor`'s job processes after a kill: `alive` says whether the
     /// executor itself is still there (an execution ended) or gone (it had died). Only now is
     /// its reservation returned, so a lead presumed lost but still running holds its share.
-    pub fn killed(&mut self, now: Millis, executor: &str, alive: bool) {
+    pub fn killed(
+        &mut self,
+        now: Millis,
+        executor: &str,
+        assignment: AssignmentToken,
+        alive: bool,
+    ) {
+        // An acknowledgment is meaningful only for a stop we requested on this assignment.
+        if self.assignments.get(executor) != Some(&(assignment, true)) {
+            return;
+        }
+        self.assignments.remove(executor);
         if alive {
             self.admission.finished(now, executor);
         } else {
@@ -760,8 +803,19 @@ impl Jobs {
             let e = self.executions.get_mut(&admitted.execution).expect("queued");
             let mut log = Vec::new();
             e.admitted(now, &mut log);
-            let _ = e.assign(now, &admitted.executor, &[], &mut log);
+            if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
+                self.assignments.insert(admitted.executor.clone(), (e.assignment(), false));
+            }
             self.after(now, admitted.execution, log, out);
+        }
+    }
+
+    fn track_stop(&mut self, effect: &Effect) {
+        if let Effect::Kill { executor, assignment } = effect
+            && let Some((current, stopping)) = self.assignments.get_mut(executor)
+            && current == assignment
+        {
+            *stopping = true;
         }
     }
 
@@ -783,14 +837,20 @@ impl Jobs {
                 match self.admission.idle_for(&namespace, &platform, &need, &except) {
                     Some(lead) => {
                         self.admission.take(&lead, id);
-                        let _ = e.assign(now, &lead, &[], &mut more);
+                        if e.assign(now, &lead, &[], &mut more).is_ok() {
+                            self.assignments.insert(lead, (e.assignment(), false));
+                        }
                     }
                     None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
-                out.extend(more.into_iter().map(|e| (id, e)));
+                for effect in more {
+                    self.track_stop(&effect);
+                    out.push((id, effect));
+                }
                 continue;
             }
+            self.track_stop(&effect);
             out.push((id, effect));
         }
         let e = &self.executions[&id];
