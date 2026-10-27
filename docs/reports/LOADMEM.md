@@ -429,6 +429,29 @@ Cargo request, and keeps the last published files for a same-daemon retry. Publi
 pressure again at object finalization. The bounded harness exercises relief within the grace
 and a persistent-pressure failure followed by recovery of the unchanged edit.
 
+**Measured**, 2026-10-27, runtime source `ab96113f`, macOS AArch64, Rust 1.99.0,
+Cranelift, n=1: the bounded warm-daemon sequence passes. Critical pressure blocks new
+entries while an admitted definition finishes. Object, patch and executable hashes stay
+unchanged until success. Relief completes the same patch; persistent critical pressure
+after drain returns a transient error, retains the worker and warm base, and recovery
+retries with no changed files as a patch. The final unchanged request succeeds. The fixture
+uses 24 changed definitions, generics, closures and function-pointer/static relocations
+with a 64 MiB soft target. It does not allocate toward host exhaustion.
+
+At the same pin, focused production tests pass: budget 10, pressure/eviction 8, patch 2.
+The one-slot controller test verifies FIFO progress, cross-thread dependent slot lifetime
+and unwind accounting. The daemon component test stops a real child through `fit`, blocks
+identical retries and exercises changed request/source/configuration through `warm`;
+unknown footprint remains observable. Native OS signal and Linux partial-signal tests
+pass. Release build, formatting and diff checks pass. Each heavy command used the shared-target
+heavy lock and footprint/swap watchdog; no trip. These are correctness observations, not
+speedups. Logs and commands: `blaze-targets/u7-pressure-recovery` and the coordinator report
+`reviews/u7-pr7-pressure-recovery-publication-sol.md`.
+
+This closes the controlled warm patch/retry and component liveness/eviction milestones,
+not genuine aggregate pressure across compiler workers. LLVM/runtime, arbitrary coroutine
+and semantic-debug differentials remain outside this bounded validation.
+
 ### Current validation
 
 **Measured**, 2026-10-26, runtime sources at `f1dedc0b`, Rust 1.99.0, Cranelift. All runs
