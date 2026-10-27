@@ -21,9 +21,9 @@ use tokio::{
 };
 
 /// How often a transfer that broke off is taken up again where it stopped.
-const RESUMES: u32 = 6;
+pub(super) const RESUMES: u32 = 6;
 /// The wait before the first of those; each one after waits twice as long.
-const FIRST_WAIT: Duration = Duration::from_millis(250);
+pub(super) const FIRST_WAIT: Duration = Duration::from_millis(250);
 const CHUNK: usize = 1 << 16;
 
 /// The SHA-256 of an object, which is its name on the remote.
@@ -31,6 +31,14 @@ const CHUNK: usize = 1 << 16;
 pub(crate) struct Digest([u8; 32]);
 
 impl Digest {
+    pub(super) fn wire(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(super) fn from_wire(bytes: [u8; 32]) -> Digest {
+        Digest(bytes)
+    }
+
     pub(crate) fn of(bytes: &[u8]) -> Digest {
         Digest(Sha256::digest(bytes).into())
     }
@@ -184,6 +192,9 @@ pub(super) enum Body {
     File(File),
     S3(ByteStream),
     Http(hyper::body::Incoming),
+    /// An object with nothing left: what a server answers when it is asked for the rest of one
+    /// that ends before the byte asked for.
+    Nothing,
 }
 
 impl Body {
@@ -197,6 +208,7 @@ impl Body {
             }
             Body::S3(stream) => Ok(stream.try_next().await?.map(|it| it.to_vec())),
             Body::Http(body) => super::https::next(body).await,
+            Body::Nothing => Ok(None),
         }
     }
 }

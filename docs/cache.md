@@ -179,9 +179,10 @@ These act on the store `cargo ra-jit status` names.
 
 ## The remote
 
-A remote is a directory, `s3://bucket/prefix`, or an `https://` address it is only read from,
+A remote is a directory, `s3://bucket/prefix`, an `https://` address it is only read from,
 whose files are named by their paths with `.` for `/` (a GitHub release's assets: see "The
-standard library" below). It holds sealed packs under the hash of
+standard library" below), or a `blaze+http://host:port` cache server (see "The server" below).
+It holds sealed packs under the hash of
 their bytes, a list of the keys in each pack, and one manifest per project that lists the
 packs that project's builds were served from.
 
@@ -227,6 +228,73 @@ push. A daemon killed with SIGKILL pushes nothing on its way out; the next push 
 
 `RA_JIT_REMOTE` needs the local store (`RA_JIT_CACHE` not `off`): the remote fills and
 reads it.
+
+### The server
+
+`ra-jit serve` shares today's cache layout over HTTP/1.1. It is unit C3 of
+[distributed.md](distributed.md).
+`ra-jit cache serve` is an alias.
+
+    ra-jit serve --cache DIR --listen 127.0.0.1:7878
+
+Without `--listen`, the address is `127.0.0.1:7878`. There is no authentication or TLS in
+this unit. Anyone who can reach the port can read, write and delete cache objects.
+An explicit non-loopback address prints a warning. Deployment access remains the
+operator's Tailscale ACLs. This unit adds no capabilities or sandbox policy.
+
+A client uses the `blaze+http` place. Addresses have a host and port, without credentials,
+a path prefix or a query. `blaze+https` is refused rather than downgraded to plaintext.
+
+    ra-jit cache push blaze+http://HOST:PORT
+    ra-jit cache pull blaze+http://HOST:PORT
+
+Push, pull, lazy fetch, the keeper, dependency units and remote collection use the existing
+transfer code. The server keeps `packs/`, `keys/`, `units/`, `manifests/` and `deps/`.
+A directory remote can read that layout.
+
+The server has these calls.
+
+| Call | Behavior |
+|---|---|
+| `POST /v1/hello` | Version 1 and the documented limits, encoded by `blaze-wire` in deterministic CBOR. |
+| `POST /v1/cache/missing` | Up to 4,096 digests, answered from the existence set. The client splits larger requests. |
+| `GET`, `HEAD`, `PUT`, `DELETE /v1/blob/<name>` | Today's blob names, such as `packs/<sha256>.pack`. |
+| `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>` | Today's text lists, with content-hash ETags and conditional PUT. |
+| `GET /v1/objects?prefix=<prefix>` | A CBOR listing for remote collection. The prefix names a cache directory. |
+
+A bare `/v1/blob/<sha256>` PUT stores raw content in `units/`. GET and HEAD find the
+existing object named by that digest. Today's named paths distinguish compressed packs
+from raw content. Compressed packs are named by the uncompressed pack's digest.
+
+A PUT streams to a temporary file. Verification hashes raw content or decompresses and hashes
+a compressed pack without reading the whole upload into memory. Packs must have this store's
+format header. The server then syncs the file, renames it and syncs the directory.
+Interrupted or invalid uploads never appear under the final name. Concurrent publication and
+deletion update the disk and existence set in the same order.
+An explicit reupload replaces the whole object and refreshes its write time for collection.
+
+GET supports partial, open-ended and suffix byte ranges. Successful ranges return `206`
+with `Content-Range`. Invalid or unsatisfiable ranges return `416`. HEAD returns the same
+length without a body. Lists use `If-Match` or `If-None-Match: *` to avoid lost updates.
+A failed condition returns code 6 with status `409`, and the client reads again.
+
+The existence set is a hint. Files changed directly behind the server are not reflected in
+that set until a rescan or restart. Fetches still read the file, and clients verify its digest.
+Direct filesystem writers do not participate in the server's conditional-write lock.
+
+`hello` returns an Ed25519 public key persisted in `DIR/key`, a placeholder Main epoch of 1,
+and an empty identity set. C3 has no records or identity restrictions. Records, generation
+lookup, root-based collection and coordinator jobs remain separate units.
+
+The `/v1` route family is not the CBOR codec version. This C3 checkout supports only the
+C1 codec, `blaze_wire::VERSION == 1`. Both peers advertise that constant and require the
+selected version to match. A future codec-2 client cannot negotiate codec 1 through this
+server. Codec changes require coordinated server and client builds with the new wire types.
+This unit does not decode old envelopes as a newer schema.
+
+`python3 -I harness/remote.py --server` exercises the server alongside available S3 services.
+`--server --transfers-only` runs its transfer, damage and signing checks without compiler
+round trips. Neither command measures a speedup.
 
 ### The standard library
 
@@ -285,9 +353,10 @@ signer is trusted completely; ra-jit does not compile again to check them. Under
 sits one assumption: two machines with the same ra-jit binary compile the same key to
 equivalent code.
 
-The harness checks, against both servers: a pack truncated, extended, emptied or with one
-byte flipped; a different valid pack under another's name; a listed pack that is missing;
-and manifests that are forged, unsigned, or signed by an unlisted key.
+The harness checks, against both servers and the cache server of "The server" below: a pack
+truncated, extended, emptied or with one byte flipped; a different valid pack under another's
+name; a listed pack that is missing; and manifests that are forged, unsigned, or signed by an
+unlisted key.
 
 There is no `SECURITY.md` in the repository at the commit these docs were written against.
 
@@ -332,6 +401,9 @@ nothing about a real network. The full tables are in [results.md](results.md).
 
 - Real AWS has not been run.
 - Windows and macOS were not run for the remote; the harness is Linux only.
+- The cache server's verification results are reported per run. No server timing is claimed.
+- A cache server holds no records yet: a push still sends every pack its manifest lacks, and
+  there is no batch lookup of a build's crates (C5).
 - When one fetch runs out of retries the remote is taken to be down and that process's
   other transfers stop. The next run resumes them.
 - A merged pack is held twice on the remote until someone runs `cache gc --remote`.
