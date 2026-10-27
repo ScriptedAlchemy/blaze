@@ -117,6 +117,26 @@ struct Dylib {
     hash: OnceLock<Option<[u8; KEY]>>,
 }
 
+#[cfg(test)]
+mod dylib_identity_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_at_the_same_path_is_not_the_previous_expansion_library() {
+        let path = std::env::temp_dir().join(format!("c4-macro-{}.dylib", std::process::id()));
+        std::fs::write(&path, b"macro-one").unwrap();
+        let absolute = AbsPathBuf::assert_utf8(path.clone());
+        let first = Dylib::at(&absolute);
+        let before = *first.hash().unwrap();
+        let timestamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"macro-two").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(timestamp).unwrap();
+        let second = Dylib::at(&absolute);
+        assert_ne!(before, *second.hash().unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 impl Dylib {
     /// The one dylib at `path`: the macros of a dylib share its hash.
     fn at(path: &AbsPath) -> Arc<Dylib> {
