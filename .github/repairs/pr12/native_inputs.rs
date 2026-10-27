@@ -11,7 +11,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::bail;
 use sha2::{Digest as _, Sha256};
 
 use crate::{Args, Program, RootDatabase};
@@ -24,6 +24,7 @@ static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Digest>>> =
 struct Inputs {
     directives: Vec<Vec<u8>>,
     paths: BTreeSet<PathBuf>,
+    opaque: bool,
 }
 
 /// A link's proposed identity. Dropping it after a failed build publishes nothing.
@@ -63,82 +64,150 @@ fn collect(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(PathBuf, In
     for &root in &roots {
         let root: ide_db::base_db::Crate = root.into();
         for krate in std::iter::once(root).chain(root.transitive_deps(db)) {
-            if krate.data(db).origin.is_lang() {
-                continue;
-            }
-            if let Some(out) = krate.env(db).get("OUT_DIR") {
+            if !krate.data(db).origin.is_lang()
+                && let Some(out) = krate.env(db).get("OUT_DIR")
+            {
                 out_dirs.insert(PathBuf::from(out));
             }
         }
     }
-    let cwd = std::env::current_dir()?;
     let mut inputs = Inputs::default();
-    for out in out_dirs {
-        let Some(printed) = crate::cargo::script::printed(&out) else { continue };
-        inputs.paths.insert(printed.clone());
-        let text = match fs::read_to_string(&printed) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("reading {}", printed.display())),
-        };
-        let mut native = false;
-        for line in text.lines() {
-            let Some(line) = line.strip_prefix("cargo:") else { continue };
-            let line = line.strip_prefix(':').unwrap_or(line);
-            let Some((key, value)) = line.split_once('=') else { continue };
-            if !key.starts_with("rustc-link-") && key != "rustc-flags" {
-                continue;
-            }
-            native = true;
-            inputs.directives.push(line.as_bytes().to_vec());
-            if key == "rustc-link-search" {
-                let path = match value.split_once('=') {
-                    Some(("native" | "dependency" | "crate" | "framework" | "all", path)) => path,
-                    _ => value,
-                };
-                inputs.paths.insert(cwd.join(path));
-            } else if key.starts_with("rustc-link-arg") {
-                // Include explicit files and response/linker scripts in addition to OUT_DIR.
-                for word in value.trim_start_matches("-Wl,").split(',') {
-                    let word = word.split_once('=').map_or(word, |(_, value)| value);
-                    let word = word.strip_prefix('@').unwrap_or(word);
-                    if !word.is_empty() && !word.starts_with('-') {
-                        let path = cwd.join(word);
-                        if path.is_file()
-                            || path.extension().is_some_and(|ext| {
-                                matches!(ext.to_str(), Some("a" | "o" | "so" | "dylib" | "lib" | "obj" | "ld" | "rsp"))
-                            })
-                        {
-                            inputs.paths.insert(path);
-                        }
-                    }
-                }
-            } else if key == "rustc-flags" {
-                let mut words = value.split_whitespace();
-                while let Some(word) = words.next() {
-                    if let Some(path) = word.strip_prefix("-L") {
-                        let path = if path.is_empty() { words.next().unwrap_or("") } else { path };
-                        let path = match path.split_once('=') {
-                            Some(("native" | "dependency" | "crate" | "framework" | "all", path)) => path,
-                            _ => path,
-                        };
-                        if !path.is_empty() {
-                            inputs.paths.insert(cwd.join(path));
-                        }
-                    }
-                }
-            }
-        }
-        if native {
-            inputs.paths.insert(out);
+    for out in &out_dirs {
+        if let Some(printed) = crate::cargo::script::printed(out) {
+            inputs.paths.insert(printed);
         }
     }
-    // Include the effective native link order and flags, not merely a sorted set of packages.
-    // Empty object inputs avoid tracking the Rust objects this build itself is about to write.
+    let cwd = std::env::current_dir()?;
     let sysroot = crate::SYSROOT.get().and_then(Option::as_deref);
-    inputs.directives.push(crate::link::command(db, &roots, &[], sysroot, binary)?.into_bytes());
-    // Keep an explicit identity even when the last native script was removed.
+    // Use the real native link builder, including attribute-declared libraries and ordering.
+    // Do not put the Rust objects this build writes into its own input fingerprint.
+    let command = crate::link::command(db, &roots, &[], sysroot, binary)?;
+    inputs.link_inputs(&command, &cwd, &out_dirs);
+    for name in ["LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH"] {
+        let mut field = name.as_bytes().to_vec();
+        match std::env::var_os(name) {
+            Some(value) => {
+                field.push(1);
+                field.extend_from_slice(value.as_encoded_bytes());
+            }
+            None => field.push(0),
+        }
+        inputs.directives.push(field);
+    }
+    // A native search directory may also contain this build's outputs. They are not inputs.
+    for path in std::iter::once(&args.out)
+        .chain(args.patch.iter())
+        .chain(args.exe.iter())
+        .chain(args.splice.iter())
+        .chain(args.prebuilt.iter())
+    {
+        inputs.paths.remove(&cwd.join(path));
+    }
     Ok(Some((binary.clone(), inputs)))
+}
+
+impl Inputs {
+    /// Track named native candidates, not every file in a search directory. Missing earlier
+    /// candidates matter too: creating one can change which library the linker selects.
+    fn link_inputs(&mut self, command: &str, cwd: &Path, out_dirs: &BTreeSet<PathBuf>) {
+        self.directives.push(command.as_bytes().to_vec());
+        let Some(words) = shlex::split(command) else {
+            self.opaque = true;
+            return;
+        };
+        let words: Vec<String> = words.into_iter().skip(1).flat_map(|word| {
+            match word.strip_prefix("-Wl,") {
+                Some(rest) => rest.split(',').map(str::to_owned).collect(),
+                None => vec![word],
+            }
+        }).collect();
+        let mut search = out_dirs.clone();
+        if let Some(paths) = std::env::var_os("LIBRARY_PATH") {
+            search.extend(std::env::split_paths(&paths).map(|path| cwd.join(path)));
+        }
+        let mut frameworks = BTreeSet::new();
+        let mut libraries = BTreeSet::new();
+        let mut framework_names = BTreeSet::new();
+        let mut at = 0;
+        while at < words.len() {
+            let word = &words[at];
+            at += 1;
+            let mut next = || {
+                let found = words.get(at).cloned();
+                at += usize::from(found.is_some());
+                found
+            };
+            match word.as_str() {
+                "-o" | "--output" | "-Map" | "--Map" | "-map" | "-dependency_info" => {
+                    if next().is_none() { self.opaque = true; }
+                }
+                "-L" | "-F" => match next() {
+                    Some(path) if word == "-L" => { search.insert(cwd.join(path)); }
+                    Some(path) => { frameworks.insert(cwd.join(path)); }
+                    None => self.opaque = true,
+                },
+                "-l" => match next() {
+                    Some(name) => { libraries.insert(name); }
+                    None => self.opaque = true,
+                },
+                "-framework" | "-weak_framework" => match next() {
+                    Some(name) => { framework_names.insert(name); }
+                    None => self.opaque = true,
+                },
+                "-T" | "--script" | "--version-script" | "--dynamic-list"
+                | "-exported_symbols_list" | "-unexported_symbols_list" | "-order_file" => {
+                    match next() {
+                        Some(path) => { self.paths.insert(cwd.join(path)); }
+                        None => self.opaque = true,
+                    }
+                }
+                _ if word.starts_with("-L") && word.len() > 2 => { search.insert(cwd.join(&word[2..])); }
+                _ if word.starts_with("-F") && word.len() > 2 => { frameworks.insert(cwd.join(&word[2..])); }
+                _ if word.starts_with("-l") && word.len() > 2 => { libraries.insert(word[2..].to_owned()); }
+                _ if word.starts_with('@') => {
+                    self.paths.insert(cwd.join(&word[1..]));
+                    // Linkers have different response grammars. Do not guess their input
+                    // closure: this invocation links in full and does not advertise reuse.
+                    self.opaque = true;
+                }
+                _ => {
+                    let file = word.split_once('=').filter(|(flag, _)| {
+                        matches!(*flag, "--script" | "--version-script" | "--dynamic-list")
+                    }).map(|(_, path)| path);
+                    if let Some(file) = file {
+                        self.paths.insert(cwd.join(file));
+                    } else if !word.starts_with('-') {
+                        let path = cwd.join(word);
+                        let native = path.extension().is_some_and(|ext| {
+                            matches!(ext.to_str(), Some("a" | "o" | "so" | "dylib" | "lib" | "obj" | "ld" | "tbd"))
+                        });
+                        if native || path.is_file() {
+                            self.paths.insert(path);
+                        }
+                    }
+                }
+            }
+        }
+        for dir in search {
+            for name in &libraries {
+                if let Some(name) = name.strip_prefix(':') {
+                    self.paths.insert(dir.join(name));
+                } else {
+                    for suffix in ["a", "so", "dylib", "tbd"] {
+                        self.paths.insert(dir.join(format!("lib{name}.{suffix}")));
+                    }
+                    self.paths.insert(dir.join(format!("{name}.lib")));
+                }
+            }
+        }
+        for dir in frameworks {
+            for name in &framework_names {
+                let framework = dir.join(format!("{name}.framework"));
+                self.paths.insert(framework.join(name));
+                self.paths.insert(framework.join(format!("{name}.tbd")));
+            }
+        }
+    }
 }
 
 pub(crate) fn stale(db: &RootDatabase, programs: &[Program]) -> anyhow::Result<bool> {
@@ -194,6 +263,9 @@ fn pending(binary: PathBuf, inputs: Inputs) -> Pending {
 
 impl Inputs {
     fn digest(&self) -> io::Result<Digest> {
+        if self.opaque {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "native input closure is not known"));
+        }
         let mut hash = Sha256::new();
         frame(&mut hash, b"blaze/native-link-inputs/v1");
         frame(&mut hash, &(self.directives.len() as u64).to_le_bytes());
@@ -227,7 +299,6 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
         frame(hash, b"symlink");
         let target = fs::read_link(path)?;
         frame(hash, target.as_os_str().as_encoded_bytes());
-        // canonicalize diagnoses cycles; dangling links retain both their target and absence.
         match path.canonicalize() {
             Ok(target) => return hash_path(&target, hash, active),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -249,9 +320,7 @@ fn hash_path(path: &Path, hash: &mut Sha256, active: &mut BTreeSet<PathBuf>) -> 
         let mut buffer = [0; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
+            if read == 0 { break; }
             file_hash.update(&buffer[..read]);
         }
         frame(hash, &file_hash.finalize());
@@ -281,7 +350,46 @@ mod tests {
     use super::*;
 
     fn inputs(path: &Path) -> Inputs {
-        Inputs { directives: vec![b"rustc-link-lib=static=generated".to_vec()], paths: BTreeSet::from([path.to_owned()]) }
+        Inputs { directives: vec![b"rustc-link-lib=static=generated".to_vec()], paths: BTreeSet::from([path.to_owned()]), opaque: false }
+    }
+
+    #[test]
+    fn a_search_directory_does_not_hash_the_link_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("libgenerated.a"), b"native").unwrap();
+        let mut inputs = Inputs::default();
+        inputs.link_inputs("cc -L. -lgenerated -o program", dir.path(), &BTreeSet::new());
+        let before = inputs.digest().unwrap();
+        fs::write(dir.path().join("program"), b"new executable").unwrap();
+        fs::write(dir.path().join("ra-jit.o"), b"new Rust object").unwrap();
+        fs::write(dir.path().join("unrelated.log"), b"progress").unwrap();
+        assert_eq!(inputs.digest().unwrap(), before);
+    }
+
+    #[test]
+    fn an_earlier_native_candidate_appearing_invalidates_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("first")).unwrap();
+        fs::create_dir(dir.path().join("second")).unwrap();
+        fs::write(dir.path().join("second/libvalue.a"), b"B").unwrap();
+        let mut inputs = Inputs::default();
+        inputs.link_inputs("cc -Lfirst -Lsecond -lvalue -o program", dir.path(), &BTreeSet::new());
+        let before = inputs.digest().unwrap();
+        fs::write(dir.path().join("first/libvalue.a"), b"A").unwrap();
+        assert_ne!(inputs.digest().unwrap(), before);
+    }
+
+    #[test]
+    fn opaque_response_inputs_disable_reuse_without_refusing_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inputs = Inputs::default();
+        inputs.link_inputs("cc -Wl,@native.rsp -o program", dir.path(), &BTreeSet::new());
+        assert!(inputs.digest().is_err());
+        let binary = dir.path().join("program");
+        let pending = pending(binary.clone(), inputs);
+        assert!(pending.changed());
+        pending.commit().unwrap();
+        assert!(!crate::lock(&LINKED_INPUTS).contains_key(&binary));
     }
 
     #[test]
