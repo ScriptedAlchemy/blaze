@@ -657,9 +657,7 @@ two more, both reproduced by the fixtures below.
   took `scripts::load_env()` whatever the owner: A's request `GEN=a` joined S and S's first run was `GEN=load`
   (`include=load env=load cfg=other native=108`, where cargo says `a a a 97`), and A's `Standing` decision kept
   it. The request's variables are passed through `join`, `add` and `add_once`; the first load keeps the startup's.
-  Observed, not changed: the worker judges a checkout it has loaded again for every build, with the variables
-  that checkout was last asked with, so B's build runs S's script again with A's variables. S's script
-  runs once in each build; the variables are the checkout's own.
+  That "observed, not changed" was the next finding (below).
 
 | scenario (Linux, hand-started worker, Docker `rust:1.99.0-bookworm`) | baseline `d592dd49` (+ the `released` barrier hook, nothing else) | fixed |
 |---|---|---|
@@ -670,6 +668,32 @@ Regression on the fixed binary in the same batches: `once`, `once-failed`, `reco
 `unrelated`, `groups` pass. A first attempt of `recovery-detached` ran the recovery as `ok unchanged` on the main loop and
 could not reach the detached link; it is kept, not counted. Evidence: further batches in
 `p05r-evidence/build-once-waiting-recovery-600411b9/`, with the binaries.
+
+### A request judges the checkouts it reads (`6bcfea42` → this head)
+
+The third independent review found the rest of that observation to be a defect. The check of a request
+visited every full checkout; those the request does not read were judged with the variables they were last
+asked with, under the request's build number, and a script that runs executed then and its result stood
+as that build's: B's request for R ran S's script with A's `GEN=a`, and B's explicit later request for S with
+`GEN=b` found a `Standing` decision of `a` (no freshness look at all) and consumed `include=a`.
+`Checkouts::stale` now judges (and loads again) only the checkout the request reads and the one it shares
+packages with (`reached`); a request for a project that is not loaded still looks at every checkout, as it
+joins them. Another checkout is judged for the build that asks for it, with that request's variables, as its
+first judgment, once. Nothing is run a second time to correct the first, and no decision is keyed by
+variables. What is given up: a loaded checkout nobody asks for is not noticed to be stale (its watched files,
+its scripts) until someone does; it is not read by anyone else's program, and its world is only pinned by
+programs built from it. The initial load, the join's first run and the recovery's variables are unchanged.
+
+| `once`, B's build asks for R (`GEN=b`) and then, before it is retired, for S (`GEN=b`); S's script runs every build | baseline `6bcfea42` | fixed |
+|---|---|---|
+| S's trail after B's request for R | `a A`, `a A` (S ran for B with A's variables) | `a A` (B's request for R ran nothing of S) |
+| B-S executed | `include=a env=a cfg=a native=97` (cargo: `b b b 98`) | `include=b env=b cfg=b native=98` = cargo's |
+| S's runs | A once, B once (the wrong variables) | A once (`a`), B once (`b`) |
+
+Regression on the fixed binary in the same batch: `once-failed`, `recovery`, `join`, `worlds`, `unrelated`,
+`groups` pass; the detached recovery witness was not repeated (the change does not touch it).
+Component: `reached` for a project that is not loaded, its own checkout, and a split's base. Mac `scripts::`,
+`recovery::` and `reached` 40 passed.
 
 ### What is not shown, not fixed, or wider
 
