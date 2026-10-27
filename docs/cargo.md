@@ -147,7 +147,10 @@ Build scripts and proc macros are still built and run as the daemon's load does
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which builds what was
 edited since on what it loaded and links the programs again; a changed manifest or lock file
-has a new worker load the workspace.
+has a new worker load the workspace. Each build links its programs into a directory of its own
+under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
+checkout of it, so a build with other features, another profile, another target or other
+flags is the program cargo would have built, not the one another build linked before.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit

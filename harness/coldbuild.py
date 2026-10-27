@@ -65,6 +65,16 @@ pub fn counted(words: &str) -> BTreeMap<&str, usize> {
 }
 """,
 }
+# A program whose source is the same under two feature sets, so that only the features decide
+# what it prints: the whole build must build it again for each, as cargo does, at one path.
+FEATURES = {
+    "Cargo.toml": '[package]\nname = "kfeat"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                  '[features]\nx = []\n',
+    "src/main.rs": """fn main() {
+    if cfg!(feature = "x") { println!("with x") } else { println!("without x") }
+}
+""",
+}
 # What blaze cannot compile yet: `f128` (docs/no-rustc.md, step G). `kbad`'s own `main` has
 # one; `kuses` reaches a library's function that has one, whose stand-in would be left in the
 # executable.
@@ -183,6 +193,28 @@ def fixtures():
     check("`cargo blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (reference.returncode, reference.stdout),
           f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}\ncargo's: {reference.stdout!r}")
     check("  ... and it is in target/debug/examples", os.path.exists(os.path.join(ws, "target", "debug", "examples", "kex")))
+
+    # The features are part of which build it is: each set is the program cargo builds, also
+    # when the other set's program is already at the one path cargo has.
+    feat = os.path.join(root, "feat")
+    write(feat, FEATURES)
+    steps = [("--features x", "with x"), ("", "without x"),
+             ("--features x", "with x"), ("", "without x")]
+    for at, (flags, expected) in enumerate(steps):
+        args = flags.split()
+        reference, _ = cargo(feat, env, os.path.join(root, "feat-ref"), "build", *args)
+        assert reference.returncode == 0, reference.stderr[-3000:]
+        ran, _ = blaze(feat, env, "build", *args)
+        said = ran.stdout + ran.stderr
+        what = " ".join(["`cargo blaze build", *args, "`"])
+        check(f"{what}: builds", ran.returncode == 0, said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(feat, "target")), said)
+        program = os.path.join(feat, "target", "debug", "kfeat")
+        ours = printed(program) if os.path.exists(program) else None
+        theirs = printed(os.path.join(root, "feat-ref", "debug", "kfeat"))
+        check(f"  ... and prints what cargo's does ({expected})", ours == theirs and ours is not None and ours[1].strip() == expected,
+              f"step {at}: blaze's printed {ours!r}, cargo's {theirs!r}")
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=feat, env=env, capture_output=True, timeout=120)
 
     for package, whose in (("kbad", "its own"), ("kuses", "a library's")):
         ran, _ = blaze(bad, env, "build", "-p", package)

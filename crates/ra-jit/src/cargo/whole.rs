@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -68,8 +68,16 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     if programs.is_empty() {
         return Ok(None);
     }
-    let dir = metadata.target_directory.as_std_path().join("ra-jit/whole");
+    let root = metadata.workspace_root.as_std_path();
+    let project = programs.first().map(|it| super::state::package_dir(&it.package));
+    let project = project.as_deref().unwrap_or(root);
+    let config = config_of(asked, root, project);
+    // One directory per build of the checkout, as the daemon names it: the features, the
+    // profile, the target and the variables that change what is compiled are all in that
+    // name, so the program one build links is never the one another places.
+    let dir = dir_of(&config, metadata.target_directory.as_std_path());
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    collect_other_builds(metadata.target_directory.as_std_path(), &dir);
     for program in &programs {
         let package = &program.package;
         let at = super::state::package_dir(package);
@@ -79,7 +87,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
             &format!("{} v{} ({})", package.name, package.version, at.display()),
         );
     }
-    if let Err(why) = whole(asked, &cwd, &metadata, &programs, &dir) {
+    if let Err(why) = whole(asked, &cwd, &metadata, &config, &programs, &dir) {
         say::error(&why);
         return Ok(Some(FAILED));
     }
@@ -100,10 +108,11 @@ fn whole(
     asked: &Invocation,
     cwd: &Path,
     metadata: &Metadata,
+    config: &WorkerConfig,
     programs: &[Program],
     dir: &Path,
 ) -> Result<(), String> {
-    let checkout = checkout(asked, cwd, metadata, programs, dir);
+    let checkout = checkout(asked, cwd, metadata, config, programs, dir);
     let reply = client::ask(Request::Build(super::asking(&checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
     let built = match reply {
@@ -144,26 +153,33 @@ fn whole(
     Ok(())
 }
 
-/// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
-fn checkout(
-    asked: &Invocation,
-    cwd: &Path,
-    metadata: &Metadata,
-    programs: &[Program],
-    dir: &Path,
-) -> Checkout {
-    let root = metadata.workspace_root.as_std_path();
-    let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.to_owned(), |it| cwd.join(it));
-    let project = programs.first().map(|it| super::state::package_dir(&it.package));
-    let project = project.as_deref().unwrap_or(root);
-    let config = WorkerConfig {
+/// The worker configuration a whole build of `asked` is, of the workspace at `root` whose
+/// program is in `project`: what loading the workspace and compiling its programs reads. Two
+/// builds with the same one are the same build, whatever spelling of the flags asked for them.
+fn config_of(asked: &Invocation, root: &Path, project: &Path) -> WorkerConfig {
+    let asked_in =
+        asked.flags.manifest_path.as_ref().map_or_else(|| root.to_owned(), |it| root.join(it));
+    WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
         cfg_test: false,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
         whole: true,
-    };
+    }
+}
+
+/// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
+fn checkout(
+    asked: &Invocation,
+    cwd: &Path,
+    metadata: &Metadata,
+    config: &WorkerConfig,
+    programs: &[Program],
+    dir: &Path,
+) -> Checkout {
+    let root = metadata.workspace_root.as_std_path();
+    let config = config.clone();
     let plans = programs.iter().map(|program| Linked {
         crates: vec![program.root.clone()],
         object: dir.join(format!("{}.o", program.name)),
@@ -332,6 +348,42 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
     Ok(run::exit_code(status))
 }
 
+/// The directory a whole build of `config`, under `target`, links its programs in: one per
+/// build of the checkout, named as the daemon names the worker of it. Two builds of one
+/// program with different features, profile, target or variables put it where cargo does,
+/// which is one path, so they must not share the file that is linked before it is placed
+/// there.
+fn dir_of(config: &WorkerConfig, target: &Path) -> PathBuf {
+    target.join("ra-jit").join("whole").join(config.id())
+}
+
+/// The directories a whole build of another set of flags linked its programs in, once they
+/// are this old: space, not correctness, as a directory that stays is found again next time.
+const OTHER_BUILDS_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Deletes the directories of whole builds of the checkout under `target` that are older than
+/// [`OTHER_BUILDS_FOR`] and that `keep` is not. A build with other features, another profile,
+/// another target or other flags has a directory of its own, and the ones of builds that long
+/// past are not what the next build of those flags links into.
+fn collect_other_builds(target: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(target.join("ra-jit").join("whole")) else { return };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let old = std::fs::metadata(&path)
+            .and_then(|it| it.modified())
+            .ok()
+            .and_then(|it| now.duration_since(it).ok())
+            .is_some_and(|it| it > OTHER_BUILDS_FOR);
+        if old {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// The programs `asked` builds, each executable root of the build, as blaze plans it with its
 /// own resolution, or as cargo's unit graph has them where blaze cannot.
 fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Result<Vec<Program>> {
@@ -399,4 +451,44 @@ fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Resul
         });
     }
     Ok(programs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cargo::cli::Asked;
+
+    /// A whole build of one program, as `cargo ra-jit build` of `args` is it, with the
+    /// configuration the daemon would load for it.
+    fn config(args: &str) -> WorkerConfig {
+        let words = std::iter::once("build").chain(args.split_whitespace());
+        let asked = match Asked::parse(words.map(str::to_owned).collect()) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        config_of(&asked, Path::new("/ws"), Path::new("/ws"))
+    }
+
+    /// The file a whole build of `args` links its program into, before it places it where
+    /// cargo has it. Two builds whose program differs in what it compiles must not share it:
+    /// the one of the second would be placed from a file the first linked.
+    #[test]
+    fn a_build_links_into_a_directory_of_its_own() {
+        let target = Path::new("/ws/target");
+        let linked = |args: &str| dir_of(&config(args), target).join("app");
+        assert_ne!(linked("--features x"), linked(""));
+        assert_ne!(linked("--release"), linked(""));
+        assert_ne!(linked("--target aarch64-unknown-linux-gnu"), linked(""));
+        assert_ne!(linked("--no-default-features"), linked(""));
+        assert_ne!(linked("--all-features"), linked(""));
+        assert_ne!(linked("--config profile.dev.opt-level=2"), linked(""));
+        // A build of the same flags again is the same directory, and places the same file,
+        // whatever the spelling of the flags that asked for it.
+        assert_eq!(linked("--features x"), linked("--features x"));
+        assert_eq!(linked("--features x"), linked("-F x"));
+        assert_eq!(linked("--release"), linked("-r"));
+        assert_eq!(linked(""), linked(""));
+        // Under the target directory, beside the daemon's other files.
+        assert!(linked("--features x").starts_with(target.join("ra-jit/whole")));
+    }
 }
