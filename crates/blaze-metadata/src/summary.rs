@@ -15,6 +15,60 @@ use url::Url;
 
 const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
 
+#[cfg(test)]
+mod native_pin_tests {
+    #[test]
+    fn native_dependency_source_matches_previous_locked_json_rule() {
+        use blaze_manifest::manifest::{EitherManifest, read_manifest};
+        use blaze_manifest::{Config, Context};
+        let root =
+            std::env::temp_dir().join(format!("blaze-native-summary-pin-{}", std::process::id()));
+        assert!(!root.exists());
+        std::fs::create_dir_all(root.join("a/src")).unwrap();
+        std::fs::create_dir_all(root.join("b/src")).unwrap();
+        std::fs::write(root.join("a/Cargo.toml"),"[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nb={path='../b'}\n").unwrap();
+        std::fs::write(root.join("a/src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("b/Cargo.toml"),
+            "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b/src/lib.rs"), "").unwrap();
+        let url = url::Url::parse("file:///native-pin-fixture").unwrap();
+        let manifest_source = blaze_manifest::source::SourceId::for_git(
+            &url,
+            cargo_util_schemas::core::GitReference::Branch("fixture".into()),
+        );
+        let config = Config::load(
+            &root,
+            vec![("CARGO_HOME".to_owned(), root.join("home").to_str().unwrap().to_owned())],
+            &[],
+        )
+        .unwrap();
+        let ctx = Context::new(config);
+        let path = root.join("a/Cargo.toml");
+        let EitherManifest::Real(manifest) = read_manifest(&path, manifest_source, &ctx).unwrap()
+        else {
+            panic!("real manifest")
+        };
+        let locked = "git+file:///native-pin-fixture?branch=fixture#0123456789012345678901234567890123456789";
+        let native = super::native_manifest(&manifest, Some(locked)).unwrap();
+        let mut exported = blaze_manifest::metadata::export_package(&path, &manifest);
+        exported.set_source(locked.to_owned());
+        let previous = super::read(&serde_json::to_value(exported).unwrap()).unwrap();
+        assert!(native.summary.source_id().full_eq(previous.summary.source_id()));
+        let actual = native.summary.dependencies()[0].source_id();
+        let expected = previous.summary.dependencies()[0].source_id();
+        assert_eq!(actual, expected, "ordinary equality may ignore precise");
+        let strict = actual.full_eq(expected);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            strict,
+            "native dependency precise source must match prior set_source boundary: actual={actual:?}, expected={expected:?}"
+        );
+    }
+}
+
 /// Resolver inputs from the native manifest model, not a JSON rendering of filesystem paths.
 /// Cargo metadata JSON requires UTF-8 paths; resolution itself must not inherit that restriction.
 pub(crate) fn native_manifest(
@@ -32,7 +86,17 @@ pub(crate) fn native_manifest(
         .dependencies
         .iter()
         .map(|dep| {
-            let source = SourceId::from_url(&dep.source_id.as_url().to_string())?;
+            // Match SerializedPackage::set_source: dependencies inside this fetched
+            // Git repository are pinned with the package, not only ordinary-equal
+            // to its unpinned manifest source.
+            let source = if let Some(locked) = source
+                && dep.source_id == m.package_id.source_id
+                && !dep.source_id.is_path()
+            {
+                SourceId::from_url(locked)?
+            } else {
+                SourceId::from_url(&dep.source_id.as_url().to_string())?
+            };
             let req = dep.req.as_ref().map(ToString::to_string);
             let mut d = Dependency::parse(&dep.name, req.as_deref(), source)?;
             d.set_kind(match dep.kind {
