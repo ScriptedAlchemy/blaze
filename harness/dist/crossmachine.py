@@ -463,6 +463,7 @@ def warm_payload_report(work, bin_dir, machines, sources):
         env = machine.env(bin_dir, os.path.join(machine.top, "warm-store"),
                           daemon_home("warm", machine.name))
         side = Side(ws, env, True)
+        previous_pids, previous_builds = None, -1
         try:
             for step, value in [("initial", 1), ("binary-edit", 2), ("deleted", None), ("recreated", 3)]:
                 if value is None:
@@ -474,10 +475,12 @@ def warm_payload_report(work, bin_dir, machines, sources):
                 wait_warm(side, ws)
                 status = side.cargo("status")[1].stdout
                 if value is None:
+                    shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
                     oracle = sh(["cargo", "build", "--offline", "--locked", "-p", "app"],
                                 cwd=ws, env=dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
                     actual, expected = None, None
                     right = built.returncode != 0 and oracle.returncode != 0
+                    oracle_code = oracle.returncode
                 else:
                     # Cargo also treats registry source replacement as immutable. A
                     # fresh oracle target is required for each binary-only edit.
@@ -486,10 +489,18 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     actual = program_output(side.cargo("run", "-p", "app", "--", timeout=600)[1])
                     right = (built.returncode == 0 and actual == expected
                              and f"vendor payload {value} caller {value + 10}" in expected[1])
+                    oracle_code = expected[0]
+                pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
+                builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
+                same_generation = bool(pids) and (previous_pids is None or pids == previous_pids) and builds >= previous_builds
+                previous_pids, previous_builds = pids, builds
+                right &= same_generation
                 rows.append(dict(machine=machine.name, step=step, right=right,
                                  actual=actual, expected=expected, status=status,
                                  classification=how_built(built.stderr), build_log=built.stderr,
-                                 worker_log=workers_log(side)))
+                                 worker_log=workers_log(side), blaze_returncode=built.returncode,
+                                 cargo_returncode=oracle_code, pids=pids, daemon_builds=builds,
+                                 same_generation=same_generation))
         finally:
             side.cargo("stop")
     return rows

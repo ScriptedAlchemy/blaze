@@ -489,7 +489,7 @@ mod tests {
             "#[repr(u8)] enum E { X = include_str!(\"payload.bin\").as_bytes()[0] } pub fn value() -> u8 { E::X as u8 }",
             "type A = [u8; include_bytes!(\"payload.bin\")[0] as usize]; pub fn value() -> u8 { 1 }",
             "struct A([u8; include_bytes!(\"payload.bin\")[0] as usize]); pub fn value() -> u8 { 1 }",
-            "pub fn value<const N: usize = { include_bytes!(\"payload.bin\")[0] as usize }>() -> u8 { 1 }",
+            "struct A<const N: usize = { include_bytes!(\"payload.bin\")[0] as usize }>; pub fn value() -> u8 { 1 }",
         ] {
             for caller_first in [false, true] {
                 check_payload_owner(body, caller_first);

@@ -5983,6 +5983,9 @@ impl WatchedFile {
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
                 mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
             });
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!("included-watch: registered {}", path.display());
+            }
             changed |= db.reload_included_file(&path);
         }
         changed
@@ -9076,6 +9079,9 @@ fn run_holding(
         }
         // Asked after the change: a file can have joined a crate with it.
         let included_changed = !included.is_empty();
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("included-watch: changed={}, sources={}", included.len(), sources.len());
+        }
         for path in included {
             db.reload_included_file(&path);
         }
