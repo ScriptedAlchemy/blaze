@@ -860,6 +860,29 @@ appearing, removed, unreadable (never certifies; skipped when run as a privilege
 manifest. 52 passed with `inputs::`, `scripts::`, `recovery::`, policy, `reached` and `Sharing`. Same pinned Linux setup. The `native=97`
 of `first-join` against cargo's 98 remains a recorded gap there; no gap in the choice witnesses.
 
+### The selected script is compared by the file it is (`8c2e753b` → this head)
+
+The tenth independent review found the registration's comparison of the script a manifest selects with the loaded target
+reduced to the file name: `old/build.rs` and `new/build.rs` were one script. A script that rewrote its own package manifest
+(a legal persistent effect of its first run) from `old/build.rs` to `new/build.rs` left a workspace parsed for the old
+selector and a manifest, read at the record, that says the new one; the guard saw `build.rs` twice and certified it. A later request whose own script
+is `new/build.rs` (V, with the same old script dormant) chose that checkout and ran its old target, which fails for `b`.
+The identity is now the path normalized as cargo normalizes a target's (`.` and `..` by name) and then the file itself when it is there
+(a link, a prefix), on both sides (`script_identity`, `selects_loaded_scripts`); the manifest is read once and the bytes recorded
+and the selection compared are one state (`Structural::read`). A manifest of a shape this does not read says nothing. The
+next request of a checkout so marked loads it again (the metadata then agrees); a candidate is never taken meanwhile.
+
+| Linux, split on, quick overlay; R's manifest selects `old/build.rs` (succeeds for `a`, fails for `b`; its first run rewrites the selector to `new/build.rs`); V's manifest is R's after that (`eebeaa3e…` both), the same dormant `old/build.rs` (`4f338d8b…`/`2cf9143f…` per build), a `new/build.rs` that succeeds for `b`; V's request is the first after the load | baseline `8c2e753b` | fixed |
+|---|---|---|
+| `selector-moves`, ONE request for V, `GEN=b` | fails with R's message (`gen … /r`); R's obsolete old script was the one run; no V program | R not run; V loads on its own (`join`), its script ran once for `b`; `include=b env=b cfg=b native=98` = cargo's |
+
+`choice-same-stamp` and `choice-stable` pass on the fixed binary in the same batch. A request after the load, before V's, reloads R on
+the rewritten manifest (the fixed registration marks it), after which R is V's twin: the scenario therefore makes V's request the
+first after the load. Component: the registration's identity (same name in two directories differs; `./` and `..` and a link to the directory
+agree; none; a manifest not read), the manifest recorded from the bytes read, with the others: 54 passed; a mutant that compares only
+the file name fails the identity test. Same pinned Linux setup. Capture limit unchanged: apart from the selected scripts, structural files are
+bound to their content at the record, which is after the load.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
