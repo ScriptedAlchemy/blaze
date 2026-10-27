@@ -170,6 +170,7 @@ class Scenario:
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir)
         self.ws = os.path.join(self.dir, "ws")
+        os.makedirs(self.ws)
         self.target = os.path.join(self.ws, "target")
         self.runs_log = os.path.join(self.dir, "runs.log")
         self.failures, self.notes, self.timeline, self.gaps = [], {}, [], []
@@ -199,7 +200,8 @@ class Scenario:
         saved, self.runs_log = self.runs_log, os.path.join(self.dir, "oracle-runs.log")
         self.project(ws, config, pkg)
         self.runs_log = saved
-        env = dict(self.env("oracle"), GEN=gen_, CARGO_TARGET_DIR=os.path.join(self.dir, "oracle-target"), **(extra or {}))
+        env = dict(self.env("oracle"), GEN=gen_, **(extra or {}))
+        env["CARGO_TARGET_DIR"] = os.path.join(self.dir, "oracle-target")
         env.pop("RA_JIT_WHOLE_BUILD", None)
         ran = subprocess.run(["cargo", "build"], cwd=ws, env=env, capture_output=True, text=True, timeout=WAIT)
         if ran.returncode != 0:
@@ -422,8 +424,11 @@ class Scenario:
 
     def stop(self):
         for home in self.daemons:
-            subprocess.run(["cargo", "ra-jit", "stop"], cwd=self.ws, env=self.env(home), capture_output=True,
-                           timeout=120)
+            try:
+                subprocess.run(["cargo", "ra-jit", "stop"], cwd=self.ws, env=self.env(home), capture_output=True,
+                               timeout=120)
+            except Exception as why:  # a daemon that does not stop is not the next scenario's to find out
+                print(f"  (stop {home}: {why})", flush=True)
 
 
 def order(sc, home, steps):
