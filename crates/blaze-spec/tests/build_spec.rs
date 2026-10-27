@@ -62,7 +62,7 @@ fn standalone_and_proc_macro_doctest_libraries_are_selected() {
         locked(&fixture, &["solo"]);
         let made = resolve(&fixture, Subcommand::Test, &["--doc"]).unwrap();
         assert_eq!(made.build.asked.len(), 1);
-        let unit = &made.build.units[made.build.asked[0] as usize];
+        let unit = &made.build.units[made.build.asked.as_slice()[0] as usize];
         assert_eq!(unit.package.0, "solo");
         assert_eq!(unit.target.0, if proc_macro { 6 } else { 0 });
         assert!(!unit.test);
