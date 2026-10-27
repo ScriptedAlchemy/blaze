@@ -942,6 +942,24 @@ On the fixed binary: `once`, `join`, `first-join`, `choice-stable`, `hostflags`,
 `4ae2a363` in the same session, when the host load was 8-15. These timeouts are infrastructure (the Mac was at load 40-55 from other work), kept as failed attempts. Component: the module's seven tests (search directory does not hash the link's outputs; an earlier candidate appearing; opaque response file; same size
 and time, other bytes; deletion, recreation, directive-only; failed or changed links do not commit; symlinks and cycles).
 
+### The acceptance gate at `15fee9f1`
+
+One exact-head gate, after the fixes above: Linux (Docker `rust:1.99.0-bookworm`, 6 GiB, no extra swap, registry crates vendored read-only, `strace` and `time` from
+the Debian mirror over http), and the Mac under the heavy lock and the watchdog (16G/12G/0).
+
+- **`scriptedits.py`, 42 probes** against cargo 1.99.0: **every case is cargo's** (42 of 42), including `no-compiler`, which now reports "blaze's build asked cargo 10 times,
+  compiling nothing" (queries) and passes by its rule.
+- **P0-A of the whole build** (the hello-world fixture with a build dependency; the audit of every exec in blaze's tree by `norustc.py`'s stand-ins): the build, two
+  edits and a no-op succeed and the program prints `hello helper=two edit=2`; **0 compiler execs**; **10 cargo execs, all 10 only asking** (0 compiling or otherwise
+  running things): `cargo -Z unstable-options config get`, `cargo --version`, `rustc --print cfg` and `--print target-spec-json` through cargo's stand-in, and
+  `cargo metadata` of the standard library's workspace (twice in the build, once more in each of two builds). The bar is 0 and 0, so **P0-A does not pass**: it fails on the
+  queries. `harness/tracedecay.py` now says how many cargo runs only ask. Closing it means owning those five queries (no-rustc, step J's neighbours); not done.
+- **Mac**: `ra-jit` 271 passed; `blaze-build-script` 47 passed and **2 failed**: `files::tests::git_listed_paths_do_not_need_to_be_utf8` and
+  `a_non_utf8_checkout_is_still_listed_from_git` create a file whose name is not UTF-8, which this Mac's APFS refuses (`Illegal byte sequence`, os error 92); the
+  crate is untouched by this lane and the same tests passed on the same Mac earlier in the lane. An environment failure, not a pass of those two tests here (they pass on Linux).
+
+Evidence `p05r-evidence/acceptance-gate-15fee9f1/`.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker's native link: closed for the cases in "The inputs of a link are its identity" and "A joined checkout's program"**
