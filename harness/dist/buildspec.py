@@ -92,6 +92,14 @@ DEFAULT_BIN = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target", "rele
 
 # The five digests the contract prints, and what `spec` is made of (docs/distributed.md, "Data shapes").
 DIGESTS = ("spec", "platform", "front_end", "config", "job_content")
+def logical_path(path):
+    """Schema-3 byte-component escaping; this helper does not certify the fake CLI."""
+    if path == ".":
+        return "."
+    safe = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
+    return "/".join("".join(chr(b) if b in safe else f"%{b:02X}" for b in os.fsencode(part))
+                    for part in path.split(os.sep))
+
 SPEC_FIELDS = ("source", "lock", "units", "asked", "profile", "platform", "rustflags", "config_env",
                "script_env", "cwd", "command", "toolchain", "workspace_manifest")
 UNIT_FIELDS = ("package", "target", "features", "cfg", "edition", "deps", "test", "host", "profile")
@@ -2486,6 +2494,7 @@ def resolve(cwd, words, env):
         docs.append(doc)
     source, checkout = source_ref(root)
     config_env = {}
+    config_tags = {}
     d = start
     chain = []
     while True:
@@ -2498,11 +2507,24 @@ def resolve(cwd, words, env):
             p = os.path.join(d, ".cargo", name)
             if os.path.exists(p):
                 for k, v in toml(p).get("env", {}).items():
-                    config_env[k] = v["value"] if isinstance(v, dict) else v
+                    value = v["value"] if isinstance(v, dict) else v
+                    force = isinstance(v, dict) and v.get("force", False)
+                    relative = isinstance(v, dict) and v.get("relative", False)
+                    if k in env and not force:
+                        config_env[k] = env[k]
+                        config_tags[k] = [0, env[k]]
+                    elif relative:
+                        native = os.path.normpath(os.path.join(d, value))
+                        config_env[k] = native
+                        config_tags[k] = [1, logical_path(os.path.relpath(native, root))]
+                    else:
+                        config_env[k] = value
+                        config_tags[k] = [0, value]
     for c in o["config"]:
         m = re.match(r"env\.(\w+)\s*=\s*(.*)$", c)
         if m:
             config_env[m.group(1)] = json.loads(m.group(2)) if m.group(2).startswith('"') else m.group(2)
+            config_tags[m.group(1)] = [0, config_env[m.group(1)]]
     macos = sys.platform == "darwin"
     mac = platform.mac_ver()[0] or "14.0"
     plat = {"0": "host", "1": sys.platform, "2": ["macosx", mac, env.get("MACOSX_DEPLOYMENT_TARGET") or mac] if macos else None,
@@ -2529,9 +2551,9 @@ def resolve(cwd, words, env):
     lock = open(os.path.join(root, "Cargo.lock"), "rb").read() if os.path.exists(os.path.join(root, "Cargo.lock")) else b""
     script_env = sorted([k, env[k]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
     spec = {"0": source, "1": sha(lock), "2": docs, "3": sorted(index[k] for k in asked if k in index),
-            "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, [0, v]] for k, v in config_env.items()),
-            "8": script_env, "9": "" if os.path.relpath(start, root) == "." else os.path.relpath(start, root),
-            "10": command, "11": sha("toolchain"), "12": os.path.relpath(os.path.join(root, "Cargo.toml"), checkout)}
+            "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_tags.items()),
+            "8": script_env, "9": logical_path(os.path.relpath(start, root)),
+            "10": command, "11": sha("toolchain"), "12": logical_path(os.path.relpath(os.path.join(root, "Cargo.toml"), checkout))}
     spec_digest = sha("spec" + canon(spec))
     digests = {"spec": spec_digest, "platform": plat_digest, "front_end": sha("front" + canon([docs, spec["1"], rustflags])),
                "config": sha("config" + canon([cmd, sorted(canon(docs[index[k]]) for k in asked), top, plat_digest, rustflags])),

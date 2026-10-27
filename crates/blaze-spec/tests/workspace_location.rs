@@ -78,7 +78,7 @@ fn siblings_are_distinct_and_selected_workspace_relocation_is_equal() {
     let right = make(&first, &first.root().join("right"), &[]);
     assert_eq!(left.build.source, right.build.source);
     assert_eq!(left.build.units, right.build.units);
-    assert_eq!(left.build.cwd, ".");
+    assert_eq!(left.build.cwd.as_str(), ".");
     assert_eq!(left.build.workspace_manifest.as_str(), "left/Cargo.toml");
     assert_eq!(right.build.workspace_manifest.as_str(), "right/Cargo.toml");
     assert_ne!(left.digest, right.digest);
@@ -99,14 +99,14 @@ fn nested_explicit_parent_manifest_and_saved_replay_use_the_selected_workspace()
     let cwd = root.join("left/nested/deep");
     let args = ["--manifest-path".to_owned(), "../../Cargo.toml".to_owned()];
     let original = make(&fixture, &cwd, &args);
-    assert_eq!(original.build.cwd, "nested/deep");
+    assert_eq!(original.build.cwd.as_str(), "nested/deep");
     assert_eq!(original.build.workspace_manifest.as_str(), "left/Cargo.toml");
     let bytes = blaze_wire::encode(&original.build);
     let saved: BuildSpec = blaze_wire::decode(&bytes, &blaze_wire::Limits::default()).unwrap();
     let (manifest, replay_cwd) = run::locations(&saved, &root).unwrap();
     assert_eq!(manifest, root.join("left/Cargo.toml"));
     assert_eq!(replay_cwd, cwd);
-    assert_ne!(replay_cwd, root.join(&saved.cwd));
+    assert_ne!(replay_cwd, root.join(saved.cwd.to_native().unwrap()));
     let host = host(false);
     let mut matched = false;
     for candidate in run::candidates(&saved).unwrap() {
@@ -114,7 +114,7 @@ fn nested_explicit_parent_manifest_and_saved_replay_use_the_selected_workspace()
             fixture.env().into_iter().filter(|(key, _)| !run::governed(key)).collect();
         env.extend(candidate.env);
         let mut request = Request::parse(candidate.command, &candidate.args).unwrap();
-        request.manifest_path = Some(manifest.to_string_lossy().into_owned());
+        request.manifest_path = Some(manifest.clone());
         let mut ctx = context(&fixture, &env, &host, &replay_cwd);
         ctx.source = saved.source.clone();
         ctx.source_root = Some(&root);
@@ -152,10 +152,47 @@ fn literal_and_relative_config_are_keyed_and_materialized_after_round_trip() {
     let worker = repository();
     assert_eq!(
         run::config_environment(&literal, &worker.root()).unwrap(),
-        [("ASSET".to_owned(), "data".to_owned())]
+        [("ASSET".to_owned(), std::ffi::OsString::from("data"))]
     );
     assert_eq!(
         run::config_environment(&relative, &worker.root()).unwrap(),
-        [("ASSET".to_owned(), worker.root().join("left/data").to_string_lossy().into_owned())]
+        [("ASSET".to_owned(), worker.root().join("left/data").into_os_string())]
     );
+}
+
+#[test]
+fn saved_revalidation_covers_both_siblings_in_relocated_source() {
+    let original = repository();
+    let moved = repository();
+    for sibling in ["left", "right"] {
+        let saved = make(
+            &original,
+            &original.root().join(sibling).join("nested/deep"),
+            &["--manifest-path".to_owned(), "../../Cargo.toml".to_owned()],
+        )
+        .build;
+        let back: BuildSpec =
+            blaze_wire::decode(&blaze_wire::encode(&saved), &blaze_wire::Limits::default())
+                .unwrap();
+        let (manifest, cwd) = run::locations(&back, &moved.root()).unwrap();
+        assert_eq!(manifest, moved.root().join(sibling).join("Cargo.toml"));
+        let root = moved.root();
+        let env = moved.env();
+        let host = host(false);
+        let mut matched = false;
+        for candidate in run::candidates(&back).unwrap() {
+            let mut request = Request::parse(candidate.command, &candidate.args).unwrap();
+            request.manifest_path = Some(manifest.clone());
+            let mut vars = env.clone();
+            vars.extend(candidate.env);
+            let mut ctx = context(&moved, &vars, &host, &cwd);
+            ctx.source = back.source.clone();
+            ctx.source_root = Some(&root);
+            if build_spec(&request, &ctx).unwrap().build == back {
+                matched = true;
+                break;
+            }
+        }
+        assert!(matched);
+    }
 }

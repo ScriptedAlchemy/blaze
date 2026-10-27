@@ -72,7 +72,7 @@ pub struct Host {
 /// the command's flags and files cannot say.
 pub struct Context<'a> {
     /// Materialized root of `source` (Git repository root, or the Root snapshot).
-    /// None means the selected workspace itself is the declared source root.
+    /// Git requires Some; only an intentionally workspace-rooted Root snapshot permits None.
     pub source_root: Option<&'a Path>,
     /// The directory the command was run in, absolute.
     pub cwd: &'a Path,
@@ -126,7 +126,7 @@ pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal>
     let asked = Asked {
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
-        manifest_path: request.manifest_path.as_deref().map(Path::new),
+        manifest_path: request.manifest_path.as_deref(),
         config: &request.config,
         features: &request.features,
         all_features: request.all_features,
@@ -218,7 +218,7 @@ impl Opened<'_> {
             .start(command.name(), &request.config)
             .map_err(|error| rejected("--config", error))?;
         let manifests = blaze_manifest::Context::new(config);
-        let manifest = root_manifest(request.manifest_path.as_deref().map(Path::new), &manifests)
+        let manifest = root_manifest(request.manifest_path.as_deref(), &manifests)
             .map_err(|error| rejected("the manifest", error))?;
         let workspace = Workspace::new(&manifest, &manifests)
             .map_err(|error| rejected("the workspace", error))?;
@@ -268,13 +268,29 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
         let asked = asked_units(request, command, graph, &units)?;
 
         let mut machine_env = ctx.env.clone();
-        machine_env.extend(
-            opened
-                .resolved
-                .config_env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.materialize(opened.workspace.root()))),
-        );
+        let configured = opened
+            .resolved
+            .config_env
+            .iter()
+            .map(|(name, value)| {
+                let native = value
+                    .materialize(opened.workspace.root())
+                    .map_err(|error| Refusal::new(name, error.to_string()))?;
+                // Native compiler variables are currently UTF-8 in Machine. Other env
+                // values need not be inspected by the native probe.
+                match native.into_string() {
+                    Ok(value) => Ok(Some((name.clone(), value))),
+                    Err(_) if crate::environment::is_script_var(name, &host.triple) => {
+                        Err(Refusal::new(
+                            name,
+                            "native probe cannot yet inspect a non-UTF-8 tool variable",
+                        ))
+                    }
+                    Err(_) => Ok(None),
+                }
+            })
+            .collect::<Result<Vec<_>, Refusal>>()?;
+        machine_env.extend(configured.into_iter().flatten());
         let machine =
             Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
@@ -282,9 +298,31 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
 
         let root = opened.workspace.root();
         let cwd = relative_cwd(ctx.cwd, root)?;
-        let source_root = ctx.source_root.unwrap_or(root);
-        let manifest = relative_cwd(opened.workspace.root_manifest(), source_root)?;
-        let workspace_manifest = blaze_wire::SourcePath::new(manifest)
+        let source_root = match (ctx.source_root, &ctx.source) {
+            (Some(root), _) => root,
+            (None, SourceRef::Root(_)) => root,
+            (None, SourceRef::Git(_)) => {
+                return Err(Refusal::new(
+                    "source_root",
+                    "Git source context requires its materialized repository root",
+                ));
+            }
+        };
+        let normalized_manifest =
+            blaze_manifest::paths::normalize_path(opened.workspace.root_manifest());
+        let normalized_source = blaze_manifest::paths::normalize_path(source_root);
+        let relative_manifest =
+            normalized_manifest.strip_prefix(&normalized_source).map_err(|_| {
+                Refusal::new(
+                    "workspace manifest outside source root",
+                    format!(
+                        "{} is not contained in {}",
+                        normalized_manifest.display(),
+                        normalized_source.display()
+                    ),
+                )
+            })?;
+        let workspace_manifest = blaze_wire::SourcePath::from_native(relative_manifest)
             .map_err(|error| Refusal::new("workspace manifest", error.to_string()))?;
         let lock: Digest = Sha256::digest(&graph.lock).into();
         let toolchain = ctx.toolchain;
@@ -539,7 +577,7 @@ fn asked_units(
 }
 
 /// `cwd` below the workspace `root`, with `/` for separators and `.` for the root itself.
-fn relative_cwd(cwd: &Path, root: &Path) -> Result<String, Refusal> {
+fn relative_cwd(cwd: &Path, root: &Path) -> Result<blaze_wire::SourcePath, Refusal> {
     let normal = |path: &Path| -> PathBuf { blaze_manifest::paths::normalize_path(path) };
     let Ok(below) = normal(cwd).strip_prefix(normal(root)).map(Path::to_owned) else {
         return Err(Refusal::with(
@@ -548,9 +586,8 @@ fn relative_cwd(cwd: &Path, root: &Path) -> Result<String, Refusal> {
             format!("the workspace root is {}", root.display()),
         ));
     };
-    let parts: Vec<String> =
-        below.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
-    Ok(if parts.is_empty() { ".".to_owned() } else { parts.join("/") })
+    blaze_wire::SourcePath::from_native(&below)
+        .map_err(|error| Refusal::new("cwd", error.to_string()))
 }
 
 /// The command of a spec, with what a run is asked to do.

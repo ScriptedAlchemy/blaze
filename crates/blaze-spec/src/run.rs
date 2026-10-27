@@ -23,26 +23,33 @@ pub fn locations(
     spec: &BuildSpec,
     source_root: &std::path::Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), Refusal> {
-    let cwd = blaze_wire::SourcePath::new(spec.cwd.clone())
-        .map_err(|error| Refusal::new("cwd", error.to_string()))?;
-    let manifest = source_root.join(spec.workspace_manifest.as_str());
+    let cwd = spec.cwd.to_native().map_err(|error| Refusal::new("cwd", error.to_string()))?;
+    let manifest = source_root.join(
+        spec.workspace_manifest
+            .to_native()
+            .map_err(|error| Refusal::new("workspace_manifest", error.to_string()))?,
+    );
     let workspace =
         manifest.parent().ok_or_else(|| Refusal::new("workspace manifest", "has no parent"))?;
-    Ok((manifest.clone(), workspace.join(cwd.as_str())))
+    Ok((manifest.clone(), workspace.join(cwd)))
 }
 
 /// Configuration values for a worker's selected workspace, preserving serialized tags.
 pub fn config_environment(
     spec: &BuildSpec,
     source_root: &std::path::Path,
-) -> Result<Vec<(String, String)>, Refusal> {
+) -> Result<Vec<(String, std::ffi::OsString)>, Refusal> {
     let (manifest, _) = locations(spec, source_root)?;
     let workspace = manifest.parent().expect("locations checked the parent");
-    Ok(spec
-        .config_env
+    spec.config_env
         .iter()
-        .map(|(name, value)| (name.clone(), value.materialize(workspace)))
-        .collect())
+        .map(|(name, value)| {
+            value
+                .materialize(workspace)
+                .map(|value| (name.clone(), value))
+                .map_err(|error| Refusal::new(name, error.to_string()))
+        })
+        .collect()
 }
 
 /// One way of saying a spec as a cargo command.
@@ -194,7 +201,8 @@ pub fn candidates(spec: &BuildSpec) -> Result<Vec<Reproduction>, Refusal> {
             args.extend(features.iter().cloned());
             args.extend(tail.iter().cloned());
             args.extend(after.iter().cloned());
-            let candidate = Reproduction { command, args, env: env.clone(), cwd: spec.cwd.clone() };
+            let candidate =
+                Reproduction { command, args, env: env.clone(), cwd: spec.cwd.as_str().to_owned() };
             if !out.contains(&candidate) {
                 out.push(candidate);
             }

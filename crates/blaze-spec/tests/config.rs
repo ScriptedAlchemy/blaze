@@ -303,7 +303,7 @@ fn a_relative_path_is_made_relative_to_the_workspace_root() {
     let request = blaze_spec::flags::Request::parse(Subcommand::Build, &[]).unwrap();
     let spec = blaze_spec::assemble::assemble(&request, &context, &graph).unwrap();
     assert!(env_of(&spec).contains(&pair("HERE", "a/data")), "{:?}", env_of(&spec));
-    assert_eq!(spec.build.cwd, "a");
+    assert_eq!(spec.build.cwd.as_str(), "a");
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn a_relative_path_of_a_file_outside_the_workspace_is_refused() {
 #[test]
 fn the_directory_is_named_from_the_workspace_root() {
     let fixture = Fixture::new();
-    assert_eq!(of(&fixture, Subcommand::Build, &[]).unwrap().build.cwd, ".");
+    assert_eq!(of(&fixture, Subcommand::Build, &[]).unwrap().build.cwd.as_str(), ".");
     let env = fixture.env();
     let host = common::host(false);
     let root = fixture.root();
@@ -342,7 +342,7 @@ fn the_directory_is_named_from_the_workspace_root() {
     let request = blaze_spec::flags::Request::parse(Subcommand::Build, &[]).unwrap();
     let spec = blaze_spec::assemble::assemble(&request, &context, &common::simple_graph(&profile))
         .unwrap();
-    assert_eq!(spec.build.cwd, "a/src");
+    assert_eq!(spec.build.cwd.as_str(), "a/src");
     // The same command from another directory of the workspace is another spec.
     let at_root = of(&fixture, Subcommand::Build, &[]).unwrap();
     assert_ne!(at_root.digest, spec.digest);

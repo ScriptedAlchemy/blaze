@@ -1195,7 +1195,7 @@ macro_rules! wire_struct {
         impl $crate::vectors::Sample for $name {
             fn sample(g: &mut $crate::vectors::Gen) -> Self {
                 $name {
-                    $($field: $crate::wire_struct!(@sample $field, g)),*
+                    $($field: $crate::vectors::Sample::sample(g)),*
                 }
             }
         }
@@ -1204,9 +1204,6 @@ macro_rules! wire_struct {
         <[()]>::len(&[$($crate::wire_struct!(@one $field)),*])
     };
     (@one $field:ident) => { () };
-    // BuildSpec's workspace-relative cwd is a normalized path, not arbitrary text.
-    (@sample cwd, $g:ident) => { ".".to_owned() };
-    (@sample $field:ident, $g:ident) => { $crate::vectors::Sample::sample($g) };
 }
 
 /// A schema type's enum: the two-element array `[discriminant, payload]`, the payload the payload

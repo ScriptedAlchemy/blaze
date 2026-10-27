@@ -389,10 +389,7 @@ fn resolve_env(
                 format!("it is of {definition}, and the workspace root is {}", root.display()),
             ));
         };
-        let parts: Vec<String> =
-            inside.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
-        let rel = if parts.is_empty() { ".".to_owned() } else { parts.join("/") };
-        let path = SourcePath::new(rel).map_err(|error| rejected(&what, error))?;
+        let path = SourcePath::from_native(inside).map_err(|error| rejected(&what, error))?;
         resolved.push((name.clone(), ConfigEnvValue::WorkspaceRelative(path)));
     }
     Ok(resolved)

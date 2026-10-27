@@ -453,7 +453,7 @@ pub struct Request {
     /// The command; `Build` until set.
     pub command: Option<Subcommand>,
     /// `--manifest-path`, as typed.
-    pub manifest_path: Option<String>,
+    pub manifest_path: Option<std::path::PathBuf>,
     /// `-p` and `--package`, as typed (a package id spec).
     pub packages: Vec<String>,
     /// `--workspace` and `--all`.
@@ -703,7 +703,7 @@ impl Request {
                 select(seen);
             }
             "doc" => self.doc = true,
-            "manifest-path" => self.manifest_path = Some(value.to_owned()),
+            "manifest-path" => self.manifest_path = Some(value.into()),
             "config" => {
                 let key = value.split_once('=').map_or(value, |it| it.0).trim();
                 if key == "unstable" || key.starts_with("unstable.") {

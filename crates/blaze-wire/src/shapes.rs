@@ -9,32 +9,136 @@ use crate::cbor::Wire;
 use crate::{Digest, Named, Set};
 use crate::{wire_enum, wire_struct};
 
-/// A normalized UTF-8 path within the declared source root. `/` separates components;
-/// `.` denotes that root. No empty, dot, parent, backslash or NUL components are allowed.
+/// A lossless logical path: `/` separates byte components and `.` denotes the root.
+/// Component bytes outside ASCII letters, digits, `-`, `_`, `.` use uppercase `%HH`.
+/// Escapes of safe bytes, empty/dot/parent components, decoded slash and NUL are invalid.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePath(String);
 
 impl SourcePath {
     /// Validates a portable source-relative path without canonicalizing malformed input.
     pub fn new(path: String) -> Result<Self, crate::Error> {
-        if path != "."
-            && (path.is_empty()
-                || path.split('/').any(|part| {
-                    part.is_empty()
-                        || part == "."
-                        || part == ".."
-                        || part.contains(['\\', '\0', ':'])
-                }))
-        {
-            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
+        if path != "." {
+            if path.is_empty() {
+                return Err(path_error());
+            }
+            for part in path.split('/') {
+                let bytes = decode_component(part)?;
+                if encode_component(&bytes) != part {
+                    return Err(path_error());
+                }
+            }
         }
         Ok(Self(path))
     }
 
-    /// The normalized logical path, never an absolute checkout path.
+    /// Encode a normalized native relative path without Unicode replacement or path guessing.
+    pub fn from_native(path: &std::path::Path) -> Result<Self, crate::Error> {
+        let mut parts = Vec::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::Normal(name) => {
+                    #[cfg(unix)]
+                    let bytes = {
+                        use std::os::unix::ffi::OsStrExt;
+                        name.as_bytes()
+                    };
+                    #[cfg(not(unix))]
+                    let bytes = name.to_str().ok_or_else(path_error)?.as_bytes();
+                    parts.push(encode_component(bytes));
+                }
+                std::path::Component::CurDir => {}
+                _ => return Err(path_error()),
+            }
+        }
+        Self::new(if parts.is_empty() { ".".to_owned() } else { parts.join("/") })
+    }
+
+    /// Decode logical components to native ones. Unix preserves every valid filename byte.
+    /// Other hosts report an explicit conversion error for byte names they cannot represent.
+    pub fn to_native(&self) -> Result<std::path::PathBuf, crate::Error> {
+        if self.0 == "." {
+            return Ok(std::path::PathBuf::from("."));
+        }
+        let mut path = std::path::PathBuf::new();
+        for component in self.0.split('/') {
+            let bytes = decode_component(component)?;
+            #[cfg(unix)]
+            let name = {
+                use std::os::unix::ffi::OsStringExt;
+                std::ffi::OsString::from_vec(bytes)
+            };
+            #[cfg(not(unix))]
+            let name =
+                std::ffi::OsString::from(String::from_utf8(bytes).map_err(|_| path_error())?);
+            // Native conversion must not reinterpret a component as an absolute/traversal path.
+            if std::path::Path::new(&name).components().count() != 1
+                || !matches!(
+                    std::path::Path::new(&name).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(path_error());
+            }
+            path.push(name);
+        }
+        Ok(path)
+    }
+
+    /// Whether the final decoded component names Cargo's required root manifest.
+    pub fn is_cargo_manifest(&self) -> bool {
+        self.0.rsplit('/').next() == Some("Cargo.toml")
+    }
+
+    /// The canonical escaped logical path, never an absolute checkout path.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn path_error() -> crate::Error {
+    crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 }
+}
+fn safe_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+fn encode_component(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for &byte in bytes {
+        if safe_byte(byte) {
+            text.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(text, "%{byte:02X}");
+        }
+    }
+    text
+}
+fn decode_component(text: &str) -> Result<Vec<u8>, crate::Error> {
+    let mut bytes = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let byte = text.as_bytes()[at];
+        if byte == b'%' {
+            let hex = text.get(at + 1..at + 3).ok_or_else(path_error)?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| path_error())?;
+            if safe_byte(byte) || matches!(byte, 0 | b'/') {
+                return Err(path_error());
+            }
+            bytes.push(byte);
+            at += 3;
+        } else {
+            if !safe_byte(byte) {
+                return Err(path_error());
+            }
+            bytes.push(byte);
+            at += 1;
+        }
+    }
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(path_error());
+    }
+    Ok(bytes)
 }
 
 impl Wire for SourcePath {
@@ -114,7 +218,7 @@ wire_struct! {
         6 => rustflags: Vec<String>,
         7 => config_env: Set<(String, ConfigEnvValue)>,
         8 => script_env: Set<(String, String)>,
-        9 => cwd: String,
+        9 => cwd: SourcePath,
         10 => command: Command,
         11 => toolchain: StoreIdentity,
         12 => workspace_manifest: SourcePath,
@@ -122,8 +226,7 @@ wire_struct! {
 }
 
 fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
-    SourcePath::new(spec.cwd.clone())?;
-    if spec.workspace_manifest.as_str() == "." {
+    if !spec.workspace_manifest.is_cargo_manifest() {
         return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
     }
     Ok(())
@@ -139,12 +242,13 @@ wire_enum! {
 
 impl ConfigEnvValue {
     /// Render the value for a worker at the selected workspace, without guessing from its text.
-    pub fn materialize(&self, workspace: &std::path::Path) -> String {
+    pub fn materialize(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<std::ffi::OsString, crate::Error> {
         match self {
-            Self::Literal(value) => value.clone(),
-            Self::WorkspaceRelative(path) => {
-                workspace.join(path.as_str()).to_string_lossy().into_owned()
-            }
+            Self::Literal(value) => Ok(value.into()),
+            Self::WorkspaceRelative(path) => Ok(workspace.join(path.to_native()?).into_os_string()),
         }
     }
 
@@ -280,7 +384,7 @@ impl CrateRecord {
     }
 
     /// The signature of this record under `key`: Ed25519 over
-    /// `"blaze/sig/CrateRecord/v2" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
+    /// `"blaze/sig/CrateRecord/v3" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
     /// domain separation every other signature of the schema uses.
     pub fn sign(&self, key: &ed25519_dalek::SigningKey) -> [u8; 64] {
         use ed25519_dalek::Signer as _;

@@ -203,7 +203,7 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
     let asked = blaze_metadata::Asked {
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        manifest_path: request.manifest_path.as_deref().map(Path::new),
+        manifest_path: request.manifest_path.as_deref(),
         config: &request.config,
         features: &request.features,
         all_features: request.all_features,
@@ -251,7 +251,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
             std::env::vars().filter(|(key, _)| !blaze_spec::run::governed(key)).collect();
         env.extend(candidate.env);
         let mut request = Request::parse(candidate.command, &candidate.args)?;
-        request.manifest_path = Some(manifest.to_string_lossy().into_owned());
+        request.manifest_path = Some(manifest.clone());
         let ctx = context(&cwd, &env, &host, identity, &root)?;
         match blaze_spec::assemble::build_spec(&request, &ctx) {
             Ok(made) if made.build == given => {

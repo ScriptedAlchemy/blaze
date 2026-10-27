@@ -726,7 +726,7 @@ fn a_spec_of_one_unit_has_its_platform_and_its_asked_unit() {
             .unwrap();
     assert_eq!(spec.build.units.len(), 1);
     assert_eq!(spec.build.asked.as_slice(), [0]);
-    assert_eq!(spec.build.cwd, ".");
+    assert_eq!(spec.build.cwd.as_str(), ".");
     assert_eq!(spec.platform.triple, "aarch64-apple-darwin");
     assert_eq!(spec.build.lock, <[u8; 32]>::from(Sha256::digest(b"lock")));
     let _ = (BTreeMap::<u8, u8>::new(), simple_graph);
