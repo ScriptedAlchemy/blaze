@@ -479,9 +479,13 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     actual, expected = None, None
                     right = built.returncode != 0 and oracle.returncode != 0
                 else:
+                    # Cargo also treats registry source replacement as immutable. A
+                    # fresh oracle target is required for each binary-only edit.
+                    shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
                     expected = reference(machine, bin_dir, ws, spec, env["RA_JIT_CACHE"], env["RA_JIT_HOME"])
                     actual = program_output(side.cargo("run", "-p", "app", "--", timeout=600)[1])
-                    right = built.returncode == 0 and actual == expected
+                    right = (built.returncode == 0 and actual == expected
+                             and f"vendor payload {value} caller {value + 10}" in expected[1])
                 rows.append(dict(machine=machine.name, step=step, right=right,
                                  actual=actual, expected=expected, status=status,
                                  classification=how_built(built.stderr), build_log=built.stderr))
