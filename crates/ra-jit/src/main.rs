@@ -22,6 +22,7 @@ mod mirdump;
 mod outline;
 mod plan;
 mod process;
+mod recovery;
 mod remote;
 mod sandbox;
 mod scripts;
@@ -6542,8 +6543,11 @@ struct Client {
     /// The client reading the output of the scripts of the database ([`scripts::pin`]) for as
     /// long as it lives: the compile, the link, the errors and the link that is detached.
     pin: Option<scripts::Pin>,
-    /// How many times the world it reads moved and it was put off to read the one that is.
-    recovered: u8,
+    /// What the request remembers of the world it reads moving, and of the recovery it waits for.
+    recovery: recovery::Recovery,
+    /// Held by the requests that load a world again for another: the recovery is over when the
+    /// last is dropped ([`recovery::Recovery::under_way`]).
+    _recovering: Option<Arc<()>>,
 }
 
 impl Client {
@@ -6556,9 +6560,18 @@ impl Client {
                 build: scripts::anonymous(),
                 own_build: true,
                 pin: None,
-                recovered: 0,
+                recovery: recovery::Recovery::default(),
+                _recovering: None,
             },
-            build => Client { stream, env, build, own_build: false, pin: None, recovered: 0 },
+            build => Client {
+                stream,
+                env,
+                build,
+                own_build: false,
+                pin: None,
+                recovery: recovery::Recovery::default(),
+                _recovering: None,
+            },
         }
     }
 
@@ -9103,28 +9116,36 @@ fn run_holding(
                         builds.edits.push(edited);
                         continue;
                     }
+                    // A recovery this edit asked for is waited for: the checkouts are loaded again
+                    // by the requests it queued, and the edit is looked at again when they are
+                    // over, not at every turn the worker takes meanwhile.
+                    if edited.client.recovery.under_way() {
+                        builds.edits.push(edited);
+                        continue;
+                    }
                     // The edit is built from the world its programs' checkouts were loaded from.
                     // If another worker ran their scripts since, that world is another than the
                     // disk's: the checkouts are asked for as a request for each of the programs
                     // would, with the variables the edit is built for, and the edit, with its
-                    // text, is put back to be taken when they are loaded again.
+                    // text, waits until they are loaded again.
                     let world = checkouts.world_for(&programs, &owners);
                     if let Err(stale) = edited.client.read(&world) {
                         scripts::barrier::event("refused", edited.client.build, &stale.to_string());
-                        if edited.client.recovered >= 4 {
+                        let Some(recovery) = edited.client.recovery.moved(&stale) else {
                             let _ = writeln!(&edited.client, "failed: {stale}; ask again");
                             continue;
-                        }
-                        edited.client.recovered += 1;
+                        };
                         let env = ide_db::base_db::ProcessEnv::try_get(&db)
                             .map(|it| it.vars(&db).clone())
                             .unwrap_or_default();
                         for &at in &owners {
                             let Some(mut client) = Client::nobody() else { continue };
                             client.env = env.clone();
+                            client._recovering = Some(recovery.clone());
                             let target = (at != 0).then(|| Target::of(&programs[at].args));
                             builds.waiting.push_back((Request::Sync, target, client));
                         }
+                        drop(recovery);
                         builds.edits.push(edited);
                         builds.again = true;
                         continue;
@@ -9184,8 +9205,10 @@ fn run_holding(
                     // A request that came through the check of the scripts asks it again, with
                     // its own variables: the world that moved is loaded as it is now.
                     let asks = matches!(request, Request::Sync | Request::Patch);
-                    if asks && client.env.iter().next().is_some() && client.recovered < 4 {
-                        client.recovered += 1;
+                    if asks
+                        && client.env.iter().next().is_some()
+                        && client.recovery.moved(&stale).is_some()
+                    {
                         builds.waiting.push_back((request, target, client));
                         builds.again = true;
                     } else {

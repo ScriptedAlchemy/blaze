@@ -294,6 +294,9 @@ struct State {
     /// How many operations of each build are under way: a judging of the scripts of all the
     /// checkouts it reads, which has the admission for as long as it lasts.
     operations: HashMap<u64, usize>,
+    /// The builds that ran a script, and so wrote an output that stands only while they hold
+    /// it: each has the admission until it is retired.
+    executors: HashSet<u64>,
 }
 
 /// A watch of a file of another process: which one it is (a thread ends only the registration
@@ -340,14 +343,18 @@ impl Leases {
     }
 
     /// Has `build` hold the output of a result it gave up the lease of, if the output is still
-    /// the run `generation` made. `false` when another build ran the script since (the result
-    /// is the output of nothing now and is forgotten: the script is judged again, which is the
-    /// only way to read what it left); an error when a script is running.
+    /// the run `generation` made. `false` when another build ran the script since, for a result
+    /// of an output that build only found fresh (it ran nothing of it: judging it again is the
+    /// first run it makes, if the script is to run); an error when a script is running, and
+    /// when the output of a script *this build ran* is not the run it was. A build that ran a
+    /// script keeps the admission and the lease until it is retired, so no other build can have
+    /// written it, and a second run of the script in the build is never the way out.
     pub(super) fn reacquire(
         &self,
         build: u64,
         run_dir: &Path,
         generation: u64,
+        ran: bool,
     ) -> Result<bool, Refused> {
         let path = run_dir.join(FILE);
         let file = open(&path)?;
@@ -365,6 +372,12 @@ impl Leases {
             return Ok(true);
         }
         let _ = file.unlock();
+        if ran {
+            return Err(Refused::Failed(format!(
+                "the output of the build script in {} was written again while the build that ran                  it was not over",
+                run_dir.display()
+            )));
+        }
         state.judged.remove(&key);
         Ok(false)
     }
@@ -429,9 +442,13 @@ impl Leases {
         }
     }
 
-    /// Lets go of the admission `build` has, if it has one.
+    /// Lets go of the admission `build` has, if it has one. A build that ran a script keeps it
+    /// until it is retired ([`Leases::retire`]).
     pub(super) fn release_admission(&self, build: u64) {
         let mut state = self.state();
+        if state.executors.contains(&build) {
+            return;
+        }
         let ours: Vec<_> =
             state.admission.iter().filter(|it| it.1.0 == build).map(|it| it.0.clone()).collect();
         if ours.is_empty() {
@@ -518,6 +535,7 @@ impl Leases {
         state.consumers.remove(&build);
         state.yielding.remove(&build);
         state.operations.remove(&build);
+        state.executors.remove(&build);
         drop(state);
         if let Some(map) = interest().as_mut() {
             map.values_mut().for_each(|it| _ = it.owners.remove(&build));
@@ -573,12 +591,17 @@ impl Leases {
                 let file = match open(&path) {
                     Ok(it) => it,
                     Err(why) => {
-                        failed = Some(Stale { run_dir: dir.clone(), why: format!("{why:?}") });
+                        failed = Some(Stale {
+                            run_dir: dir.clone(),
+                            why: format!("{why:?}"),
+                            found: None,
+                        });
                         break;
                     }
                 };
                 if let Err(err) = file.lock_shared() {
-                    failed = Some(Stale { run_dir: dir.clone(), why: err.to_string() });
+                    failed =
+                        Some(Stale { run_dir: dir.clone(), why: err.to_string(), found: None });
                     break;
                 }
                 if let Some(old) = self.state().held.insert(key.clone(), file) {
@@ -586,8 +609,10 @@ impl Leases {
                 }
                 taken.push(key);
             }
-            if super::generation_of(dir) != Some(*generation) {
-                failed = Some(Stale { run_dir: dir.clone(), why: "it was run again".to_owned() });
+            let found = super::generation_of(dir);
+            if found != Some(*generation) {
+                failed =
+                    Some(Stale { run_dir: dir.clone(), why: "it was run again".to_owned(), found });
                 break;
             }
         }
@@ -659,6 +684,8 @@ fn release_leases(state: &mut State, build: u64) -> usize {
 pub(crate) struct Stale {
     pub(crate) run_dir: PathBuf,
     pub(crate) why: String,
+    /// The generation the output there is now of ([`super::generation_of`]): which run moved it.
+    pub(crate) found: Option<u64>,
 }
 
 impl std::fmt::Display for Stale {
@@ -707,6 +734,12 @@ impl Writer<'_> {
         }
         self.leases.hold(self.build, &self.run_dir)?;
         self.leases.record(self.build, &self.run_dir, Ok(done));
+        if self.build != 0 {
+            // From here on the build keeps the admission until it is retired: the output is the
+            // one run of the script the build has, and its later requests, whichever groups
+            // they judge, are not to find it written by another build.
+            self.leases.state().executors.insert(self.build);
+        }
         Ok(())
     }
 
@@ -754,9 +787,17 @@ mod tests {
             output: Default::default(),
             fingerprint: 0,
             generation: token,
+            ran: true,
             made: None,
             links: None,
         })
+    }
+
+    /// The output of an earlier run, found fresh by `build`, which holds it and ran nothing.
+    fn found(out: &Path, token: u64) -> Arc<Done> {
+        let mut done = done(out, token);
+        Arc::get_mut(&mut done).unwrap().ran = false;
+        done
     }
 
     fn busy<T>(refused: Result<T, Refused>) -> Busy {
@@ -773,6 +814,15 @@ mod tests {
         let writer = leases.writer(build, run_dir).unwrap();
         let token = record(run_dir, marker);
         writer.stands(done(run_dir, token)).unwrap();
+        token
+    }
+
+    /// A script found fresh by `build`: its admission, its lease, nothing run. Its token.
+    fn reads(leases: &Leases, build: u64, base: &Path, run_dir: &Path, marker: &str) -> u64 {
+        leases.admit(build, base).unwrap();
+        let token = record(run_dir, marker);
+        leases.hold(build, run_dir).unwrap();
+        leases.record(build, run_dir, Ok(found(run_dir, token)));
         token
     }
 
@@ -815,7 +865,7 @@ mod tests {
         let (base, x) = (dir("judged"), dir("judged-x"));
         let leases = Leases::default();
         assert!(leases.judged(1, &x).is_none());
-        runs(&leases, 1, &base, &x, "one");
+        reads(&leases, 1, &base, &x, "one");
         let first = leases.judged(1, &x).unwrap().unwrap();
         // Another build asks to run it: it is held, so it is put off, and the result stands.
         leases.release_admission(1);
@@ -859,8 +909,8 @@ mod tests {
                 true => (Arc::new(Leases::default()), Some(Leases::default())),
             };
             let writer_side = writer.as_ref().unwrap_or(&reader);
-            // M judged R and its admission is over: it holds R.
-            runs(&reader, 1, &base, &r, "r1");
+            // M found R fresh and its admission is over: it holds R.
+            reads(&reader, 1, &base, &r, "r1");
             reader.release_admission(1);
             // W owns the admission and must run R, which M reads: it waits.
             writer_side.admit(2, &base).unwrap();
@@ -877,13 +927,20 @@ mod tests {
             // W goes on, and ends; M asks again and gets the admission.
             let token = record(&r, "r2");
             writer_side.writer(2, &r).unwrap().stands(done(&r, token)).unwrap();
+            // W ran a script: it has the admission until its build ends.
             writer_side.release_admission(2);
+            assert!(matches!(
+                busy(reader.admit(1, &base)),
+                Busy::Process { .. } | Busy::Elsewhere { .. }
+            ));
+            writer_side.retire(2);
             reader.admit(1, &base).unwrap();
-            // W ran R meanwhile: M's result is of an output that is not there, and is forgotten.
-            assert!(!reader.reacquire(1, &r, old).unwrap());
+            // W ran R meanwhile: M only found R fresh, ran nothing of it, so its result is of an
+            // output that is not there, and is forgotten: judging it again is its first run.
+            assert!(!reader.reacquire(1, &r, old, false).unwrap());
             assert!(reader.decision(1, &r).is_none());
             reader.release_admission(1);
-            writer_side.retire(2);
+            reader.retire(1);
         }
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&r);
@@ -896,12 +953,13 @@ mod tests {
     fn opposite_group_orders_both_finish_whoever_holds_what() {
         let (base, r, s) = (dir("opposite"), dir("opposite-r"), dir("opposite-s"));
         let (a, b) = (Leases::default(), Leases::default());
-        // A judged R, B judged S; each let go of the admission between its groups.
-        runs(&a, 1, &base, &r, "r-a");
+        // A found R fresh, B found S; each let go of the admission between its groups.
+        reads(&a, 1, &base, &r, "r-a");
         a.release_admission(1);
-        runs(&b, 2, &base, &s, "s-b");
+        let on_s = reads(&b, 2, &base, &s, "s-b");
         b.release_admission(2);
-        // A's second group is S: B reads it, so A waits, and keeps the admission.
+        // A's second group is S, which it must run: B reads it, so A waits, and keeps the
+        // admission.
         a.admit(1, &base).unwrap();
         assert!(matches!(busy(a.writer(1, &s)), Busy::Elsewhere { .. }));
         assert!(!a.yield_world(1), "it has the admission: what it holds is waited for by no one");
@@ -909,28 +967,94 @@ mod tests {
         // yields S, which A waits for.
         assert!(matches!(busy(b.admit(2, &base)), Busy::Elsewhere { .. }));
         assert!(b.yield_world(2));
-        // A goes on and ends; B follows over what A left: R is read by A, so it waits for A.
+        // A goes on and ends its run, and keeps the admission: it ran a script. B waits holding
+        // nothing, so A's later groups find nothing of B's in the way.
         let token = record(&s, "s-a");
         a.writer(1, &s).unwrap().stands(done(&s, token)).unwrap();
         a.release_admission(1);
-        b.admit(2, &base).unwrap();
-        b.hold(2, &s).unwrap();
-        assert!(matches!(busy(b.writer(2, &r)), Busy::Elsewhere { .. }));
+        assert!(matches!(busy(b.admit(2, &base)), Busy::Elsewhere { .. }));
+        assert!(b.builds().len() == 1, "B holds no lease; its decision stays");
+        // A's build ends; B follows, over what A left: it runs R, which A no longer reads.
         a.retire(1);
+        b.admit(2, &base).unwrap();
+        assert!(!b.reacquire(2, &s, on_s, false).unwrap(), "A ran S meanwhile; B only read it");
         let token = record(&r, "r-b");
         b.writer(2, &r).unwrap().stands(done(&r, token)).unwrap();
-        b.release_admission(2);
         b.retire(2);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&r);
         let _ = std::fs::remove_dir_all(&s);
     }
 
+    /// The review's sequence at the leases: a build ran a script and answered, and has more to
+    /// judge. Another build may not take the admission between its requests to wait for the
+    /// output, and so the first never has to give it up: the script is not run a second time.
+    #[test]
+    fn a_build_that_ran_a_script_keeps_the_output_and_the_admission_until_it_is_retired() {
+        let (base, r, s) = (dir("executor"), dir("executor-r"), dir("executor-s"));
+        for processes in [false, true] {
+            let _ = std::fs::remove_dir_all(&r);
+            let (a, b) = match processes {
+                false => {
+                    let one = Arc::new(Leases::default());
+                    (one.clone(), one)
+                }
+                true => (Arc::new(Leases::default()), Arc::new(Leases::default())),
+            };
+            // A's first operation runs R and answers; its attempt ends and lets go of the
+            // admission, which a build that ran a script does not.
+            let token = runs(&a, 1, &base, &r, "r-a");
+            a.release_admission(1);
+            // B asks for the admission to run R after it: it is not given, so it holds nothing.
+            let refused = busy(b.admit(2, &base));
+            assert!(matches!(refused, Busy::Process { build: 1, .. } | Busy::Elsewhere { .. }));
+            assert!(!a.yield_world(1), "A has the admission: nothing waits for what it holds");
+            // A's later operation judges another group, and R again: both are A's.
+            a.admit(1, &base).unwrap();
+            let before = a.judged(1, &r).unwrap().unwrap();
+            assert!(matches!(a.decision(1, &r), Some(Judged::Standing(_))));
+            reads(&a, 1, &base, &s, "s-a");
+            a.release_admission(1);
+            assert_eq!(super::super::generation_of(&r), Some(token), "nobody wrote R");
+            assert!(Arc::ptr_eq(&before, &a.judged(1, &r).unwrap().unwrap()));
+            // B waits for the end of A's build, and then runs.
+            assert!(matches!(
+                busy(b.admit(2, &base)),
+                Busy::Process { build: 1, .. } | Busy::Elsewhere { .. }
+            ));
+            a.retire(1);
+            b.admit(2, &base).unwrap();
+            let again = record(&r, "r-b");
+            b.writer(2, &r).unwrap().stands(done(&r, again)).unwrap();
+            b.retire(2);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// A build that ran a script is never given another run of it: if its output is not the run
+    /// it was, that is an error and not a second execution.
+    #[test]
+    fn the_output_of_a_script_a_build_ran_is_never_forgotten_for_a_second_run() {
+        let (base, r) = (dir("ran-forgotten"), dir("ran-forgotten-r"));
+        let leases = Leases::default();
+        let token = runs(&leases, 1, &base, &r, "one");
+        // Whatever took its lease (nothing in the protocol does), the result is not dropped.
+        release_leases(&mut leases.state(), 1);
+        record(&r, "two");
+        let refused = leases.reacquire(1, &r, token, true);
+        assert!(matches!(refused, Err(Refused::Failed(why)) if why.contains("written again")));
+        assert!(matches!(leases.decision(1, &r), Some(Judged::Released(_))));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
     #[test]
     fn a_consumer_reads_nothing_it_has_not_pinned_and_a_build_that_yields_waits_for_its_end() {
         let (base, x) = (dir("pin"), dir("pin-x"));
         let leases = Leases::default();
-        let token = runs(&leases, 1, &base, &x, "one");
+        let token = reads(&leases, 1, &base, &x, "one");
         leases.release_admission(1);
         let world = vec![(x.clone(), token)];
         leases.pin(1, &world).unwrap();
@@ -1015,7 +1139,7 @@ mod tests {
     fn a_result_that_was_yielded_is_the_builds_again_while_the_output_is_the_run_it_was_of() {
         let (base, x) = (dir("released"), dir("released-x"));
         let leases = Leases::default();
-        let generation = runs(&leases, 1, &base, &x, "one");
+        let generation = reads(&leases, 1, &base, &x, "one");
         leases.release_admission(1);
         assert!(matches!(leases.decision(1, &x), Some(Judged::Standing(_))));
         assert!(leases.yield_world(1));
@@ -1023,7 +1147,7 @@ mod tests {
         // Another build reads it meanwhile, which is nothing to the result.
         let other = anonymous();
         leases.hold(other, &x).unwrap();
-        assert!(leases.reacquire(1, &x, generation).unwrap());
+        assert!(leases.reacquire(1, &x, generation, false).unwrap());
         assert!(
             matches!(leases.decision(1, &x), Some(Judged::Standing(done)) if done.generation == generation)
         );
@@ -1043,7 +1167,7 @@ mod tests {
     fn a_pin_that_is_taking_its_leases_is_a_consumer_before_it_has_them() {
         let (base, x, y) = (dir("inflight"), dir("inflight-x"), dir("inflight-y"));
         let leases = Arc::new(Leases::default());
-        let token = runs(&leases, 1, &base, &x, "one");
+        let token = reads(&leases, 1, &base, &x, "one");
         leases.release_admission(1);
         // Y is being run by another build: a pin that wants it waits.
         let other = Leases::default();
@@ -1075,16 +1199,14 @@ mod tests {
         let (base, r, s) = (dir("operation"), dir("operation-r"), dir("operation-s"));
         let (a, b) = (Leases::default(), Leases::default());
         a.begin_operation(1);
-        // A judges R and S; its first group ends an attempt, and the admission is its still.
-        a.admit(1, &base).unwrap();
-        let token = record(&r, "r-a");
-        a.writer(1, &r).unwrap().stands(done(&r, token)).unwrap();
+        // A judges R and S, both found fresh; its first group ends an attempt, and the
+        // admission is its still.
+        reads(&a, 1, &base, &r, "r-a");
         assert!(a.in_operation(1));
         // B asks for S first: it holds nothing, so it has nothing for A to wait for.
         assert!(matches!(busy(b.admit(2, &base)), Busy::Elsewhere { .. }));
         assert!(b.builds().is_empty());
-        let token = record(&s, "s-a");
-        a.writer(1, &s).unwrap().stands(done(&s, token)).unwrap();
+        reads(&a, 1, &base, &s, "s-a");
         a.end_operation(1, false);
         assert!(!a.in_operation(1));
         // The operation is over and the admission with it; A reads both, and B runs after it.

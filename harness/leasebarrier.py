@@ -4,7 +4,8 @@ blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of 
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
 scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, coab, internal,
-           groups, overlay, worlds, join, link-control, archive-control     (all, by default)
+           groups, overlay, worlds, join, once, once-failed, recovery, link-control, archive-control
+           (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -70,6 +71,17 @@ worlds        A worker that has R and S loaded and an editor's edit of R, held b
 join          A worker started by a build in R; a build in S joins S; then S again with another
               `GEN`: the scripts of S have to run for it (the join's leases are that request's, and
               ended with it).
+once          One build (an explicit `RA_JIT_BUILD`, several requests, as the daemon sends them) of a worker
+              started by hand: A's first request runs R and is answered; B, another build, asks for R with
+              another `GEN` and is put off; A's next request joins S and then asks R again. A script that runs
+              every build with a guard that fails its second execution for one build (`ONCE_TAG`): A runs R
+              once, B has run nothing while A's build lasts, and B is built after A is retired.
+once-failed   The same with a script that fails for A: the failure is A's for good, each request of
+              it fails alike, the script of R runs once for A, and B's build goes on meanwhile.
+recovery      A's database is of one run of a script, another worker (B) runs it again and is held after
+              its scripts for longer than the worker takes turns, and an editor's edit to A needs the world
+              restored: the edit is neither failed nor asked about at every turn while B works, and is
+              built when B ends, with no second request.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -102,6 +114,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GEN_FROM_FILE");
     println!("cargo:rerun-if-env-changed=ALWAYS");
     println!("cargo:rerun-if-env-changed=ONCE_DIR");
+    println!("cargo:rerun-if-env-changed=ONCE_TAG");
+    println!("cargo:rerun-if-env-changed=ONCE_BY_DIR");
     // The value is the variable's, or the content of a file that the script watches: the same
     // fingerprint (a watched path) for a run that leaves other output.
     let gen_ = match env::var("GEN_FROM_FILE").as_deref() {
@@ -120,7 +134,14 @@ fn main() {
     // A script that fails the second time it runs for one value, in one package: the extra
     // execution of a build is an effect that is not undone by anything that follows.
     if let Ok(once) = env::var("ONCE_DIR") {
-        let mark = format!("{once}/{}-{gen_}", env::var("CARGO_PKG_NAME").unwrap());
+        // Named for the package, or with ONCE_BY_DIR for the checkout it is in (two checkouts of
+        // one package), and with ONCE_TAG for the build that asks (a build is its requests' tag).
+        let whose = match env::var("ONCE_BY_DIR").as_deref() {
+            Ok("1") => PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).file_name().unwrap().to_string_lossy().into_owned(),
+            _ => env::var("CARGO_PKG_NAME").unwrap(),
+        };
+        let tag = env::var("ONCE_TAG").map(|it| format!("-{it}")).unwrap_or_default();
+        let mark = format!("{once}/{whose}-{gen_}{tag}");
         if fs::OpenOptions::new().write(true).create_new(true).open(&mark).is_err() {
             eprintln!("script ran twice: {mark}");
             exit(7);
@@ -1058,12 +1079,12 @@ def overlay(sc, source_sha):
     sc.timeouts()
 
 
-def by_hand(sc, extra):
+def by_hand(sc, extra, gen_="a"):
     """A whole-build worker started by hand (`ra-jit <R> --exe .. --socket ..`), which has R
     loaded for its own load and serves: the way a checkout is joined (the daemon has a worker for
     each directory a build is asked in). Its pid and log are saved with the scenario."""
     sock = os.path.join(sc.dir, "worker.sock")
-    env = sc.env("a", dict(GEN="a", **extra))
+    env = sc.env("a", dict(GEN=gen_, **extra))
     env.pop("RA_JIT_WHOLE_BUILD", None)
     err = open(os.path.join(sc.dir, "worker.log"), "w")
     argv = [RA_JIT, sc.r, "--crate", "gen_one", "--out", os.path.join(sc.dir, "w.o"), "--exe",
@@ -1258,6 +1279,215 @@ def generation(sc, source_sha):
     sc.timeouts()
 
 
+def retire(sc, sock, build):
+    """The daemon's last word about a build: every request of it is answered (`retire <build>`)."""
+    import socket
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(60)
+        s.connect(os.path.join(sc.dir, sock))
+        s.sendall(f"retire\t{build}\n\n".encode())
+        return s.makefile().readline().strip()
+
+
+def in_background(fn, *args, **kwargs):
+    """`fn` on a thread; the thread's `.result` is its return value once it has ended."""
+    import threading
+    t = threading.Thread(target=lambda: setattr(t, "result", fn(*args, **kwargs)))
+    t.result = None
+    t.start()
+    return t
+
+
+def worker_events(sc):
+    return sc.events("a", open(os.path.join(sc.dir, "worker.log"), errors="replace").read())
+
+
+def same_build(sc, source_sha, fails):
+    """One build (an explicit `RA_JIT_BUILD`, as the daemon numbers a build and sends every request
+    of it) of a worker started by hand, over the review's sequence. The build is A, and its scripts
+    run every build (`ALWAYS`) with a guard that fails the second execution of a checkout's script
+    for one value and one build (`ONCE_TAG`):
+
+    1. A's first request is answered: the script of R ran for A.
+    2. B, another build (another number, its tag), asks for R with another `GEN`: it has to run the
+       script after A's build is over, and is put off.
+    3. A's next request joins S (another checkout, a group it has not judged). Nothing may stop A:
+       it does not run R again, and B has run nothing.
+    4. A is retired (every request answered): B runs, and is built.
+
+    With `fails` the script of A fails (`FAIL`) in R: the failure is A's for good (each request of
+    it gets the same message) and runs once, B's build goes on meanwhile."""
+    extra = shared_projects(sc, worktrees=True)
+    once = os.path.join(sc.dir, "once")
+    os.makedirs(once)
+    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1")
+    oracle = {g: sc.oracle(g, {"GEN_ARCHIVE": "same"}) for g in ("a", "b")}
+    sc.notes["oracle"] = oracle
+    # The worker's own load has a value and a tag of its own.
+    worker, sock, env = by_hand(sc, dict(extra, ONCE_TAG="load"), gen_="load")
+    A, B = "1001", "2002"
+    try:
+        if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
+            return
+        env_a = dict(env, ONCE_TAG="A", RA_JIT_BUILD=A, GEN="a", **({"FAIL": "1"} if fails else {}))
+        rc1, said1 = sync(sc, sock, env_a, within=LOST)
+        sc.notes["a1"] = (rc1, said1[-300:])
+        if fails:
+            if rc1 == 0 or "script failed for a" not in said1:
+                sc.fail(f"A's first request was to fail with the script's message: {rc1} {said1[-300:]!r}")
+        elif rc1 != 0:
+            sc.fail(f"A's first request exited {rc1}: {said1[-400:]}")
+            return
+        kept_a = os.path.join(sc.dir, "a1.bin")
+        if os.path.exists(os.path.join(sc.dir, "w.bin")):
+            shutil.copy2(os.path.join(sc.dir, "w.bin"), kept_a)
+        # B: another build, another value; it needs the output A holds (when A ran the script).
+        env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD=B, GEN="b")
+        b = in_background(sync, sc, sock, env_b, within=LOST)
+        if not fails:
+            deadline = time.time() + 120
+            while time.time() < deadline and not any(e[0] == "put-off" and e[1] == int(B) for e in worker_events(sc)):
+                time.sleep(0.2)
+            sc.notes["b-put-off"] = [e for e in worker_events(sc) if e[0] == "put-off" and e[1] == int(B)][:1]
+            if not sc.notes["b-put-off"]:
+                sc.fail("B was not put off while A's build held the output of R")
+            held = sorted(os.listdir(once))
+            if any(m.endswith("-B") for m in held):
+                sc.fail(f"B ran a script while A's build was not over: {held}")
+        # A's next request joins S, a group it has not judged.
+        s_out, s_exe = os.path.join(sc.dir, "s.o"), os.path.join(sc.dir, "s.bin")
+        rc2, said2 = sync(sc, sock, env_a, "--project", sc.s, "--crate", "gen_one", "--out", s_out, "--exe", s_exe,
+                          within=LOST)
+        sc.notes["a2"] = (rc2, said2[-400:])
+        if fails:
+            if rc2 == 0 or "script failed for a" not in said2:
+                sc.fail(f"A's join was to fail with the same message: {rc2} {said2[-300:]!r}")
+        elif rc2 != 0:
+            sc.fail(f"A's request that joins S exited {rc2}: {said2[-500:]}")
+        # And once more, the same request as the first.
+        rc3, said3 = sync(sc, sock, env_a, within=LOST)
+        sc.notes["a3"] = (rc3, said3[-300:])
+        if (rc3 == 0) == fails:
+            sc.fail(f"A's third request ended {rc3}: {said3[-300:]!r}")
+        if "script ran twice" in said1 + said2 + said3:
+            sc.fail(f"a script ran a second time in A's build: {said2[-300:]!r} {said3[-300:]!r}")
+        if not fails and (rc2 == 0 and rc3 == 0):
+            for tag, exe, want in (("A-R", kept_a, oracle["a"]["gen-one"]), ("A-S", s_exe, oracle["a"]["gen-one"])):
+                got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+                sc.notes.setdefault("programs", {})[tag] = got
+                if got is None:
+                    sc.fail(f"{tag}: no program")
+                elif got != want:
+                    strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+                    if strip(got) == strip(want):
+                        sc.gaps.append(f"{tag}: {got!r}, cargo's {want!r} (the warm worker's native link)")
+                    else:
+                        sc.fail(f"{tag} printed {got!r}, cargo's {want!r}")
+        if not fails and b.is_alive():
+            sc.notes["b-after-a-requests-alive"] = True
+        sc.notes["retire-a"] = retire(sc, sock, A)
+        b.join(LOST)
+        if b.is_alive() or b.result is None:
+            sc.fail("B (put off behind A's build) did not end after A was retired")
+            return
+        rcb, saidb = b.result
+        sc.notes["b"] = (rcb, saidb[-300:])
+        if rcb != 0:
+            sc.fail(f"B exited {rcb}: {saidb[-400:]}")
+        sc.notes["retire-b"] = retire(sc, sock, B)
+        ran = sorted(os.listdir(once))
+        sc.notes["executions"] = ran
+        want = ["r-a-A", "r-b-B"] if fails else ["r-a-A", "r-b-B", "s-a-A"]
+        have = [m for m in ran if m.endswith(("-A", "-B"))]
+        if have != sorted(want):
+            sc.fail(f"each script was to run once in each build ({sorted(want)}): {have}")
+        if not fails and rcb == 0:
+            got = subprocess.run([os.path.join(sc.dir, "w.bin")], capture_output=True, text=True).stdout
+            sc.notes.setdefault("programs", {})["B-R"] = got
+            strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+            if strip(got) != strip(oracle["b"]["gen-one"]):
+                sc.fail(f"B-R printed {got!r}, cargo's {oracle['b']['gen-one']!r}")
+        sc.timeouts()
+    finally:
+        worker.kill()
+        sc.notes["worker-log-tail"] = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()[-3000:]
+
+
+def once_ran(sc, source_sha):
+    same_build(sc, source_sha, False)
+
+
+def once_failed(sc, source_sha):
+    same_build(sc, source_sha, True)
+
+
+def recovery(sc, source_sha):
+    """A's database is of one run of a script; another worker (B) runs it again and is held after
+    its scripts, before its compile and link, for longer than the worker takes turns; an editor's
+    edit to A needs the world restored (A's script run again over the file it watches). The edit
+    waits for B's build and is built when it ends, with no second request from the editor: it is
+    not asked again for the same world at every turn, and not failed while B is working."""
+    import threading
+    extra = {"GEN_ARCHIVE": "same", "GEN_FROM_FILE": "1"}
+    sc.project()
+    value = os.path.join(sc.ws, "value.txt")
+    with open(value, "w") as f:
+        f.write("a\n")
+    A = sc.client("a", ("--bin", "gen-one"), **extra)
+    sc.finish(A, "A")
+    if A.returncode != 0:
+        sc.fail(f"A's build exited {A.returncode}: {A.err[-600:]}")
+        return
+    time.sleep(1.2)
+    with open(value, "w") as f:
+        f.write("b\n")
+    sc.arm("b", "consume")
+    B = sc.client("b", ("--bin", "gen-two"), **extra)
+    held_b = sc.reached("b", "consume", B, within=120)
+    if held_b is None:
+        return
+    text = edited_program("gen")
+    want = oracle_of(sc, {"src/one.rs": text, "value.txt": "b\n"}, extra)
+    answer, began = {}, time.time()
+    path = os.path.join(sc.ws, "src", "one.rs")
+    editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.env("a")["RA_JIT_HOME"], path, text),
+                                                           at=time.time()))
+    editor.start()
+    sc.wait_event("a", "refused", within=120)
+    # B is held for as long as it takes the worker to take many turns (it takes them in
+    # milliseconds): the edit is neither answered nor asked about again and again.
+    hold = float(os.environ.get("LEASEBARRIER_RECOVERY_HOLD", "12"))
+    time.sleep(hold)
+    refused = [e for e in sc.events("a") if e[0] == "refused"]
+    sc.notes["refused-while-b-held"] = len(refused)
+    sc.notes["answered-while-b-held"] = answer.get("said")
+    if "said" in answer:
+        sc.fail(f"the edit was answered {answer['said']!r} after {answer['at'] - began:.1f}s, while B's build was held")
+    if len(refused) > 1:
+        sc.fail(f"the edit's world was looked at and refused {len(refused)} times while nothing had moved")
+    sc.release("b", "consume", held_b)
+    sc.finish(B, "B")
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+    editor.join(WAIT)
+    said = answer.get("said")
+    sc.notes["edit-said"] = said
+    if not str(said).startswith("ok"):
+        sc.fail(f"the edit was answered {said!r} once B's build was over (with no second request)")
+        return
+    time.sleep(2)
+    spliced = os.path.join(sc.ws, "target", "ra-jit", "whole", "gen-one")
+    got = sc.program("gen-one", spliced)
+    sc.notes["edited-a"] = [got, want]
+    strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+    if got is None or strip(got) != strip(want):
+        sc.fail(f"A's edited program printed {got!r}, what cargo builds of the tree {want!r}")
+    elif got != want:
+        sc.gaps.append(f"A's edited program printed {got!r}, cargo's {want!r} (the warm worker's native link)")
+    sc.notes["refused"] = [e for e in sc.events("a") if e[0] == "refused"]
+    sc.timeouts()
+
+
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
     which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
@@ -1337,6 +1567,9 @@ SCENARIOS = {
     "groups": groups,
     "generation": generation,
     "unrelated": unrelated,
+    "once": once_ran,
+    "once-failed": once_failed,
+    "recovery": recovery,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,

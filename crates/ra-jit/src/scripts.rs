@@ -424,6 +424,9 @@ struct Done {
     fingerprint: u64,
     /// Which run left the output ([`generation_of`]).
     generation: u64,
+    /// Whether the build that judged it ran the script (and so keeps the output until it ends),
+    /// or found the output of an earlier run fresh.
+    ran: bool,
     made: Option<SystemTime>,
     links: Option<String>,
 }
@@ -622,11 +625,12 @@ impl<'a> Runner<'a> {
                 self.judged.push((run_dir, done.generation));
                 return Ok(Some(done));
             }
-            // The build gave its lease up to wait: its result is the build's again if the output
-            // is still the run it was of, and if another build ran the script meanwhile it is not
-            // (that build's output is not this one's) and the script is judged again.
+            // The build gave its lease up to wait (it ran nothing of this script: a build that
+            // ran one keeps its lease): its result is the build's again if the output is still
+            // the run it was of, and if another build ran the script meanwhile it is not and the
+            // script is judged again.
             Some(leases::Judged::Released(done)) => {
-                let again = self.leases.reacquire(build, &run_dir, done.generation);
+                let again = self.leases.reacquire(build, &run_dir, done.generation, done.ran);
                 if again.map_err(|it| self.refused(it))? {
                     self.judged.push((run_dir, done.generation));
                     return Ok(Some(done));
@@ -749,6 +753,7 @@ impl<'a> Runner<'a> {
             output: printed,
             fingerprint: fingerprint.hash(),
             generation,
+            ran: writer.is_some(),
             made: std::fs::metadata(&output_file).and_then(|it| it.modified()).ok(),
             links: data.links.clone(),
         });

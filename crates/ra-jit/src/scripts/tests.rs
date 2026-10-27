@@ -244,6 +244,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
                 output,
                 fingerprint: 0,
                 generation: 0,
+                ran: false,
                 made: None,
                 links: None,
             })),
@@ -533,6 +534,10 @@ fn builds_that_find_the_script_fresh_read_its_output_together() {
     let base = dir("fresh-together");
     let pkg = Fixture::at(&base);
     let (first, second) = (Leases::default(), Leases::default());
+    // An earlier build ran the script, and is over.
+    let earlier = Leases::default();
+    pkg.request(&earlier, 9, "a", &[]).unwrap();
+    earlier.retire(9);
     pkg.request(&first, 1, "a", &[]).unwrap();
     // The same value: nothing is to run, so the second worker's build does not wait for the
     // first's.
@@ -655,29 +660,93 @@ fn two_runs_of_one_fingerprint_are_two_generations_and_a_world_of_one_is_not_the
 
 #[cfg(unix)]
 #[test]
-fn a_script_runs_once_in_a_build_that_yields_unless_another_build_ran_it_meanwhile() {
+fn a_script_a_build_ran_is_run_once_in_it_whatever_another_build_asks_between_its_requests() {
     let base = dir("once");
     let pkg = Fixture::at(&base);
     let leases = Leases::default();
     let always = [("ALWAYS", "1")];
     pkg.request(&leases, 1, "a", &always).unwrap();
     assert_eq!(pkg.runs(), ["a"]);
-    // The build yields to wait for something else: its lease goes, its decision stays.
-    assert!(leases.yield_world(1));
+    // The build is refused something and would yield: it ran a script, so it keeps what it holds
+    // and the admission, and nothing waits for it.
+    assert!(!leases.yield_world(1));
+    // Another build wants to run the script: it is put off, and does not hold the admission
+    // while it waits, so the first build's later requests do not wait for it.
+    assert_eq!(why(pkg.request(&leases, 2, "b", &always)), Err("busy 1".to_owned()));
     let again = pkg.request(&leases, 1, "a", &always).unwrap();
-    assert_eq!(pkg.runs(), ["a"], "an always-stale script runs once in a build, yielded or not");
+    assert_eq!(pkg.runs(), ["a"], "an always-stale script runs once in a build");
     assert_eq!(pkg.generated(&again), "a");
-    // Another build runs it while this one has given the lease up: the output is that build's,
-    // and the only way to read what the script left is to judge it again.
-    assert!(leases.yield_world(1));
-    pkg.request(&leases, 2, "b", &always).unwrap();
-    assert_eq!(pkg.runs(), ["a", "b"]);
-    let third = pkg.request(&leases, 1, "a", &always);
-    assert!(matches!(third, Err(Attempt::Busy(_))), "build 2 reads it: the build waits for it");
-    leases.retire(2);
+    assert_eq!(why(pkg.request(&leases, 2, "b", &always)), Err("busy 1".to_owned()));
+    assert_eq!(pkg.generated(&again), "a", "and nobody wrote its output");
     let last = pkg.request(&leases, 1, "a", &always).unwrap();
-    assert_eq!(pkg.generated(&last), "a");
-    assert_eq!(pkg.runs(), ["a", "b", "a"]);
+    assert_eq!((pkg.generated(&last), pkg.runs()), ("a".to_owned(), vec!["a".to_owned()]));
+    // The build is over, and the other runs it, once.
+    leases.retire(1);
+    let b = pkg.request(&leases, 2, "b", &always).unwrap();
+    assert_eq!(
+        (pkg.generated(&b), pkg.runs()),
+        ("b".to_owned(), vec!["a".to_owned(), "b".to_owned()])
+    );
+    leases.retire(2);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The sequence of the review, with the real runner: the first build's first request ran the
+/// script and was answered, the second build waits to run it, and the first build has another
+/// request. The script counts its runs: a second run of it in the first build is the defect.
+#[cfg(unix)]
+#[test]
+fn a_build_that_ran_a_script_never_runs_it_again_in_a_later_request_with_another_build_waiting() {
+    let base = dir("once-later");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let always = [("ALWAYS", "1")];
+    let first = pkg.request(&leases, 1, "a", &always).unwrap();
+    // The attempt ended and the second build comes: the first answered, and has more to judge.
+    let mut waiting = 0;
+    for _ in 0..3 {
+        match pkg.request(&leases, 2, "b", &always) {
+            Err(Attempt::Busy(Busy::Process { build: 1, .. })) => waiting += 1,
+            other => panic!("the second build was not put off: {}", why(other).unwrap_err()),
+        }
+        // The first build's next request: the same judgment, the same output.
+        let next = pkg.request(&leases, 1, "a", &always).unwrap();
+        assert_eq!(next.generation, first.generation);
+        assert_eq!(pkg.generated(&next), "a");
+    }
+    assert_eq!((waiting, pkg.runs()), (3, vec!["a".to_owned()]));
+    leases.retire(1);
+    assert!(pkg.request(&leases, 2, "b", &always).is_ok());
+    assert_eq!(pkg.runs(), ["a", "b"]);
+    leases.retire(2);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A build that only found the script fresh has not run it: when another build ran it meanwhile,
+/// the first one's judging of it again is its first run, never a second.
+#[cfg(unix)]
+#[test]
+fn a_build_that_found_a_script_fresh_runs_it_once_if_another_build_ran_it_while_it_waited() {
+    let base = dir("once-fresh");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    // An earlier build ran it for `a0`, and is over.
+    pkg.request(&leases, 9, "a0", &[]).unwrap();
+    leases.retire(9);
+    // The build finds it fresh, holds the output, and is refused something: it yields.
+    pkg.request(&leases, 1, "a0", &[]).unwrap();
+    assert_eq!(pkg.runs(), ["a0"]);
+    assert!(leases.yield_world(1));
+    // Another build wants another value, and runs.
+    pkg.request(&leases, 2, "b", &[]).unwrap();
+    leases.retire(2);
+    assert_eq!(pkg.runs(), ["a0", "b"]);
+    // The first build's script is to run: the output is not the one it found, and it ran nothing.
+    let a = pkg.request(&leases, 1, "a0", &[]).unwrap();
+    assert_eq!(pkg.generated(&a), "a0");
+    assert_eq!(pkg.runs(), ["a0", "b", "a0"]);
+    // And now it ran, and keeps it.
+    assert!(!leases.yield_world(1));
     leases.retire(1);
     let _ = std::fs::remove_dir_all(&base);
 }
