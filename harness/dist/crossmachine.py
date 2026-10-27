@@ -545,6 +545,74 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
+def nonfunction_report(work, bin_dir, machines, sources):
+    """Drive newly introduced const/discriminant includes through actual requests."""
+    from cargo_ra_jit import Side, program_output, wait_warm
+    rows = []
+    for machine in machines:
+        ws = os.path.join(machine.checkout("nonfunction", sources["vendor-payload"]), "vendored")
+        source = os.path.join(ws, "vendor/fastrand/src/lib.rs")
+        original = open(source).read()
+        payload = os.path.join(ws, "vendor/fastrand/src/absent.bin")
+        env = machine.env(bin_dir, os.path.join(machine.top, "nonfunction-store"), daemon_home("nonf", machine.name))
+        side = Side(ws, env, True)
+        old_pids, old_builds = None, -1
+        try:
+            for step, declaration, value, fail in [
+                ("initial", "const X: &[u8] = &[1];", None, False),
+                ("const-missing", 'const X: &[u8] = include_bytes!("absent.bin");', None, True),
+                ("const-created", 'const X: &[u8] = include_bytes!("absent.bin");', 2, False),
+                ("reader-removed", "const X: &[u8] = &[42];", 2, False),
+                ("obsolete-deleted", "const X: &[u8] = &[42];", None, False),
+                ("cfg-disabled", '#[cfg(any())] const UNUSED: &[u8] = include_bytes!("absent.bin"); const X: &[u8] = &[42];', None, False),
+                ("enum-missing", '#[repr(u8)] enum E { X = include_bytes!("absent.bin")[0] } const X: &[u8] = &[E::X as u8];', None, True),
+                ("enum-created", '#[repr(u8)] enum E { X = include_bytes!("absent.bin")[0] } const X: &[u8] = &[E::X as u8];', 3, False),
+            ]:
+                text = original.replace('pub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }',
+                                        declaration + '\npub fn c4_payload() -> u8 { X[0] }')
+                if value is None:
+                    if os.path.exists(payload):
+                        os.remove(payload)
+                else:
+                    with open(payload, "wb") as output:
+                        output.write(bytes([value]))
+                with open(source, "w") as output:
+                    output.write(text)
+                checksum = os.path.join(ws, "vendor/fastrand/.cargo-checksum.json")
+                checks = json.load(open(checksum))
+                checks["files"]["src/lib.rs"] = hashlib.sha256(text.encode()).hexdigest()
+                checks["files"].pop("src/absent.bin", None)
+                if value is not None:
+                    checks["files"]["src/absent.bin"] = hashlib.sha256(bytes([value])).hexdigest()
+                with open(checksum, "w") as output:
+                    json.dump(checks, output)
+                _, built = side.cargo("build", "-p", "app")
+                _, ready = wait_warm(side, ws)
+                status = side.cargo("status")[1].stdout
+                shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
+                oracle = sh(["cargo", "build", "--locked", "--offline", "-p", "app"],
+                            cwd=ws, env=dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
+                actual = expected = None
+                if fail:
+                    semantic = missing_input_failure(built.returncode, built.stderr, oracle.returncode, oracle.stdout, payload)
+                else:
+                    actual = program_output(side.cargo("run", "-p", "app")[1])
+                    reference_env = dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
+                    expected = program_output(sh(["cargo", "run", "--locked", "--offline", "-q", "-p", "app"], cwd=ws,
+                                                 env=reference_env, stderr=subprocess.PIPE))
+                    semantic = built.returncode == oracle.returncode == 0 and actual == expected
+                pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
+                builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
+                generation = valid_worker_generation(status, ready, pids, old_pids, builds, old_builds)
+                old_pids, old_builds = pids, builds
+                rows.append(dict(machine=machine.name, step=step, semantic=semantic, right=semantic and generation and not recognized_fallback(built.stderr),
+                                 blaze_returncode=built.returncode, cargo_returncode=oracle.returncode, actual=actual,
+                                 expected=expected, build_log=built.stderr, cargo_log=oracle.stdout, worker_log=workers_log(side),
+                                 pids=pids, status=status, ready=ready, daemon_builds=builds))
+        finally:
+            side.cargo("stop")
+    return rows
+
 
 def valid_worker_generation(status, ready, pids, previous_pids, builds, previous_builds):
     return (bool(pids) and "failed:" not in status and ": ready" in status
@@ -1118,6 +1186,7 @@ def main():
                    help="build and run only with plain cargo on both machines: no daemon is loaded")
     p.add_argument("--warm-payload", action="store_true",
                    help="same-daemon binary payload edit/delete/recreate on two checkout paths")
+    p.add_argument("--warm-nonfunction", action="store_true")
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
     p.add_argument("--watchdog-mb", type=int, default=24 * 1024)
@@ -1133,7 +1202,7 @@ def main():
     if a.remote or a.b_docker:
         sys.exit("--remote and --b-docker belong to unit C5 (a server remote, a machine of another libc); "
                  "crossmachine.py has a directory remote and two machines of this host")
-    names = ["vendor-payload"] if a.warm_payload else (ALL if a.all else a.fixtures)
+    names = ["vendor-payload"] if a.warm_payload or a.warm_nonfunction else (ALL if a.all else a.fixtures)
     if not names:
         p.error("name a fixture, or --all")
     unknown = [n for n in names if n not in FIXTURES]
@@ -1176,11 +1245,13 @@ def main():
                  f"machine B: home {b_m.home}\n           checkouts {b_m.checkouts}")
         if a.reference_only:
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
-        if a.warm_payload:
-            rows = warm_payload_report(work, bin_dir, (a_m, b_m), sources)
+        if a.warm_payload or a.warm_nonfunction:
+            rows = (nonfunction_report if a.warm_nonfunction else warm_payload_report)(work, bin_dir, (a_m, b_m), sources)
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
                 json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
             print(json.dumps(rows, indent=1))
+            if a.warm_nonfunction:
+                return 1 if any(not row["right"] for row in rows) or watchdog.tripped else 0
             return 1 if any(
                 not r["right"]
                 or (r["step"] not in ("deleted", "reintroduce-missing") and r["classification"] != "daemon")
