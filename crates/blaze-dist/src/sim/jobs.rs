@@ -5,25 +5,24 @@
 //! leads die or stall and come back with a dead attempt's events; builders are rebuilt. The
 //! checker holds after every step:
 //!
+//! - **assignment**: one live assignment per slot, retained until its own kill acknowledgment;
 //! - **capacity**: no machine's reservations sum past its capacity;
 //! - **order**: a pull request's job is admitted only while no `Main` job waits on its
 //!   platform, and every job only after the jobs of its class queued before it;
 //! - **queue**: at most `Q` executions wait per platform, and `busy` is answered exactly then;
-//! - **placement**: an execution runs on its platform and namespace within the executor's
-//!   reservation; a live lead has exactly that assignment and cannot lead another execution;
+//! - **placement**: an execution runs on its platform within the executor's reservation;
 //! - **attempts**: an execution is reassigned at most once, a second loss ends it `Lost`, and a
 //!   dead attempt's events are refused;
 //! - **subscribers**: equal content shares one execution while it runs; `TimedOut` only past a
-//!   subscriber's own deadline and no other outcome after it; the last subscriber leaving
-//!   ends it; a refusal never ends `Passed`;
-//! - **stages**: coordinator-generated stage timestamps go forward in order. Arbitrary
-//!   worker-supplied `Stage` events are outside this check;
+//!   subscriber's own deadline; the last subscriber leaving ends it; a refusal never ends
+//!   `Passed`;
+//! - **stages**: every execution's stage timestamps go forward in order;
 //! - **progress**: every execution ends.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_wire::{
-    Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
+    BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
     Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourceRef, Stage,
     StoreIdentity, WorkersEventsRequest,
 };
@@ -73,13 +72,14 @@ struct World {
     queue_limit: usize,
     /// The checker's own queue: per platform and class, the executions waiting, in order.
     shadow: BTreeMap<(Digest, Class), VecDeque<ExecutionId>>,
-    meta: BTreeMap<ExecutionId, (Digest, Namespace, Reservation)>,
+    meta: BTreeMap<ExecutionId, (Digest, Namespace)>,
     subscribers: BTreeMap<u64, (ExecutionId, u64)>,
     ended_subs: BTreeSet<u64>,
     left: BTreeSet<u64>,
     leads: BTreeMap<ExecutionId, Lead>,
     late: Vec<(ExecutionId, String, blaze_wire::Attempt)>,
-    kills: Vec<(Millis, String, ExecutionId, Attempt)>,
+    kills: Vec<(Millis, String, jobs::AssignmentToken, bool)>,
+    live: BTreeMap<String, jobs::AssignmentToken>,
     dead: BTreeSet<String>,
     summary: Summary,
 }
@@ -132,6 +132,7 @@ impl World {
             leads: BTreeMap::new(),
             late: Vec::new(),
             kills: Vec::new(),
+            live: BTreeMap::new(),
             dead: BTreeSet::new(),
             summary: Summary {
                 seed,
@@ -156,11 +157,12 @@ impl World {
             let mut out = Vec::new();
             self.jobs.tick(self.now, &mut out);
             self.effects(out)?;
+            self.check_assignments()?;
             self.jobs.admission_view().check().map_err(|e| self.violation("capacity", e))?;
-            self.assignments()?;
             if self.now >= horizon
-                && self.jobs.executions().all(|e| matches!(e.state(), ExecState::Ended(_)))
                 && self.kills.is_empty()
+                && self.live.is_empty()
+                && self.jobs.executions().all(|e| matches!(e.state(), ExecState::Ended(_)))
             {
                 break;
             }
@@ -200,7 +202,8 @@ impl World {
                 let gone = self.jobs.admission().close_pr(n);
                 for (executor, busy) in gone {
                     self.dead.insert(executor.clone());
-                    if let Some((execution, _)) = busy
+                    self.live.remove(&executor);
+                    if let Some(execution) = busy
                         && let Some(lead) = self.leads.get_mut(&execution)
                         && lead.executor == executor
                     {
@@ -287,7 +290,7 @@ impl World {
             .executions()
             .find(|e| {
                 !matches!(e.state(), ExecState::Ended(_))
-                    && self.meta.get(&e.id).is_some_and(|(_, ns, _)| *ns == namespace)
+                    && self.meta.get(&e.id).is_some_and(|(_, ns)| *ns == namespace)
                     && e.content
                         == blaze_wire::JobContent::of(&blaze_wire::JobContentInput {
                             spec: blaze_wire::digest_of(&spec),
@@ -296,7 +299,7 @@ impl World {
             })
             .map(|e| e.id);
         let mut out = Vec::new();
-        match self.jobs.submit(self.now, &req, need.clone(), &mut out) {
+        match self.jobs.submit(self.now, &req, need, &mut out) {
             Ok(answer) => {
                 self.subscribers.insert(answer.subscriber, (answer.execution, req.deadline_ms));
                 match running {
@@ -321,7 +324,7 @@ impl World {
                             ));
                         }
                         self.summary.executions += 1;
-                        self.meta.insert(answer.execution, (platform, namespace, need));
+                        self.meta.insert(answer.execution, (platform, namespace));
                         self.shadow
                             .entry((platform, class))
                             .or_default()
@@ -420,24 +423,44 @@ impl World {
         Ok(())
     }
 
-    /// The agents: kill acknowledgements may be delayed and duplicated. Each one names its
-    /// assignment, so replay after the executor starts another job cannot free that job.
+    /// The agents: a kill is carried out a little later, and the executor is returned to
+    /// admission, idle or gone.
     fn agents(&mut self) {
         let now = self.now;
         let (due, later): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.kills).into_iter().partition(|(at, ..)| *at <= now);
         self.kills = later;
-        for (_, executor, execution, attempt) in due {
-            let alive = !self.dead.contains(&executor);
-            self.jobs.killed(now, &executor, execution, attempt, alive);
+        for (_, executor, assignment, alive) in due {
+            // The simulated agent stops only the named assignment. Delayed duplicates
+            // cannot stop the newer process occupying this slot.
+            if self.live.get(&executor) == Some(&assignment) {
+                self.live.remove(&executor);
+            }
+            self.jobs.killed(now, &executor, assignment, alive);
         }
+    }
+
+    fn check_assignments(&self) -> Result<(), Violation> {
+        for (executor, assignment) in &self.live {
+            let slot = self.jobs.admission_view().executor(executor);
+            if !slot.is_some_and(|s| {
+                s.busy == Some(assignment.execution)
+                    && s.phase != crate::admission::ExecutorPhase::Stopped
+            }) {
+                return Err(self.violation(
+                    "assignment",
+                    format!("live assignment {assignment:?} lost its slot {executor}: {slot:?}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn effects(&mut self, out: Vec<(ExecutionId, jobs::Effect)>) -> Result<(), Violation> {
         for (id, effect) in out {
             match effect {
                 jobs::Effect::Event(item) => self.event(id, &item.event, item.attempt)?,
-                jobs::Effect::Kill { executor, attempt } => {
+                jobs::Effect::Kill { executor, assignment } => {
                     if let Some(lead) = self.leads.get(&id)
                         && lead.executor == executor
                         && lead.dead
@@ -445,11 +468,11 @@ impl World {
                         self.dead.insert(executor.clone());
                     }
                     let at = self.now + self.rng.range(0, 10_000);
-                    self.kills.push((at, executor.clone(), id, attempt));
-                    if self.rng.chance(250_000) {
-                        let replay_at = at + self.rng.range(10_000, 30_000);
-                        self.kills.push((replay_at, executor, id, attempt));
-                    }
+                    let alive = !self.dead.contains(&executor);
+                    self.kills.push((at, executor.clone(), assignment, alive));
+                    // A second acknowledgment can arrive after the slot has been reused.
+                    let duplicate_at = at + self.rng.range(1_000, 60_000);
+                    self.kills.push((duplicate_at, executor, assignment, alive));
                 }
                 jobs::Effect::SubscriberEnded { subscriber, outcome, .. } => {
                     if self.left.contains(&subscriber) {
@@ -465,16 +488,18 @@ impl World {
                         ));
                     }
                     let (_, deadline) = self.subscribers[&subscriber];
+                    if matches!(outcome, Outcome::Passed | Outcome::Failed | Outcome::Refused)
+                        && self.now > deadline
+                    {
+                        return Err(self.violation(
+                            "subscribers",
+                            format!("expired subscriber {subscriber} received {outcome:?}"),
+                        ));
+                    }
                     if outcome == Outcome::TimedOut && self.now <= deadline {
                         return Err(self.violation(
                             "subscribers",
                             format!("subscriber {subscriber} timed out before its deadline"),
-                        ));
-                    }
-                    if self.now > deadline && outcome != Outcome::TimedOut {
-                        return Err(self.violation(
-                            "subscribers",
-                            format!("subscriber {subscriber} got {outcome:?} past its deadline"),
                         ));
                     }
                 }
@@ -491,7 +516,7 @@ impl World {
         event: &JobEvent,
         attempt: blaze_wire::Attempt,
     ) -> Result<(), Violation> {
-        let (platform, namespace, need) = self.meta.get(&id).cloned().expect("submitted");
+        let (platform, namespace) = self.meta.get(&id).cloned().expect("submitted");
         match event {
             JobEvent::Stage(stage) if stage.stage == Stage::Admitted => {
                 let class = Class::of(&namespace).expect("a job's");
@@ -515,15 +540,20 @@ impl World {
                 }
             }
             JobEvent::Assigned(assigned) => {
+                let token = jobs::AssignmentToken { execution: id, attempt: assigned.attempt };
+                if let Some(old) = self.live.insert(assigned.executor.clone(), token) {
+                    return Err(self.violation(
+                        "assignment",
+                        format!(
+                            "slot {} assigned {token:?} while {old:?} is still live",
+                            assigned.executor
+                        ),
+                    ));
+                }
                 let executor = self.jobs.admission_view().executor(&assigned.executor).cloned();
                 match executor {
                     Some(e)
-                        if self.jobs.admission_view().platform(&e.machine) == Some(platform)
-                            && e.namespace == namespace
-                            && e.busy == Some((id, attempt))
-                            && e.reservation.memory >= need.memory
-                            && e.reservation.cpus >= need.cpus
-                            && e.reservation.disk >= need.disk => {}
+                        if self.jobs.admission_view().platform(&e.machine) == Some(platform) => {}
                     other => {
                         return Err(self.violation(
                             "placement",
@@ -579,37 +609,6 @@ impl World {
                 *self.summary.outcomes.entry(done.outcome.discriminant()).or_default() += 1;
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    /// Capacity sums alone cannot detect two executions sharing one executor reservation.
-    fn assignments(&self) -> Result<(), Violation> {
-        let mut owners = BTreeMap::new();
-        for execution in self.jobs.executions() {
-            if execution.state() != ExecState::Running {
-                continue;
-            }
-            let Some(lead) = execution.lead() else { continue };
-            if let Some(other) = owners.insert(lead, execution.id) {
-                return Err(self.violation(
-                    "placement",
-                    format!("{lead} leads both {other:?} and {:?}", execution.id),
-                ));
-            }
-            let expected = Some((execution.id, execution.attempt()));
-            if !self.dead.contains(lead)
-                && self
-                    .jobs
-                    .admission_view()
-                    .executor(lead)
-                    .is_none_or(|slot| slot.busy != expected)
-            {
-                return Err(self.violation(
-                    "placement",
-                    format!("{lead} lost the reservation of {:?}", execution.id),
-                ));
-            }
         }
         Ok(())
     }

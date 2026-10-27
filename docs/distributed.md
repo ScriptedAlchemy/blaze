@@ -1501,11 +1501,22 @@ What the crate fixes that this section leaves open, one line each:
   `not-yet` with a retry time; after, `front-end-differs` for the attempt. A new lead whose root
   set differs from the fixed one, after a reassignment, is authoritative too.
 - A lead that is loading its front end heartbeats; only a lead that stops heartbeating is lost.
+- A stop effect and its acknowledgment carry the execution and attempt that occupied the
+  executor slot. Only a matching pending stop releases that slot; a delayed duplicate cannot
+  release a newer assignment or finish its drain.
+- Worker events expire subscribers against their own deadlines before accepting a terminal
+  result, just as a timer does. Each subscriber receives its outcome once.
 - Refusals keep section 8's codes, and each message starts with a stable token (`dead-lease`,
   `attempt-moved`, `not-joined`, `not-yet`, ...) that an executor reads back.
 - Admission is strict per platform: the head of `Main`'s queue first, a pull request's job only
   while no `Main` job waits, and a head that cannot run blocks its class. An idle executor takes a
   job only if its reservation covers the job's measured need.
+
+The permanent-stall regression keeps a promoted lead heartbeating without completing its
+batch. It checks deadline cancellation, no false coverage, fenced late results and stop effects.
+It does not establish successful recovery from a heartbeating stuck lead. These state machines
+and synthetic simulations do not certify compiler, transport, publication or process cleanup
+integration; their effects still need drivers.
 
 **The simulation.** `blaze_dist::sim` runs the machines on one thread over a seeded scheduler and a
 virtual clock, as roadmap.md's simulation backend describes. The work simulation puts the
