@@ -9090,15 +9090,7 @@ fn run_holding(
                 hir::attach_db(&db, || {
                     for &krate in ide_db::base_db::all_crates(&db).iter() {
                         if db.included_by(krate).iter().any(|(read, _)| read == &path) {
-                            let declared = declared_in(&db, krate.into());
-                            for function in declared.functions {
-                                let body = Body::of(&db, function.into());
-                                eprintln!("included-owner: {:?}, literals={:?}",
-                                    function, body.exprs().filter_map(|(_, expr)| match expr {
-                                        hir_def::hir::Expr::Literal(hir_def::hir::Literal::ByteString(bytes)) => Some(bytes.len()),
-                                        _ => None,
-                                    }).collect::<Vec<_>>());
-                            }
+                            eprintln!("included-owner: {:?}", krate);
                         }
                     }
                 });
@@ -9805,6 +9797,24 @@ impl Program {
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
+        // Missing external inputs are compilation errors even when an old patch
+        // base can still execute. Never advertise that old executable as a new
+        // successful build.
+        for name in args.crates() {
+            for krate in crates_named(db, name, args).unwrap_or_default() {
+                let mut closure = ide_db::base_db::Crate::from(krate).transitive_deps(db);
+                closure.insert(krate.into());
+                for dependency in closure {
+                    if let Some((path, _)) =
+                        db.included_by(dependency).into_iter().find(|(_, bytes)| bytes.is_none())
+                    {
+                        let said =
+                            errors::of_none(&format!("could not read included input `{path}`"));
+                        return Ok(Err(Refused::Error(errors::Said::one(said))));
+                    }
+                }
+            }
+        }
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // Neither is what no crate that is built reads: an example, or a test.
         edited.retain(|&file| listed.sees(db, file));

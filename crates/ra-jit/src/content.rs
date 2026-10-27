@@ -484,7 +484,10 @@ mod tests {
 
     #[test]
     fn included_bytes_advance_mir_in_one_database() {
-        check_payload_owner("pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }", false);
+        check_payload_owner(
+            "pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }",
+            false,
+        );
     }
 
     #[test]
@@ -574,17 +577,24 @@ mod tests {
             });
             let path = paths::AbsPathBuf::assert_utf8(payload.clone());
             let bodies = |db: &RootDatabase| {
-                let dep = *ide_db::base_db::all_crates(db).iter().find(|krate| {
-                    krate.extra_data(db).display_name.as_ref().unwrap().to_string() == "dep"
-                }).unwrap();
+                let dep = *ide_db::base_db::all_crates(db)
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(db).display_name.as_ref().unwrap().to_string() == "dep"
+                    })
+                    .unwrap();
                 let declared = crate::declared_in(db, dep.into());
-                declared.functions.iter().map(|&id| {
-                    use hir_ty::db::HirDatabase as _;
-                    (
-                        format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into())),
-                        format!("{:?}", db.runtime_mir_body(id.into())),
-                    )
-                }).collect::<Vec<_>>()
+                declared
+                    .functions
+                    .iter()
+                    .map(|&id| {
+                        use hir_ty::db::HirDatabase as _;
+                        (
+                            format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into())),
+                            format!("{:?}", db.runtime_mir_body(id.into())),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             };
             let old_bodies = hir::attach_db(&db, || bodies(&db));
             std::fs::write(&payload, [byte + 10]).unwrap();
