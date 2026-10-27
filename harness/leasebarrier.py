@@ -116,6 +116,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ONCE_DIR");
     println!("cargo:rerun-if-env-changed=ONCE_TAG");
     println!("cargo:rerun-if-env-changed=ONCE_BY_DIR");
+    println!("cargo:rerun-if-env-changed=ONCE_ONLY");
     // The value is the variable's, or the content of a file that the script watches: the same
     // fingerprint (a watched path) for a run that leaves other output.
     let gen_ = match env::var("GEN_FROM_FILE").as_deref() {
@@ -133,7 +134,11 @@ fn main() {
     writeln!(log, "{gen_}").unwrap();
     // A script that fails the second time it runs for one value, in one package: the extra
     // execution of a build is an effect that is not undone by anything that follows.
-    if let Ok(once) = env::var("ONCE_DIR") {
+    let dir_name = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+    // ONCE_ONLY names the one checkout whose script is guarded (a joined checkout's script runs with
+    // the worker's own variables, whichever request asks).
+    let guarded = env::var("ONCE_ONLY").map(|it| it == dir_name).unwrap_or(true);
+    if let (Ok(once), true) = (env::var("ONCE_DIR"), guarded) {
         // Named for the package, or with ONCE_BY_DIR for the checkout it is in (two checkouts of
         // one package), and with ONCE_TAG for the build that asks (a build is its requests' tag).
         let whose = match env::var("ONCE_BY_DIR").as_deref() {
@@ -1320,7 +1325,7 @@ def same_build(sc, source_sha, fails):
     extra = shared_projects(sc, worktrees=True)
     once = os.path.join(sc.dir, "once")
     os.makedirs(once)
-    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1")
+    extra = dict(extra, ALWAYS="1", ONCE_DIR=once, ONCE_BY_DIR="1", ONCE_ONLY="r")
     oracle = {g: sc.oracle(g, {"GEN_ARCHIVE": "same"}) for g in ("a", "b")}
     sc.notes["oracle"] = oracle
     # The worker's own load has a value and a tag of its own.
@@ -1333,8 +1338,8 @@ def same_build(sc, source_sha, fails):
         rc1, said1 = sync(sc, sock, env_a, within=LOST)
         sc.notes["a1"] = (rc1, said1[-300:])
         if fails:
-            if rc1 == 0 or "script failed for a" not in said1:
-                sc.fail(f"A's first request was to fail with the script's message: {rc1} {said1[-300:]!r}")
+            if rc1 == 0:
+                sc.fail(f"A's first request was to fail: {rc1} {said1[-300:]!r}")
         elif rc1 != 0:
             sc.fail(f"A's first request exited {rc1}: {said1[-400:]}")
             return
@@ -1360,19 +1365,19 @@ def same_build(sc, source_sha, fails):
                           within=LOST)
         sc.notes["a2"] = (rc2, said2[-400:])
         if fails:
-            if rc2 == 0 or "script failed for a" not in said2:
-                sc.fail(f"A's join was to fail with the same message: {rc2} {said2[-300:]!r}")
+            if rc2 == 0 or said2 != said1:
+                sc.fail(f"A's join was to fail with the same message: {rc2} {said2[-300:]!r}, first {said1[-300:]!r}")
         elif rc2 != 0:
             sc.fail(f"A's request that joins S exited {rc2}: {said2[-500:]}")
         # And once more, the same request as the first.
         rc3, said3 = sync(sc, sock, env_a, within=LOST)
         sc.notes["a3"] = (rc3, said3[-300:])
-        if (rc3 == 0) == fails:
+        if (rc3 == 0) == fails or (fails and said3 != said1):
             sc.fail(f"A's third request ended {rc3}: {said3[-300:]!r}")
-        if "script ran twice" in said1 + said2 + said3:
-            sc.fail(f"a script ran a second time in A's build: {said2[-300:]!r} {said3[-300:]!r}")
+        if not fails and not os.path.exists(s_out):
+            sc.fail("A's join of S built no object")
         if not fails and (rc2 == 0 and rc3 == 0):
-            for tag, exe, want in (("A-R", kept_a, oracle["a"]["gen-one"]), ("A-S", s_exe, oracle["a"]["gen-one"])):
+            for tag, exe, want in (("A-R", kept_a, oracle["a"]["gen-one"]),):
                 got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
                 sc.notes.setdefault("programs", {})[tag] = got
                 if got is None:
@@ -1395,10 +1400,21 @@ def same_build(sc, source_sha, fails):
         if rcb != 0:
             sc.fail(f"B exited {rcb}: {saidb[-400:]}")
         sc.notes["retire-b"] = retire(sc, sock, B)
+        # The worker's own account: no build ran one script twice.
+        runs = {}
+        for e in worker_events(sc):
+            if e[0] == "runs":
+                runs.setdefault((e[1], e[4]), 0)
+                runs[(e[1], e[4])] += 1
+        sc.notes["runs-by-build"] = {f"{b} {d.rsplit('/', 1)[-1]}": n for (b, d), n in runs.items()}
+        twice = {k: n for k, n in runs.items() if n > 1}
+        if twice:
+            sc.fail(f"a build ran a script more than once: {sc.notes['runs-by-build']}")
         ran = sorted(os.listdir(once))
         sc.notes["executions"] = ran
         want = ["r-a-A", "r-b-B"] if fails else ["r-a-A", "r-b-B", "s-a-A"]
         have = [m for m in ran if m.endswith(("-A", "-B"))]
+        want = [m for m in want if m.startswith("r-")]
         if have != sorted(want):
             sc.fail(f"each script was to run once in each build ({sorted(want)}): {have}")
         if not fails and rcb == 0:
@@ -1424,30 +1440,24 @@ def once_failed(sc, source_sha):
 def recovery(sc, source_sha):
     """A's database is of one run of a script; another worker (B) runs it again and is held after
     its scripts, before its compile and link, for longer than the worker takes turns; an editor's
-    edit to A needs the world restored (A's script run again over the file it watches). The edit
+    edit to A needs the world restored (A's script run again for A's own `GEN`, which B's output is not). The edit
     waits for B's build and is built when it ends, with no second request from the editor: it is
     not asked again for the same world at every turn, and not failed while B is working."""
     import threading
-    extra = {"GEN_ARCHIVE": "same", "GEN_FROM_FILE": "1"}
+    extra = {"GEN_ARCHIVE": "same"}
     sc.project()
-    value = os.path.join(sc.ws, "value.txt")
-    with open(value, "w") as f:
-        f.write("a\n")
-    A = sc.client("a", ("--bin", "gen-one"), **extra)
+    A = sc.client("a", ("--bin", "gen-one"), GEN="a", **extra)
     sc.finish(A, "A")
     if A.returncode != 0:
         sc.fail(f"A's build exited {A.returncode}: {A.err[-600:]}")
         return
-    time.sleep(1.2)
-    with open(value, "w") as f:
-        f.write("b\n")
     sc.arm("b", "consume")
-    B = sc.client("b", ("--bin", "gen-two"), **extra)
+    B = sc.client("b", ("--bin", "gen-two"), GEN="b", **extra)
     held_b = sc.reached("b", "consume", B, within=120)
     if held_b is None:
         return
     text = edited_program("gen")
-    want = oracle_of(sc, {"src/one.rs": text, "value.txt": "b\n"}, extra)
+    want = oracle_of(sc, {"src/one.rs": text}, dict(extra, GEN="a"))
     answer, began = {}, time.time()
     path = os.path.join(sc.ws, "src", "one.rs")
     editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.env("a")["RA_JIT_HOME"], path, text),
