@@ -352,15 +352,16 @@ impl Generator<'_, '_> {
         for &pkg in self.packages {
             for (at, target) in self.targets(pkg).iter().enumerate() {
                 if target.is_lib() && target.doctest && target.doctestable() {
-                    let test = self.new_unit(arena, pkg, at, CMode::Test)?;
-                    let mut library = arena.units[test].clone();
-                    library.mode = CMode::Build;
-                    // rustdoc loads a proc macro as a build dependency. Its own test
-                    // executable has the test profile, but the library it loads must
-                    // use build overrides and deferred host debuginfo.
-                    if target.proc_macro {
-                        library.profile = self.env.profile(pkg, UnitFor::new_host(true));
-                    }
+                    // A doctest's linked library is generated as a build dependency, not
+                    // a test root. In particular a proc macro uses its host profile.
+                    let unit_for = if target.proc_macro {
+                        UnitFor::new_host_test()
+                    } else {
+                        UnitFor::new_test()
+                    };
+                    let at = self.new_unit(arena, pkg, at, CMode::Build)?;
+                    let mut library = arena.units[at].clone();
+                    library.profile = self.env.profile(pkg, unit_for);
                     libraries.push(arena.intern(library));
                 }
             }
