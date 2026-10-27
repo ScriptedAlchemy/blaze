@@ -587,7 +587,11 @@ fn source_path(
     let source_root = db.source_root(source_root).source_root(db);
     let path = source_root.path_for_file(&file)?.as_path()?.to_string();
     let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
-    let relative = Path::new(&path).strip_prefix(root).ok().or(base);
+    // Cargo names source-replaced registry files absolutely even when vendor/
+    // happens to live below the workspace. Only workspace files are relative.
+    let relative = (!source_root.is_library)
+        .then(|| Path::new(&path).strip_prefix(root).ok().or(base))
+        .flatten();
     Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
 }
 

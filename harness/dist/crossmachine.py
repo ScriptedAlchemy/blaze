@@ -515,15 +515,24 @@ def fed_coverage(fixture, said, names, log_exists):
         diffs.append(Difference(fixture, "fed-coverage", "missing B-fed key log",
                                 "zero named additions is not evidence of zero compilation"))
     store_lines = re.findall(r"^store:.*$", said, re.M)
-    entry_lines = re.findall(r"^entries:.*$", said, re.M)
+    # `entries: 1.2µs` is a phase timing, not an entry-count record.
+    entry_lines = [line for line in re.findall(r"^entries:.*$", said, re.M)
+                   if not re.fullmatch(r"entries: [\d.]+(?:ns|µs|ms|s)", line)]
+    stats_lines = re.findall(r"^stats:.*$", said, re.M)
+    stats_pattern = r"stats: (\d+) of \d+ functions compiled, \d+ reused"
     store_pattern = r"store: \d+ functions found, \d+ compiled and added"
     entry_pattern = (r"entries: \d+ found, \d+ added, \d+ as stored, \d+ not as stored, "
                      r"\d+ instances and \d+ requests without a stable name")
-    if (not store_lines or not entry_lines
+    if (not (store_lines or stats_lines) or not entry_lines
             or any(not re.fullmatch(store_pattern, line) for line in store_lines)
+            or any(not re.fullmatch(stats_pattern, line) for line in stats_lines)
             or any(not re.fullmatch(entry_pattern, line) for line in entry_lines)):
         diffs.append(Difference(fixture, "fed-coverage", "missing compute counters",
                                 "complete entry and store counters are required"))
+    if any(int(match[1]) for line in stats_lines
+           if (match := re.fullmatch(stats_pattern, line))):
+        diffs.append(Difference(fixture, "fed-compute", "stats report compilation",
+                                "the compiler statistics report new work"))
     if totals["compiled"] or entries["added"] or entries["unnamed"] or entries["unnamed_requests"]:
         diffs.append(Difference(fixture, "fed-compute", "B-fed performed or omitted compute",
                                 f"compiled={totals['compiled']}, added={entries['added']}, "
@@ -550,6 +559,9 @@ def build_and_run(machine, bin_dir, ws, spec, label, store, ra_home, keys_log, e
     from cargo_ra_jit import Side, program_output, wait_warm, how_built
     run = Run(label)
     env = machine.env(bin_dir, store, ra_home, dict(extra_env, RA_JIT_KEYS_LOG=keys_log))
+    # An empty *requested* log is valid zero-addition evidence only with complete
+    # counters; an absent log is still rejected by fed_coverage.
+    open(keys_log, "a").close()
     side = Side(ws, env, True)
     package = ["-p", spec["package"]]
     args = spec["run"] if spec["run"] is not None else []
@@ -918,6 +930,13 @@ def self_test():
     check("truncated counters fail coverage", bool(fed_coverage("t", "store: 0 functions found, 7 compiled and\nentries: 0 found, 7 added,\n", {}, True)))
     check("unavailable counters fail coverage", bool(fed_coverage("t", "store: unavailable\nentries: unavailable\n", {}, True)))
     check("a malformed record beside valid counters fails", bool(fed_coverage("t", zero + "store: broken\n", {}, True)))
+    stats_zero = zero.split("\n", 1)[1] + "stats: 0 of 3 functions compiled, 3 reused\nentries: 1.2µs\n"
+    check("complete compiler stats and phase timing pass coverage", not fed_coverage("t", stats_zero, {}, True))
+    check("truncated compiler stats fail coverage", bool(fed_coverage("t", stats_zero.replace("3 reused", ""), {}, True)))
+    check("nonzero compiler stats fail coverage", bool(fed_coverage("t", stats_zero.replace("stats: 0", "stats: 1"), {}, True)))
+    global DAEMON_ROOT
+    DAEMON_ROOT = "/tmp/c4h-test"
+    check("independent daemon homes fit the socket budget", len((daemon_home("vendor-payload", "b-solo") + "/workers/" + "f" * 16 + "/sock.new/s").encode()) < 104)
     check("unnamed compute fails coverage", bool(fed_coverage("t", zero.replace("0 instances", "1 instances"), {}, True)))
     check("unnamed requests fail coverage", bool(fed_coverage("t", zero.replace("0 requests", "1 requests"), {}, True)))
     check("compiled functions fail despite empty log", bool(fed_coverage("t", zero.replace("0 compiled", "1 compiled"), {}, True)))

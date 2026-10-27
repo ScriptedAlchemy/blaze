@@ -480,7 +480,12 @@ mod tests {
 
     fn check_payload_owner(body: &str, caller_first: bool) {
         use test_fixture::WithFixture;
-        let top = std::env::temp_dir().join(format!("c4-payload-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let top = std::env::temp_dir().join(format!(
+            "c4-payload-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(top.join("vendor/dep/src")).unwrap();
         let payload = top.join("vendor/dep/src/payload.bin");
         let fixture = format!(
