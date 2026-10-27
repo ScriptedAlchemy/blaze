@@ -761,6 +761,7 @@ impl Worker {
             return;
         }
         let Ok(mut stream) = socket::connect(&self.socket) else { return };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
         let _ = stream.write_all(format!("retire\t{build}\n\n").as_bytes());
         let mut reply = String::new();
         let _ = BufReader::new(stream).read_line(&mut reply);
@@ -1259,7 +1260,9 @@ impl Daemon {
                 // The build ends with its answer: what its scripts wrote is no longer read.
                 let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
                 if let Some(worker) = worker {
-                    worker.retire(build);
+                    // After the answer, and not before it: a worker that is slow to hear it
+                    // delays no client.
+                    std::thread::spawn(move || worker.retire(build));
                 }
                 reply
             }

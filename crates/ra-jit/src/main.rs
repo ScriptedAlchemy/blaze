@@ -8587,6 +8587,7 @@ fn run_holding(
                         // Another build of this worker reads the output of a script this one
                         // is to run: it is asked for again once that build is retired.
                         Err(error) if error.downcast_ref::<scripts::Busy>().is_some() => {
+                            scripts::barrier::event("put-off", stream.build, &format!("{error}"));
                             later.push((request, asked, stream));
                             continue;
                         }
@@ -9295,6 +9296,10 @@ fn run_holding(
                     tests_now: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
+                // The builds whose scripts this program is compiled and linked from.
+                let mut consumes: Vec<u64> = clients.iter().map(|it| it.2.build).collect();
+                consumes.sort();
+                consumes.dedup();
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
@@ -9323,6 +9328,9 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    for build in consumes {
+                        scripts::barrier::hold("consume", build);
+                    }
                     // The write that interrupts waits for the clone to be dropped, and the
                     // collection of types asks that the solver cache of this thread, which
                     // outlives the clone until the thread ends, is cleared first: `solve`

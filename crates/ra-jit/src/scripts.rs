@@ -58,7 +58,9 @@ static LEASES: LazyLock<Leases> = LazyLock::new(Leases::default);
 /// Ends the build `build`: the output of the scripts it held is free to be written again, and
 /// what it judged is forgotten. The daemon says so when it has answered the client.
 pub(crate) fn retire(build: u64) {
-    LEASES.retire(build);
+    barrier::hold("retire", build);
+    let released = LEASES.retire(build);
+    barrier::event("retired", build, &format!("released={released}"));
 }
 
 /// What the runs of a build are asked for with.
@@ -163,10 +165,7 @@ fn retrying<T>(mut once: impl FnMut() -> Result<T, Attempt>) -> anyhow::Result<T
             Ok(done) => return Ok(done),
             Err(Attempt::Failed(error)) => return Err(error),
             Err(Attempt::Waits(run_dir)) => {
-                eprintln!(
-                    "build script: waits for the build of another worker that reads {}",
-                    run_dir.display()
-                );
+                barrier::event("waits", 0, &format!("run_dir={}", run_dir.display()));
                 Leases::wait(&run_dir, leases::deadline()).map_err(anyhow::Error::msg)?;
             }
         }
@@ -488,6 +487,7 @@ impl<'a> Runner<'a> {
         let printed = match stale {
             None => {
                 self.leases.stands(build, &run_dir).map_err(|it| self.refused(it))?;
+                barrier::event("holds", build, &format!("fresh run_dir={}", run_dir.display()));
                 let printed = std::fs::read(&output_file)
                     .map_err(|it| format!("{}: {it}", output_file.display()))?;
                 output::parse(&printed, &cx).map_err(|it| it.0)?
@@ -496,6 +496,7 @@ impl<'a> Runner<'a> {
                 // No build reads the output this run is to replace.
                 let writer = self.leases.writer(build, &run_dir).map_err(|it| self.refused(it))?;
                 eprintln!("build script of {}: runs, {why}", data.name);
+                barrier::event("runs", build, &format!("run_dir={}", run_dir.display()));
                 // As cargo empties its record before a run: a run that does not end is not one.
                 _ = std::fs::remove_file(&record);
                 let ran = blaze_build_script::env(&unit, &cargo_env)
@@ -524,6 +525,7 @@ impl<'a> Runner<'a> {
                 std::fs::write(&record, json)
                     .map_err(|it| format!("{}: {it}", record.display()))?;
                 writer.stands().map_err(|it| self.refused(it))?;
+                barrier::event("holds", build, &format!("ran run_dir={}", run_dir.display()));
                 printed
             }
         };
@@ -1070,5 +1072,6 @@ impl ProfilePackage for Named<'_> {
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod barrier;
 mod leases;
 mod lock;

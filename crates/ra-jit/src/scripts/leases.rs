@@ -165,17 +165,20 @@ impl Leases {
         }
     }
 
-    /// Ends `build`: its leases are released and what it judged is forgotten.
-    pub(super) fn retire(&self, build: u64) {
+    /// Ends `build`: its leases are released and what it judged is forgotten. How many leases
+    /// it held.
+    pub(super) fn retire(&self, build: u64) -> usize {
         let mut state = self.state();
         state.judged.retain(|(it, _), _| *it != build);
         let held: Vec<_> = state.held.keys().filter(|(it, _)| *it == build).cloned().collect();
+        let released = held.len();
         for key in held {
             if let Some(file) = state.held.remove(&key) {
                 // An unlock, not a close: a process forked meanwhile may hold the description.
                 let _ = file.unlock();
             }
         }
+        released
     }
 
     /// The builds that hold something, for the log and the tests.
