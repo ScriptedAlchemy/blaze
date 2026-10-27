@@ -395,6 +395,16 @@ pub struct IncludedFile {
     pub bytes: Option<std::sync::Arc<[u8]>>,
 }
 
+/// An include performed by the current tracked query execution. Unlike the
+/// historical watcher map, salsa accumulators retract observations when the
+/// query stops reading a file, and replay them on memo hits.
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentIncludedInput {
+    pub krate: Crate,
+    pub path: AbsPathBuf,
+}
+
 #[salsa::input(debug)]
 pub struct FileSourceRootInput {
     #[returns(copy)]

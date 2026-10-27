@@ -949,6 +949,7 @@ fn included_bytes<'db>(
     call_id: MacroCallId,
     path: &str,
 ) -> Option<&'db [u8]> {
+    use salsa::Accumulator as _;
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
     // A file of the VFS that is not UTF-8 is read from disk like one outside it.
@@ -957,7 +958,15 @@ fn included_bytes<'db>(
     {
         return Some(db.file_text(file).text(db).as_bytes());
     }
-    db.included_file(call_id.loc(db).krate, path)?.bytes(db).as_deref()
+    let krate = call_id.loc(db).krate;
+    let file = db.included_file(krate, path)?;
+    // The path is anchored as the input reader resolves it, including files
+    // outside VFS. Accumulate before reading so missing inputs are live too.
+    let root = db.file_source_root(anchor).source_root_id(db);
+    let sources = db.source_root(root).source_root(db);
+    let absolute = sources.path_for_file(&anchor)?.as_path()?.parent()?.absolutize(path.path);
+    base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
+    file.bytes(db).as_deref()
 }
 
 fn include_str_expand(
