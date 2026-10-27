@@ -539,7 +539,7 @@ mod tests {
                 ide_db::base_db::SourceRoot::new_library(dep_files),
             ]);
             db.apply_change(change);
-            hir::attach_db(&db, || {
+            let first = hir::attach_db(&db, || {
                 let crates = ide_db::base_db::all_crates(&db);
                 let find = |name: &str| {
                     *crates
@@ -566,7 +566,22 @@ mod tests {
                         .all(|slot| slot.get().is_some())
                 );
                 (dep_hash, app_hash)
-            })
+            });
+            let path = paths::AbsPathBuf::assert_utf8(payload.clone());
+            std::fs::write(&payload, [byte + 10]).unwrap();
+            assert!(db.reload_included_file(&path));
+            let second = hir::attach_db(&db, || {
+                let crates = ide_db::base_db::all_crates(&db);
+                let app = *crates
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == "app"
+                    })
+                    .unwrap();
+                Contents::default().source_hash(&db, app)
+            });
+            assert_ne!(first.1, second, "same database must advance included-input identity");
+            first
         };
         let one = hash(1);
         let other = hash(2);

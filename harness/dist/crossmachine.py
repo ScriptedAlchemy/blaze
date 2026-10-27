@@ -488,7 +488,8 @@ def warm_payload_report(work, bin_dir, machines, sources):
                              and f"vendor payload {value} caller {value + 10}" in expected[1])
                 rows.append(dict(machine=machine.name, step=step, right=right,
                                  actual=actual, expected=expected, status=status,
-                                 classification=how_built(built.stderr), build_log=built.stderr))
+                                 classification=how_built(built.stderr), build_log=built.stderr,
+                                 worker_log=workers_log(side)))
         finally:
             side.cargo("stop")
     return rows
