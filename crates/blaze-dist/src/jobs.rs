@@ -10,10 +10,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_wire::job_terminal_v2::{
+    SubscriberTerminalV2, TerminationReasonV2, TerminationV2, VERSION as TERMINAL_VERSION,
+};
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
     JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
-    Reservation, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
+    Reservation, SourceRef, Stage, StageEvent, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
     WorkLeaseRequest, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
 };
 
@@ -30,11 +33,29 @@ pub struct ExecutionConfig {
     pub missed_heartbeats: u64,
     /// The work set's.
     pub work: WorkConfig,
+    /// Admission's explicit compile requirement. Never inferred from worker events.
+    pub completion: CompletionMode,
+}
+
+/// Whether the admitted job needs distributed compile work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionMode {
+    /// Success requires the current lead's agreed, completed work set.
+    WorkProtocol,
+    /// Admission established that no compile work is required (for example verified cached
+    /// artifacts or an already-built test shard). The lead still reports the final verdict.
+    /// This is a driver decision, not a worker claim or inference from an empty BuildSpec.
+    NoCompileWork,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> ExecutionConfig {
-        ExecutionConfig { heartbeat_ms: 5_000, missed_heartbeats: 3, work: WorkConfig::default() }
+        ExecutionConfig {
+            heartbeat_ms: 5_000,
+            missed_heartbeats: 3,
+            work: WorkConfig::default(),
+            completion: CompletionMode::WorkProtocol,
+        }
     }
 }
 
@@ -109,6 +130,8 @@ pub enum Effect {
         outcome: Outcome,
         /// What it does next on its side.
         policy: LocalPolicy,
+        /// The versioned delivery used by the terminal endpoint and client policy.
+        terminal: SubscriberTerminalV2,
     },
     /// The work set's log.
     Work(work::Effect),
@@ -135,6 +158,8 @@ pub struct Execution {
     subscribers: BTreeMap<u64, Subscriber>,
     events: Vec<EventItem>,
     stages: Vec<(Stage, Millis)>,
+    compiled: Option<(Attempt, u64)>,
+    terminals: BTreeMap<u64, SubscriberTerminalV2>,
     refused: bool,
     state: ExecState,
 }
@@ -166,6 +191,8 @@ impl Execution {
             subscribers: BTreeMap::from([(first.id, first)]),
             events: Vec::new(),
             stages: Vec::new(),
+            compiled: None,
+            terminals: BTreeMap::new(),
             refused: false,
             state: ExecState::Queued,
         };
@@ -176,6 +203,11 @@ impl Execution {
     /// Where it is.
     pub fn state(&self) -> ExecState {
         self.state.clone()
+    }
+
+    /// The immutable typed terminal endpoint response for a subscriber, once it ended.
+    pub fn terminal(&self, subscriber: u64) -> Option<&SubscriberTerminalV2> {
+        self.terminals.get(&subscriber)
     }
 
     /// Its current attempt.
@@ -357,6 +389,9 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
+        if self.config.completion == CompletionMode::NoCompileWork {
+            return Err(Refusal::Malformed("work call in no-compile-work execution".to_owned()));
+        }
         self.heard.insert(from.to_owned(), now);
         let work = self.work.as_mut().ok_or(Refusal::NotJoined)?;
         let mut log = Vec::new();
@@ -422,26 +457,61 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
-        self.expire_subscribers(now, out);
-        if matches!(self.state, ExecState::Ended(_)) {
-            return Ok(WorkersEventsAnswer::CANCEL);
-        }
-        self.heard.insert(from.to_owned(), now);
+        // Validate the entire batch before it changes liveness, refusal state or the stream.
+        // A rejected tail must not leave an accepted prefix in the public event log.
         let lead = self.lead.as_deref() == Some(from);
-        if lead {
-            self.lead_heard = now;
-        }
         let mut done = None;
         for event in &req.events {
             match event {
+                JobEvent::Stage(_) | JobEvent::Assigned(_) => {
+                    return Err(Refusal::Malformed("coordinator-owned event".to_owned()));
+                }
+                JobEvent::Published(_) | JobEvent::Program(_) | JobEvent::Verdict(_) if !lead => {
+                    return Err(Refusal::NotHolder);
+                }
+                JobEvent::Done(d) => {
+                    if !lead {
+                        return Err(Refusal::NotHolder);
+                    }
+                    if done.is_some()
+                        || !matches!(
+                            d.outcome,
+                            Outcome::Passed | Outcome::Failed | Outcome::Refused
+                        )
+                    {
+                        return Err(Refusal::Malformed("invalid worker verdict batch".to_owned()));
+                    }
+                    if d.outcome == Outcome::Passed
+                        && self.attached().any(|s| now <= s.deadline_ms)
+                        && !self.success_ready()
+                    {
+                        return Err(Refusal::Malformed(
+                            "success before authoritative completion".to_owned(),
+                        ));
+                    }
+                    done = Some(d.outcome.clone());
+                }
+                JobEvent::Output(_) | JobEvent::Refused(_) => {}
+                _ => {}
+            }
+        }
+        self.expire_subscribers(now, out);
+        if self.attached().next().is_none() {
+            self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
+            return Ok(WorkersEventsAnswer::CANCEL);
+        }
+        self.heard.insert(from.to_owned(), now);
+        if lead {
+            self.lead_heard = now;
+        }
+        for event in &req.events {
+            match event {
                 JobEvent::Refused(_) => self.refused = true,
-                JobEvent::Done(d) if lead => {
+                JobEvent::Done(_) => {
                     // Publish only the coordinator's final verdict, once. A raw Passed
                     // here could otherwise escape into replay before refusal normalization.
-                    done = Some(d.outcome.clone());
                     continue;
                 }
-                JobEvent::Done(_) => return Err(Refusal::NotHolder),
                 _ => {}
             }
             self.push(event.clone(), out);
@@ -462,6 +532,16 @@ impl Execution {
         Ok(answer)
     }
 
+    /// Current-attempt/root-epoch authority, not a worker's Compiled notification.
+    fn success_ready(&self) -> bool {
+        self.config.completion == CompletionMode::NoCompileWork
+            || self.work.as_ref().is_some_and(|work| {
+                work.is_done()
+                    && work.lead_joined()
+                    && self.compiled == Some((self.attempt, work.root_epoch()))
+            })
+    }
+
     /// `GET /v1/jobs/<execution>/events?from=N`: the items after sequence `from`.
     pub fn events(&self, from: u64) -> &[EventItem] {
         let start = usize::try_from(from).unwrap_or(usize::MAX).min(self.events.len());
@@ -475,6 +555,10 @@ impl Execution {
             return;
         }
         self.expire_subscribers(now, out);
+        if self.attached().next().is_none() {
+            // The latest deadline passed: the execution ends, its coverage not claimed.
+            return self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
+        }
         if self.state != ExecState::Running {
             return;
         }
@@ -498,40 +582,36 @@ impl Execution {
         self.after_work(now, out);
     }
 
-    // Shared by timer and worker-event transitions: delivery order cannot award an
-    // expired subscriber a successful result. The protocol uses strictly past deadline.
-    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect>) {
-        let late: Vec<u64> =
-            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
-        for id in late {
-            let subscriber = self.subscribers.get_mut(&id).expect("attached");
-            subscriber.state = SubscriberState::TimedOut;
-            out.push(Effect::SubscriberEnded {
-                subscriber: id,
-                outcome: Outcome::TimedOut,
-                policy: subscriber.policy.clone(),
-            });
-        }
-        if self.attached().next().is_none() {
-            // The latest deadline passed: the execution ends, its coverage not claimed.
-            return self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
-        }
-    }
-
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
     fn after_work(&mut self, now: Millis, out: &mut Vec<Effect>) {
-        if self.work.as_ref().is_some_and(WorkSet::is_done)
-            && !self.stages.iter().any(|(s, _)| *s == Stage::Compiled)
+        if let Some(work) = &self.work
+            && work.is_done()
+            && work.lead_joined()
+            && self.compiled != Some((self.attempt, work.root_epoch()))
         {
+            // A replacement lead must first check the retained root set. It then gets its
+            // own notification, including when a changed root list reopened completed work.
+            self.compiled = Some((self.attempt, work.root_epoch()));
             self.stage(now, Stage::Compiled, out);
         }
     }
 
     /// Ends the execution: the work set drops its leases, every executor is stopped, and every
-    /// attached subscriber gets the outcome.
-    pub fn end(&mut self, now: Millis, outcome: Outcome, why: EndWhy, out: &mut Vec<Effect>) {
+    /// attached subscriber gets the outcome. Deadlines apply even when a completion arrives
+    /// before the driver's next timer tick.
+    pub(crate) fn end(
+        &mut self,
+        now: Millis,
+        mut outcome: Outcome,
+        mut why: EndWhy,
+        out: &mut Vec<Effect>,
+    ) {
         if let ExecState::Ended(_) = self.state {
             return;
+        }
+        if self.expire_subscribers(now, out) && self.attached().next().is_none() {
+            outcome = Outcome::Cancelled;
+            why = EndWhy::Deadline;
         }
         self.state = ExecState::Ended(outcome.clone());
         if let Some(work) = &mut self.work {
@@ -539,20 +619,73 @@ impl Execution {
             work.end(why, &mut log);
             out.extend(log.into_iter().map(Effect::Work));
         }
-        self.finish(now, outcome, out);
+        self.finish(now, outcome, why, out);
     }
 
-    fn finish(&mut self, now: Millis, outcome: Outcome, out: &mut Vec<Effect>) {
+    /// Cancel an execution administratively, preserving a typed cancellation for subscribers.
+    pub fn cancel(&mut self, now: Millis, out: &mut Vec<Effect>) {
+        self.end(now, Outcome::Cancelled, EndWhy::Cancelled, out);
+    }
+
+    /// Detaches subscribers whose own deadlines have passed, once, before either a timer or
+    /// a final result can report an outcome to them.
+    fn expire_subscribers(&mut self, now: Millis, out: &mut Vec<Effect>) -> bool {
+        let late: Vec<u64> =
+            self.attached().filter(|s| now > s.deadline_ms).map(|s| s.id).collect();
+        let expired = !late.is_empty();
+        for id in late {
+            let subscriber = self.subscribers.get_mut(&id).expect("attached");
+            subscriber.state = SubscriberState::TimedOut;
+            let terminal = SubscriberTerminalV2 {
+                execution: self.id,
+                attempt: self.attempt,
+                subscriber: id,
+                termination: TerminationV2 {
+                    version: TERMINAL_VERSION,
+                    outcome: Outcome::TimedOut,
+                    reason: TerminationReasonV2::SubscriberDeadline,
+                },
+            };
+            self.terminals.insert(id, terminal.clone());
+            out.push(Effect::SubscriberEnded {
+                subscriber: id,
+                outcome: Outcome::TimedOut,
+                policy: subscriber.policy.clone(),
+                terminal,
+            });
+        }
+        expired
+    }
+
+    fn finish(&mut self, now: Millis, outcome: Outcome, why: EndWhy, out: &mut Vec<Effect>) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
         for subscriber in self.subscribers.values_mut() {
             if subscriber.state == SubscriberState::Attached {
                 subscriber.state = SubscriberState::Ended;
+                let terminal = SubscriberTerminalV2 {
+                    execution: self.id,
+                    attempt: self.attempt,
+                    subscriber: subscriber.id,
+                    termination: TerminationV2 {
+                        version: TERMINAL_VERSION,
+                        outcome: outcome.clone(),
+                        reason: match why {
+                            EndWhy::Reported => TerminationReasonV2::Reported,
+                            EndWhy::NoLead => TerminationReasonV2::NoLead,
+                            EndWhy::LeadLostTwice => TerminationReasonV2::LeadLostTwice,
+                            EndWhy::Cancelled => TerminationReasonV2::Cancelled,
+                            EndWhy::Deadline => TerminationReasonV2::Deadline,
+                        },
+                    },
+                };
+                self.terminals.insert(subscriber.id, terminal.clone());
                 out.push(Effect::SubscriberEnded {
                     subscriber: subscriber.id,
                     outcome: outcome.clone(),
                     policy: subscriber.policy.clone(),
+                    terminal,
                 });
             }
         }
@@ -585,13 +718,19 @@ pub enum LocalAction {
     Fail,
 }
 
-/// The action for a remote outcome under `policy`. `Never` fails on anything but a remote
-/// verdict; `Fallback` builds locally after the deadline or a remote failure that is not a
-/// verdict (a build error or a failed test is a result, not retried); `Race` was building
-/// locally from the start, and the first to finish wins, a failure included.
-pub fn local_action(policy: &LocalPolicy, remote: &Outcome) -> LocalAction {
-    let verdict = matches!(remote, Outcome::Passed | Outcome::Failed | Outcome::Refused);
-    match policy {
+/// The action for a versioned, classified terminal delivery under `policy`. `Passed`, `Failed`
+/// and `Refused` are taken as verdicts; other outcomes fail under `Never` and build locally
+/// under `Fallback`. `Race` was building locally from the start, and the first verdict wins,
+/// a build error or failed test included.
+///
+/// Unknown versions or inconsistent outcome/reason pairs are refused, never guessed from
+/// the v1 stream. `NoLead` is infrastructure even though its outcome is `Failed`.
+pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<LocalAction, Refusal> {
+    if !remote.is_valid() {
+        return Err(Refusal::Malformed("invalid terminal contract".to_owned()));
+    }
+    let verdict = remote.reason == TerminationReasonV2::Reported;
+    Ok(match policy {
         LocalPolicy::Never => {
             if verdict {
                 LocalAction::Take
@@ -614,7 +753,7 @@ pub fn local_action(policy: &LocalPolicy, remote: &Outcome) -> LocalAction {
                 LocalAction::BuildLocally
             }
         }
-    }
+    })
 }
 
 /// The server's executions: one per running `JobContent`, admitted in section 5's order.
@@ -625,10 +764,18 @@ pub struct Jobs {
     executions: BTreeMap<ExecutionId, Execution>,
     running: BTreeMap<JobContent, ExecutionId>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
-    pr_latest: BTreeMap<u64, ExecutionId>,
+    pr_jobs: BTreeMap<u64, PrJobs>,
     assignments: BTreeMap<String, (AssignmentToken, bool)>,
     next_execution: u64,
     next_subscriber: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PrJobs {
+    /// The source of the most recently submitted revision; platforms and profiles may differ.
+    source: SourceRef,
+    /// Live executions of this pull request, including older revisions kept by subscribers.
+    executions: BTreeMap<ExecutionId, SourceRef>,
 }
 
 impl Jobs {
@@ -640,7 +787,7 @@ impl Jobs {
             executions: BTreeMap::new(),
             running: BTreeMap::new(),
             platforms: BTreeMap::new(),
-            pr_latest: BTreeMap::new(),
+            pr_jobs: BTreeMap::new(),
             assignments: BTreeMap::new(),
             next_execution: 1,
             next_subscriber: 1,
@@ -662,6 +809,16 @@ impl Jobs {
         self.executions.get(&id)
     }
 
+    /// Typed response for the additive v2 subscriber-terminal endpoint. A v1 Done event is
+    /// not enough to synthesize it: infrastructure and completed failures share an outcome.
+    pub fn terminal(
+        &self,
+        execution: ExecutionId,
+        subscriber: u64,
+    ) -> Option<&SubscriberTerminalV2> {
+        self.executions.get(&execution)?.terminal(subscriber)
+    }
+
     /// Every execution.
     pub fn executions(&self) -> impl Iterator<Item = &Execution> {
         self.executions.values()
@@ -669,7 +826,8 @@ impl Jobs {
 
     /// `POST /v1/jobs`, with the reservation the server measured for its lead. An equal
     /// `JobContent` running already is joined, not started again. A pull request's new push
-    /// cancels its previous execution when nothing else subscribes to it.
+    /// cancels earlier-source executions when nothing else subscribes to them. Platform,
+    /// command and profile variants of the same source run together.
     pub fn submit(
         &mut self,
         now: Millis,
@@ -722,9 +880,35 @@ impl Jobs {
         self.executions.insert(id, execution);
         self.running.insert(content, id);
         self.platforms.insert(id, (req.spec.platform, need));
-        if let Namespace::Pr(pr) = &req.namespace {
-            if let Some(previous) = self.pr_latest.insert(pr.n, id)
-                && let Some(old) = self.executions.get(&previous)
+        self.pr_submitted(now, req, id, out);
+        Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
+    }
+
+    fn pr_submitted(
+        &mut self,
+        now: Millis,
+        req: &JobRequest,
+        id: ExecutionId,
+        out: &mut Vec<(ExecutionId, Effect)>,
+    ) {
+        let Namespace::Pr(pr) = &req.namespace else { return };
+        let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
+            source: req.spec.source.clone(),
+            executions: BTreeMap::new(),
+        });
+        jobs.executions.insert(id, req.spec.source.clone());
+        if jobs.source == req.spec.source {
+            return;
+        }
+        jobs.source = req.spec.source.clone();
+        let previous: Vec<_> = jobs
+            .executions
+            .iter()
+            .filter(|(_, source)| **source != req.spec.source)
+            .map(|(&id, _)| id)
+            .collect();
+        for previous in previous {
+            if let Some(old) = self.executions.get(&previous)
                 && !matches!(old.state(), ExecState::Ended(_))
                 && old.attached().count() == 1
             {
@@ -732,7 +916,6 @@ impl Jobs {
                 let _ = self.unsubscribe(now, previous, only, out);
             }
         }
-        Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
     }
 
     /// `DELETE /v1/jobs/<execution>/subscribers/<id>`.
@@ -768,6 +951,8 @@ impl Jobs {
     /// The agent stopped `executor`'s job processes after a kill: `alive` says whether the
     /// executor itself is still there (an execution ended) or gone (it had died). Only now is
     /// its reservation returned, so a lead presumed lost but still running holds its share.
+    /// The acknowledgement names the killed assignment: a duplicate or late one cannot free
+    /// a newer execution or attempt on the same executor.
     pub fn killed(
         &mut self,
         now: Millis,
@@ -780,8 +965,15 @@ impl Jobs {
             return;
         }
         self.assignments.remove(executor);
+        if self
+            .admission
+            .executor(executor)
+            .is_none_or(|slot| slot.busy != Some((assignment.execution, assignment.attempt)))
+        {
+            return;
+        }
         if alive {
-            self.admission.finished(now, executor);
+            self.admission.finished(now, executor, assignment.execution, assignment.attempt);
         } else {
             self.admission.lost(now, executor);
         }
@@ -836,8 +1028,8 @@ impl Jobs {
                 let e = self.executions.get_mut(&id).expect("present");
                 match self.admission.idle_for(&namespace, &platform, &need, &except) {
                     Some(lead) => {
-                        self.admission.take(&lead, id);
                         if e.assign(now, &lead, &[], &mut more).is_ok() {
+                            self.admission.take(&lead, id, e.attempt());
                             self.assignments.insert(lead, (e.assignment(), false));
                         }
                     }
@@ -859,6 +1051,11 @@ impl Jobs {
                 self.running.remove(&e.content);
             }
             self.admission.dequeue(id);
+            if let Namespace::Pr(pr) = &e.namespace
+                && let Some(jobs) = self.pr_jobs.get_mut(&pr.n)
+            {
+                jobs.executions.remove(&id);
+            }
         }
     }
 }
