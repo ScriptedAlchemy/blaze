@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blaze_wire::{Digest, ExecutionId, Namespace, Reservation};
+use blaze_wire::{Attempt, Digest, ExecutionId, Namespace, Reservation};
 
 use crate::{Millis, Refusal};
 
@@ -90,8 +90,8 @@ pub struct ExecutorSlot {
     pub namespace: Namespace,
     /// What it holds on its machine.
     pub reservation: Reservation,
-    /// The execution it runs.
-    pub busy: Option<ExecutionId>,
+    /// The execution and attempt it runs. Completion acknowledgements must match both.
+    pub busy: Option<(ExecutionId, Attempt)>,
     /// Where it is.
     pub phase: ExecutorPhase,
     /// When it last finished a job.
@@ -298,7 +298,8 @@ impl Admission {
                     Some(Class::Main) => queue.main.pop_front(),
                     _ => queue.pr.pop_front(),
                 };
-                self.executors.get_mut(&executor).expect("placed").busy = Some(head.execution);
+                self.executors.get_mut(&executor).expect("placed").busy =
+                    Some((head.execution, Attempt(1)));
                 admitted.push(Admitted {
                     execution: head.execution,
                     namespace: head.namespace,
@@ -368,15 +369,25 @@ impl Admission {
     }
 
     /// Marks `executor` as running `execution`, for a reassignment.
-    pub fn take(&mut self, executor: &str, execution: ExecutionId) {
+    pub fn take(&mut self, executor: &str, execution: ExecutionId, attempt: Attempt) {
         if let Some(e) = self.executors.get_mut(executor) {
-            e.busy = Some(execution);
+            e.busy = Some((execution, attempt));
         }
     }
 
-    /// The job on `executor` ended: it is idle, or, draining, stops and lets its rebuild in.
-    pub fn finished(&mut self, now: Millis, executor: &str) {
+    /// The assignment on `executor` ended: it is idle, or, draining, stops and lets its rebuild
+    /// in. A stale acknowledgement does not change a newer assignment.
+    pub fn finished(
+        &mut self,
+        now: Millis,
+        executor: &str,
+        execution: ExecutionId,
+        attempt: Attempt,
+    ) {
         let Some(e) = self.executors.get_mut(executor) else { return };
+        if e.busy != Some((execution, attempt)) {
+            return;
+        }
         e.busy = None;
         e.idle_since = now;
         if e.phase == ExecutorPhase::Draining {
@@ -396,7 +407,7 @@ impl Admission {
 
     /// The pull request closed: its executors are destroyed. Answers the ones that were busy,
     /// whose jobs end.
-    pub fn close_pr(&mut self, n: u64) -> Vec<(String, Option<ExecutionId>)> {
+    pub fn close_pr(&mut self, n: u64) -> Vec<(String, Option<(ExecutionId, Attempt)>)> {
         let mut gone = Vec::new();
         for e in self.executors.values_mut() {
             if e.namespace == Namespace::Pr(blaze_wire::PrNamespace { n })

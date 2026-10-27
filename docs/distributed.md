@@ -1521,10 +1521,13 @@ checker's own clock), of another attempt, or after Done; at Done every root, fou
 terminal, from exactly one accepted result whose item is the lead's front end's, or in the lead's
 tail; an unknown name a conflict or `Local`; Done reached unless the lead was lost twice or no
 lead was left; a correct holder never told it is malformed. The jobs simulation checks capacity,
-`Main` first and first in first out, `Q`, platform matching, attempts, subscribers, stage order and
-that every execution ends. `cargo test -p blaze-dist` runs 10,000 seeds of each and prints the
-seed of a failure with the command that replays it; timings and the mutation check are in the
-unit's report.
+`Main` first and first in first out, `Q`, platform and namespace matching, assignment identity,
+attempts, subscriber deadlines, coordinator-generated stage order and that every execution ends.
+Arbitrary worker-supplied `Stage` events are outside that stage-order check.
+`cargo test -p blaze-dist` runs 10,000 seeds of each and prints the seed of a failure with the
+command that replays it. The [review report](reports/DSM-REVIEW.md) records the regressions,
+validation commands, timings, mutation checks and the remaining client-policy classification
+limit.
 
 ### Export and ingestion (re-review B, B3)
 

@@ -246,6 +246,18 @@ impl Holder {
     /// One step.
     pub fn step(&mut self, now: Millis, event: Event, out: &mut Vec<Effect>) {
         if self.phase == Phase::Stopped {
+            // Cancellation can race a compile already in flight. Its discoveries were
+            // never reported, but the compiler retained them before returning this batch.
+            if let Event::Compiled(batch) = event {
+                self.release(
+                    batch
+                        .roots
+                        .iter()
+                        .chain(&batch.names)
+                        .flat_map(|item| item.found.iter().map(|found| found.name)),
+                    out,
+                );
+            }
             return;
         }
         match event {
@@ -458,19 +470,20 @@ impl Holder {
         out: &mut Vec<Effect>,
     ) {
         let conflicts: BTreeSet<WorkName> = answer.conflicts.iter().copied().collect();
+        let mut release = conflicts.clone();
         for item in &result.items {
             for found in item.found.iter() {
                 if !conflicts.contains(&found.name) && !self.rejected.contains(&found.name) {
                     self.findings.insert(found.name, found.tuple);
+                } else {
+                    // A newly discovered request is already retained by the compiler,
+                    // even though it never enters this map of accepted findings.
+                    release.insert(found.name);
                 }
             }
         }
-        let mut release: Vec<WorkName> = conflicts.into_iter().collect();
         release.extend(result.items[root_items..].iter().map(|item| item.name));
-        release.retain(|name| self.findings.remove(name).is_some() | self.lost.remove(name));
-        if !release.is_empty() {
-            out.push(Effect::Release(release));
-        }
+        self.release(release, out);
     }
 
     fn join(&mut self, now: Millis, out: &mut Vec<Effect>) {
@@ -504,13 +517,25 @@ impl Holder {
     }
 
     fn stop(&mut self, why: StopWhy, out: &mut Vec<Effect>) {
+        let mut held: BTreeSet<WorkName> = self.findings.keys().copied().collect();
+        if let Phase::Reporting { result, .. } = &self.phase {
+            held.extend(result.items.iter().flat_map(|item| item.found.iter().map(|f| f.name)));
+        }
         self.phase = Phase::Stopped;
         self.outstanding = None;
-        let held: Vec<WorkName> = self.findings.keys().copied().collect();
-        if !held.is_empty() {
-            out.push(Effect::Release(held));
-        }
-        self.findings.clear();
+        self.release(held, out);
+        self.lost.clear();
         out.push(Effect::Stop(why));
+    }
+
+    fn release(&mut self, names: impl IntoIterator<Item = WorkName>, out: &mut Vec<Effect>) {
+        let names: BTreeSet<WorkName> = names.into_iter().collect();
+        for name in &names {
+            self.findings.remove(name);
+            self.lost.remove(name);
+        }
+        if !names.is_empty() {
+            out.push(Effect::Release(names.into_iter().collect()));
+        }
     }
 }

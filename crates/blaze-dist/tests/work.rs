@@ -157,6 +157,105 @@ fn a_helper_that_comes_before_the_lead_with_another_root_set_waits() {
 }
 
 #[test]
+fn review_the_leads_rejections_apply_to_provisional_discoveries() {
+    for stage in ["waiting", "held", "exported"] {
+        let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+        let roots = rootset(2, 1);
+        join(&mut w, 0, "helper", &roots).unwrap();
+        let first = lease(&mut w, 0, "helper").unwrap();
+        let discovered = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+        w.result(1, "helper", &result(&first, 1, discovered, Vec::new()), &mut Vec::new()).unwrap();
+        let pending = (stage != "waiting").then(|| lease(&mut w, 2, "helper").unwrap());
+        if stage == "exported" {
+            let grant = pending.as_ref().unwrap();
+            let exported = result(grant, 2, root_items(grant), vec![exported(name(7))]);
+            w.result(3, "helper", &exported, &mut Vec::new()).unwrap();
+        }
+
+        let mut effects = Vec::new();
+        w.join(
+            4,
+            "lead",
+            &WorkJoinRequest {
+                execution: EXEC,
+                attempt: A1,
+                roots,
+                rejected: Set::new(vec![name(7)]),
+            },
+            &mut effects,
+        )
+        .unwrap();
+        assert_eq!(
+            w.report().names[&name(7)].1,
+            Some(Terminal::Tail(TailWhy::Rejected)),
+            "the lead's rejection must cover a {stage} provisional discovery"
+        );
+        if stage == "held" {
+            let grant = pending.as_ref().unwrap();
+            let exported = result(grant, 2, root_items(grant), vec![exported(name(7))]);
+            w.result(5, "helper", &exported, &mut effects).unwrap();
+        }
+        if stage != "waiting" {
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ExportInvalidated { name: invalidated, .. } if *invalidated == name(7)
+            )));
+        }
+        assert_eq!(w.report().names[&name(7)].1, Some(Terminal::Tail(TailWhy::Rejected)));
+        if let Some(grant) = lease(&mut w, 6, "lead") {
+            assert!(!grant.names.iter().any(|found| *found == name(7)));
+        }
+    }
+}
+
+#[test]
+fn review_an_invalidated_held_name_is_acknowledged_even_when_unknown() {
+    for rejected in [false, true] {
+        let mut w = set(WorkConfig { grant_roots: 1, ..small() });
+        let roots = rootset(3, 1);
+        join(&mut w, 0, "helper", &roots).unwrap();
+        let first = lease(&mut w, 0, "helper").unwrap();
+        let discovered = vec![with_found(exported(name(100)), &[(name(7), 7)])];
+        w.result(1, "helper", &result(&first, 1, discovered, Vec::new()), &mut Vec::new()).unwrap();
+        let held = lease(&mut w, 2, "helper").unwrap();
+        assert_eq!(held.names.as_slice(), &[name(7)]);
+
+        w.join(
+            3,
+            "lead",
+            &WorkJoinRequest {
+                execution: EXEC,
+                attempt: A1,
+                roots,
+                rejected: Set::new(if rejected { vec![name(7)] } else { Vec::new() }),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let other = lease(&mut w, 4, "lead").unwrap();
+        let other_items = if rejected {
+            root_items(&other)
+        } else {
+            vec![with_found(exported(name(102)), &[(name(7), 8)])]
+        };
+        w.result(5, "lead", &result(&other, 1, other_items, Vec::new()), &mut Vec::new()).unwrap();
+
+        // The name became terminal, but its batch still owns an unfinished root.
+        let late = result(&held, 2, root_items(&held), vec![lost(name(7), UNKNOWN_NAME)]);
+        let answer = w.result(6, "helper", &late, &mut Vec::new()).unwrap();
+        assert_eq!(answer.conflicts.as_slice(), &[name(7)]);
+        let reason = if rejected { TailWhy::Rejected } else { TailWhy::Conflict };
+        assert_eq!(w.report().names[&name(7)].1, Some(Terminal::Tail(reason)));
+        assert!(w.is_done());
+        let commits = w.counters().commits;
+        let conflicts = w.counters().conflicts;
+        assert_eq!(w.result(7, "helper", &late, &mut Vec::new()).unwrap(), answer);
+        assert_eq!(w.counters().commits, commits);
+        assert_eq!(w.counters().conflicts, conflicts);
+    }
+}
+
+#[test]
 fn a_dead_generation_is_refused_whole_and_registers_no_names() {
     let mut w = set(WorkConfig { lease_ms: 1_000, ..small() });
     join(&mut w, 0, "lead", &rootset(4, 1)).unwrap();
@@ -188,6 +287,26 @@ fn a_replay_gets_the_same_answer_before_and_after_a_generation_change() {
     let mut other = r.clone();
     other.items[0] = exported(name(99));
     assert_eq!(w.result(5, "lead", &other, &mut Vec::new()), Err(Refusal::SeqReused));
+}
+
+#[test]
+fn review_a_committed_replay_is_fenced_when_its_attempt_has_moved() {
+    let mut w = set(small());
+    let roots = rootset(4, 1);
+    join(&mut w, 0, "lead", &roots).unwrap();
+    let grant = lease(&mut w, 0, "lead").unwrap();
+    let committed = result(&grant, 1, root_items(&grant), Vec::new());
+    w.result(1, "lead", &committed, &mut Vec::new()).unwrap();
+
+    w.new_attempt(Attempt(2), "lead", &mut Vec::new());
+    join(&mut w, 2, "lead", &roots).unwrap();
+    let current = lease(&mut w, 2, "lead").unwrap();
+    let mut log = Vec::new();
+    assert_eq!(w.result(3, "lead", &committed, &mut log), Err(Refusal::AttemptMoved));
+    assert!(!log.iter().any(|effect| matches!(effect, Effect::Replayed { .. })));
+    assert_eq!(w.counters().replays, 0);
+    // A delayed packet from the old attempt cannot replace or complete the current grant.
+    assert_eq!(lease(&mut w, 4, "lead").unwrap(), current);
 }
 
 #[test]
