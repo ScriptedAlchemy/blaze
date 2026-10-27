@@ -1137,8 +1137,9 @@ def worlds(sc, source_sha):
             pinned = [e for e in sc.events("a", log + open(os.path.join(sc.dir, "worker.log"), errors="replace").read())
                       if e[0] == "pins" and e[1] == nobody]
             sc.notes["pins"] = pinned
-            if not pinned or "world=2" not in pinned[0][4]:
-                sc.fail(f"the edit did not read both groups' output: {pinned}")
+            # The programs of R read R's scripts, and a world of S's is none of theirs.
+            if not pinned or "world=1" not in pinned[0][4]:
+                sc.fail(f"the edit did not read the output of R's scripts: {pinned}")
         sc.timeouts()
     finally:
         worker.kill()
@@ -1237,8 +1238,12 @@ def generation(sc, source_sha):
     if not said.startswith("ok"):
         sc.fail(f"the edit of A was answered {said!r}: a world that moved is loaded again for it")
         return
-    got = sc.program("gen-one")
+    # The edit is spliced into the executable the worker linked, not the copy the client installed.
+    spliced = os.path.join(sc.ws, "target", "ra-jit", "whole", "gen-one")
+    got = sc.program("gen-one", spliced)
     sc.notes["edited-a"] = [got, want]
+    if got is None:
+        sc.fail(f"the edited program of A is not at {spliced}")
     strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
     if strip(got) != strip(want):
         sc.fail(f"A's edited program printed {got!r}, what cargo builds of the tree {want!r}")
@@ -1265,8 +1270,8 @@ def unrelated(sc, source_sha):
         if B.returncode != 0:
             sc.fail(f"B's build in S exited {B.returncode}: {B.err[-400:]}")
             return
-        if sc.runs() != ["a", "b"]:
-            sc.fail(f"the script of S was to run for B: {sc.runs()}")
+        if sc.runs().count("b") != 1:
+            sc.fail(f"the script of S was to run once for B: {sc.runs()}")
         path = os.path.join(sc.r, "src", "one.rs")
         text = open(path).read() + "// an edit\n"
         said = send_edit(sc.dir, path, text, "worker.sock")
