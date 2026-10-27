@@ -37,7 +37,9 @@ use hyper_util::{
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-use super::transfer::{FIRST_WAIT, Object, RESUMES, Refused, TooLong, Traffic, Version};
+use super::transfer::{
+    FIRST_WAIT, Object, RESUMES, Refused, StalePartial, TooLong, Traffic, Version, is_final,
+};
 
 /// The bytes of one read of a file that is sent.
 const CHUNK: usize = 1 << 16;
@@ -192,7 +194,11 @@ impl Serve {
                     .and_then(|it| it.split_once('-'))
                     .and_then(|(first, _)| first.parse::<u64>().ok());
                 if first != Some(offset) {
-                    bail!("{} sends a range of {name} that does not start at {offset}", self.base);
+                    return Err(Refused(format!(
+                        "{} sends a range of {name} that does not start at {offset}",
+                        self.base
+                    ))
+                    .into());
                 }
                 Ok(Some(super::transfer::Body::Http(body)))
             }
@@ -204,8 +210,17 @@ impl Serve {
                     .and_then(|it| it.to_str().ok())
                     .and_then(|it| it.strip_prefix("bytes */"))
                     .and_then(|it| it.parse::<u64>().ok());
+                if let Some(len) = len
+                    && len < offset
+                {
+                    return Err(StalePartial { name: name.to_owned(), offset, len }.into());
+                }
                 if offset == 0 || len != Some(offset) {
-                    bail!("{} sends an invalid end-of-blob range for {name}", self.base);
+                    return Err(Refused(format!(
+                        "{} sends an invalid end-of-blob range for {name}",
+                        self.base
+                    ))
+                    .into());
                 }
                 Ok(Some(super::transfer::Body::Nothing))
             }
@@ -427,6 +442,9 @@ impl Serve {
                 }
                 Err(e) => e,
             };
+            if is_final(&failed) {
+                return Err(failed);
+            }
             if again == RESUMES {
                 bail!("{failed:#}, after asking {again} times more");
             }
@@ -469,7 +487,9 @@ impl Serve {
             u64::from(self.limits.request)
         };
         if hyper::body::Body::size_hint(request.body()).upper().is_some_and(|len| len > most) {
-            bail!("the request exceeds the server's advertised limit");
+            return Err(
+                Refused("the request exceeds the server's advertised limit".to_owned()).into()
+            );
         }
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         let patience = self.patience + extra;
@@ -925,6 +945,152 @@ mod tests {
         for (_, range, _) in fake.requests.lock().unwrap().iter().skip(1) {
             assert_eq!(range.as_deref(), Some("bytes=4-"));
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_restarts_a_too_long_saved_prefix_without_disabling_other_transfers() {
+        for compressed in [false, true] {
+            let bytes = b"rajitpk\x03a verified pack";
+            let encoded =
+                if compressed { zstd::bulk::compress(bytes, 3).unwrap() } else { bytes.to_vec() };
+            let want = super::super::Digest::of(&encoded);
+            let name = if compressed {
+                format!("packs/{}.pack.zst", super::super::Digest::of(bytes))
+            } else {
+                format!("units/{want}")
+            };
+            let stale_len = encoded.len() + 3;
+            let fake = Fake::start(
+                encode(&hello(Limits::DOCUMENTED)),
+                vec![
+                    (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        vec![("content-range", format!("bytes */{}", encoded.len()))],
+                        Vec::new(),
+                    ),
+                    reply(StatusCode::OK, encoded.clone()),
+                    reply(StatusCode::OK, b"unrelated".to_vec()),
+                ],
+            )
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let to = dir.path().join("verified");
+            let partial = to.with_file_name(if compressed {
+                "verified.zst.tmp"
+            } else {
+                "verified.fetch.tmp"
+            });
+            std::fs::write(&partial, vec![b'x'; stale_len]).unwrap();
+            let remote = super::super::Remote::open(fake.url.as_str(), dir.path()).await.unwrap();
+            let unpacked =
+                compressed.then(|| (super::super::Digest::of(bytes), bytes.len() as u64));
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(3),
+                remote.fetch_coded(&name, &want, unpacked, &to, (stale_len + 10) as u64, |_| true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(fetched, super::super::Fetched::Whole(_)));
+            assert_eq!(std::fs::read(&to).unwrap(), bytes);
+            assert!(!partial.exists());
+            let other = dir.path().join("unrelated");
+            let want = super::super::Digest::of(b"unrelated");
+            remote
+                .fetch_file(&format!("units/{want}"), &want, &other, 100, |_| true)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(other).unwrap(), b"unrelated");
+            assert_eq!(remote.traffic.resumed.load(Ordering::Relaxed), 0);
+            let requests = fake.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_eq!(requests[1].1, Some(format!("bytes={stale_len}-")));
+            assert!(requests[2].1.is_none());
+            assert!(requests[3].1.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_bad_clean_restart_and_discards_the_saved_prefix() {
+        let fake = Fake::start(
+            encode(&hello(Limits::DOCUMENTED)),
+            vec![
+                (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    vec![("content-range", "bytes */4".to_owned())],
+                    Vec::new(),
+                ),
+                reply(StatusCode::OK, b"wrong".to_vec()),
+                reply(StatusCode::OK, b"other".to_vec()),
+            ],
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("verified");
+        let partial = dir.path().join("verified.fetch.tmp");
+        std::fs::write(&partial, b"obsolete prefix").unwrap();
+        let remote = super::super::Remote::open(fake.url.as_str(), dir.path()).await.unwrap();
+        let want = super::super::Digest::of(b"correct");
+        let error = remote
+            .fetch_file(&format!("units/{want}"), &want, &to, 100, |_| true)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("rejected"));
+        assert!(!to.exists());
+        assert!(!partial.exists());
+        let want = super::super::Digest::of(b"other");
+        remote.fetch_file(&format!("units/{want}"), &want, &to, 100, |_| true).await.unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"other");
+        assert_eq!(fake.requests.lock().unwrap().len(), 4);
+        assert_eq!(remote.traffic.resumed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_416_is_final_and_does_not_keep_a_partial_or_poison_traffic() {
+        let fake = Fake::start(
+            encode(&hello(Limits::DOCUMENTED)),
+            vec![
+                reply(StatusCode::RANGE_NOT_SATISFIABLE, Vec::new()),
+                reply(StatusCode::OK, b"correct".to_vec()),
+            ],
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("verified");
+        let partial = dir.path().join("verified.fetch.tmp");
+        std::fs::write(&partial, b"saved").unwrap();
+        let remote = super::super::Remote::open(fake.url.as_str(), dir.path()).await.unwrap();
+        let want = super::super::Digest::of(b"correct");
+        let name = format!("units/{want}");
+        let error = remote.fetch_file(&name, &want, &to, 100, |_| true).await.err().unwrap();
+        assert!(error.is::<Refused>());
+        assert!(!partial.exists());
+        assert!(!to.exists());
+        remote.fetch_file(&name, &want, &to, 100, |_| true).await.unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"correct");
+        assert_eq!(fake.requests.lock().unwrap().len(), 3);
+        assert_eq!(remote.traffic.resumed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversize_local_upload_is_refused_without_network_retries() {
+        let limits = Limits { blob: 64, ..Limits::DOCUMENTED };
+        let fake = Fake::start(encode(&hello(limits)), Vec::new()).await;
+        let client = fake.client().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("upload");
+        std::fs::write(&file, vec![0; 65]).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_file(&format!("units/{}", "01".repeat(32)), &file, 65),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.is::<Refused>());
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        assert_eq!(client.traffic.resumed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

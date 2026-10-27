@@ -282,10 +282,18 @@ GET supports partial, open-ended and suffix byte ranges. Successful ranges retur
 with `Content-Range`. Invalid or unsatisfiable ranges return `416`. HEAD returns the same
 length without a body. Lists use `If-Match` or `If-None-Match: *` to avoid lost updates.
 A failed condition returns code 6 with status `409`, and the client reads again.
+When a resumed download gets `416` because the remote object is shorter than the saved
+prefix, the fetch drops that prefix and restarts once from zero. A malformed range response
+is a final refusal and removes the partial instead of disabling other transfers.
+The restarted bytes must still satisfy the listed size, digest and pack-format checks
+before publication. A local upload over the negotiated size limit is not retried.
 
 The existence set is a hint. Files changed directly behind the server are not reflected in
 that set until a rescan or restart. Fetches still read the file, and clients verify its digest.
 Direct filesystem writers do not participate in the server's conditional-write lock.
+Listings are a best-effort snapshot. An object deleted between enumeration and its metadata
+read is omitted. Other filesystem errors remain errors. A real manifest that disappears
+after it was listed still causes collection to fail rather than losing its references.
 
 `hello` returns an Ed25519 public key persisted in `DIR/key`, a placeholder Main epoch of 1,
 and an empty identity set. C3 has no records or identity restrictions. Records, generation
@@ -318,6 +326,8 @@ round trips. Neither command measures a speedup.
 `--selftest` checks given-S3, cache-server, MinIO and SeaweedFS dispatch without credentials.
 The TLS fixture requires MinIO and openssl. SeaweedFS retains its normal S3 checks but does
 not run the MinIO-specific TLS fixture; the harness reports that omission.
+The focused server CI also runs actual remote-client tests and the dispatch selftest.
+It installs Rust 1.99.0 with rust-src and does not build a release harness binary.
 
 ### The standard library
 

@@ -7,6 +7,8 @@ on:
       - crates/blaze-serve/**
       - crates/blaze-wire/**
       - crates/ra-jit-store/**
+      - crates/ra-jit/**
+      - harness/**
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/blaze-serve-review.yaml
@@ -39,3 +41,9 @@ jobs:
       - name: Test the actual server, HTTP routes, and publication races
         if: ${{ !cancelled() }}
         run: cargo test --locked -p blaze-serve -- --test-threads=2
+      - name: Test remote clients and fetch recovery
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
+      - name: Check harness dispatch without services or credentials
+        if: ${{ !cancelled() }}
+        run: python3 -I harness/remote.py --selftest

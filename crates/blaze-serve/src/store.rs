@@ -78,6 +78,8 @@ pub struct Store {
     publication: Mutex<()>,
     #[cfg(test)]
     before_name: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    before_stat: Mutex<Option<Box<dyn Fn(&Path) + Send>>>,
 }
 
 impl Store {
@@ -101,6 +103,8 @@ impl Store {
             publication: Mutex::new(()),
             #[cfg(test)]
             before_name: Mutex::new(None),
+            #[cfg(test)]
+            before_stat: Mutex::new(None),
         };
         store.sweep_temporaries();
         store.rescan()?;
@@ -374,10 +378,15 @@ impl Store {
             if !name.starts_with(prefix) || ObjectName::parse(&name).is_none() {
                 continue;
             }
-            if !entry.file_type()?.is_file() {
-                continue;
+            #[cfg(test)]
+            if let Some(pause) = self.before_stat.lock().unwrap().as_ref() {
+                pause(&entry.path());
             }
-            let found = entry.metadata().map_err(|e| failed(&format!("listing {prefix}"), e))?;
+            let found = match std::fs::symlink_metadata(entry.path()) {
+                Ok(found) => found,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(failed(&format!("listing {prefix}"), e)),
+            };
             if !found.is_file() {
                 continue;
             }
@@ -557,6 +566,44 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn listing_skips_a_published_object_deleted_after_enumeration() {
+        let dir = scratch();
+        let store = std::sync::Arc::new(Store::open(dir.path()).unwrap());
+        let name = format!("units/{}", hex(&Sha256::digest(b"bytes").into()));
+        store.put_blob(&name, b"bytes").unwrap();
+        let (ready, arrived) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        *store.before_stat.lock().unwrap() = Some(Box::new(move |_| {
+            ready.send(()).unwrap();
+            resumed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }));
+        let listing = {
+            let store = store.clone();
+            std::thread::spawn(move || store.list("units/"))
+        };
+        arrived.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(store.delete(&name).unwrap());
+        resume.send(()).unwrap();
+        assert!(listing.join().unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn listing_does_not_hide_a_non_not_found_filesystem_error() {
+        let dir = scratch();
+        let store = Store::open(dir.path()).unwrap();
+        let name = format!("units/{}", hex(&Sha256::digest(b"bytes").into()));
+        store.put_blob(&name, b"bytes").unwrap();
+        *store.before_stat.lock().unwrap() = Some(Box::new(move |path| {
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(path.parent().unwrap()).unwrap();
+            std::fs::write(path.parent().unwrap(), b"not a directory").unwrap();
+        }));
+        let error = store.list("units/").unwrap_err();
+        assert_eq!(error.code, blaze_wire::ErrorCode::Internal);
+        assert!(error.message.contains("listing units/"));
     }
 
     #[test]

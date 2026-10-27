@@ -217,10 +217,31 @@ impl Body {
 /// there, an object is longer than is taken, or a file of this machine could not be written.
 pub(super) fn is_final(error: &anyhow::Error) -> bool {
     error.is::<Refused>()
+        || error.is::<StalePartial>()
         || error.is::<Missing>()
         || error.is::<TooLong>()
         || error.is::<std::io::Error>()
 }
+
+/// The remote object is shorter than the saved prefix. Fetch can restart once from zero.
+#[derive(Debug)]
+pub(super) struct StalePartial {
+    pub(super) name: String,
+    pub(super) offset: u64,
+    pub(super) len: u64,
+}
+
+impl fmt::Display for StalePartial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} has {} bytes, shorter than the saved {} bytes",
+            self.name, self.len, self.offset
+        )
+    }
+}
+
+impl std::error::Error for StalePartial {}
 
 impl super::Remote {
     /// Makes a request of the remote until it is answered, with the waits a broken transfer
@@ -481,6 +502,11 @@ impl super::Remote {
             }
             match appended {
                 Ok(()) => {}
+                Err(e) if e.is::<StalePartial>() && std::mem::take(&mut left_by_another) => {
+                    partial.empty().await?;
+                    resumes = 0;
+                    continue;
+                }
                 Err(e) if is_final(&e) => {
                     partial.discard().await;
                     if e.is::<TooLong>() {
