@@ -445,11 +445,10 @@ fn no_worker_never_passes_and_old_attempt_is_fenced_after_reconnect() {
 #[test]
 fn real_cli_hello_and_lifetime_retention_are_bounded() {
     let f = Fixture::new(false, Config { session_ms: 10, ..Config::default() });
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_blaze-dist-local"))
-        .arg("hello")
-        .arg(&f.path)
-        .output()
-        .unwrap();
+    // The executable is the transport CLI Cargo built for this integration test,
+    // not a Cargo subprocess or a compiler fallback.
+    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
+    let output = std::process::Command::new(executable).arg("hello").arg(&f.path).output().unwrap();
     assert!(output.status.success());
     let hex = String::from_utf8(output.stdout).unwrap();
     assert!(!hex.trim().is_empty());
@@ -617,7 +616,8 @@ fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
 #[test]
 fn production_cli_client_transmits_cbor_submit_over_the_socket() {
     let f = Fixture::new(false, Config::default());
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_blaze-dist-local"))
+    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
+    let mut child = std::process::Command::new(executable)
         .arg("client")
         .arg(&f.path)
         .stdin(std::process::Stdio::piped())
@@ -727,7 +727,8 @@ fn production_cli_server_owns_and_removes_its_actual_socket() {
         "/tmp/blaze-cli-{}.sock",
         random_id().unwrap()[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
     ));
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_blaze-dist-local"))
+    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
+    let mut child = std::process::Command::new(executable)
         .arg("serve")
         .arg(&path)
         .stdin(std::process::Stdio::piped())
