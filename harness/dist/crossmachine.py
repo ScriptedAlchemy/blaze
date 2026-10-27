@@ -406,7 +406,7 @@ def vendor_body(ws, value, append=False):
     source = os.path.join(vendor, "src", "lib.rs")
     text = open(source).read()
     if append:
-        text += '\npub fn c4_identity() -> u32 { 1 }\npub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }\n'
+        text += '\npub fn c4_identity() -> u32 { 1 }\npub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }\npub fn c4_text_payload() -> u8 { include_str!("payload.bin").as_bytes()[0] }\n'
     else:
         old = "pub fn c4_identity() -> u32 { 1 }"
         if old not in text:
@@ -474,9 +474,12 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     text = open(source).read()
                     if step == "remove-reader":
                         text = text.replace('include_bytes!("payload.bin")[0]', "42")
+                        text = text.replace('include_str!("payload.bin").as_bytes()[0]', "42")
                     else:
                         text = text.replace("pub fn c4_payload() -> u8 { 42 }",
                                             'pub fn c4_payload() -> u8 { include_bytes!("payload.bin")[0] }')
+                        text = text.replace("pub fn c4_text_payload() -> u8 { 42 }",
+                                            'pub fn c4_text_payload() -> u8 { include_str!("payload.bin").as_bytes()[0] }')
                     with open(source, "w") as output:
                         output.write(text)
                     checks = json.load(open(checksum))
@@ -515,14 +518,14 @@ def warm_payload_report(work, bin_dir, machines, sources):
                     actual = program_output(side.cargo("run", "-p", "app", "--", timeout=600)[1])
                     wanted = 42 if step in ("remove-reader", "obsolete-deleted") else value
                     right = (built.returncode == 0 and actual == expected
-                             and f"vendor payload {wanted} caller {wanted + 10}" in expected[1])
+                             and f"vendor payload {wanted} caller {wanted + 10}" in expected[1]
+                             and f"text payload {wanted}" in expected[1])
                     oracle_code = expected[0]
                     oracle_log = expected[2]
                 pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
                 builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
-                same_generation = (bool(pids) and "failed:" not in status and ": ready" in status
-                                   and (previous_pids is None or pids == previous_pids)
-                                   and builds >= previous_builds)
+                same_generation = valid_worker_generation(status, ready, pids, previous_pids,
+                                                          builds, previous_builds)
                 previous_pids, previous_builds = pids, builds
                 right &= same_generation
                 right &= not recognized_fallback(built.stderr) and not any(
@@ -541,6 +544,13 @@ def warm_payload_report(work, bin_dir, machines, sources):
 def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
+
+
+def valid_worker_generation(status, ready, pids, previous_pids, builds, previous_builds):
+    return (bool(pids) and "failed:" not in status and ": ready" in status
+            and ready and all(state == "ready" for state in ready)
+            and (previous_pids is None or pids == previous_pids) and builds >= previous_builds
+            and not any(int(n) for n in re.findall(r"(\d+) by cargo", status)))
 
 
 def missing_input_failure(blaze_code, blaze_log, cargo_code, cargo_log, payload):
@@ -1041,6 +1051,11 @@ def self_test():
     check("unrelated compiler errors fail", not missing_input_failure(101, "unrelated error", 101, oracle, payload))
     check("missing oracle diagnostic fails", not missing_input_failure(101, missing, 101, "unrelated error", payload))
     check("fallback beside expected error fails", not missing_input_failure(101, missing + "\nthis is `cargo build`", 101, oracle, payload))
+    ready_status = "daemon: pid 1\nworker: pid 2\n/ws: ready\n3 builds by the daemon, 0 by cargo"
+    check("unchanged ready workers pass", valid_worker_generation(ready_status, ["ready"], ["1", "2"], ["1", "2"], 3, 2))
+    check("PID replacement fails", not valid_worker_generation(ready_status, ["ready"], ["1", "3"], ["1", "2"], 3, 2))
+    check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))
+    check("cargo build count fails", not valid_worker_generation(ready_status.replace("0 by cargo", "1 by cargo"), ["ready"], ["1", "2"], ["1", "2"], 3, 2))
     check("unnamed compute fails coverage", bool(fed_coverage("t", zero.replace("0 instances", "1 instances"), {}, True)))
     check("unnamed requests fail coverage", bool(fed_coverage("t", zero.replace("0 requests", "1 requests"), {}, True)))
     check("compiled functions fail despite empty log", bool(fed_coverage("t", zero.replace("0 compiled", "1 compiled"), {}, True)))
