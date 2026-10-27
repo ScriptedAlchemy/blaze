@@ -3,7 +3,7 @@
 blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of a script").
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
-scenarios: same-worker, cross-worker, failure, archive-control     (all, by default)
+scenarios: same-worker, cross-worker, failure, link-control, archive-control     (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -27,6 +27,9 @@ failure       One worker, one build with two programs whose script fails: the sa
               each request and one run of the script; then a build that works; then the failure
               again as a build of its own.
 
+link-control  Not about leases, no concurrency: GEN=a then GEN=b, a static library named for the
+              value. Whether a warm worker links the program with the library the script now
+              names. What differs from cargo is recorded as a gap.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -380,10 +383,13 @@ def first(events, what, build):
 
 def same_or_cross(sc, cross, source_sha):
     a_home, b_home = "a", ("b" if cross else "a")
-    exp_a, exp_b = sc.oracle("a"), sc.oracle("b")
+    # One archive name whose contents are the build's: a script of another build that writes
+    # over it while this one links is what the leases are to prevent.
+    extra = {"GEN_ARCHIVE": "same"}
+    exp_a, exp_b = sc.oracle("a", extra), sc.oracle("b", extra)
     sc.project()
     sc.arm(a_home, "consume")
-    A = sc.client(a_home, GEN="a")
+    A = sc.client(a_home, GEN="a", **extra)
     ba = sc.reached(a_home, "consume", A)
     if ba is None:
         sc.finish(A, "A", 5)
@@ -393,23 +399,16 @@ def same_or_cross(sc, cross, source_sha):
     sc.timeline.append((time.time_ns() // 1000, f"A (build {ba}) held at consume ({a_home})"))
     held = tree_hash(sc.run_dir())
     sc.notes["a-output-hash"] = held
-    runs = sc.runs()
-    if runs != ["a"]:
-        sc.fail(f"A's script did not run once before the barrier: {runs}")
-    # B asks, with another value of the variable the script watches.
-    B = sc.client(b_home, GEN="b")
+    if sc.runs() != ["a"]:
+        sc.fail(f"A's script did not run once before the barrier: {sc.runs()}")
+    # B asks, with another value of the variable the script watches, while A is held between
+    # its scripts and its compile and link. (In one worker B's checkout is loaded after A's
+    # build, which the worker settles first; in another's it is loaded at once, and waits for
+    # the lease.)
+    B = sc.client(b_home, GEN="b", **extra)
     if cross:
-        waited = sc.wait_event(b_home, "waits", within=WAIT)
-        sc.notes["b-waits-event"] = waited
-        bb = None
-    else:
-        put = sc.wait_event(a_home, "put-off")
-        sc.notes["b-put-off-event"] = put
-        bb = put[1] if put else None
-        if bb == ba:
-            sc.fail("the build that was put off is A's own")
-    sc.unchanged(held, "B asking while A is held", B)
-    # A resumes: its compile and link read the output its script wrote.
+        sc.notes["b-waits-event"] = sc.wait_event(b_home, "waits")
+    sc.unchanged(held, "B asking while A is held before its compile and link", B)
     sc.release(a_home, "consume", ba)
     sc.finish(A, "A")
     if A.returncode != 0:
@@ -417,9 +416,16 @@ def same_or_cross(sc, cross, source_sha):
     if "[ra-jit]" not in A.err:
         sc.fail("A's build was not the daemon's whole build")
     kept_a = sc.keep("a")
-    retire_at = sc.reached(a_home, "retire", B)
+    # A's client has its answer. The daemon's word that A is over is held at the worker.
+    sc.reached(a_home, "retire", B)
+    bb = None
+    if not cross:
+        put = sc.wait_event(a_home, "put-off")
+        sc.notes["b-put-off-event"] = put
+        bb = put[1] if put else None
+        if bb == ba:
+            sc.fail("the build that was put off is A's own")
     sc.check_programs("A", kept_a, exp_a, "a")
-    # The client has its answer and A is not retired: B has still run nothing.
     sc.unchanged(held, "B asking after A's client was answered, before A is retired", B)
     if B.poll() is not None:
         sc.fail("B's client ended before A was retired")
@@ -435,48 +441,49 @@ def same_or_cross(sc, cross, source_sha):
     if sc.runs() != ["a", "b"]:
         sc.fail(f"the script ran {sc.runs()}, once for each build, 'a' then 'b'")
     sc.timeouts()
-    ev_a = sc.events(a_home)
-    ev_b = sc.events(b_home)
+    ev_a, ev_b = sc.events(a_home), sc.events(b_home)
+    retire_reached = next((e[3] for e in ev_a if e[0] == "barrier-reached" and e[1] == ba and "retire" in e[4]), None)
+    common = [
+        ("A held at consume", first(ev_a, "barrier-reached", ba)),
+        ("A released", first(ev_a, "barrier-released", ba)),
+        ("A's client ended", A.ended),
+    ]
     if not cross:
-        order(sc, a_home, [
-            ("A held at consume", first(ev_a, "barrier-reached", ba)),
-            ("B put off", first(ev_a, "put-off", bb) if bb else None),
-            ("A released", first(ev_a, "barrier-released", ba)),
-            ("A's client ended", A.ended),
-            ("retire reached", next((e[3] for e in ev_a if e[0] == "barrier-reached" and e[1] == ba and "retire" in e[4]), None)),
+        order(sc, a_home, common + [
+            ("retire held", retire_reached),
             ("A retired", first(ev_a, "retired", ba)),
             ("B ran the script", next((e[3] for e in ev_a if e[0] == "runs" and e[1] == bb), None)),
         ])
+        order(sc, a_home, [("B put off", first(ev_a, "put-off", bb) if bb else None),
+                           ("A retired", first(ev_a, "retired", ba))])
     else:
-        order(sc, a_home, [
-            ("A held at consume", first(ev_a, "barrier-reached", ba)),
-            ("A released", first(ev_a, "barrier-released", ba)),
-            ("A's client ended", A.ended),
-            ("A retired", first(ev_a, "retired", ba)),
-        ])
-        ran_b = next((e[3] for e in ev_b if e[0] == "runs"), None)
-        waits = next((e[3] for e in ev_b if e[0] == "waits"), None)
-        order(sc, b_home, [("B waits", waits), ("A retired", first(ev_a, "retired", ba)), ("B ran the script", ran_b)])
+        order(sc, a_home, common + [("A retired", first(ev_a, "retired", ba))])
+        order(sc, b_home, [("B waits", next((e[3] for e in ev_b if e[0] == "waits"), None)),
+                           ("A retired", first(ev_a, "retired", ba)),
+                           ("B ran the script", next((e[3] for e in ev_b if e[0] == "runs"), None))])
     sc.notes["builds"] = {"A": ba, "B": bb}
-    del retire_at
 
 
 def failure(sc, source_sha):
     sc.project()
-    ok = sc.client("a", GEN="a")
+    ok = sc.client("a", GEN="a", GEN_ARCHIVE="same")
     sc.finish(ok, "warm")
     if ok.returncode != 0:
         sc.fail(f"the build that was to warm the worker exited {ok.returncode}: {ok.err[-600:]}")
         return
     messages = []
     for tag, env in (("F1", {"GEN": "bad", "FAIL": "1"}), ("G", {"GEN": "c"}), ("F2", {"GEN": "bad", "FAIL": "1"})):
-        p = sc.client("a", **env)
+        p = sc.client("a", GEN_ARCHIVE="same", **env)
         sc.finish(p, tag)
         sc.notes[f"{tag}-rc"] = p.returncode
         if tag == "G":
             if p.returncode != 0:
                 sc.fail(f"G, after a failure, exited {p.returncode}: {p.err[-600:]}")
-            sc.check_programs("G", {}, None, "c")
+            # What G printed is cargo's or it is a gap of the warm worker's link (link-control).
+            for name in PROGRAMS:
+                got = sc.program(name)
+                if got is None or f"include=c env=c cfg=c native=99" not in got:
+                    sc.gaps.append(f"G after a failed build: {name} printed {got!r}")
         else:
             if p.returncode == 0 or "failed to run custom build command" not in p.err:
                 sc.fail(f"{tag} did not fail with cargo's message for a script: rc {p.returncode}: {p.err[-600:]}")
@@ -497,6 +504,26 @@ def failure(sc, source_sha):
     if sc.notes.get("F1-said") != sc.notes.get("F2-said"):
         sc.fail(f"the failure said different things: {sc.notes.get('F1-said')} / {sc.notes.get('F2-said')}")
     sc.timeouts()
+
+
+def link_control(sc, source_sha):
+    """No concurrency, no barrier: GEN=a, then GEN=b, a static library named for the value. Not
+    about leases: whether a warm worker, which finds only the script's output changed, links the
+    program with the library that output names."""
+    sc.project()
+    expected = {"a": sc.oracle("a"), "b": sc.oracle("b")}
+    sc.project()
+    for gen_ in ("a", "b"):
+        p = sc.client("a", GEN=gen_)
+        sc.finish(p, gen_)
+        if p.returncode != 0:
+            sc.fail(f"the build of GEN={gen_} exited {p.returncode}: {p.err[-600:]}")
+            return
+        for name in PROGRAMS:
+            got = sc.program(name)
+            if got != (expected[gen_] or {}).get(name):
+                sc.gaps.append(f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}")
+    sc.notes["gap-count"] = len(sc.gaps)
 
 
 def archive_control(sc, source_sha):
@@ -521,6 +548,7 @@ def archive_control(sc, source_sha):
 
 SCENARIOS = {
     "archive-control": archive_control,
+    "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
     "cross-worker": lambda sc, sha: same_or_cross(sc, True, sha),
     "failure": failure,
@@ -534,7 +562,7 @@ def main():
     ap.add_argument("--source-sha", default=os.environ.get("SOURCE_SHA", "unknown"))
     ap.add_argument("scenarios", nargs="*")
     args = ap.parse_args()
-    names = args.scenarios or [n for n in SCENARIOS if n != "archive-control"] + ["archive-control"]
+    names = args.scenarios or [n for n in SCENARIOS if not n.endswith("-control")] + ["link-control", "archive-control"]
     work = os.path.abspath(args.work)
     os.makedirs(work, exist_ok=True)
     report = {}
