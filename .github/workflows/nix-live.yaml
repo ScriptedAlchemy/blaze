@@ -10,6 +10,16 @@
 #   nix (darwin)  the flake evaluates and builds its cheapest outputs on aarch64-darwin
 #   demo          demo/life builds and its window opens (xvfb) and stays up
 #   live edits    macOS arm64: edit a running program's function, ra-jit-live applies the patch
+#
+# The binary cache (FlakeHub) is an optimization, never a gate. FlakeHub wants a flake
+# registered with FlakeHub and an OIDC token this repository does not grant, so it is off
+# unless the repository variable ENABLE_FLAKEHUB_CACHE is "true"; without it Nix substitutes
+# from the signed public cache.nixos.org the installer configures. A cache step that fails
+# must not fail a job, so it alone carries `continue-on-error`. Everything the cache would
+# speed up -- evaluation, unit-graph regeneration, the Linux and Darwin builds -- runs either
+# way. `harness/dist/check_nix_workflow.py` runs as a step in `unit-graphs` and fails when an
+# expected gate is missing or made conditional, so deleting a gate is not a way to pass.
+# No job adds `id-token: write`: the cache is not worth granting identity.
 name: nix and live
 on:
   push:
@@ -51,7 +61,14 @@ jobs:
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: DeterminateSystems/flakehub-cache-action@v3
+        # Off unless the repository opts in (header): an unregistered fork's cache cannot
+        # authenticate, and that must never fail a job. The Nix commands below run regardless.
+        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
+        continue-on-error: true
       - run: python3 nix/unit_graph.py
+      # Fails when a gate is deleted or made conditional (harness/dist/check_nix_workflow.py).
+      - name: the cache is optional and every required command is present
+        run: python3 harness/dist/check_nix_workflow.py
       - name: nix/units is what unit_graph.py writes
         run: |
           git diff --stat -- nix/units
@@ -65,6 +82,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: DeterminateSystems/flakehub-cache-action@v3
+        # Off unless the repository opts in (header): an unregistered fork's cache cannot
+        # authenticate, and that must never fail a job. The Nix commands below run regardless.
+        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
+        continue-on-error: true
       - name: flake evaluates
         run: nix flake check --print-build-logs
       # The daemon as a package, the demo as a package, and the per-unit builds both are made of.
@@ -90,6 +111,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: DeterminateSystems/flakehub-cache-action@v3
+        # Off unless the repository opts in (header): an unregistered fork's cache cannot
+        # authenticate, and that must never fail a job. The Nix commands below run regardless.
+        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
+        continue-on-error: true
       - name: outputs evaluate
         run: |
           for attr in daemon run life daemon-units life-bin; do

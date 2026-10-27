@@ -94,6 +94,21 @@ mod tests {
         socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         socket2::SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
+        // Saturate the kernel send and receive windows before measuring the idle phase.
+        let fill = [7; 65536];
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                match stream.try_write(&fill) {
+                    Ok(count) => assert!(count != 0),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("filling TCP window: {error}"),
+                }
+            }
+        })
+        .await
+        .expect_err("a peer that never reads cannot drain indefinitely");
         let mut io = ProgressIo::new(stream, Duration::from_millis(100));
         let heartbeat = tokio::spawn(async move {
             for _ in 0..100 {
@@ -103,26 +118,22 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        let bytes = vec![7; 16 << 20];
-        let mut written = 0;
         let mut read_wakes = 0;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_millis(600),
             std::future::poll_fn(|cx| {
                 loop {
-                    match Pin::new(&mut io).poll_write(cx, &bytes[written..]) {
-                        Poll::Ready(Ok(count)) => {
-                            assert!(count != 0);
-                            written += count;
-                            assert!(
-                                written < bytes.len(),
-                                "the peer unexpectedly read the response"
-                            );
-                        }
-                        Poll::Ready(Err(error)) => return Poll::Ready(error),
-                        Poll::Pending => break,
+                    match io.stream.try_write(&fill) {
+                        Ok(count) => assert!(count != 0),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("maintaining TCP backpressure: {error}"),
                     }
+                }
+                match Pin::new(&mut io).poll_write(cx, &fill) {
+                    Poll::Ready(Err(error)) => return Poll::Ready(error),
+                    Poll::Ready(Ok(_)) => panic!("the fixture permitted write progress"),
+                    Poll::Pending => {}
                 }
                 let mut input = [0; 32];
                 let mut read = ReadBuf::new(&mut input);
