@@ -97,8 +97,10 @@ fn process_collection_does_not_panic_on_raw_value() {
     }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "process_collection_does_not_panic_on_raw_value"])
+        .env_clear()
         .env(MARKER, "1")
         .env("ARBITRARY", OsString::from_vec(vec![0xff]))
+        .env("PATH", "/usr/bin:/bin")
         .status()
         .unwrap();
     assert!(status.success());
