@@ -52,6 +52,10 @@ pub fn text_view(
     for (name, value) in native {
         if let Some(value) = value.to_str() {
             text.insert(name.clone(), value.to_owned());
+        } else if cargo_ignored(name) {
+            // Encoding does not turn an ignored transport/printing/location knob into
+            // a target compiler option. Native home discovery is handled separately.
+            continue;
         } else if name == "RUSTFLAGS"
             || name == "CARGO_ENCODED_RUSTFLAGS"
             || name.starts_with("CARGO_BUILD_")
@@ -104,6 +108,13 @@ pub const CARGO_IGNORED: &[&str] = &[
     "CARGO_HTTP_",
     "CARGO_NET_",
 ];
+
+/// Entries ending in `_` are prefixes; all others are exact variable names.
+pub fn cargo_ignored(name: &str) -> bool {
+    CARGO_IGNORED
+        .iter()
+        .any(|entry| if entry.ends_with('_') { name.starts_with(entry) } else { name == *entry })
+}
 
 /// The variables blaze reads for what its code generators do, carried per unit.
 pub const RA_JIT_CARRIED: &[&str] =
