@@ -482,6 +482,7 @@ wire_types! {
     SourcePath,
     ConfigEnvValue,
     InputText,
+    EnvText,
     NativeValue,
     UnitSpec,
     ProfileSpec,

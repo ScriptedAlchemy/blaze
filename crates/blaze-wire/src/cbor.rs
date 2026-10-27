@@ -1167,7 +1167,7 @@ impl Wire for Bytes {
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
-        $name:ident { $(validate $validator:path,)? $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
+        $name:ident { $(validate $validator:path,)? $(sample $repair:path,)? $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1214,9 +1214,12 @@ macro_rules! wire_struct {
 
         impl $crate::vectors::Sample for $name {
             fn sample(g: &mut $crate::vectors::Gen) -> Self {
-                $name {
+                #[allow(unused_mut)]
+                let mut value = $name {
                     $($field: $crate::vectors::Sample::sample(g)),*
-                }
+                };
+                $($repair(&mut value);)?
+                value
             }
         }
     };

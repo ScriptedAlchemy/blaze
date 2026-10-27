@@ -511,13 +511,20 @@ struct BuildSpec {                  // 0..=12, schema version 4
 ```rust
 struct SourcePath(String);          // schema 3: escaped byte-component logical path
 enum ConfigEnvValue {
-    Literal(InputText),            // 0, [0, text], message-bounded free-form value
+    Literal(EnvText),              // 0, [0, text], message-bounded NUL-free env value
     WorkspaceRelative(SourcePath), // 1, [1, path], joined to the selected workspace on the worker
     Native(NativeValue),            // 2, [2, bytes], NUL-free Unix environment bytes (v4)
 }
 struct InputText(String);           // same CBOR text, budget Limits.request, not identifier limit
+struct EnvText(String);             // same CBOR text budget, environment-specific NUL exclusion
 struct NativeValue(Vec<u8>);        // CBOR bytes, budget Limits.request, no NUL
 ```
+
+Native env values must be non-UTF-8; valid UTF-8 has the single Literal encoding.
+EnvText excludes NUL, and env maps reject empty/`=`/NUL names and repeated names.
+script_env is original ambient input only and cannot contain WorkspaceRelative;
+configured values stay origin-tagged in config_env. Only the local native probe
+receives their materialized absolute paths, which never replace portable wire tags.
 
 Schema 3 `SourcePath` losslessly escapes native component bytes. ASCII letters,
 digits, `-`, `_`, `.` are literal; every other byte is uppercase `%HH`. `/`

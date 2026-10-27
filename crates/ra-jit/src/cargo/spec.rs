@@ -51,7 +51,10 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
     };
     let cwd = std::env::current_dir()?;
     let native_env = blaze_spec::environment::native_process();
-    let env = blaze_spec::environment::text_view(&native_env)?;
+    let env = match blaze_spec::environment::text_view(&native_env) {
+        Ok(env) => env,
+        Err(why) => return refused(&why),
+    };
     let (host, identity) = host()?;
     let source_root = blaze_spec::git_path::root(&cwd).map_err(anyhow::Error::msg)?;
     let mut ctx = context(&cwd, &env, &host, identity, &source_root)?;
@@ -208,6 +211,9 @@ fn host() -> anyhow::Result<(Host, StoreIdentity)> {
 
 fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json::Value> {
     let asked = blaze_metadata::Asked {
+        cargo_home: ctx
+            .native_env
+            .and_then(|env| blaze_spec::environment::cargo_home(env, ctx.cwd)),
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         manifest_path: request.manifest_path.as_deref(),
@@ -257,7 +263,10 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         let mut native = blaze_spec::environment::native_process();
         native.retain(|key, _| !blaze_spec::run::governed(key));
         native.extend(candidate.env);
-        let env = blaze_spec::environment::text_view(&native)?;
+        let env = match blaze_spec::environment::text_view(&native) {
+            Ok(env) => env,
+            Err(why) => return refused(&why),
+        };
         let mut request = Request::parse(candidate.command, &candidate.args)?;
         request.manifest_path = Some(manifest.clone());
         let mut ctx = context(&cwd, &env, &host, identity, &root)?;

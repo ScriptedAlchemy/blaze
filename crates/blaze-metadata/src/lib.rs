@@ -41,6 +41,8 @@ use crate::summary::Read;
 
 /// What is asked of the workspace, as `cargo metadata` or `cargo build` is asked.
 pub struct Asked<'a> {
+    /// Actual native Cargo-home discovery path, when supplied by a native-env caller.
+    pub cargo_home: Option<PathBuf>,
     /// The directory cargo would be run in, and its variables.
     pub cwd: &'a Path,
     pub env: Vec<(String, String)>,
@@ -262,7 +264,10 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
 /// The configuration `asked` is read with, for the command cargo would be run as, and whether
 /// the run is offline.
 fn open(asked: &Asked<'_>, command: &str) -> Result<(Context, bool)> {
-    let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
+    let mut config = match &asked.cargo_home {
+        Some(home) => Config::load_with_home(asked.cwd, asked.env.clone(), &[], home.clone())?,
+        None => Config::load(asked.cwd, asked.env.clone(), &[])?,
+    };
     config.start(command, asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
     Ok((Context::new(config), offline))

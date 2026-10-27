@@ -61,6 +61,7 @@ fn main() -> Result<()> {
     }
     let cwd = std::env::current_dir()?;
     let asked = Asked {
+        cargo_home: None,
         cwd: &cwd,
         env: std::env::vars().collect(),
         manifest_path: manifest_path.as_deref(),

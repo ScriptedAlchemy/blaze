@@ -424,7 +424,7 @@ fn new_into_really_appends_to_caller_output() {
 #[test]
 fn all_domains_are_unique_and_prefix_free() {
     let entries = every();
-    assert_eq!(entries.len(), 102);
+    assert_eq!(entries.len(), 103);
     let mut names = BTreeSet::new();
     let mut domains = vec![];
     for e in entries {

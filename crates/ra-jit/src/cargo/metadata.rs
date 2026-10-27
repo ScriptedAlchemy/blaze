@@ -74,6 +74,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
         let cfg: Vec<cargo_platform::Cfg> = cfg.iter().filter_map(platform_cfg).collect();
         let triple = triple.context("no target triple")?;
         let asked = blaze_metadata::Asked {
+            cargo_home: None,
             cwd: &cwd,
             env: vars.into_iter().collect(),
             manifest_path: manifest,
@@ -134,6 +135,7 @@ pub(crate) fn programs(
         });
         let cfg = cfg.collect::<anyhow::Result<Vec<_>>>()?;
         let asked = blaze_metadata::Asked {
+            cargo_home: None,
             cwd,
             env: std::env::vars().collect(),
             manifest_path: manifest,

@@ -45,6 +45,36 @@ impl crate::vectors::Sample for InputText {
     }
 }
 
+/// Message-bounded environment text, with NUL excluded before materialization.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnvText(pub String);
+impl From<String> for EnvText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl Wire for EnvText {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        let text = r.path_text()?;
+        if text.contains('\0') {
+            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at });
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+impl Named for EnvText {
+    const NAME: &'static str = "EnvText";
+}
+impl crate::vectors::Sample for EnvText {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(String::sample(g))
+    }
+}
+
 /// A lossless logical path: `/` separates byte components and `.` denotes the root.
 /// Component bytes outside ASCII letters, digits, `-`, `_`, `.` use uppercase `%HH`.
 /// Escapes of safe bytes, empty/dot/parent components, decoded slash and NUL are invalid.
@@ -245,6 +275,7 @@ wire_struct! {
     /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
     BuildSpec {
         validate validate_build_paths,
+        sample sample_build_env,
         0 => source: SourceRef,
         1 => lock: Digest,
         2 => units: Vec<UnitSpec>,
@@ -262,8 +293,73 @@ wire_struct! {
 }
 
 fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
+    validate_tagged_env(&spec.config_env, false)?;
+    validate_tagged_env(&spec.script_env, true)?;
     if !spec.workspace_manifest.is_cargo_manifest() {
         return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
+    }
+    Ok(())
+}
+
+fn sample_build_env(spec: &mut BuildSpec) {
+    spec.config_env = Set::new(
+        spec.config_env
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (format!("CONFIG_{i}"), v.clone()))
+            .collect(),
+    );
+    spec.script_env = Set::new(
+        spec.script_env
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                (
+                    format!("SCRIPT_{i}"),
+                    match v {
+                        ConfigEnvValue::WorkspaceRelative(path) => {
+                            ConfigEnvValue::Literal(path.as_str().to_owned().into())
+                        }
+                        value => value.clone(),
+                    },
+                )
+            })
+            .collect(),
+    );
+}
+
+fn validate_env_name(name: &str) -> Result<(), crate::Error> {
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(path_error());
+    }
+    Ok(())
+}
+fn validate_tagged_env(
+    env: &Set<(String, ConfigEnvValue)>,
+    ambient: bool,
+) -> Result<(), crate::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in env.iter() {
+        validate_env_name(name)?;
+        if !seen.insert(name) {
+            return Err(path_error());
+        }
+        if ambient && matches!(value, ConfigEnvValue::WorkspaceRelative(_)) {
+            return Err(path_error());
+        }
+        if matches!(value,ConfigEnvValue::Literal(text) if text.0.contains('\0')) {
+            return Err(path_error());
+        }
+    }
+    Ok(())
+}
+fn validate_text_env(env: &Set<(String, String)>) -> Result<(), crate::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in env.iter() {
+        validate_env_name(name)?;
+        if value.contains('\0') || !seen.insert(name) {
+            return Err(path_error());
+        }
     }
     Ok(())
 }
@@ -271,7 +367,7 @@ fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
 wire_enum! {
     /// Schema 2 preserves whether configuration text is literal or a workspace-relative path.
     ConfigEnvValue {
-        Literal => 0 (InputText),
+        Literal => 0 (EnvText),
         WorkspaceRelative => 1 (SourcePath),
         Native => 2 (NativeValue),
     }
@@ -284,9 +380,17 @@ impl ConfigEnvValue {
         workspace: &std::path::Path,
     ) -> Result<std::ffi::OsString, crate::Error> {
         match self {
-            Self::Literal(value) => Ok(value.0.clone().into()),
+            Self::Literal(value) => {
+                if value.0.contains('\0') {
+                    return Err(path_error());
+                }
+                Ok(value.0.clone().into())
+            }
             Self::WorkspaceRelative(path) => Ok(workspace.join(path.to_native()?).into_os_string()),
             Self::Native(bytes) => {
+                if bytes.0.contains(&0) || std::str::from_utf8(&bytes.0).is_ok() {
+                    return Err(path_error());
+                }
                 #[cfg(unix)]
                 {
                     use std::os::unix::ffi::OsStringExt;
@@ -314,7 +418,7 @@ impl ConfigEnvValue {
     /// Keep UTF-8's existing text encoding, and encode other native Unix values as bytes.
     pub fn from_native(value: &std::ffi::OsStr) -> Self {
         if let Some(text) = value.to_str() {
-            return Self::Literal(InputText(text.to_owned()));
+            return Self::Literal(EnvText(text.to_owned()));
         }
         Self::Native(NativeValue(value.as_encoded_bytes().to_vec()))
     }
@@ -330,7 +434,7 @@ impl Wire for NativeValue {
     fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
         let at = r.position();
         let bytes = r.input_bytes()?;
-        if bytes.contains(&0) {
+        if bytes.contains(&0) || std::str::from_utf8(bytes).is_ok() {
             return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at });
         }
         Ok(Self(bytes.to_vec()))
@@ -400,6 +504,8 @@ wire_enum! {
 wire_struct! {
     /// What a test run is asked to do. A timeout schedules, and is in the job request, not here.
     RunSpec {
+        validate validate_run_env,
+        sample sample_run_env,
         0 => filters: Vec<String>,
         1 => exact: bool,
         2 => skip: Vec<String>,
@@ -411,6 +517,15 @@ wire_struct! {
         8 => env: Set<(String, String)>,
         9 => doc: u8,
     }
+}
+
+fn validate_run_env(run: &RunSpec) -> Result<(), crate::Error> {
+    validate_text_env(&run.env)
+}
+fn sample_run_env(run: &mut RunSpec) {
+    run.env = Set::new(
+        run.env.iter().enumerate().map(|(i, (_, v))| (format!("ENV_{i}"), v.clone())).collect(),
+    );
 }
 
 wire_enum! {
@@ -728,6 +843,8 @@ wire_struct! {
 wire_struct! {
     /// What a test program needs to run on a machine that did not build it, by digest.
     RuntimeBundle {
+        validate validate_runtime_env,
+        sample sample_runtime_env,
         0 => program: Digest,
         1 => programs: Set<(String, Digest)>,
         2 => libraries: Set<(String, Digest)>,
@@ -735,6 +852,15 @@ wire_struct! {
         4 => cwd: String,
         5 => env: Set<(String, String)>,
     }
+}
+
+fn validate_runtime_env(bundle: &RuntimeBundle) -> Result<(), crate::Error> {
+    validate_text_env(&bundle.env)
+}
+fn sample_runtime_env(bundle: &mut RuntimeBundle) {
+    bundle.env = Set::new(
+        bundle.env.iter().enumerate().map(|(i, (_, v))| (format!("ENV_{i}"), v.clone())).collect(),
+    );
 }
 
 wire_struct! {

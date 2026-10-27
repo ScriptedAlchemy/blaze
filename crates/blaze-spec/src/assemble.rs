@@ -126,6 +126,7 @@ pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal>
     let offline = Opened::with(request, ctx, |opened| Ok(opened.resolved.offline))?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
     let asked = Asked {
+        cargo_home: ctx.native_env.and_then(|env| environment::cargo_home(env, ctx.cwd)),
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
         manifest_path: request.manifest_path.as_deref(),
@@ -224,8 +225,13 @@ impl Opened<'_> {
         let rejected = |what: &str, error: anyhow::Error| {
             Refusal::with(Reason::ConfigRejected, what, format!("{error:#}"))
         };
-        let mut config = Config::load(ctx.cwd, ctx.env.clone(), &[])
-            .map_err(|error| rejected("the configuration", error))?;
+        let native_home =
+            ctx.native_env.and_then(|native| environment::cargo_home(native, ctx.cwd));
+        let mut config = match native_home {
+            Some(home) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
+            None => Config::load(ctx.cwd, ctx.env.clone(), &[]),
+        }
+        .map_err(|error| rejected("the configuration", error))?;
         config
             .start(command.name(), &request.config)
             .map_err(|error| rejected("--config", error))?;
@@ -352,15 +358,21 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
             platform: platform_digest,
             rustflags: flags.flags.iter().cloned().map(Into::into).collect(),
             config_env: Set::new(opened.resolved.config_env.clone()),
-            script_env: Set::new(
-                machine_env
+            script_env: Set::new(match ctx.native_env {
+                Some(native) => native
                     .iter()
                     .filter(|(name, _)| environment::is_script_var(name, &host.triple))
                     .map(|(name, value)| {
                         (name.clone(), blaze_wire::ConfigEnvValue::from_native(value))
                     })
                     .collect(),
-            ),
+                None => environment::script_env(ctx.env, &host.triple)
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, blaze_wire::ConfigEnvValue::from_native(value.as_ref()))
+                    })
+                    .collect(),
+            }),
             cwd,
             command: command_of(request, command),
             toolchain,

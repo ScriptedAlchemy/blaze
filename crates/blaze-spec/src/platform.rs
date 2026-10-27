@@ -803,6 +803,33 @@ mod native_word_tests {
             assert_eq!(a, b);
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn raw_parser_quote_escape_and_trailing_backslash_match_ascii_control() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        for prefix in ["cc 'a b' ", "cc \"a b\" ", "cc a\\ b ", "cc\t", "cc "] {
+            for tail in ["n", "n\\"] {
+                let control = format!("{prefix}{tail}");
+                let mut raw = control.as_bytes().to_vec();
+                let at = raw.iter().rposition(|b| *b == b'n').unwrap();
+                raw[at] = 0xff;
+                let parsed = super::words_native(&std::ffi::OsString::from_vec(raw));
+                let mut expected: Vec<Vec<u8>> =
+                    super::words(&control).into_iter().map(String::into_bytes).collect();
+                for word in &mut expected {
+                    for b in word {
+                        if *b == b'n' {
+                            *b = 0xff;
+                        }
+                    }
+                }
+                assert_eq!(
+                    parsed.iter().map(|v| v.as_bytes().to_vec()).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
 }
 
 /// The words of `value`, split as a shell splits them on whitespace and quotes, so that a value

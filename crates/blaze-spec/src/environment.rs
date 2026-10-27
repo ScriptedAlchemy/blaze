@@ -33,6 +33,21 @@ pub fn native_process() -> BTreeMap<String, std::ffi::OsString> {
 pub fn text_view(
     native: &BTreeMap<String, std::ffi::OsString>,
 ) -> Result<BTreeMap<String, String>, Refusal> {
+    let names: BTreeMap<String, String> = native
+        .iter()
+        .map(|(name, value)| {
+            (name.clone(), if value.is_empty() { String::new() } else { "present".to_owned() })
+        })
+        .collect();
+    check(&names)?;
+    for (name, value) in native {
+        if value.to_str().is_none()
+            && name.starts_with("CARGO_TARGET_")
+            && name.ends_with("_LINKER")
+        {
+            return Err(Refusal::of(Reason::TargetLinker, name.clone()));
+        }
+    }
     let mut text = BTreeMap::new();
     for (name, value) in native {
         if let Some(value) = value.to_str() {
@@ -41,6 +56,7 @@ pub fn text_view(
             || name == "CARGO_ENCODED_RUSTFLAGS"
             || name.starts_with("CARGO_BUILD_")
             || name.starts_with("CARGO_PROFILE_")
+            || name.starts_with("CARGO_TARGET_")
             || RA_JIT_CARRIED.contains(&name.as_str())
         {
             return Err(Refusal::new(
@@ -50,6 +66,17 @@ pub fn text_view(
         }
     }
     Ok(text)
+}
+
+/// Cargo's native home path, used for discovery even when the spelling is not UTF-8.
+pub fn cargo_home(
+    native: &BTreeMap<String, std::ffi::OsString>,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = native.get("CARGO_HOME").filter(|p| !p.is_empty()) {
+        return Some(cwd.join(path));
+    }
+    native.get("HOME").filter(|p| !p.is_empty()).map(|p| std::path::PathBuf::from(p).join(".cargo"))
 }
 
 /// A variable refused by name, with what it does and why blaze cannot carry it.

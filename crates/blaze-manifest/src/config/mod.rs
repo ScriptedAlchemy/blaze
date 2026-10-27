@@ -270,6 +270,18 @@ impl Config {
     ) -> anyhow::Result<Config> {
         let env: BTreeMap<String, String> = env.into_iter().collect();
         let home = cargo_home(cwd, &env)?;
+        Self::load_with_home(cwd, env, cli, home)
+    }
+
+    /// Native Cargo-home discovery for callers which retain non-UTF-8 process paths.
+    /// The text configuration view is unchanged; only its actual discovery root is explicit.
+    pub fn load_with_home(
+        cwd: &Path,
+        env: impl IntoIterator<Item = (String, String)>,
+        cli: &[String],
+        home: PathBuf,
+    ) -> anyhow::Result<Config> {
+        let env: BTreeMap<String, String> = env.into_iter().collect();
         let mut config = Config {
             cwd: cwd.to_path_buf(),
             home,

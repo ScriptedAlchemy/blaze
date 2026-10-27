@@ -192,7 +192,8 @@ pub fn candidates(spec: &BuildSpec) -> Result<Vec<Reproduction>, Refusal> {
         }
     }
 
-    let env = environment(spec, run.map(|it| it.env.iter().cloned().collect()).unwrap_or_default());
+    let env =
+        environment(spec, run.map(|it| it.env.iter().cloned().collect()).unwrap_or_default())?;
     let mut out = Vec::new();
     for targets in &targets {
         for features in &features {
@@ -241,7 +242,7 @@ fn named_targets(asked: &[&UnitSpec]) -> Vec<String> {
 fn environment(
     spec: &BuildSpec,
     test_env: Vec<(String, String)>,
-) -> Vec<(String, std::ffi::OsString)> {
+) -> Result<Vec<(String, std::ffi::OsString)>, Refusal> {
     let mut env = Vec::new();
     if !spec.rustflags.is_empty() {
         env.push((
@@ -260,14 +261,20 @@ fn environment(
     env.push(("RA_JIT_MIR_OPT".to_owned(), profile.mir_opt.to_string()));
     let mut native: Vec<_> =
         env.into_iter().map(|(k, v)| (k, std::ffi::OsString::from(v))).collect();
-    native.extend(spec.script_env.iter().map(|(k, v)| {
-        (
+    for (k, v) in spec.script_env.iter() {
+        if matches!(v, blaze_wire::ConfigEnvValue::WorkspaceRelative(_)) {
+            return Err(Refusal::new(
+                k,
+                "script_env contains configuration-relative origin; expected ambient value",
+            ));
+        }
+        native.push((
             k.clone(),
-            v.materialize(std::path::Path::new(".")).expect("generated native env representable"),
-        )
-    }));
+            v.materialize(std::path::Path::new(".")).map_err(|e| Refusal::new(k, e.to_string()))?,
+        ));
+    }
     native.extend(test_env.into_iter().map(|(k, v)| (k, v.into())));
-    native
+    Ok(native)
 }
 
 /// What differs first between the spec a run was given and the one the tree and environment make
