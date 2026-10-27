@@ -1286,19 +1286,23 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let job = hir_ty_codegen::budget::job_context();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                let job = job.clone();
                 scope.spawn(move || {
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
+                    job.run(|| {
+                        hir::attach_db(&db, || {
+                            loop {
+                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if at >= count {
+                                    break;
+                                }
+                                work(&db, &resolver, at);
                             }
-                            work(&db, &resolver, at);
-                        }
+                        })
                     })
                 });
             }
@@ -4510,7 +4514,7 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
+    let stale: Result<Option<Vec<_>>, CodegenError> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
                 let (db, known, local, next) = (db.clone(), &*known, &local, &next);
@@ -4530,8 +4534,13 @@ fn build(
                 })
             })
             .collect();
-        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
+        let parts: Result<Vec<_>, CodegenError> = parts
+            .into_iter()
+            .map(|it| it.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        parts.map(|parts| parts.into_iter().collect())
     });
+    let stale = stale.map_err(anyhow::Error::new)?;
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
@@ -4541,7 +4550,7 @@ fn build(
     let unit = hir::attach_db(db, || {
         CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
     })
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::new)?;
     let Some(mut unit) = unit else { return Ok(None) };
     known.stats.onto_rustcs = unit.object.is_some() && resolver.onto_rustcs();
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
@@ -5441,6 +5450,8 @@ enum Refused {
     Error(errors::Said),
     /// The source is one ra-jit does not build as it is, or ra-jit failed to: cargo builds it.
     Cargos(String),
+    /// A transient host-pressure failure leaves the worker and last published build intact.
+    Pressure(String),
 }
 
 impl Refused {
@@ -5449,6 +5460,7 @@ impl Refused {
         match self {
             Refused::Error(said) => said.reply(),
             Refused::Cargos(why) => format!("cargo: {}", why.replace('\n', " ")),
+            Refused::Pressure(why) => format!("error: {}", why.replace('\n', " ")),
         }
     }
 }
@@ -5458,6 +5470,7 @@ impl std::fmt::Display for Refused {
         match self {
             Refused::Error(said) => said.fmt(f),
             Refused::Cargos(why) => f.write_str(why),
+            Refused::Pressure(why) => f.write_str(why),
         }
     }
 }
@@ -9666,7 +9679,20 @@ impl Program {
             eprintln!("edit-to-binary: {:.1?}", start.elapsed());
             why
         };
-        let Some(mut warm) = warm? else { return Ok(Err(held(known))) };
+        let warm = match warm {
+            Err(why)
+                if matches!(
+                    why.downcast_ref::<CodegenError>(),
+                    Some(CodegenError::OverBudget(_))
+                ) =>
+            {
+                eprintln!("pressure: edit not published; last build retained: {why}");
+                unbuilt.stale = true;
+                return Ok(Err(Refused::Pressure(why.to_string())));
+            }
+            other => other?,
+        };
+        let Some(mut warm) = warm else { return Ok(Err(held(known))) };
         // Code compiled at a higher level can call what rustc built into its callers and left
         // no symbol of. The executable can't take a patch with it, and a full link would start
         // the program over, so the code goes instead; of several functions installed
@@ -9923,6 +9949,19 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pressure_reply_is_a_transient_error_not_a_cargo_request() {
+        let reply = super::Refused::Pressure("host memory pressure".into()).reply();
+        assert_eq!(reply, "error: host memory pressure");
+        let error = anyhow::Error::new(hir_ty_codegen::CodegenError::OverBudget(
+            "host memory pressure".into(),
+        ));
+        assert!(matches!(
+            error.downcast_ref::<hir_ty_codegen::CodegenError>(),
+            Some(hir_ty_codegen::CodegenError::OverBudget(_))
+        ));
+    }
+
     use super::*;
 
     #[test]

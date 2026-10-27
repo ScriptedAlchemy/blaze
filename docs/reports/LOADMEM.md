@@ -410,6 +410,25 @@ resets on recovery or an unreadable signal even while a live program prevents ev
 sampler publishes critical state before purging. Every five seconds a critical pause logs the
 jobs still in flight and completed compile steps.
 
+### Bounded pressure-recovery acceptance hooks
+
+`RA_JIT_TEST_PRESSURE_DIR` is an explicit diagnostic hook for
+`harness/pressure_recovery.py`. Without that variable, it performs no file I/O, delay or
+pressure substitution; macOS memorystatus and Linux PSI/MemAvailable remain the providers.
+With it, `pressure` in the named directory contains `normal`, `warning`, `critical`, or
+`unknown`. Missing/unreadable content is unknown. `events` records production sampler and
+admission transitions. A `hold` file containing `define_function` holds a definition only
+after it has acquired its permit; `admission` holds any newly admitted job. Removing it
+releases the in-flight work. This never allocates toward host exhaustion.
+
+Admission queues top-level jobs FIFO. An admitted job can lend its context to dependent
+resolver threads; the slot lives until its last helper finishes. Unrelated compile queues
+must not inherit that context. A helper unwind does not count completed progress. A transient
+pressure error restores the warm patch base and stale work, returns an error rather than a
+Cargo request, and keeps the last published files for a same-daemon retry. Publication checks
+pressure again at object finalization. The bounded harness exercises relief within the grace
+and a persistent-pressure failure followed by recovery of the unchanged edit.
+
 ### Current validation
 
 **Measured**, 2026-10-26, runtime sources at `f1dedc0b`, Rust 1.99.0, Cranelift. All runs

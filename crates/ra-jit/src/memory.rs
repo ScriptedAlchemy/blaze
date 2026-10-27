@@ -369,7 +369,7 @@ fn pressure_reserve() -> anyhow::Result<u64> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     use hir_ty_codegen::budget::Pressure;
     let mut level: libc::c_int = 0;
     let mut size = size_of::<libc::c_int>();
@@ -395,7 +395,7 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     linux_pressure(
         &std::fs::read_to_string("/proc/meminfo").ok()?,
         &std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default(),
@@ -404,8 +404,12 @@ pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
     None
+}
+
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    hir_ty_codegen::budget::testing::pressure().unwrap_or_else(os_pressure)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -469,6 +473,13 @@ mod tests {
         // Incomplete quiet signals do not claim that all pressure sources are normal.
         assert_eq!(linux_pressure("", "full avg10=0 total=0\n", 1 << 20), None);
         assert_eq!(linux_pressure("", "", 1 << 20), None);
+    }
+
+    #[test]
+    fn native_pressure_reader_is_not_a_production_noop() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(os_pressure().is_some(), "native OS pressure reader unavailable");
+        }
     }
 
     #[test]

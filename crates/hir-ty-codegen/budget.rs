@@ -4,9 +4,10 @@
 //! freed pages; only persistent critical host pressure can fail admission. In-flight jobs
 //! finish: this is not a bound on the allocation of a single function.
 use std::{
-    cell::Cell,
+    cell::RefCell,
+    collections::VecDeque,
     sync::{
-        Condvar, LazyLock, Mutex, OnceLock,
+        Arc, Condvar, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
@@ -48,6 +49,8 @@ struct State {
     paused: bool,
     active: usize,
     completed: usize,
+    next_ticket: u64,
+    queue: VecDeque<u64>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -63,6 +66,8 @@ impl Default for State {
             paused: false,
             active: 0,
             completed: 0,
+            next_ticket: 0,
+            queue: VecDeque::new(),
         }
     }
 }
@@ -112,6 +117,7 @@ impl State {
         self.pressure = pressure;
         self.progress = progress;
         self.held = held;
+        testing::sample(pressure, self.active, progress);
     }
 }
 static MONITOR: OnceLock<Monitor> = OnceLock::new();
@@ -218,7 +224,7 @@ pub(super) fn budget() -> Option<Budget> {
 
 /// A transient failure is returned outside salsa queries so recovery can retry the build.
 pub(super) fn admit() -> super::Result<()> {
-    if IN_JOB.with(Cell::get) != 0 {
+    if IN_JOB.with(|job| job.borrow().is_some()) {
         return Ok(());
     }
     let Some(monitor) = MONITOR.get() else { return Ok(()) };
@@ -243,8 +249,15 @@ impl Monitor {
     fn wait(&self, acquire: bool) -> super::Result<()> {
         let entered = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = acquire.then(|| {
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.queue.push_back(ticket);
+            ticket
+        });
         while state.pressure == Pressure::Critical
-            || (acquire && state.active >= self.limit(&state))
+            || (acquire
+                && (state.queue.front().copied() != ticket || state.active >= self.limit(&state)))
         {
             if state.pressure == Pressure::Critical && !state.paused {
                 eprintln!(
@@ -257,6 +270,10 @@ impl Monitor {
                 && state.failed
                 && entered.elapsed() >= self.grace
             {
+                if let Some(ticket) = ticket {
+                    state.queue.retain(|it| *it != ticket);
+                    self.changed.notify_all();
+                }
                 return Err(super::CodegenError::OverBudget(format!(
                     "host memory pressure remained critical for {} seconds without compile progress after pausing new work",
                     self.grace.as_secs()
@@ -269,39 +286,143 @@ impl Monitor {
                 .0;
         }
         if acquire {
+            assert_eq!(state.queue.pop_front(), ticket);
             state.active += 1;
+            self.changed.notify_all();
         }
         Ok(())
     }
 }
 
-/// Counts top-level jobs only: recursive salsa computations do not acquire another slot.
-pub(super) struct Permit(Option<&'static Monitor>, std::marker::PhantomData<*mut ()>);
-impl Drop for Permit {
+/// A job keeps its slot until its last dependent helper finishes, even on another thread.
+struct Job {
+    monitor: Option<&'static Monitor>,
+    failed: AtomicBool,
+}
+impl Drop for Job {
     fn drop(&mut self) {
-        IN_JOB.with(|depth| depth.set(depth.get() - 1));
-        if let Some(monitor) = self.0 {
+        if let Some(monitor) = self.monitor {
             let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active -= 1;
-            if !std::thread::panicking() {
+            if !self.failed.load(Relaxed) && !std::thread::panicking() {
                 state.completed = state.completed.saturating_add(1);
             }
+            testing::event("job_exit");
             monitor.changed.notify_all();
         }
+    }
+}
+/// A permit cannot migrate between threads: it restores that thread's previous context.
+pub(super) struct Permit {
+    job: Arc<Job>,
+    previous: Option<Arc<Job>>,
+    _local: std::marker::PhantomData<*mut ()>,
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.job.failed.store(true, Relaxed);
+        }
+        IN_JOB.with(|job| *job.borrow_mut() = self.previous.take());
     }
 }
 thread_local! {
     // Foreground definitions can ask other definitions while applying relocations.
     // Those are part of the same admitted job, not new work to pause mid-flight.
-    static IN_JOB: Cell<usize> = const { Cell::new(0) };
+    static IN_JOB: RefCell<Option<Arc<Job>>> = const { RefCell::new(None) };
 }
 pub(super) fn enter() -> super::Result<Permit> {
-    let monitor = IN_JOB.with(|depth| (depth.get() == 0).then(|| MONITOR.get()).flatten());
-    if let Some(monitor) = monitor {
-        monitor.wait(true)?;
+    let previous = IN_JOB.with(|job| job.borrow().clone());
+    let job = match &previous {
+        Some(job) => job.clone(),
+        None => {
+            let monitor = MONITOR.get();
+            if let Some(monitor) = monitor {
+                monitor.wait(true)?;
+            }
+            Arc::new(Job { monitor, failed: AtomicBool::new(false) })
+        }
+    };
+    IN_JOB.with(|current| *current.borrow_mut() = Some(job.clone()));
+    let permit = Permit { job, previous, _local: std::marker::PhantomData };
+    if permit.previous.is_none() {
+        testing::entry();
     }
-    IN_JOB.with(|depth| depth.set(depth.get() + 1));
-    Ok(Permit(monitor, std::marker::PhantomData))
+    Ok(permit)
+}
+
+/// Capture only dependent work of an admitted job, never an independent compile queue.
+/// Helpers inherit its slot rather than block behind the parent waiting to join them.
+#[derive(Clone)]
+pub struct JobContext(Option<Arc<Job>>);
+
+pub fn job_context() -> JobContext {
+    JobContext(IN_JOB.with(|job| job.borrow().clone()))
+}
+
+impl JobContext {
+    pub fn run<T>(&self, work: impl FnOnce() -> T) -> T {
+        let Some(job) = &self.0 else { return work() };
+        let previous = IN_JOB.with(|current| current.replace(Some(job.clone())));
+        let _permit = Permit { job: job.clone(), previous, _local: std::marker::PhantomData };
+        work()
+    }
+}
+
+/// Explicit, file-controlled diagnostics for bounded pressure acceptance tests.
+/// Without RA_JIT_TEST_PRESSURE_DIR there is no override, I/O or entry delay.
+pub mod testing {
+    use super::Pressure;
+    use std::{
+        path::PathBuf,
+        sync::{LazyLock, Mutex},
+        time::Duration,
+    };
+
+    static DIRECTORY: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| std::env::var_os("RA_JIT_TEST_PRESSURE_DIR").map(PathBuf::from));
+    static WRITING: Mutex<()> = Mutex::new(());
+
+    pub fn pressure() -> Option<Option<Pressure>> {
+        let dir = DIRECTORY.as_ref()?;
+        Some(match std::fs::read_to_string(dir.join("pressure")).ok().as_deref().map(str::trim) {
+            Some("normal") => Some(Pressure::Normal),
+            Some("warning") => Some(Pressure::Warning),
+            Some("critical") => Some(Pressure::Critical),
+            _ => None,
+        })
+    }
+
+    pub(super) fn event(text: &str) {
+        let Some(dir) = DIRECTORY.as_ref() else { return };
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::Write;
+        if let Ok(mut file) =
+            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("events"))
+        {
+            _ = writeln!(file, "{text}");
+        }
+    }
+
+    pub(super) fn entry() {
+        event("job_enter");
+        checkpoint("admission");
+    }
+
+    pub(super) fn sample(pressure: Pressure, active: usize, progress: usize) {
+        if DIRECTORY.is_some() {
+            event(&format!("sample {pressure:?} active={active} completed={progress}"));
+        }
+    }
+
+    pub fn checkpoint(name: &str) {
+        let Some(dir) = DIRECTORY.as_ref() else { return };
+        event(&format!("checkpoint {name}"));
+        while std::fs::read_to_string(dir.join("hold")).ok().as_deref().map(str::trim) == Some(name)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 pub(super) fn allowed(held: u64, most: u64, threads: usize) -> usize {
@@ -349,6 +470,10 @@ impl Governor {
             self.shed.store(true, Relaxed);
         }
         self.shed()
+    }
+
+    pub(super) fn stop(&self) {
+        self.shed.store(true, Relaxed);
     }
 }
 
@@ -558,5 +683,104 @@ mod tests {
         assert!(!state.failed);
         state.sample(Some(Pressure::Critical), None, grace * 4, 1, grace, false);
         assert!(state.failed);
+    }
+
+    #[test]
+    fn production_monitor_fair_jobs_helpers_failure_and_recovery() {
+        const TEST: &str =
+            "budget::tests::production_monitor_fair_jobs_helpers_failure_and_recovery";
+        const CHILD: &str = "RA_JIT_TEST_FAIR_PRESSURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        static SIGNAL: AtomicUsize = AtomicUsize::new(0);
+        fn pressure() -> Option<Pressure> {
+            match SIGNAL.load(Relaxed) {
+                0 => Some(Pressure::Normal),
+                1 => Some(Pressure::Critical),
+                _ => None,
+            }
+        }
+        monitor(
+            Some(Budget { most: 1, held: || Some(100), give_back: || {} }),
+            pressure,
+            || {},
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let controller = MONITOR.get().unwrap();
+        let until = |condition: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !condition() {
+                assert!(Instant::now() < deadline, "controller did not reach expected state");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let parent = enter().unwrap();
+        let context = job_context();
+        let (started, ready) = mpsc::channel();
+        let (relief, released) = mpsc::channel();
+        let helper = std::thread::spawn(move || {
+            context.run(|| {
+                let _nested = enter().unwrap();
+                started.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(3)).unwrap();
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(parent);
+        assert_eq!(controller.state.lock().unwrap().active, 1, "helper owns parent slot");
+        SIGNAL.store(1, Relaxed);
+        until(&|| host_pressure() == Some(Pressure::Critical));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!controller.state.lock().unwrap().failed, "active helper is not timed out");
+        relief.send(()).unwrap();
+        helper.join().unwrap();
+        let governor = Governor::new(budget(), 1);
+        assert!(governor.look(), "only drained critical work fails after grace");
+        assert!(governor.shed());
+        assert_eq!(controller.state.lock().unwrap().active, 0);
+        SIGNAL.store(2, Relaxed);
+        until(&|| host_pressure().is_none());
+        assert!(!controller.state.lock().unwrap().failed);
+        // A new build retries with the same process monitor; a stopped build's governor
+        // remains terminal so it cannot publish a partial result after relief.
+        let fresh = Governor::new(budget(), 1);
+        assert!(!fresh.look());
+        assert!(governor.shed());
+        let blocker = enter().unwrap();
+        let (sent, received) = mpsc::channel();
+        let mut threads = Vec::new();
+        for index in 0..6 {
+            let sent = sent.clone();
+            threads.push(std::thread::spawn(move || {
+                let _permit = enter().unwrap();
+                sent.send(index).unwrap();
+            }));
+            until(&|| controller.state.lock().unwrap().queue.len() == index + 1);
+        }
+        drop(blocker);
+        for index in 0..6 {
+            assert_eq!(received.recv_timeout(Duration::from_secs(3)).unwrap(), index);
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(controller.state.lock().unwrap().active, 0);
+        assert!(controller.state.lock().unwrap().queue.is_empty());
+        SIGNAL.store(0, Relaxed);
+        until(&|| host_pressure() == Some(Pressure::Normal));
     }
 }

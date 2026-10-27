@@ -89,6 +89,7 @@ fn spares() -> Result<Spares, String> {
 /// What a worker holds and how much it is in use.
 struct Held {
     bytes: u64,
+    known: bool,
     asked: Instant,
     /// Answering a request or loading a checkout.
     busy: bool,
@@ -103,7 +104,7 @@ fn over(holding: &[(String, Held)], most: u64, critical: bool) -> Vec<String> {
     let mut all: u64 = holding.iter().map(|it| it.1.bytes).sum();
     let last = holding.iter().map(|it| it.1.asked).max();
     let mut idle: Vec<&(String, Held)> =
-        holding.iter().filter(|it| !it.1.busy && Some(it.1.asked) != last).collect();
+        holding.iter().filter(|it| it.1.known && !it.1.busy && Some(it.1.asked) != last).collect();
     idle.sort_by_key(|it| it.1.asked);
     let mut stopped = Vec::new();
     for (id, held) in idle {
@@ -114,7 +115,7 @@ fn over(holding: &[(String, Held)], most: u64, critical: bool) -> Vec<String> {
         stopped.push(id.clone());
     }
     for (id, held) in holding {
-        if critical && !held.busy && held.bytes > most && !stopped.contains(id) {
+        if held.known && !held.busy && held.bytes > most && !stopped.contains(id) {
             stopped.push(id.clone());
         }
     }
@@ -792,6 +793,7 @@ impl Worker {
         }
         Held {
             bytes: bytes.unwrap_or(0),
+            known: bytes.is_some(),
             asked: *lock(&self.asked),
             busy: self.answering.load(Relaxed) != 0 || self.loads(),
         }
@@ -1716,6 +1718,7 @@ mod tests {
         let now = Instant::now();
         let held = |bytes: u64, ago: u64, busy: bool| Held {
             bytes,
+            known: true,
             asked: now - Duration::from_secs(ago),
             busy,
         };
@@ -1760,7 +1763,10 @@ mod tests {
 
     #[test]
     fn a_lone_worker_keeps_its_cache_past_the_soft_target() {
-        let holding = [("loading".into(), Held { bytes: 30, asked: Instant::now(), busy: false })];
+        let holding = [(
+            "loading".into(),
+            Held { bytes: 30, known: true, asked: Instant::now(), busy: false },
+        )];
         assert!(over(&holding, 16, false).is_empty());
         assert_eq!(over(&holding, 16, true), ["loading"]);
     }
@@ -1820,11 +1826,106 @@ mod tests {
     #[test]
     fn busy_worker_owns_its_pause_and_failure_while_idle_cache_can_be_reclaimed() {
         let now = Instant::now();
-        let loading = Held { bytes: 30, asked: now, busy: true };
+        let loading = Held { bytes: 30, known: true, asked: now, busy: true };
         assert!(over(&[("loading".to_owned(), loading)], 16, true).is_empty());
-        let idle = Held { bytes: 30, asked: now, busy: false };
+        let idle = Held { bytes: 30, known: true, asked: now, busy: false };
         assert_eq!(over(&[("idle".to_owned(), idle)], 16, true), ["idle"]);
-        let under = Held { bytes: 16, asked: now, busy: true };
+        let under = Held { bytes: 16, known: true, asked: now, busy: true };
         assert_eq!(over(&[("loading".to_owned(), under)], 16, true), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_eviction_preserves_unknown_workers_and_retries_changed_inputs() {
+        use hir_ty_codegen::budget::Pressure::{Critical, Normal};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn value() -> u32 { 1 }\n").unwrap();
+        let checkout: Checkout = serde_json::from_value(serde_json::json!({
+            "key": "checkout", "generation": 42, "built_at": 100,
+            "root": dir.path(), "programs": [], "sources": [source], "env": {},
+            "config": {
+                "repository": dir.path(), "project": "", "cfg_test": false, "env": {},
+                "selection": { "profile": "dev", "features": [], "no_default_features": false,
+                    "all_features": false, "packages": [], "workspace": false,
+                    "target": null, "dev_deps": false }
+            }
+        }))
+        .unwrap();
+        let worker = Arc::new(Worker {
+            project: checkout.project(),
+            socket: dir.path().join("unused.sock"),
+            log: dir.path().join("log"),
+            env: crate::process::own(),
+            child: Mutex::new(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+            checkouts: Mutex::new(FxHashMap::from_iter([(
+                checkout.key.clone(),
+                Loaded {
+                    generation: checkout.generation,
+                    root: checkout.root.clone(),
+                    request: request_key(&checkout),
+                    warmth: Warmth::Ready,
+                },
+            )])),
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            noted: AtomicBool::new(true),
+            unknown_held: AtomicBool::new(false),
+        });
+        let id = checkout.config.id();
+        let daemon = Daemon {
+            version: "test".into(),
+            home: dir.path().into(),
+            idle: None,
+            memory_max: Some(1),
+            workers: Mutex::new(FxHashMap::from_iter([(id.clone(), worker.clone())])),
+            pressure_stops: Mutex::default(),
+            spare: Mutex::default(),
+            spare_when: Spares::Never,
+            ahead: Mutex::default(),
+            spares: AtomicUsize::new(0),
+            checkers: Mutex::default(),
+            asked: Mutex::new(Instant::now()),
+        };
+        let now = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut since = None;
+        assert!(!pressure_persisted(&mut since, Some(Critical), now, grace));
+        assert!(!pressure_persisted(&mut since, None, now + grace, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 2, grace));
+        daemon.fit(1, false);
+        assert!(lock(&daemon.workers).contains_key(&id), "soft target retains the cache");
+        assert!(pressure_persisted(&mut since, Some(Critical), now + grace * 3, grace));
+        daemon.fit(1, true);
+        assert!(!lock(&daemon.workers).contains_key(&id));
+        let stopped = worker.held();
+        assert!(!stopped.known);
+        assert!(worker.unknown_held.load(Relaxed), "unreadable footprint is observable");
+        assert!(over(&[(id.clone(), stopped)], 0, true).is_empty());
+        let retry = daemon.warm(checkout.clone()).unwrap_err().to_string();
+        assert!(retry.contains("host memory pressure stopped this load"), "{retry}");
+        let mut changed = checkout.clone();
+        changed.env.insert("INPUT".into(), "changed".into());
+        let retry = daemon.warm(changed).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty(), "changed request clears tombstone");
+        let stop = PressureStop {
+            generation: 42,
+            request: request_key(&checkout),
+            most: 1,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        assert!(!stop.blocks(42, &request_key(&checkout), 1, checkout.written_since(stop.at)));
+        let mut config = checkout.config.clone();
+        config.env.insert("RA_JIT_WORKER_MEMORY".into(), "off".into());
+        assert_ne!(config.id(), id);
+        assert!(!pressure_persisted(&mut since, Some(Normal), now + grace * 4, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 5, grace));
+        assert!(!pressure_persisted(
+            &mut since,
+            Some(Critical),
+            now + grace * 6 - Duration::from_millis(1),
+            grace
+        ));
     }
 }

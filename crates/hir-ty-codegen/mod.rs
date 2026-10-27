@@ -164,6 +164,8 @@ pub enum CodegenError {
     OverBudget(String),
 }
 
+impl std::error::Error for CodegenError {}
+
 impl CodegenError {
     /// Whether rustc has no symbol of the function that ours could take the place of.
     pub fn no_symbol(&self) -> bool {
@@ -716,6 +718,13 @@ impl CodegenUnit {
                 let why = match patch {
                     Ok(Ok(patch)) => break Some(patch),
                     Ok(Err(why)) => Some(why),
+                    Err(error @ CodegenError::OverBudget(_)) => {
+                        // No new object exists. Keep the warm base and revalidate the same
+                        // edit after recovery, rather than retrying it as a full build.
+                        known.put_base(base);
+                        known.stale = stale;
+                        return Err(error);
+                    }
                     Err(_) => None,
                 };
                 // Code compiled at a higher level that a patch can't hold goes, not the
@@ -1377,8 +1386,10 @@ impl Rejections {
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
-    ) -> Option<Stale> {
-        Some(self.patched()?.stale(db, symbols, part, parts))
+    ) -> Result<Option<Stale>> {
+        let Some(base) = self.patched() else { return Ok(None) };
+        let _permit = budget::enter()?;
+        Ok(Some(base.stale(db, symbols, part, parts)))
     }
 
     /// What the next build is a patch of, if it is one.
@@ -5061,7 +5072,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(why) = self.shed.take() {
             return Err(CodegenError::OverBudget(why));
         }
+        budget::admit()?;
         self.make_later();
+        budget::admit()?;
         if Target::current().writes_wasm_objects() {
             return Ok((self.finish_wasm()?, Vec::new()));
         }
@@ -5175,6 +5188,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let _permit = budget::enter().inspect_err(|why| {
             self.shed = Some(why.to_string());
         })?;
+        budget::testing::checkpoint("define_function");
         let db = self.db;
         let stored = match self.stored_roots.get(&func) {
             Some(name) => name.clone(),
@@ -5622,25 +5636,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let mut homes = home::Homes::default();
             let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                // Admission must not hold Ahead: in-flight jobs need it to finish.
-                drop(state);
-                let failed = governor.look();
-                state = ahead.lock().unwrap_or_else(|e| e.into_inner());
-                if failed {
-                    state.stopped = true;
-                    idle.notify_all();
-                }
                 if state.stopped {
                     return;
                 }
-                // As many compile as the memory the process holds allows: the others wait for
-                // one of them to be through, and leave with them once nothing is left to do.
-                if state.working >= governor.allowed()
-                    && !(state.roots.is_empty() && state.queue.is_empty())
-                {
-                    state = idle.wait(state).unwrap_or_else(|e| e.into_inner());
-                    continue;
-                }
+                // The process-wide FIFO admission gate owns the concurrency limit.
+                // Idle threads hold no permit and do not wait for pressure to recover.
                 let job = match state.roots.pop_front() {
                     Some(root) => either::Either::Left(root),
                     None => match state.queue.pop() {
@@ -5660,6 +5660,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let _permit = match budget::enter() {
                     Ok(permit) => permit,
                     Err(_) => {
+                        governor.stop();
                         let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                         state.working -= 1;
                         state.stopped = true;
@@ -5714,10 +5715,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 drop(working);
                 drop(_permit);
-                let shed = governor.look();
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
-                if shed {
+                if governor.shed() {
                     state.stopped = true;
                 }
                 if let either::Either::Left(root) = job {
