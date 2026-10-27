@@ -278,6 +278,20 @@ def tree_hash(directory):
     return h.hexdigest()
 
 
+class Gaps(list):
+    """The differences from cargo that a scenario records and does not fail: failures when LEASEBARRIER_STRICT=1."""
+
+    def __init__(self, scenario):
+        super().__init__()
+        self.scenario = scenario
+
+    def append(self, what):
+        if os.environ.get("LEASEBARRIER_STRICT") == "1":
+            self.scenario.fail(what)
+        else:
+            super().append(what)
+
+
 class Scenario:
     def __init__(self, name, work):
         self.name, self.dir = name, os.path.join(work, name)
@@ -287,7 +301,9 @@ class Scenario:
         os.makedirs(self.ws)
         self.target = os.path.join(self.ws, "target")
         self.runs_log = os.path.join(self.dir, "runs.log")
-        self.failures, self.notes, self.timeline, self.gaps = [], {}, [], []
+        self.failures, self.notes, self.timeline = [], {}, []
+        # What differs from cargo only by `native` is a failure when LEASEBARRIER_STRICT=1 (the gap is closed), else recorded.
+        self.gaps = Gaps(self)
         self.daemons = []
 
     # -- the project and the oracle

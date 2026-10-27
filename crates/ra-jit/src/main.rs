@@ -6468,9 +6468,13 @@ impl Target {
             checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
+        // A program of the checkout the daemon was started for is built with the crates it was started
+        // with; one of another checkout (a join) is of its own crate: the daemon's crates are of
+        // another workspace, and their native libraries are not its link's.
+        let same_checkout = checkout == daemon.checkout;
         let batch = batch.unwrap_or_else(|| {
             let started_with = std::iter::once(&daemon.krate).chain(&daemon.batch);
-            started_with.filter(|&it| *it != krate).cloned().collect()
+            started_with.filter(|&it| same_checkout && *it != krate).cloned().collect()
         });
         Ok(Args {
             project,
