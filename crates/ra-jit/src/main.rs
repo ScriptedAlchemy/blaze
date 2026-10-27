@@ -4603,8 +4603,10 @@ fn build(
         unset: unset_in(db, &local),
         unwritten,
     };
-    // A patch is of the last full build and replaces nothing the next edit is built from.
-    if !undoable || known.stats.patched.is_some() {
+    // An edit may need another build after checking tiered code. Keep even a complete
+    // patch unpublished until that decision finishes: a failed retry must leave the
+    // last published object, patch and executable together.
+    if !undoable {
         build.keep(known)?;
     }
     if let Some(path) = &args.report {
@@ -5229,12 +5231,12 @@ fn can_call(binary: &Path, name: &str) -> bool {
     }
 }
 
-/// A symbol the patch at `patch` refers to that the executable at `binary` does not give it;
+/// A symbol the uncommitted patch refers to that the executable does not give it;
 /// none while the executable is being read, which a splice then says.
-fn missing_in(binary: &Path, patch: &Path) -> Option<String> {
+fn missing_in(binary: &Path, patch: &[u8]) -> Option<String> {
     let linked = lock(&LINKED);
     let Some(Executable::Read(baseline)) = linked.get(binary) else { return None };
-    baseline.missing_in(&std::fs::read(patch).ok()?)
+    baseline.missing_in(patch)
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -5472,6 +5474,26 @@ impl std::fmt::Display for Refused {
             Refused::Cargos(why) => f.write_str(why),
             Refused::Pressure(why) => f.write_str(why),
         }
+    }
+}
+
+/// Every build attempt in an edit, including retries for tiered code, has this boundary.
+/// Preserve typed host-pressure failures without terminating the worker or asking Cargo.
+/// This preserves published files; retaining an in-memory base is the patch path's rule,
+/// not a guarantee for a full rebuild that has already discarded its old base.
+fn recover_pressure<T>(
+    built: anyhow::Result<T>,
+    unbuilt: &mut Unbuilt,
+) -> anyhow::Result<Result<T, Refused>> {
+    match built {
+        Err(why)
+            if matches!(why.downcast_ref::<CodegenError>(), Some(CodegenError::OverBudget(_))) =>
+        {
+            eprintln!("pressure: edit not published; last published files retained: {why:#}");
+            unbuilt.stale = true;
+            Ok(Err(Refused::Pressure(format!("{why:#}"))))
+        }
+        other => other.map(Ok),
     }
 }
 
@@ -9679,18 +9701,9 @@ impl Program {
             eprintln!("edit-to-binary: {:.1?}", start.elapsed());
             why
         };
-        let warm = match warm {
-            Err(why)
-                if matches!(
-                    why.downcast_ref::<CodegenError>(),
-                    Some(CodegenError::OverBudget(_))
-                ) =>
-            {
-                eprintln!("pressure: edit not published; last build retained: {why}");
-                unbuilt.stale = true;
-                return Ok(Err(Refused::Pressure(why.to_string())));
-            }
-            other => other?,
+        let warm = match recover_pressure(warm, unbuilt)? {
+            Ok(warm) => warm,
+            Err(pressure) => return Ok(Err(pressure)),
         };
         let Some(mut warm) = warm else { return Ok(Err(held(known))) };
         // Code compiled at a higher level can call what rustc built into its callers and left
@@ -9699,23 +9712,29 @@ impl Program {
         // together, the others are installed again one by one, a build each.
         loop {
             let missing = match (&args.splice, &args.patch) {
-                (Some(binary), Some(patch)) if known.stats.patched.is_some() => {
-                    missing_in(binary, patch)
-                }
+                (Some(binary), Some(patch)) if known.stats.patched.is_some() => warm
+                    .unwritten
+                    .iter()
+                    .find(|(path, _)| path == patch)
+                    .and_then(|(_, bytes)| missing_in(binary, bytes)),
                 _ => None,
             };
             let again = match missing {
                 Some(missing) => known.tiers.refuse(&format!(
                     "no patch can hold its code: {missing} is not in the executable"
                 )),
-                None => known.tiers.held(),
+                None => known.tiers.held() || hir_ty_codegen::budget::testing::tier_retry(),
             };
             if !again {
                 break;
             }
-            match build(db, table, args, known, listed, Some(&hold))? {
-                Some(again) => warm = again,
-                None => return Ok(Err(held(known))),
+            hir_ty_codegen::budget::testing::checkpoint("tier_rebuild");
+            let retry =
+                recover_pressure(build(db, table, args, known, listed, Some(&hold)), unbuilt)?;
+            match retry {
+                Err(pressure) => return Ok(Err(pressure)),
+                Ok(Some(again)) => warm = again,
+                Ok(None) => return Ok(Err(held(known))),
             }
         }
         let full = known.stats.patched.is_none();
@@ -9949,6 +9968,52 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("patch.o");
+        std::fs::write(&patch, b"last published patch").unwrap();
+        let candidate = || Build {
+            compiled: 1,
+            skipped: Vec::new(),
+            instances: 0,
+            codegen: Duration::ZERO,
+            emit: Duration::ZERO,
+            steps: [Duration::ZERO; 3],
+            looked: Default::default(),
+            unset: None,
+            unwritten: vec![(patch.clone(), b"new complete patch".to_vec())],
+        };
+        let mut unbuilt = Unbuilt::default();
+        let first = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("first attempt failed"))
+            .unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let error = anyhow::Error::new(CodegenError::OverBudget("host memory pressure".into()))
+            .context("second tier build");
+        let second: Result<Option<Build>, Refused> =
+            recover_pressure(Err(error), &mut unbuilt).unwrap();
+        let reply = match second {
+            Err(why) => why.reply(),
+            Ok(_) => panic!("second build did not fail"),
+        };
+        assert!(reply.starts_with("error: second tier build: "));
+        assert!(reply.contains("host memory pressure"));
+        assert!(unbuilt.stale);
+        drop(first);
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let mut retry = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("recovery failed"))
+            .unwrap();
+        retry.keep(&mut Rejections::default()).unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"new complete patch");
+        let unrelated =
+            recover_pressure::<()>(Err(anyhow::anyhow!("ordinary error")), &mut unbuilt);
+        assert_eq!(unrelated.err().unwrap().to_string(), "ordinary error");
+    }
+
     #[test]
     fn pressure_reply_is_a_transient_error_not_a_cargo_request() {
         let reply = super::Refused::Pressure("host memory pressure".into()).reply();

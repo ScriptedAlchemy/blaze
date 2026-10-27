@@ -423,6 +423,12 @@ pub mod testing {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+
+    /// Exercise the existing edit retry branch without requiring emitted LLVM code.
+    /// Consumed once, and entirely inert without the explicit pressure-test directory.
+    pub fn tier_retry() -> bool {
+        DIRECTORY.as_ref().is_some_and(|dir| std::fs::remove_file(dir.join("tier_retry")).is_ok())
+    }
 }
 
 pub(super) fn allowed(held: u64, most: u64, threads: usize) -> usize {

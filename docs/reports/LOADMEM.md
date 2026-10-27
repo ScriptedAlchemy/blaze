@@ -429,6 +429,19 @@ Cargo request, and keeps the last published files for a same-daemon retry. Publi
 pressure again at object finalization. The bounded harness exercises relief within the grace
 and a persistent-pressure failure followed by recovery of the unchanged edit.
 
+The base-retention rule above is specific to patch compilation. A declined patch's full
+rebuild can have discarded its in-memory base before a pressure failure; its retry may
+correctly rebuild in full. Retaining the last published files and worker does not mean the
+full-build path restores all earlier memos or tier state.
+
+The edit's initial build and every tier-induced retry use the same typed pressure boundary.
+All candidate edit files, including completed patches, remain unpublished until the tier
+decision finishes. Missing-symbol checks inspect candidate patch bytes, not the preceding
+published patch. `harness/tier_pressure_retry.py` targets the second-build branch: a
+`tier_retry` file in the explicit test directory is consumed once to exercise that existing
+branch without emitted LLVM code; `hold` containing `tier_rebuild` pauses before the retry.
+This is pressure/publication coverage, not an LLVM tier-execution test.
+
 **Measured**, 2026-10-27, runtime source `ab96113f`, macOS AArch64, Rust 1.99.0,
 Cranelift, n=1: the bounded warm-daemon sequence passes. Critical pressure blocks new
 entries while an admitted definition finishes. Object, patch and executable hashes stay
