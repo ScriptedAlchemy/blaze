@@ -907,11 +907,38 @@ Three blockers that were named, closed in small steps with cargo as the oracle.
 `first-join`, `join`, `once`, `choice-stable`, `first-join-private`, `reload-busy` and `lost-wake` pass on the fixed binary in their batches.
 Component: `apply_flags` (cfg both forms, debug-assertions values, what is named and does not eat the next flag), the one-line failure round trip.
 
+### The inputs of a link are its identity (adapted from the prepared `repair/pr12-native-inputs`)
+
+A warm worker took a script's native output to be unchanged when its directives, the Rust crates and the sizes were: a library renamed
+for a value (`link-strict`), or an archive of the same name and path whose bytes changed (`archive-strict`, `native-only`), was patched or
+spliced and the program kept the old one, and the harness recorded it as a gap. Worse than `native=97` for 98: in `link-strict` the second build
+printed `include=a env=a cfg=a` for `GEN=b` (the objects were built, the executable was not linked).
+`native_inputs.rs` keeps, for each executable a whole build links, the identity of its last successful link: a digest of the link line
+(the real `link::command`) and of the content of each file it can name, in each search directory (the scripts' `OUT_DIR`s, `-L`, `LIBRARY_PATH`),
+absent ones too (an earlier candidate appearing changes the link), with symlinks and directories followed and cycles refused. A change, looked at
+before the no-op paths of a request (`native_inputs::stale`, `invalidate`) and again as the program is built (`begin`), forgets the base and the splice and
+links in full; the identity is published only by a link that succeeded (`commit`, not for a deferred or compile-only one) and whose inputs held while it ran,
+and the old one is removed when a link begins, so A, B, a failed link, A is not taken for reuse. A closure that cannot be said (a response file, an unreadable
+path, a crate not loaded) links in full and refuses nothing. The link line is regenerated from the current directives before every link. Credit and
+provenance: the identity, the pending-then-commit and the tests are those of `.github/repairs/pr12/native_inputs.rs` of `repair/pr12-native-inputs`
+(7fc32028), read through Git and never applied (its `apply.py` checks blobs of an old main, and that branch's CI failed before testing it); the collection no
+longer fails the request, a never-linked program is not stale, and the call sites are this head's. Cost: the files named by a link are read at each request.
+
+| Linux, one warm worker | baseline `9f5aac12` | fixed |
+|---|---|---|
+| `native-only`: only the archive's bytes change, 97, 98, 97; a corrupt archive; its restoration with size and time kept; a no-op | 98 build prints 97; the corrupt archive is accepted as an unchanged success | each build = cargo's, the corrupt archive fails, the restored one links, the no-op neither relinks nor runs the script |
+| `link-strict`: a library named for the value, a, b, a | `GEN=b` prints `include=a env=a cfg=a native=97` | every build = cargo's |
+| `archive-strict`: one name, contents a, c, a | `GEN=c` prints `native=97` (cargo 99) | every build = cargo's |
+
+On the fixed binary: `once`, `join`, `first-join`, `choice-stable`, `hostflags`, `internal`, `generation`, `overlay`, `lost-wake`, `reload-busy` pass; `worlds` and
+`groups` timed out at 120 s on a host at load 50 (a first-load of 190 s) and pass with the timeout at 400 s; `coab` timed out at 400 s and at 1200 s on that host (a nested compile of a build script held 15 cores for 17 minutes) and passes, as it did at
+`4ae2a363` in the same session, when the host load was 8-15. These timeouts are infrastructure (the Mac was at load 40-55 from other work), kept as failed attempts. Component: the module's seven tests (search directory does not hash the link's outputs; an earlier candidate appearing; opaque response file; same size
+and time, other bytes; deletion, recreation, directive-only; failed or changed links do not commit; symlinks and cycles).
+
 ### What is not shown, not fixed, or wider
 
-- **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
-  the old archive's. It is recorded as a gap by the harness. **Not fixed: a named blocker** (a cloud candidate
-  for it is separate and was not incorporated).
+- **A warm worker's native link (closed for the cases in "The inputs of a link are its identity")**; one gap remains in `first-join`
+  (an independent S printed `native=97` against cargo's 98: not understood, recorded, not waived).
 - **Host flags (partly closed, see "The flags for rustc of a script's compile"):** `--cfg` and `-C debug-assertions` of the flags
   a script's compile gets are applied and an explicit `--target <host>` is cargo's cross build; the other flags (codegen options,
   lints, search paths) are named on stderr and **not** applied.
