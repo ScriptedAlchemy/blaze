@@ -2584,6 +2584,9 @@ impl Checkouts {
             // variables of the process that asked for it.
             let build = std::env::var(cargo::daemon::LOAD_BUILD).ok();
             let build = build.and_then(|it| it.parse().ok()).unwrap_or(0);
+            // A load that no daemon's build started has the scripts' output for its own, until
+            // its first program is compiled and linked (`ra-jit --exe`, a worker run by hand).
+            let build = if build == 0 { scripts::load_build() } else { build };
             let load_env = scripts::load_env();
             let (workspace, told, own) = workspace_at(
                 project,
@@ -6446,22 +6449,42 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
-    /// The build of the daemon's the request is for, `0` when it says none: a build is one
-    /// request to the daemon and may be several to a worker.
+    /// The build of the daemon's the request is for: a build is one request to the daemon and
+    /// may be several to a worker. A request that names none has a number of its own
+    /// ([`Client::of`]), which it holds the output of the scripts under until it is dropped.
     build: u64,
+    /// Whether `build` is the request's own, and ends with it.
+    own_build: bool,
 }
 
 impl Client {
+    /// A client of the build `build`, or when that is `0` of one of its own.
+    fn of(stream: UnixStream, env: ide_db::base_db::Env, build: u64) -> Client {
+        match build {
+            0 => Client { stream, env, build: scripts::anonymous(), own_build: true },
+            build => Client { stream, env, build, own_build: false },
+        }
+    }
+
     /// A client that hears nothing: the one a build the daemon asks for itself answers.
     #[cfg(unix)]
     fn nobody() -> Option<Client> {
         let (stream, _) = UnixStream::pair().ok()?;
-        Some(Client { stream, env: ide_db::base_db::Env::default(), build: 0 })
+        Some(Client::of(stream, ide_db::base_db::Env::default(), 0))
     }
 
     #[cfg(not(unix))]
     fn nobody() -> Option<Client> {
         None
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // The request is over, answered or not: what it read of the scripts' output is free.
+        if self.own_build {
+            scripts::release(self.build);
+        }
     }
 }
 
@@ -6764,6 +6787,11 @@ struct Builds {
     waiting: std::collections::VecDeque<Asked>,
     /// Whether the requests that wait can only be built once something else happens.
     stuck: bool,
+    /// The [`scripts::generation`] when the first request was put off for a script's output
+    /// that another build holds, while the requests that wait are asked again: the worker does
+    /// not sleep through a generation that has moved since, however the event that moved it
+    /// was taken.
+    busy_since: Option<u64>,
     /// The edits that wait, the newest of each file: one typed over before it was built is
     /// answered as superseded.
     edits: Vec<Edited>,
@@ -6783,6 +6811,12 @@ struct Builds {
 }
 
 impl Builds {
+    /// A request is put off for a script's output that another build holds, and asks again
+    /// once [`scripts::generation`] is not `generation` any more.
+    fn put_off(&mut self, generation: u64) {
+        self.busy_since = Some(self.busy_since.map_or(generation, |it| it.min(generation)));
+    }
+
     /// Gives the programs that are not being built what was compiled of them at a higher
     /// level, and has each patched with it.
     fn install_tiered(&mut self, programs: &mut [Program]) {
@@ -7090,7 +7124,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
         let (env, build) = process::decode_request(&env);
-        let client = Client { stream, env, build };
+        let client = Client::of(stream, env, build);
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
@@ -7099,7 +7133,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
         && (fields.len() == 1 || target.is_some())
     {
         let (env, build) = process::decode_request(&env);
-        let client = Client { stream, env, build };
+        let client = Client::of(stream, env, build);
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -8248,6 +8282,13 @@ fn run_holding(
             if let Some((cmd, exe)) = own_link_line(&db, &args)? {
                 (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
             }
+            // The scripts of the load are judged, and its program is compiled and linked next:
+            // that is what the build that started this process holds their output for.
+            let loaded_for = std::env::var(cargo::daemon::LOAD_BUILD)
+                .ok()
+                .and_then(|it| it.parse().ok())
+                .unwrap_or_else(scripts::load_build);
+            scripts::barrier::hold("consume", loaded_for);
             let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
             // An `include!` in a body is first seen when the body is compiled.
             if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -8291,6 +8332,9 @@ fn run_holding(
                     write_inputs(&db, &args, tree.vfs(), exe, path)?;
                 }
             }
+            // The first program is compiled and linked: a process no daemon's build started
+            // holds the scripts' output no more.
+            scripts::release_load();
             Some(cold)
         }
     };
@@ -8348,6 +8392,13 @@ fn run_holding(
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
+    if serving {
+        // A request that is put off for a script's output another build holds is asked again
+        // when it is free: a build's end, an admission let go, or a file freed wakes the loop.
+        scripts::set_deferrable(true);
+        let wake = sender.clone();
+        scripts::set_waker(move || _ = wake.send(Event::Retired));
+    }
     if let Some(served) = listener {
         let sender = sender.clone();
         // Each connection is read by a thread of its own: one that sends nothing, or
@@ -8401,6 +8452,7 @@ fn run_holding(
         running: FxHashMap::default(),
         waiting: Default::default(),
         stuck: false,
+        busy_since: None,
         edits: Vec::new(),
         tier_asks: Vec::new(),
         tiered: Vec::new(),
@@ -8505,6 +8557,8 @@ fn run_holding(
                 if !builds.over_budget.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
                 }
+                // Every request that waits is asked now: one that is still put off says so.
+                builds.busy_since = None;
                 loop {
                     // Asked again after each: a checkout that joins takes long enough for the
                     // requests sent with its own to arrive.
@@ -8535,6 +8589,9 @@ fn run_holding(
                     // taken for this turn are of the checkout as it was.
                     let project = target.as_ref().and_then(|it| it.project.as_ref());
                     let project = project.unwrap_or(&programs[0].args.project);
+                    // Read before anything is asked of the scripts, so that what moves while
+                    // they are is seen by the worker before it sleeps.
+                    let generation = scripts::generation();
                     match checkouts.stale(project, &stream.env, stream.build) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
@@ -8580,6 +8637,19 @@ fn run_holding(
                             listed.touch(&db, Some(&new));
                             lock(&as_built).clear();
                             if let Err(error) = reloaded.and(started) {
+                                // A script that another build holds is waited for here too:
+                                // the load failed before it changed any checkout.
+                                if error.downcast_ref::<scripts::Busy>().is_some() {
+                                    scripts::barrier::event(
+                                        "put-off",
+                                        stream.build,
+                                        &format!("reload: {error}"),
+                                    );
+                                    builds.put_off(generation);
+                                    scripts::barrier::hold("deferred", stream.build);
+                                    later.push((request, asked, stream));
+                                    continue;
+                                }
                                 let _ = writeln!(&stream, "failed: {error:#}");
                                 continue;
                             }
@@ -8588,6 +8658,8 @@ fn run_holding(
                         // is to run: it is asked for again once that build is retired.
                         Err(error) if error.downcast_ref::<scripts::Busy>().is_some() => {
                             scripts::barrier::event("put-off", stream.build, &format!("{error}"));
+                            builds.put_off(generation);
+                            scripts::barrier::hold("deferred", stream.build);
                             later.push((request, asked, stream));
                             continue;
                         }
@@ -8902,8 +8974,7 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client =
-                                Client { stream, env: edited.client.env.clone(), build: 0 };
+                            let client = Client::of(stream, edited.client.env.clone(), 0);
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
@@ -8922,7 +8993,9 @@ fn run_holding(
                     clients.push((at, (Request::Sync, target, client)));
                 }
                 // What waited for the build that was interrupted is asked again at once.
-                builds.stuck = clients.is_empty() && !interrupt;
+                // Not asleep when a build that held what a request waits for ended meanwhile.
+                let moved = builds.busy_since.is_some_and(|it| it != scripts::generation());
+                builds.stuck = clients.is_empty() && !interrupt && !moved;
                 if clients.is_empty() {
                     continue;
                 }
@@ -9296,10 +9369,14 @@ fn run_holding(
                     tests_now: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
-                // The builds whose scripts this program is compiled and linked from.
+                // The builds whose scripts this program is compiled and linked from, and the
+                // clients that judged none of them (an edit, a rebuild nobody asked for), which
+                // hold the output the process last judged for as long as they live.
                 let mut consumes: Vec<u64> = clients.iter().map(|it| it.2.build).collect();
                 consumes.sort();
                 consumes.dedup();
+                let judged_none: Vec<u64> =
+                    clients.iter().filter(|it| it.2.own_build).map(|it| it.2.build).collect();
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
@@ -9328,6 +9405,17 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    for build in judged_none {
+                        match scripts::hold_loaded(build) {
+                            Ok(0) => {}
+                            Ok(held) => scripts::barrier::event(
+                                "holds",
+                                build,
+                                &format!("loaded scripts={held}"),
+                            ),
+                            Err(why) => eprintln!("build scripts: the output is not held: {why}"),
+                        }
+                    }
                     for build in consumes {
                         scripts::barrier::hold("consume", build);
                     }

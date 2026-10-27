@@ -239,7 +239,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         };
         runner.done.insert(
             (package, for_host),
-            Ok(std::rc::Rc::new(Done {
+            Ok(Arc::new(Done {
                 out_dir: unit.out_dir.clone(),
                 output,
                 fingerprint: 0,
@@ -361,7 +361,7 @@ impl Fixture {
         build: u64,
         gen_: &str,
         extra: &[(&str, &str)],
-    ) -> Result<std::rc::Rc<Done>, Attempt> {
+    ) -> Result<Arc<Done>, Attempt> {
         let mut env = BTreeMap::from([
             (
                 "CARGO_HOME".to_owned(),
@@ -382,31 +382,46 @@ impl Fixture {
             target: HOST,
             packages: Some(&packages),
         };
-        let base: &Path = self.cargo.target_directory().as_ref();
-        let _held = lock::acquire(&base.join(DIR)).unwrap();
         let mut runner =
             Runner::new(leases, &self.cargo, &asked, self.sysroot.clone(), &self.cfg).unwrap();
-        let profile = runner.profile(self.package, UnitFor::new_normal(), &runner.kind(false));
+        let unit_for = UnitFor::new_normal();
+        let profile = runner.profile(self.package, unit_for, &runner.kind(false));
         let script = self.root.join("script.sh");
-        let unit = runner.unit(self.package, false, &profile, script.clone(), Vec::new()).unwrap();
         let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
-        match runner.judge(self.package, unit, (1, made), &[]) {
-            Ok(done) => Ok(std::rc::Rc::new(done)),
-            Err(why) => Err(Attempt::of(runner.busy.take(), why)),
+        let said = (|| {
+            // As `Runner::make` starts: what the build judged already, else the admission.
+            if let Some(judged) = runner.begin(self.package, false, &profile)? {
+                return Ok(judged);
+            }
+            let unit =
+                runner.unit(self.package, false, &profile, script.clone(), Vec::new()).unwrap();
+            runner.judge(self.package, unit, (1, made), &[])
+        })();
+        // As `attempt` ends: the admission is let go unless the build waits.
+        match said {
+            Ok(done) => {
+                leases.release_admission(build);
+                Ok(done)
+            }
+            Err(why) => {
+                let attempt = Attempt::of(runner.busy.take(), why);
+                if !matches!(attempt, Attempt::Busy(_)) {
+                    leases.release_admission(build);
+                }
+                Err(attempt)
+            }
         }
     }
 }
 
 /// The messages of an attempt that did not end: the build that holds the output, or the failure.
 #[cfg(unix)]
-fn why(attempt: Result<std::rc::Rc<Done>, Attempt>) -> Result<String, String> {
+fn why(attempt: Result<Arc<Done>, Attempt>) -> Result<String, String> {
     match attempt {
         Ok(_) => Ok("ran".to_owned()),
-        Err(Attempt::Waits(dir)) => Err(format!("waits {}", dir.display())),
-        Err(Attempt::Failed(error)) => match error.downcast_ref::<Busy>() {
-            Some(Busy::Process { build, .. }) => Err(format!("busy {build}")),
-            _ => Err(format!("{error:#}")),
-        },
+        Err(Attempt::Busy(Busy::Process { build, .. })) => Err(format!("busy {build}")),
+        Err(Attempt::Busy(Busy::Elsewhere { path })) => Err(format!("waits {}", path.display())),
+        Err(Attempt::Failed(error)) => Err(format!("{error:#}")),
     }
 }
 
@@ -486,7 +501,10 @@ fn a_judgment_that_stands_is_not_taken_for_the_output_another_worker_wrote_after
     assert_eq!((pkg.generated(&a), pkg.runs()), ("a".to_owned(), vec!["a".to_owned()]));
     // The other worker's build has another value of a variable the script watches, so it must
     // run the script, and cannot while the first worker's build reads the output.
-    assert!(matches!(pkg.request(&second, 9, "b", &[]), Err(Attempt::Waits(_))));
+    assert!(matches!(
+        pkg.request(&second, 9, "b", &[]),
+        Err(Attempt::Busy(Busy::Elsewhere { .. }))
+    ));
     assert_eq!((pkg.generated(&a), pkg.runs()), ("a".to_owned(), vec!["a".to_owned()]));
     // The first build's next request is the same judgment, over the same output.
     let again = pkg.request(&first, 1, "a", &[]).unwrap();
@@ -496,7 +514,7 @@ fn a_judgment_that_stands_is_not_taken_for_the_output_another_worker_wrote_after
     first.retire(1);
     let b = pkg.request(&second, 9, "b", &[]).unwrap();
     assert_eq!((pkg.generated(&b), pkg.runs().len()), ("b".to_owned(), 2));
-    assert!(matches!(pkg.request(&first, 1, "a", &[]), Err(Attempt::Waits(_))));
+    assert!(matches!(pkg.request(&first, 1, "a", &[]), Err(Attempt::Busy(Busy::Elsewhere { .. }))));
     assert_eq!(pkg.generated(&b), "b");
     second.retire(9);
     let a_again = pkg.request(&first, 1, "a", &[]).unwrap();
@@ -519,9 +537,9 @@ fn builds_that_find_the_script_fresh_read_its_output_together() {
     assert_eq!((pkg.generated(&b), pkg.runs().len()), ("a".to_owned(), 1));
     // A build that must run it waits for both.
     let third = Leases::default();
-    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Waits(_))));
+    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Busy(Busy::Elsewhere { .. }))));
     first.retire(1);
-    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Waits(_))));
+    assert!(matches!(pkg.request(&third, 3, "c", &[]), Err(Attempt::Busy(Busy::Elsewhere { .. }))));
     second.retire(2);
     let c = pkg.request(&third, 3, "c", &[]).unwrap();
     assert_eq!((pkg.generated(&c), pkg.runs().len()), ("c".to_owned(), 2));
@@ -539,7 +557,7 @@ fn the_second_worker_of_the_barrier_test() {
     let leases = Leases::default();
     std::fs::write(base.join("b-asks"), "").unwrap();
     // As `run` asks: put off for a worker's build, and asked again once it is over.
-    let done = retrying(|| pkg.request(&leases, 7, "b", &[("ALWAYS", "1")])).unwrap();
+    let done = retrying(false, || pkg.request(&leases, 7, "b", &[("ALWAYS", "1")])).unwrap();
     std::fs::write(base.join("b-ran"), pkg.generated(&done)).unwrap();
     assert_eq!(done.output.cfgs, ["gen_b"]);
     assert_eq!(done.output.library_links, ["static=gen_b"]);

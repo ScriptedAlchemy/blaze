@@ -753,18 +753,30 @@ impl Worker {
         }
     }
 
-    /// Tells the process that the daemon's `build` is over, once the client has its answer:
-    /// the output of the build scripts that the build held is free to be written again.
-    /// A process that does not hear it holds that output until it ends, as with the daemon.
+    /// Tells the process that the daemon's `build` is over: every request of it has been answered
+    /// by the worker, which answers once it has compiled and linked, so nothing of the build
+    /// reads the output of the build scripts any more, and it is free to be written again. It is
+    /// asked until the process hears it or ends: a process that is loading the workspace listens
+    /// only when it has, and one that never heard would hold the build's leases until it ended.
     fn retire(&self, build: u64) {
         if build == 0 {
             return;
         }
-        let Ok(mut stream) = socket::connect(&self.socket) else { return };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.write_all(format!("retire\t{build}\n\n").as_bytes());
-        let mut reply = String::new();
-        let _ = BufReader::new(stream).read_line(&mut reply);
+        loop {
+            if self.ended().is_some() {
+                return;
+            }
+            if let Ok(mut stream) = socket::connect(&self.socket) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.write_all(format!("retire\t{build}\n\n").as_bytes());
+                let mut reply = String::new();
+                let _ = BufReader::new(stream).read_line(&mut reply);
+                if reply.starts_with("ok") {
+                    return;
+                }
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     /// Brings the programs of `checkout` up to date for the daemon's `build`, all at once: the
@@ -1260,8 +1272,8 @@ impl Daemon {
                 // The build ends with its answer: what its scripts wrote is no longer read.
                 let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
                 if let Some(worker) = worker {
-                    // After the answer, and not before it: a worker that is slow to hear it
-                    // delays no client.
+                    // From a thread of its own, once every request of the build is answered:
+                    // a worker that is slow to hear it delays no client.
                     std::thread::spawn(move || worker.retire(build));
                 }
                 reply

@@ -3,7 +3,8 @@
 blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of a script").
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
-scenarios: same-worker, cross-worker, failure, link-control, archive-control     (all, by default)
+scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, link-control,
+           archive-control     (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -30,6 +31,17 @@ failure       One worker, one build with two programs whose script fails: the sa
 link-control  Not about leases, no concurrency: GEN=a then GEN=b, a static library named for the
               value. Whether a warm worker links the program with the library the script now
               names. What differs from cargo is recorded as a gap.
+lost-wake     One worker. A is answered and its retire is held at the worker; B asks and is put off,
+              and the worker is held between the put-off and the queue (`deferred`). A's retire is
+              let go there, so that the wake it makes is taken before B is queued. B has to be
+              built with no other request to wake the worker.
+reload-busy   One worker. A is answered, its retire held. A forced `[env] GEN` in the cargo
+              configuration makes B's request a reload of the workspace, which runs the script A
+              reads the output of: B is put off, not failed, and built after the retire.
+direct        Two direct runs (`ra-jit <project> --crate .. --exe ..`, no daemon, build 0) of one
+              project and target directory. A is held after its scripts and before its compile
+              and link; B, with another `GEN`, has to wait for A's process, not to rewrite the
+              output A is to read.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -143,7 +155,7 @@ class Scenario:
         self.daemons = []
 
     # -- the project and the oracle
-    def project(self, ws=None):
+    def project(self, ws=None, config=None):
         ws = ws or self.ws
         os.makedirs(os.path.join(ws, "src"), exist_ok=True)
         for name, text in {"Cargo.toml": MANIFEST, "build.rs": BUILD_RS.replace("@LOG@", self.runs_log),
@@ -151,15 +163,19 @@ class Scenario:
                            "src/two.rs": PROGRAM.replace("@NAME@", "gen-two")}.items():
             with open(os.path.join(ws, name), "w") as f:
                 f.write(text)
+        if config is not None:
+            os.makedirs(os.path.join(ws, ".cargo"), exist_ok=True)
+            with open(os.path.join(ws, ".cargo", "config.toml"), "w") as f:
+                f.write(config)
         open(self.runs_log, "w").close()
         subprocess.run(["cargo", "generate-lockfile"], cwd=ws, env=self.env("x"), capture_output=True, check=True)
 
-    def oracle(self, gen_, extra=None):
+    def oracle(self, gen_, extra=None, config=None):
         """What cargo's build gives for `GEN=gen_`: the output each program must have."""
         ws = os.path.join(self.dir, "oracle-ws")
         shutil.rmtree(ws, ignore_errors=True)
         saved, self.runs_log = self.runs_log, os.path.join(self.dir, "oracle-runs.log")
-        self.project(ws)
+        self.project(ws, config)
         self.runs_log = saved
         env = dict(self.env("oracle"), GEN=gen_, CARGO_TARGET_DIR=os.path.join(self.dir, "oracle-target"), **(extra or {}))
         env.pop("RA_JIT_WHOLE_BUILD", None)
@@ -233,10 +249,10 @@ class Scenario:
                 return f.read()
         return ""
 
-    def events(self, home):
+    def events(self, home, text=None):
         """The `script-lease:` lines of a worker's log: (what, build, at_us, rest)."""
         found = []
-        for line in self.log_of(home).splitlines():
+        for line in (self.log_of(home) if text is None else text).splitlines():
             m = re.match(r"script-lease: (\S+) build=(\d+) pid=(\d+) at_us=(\d+) ?(.*)", line)
             if m:
                 found.append((m[1], int(m[2]), int(m[3]), int(m[4]), m[5]))
@@ -516,6 +532,139 @@ def failure(sc, source_sha):
     sc.timeouts()
 
 
+LOST = float(os.environ.get("LEASEBARRIER_LOST", "120"))
+CONFIG_B = '[env]\nGEN = { value = "b", force = true }\n'
+
+
+def settled_a(sc, extra):
+    """A (GEN=a) built and answered, its retire held at the worker: the window in which A's
+    build is over for its client and the worker has not heard it."""
+    sc.project()
+    sc.arm("a", "retire")
+    A = sc.client("a", GEN="a", **extra)
+    sc.finish(A, "A")
+    if A.returncode != 0:
+        sc.fail(f"A's build exited {A.returncode}: {A.err[-600:]}")
+        return None
+    ba = sc.reached("a", "retire")
+    return (A, ba) if ba is not None else None
+
+
+def lost_wake(sc, source_sha):
+    extra = {"GEN_ARCHIVE": "same"}
+    exp_b = sc.oracle("b", extra)
+    held = settled_a(sc, extra)
+    if held is None:
+        return
+    A, ba = held
+    sc.arm("a", "deferred")
+    B = sc.client("a", GEN="b", **extra)
+    bb = sc.reached("a", "deferred", B)
+    if bb is None:
+        sc.finish(B, "B", 5)
+        return
+    sc.notes["b-put-off"] = sc.wait_event("a", "put-off", bb, within=30)
+    # A's retirement arrives while the worker is held between B's put-off and its queue.
+    sc.release("a", "retire", ba)
+    sc.wait_event("a", "retired", ba, within=30)
+    sc.disarm("a", "deferred")
+    sc.release("a", "deferred", bb)
+    sc.finish(B, "B", within=LOST)
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode} (a request nothing woke is killed, not ended): {B.err[-600:]}")
+        return
+    sc.check_programs("B", {}, exp_b, "b", gap_native=ord("a"))
+    if sc.runs() != ["a", "b"]:
+        sc.fail(f"the script ran {sc.runs()}, once for each build, 'a' then 'b'")
+    sc.timeouts()
+
+
+def reload_busy(sc, source_sha):
+    extra = {"GEN_ARCHIVE": "same"}
+    exp_b = sc.oracle("b", extra, config=CONFIG_B)
+    held = settled_a(sc, extra)
+    if held is None:
+        return
+    A, ba = held
+    # The configuration forces GEN=b, whatever the process says: the workspace is loaded again
+    # for B's request, and its script is to run again over the output A reads.
+    os.makedirs(os.path.join(sc.ws, ".cargo"), exist_ok=True)
+    with open(os.path.join(sc.ws, ".cargo", "config.toml"), "w") as f:
+        f.write(CONFIG_B)
+    held_hash = tree_hash(sc.run_dir())
+    B = sc.client("a", GEN="a", **extra)
+    put = sc.wait_event("a", "put-off", within=60)
+    sc.notes["b-put-off"] = put
+    if put and "reload:" not in put[4]:
+        sc.fail(f"B was put off by the stale check, not by a reload: {put[4]}")
+    sc.unchanged(held_hash, "B asking for a reload while A is not retired", B)
+    if B.poll() is not None:
+        sc.fail(f"B's client ended ({B.returncode}) before A was retired: {B.communicate()[1][-400:]}")
+    sc.release("a", "retire", ba)
+    sc.disarm("a", "retire")
+    sc.finish(B, "B", within=LOST)
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+        return
+    sc.check_programs("B", {}, exp_b, "b", gap_native=ord("a"))
+    if sc.runs() != ["a", "b"]:
+        sc.fail(f"the script ran {sc.runs()}, once for each build, 'a' then 'b'")
+    sc.timeouts()
+
+
+def direct(sc, source_sha):
+    extra = {"GEN_ARCHIVE": "same"}
+    exp_a, exp_b = sc.oracle("a", extra), sc.oracle("b", extra)
+    sc.project()
+
+    def run(tag, gen_, home):
+        env = sc.env(home, dict(GEN=gen_, **extra))
+        env.pop("RA_JIT_WHOLE_BUILD", None)
+        exe, obj = os.path.join(sc.dir, f"{tag}.bin"), os.path.join(sc.dir, f"{tag}.o")
+        err = open(os.path.join(sc.dir, f"direct-{tag}.err"), "w")
+        p = subprocess.Popen([RA_JIT, sc.ws, "--crate", "gen_one", "--out", obj, "--exe", exe],
+                             cwd=sc.ws, env=env, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
+        p.exe, p.errfile, p.started = exe, err.name, time.time_ns() // 1000
+        return p
+
+    sc.arm("a", "consume")
+    A = run("A", "a", "a")
+    ba = sc.reached("a", "consume", A)
+    if ba is None:
+        A.kill()
+        return
+    sc.disarm("a", "consume")
+    held = tree_hash(sc.run_dir())
+    B = run("B", "b", "b")
+    sc.unchanged(held, "B (direct) asking while A (direct) is held before its compile and link", B)
+    if B.poll() is not None:
+        sc.fail(f"B ended ({B.returncode}) while A was held")
+    sc.release("a", "consume", ba)
+    for tag, p in (("A", A), ("B", B)):
+        try:
+            p.wait(timeout=WAIT)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            sc.fail(f"{tag} (direct) did not end in {WAIT:.0f}s")
+        sc.timeline.append((time.time_ns() // 1000, f"direct {tag} ended rc={p.returncode}"))
+        if p.returncode != 0:
+            sc.fail(f"{tag} (direct) exited {p.returncode}: {open(p.errfile, errors='replace').read()[-600:]}")
+    for tag, p, want, gen_ in (("A", A, exp_a, "a"), ("B", B, exp_b, "b")):
+        got = subprocess.run([p.exe], capture_output=True, text=True).stdout if os.path.exists(p.exe) else None
+        expect = want["gen-one"]
+        if got != expect:
+            sc.fail(f"{tag} (direct): printed {got!r}, the oracle's {expect!r}")
+        sc.notes.setdefault("programs", {})[f"{tag}/direct"] = got
+    if sc.runs() != ["a", "b"]:
+        sc.fail(f"the script ran {sc.runs()}, once for each process, 'a' then 'b'")
+    ev_a = sc.events("a", open(A.errfile, errors="replace").read())
+    ev_b = sc.events("b", open(B.errfile, errors="replace").read())
+    sc.notes["direct-events-a"], sc.notes["direct-events-b"] = ev_a, ev_b
+    if not any(e[0] == "waits" for e in ev_b):
+        sc.fail("B (direct) did not wait for A's process")
+    sc.timeouts()
+
+
 def link_control(sc, source_sha):
     """No concurrency, no barrier: GEN=a, then GEN=b, a static library named for the value. Not
     about leases: whether a warm worker, which finds only the script's output changed, links the
@@ -557,6 +706,9 @@ def archive_control(sc, source_sha):
 
 
 SCENARIOS = {
+    "lost-wake": lost_wake,
+    "reload-busy": reload_busy,
+    "direct": direct,
     "archive-control": archive_control,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
