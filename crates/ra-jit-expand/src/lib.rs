@@ -49,7 +49,6 @@ use proc_macro_api::{
     version::CURRENT_API_VERSION,
 };
 use ra_jit_store::{KEY, Store};
-use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
@@ -110,7 +109,7 @@ fn wrap(
     Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, skipped })
 }
 
-/// A dylib of proc macros, hashed the first time one of its macros expands.
+/// A loaded dylib generation, fingerprinted when its expansion wrapper is made.
 #[derive(Debug)]
 struct Dylib {
     path: AbsPathBuf,

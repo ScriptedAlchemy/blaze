@@ -56,8 +56,10 @@ impl ProcMacroServerPool {
         // The server may cache native loaded libraries by pathname/mtime. Give
         // this immutable loaded generation its own file, retained by its handles.
         let snapshot = stdx::tempfile::NamedTempFile::new_from_existing(
-            "proc-macro-content", dylib.path.as_ref(),
-        ).map_err(|error| ServerError { message: error.to_string(), io: None })?;
+            "proc-macro-content",
+            dylib.path.as_ref(),
+        )
+        .map_err(|error| ServerError { message: error.to_string(), io: None })?;
         let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.path().to_owned()));
         let snapshot = Arc::new(LibrarySnapshot(snapshot));
         use sha2::{Digest as _, Sha256};

@@ -168,9 +168,12 @@ impl Inputs {
             // included assets and dependency producers are content inputs, even
             // when their size and timestamps were restored.
             let mut macro_inputs = std::collections::BTreeSet::new();
-            let mut pending: Vec<_> = cargo.packages().filter(|&package| {
-                cargo[package].targets.iter().any(|&target| cargo[target].kind.is_proc_macro())
-            }).collect();
+            let mut pending: Vec<_> = cargo
+                .packages()
+                .filter(|&package| {
+                    cargo[package].targets.iter().any(|&target| cargo[target].kind.is_proc_macro())
+                })
+                .collect();
             while let Some(package) = pending.pop() {
                 if !macro_inputs.insert(package) {
                     continue;
@@ -367,6 +370,25 @@ fn stamp(path: &Path, package: bool) -> u64 {
     let mut hasher = FxHasher::default();
     stamp_into(path, package, &mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    #[test]
+    fn producer_change_is_detected_with_equal_size_and_restored_mtime() {
+        let dir = std::env::temp_dir().join(format!("c4-producer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, b"fn value() -> u8 { 1 }").unwrap();
+        let watched = Watched::new(dir.clone(), true);
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"fn value() -> u8 { 2 }").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        assert!(watched.changed());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// When the file at `path`, or the directory there or anything below it that [`stamp`] looks

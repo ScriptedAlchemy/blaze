@@ -2827,7 +2827,8 @@ fn package_alike(
             if path.is_dir() {
                 return package_alike(&path, base, over, nested, compared);
             }
-            let (Ok(our_bytes), Ok(their_bytes)) = (std::fs::read(&path), std::fs::read(&their)) else {
+            let (Ok(our_bytes), Ok(their_bytes)) = (std::fs::read(&path), std::fs::read(&their))
+            else {
                 return false;
             };
             if our_bytes.len() != their_bytes.len() {
@@ -2839,18 +2840,13 @@ fn package_alike(
             if let Some((_, _, alike)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
                 return alike;
             }
-            let alike = match (Ok::<_, std::io::Error>(our_bytes), Ok::<_, std::io::Error>(their_bytes)) {
-                (Ok(ours), Ok(theirs)) => {
-                    // Code that asks where its package is does not say the same in two
-                    // checkouts.
-                    let asks = path.extension().is_some_and(|it| it == "rs")
-                        && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
-                            ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
-                        });
-                    ours == theirs && !asks
-                }
-                _ => false,
-            };
+            // Content, not metadata, determines whether the cached comparison
+            // remains applicable after an equal-size/restored-mtime edit.
+            let asks = path.extension().is_some_and(|it| it == "rs")
+                && memchr::memmem::find_iter(&our_bytes, b"env!(").any(|at| {
+                    our_bytes[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
+                });
+            let alike = our_bytes == their_bytes && !asks;
             compared.lock().unwrap_or_else(|e| e.into_inner()).insert(their, (ours, theirs, alike));
             alike
         })
