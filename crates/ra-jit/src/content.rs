@@ -672,7 +672,7 @@ mod tests {
                 // Normal source/body discovery registers a new missing input before
                 // the fast validation probe. An empty historical map is not an
                 // exemption from normal compiler include expansion.
-                crate::declared_in(&db, dep.into());
+                crate::prepare_changed_input_owners(&db, &[files[1].file_id(&db)]);
                 assert_eq!(
                     crate::missing_input_of(&db, dep),
                     Some(paths::AbsPathBuf::assert_utf8(

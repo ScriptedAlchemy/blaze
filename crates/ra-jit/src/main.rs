@@ -3722,6 +3722,21 @@ fn missing_input_of(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Option<
     missing_required_input(db.included_by(krate), || current_input_paths(db, krate))
 }
 
+fn prepare_changed_input_owners(db: &RootDatabase, files: &[vfs::FileId]) {
+    let mut crates: FxHashSet<_> = files
+        .iter()
+        .flat_map(|&file| ide_db::base_db::relevant_crates(db, file).iter().copied())
+        .collect();
+    for krate in crates.clone() {
+        crates.extend(krate.transitive_rev_deps(db));
+    }
+    for krate in crates {
+        // The tracked discovery query observes source/cfg/macro inputs and covers
+        // every expression owner. Untouched builds never enter this preparation.
+        discover_current_inputs(db, krate);
+    }
+}
+
 fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
     let start = Instant::now();
     // The first thing asked of a crate after an edit: name resolution is redone here.
@@ -9846,6 +9861,7 @@ impl Program {
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
+        hir::attach_db(db, || prepare_changed_input_owners(db, &edited));
         // Missing external inputs are compilation errors even when an old patch
         // base can still execute. Never advertise that old executable as a new
         // successful build.
