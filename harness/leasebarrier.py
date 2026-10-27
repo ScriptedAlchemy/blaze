@@ -3,7 +3,7 @@
 blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of a script").
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
-scenarios: same-worker, cross-worker, failure     (all, by default)
+scenarios: same-worker, cross-worker, failure, archive-control     (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -26,6 +26,10 @@ cross-worker  Two daemons (two `RA_JIT_HOME`) over one project and one target di
 failure       One worker, one build with two programs whose script fails: the same failure from
               each request and one run of the script; then a build that works; then the failure
               again as a build of its own.
+
+archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
+              name whose contents change. What blaze prints differing from cargo's is recorded as a
+              gap, not a failure of the lease scenarios.
 
 Every scenario records what it ran under `--work`: the worker's pid and log, the build numbers,
 the barrier's files, the source and binary hashes, the order of the log's `script-lease:` lines
@@ -52,6 +56,7 @@ fn main() {
     let gen_ = env::var("GEN").unwrap_or_else(|_| "none".to_owned());
     println!("cargo:rerun-if-env-changed=GEN");
     println!("cargo:rerun-if-env-changed=FAIL");
+    println!("cargo:rerun-if-env-changed=GEN_ARCHIVE");
     let mut log = fs::OpenOptions::new().create(true).append(true).open("@LOG@").unwrap();
     writeln!(log, "{gen_}").unwrap();
     if env::var("FAIL").as_deref() == Ok("1") {
@@ -59,16 +64,20 @@ fn main() {
         exit(3);
     }
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    fs::write(out.join("gen.rs"), format!("pub const GEN: &str = {gen_:?};\n")).unwrap();
     let value = gen_.bytes().next().unwrap_or(b'?') as i32;
-    fs::write(out.join("gen.c"), format!("int gen_value(void) {{ return {value}; }}\n")).unwrap();
+    // The library is named for the value, so that a link line of another build's cannot find
+    // the symbol; with GEN_ARCHIVE=same it has one name and only its contents change.
+    let same = env::var("GEN_ARCHIVE").as_deref() == Ok("same");
+    let (lib, symbol) = if same { ("gen".to_owned(), "gen_value".to_owned()) } else { (format!("gen_{gen_}"), format!("gen_value_{gen_}")) };
+    fs::write(out.join("gen.rs"), format!("pub const GEN: &str = {gen_:?};\nextern \"C\" {{ fn {symbol}() -> i32; }}\npub fn native() -> i32 {{ unsafe {{ {symbol}() }} }}\n")).unwrap();
+    fs::write(out.join("gen.c"), format!("int {symbol}(void) {{ return {value}; }}\n")).unwrap();
     let status = Command::new("cc").args(["-c", "-o"]).arg(out.join("gen.o")).arg(out.join("gen.c")).status().unwrap();
     assert!(status.success());
-    let _ = fs::remove_file(out.join("libgen.a"));
-    let status = Command::new("ar").arg("rcs").arg(out.join("libgen.a")).arg(out.join("gen.o")).status().unwrap();
+    let _ = fs::remove_file(out.join(format!("lib{lib}.a")));
+    let status = Command::new("ar").arg("rcs").arg(out.join(format!("lib{lib}.a"))).arg(out.join("gen.o")).status().unwrap();
     assert!(status.success());
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=gen");
+    println!("cargo:rustc-link-lib=static={lib}");
     println!("cargo:rustc-env=GEN_VALUE={gen_}");
     println!("cargo:rustc-cfg=gen_{gen_}");
     println!("cargo:rustc-check-cfg=cfg(gen_a,gen_b,gen_c,gen_bad,gen_none)");
@@ -77,13 +86,9 @@ fn main() {
 
 PROGRAM = r'''include!(concat!(env!("OUT_DIR"), "/gen.rs"));
 
-extern "C" {
-    fn gen_value() -> i32;
-}
-
 fn main() {
     let cfgv = if cfg!(gen_a) { "a" } else if cfg!(gen_b) { "b" } else if cfg!(gen_c) { "c" } else { "other" };
-    println!("@NAME@ include={GEN} env={} cfg={cfgv} native={}", env!("GEN_VALUE"), unsafe { gen_value() });
+    println!("@NAME@ include={GEN} env={} cfg={cfgv} native={}", env!("GEN_VALUE"), native());
 }
 '''
 
@@ -131,7 +136,7 @@ class Scenario:
         os.makedirs(self.dir)
         self.ws = os.path.join(self.dir, "ws")
         self.runs_log = os.path.join(self.dir, "runs.log")
-        self.failures, self.notes, self.timeline = [], {}, []
+        self.failures, self.notes, self.timeline, self.gaps = [], {}, [], []
         self.daemons = []
 
     # -- the project and the oracle
@@ -146,14 +151,14 @@ class Scenario:
         open(self.runs_log, "w").close()
         subprocess.run(["cargo", "generate-lockfile"], cwd=ws, env=self.env("x"), capture_output=True, check=True)
 
-    def oracle(self, gen_):
+    def oracle(self, gen_, extra=None):
         """What cargo's build gives for `GEN=gen_`: the output each program must have."""
         ws = os.path.join(self.dir, "oracle-ws")
         shutil.rmtree(ws, ignore_errors=True)
         saved, self.runs_log = self.runs_log, os.path.join(self.dir, "oracle-runs.log")
         self.project(ws)
         self.runs_log = saved
-        env = dict(self.env("oracle"), GEN=gen_, CARGO_TARGET_DIR=os.path.join(self.dir, "oracle-target"))
+        env = dict(self.env("oracle"), GEN=gen_, CARGO_TARGET_DIR=os.path.join(self.dir, "oracle-target"), **(extra or {}))
         env.pop("RA_JIT_WHOLE_BUILD", None)
         ran = subprocess.run(["cargo", "build"], cwd=ws, env=env, capture_output=True, text=True, timeout=WAIT)
         if ran.returncode != 0:
@@ -199,6 +204,9 @@ class Scenario:
             self.fail(f"{what}: the client did not end in {within or WAIT:.0f}s")
         p.ended = time.time_ns() // 1000
         p.out, p.err = out, err
+        for suffix, text in (("out", out), ("err", err)):
+            with open(os.path.join(self.dir, f"client-{what}.{suffix}"), "w") as f:
+                f.write(text)
         self.timeline.append((p.ended, f"client {what} ended rc={p.returncode}"))
         if "building with cargo" in err:
             self.fail(f"{what}: the build fell back to cargo")
@@ -246,6 +254,7 @@ class Scenario:
         return os.path.join(self.dir, "barrier-" + home)
 
     def arm(self, home, point):
+        os.makedirs(self.barrier(home), exist_ok=True)
         open(os.path.join(self.barrier(home), point + ".hold"), "w").close()
 
     def disarm(self, home, point):
@@ -340,6 +349,7 @@ class Scenario:
                 shutil.copy2(st["worker_log"], os.path.join(self.dir, f"worker-{home}.log"))
             ev["events-" + home] = self.events(home)
             ev["barrier-" + home] = sorted(os.listdir(self.barrier(home))) if os.path.isdir(self.barrier(home)) else []
+        ev["gaps"] = self.gaps
         ev["runs"] = self.runs() if os.path.exists(self.runs_log) else []
         ev["notes"] = {k: v for k, v in self.notes.items() if not k.startswith("status-")}
         return ev
@@ -468,10 +478,18 @@ def failure(sc, source_sha):
                 sc.fail(f"G, after a failure, exited {p.returncode}: {p.err[-600:]}")
             sc.check_programs("G", {}, None, "c")
         else:
-            if p.returncode == 0 or "script failed for bad" not in p.err:
-                sc.fail(f"{tag} did not fail with the script's message: rc {p.returncode}: {p.err[-600:]}")
+            if p.returncode == 0 or "failed to run custom build command" not in p.err:
+                sc.fail(f"{tag} did not fail with cargo's message for a script: rc {p.returncode}: {p.err[-600:]}")
             messages.append(re.findall(r"script failed for bad", p.err))
             sc.notes[f"{tag}-said"] = [l for l in p.err.splitlines() if "failed" in l][:4]
+    ev = sc.events("a")
+    per_build = {}
+    for e in ev:
+        if e[0] == "runs":
+            per_build[e[1]] = per_build.get(e[1], 0) + 1
+    sc.notes["runs-per-build"] = per_build
+    if any(n != 1 for n in per_build.values()):
+        sc.fail(f"a script ran more than once in a build: {per_build}")
     counted = sc.runs().count("bad")
     # Two programs ask the worker twice in each build, and the script runs once in each.
     if counted != 2:
@@ -481,7 +499,28 @@ def failure(sc, source_sha):
     sc.timeouts()
 
 
+def archive_control(sc, source_sha):
+    """No concurrency: GEN=a, then GEN=c, with a static archive of one name whose contents
+    change. Not about leases; it says whether blaze relinks a program whose archive changed."""
+    sc.project()
+    extra = {"GEN_ARCHIVE": "same"}
+    expected = {"a": sc.oracle("a", extra), "c": sc.oracle("c", extra)}
+    sc.project()
+    for gen_ in ("a", "c"):
+        p = sc.client("a", GEN=gen_, **extra)
+        sc.finish(p, gen_)
+        if p.returncode != 0:
+            sc.fail(f"the build of GEN={gen_} exited {p.returncode}: {p.err[-600:]}")
+            return
+        for name in PROGRAMS:
+            got = sc.program(name)
+            if got != (expected[gen_] or {}).get(name):
+                sc.gaps.append(f"GEN={gen_}: {name} printed {got!r}, cargo's {(expected[gen_] or {}).get(name)!r}")
+    sc.notes["gap-count"] = len(sc.gaps)
+
+
 SCENARIOS = {
+    "archive-control": archive_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
     "cross-worker": lambda sc, sha: same_or_cross(sc, True, sha),
     "failure": failure,
@@ -495,7 +534,7 @@ def main():
     ap.add_argument("--source-sha", default=os.environ.get("SOURCE_SHA", "unknown"))
     ap.add_argument("scenarios", nargs="*")
     args = ap.parse_args()
-    names = args.scenarios or list(SCENARIOS)
+    names = args.scenarios or [n for n in SCENARIOS if n != "archive-control"] + ["archive-control"]
     work = os.path.abspath(args.work)
     os.makedirs(work, exist_ok=True)
     report = {}
