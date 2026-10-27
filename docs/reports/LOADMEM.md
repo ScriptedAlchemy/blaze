@@ -442,6 +442,15 @@ published patch. `harness/tier_pressure_retry.py` targets the second-build branc
 branch without emitted LLVM code; `hold` containing `tier_rebuild` pauses before the retry.
 This is pressure/publication coverage, not an LLVM tier-execution test.
 
+**Measured**, 2026-10-27, runtime `4602d911`, macOS AArch64, Rust 1.99.0,
+Cranelift, n=1: the targeted second-build tier-retry sequence passes. The first complete
+candidate stays unpublished at the tier decision. Critical pressure in the second build
+blocks new entries; relief finishes a patch. Persistent critical pressure returns a typed
+error, retains the same worker PID and published hashes, and recovery retries with no file
+change. Nine focused pressure tests, release build, formatting and diff checks pass.
+No watchdog trip; no root-only edit harness, corpus, c_main or emitted LLVM run repeated.
+Raw result: [u7-tier-retry-4602d911.json](loadmem/u7-tier-retry-4602d911.json).
+
 **Measured**, 2026-10-27, runtime source `ab96113f`, macOS AArch64, Rust 1.99.0,
 Cranelift, n=1: the bounded warm-daemon sequence passes. Critical pressure blocks new
 entries while an admitted definition finishes. Object, patch and executable hashes stay
