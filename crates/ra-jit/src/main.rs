@@ -9803,7 +9803,7 @@ impl Program {
         for name in args.crates() {
             for krate in crates_named(db, name, args).unwrap_or_default() {
                 let mut closure = ide_db::base_db::Crate::from(krate).transitive_deps(db);
-                closure.insert(krate.into());
+                closure.push(krate.into());
                 for dependency in closure {
                     if let Some((path, _)) =
                         db.included_by(dependency).into_iter().find(|(_, bytes)| bytes.is_none())
