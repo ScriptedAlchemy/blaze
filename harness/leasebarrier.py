@@ -96,6 +96,9 @@ first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SP
 quick-choice  `RA_JIT_SPLIT=0`, quick overlay: a request for R is held as it enters its link (the executable was taken
               away), V's first request arrives (R is no candidate while it links), the worker settles and the link is let
               go: V is loaded on its own and judged for its variables, not read through R's world.
+choice-same-stamp  R1 selects `build-old.rs` (fails for b), R2 and V `build-new.rs` (12 bytes each); R1's selector is replaced by
+              R2's with the same size and the time of the last write restored (hashes and mtime ns in the ledger): R1 is not V's to
+              run, and V is built from R2, as cargo builds it.
 choice-edited-failing  The same, and R1's newly selected script fails for b (in R1's directory only): V is built from R2, R1's
               script is not run for it. choice-failing-base: no edit, and the script V and R2 share fails for b: V's
               failure is the consumed base's, and is said.
@@ -1852,19 +1855,32 @@ def consumption_choice(sc, source_sha, mode):
       to run, and V is built, as cargo builds it.
     `stable`: no edit: V is split from R2, which is judged, and R1 is left alone.
     `failing-base`: no edit, and the script V and R2 share fails for b (in all three): V's failure is the
-      consumed base's, and is said."""
+      consumed base's, and is said.
+    `same-stamp`: R1 selects `build-old.rs` (the same everywhere; it fails for b), R2 and V `build-new.rs`; R1's
+      manifest is replaced by R2's, of the same size, with the time of its last write put back."""
     once = os.path.join(sc.dir, "once")
     os.makedirs(once)
     sc.target = os.path.join(sc.dir, "target-shared")
     saved = sc.runs_log
     paths = {name: os.path.join(sc.dir, name) for name in ("r1", "r2", "v")}
+    same_stamp = mode == "same-stamp"
     for name, path in paths.items():
         sc.runs_log = saved
         sc.project(path)
+        new_rs = BUILD_RS.replace("@LOG@", sc.runs_log)
         with open(os.path.join(path, "build-new.rs"), "w") as f:
-            f.write(BUILD_RS.replace("@LOG@", sc.runs_log) + ("// R1's own\n" if name == "r1" else ""))
-        if name != "r1":
-            manifest = open(os.path.join(path, "Cargo.toml")).read().replace('build = "build.rs"', 'build = "build-new.rs"')
+            f.write(new_rs + ("// R1's own\n" if name == "r1" and not same_stamp else ""))
+        if same_stamp:
+            # The same old script everywhere, which fails for b; R1 selects it, R2 and V select the new one.
+            old_rs = new_rs.replace("    // A script cargo runs every build.",
+                                    '    if gen_ == "b" {\n        eprintln!("the old script fails for b");\n        exit(3);\n    }\n'
+                                    "    // A script cargo runs every build.", 1)
+            assert old_rs != new_rs
+            with open(os.path.join(path, "build-old.rs"), "w") as f:
+                f.write(old_rs)
+        select = "build-old.rs" if same_stamp and name == "r1" else "build-new.rs"
+        if name != "r1" or same_stamp:
+            manifest = open(os.path.join(path, "Cargo.toml")).read().replace('build = "build.rs"', f'build = "{select}"')
             with open(os.path.join(path, "Cargo.toml"), "w") as f:
                 f.write(manifest)
     sc.r = paths["r1"]
@@ -1901,6 +1917,22 @@ def consumption_choice(sc, source_sha, mode):
         sc.notes["identities-before"] = ident()
         if mode in ("edited", "edited-failing"):
             shutil.copy2(os.path.join(paths["r2"], "Cargo.toml"), os.path.join(paths["r1"], "Cargo.toml"))
+        if same_stamp:
+            # R1's selector is replaced by R2's: the same size, and the time of the last write put back.
+            r1 = os.path.join(paths["r1"], "Cargo.toml")
+            before_stat = os.stat(r1)
+            new_text = open(os.path.join(paths["r2"], "Cargo.toml"), "rb").read()
+            old_text = open(r1, "rb").read()
+            if len(new_text) != len(old_text):
+                sc.fail(f"the two manifests are not of one size: {len(old_text)} {len(new_text)}")
+            with open(r1, "wb") as f:
+                f.write(new_text)
+            os.utime(r1, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+            after_stat = os.stat(r1)
+            sc.notes["r1-manifest-stamp"] = {"size": [before_stat.st_size, after_stat.st_size],
+                                             "mtime_ns": [before_stat.st_mtime_ns, after_stat.st_mtime_ns]}
+            if (before_stat.st_size, before_stat.st_mtime_ns) != (after_stat.st_size, after_stat.st_mtime_ns):
+                sc.fail(f"the stamp of R1's manifest was not kept: {sc.notes['r1-manifest-stamp']}")
         sc.notes["identities-after"] = ident()
         out, exe = os.path.join(sc.dir, "first.o"), os.path.join(sc.dir, "first.bin")
         env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD="5001", GEN="b")
@@ -1929,6 +1961,8 @@ def consumption_choice(sc, source_sha, mode):
             elif got != want:
                 sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
 
+        if same_stamp and sc.notes["identities-before"]["r1"]["Cargo.toml"] == sc.notes["identities-after"]["r1"]["Cargo.toml"]:
+            sc.fail("R1's manifest was not changed")
         if mode == "failing-base":
             if rc == 0:
                 sc.fail("V reads R2's script, which fails for b as V's own does: the request was to fail")
@@ -1960,6 +1994,10 @@ def choice_edited_failing(sc, source_sha):
 
 def choice_stable(sc, source_sha):
     consumption_choice(sc, source_sha, "stable")
+
+
+def choice_same_stamp(sc, source_sha):
+    consumption_choice(sc, source_sha, "same-stamp")
 
 
 def choice_failing_base(sc, source_sha):
@@ -2056,6 +2094,7 @@ SCENARIOS = {
     "choice-edited": choice_edited,
     "choice-edited-failing": choice_edited_failing,
     "choice-failing-base": choice_failing_base,
+    "choice-same-stamp": choice_same_stamp,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,

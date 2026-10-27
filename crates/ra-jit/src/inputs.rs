@@ -48,8 +48,12 @@ pub(crate) struct Inputs {
 struct Checkout {
     root: PathBuf,
     /// The manifests and the lock file, the build scripts cargo finds by their name, and
-    /// the files cargo's configuration is read from: those that are not there too.
-    files: Vec<Watched>,
+    /// the files cargo's configuration is read from: those that are not there too. Each by its
+    /// content ([`Structural`]), not by when it was written.
+    files: Vec<Structural>,
+    /// Whether the build scripts the loaded workspace selects are those the manifests select, as
+    /// they were when the files above were read for this record.
+    consistent: bool,
     /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
     scripts: Option<Scripts>,
@@ -74,6 +78,104 @@ impl Watched {
     fn changed(&self) -> bool {
         stamp(&self.path, self.package) != self.stamp
     }
+}
+
+/// What a file that the structure of a workspace is read from was, by what it held. A length and a
+/// time of the last write are no proof of it: a file replaced by one of the same size and given its
+/// time again is the same to them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Content {
+    Absent,
+    /// A file: its size and a hash of its bytes.
+    File(u64, u64),
+    /// A directory, or what is no file.
+    Other,
+    /// What could not be read: never equal to anything, so that it certifies nothing.
+    Unreadable,
+}
+
+impl Content {
+    fn of(path: &Path) -> Content {
+        let metadata = match std::fs::metadata(path) {
+            Ok(it) => it,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Content::Absent,
+            Err(_) => return Content::Unreadable,
+        };
+        if !metadata.is_file() {
+            return Content::Other;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let mut hasher = FxHasher::default();
+                bytes.hash(&mut hasher);
+                Content::File(bytes.len() as u64, hasher.finish())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Content::Absent,
+            Err(_) => Content::Unreadable,
+        }
+    }
+}
+
+/// A file the structure of a workspace was read from, and its content when the record was made.
+#[derive(Clone)]
+struct Structural {
+    path: PathBuf,
+    was: Content,
+}
+
+impl Structural {
+    fn new(path: PathBuf) -> Structural {
+        let was = Content::of(&path);
+        Structural { path, was }
+    }
+
+    /// Whether the file is other than it was: by its content, read now. A file that cannot be read
+    /// is other, then and now.
+    fn changed(&self) -> bool {
+        let now = Content::of(&self.path);
+        now == Content::Unreadable || now != self.was
+    }
+}
+
+/// The file names of `scripts`, sorted: how the script a manifest selects is told from another without a
+/// path of one form (a link, a prefix) being taken for a different script.
+fn script_names(scripts: &[PathBuf]) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> =
+        scripts.iter().filter_map(|it| it.file_name().map(ToOwned::to_owned)).collect();
+    names.sort();
+    names
+}
+
+/// The build scripts the manifest at `manifest` selects, as cargo does: `build = false` none, `true` or no key
+/// `build.rs` when it is there, a string the file it names, a list each. `None` when the manifest says
+/// something this does not read (then nothing is claimed of it).
+fn selected_scripts(manifest: &Path, text: &str) -> Option<Vec<PathBuf>> {
+    let table: toml::Table = text.parse().ok()?;
+    let dir = manifest.parent()?;
+    let named = |name: &str| {
+        let mut path = PathBuf::new();
+        for part in dir.join(name).components() {
+            match part {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    path.pop();
+                }
+                part => path.push(part),
+            }
+        }
+        path
+    };
+    let mut scripts = match table.get("package")?.get("build") {
+        None => dir.join("build.rs").is_file().then(|| vec![named("build.rs")]).unwrap_or_default(),
+        Some(toml::Value::Boolean(false)) => Vec::new(),
+        Some(toml::Value::Boolean(true)) => vec![named("build.rs")],
+        Some(toml::Value::String(name)) => vec![named(name)],
+        Some(toml::Value::Array(names)) => {
+            names.iter().map(|it| it.as_str().map(named)).collect::<Option<Vec<_>>>()?
+        }
+        Some(_) => return None,
+    };
+    Some(scripts)
 }
 
 /// The build scripts of one workspace and what they said.
@@ -372,18 +474,34 @@ impl Inputs {
         let mut files = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
-                files.push(Watched::new(dir.join(".cargo").join(name), false));
+                files.push(Structural::new(dir.join(".cargo").join(name)));
             }
         }
         for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"] {
-            files.push(Watched::new(root.join(name), false));
+            files.push(Structural::new(root.join(name)));
         }
+        // The files are read here, after the workspace was: a manifest written between the two is not
+        // what the workspace says. For the script each package selects, the one thing a candidate is
+        // chosen by, that is looked at: the targets loaded against the manifests as they are read now.
+        let mut consistent = true;
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
-                files.push(Watched::new(manifest.to_owned(), false));
+                files.push(Structural::new(manifest.to_owned()));
                 // A script that appears there is run without the manifest naming it.
-                files.push(Watched::new(manifest.with_file_name("build.rs"), false));
+                files.push(Structural::new(manifest.with_file_name("build.rs")));
+                let mut loaded: Vec<PathBuf> = cargo[package]
+                    .targets
+                    .iter()
+                    .filter(|&&it| matches!(cargo[it].kind, TargetKind::BuildScript))
+                    .map(|&it| PathBuf::from(AsRef::<Path>::as_ref(&cargo[it].root)))
+                    .collect();
+                let selected = std::fs::read_to_string(manifest)
+                    .ok()
+                    .and_then(|text| selected_scripts(manifest, &text));
+                if selected.is_some_and(|it| script_names(&it) != script_names(&loaded)) {
+                    consistent = false;
+                }
             }
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
@@ -404,7 +522,7 @@ impl Inputs {
             }
         }
         self.checkouts.retain(|it| it.root != root);
-        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
+        self.checkouts.push(Checkout { root: root.to_owned(), files, consistent, flags, scripts });
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
@@ -424,7 +542,7 @@ impl Inputs {
             return Ok(false);
         };
         let flags = env.is_some_and(|env| checkout.flags.iter().any(|(n, was)| env.get(n) != *was));
-        if flags || checkout.files.iter().any(Watched::changed) {
+        if flags || !checkout.consistent || checkout.files.iter().any(Structural::changed) {
             // The workspace is read again whole, and the scripts run for it.
             if let Some(scripts) = &mut checkout.scripts {
                 scripts.ready = None;
@@ -440,13 +558,13 @@ impl Inputs {
 
     /// Whether what the workspace loaded at `root` says of itself (its packages, its targets, which
     /// script each selects) is what its manifests and configuration say now. Nothing is run to say it:
-    /// the files the load read are looked at. A checkout that is not watched has said nothing that
-    /// could be out of date.
+    /// the files the load read are read again and compared by their content, never by their size and
+    /// time. A checkout that is not watched has said nothing that could be out of date.
     pub(crate) fn describes(&self, root: &Path) -> bool {
         self.checkouts
             .iter()
             .find(|it| it.root == root)
-            .is_none_or(|it| !it.files.iter().any(Watched::changed))
+            .is_none_or(|it| it.consistent && !it.files.iter().any(Structural::changed))
     }
 
     /// What the scripts of the checkout at `root` said when the last check ran them, when the
@@ -791,27 +909,105 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn a_checkout_describes_itself_only_while_the_files_it_was_loaded_from_are_as_they_were() {
-        let dir = std::env::temp_dir().join(format!("ra-jit-describes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let manifest = dir.join("Cargo.toml");
-        std::fs::write(&manifest, "[package]\nname = \"a\"\nbuild = \"build.rs\"\n").unwrap();
+    /// A manifest replaced by one of the same size, given the time of the last write it had.
+    fn replaced_in_place(path: &Path, text: &str) {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        let old = std::fs::read(path).unwrap();
+        assert_eq!(old.len(), text.len(), "the replacement is of the same size");
+        std::fs::write(path, text).unwrap();
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        let after = std::fs::metadata(path).unwrap();
+        assert_eq!((after.len(), after.modified().unwrap()), (old.len() as u64, modified));
+    }
+
+    fn checkout_of(dir: &Path, files: &[PathBuf]) -> Inputs {
         let mut inputs = Inputs::default();
-        // A checkout that is not watched has said nothing that could be out of date.
-        assert!(inputs.describes(&dir));
         inputs.checkouts.push(Checkout {
-            root: dir.clone(),
-            files: vec![Watched::new(manifest.clone(), false)],
+            root: dir.to_owned(),
+            files: files.iter().cloned().map(Structural::new).collect(),
+            consistent: true,
             flags: Vec::new(),
             scripts: None,
         });
+        inputs
+    }
+
+    #[test]
+    fn a_checkout_describes_itself_only_while_the_files_it_was_loaded_from_hold_what_they_held() {
+        let dir = dir("describes");
+        let manifest = dir.join("Cargo.toml");
+        let old = "[package]\nname = \"a\"\nbuild = \"build-old.rs\"\n";
+        let new = "[package]\nname = \"a\"\nbuild = \"build-new.rs\"\n";
+        assert_eq!(old.len(), new.len());
+        std::fs::write(&manifest, old).unwrap();
+        // A checkout that is not watched has said nothing that could be out of date.
+        assert!(Inputs::default().describes(&dir));
+        let inputs = checkout_of(&dir, &[manifest.clone(), dir.join("build.rs")]);
         assert!(inputs.describes(&dir));
-        // The manifest selects another script: what the loaded targets say is not what it says.
-        std::fs::write(&manifest, "[package]\nname = \"a\"\nbuild = \"build-new.rs\"\n").unwrap();
-        assert!(!inputs.describes(&dir));
+        // Written again with the same bytes, the time and size what they were: the same.
+        std::fs::write(&manifest, old).unwrap();
+        assert!(inputs.describes(&dir), "a file written again with the same content is the same");
+        // The selector replaced by one of the same size, with the time of the last write restored.
+        replaced_in_place(&manifest, new);
+        assert!(
+            !inputs.describes(&dir),
+            "the content is not the one the workspace was loaded from"
+        );
         assert!(inputs.describes(&dir.join("elsewhere")));
+        // Back as it was: it holds what it held.
+        std::fs::write(&manifest, old).unwrap();
+        assert!(inputs.describes(&dir));
+        // A file that was not there and appears, or one that goes.
+        std::fs::write(dir.join("build.rs"), "fn main() {}\n").unwrap();
+        assert!(!inputs.describes(&dir));
+        std::fs::remove_file(dir.join("build.rs")).unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        assert!(!inputs.describes(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_certifies_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = dir("unreadable");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\n").unwrap();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0)).unwrap();
+        // A privileged process reads it anyway, and then there is nothing to test.
+        if std::fs::read(&manifest).is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let inputs = checkout_of(&dir, std::slice::from_ref(&manifest));
+        assert!(!inputs.describes(&dir), "unreadable then and now is not the same file");
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_script_a_manifest_selects_is_read_from_its_content() {
+        let dir = dir("selected");
+        let manifest = dir.join("Cargo.toml");
+        let selects = |text: &str| selected_scripts(&manifest, text).map(|it| script_names(&it));
+        let name = |it: &str| vec![std::ffi::OsString::from(it)];
+        assert_eq!(
+            selects("[package]\nname = \"a\"\nbuild = \"build-new.rs\"\n"),
+            Some(name("build-new.rs"))
+        );
+        assert_eq!(
+            selects("[package]\nname = \"a\"\nbuild = \"./x/../build-old.rs\"\n"),
+            Some(name("build-old.rs"))
+        );
+        assert_eq!(selects("[package]\nname = \"a\"\nbuild = false\n"), Some(Vec::new()));
+        assert_eq!(selects("[package]\nname = \"a\"\nbuild = true\n"), Some(name("build.rs")));
+        // No key: the script cargo finds by its name, when it is there.
+        assert_eq!(selects("[package]\nname = \"a\"\n"), Some(Vec::new()));
+        std::fs::write(dir.join("build.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(selects("[package]\nname = \"a\"\n"), Some(name("build.rs")));
+        // What is not read says nothing.
+        assert_eq!(selects("not toml ="), None);
+        assert_eq!(selects("[workspace]\n"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
