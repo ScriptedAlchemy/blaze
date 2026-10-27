@@ -88,6 +88,61 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn read_wakes_and_noop_flushes_do_not_extend_a_stalled_write_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
+        let mut io = ProgressIo::new(stream, Duration::from_millis(100));
+        let heartbeat = tokio::spawn(async move {
+            for _ in 0..100 {
+                if peer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let bytes = vec![7; 16 << 20];
+        let mut written = 0;
+        let mut read_wakes = 0;
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(600),
+            std::future::poll_fn(|cx| {
+                loop {
+                    match Pin::new(&mut io).poll_write(cx, &bytes[written..]) {
+                        Poll::Ready(Ok(count)) => {
+                            assert!(count != 0);
+                            written += count;
+                            assert!(
+                                written < bytes.len(),
+                                "the peer unexpectedly read the response"
+                            );
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(error),
+                        Poll::Pending => break,
+                    }
+                }
+                let mut input = [0; 32];
+                let mut read = ReadBuf::new(&mut input);
+                if Pin::new(&mut io).poll_read(cx, &mut read).is_ready() {
+                    read_wakes += usize::from(!read.filled().is_empty());
+                }
+                // Hyper flushes on read-side dispatcher wakes too. TCP flush moves no bytes.
+                assert!(matches!(Pin::new(&mut io).poll_flush(cx), Poll::Ready(Ok(()))));
+                Poll::Pending
+            }),
+        )
+        .await;
+        heartbeat.abort();
+        let error = result.expect("read-side wakes extended the write-progress deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(read_wakes > 1, "the regression never exercised repeated read-side wakes");
+        assert!(started.elapsed() < Duration::from_millis(600));
+    }
+
+    #[tokio::test]
     async fn progressing_tcp_writes_can_outlast_the_idle_interval() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();

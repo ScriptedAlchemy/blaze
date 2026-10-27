@@ -717,7 +717,25 @@ fn retry_accept(error: &std::io::Error) -> bool {
     ) || {
         #[cfg(unix)]
         {
-            matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS))
+            let resource =
+                matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS));
+            #[cfg(target_os = "linux")]
+            let pending_network = matches!(
+                error.raw_os_error(),
+                Some(
+                    libc::ENETDOWN
+                        | libc::EPROTO
+                        | libc::ENOPROTOOPT
+                        | libc::EHOSTDOWN
+                        | libc::ENONET
+                        | libc::EHOSTUNREACH
+                        | libc::EOPNOTSUPP
+                        | libc::ENETUNREACH
+                )
+            );
+            #[cfg(not(target_os = "linux"))]
+            let pending_network = false;
+            resource || pending_network
         }
         #[cfg(not(unix))]
         {
@@ -1059,6 +1077,12 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(std::io::Error::from_raw_os_error(libc::EMFILE));
+        #[cfg(target_os = "linux")]
+        {
+            let mut errors = run.server.accept_errors.lock().unwrap();
+            errors.push_back(std::io::Error::from_raw_os_error(libc::EPROTO));
+            errors.push_back(std::io::Error::from_raw_os_error(libc::ENETUNREACH));
+        }
         let stale_dir = run.server.store().dir().join("units/.bad.123-456-1.tmp");
         std::fs::create_dir(&stale_dir).unwrap();
         let abandoned = run.server.store().dir().join("units/.abandoned.123-456-2.tmp");
