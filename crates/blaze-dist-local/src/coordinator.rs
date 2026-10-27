@@ -254,12 +254,22 @@ impl Coordinator {
             Ok(answer) => answer,
             Err(error) => Answer::Error(error),
         };
-        let reply = encode(&ServerFrame::Response(Response {
+        let mut reply = encode(&ServerFrame::Response(Response {
             epoch: self.epoch,
             session: request.session,
             sequence: request.sequence,
             answer,
         }));
+        if reply.len() > self.config.max_frame as usize {
+            // Keep the already-observed transition journaled if a future response variant
+            // breaks its structural bound; never transmit an oversize frame or retry it.
+            reply = encode(&ServerFrame::Response(Response {
+                epoch: self.epoch,
+                session: request.session,
+                sequence: request.sequence,
+                answer: Answer::Error(error(ErrorCode::Busy, "response-frame-capacity")),
+            }));
+        }
         // Responses are bounded structurally by event pagination and request limits.
         // The server configuration is validated to leave room for all non-event answers.
         let session = self.sessions.get_mut(&request.session).expect("validated session");
