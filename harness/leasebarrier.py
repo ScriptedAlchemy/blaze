@@ -833,7 +833,7 @@ def send_edit(home_dir, path, text, sock="daemon.sock"):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(WAIT)
         s.connect(os.path.join(home_dir, sock))
-        s.sendall(f"edit\t{path}\t{escaped}\n".encode())
+        s.sendall(f"edit\t{path}\t{escaped}\n\n".encode())  # a worker reads the request and the process's variables
         return s.makefile().readline().strip()
 
 
