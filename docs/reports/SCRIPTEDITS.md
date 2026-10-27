@@ -930,6 +930,13 @@ longer fails the request, a never-linked program is not stale, and the call site
 | `link-strict`: a library named for the value, a, b, a | `GEN=b` prints `include=a env=a cfg=a native=97` | every build = cargo's |
 | `archive-strict`: one name, contents a, c, a | `GEN=c` prints `native=97` (cargo 99) | every build = cargo's |
 
+A joined checkout's program (`first-join`'s gap): the link line of an independent S joined by a hand-started `ra-jit sync` (no crate list) held R's
+`-L …/gena…/out` before its own: `Target::args` gave a request with no crate list the daemon's started-with crates as its batch, whatever the
+checkout, so R's crate was linked into S's program and R's `libgen.a` won (97 for 98). The default batch is the daemon's crates only for the daemon's own checkout;
+the `cargo-ra-jit` client always sends its crate list, so a build through the daemon is unchanged. The log now has `link line: …`. Under
+`LEASEBARRIER_STRICT=1`: `first-join`, `first-join-private`, `first-join-shared`, `generation` (whose edit used to record 97 for 98), `unrelated`, `join`, `once`,
+`choice-stable`, `hostflags` and `native-only` pass at `2695888a`.
+
 On the fixed binary: `once`, `join`, `first-join`, `choice-stable`, `hostflags`, `internal`, `generation`, `overlay`, `lost-wake`, `reload-busy` pass; `worlds` and
 `groups` timed out at 120 s on a host at load 50 (a first-load of 190 s) and pass with the timeout at 400 s; `coab` timed out at 400 s and at 1200 s on that host (a nested compile of a build script held 15 cores for 17 minutes) and passes, as it did at
 `4ae2a363` in the same session, when the host load was 8-15. These timeouts are infrastructure (the Mac was at load 40-55 from other work), kept as failed attempts. Component: the module's seven tests (search directory does not hash the link's outputs; an earlier candidate appearing; opaque response file; same size
@@ -937,8 +944,8 @@ and time, other bytes; deletion, recreation, directive-only; failed or changed l
 
 ### What is not shown, not fixed, or wider
 
-- **A warm worker's native link (closed for the cases in "The inputs of a link are its identity")**; one gap remains in `first-join`
-  (an independent S printed `native=97` against cargo's 98: not understood, recorded, not waived).
+- **A warm worker's native link: closed for the cases in "The inputs of a link are its identity" and "A joined checkout's program"**
+  (the harness fails on a native-only difference with `LEASEBARRIER_STRICT=1`; the scenarios listed there pass under it).
 - **Host flags (partly closed, see "The flags for rustc of a script's compile"):** `--cfg` and `-C debug-assertions` of the flags
   a script's compile gets are applied and an explicit `--target <host>` is cargo's cross build; the other flags (codegen options,
   lints, search paths) are named on stderr and **not** applied.
