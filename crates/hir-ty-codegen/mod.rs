@@ -2874,7 +2874,11 @@ fn compiled_instance<'db>(
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
     if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
-        eprintln!("input-codegen: instance {:?}", instance.def);
+        let name = match instance.def {
+            InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str().to_owned(),
+            _ => format!("{:?}", instance.def),
+        };
+        eprintln!("input-codegen: instance {name}");
     }
     // The code can be instantiated in a caller crate, but its included literals
     // belong to the definition's crate, not the monomorphization environment.
