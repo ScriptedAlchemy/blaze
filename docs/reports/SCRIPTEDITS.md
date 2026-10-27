@@ -490,9 +490,11 @@ or P0-D, nor replace the 42-case runtime suite or the platform checks required f
 
 ## What a build holds of a script (leases)
 
-Review of `91d58995` (2026-10-26/27) found two request-lifetime faults in the runner above. Both
-are fixed in `scripts/leases.rs`; this section says what the lifecycle is, what was chosen and
-what is **read**, **measured** (here, on the Mac, `RUST_BACKTRACE=0`) and **not run**.
+Review of `91d58995` (2026-10-26/27) found two request-lifetime faults in the runner above.
+`scripts/leases.rs` answers both; this section says what the lifecycle is, what was chosen and what is
+**read**, **measured** (on the Mac, `RUST_BACKTRACE=0`: the lease rules and a two-process component
+test; on Linux through the daemon, below) and not shown. Whether they are fixed is for the review
+to say; the Linux runs below are the evidence it can read.
 
 ### The lifecycle (read)
 
@@ -523,7 +525,8 @@ that per script and shares it among the builds that only read:
 - what a build judged is kept by (build, run directory): once judged, a script is not judged or
   run again in that build, whatever other builds did between its requests, and a failure is kept
   with its message and delivered by each request;
-- the daemon sends `retire <build>` to the worker once the client has its answer; a worker that
+- the daemon sends `retire <build>` to the worker from a thread of its own, after `built()` returns
+  and the reply is on its way to the client (it delays and can hang no client); a worker that
   ends releases its leases with its descriptors;
 - a run that finds the lease held by another build **of the same worker** is put off
   (`scripts::Busy`; the main loop asks again after `Event::Retired`), because only that build's
@@ -570,9 +573,64 @@ kept for the last build only (the behaviour before this change), the A/B/A count
 failing-script test fail and the others pass, as the cross-process tests rest on `flock` alone.
 This is the old behaviour restated, not the old code run.
 
-### Not run
+### Linux, through the daemon (measured, 2026-10-27)
 
-The same barrier through two real workers (daemon, load, compile, link) needs the Linux whole build,
-which this Mac cannot run (#255); the `retire` message from the daemon to the worker and the main
-loop's putting a request off were typechecked and are read, not exercised. The 42-probe
-`scriptedits.py` suite and the P0-A audit were not rerun for this change. Not claimed.
+Source `1d895248` (code `167e5fdb` plus harness commits), Linux aarch64, Docker `rust:1.99.0-bookworm`,
+one container with `--memory=6g --memory-swap=6g`, release build of `ra-jit` (2m20s), jobs 6,
+`RA_JIT_MEMORY_MAX=5G`, `RA_JIT_OWN_BASE_MEMORY=3G`, `RA_JIT_SPARE=0`, `RUST_BACKTRACE=0`; container
+and volumes removed afterwards. Binary sha256 `e13d4741…` (in the evidence).
+
+| Check | Result |
+|---|---|
+| `cargo test --release -p blaze-build-script`, untouched | 49 passed, 0 failed (the Mac's two APFS failures are the file system's) |
+| `cargo test --release -p ra-jit --bin ra-jit scripts::` | 19 passed |
+| `harness/leasebarrier.py` `same-worker`, `cross-worker`, `failure` | passed, run twice (the second run in the same container) |
+
+`harness/leasebarrier.py` builds a package of two programs with the daemon (`cargo ra-jit build`,
+`RA_JIT_WHOLE_BUILD=1`, blaze's compiler and linker; cargo only builds the oracle). Its script
+writes a file the programs `include!`, a `cfg`, a `rustc-env`, and a static archive it compiles
+(`cc`, `ar`) whose symbol the programs call: all of the value `GEN`, which the script watches.
+The worker is held by files (`RA_JIT_SCRIPT_BARRIER_DIR`; `scripts/barrier.rs`), not by time.
+
+- **Same worker.** A (`GEN=a`) is held after its scripts are judged and before its compile and
+  link. B (`GEN=b`) asks. B's checkout is loaded only after A's build (the worker settles first),
+  so nothing of B's reaches the script while A is held: the output's hash and the script's run
+  count do not change for 4 s. A is let go, builds, and its client is answered; the daemon's
+  `retire` is held at the worker. B's two requests are put off (`script-lease: put-off`, the
+  `Busy` path), and for 4 s more the output and run count do not change and B's client does not
+  end. A's programs, copied before the retire is let go, print `a` for the include, the variable,
+  the `cfg` and the archive's symbol, as cargo's do. The retire is let go: `retired released=1`,
+  and B runs the script 1.3 ms later (the `Event::Retired` wake-up) and builds. B's include,
+  variable and `cfg` are `b`'s; A's copies still print `a`. Script runs: `a`, `b`.
+- **Another worker.** Two daemons (`RA_JIT_HOME`), one project and target directory. The same,
+  but B (a worker of its own, cold) logs `waits` and runs the script 0.2 s after A's retire (the wait
+  polls, up to 250 ms apart); both
+  programs are the oracle's byte for byte, archive and all.
+- **Failure.** A build with two programs whose script fails (`exit 3`): the two requests of
+  each build log one `runs` and no `holds`; the script's runs are `bad` once for each of the two
+  failing builds; a build that works between them runs; the client's message is the same each time.
+
+What this does not show:
+
+- **Retire after the answer, from the outside.** The worker's log has no word of when the client
+  was answered, and the client's process ends a few ms after its answer. What is observed is that the
+  retire is held while the client ends and B has run nothing; that the daemon sends it after the
+  reply is **read** from `Request::Build` (it is spawned after `built()` returns).
+- **A warm worker does not relink for a library the script now names.** In the same worker
+  B's include, variable and `cfg` are `b`'s but `native=97`: the archive's contents are A's. This is
+  not the leases: with no second build, one worker, `GEN=a` then `GEN=b` (library named for the
+  value) leaves the program A's with exit 0 (`link: … not spliced: gen_value_b is not in the
+  executable`), and with one name `GEN=a` then `GEN=c` prints `native=97`, cargo's `99`. The same
+  controls give the same result on the binary of `91d58995` built the same way. The harness
+  records them as gaps (`link-control`, `archive-control`), not as passes. A is checked exactly:
+  its link is what a script of B's overwriting the archive would corrupt.
+- **The failure's text.** The client prints the first line of cargo's message
+  (`failed to run custom build command for …`); the exit status and the script's standard error, which
+  are further lines, are not in what the daemon sends it (a reply is one line). Read, not changed.
+- `scriptedits.py` (42 probes) and the P0-A audit were not rerun for this change. `build == 0`
+  keeps nothing.
+
+The earlier summary that both findings of review 5661429749 were fixed rests, for the lease and the
+retire and put-off path, on these runs on Linux (the Mac runs were of the lease rules and a
+two-process component test); for B's link in one worker it does not hold, for a reason that is
+older than the change.

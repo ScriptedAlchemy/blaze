@@ -27,6 +27,9 @@ All notable changes to ra-jit are written here. The format follows
   it waits for the builds that read the output (another worker's) or is asked again once they
   are over (this worker's), and a script runs once in each build whatever other builds asked in
   between. A script that failed fails each request of its build with the same message.
+  `script-lease:` lines in the worker's log say each step, and `RA_JIT_SCRIPT_BARRIER_DIR` holds a
+  worker by files at a build's compile and link or at its retire, which `harness/leasebarrier.py`
+  drives through the daemon (Linux).
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
