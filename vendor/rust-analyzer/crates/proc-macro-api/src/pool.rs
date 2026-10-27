@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::{MacroDylib, ProcMacro, ServerError, process::ProcMacroServerProcess};
+use crate::{LibrarySnapshot, MacroDylib, ProcMacro, ServerError, process::ProcMacroServerProcess};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcMacroServerPool {
@@ -52,7 +52,14 @@ impl ProcMacroServerPool {
     pub(crate) fn load_dylib(&self, dylib: &MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
         let _span = tracing::info_span!("ProcMacroServer::load_dylib").entered();
 
-        let dylib_path = Arc::new(dylib.path.clone());
+        let original_dylib_path = Arc::new(dylib.path.clone());
+        // The server may cache native loaded libraries by pathname/mtime. Give
+        // this immutable loaded generation its own file, retained by its handles.
+        let snapshot = stdx::tempfile::NamedTempFile::new_from_existing(
+            "proc-macro-content", dylib.path.as_ref(),
+        ).map_err(|error| ServerError { message: error.to_string(), io: None })?;
+        let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.path().to_owned()));
+        let snapshot = Arc::new(LibrarySnapshot(snapshot));
         use sha2::{Digest as _, Sha256};
         let dylib_content =
             std::fs::read(dylib_path.as_path()).ok().map(|bytes| Sha256::digest(bytes).into());
@@ -60,13 +67,13 @@ impl ProcMacroServerPool {
         let (first, rest) = self.workers.split_first().expect("worker pool must not be empty");
 
         let macros = first
-            .find_proc_macros(&dylib.path)?
+            .find_proc_macros(&dylib_path)?
             .map_err(|e| ServerError { message: e, io: None })?;
 
         rest.into_par_iter()
             .map(|worker| {
                 worker
-                    .find_proc_macros(&dylib.path)?
+                    .find_proc_macros(&dylib_path)?
                     .map(|_| ())
                     .map_err(|e| ServerError { message: e, io: None })
             })
@@ -80,6 +87,8 @@ impl ProcMacroServerPool {
                 kind,
                 dylib_path: dylib_path.clone(),
                 dylib_content,
+                original_dylib_path: original_dylib_path.clone(),
+                _snapshot: snapshot.clone(),
             })
             .collect())
     }

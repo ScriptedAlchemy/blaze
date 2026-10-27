@@ -164,6 +164,23 @@ impl Inputs {
             files.push(Watched::new(root.join(name), false));
         }
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+            // A macro is a producer used while loading its callers. Source,
+            // included assets and dependency producers are content inputs, even
+            // when their size and timestamps were restored.
+            let mut macro_inputs = std::collections::BTreeSet::new();
+            let mut pending: Vec<_> = cargo.packages().filter(|&package| {
+                cargo[package].targets.iter().any(|&target| cargo[target].kind.is_proc_macro())
+            }).collect();
+            while let Some(package) = pending.pop() {
+                if !macro_inputs.insert(package) {
+                    continue;
+                }
+                pending.extend(cargo[package].dependencies.iter().map(|dependency| dependency.pkg));
+            }
+            for package in macro_inputs {
+                let manifest: &Path = cargo[package].manifest.as_ref();
+                files.push(Watched::new(manifest.parent().unwrap().to_owned(), true));
+            }
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
                 files.push(Watched::new(manifest.to_owned(), false));
@@ -373,7 +390,10 @@ fn newest(path: &Path, package: bool) -> Option<std::time::SystemTime> {
 fn stamp_into(path: &Path, package: bool, hasher: &mut FxHasher) {
     let Ok(metadata) = std::fs::metadata(path) else { return };
     if !metadata.is_dir() {
-        (metadata.len(), metadata.modified().ok()).hash(hasher);
+        match std::fs::read(path) {
+            Ok(bytes) => bytes.hash(hasher),
+            Err(_) => "unreadable".hash(hasher),
+        }
         return;
     }
     let Ok(entries) = std::fs::read_dir(path) else { return };

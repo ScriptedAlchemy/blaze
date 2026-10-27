@@ -114,6 +114,16 @@ pub struct ProcMacro {
     name: Box<str>,
     kind: ProcMacroKind,
     dylib_content: Option<[u8; 32]>,
+    original_dylib_path: Arc<AbsPathBuf>,
+    _snapshot: Arc<LibrarySnapshot>,
+}
+
+struct LibrarySnapshot(stdx::tempfile::NamedTempFile);
+
+impl fmt::Debug for LibrarySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.path().fmt(f)
+    }
 }
 
 impl Eq for ProcMacro {}
@@ -121,7 +131,7 @@ impl PartialEq for ProcMacro {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.kind == other.kind
-            && self.dylib_path == other.dylib_path
+            && self.original_dylib_path == other.original_dylib_path
             && self.dylib_content == other.dylib_content
     }
 }
