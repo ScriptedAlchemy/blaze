@@ -2055,7 +2055,14 @@ def selector_moves(sc, source_sha):
                           if os.path.exists(os.path.join(once, f"trail-{name}")) else [])
     h = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     try:
-        if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
+        # The worker is ready when its first program is linked: no request of the harness comes before V's (a request
+        # after the load would load R again, on the manifest the script rewrote, and R would no longer be the old target).
+        deadline = time.time() + WAIT
+        while time.time() < deadline and not (os.path.exists(sock) and os.path.exists(os.path.join(sc.dir, "w.bin"))):
+            time.sleep(0.5)
+        time.sleep(3)
+        if not (os.path.exists(sock) and os.path.exists(os.path.join(sc.dir, "w.bin"))):
+            sc.fail("the worker did not load R and link its program")
             return
         log = lambda: open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
         r_manifest, v_manifest = os.path.join(paths["r"], "Cargo.toml"), os.path.join(paths["v"], "Cargo.toml")
