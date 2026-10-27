@@ -3,8 +3,8 @@
 blaze's daemon and workers (docs/reports/SCRIPTEDITS.md, "What a build holds of a script").
 
 usage: leasebarrier.py [--work DIR] [--json OUT] [--source-sha SHA] [scenario ...]
-scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, link-control,
-           archive-control     (all, by default)
+scenarios: same-worker, cross-worker, failure, lost-wake, reload-busy, direct, coab, internal,
+           link-control, archive-control     (all, by default)
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, where the whole
 build works (`RA_JIT_WHOLE_BUILD=1`; #255 is macOS's). Cargo is the oracle only: it builds the
@@ -42,6 +42,15 @@ direct        Two direct runs (`ra-jit <project> --crate .. --exe ..`, no daemon
               project and target directory. A is held after its scripts and before its compile
               and link; B, with another `GEN`, has to wait for A's process, not to rewrite the
               output A is to read.
+coab          Three daemons over one project and target directory and the review's opposite orders
+              (five packages p0..p4: scripts in p2 and p4; p1 and p3 have p2 as a dependency and p4
+              as a build dependency): C reads p2's output and its retire is held; A (-p p1) runs p4's
+              script and then needs p2's, which C reads; B (-p p3) finds p2 fresh and needs p4's.
+              Neither may wait for the other: with no deadline that ends them, they all end when C
+              is retired.
+internal      A build nobody asked for: a worker that took the code of the checkout from the store
+              builds it again after it has answered. It is held before its compile and link while
+              another worker, with another `GEN`, asks for the scripts; it must wait.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -198,6 +207,8 @@ class Scenario:
             if name in os.environ:
                 env[name] = os.environ[name]
         env["RA_JIT_SCRIPT_BARRIER_DIR"] = os.path.join(self.dir, "barrier-" + home)
+        # The deadline of a build that waits, in the binaries that have one (it is a failure there).
+        env["RA_JIT_SCRIPT_LEASE_WAIT_SECS"] = "30"
         os.makedirs(env["RA_JIT_SCRIPT_BARRIER_DIR"], exist_ok=True)
         env.update(extra or {})
         return env
@@ -219,7 +230,11 @@ class Scenario:
             out, err = p.communicate(timeout=within or WAIT)
         except subprocess.TimeoutExpired:
             p.kill()
-            out, err = p.communicate()
+            # What the client's children still hold open is not waited for.
+            try:
+                out, err = p.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out, err = "", "(the client was killed; its output was not read)"
             self.fail(f"{what}: the client did not end in {within or WAIT:.0f}s")
         p.ended = time.time_ns() // 1000
         p.out, p.err = out, err
@@ -673,6 +688,166 @@ def direct(sc, source_sha):
     sc.timeouts()
 
 
+X_SCRIPT = r'''use std::{env, fs, io::Write, path::PathBuf};
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=@VAR@");
+    let v = env::var("@VAR@").unwrap_or_else(|_| "none".to_owned());
+    let mut log = fs::OpenOptions::new().create(true).append(true).open("@LOG@").unwrap();
+    writeln!(log, "@TAG@:{v}").unwrap();
+    fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("val.rs"), format!("pub const VAL: &str = {v:?};\n")).unwrap();
+}
+'''
+FROM_Y_SCRIPT = r'''use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(out.join("from_y.rs"), format!("pub const FROM_Y: &str = {:?};\n", p4::VAL)).unwrap();
+}
+'''
+
+
+def coab_project(sc, ws):
+    def put(name, text):
+        path = os.path.join(ws, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    put("Cargo.toml", '[workspace]\nmembers = ["p0", "p1", "p2", "p3", "p4"]\nresolver = "2"\n')
+    for lib, tag, var in (("p2", "x", "XVAL"), ("p4", "y", "YVAL")):
+        put(f"{lib}/Cargo.toml", f'[package]\nname = "{lib}"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n')
+        put(f"{lib}/build.rs", X_SCRIPT.replace("@VAR@", var).replace("@TAG@", tag).replace("@LOG@", sc.runs_log))
+        put(f"{lib}/src/lib.rs", 'include!(concat!(env!("OUT_DIR"), "/val.rs"));\n')
+    put("p0/Cargo.toml", '[package]\nname = "p0"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\np2 = { path = "../p2" }\n')
+    put("p0/src/main.rs", 'fn main() { println!("p0 x={}", p2::VAL); }\n')
+    for prog in ("p1", "p3"):
+        put(f"{prog}/Cargo.toml", f'[package]\nname = "{prog}"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n'
+            '[dependencies]\np2 = { path = "../p2" }\n[build-dependencies]\np4 = { path = "../p4" }\n')
+        put(f"{prog}/build.rs", FROM_Y_SCRIPT)
+        put(f"{prog}/src/main.rs", 'include!(concat!(env!("OUT_DIR"), "/from_y.rs"));\n'
+            f'fn main() {{ println!("{prog} x={{}} y={{}}", p2::VAL, FROM_Y); }}\n')
+    open(sc.runs_log, "w").close()
+    subprocess.run(["cargo", "generate-lockfile"], cwd=ws, env=sc.env("x"), capture_output=True, check=True)
+
+
+def coab(sc, source_sha):
+    coab_project(sc, sc.ws)
+    # What cargo builds for each: the oracle, in a copy of the project.
+    expected = {}
+    for prog, x, y in (("p0", "x1", None), ("p1", "x2", "y2"), ("p3", "x1", "y3")):
+        shutil.rmtree(os.path.join(sc.dir, "oracle-ws"), ignore_errors=True)
+        saved, sc.runs_log = sc.runs_log, os.path.join(sc.dir, "oracle-runs.log")
+        coab_project(sc, os.path.join(sc.dir, "oracle-ws"))
+        sc.runs_log = saved
+        env = dict(sc.env("oracle"), XVAL=x, CARGO_TARGET_DIR=os.path.join(sc.dir, "oracle-target"))
+        if y:
+            env["YVAL"] = y
+        env.pop("RA_JIT_WHOLE_BUILD", None)
+        ran = subprocess.run(["cargo", "build", "-p", prog], cwd=os.path.join(sc.dir, "oracle-ws"), env=env,
+                             capture_output=True, text=True, timeout=WAIT)
+        if ran.returncode != 0:
+            sc.fail(f"the oracle (cargo, {prog}) did not build: {ran.stderr[-400:]}")
+            return
+        expected[prog] = subprocess.run([os.path.join(sc.dir, "oracle-target", "debug", prog)],
+                                        capture_output=True, text=True).stdout
+    open(sc.runs_log, "w").close()
+    sc.arm("c", "retire")
+    # C reads p2's output, its build is answered and its retire is held.
+    C = sc.client("c", ("-p", "p0"), XVAL="x1")
+    sc.finish(C, "C")
+    if C.returncode != 0:
+        sc.fail(f"C's build exited {C.returncode}: {C.err[-600:]}")
+        return
+    bc = sc.reached("c", "retire")
+    if bc is None:
+        return
+    # A runs p4's script, then needs p2's, which C reads.
+    A = sc.client("a", ("-p", "p1"), XVAL="x2", YVAL="y2")
+    sc.notes["a-waits"] = sc.wait_event("a", "waits", within=WAIT)
+    # B finds p2 fresh, and needs p4's script, which A has run.
+    B = sc.client("b", ("-p", "p3"), XVAL="x1", YVAL="y3")
+    sc.notes["b-waits"] = sc.wait_event("b", "waits", within=WAIT)
+    time.sleep(WATCH)
+    for tag, p in (("A", A), ("B", B)):
+        if p.poll() is not None:
+            sc.fail(f"{tag}'s client ended ({p.returncode}) while C was not retired: {p.communicate()[1][-400:]}")
+    sc.release("c", "retire", bc)
+    sc.disarm("c", "retire")
+    sc.finish(A, "A", within=LOST)
+    kept_a = os.path.join(sc.dir, "a-p1")
+    if os.path.exists(os.path.join(sc.ws, "target", "debug", "p1")):
+        shutil.copy2(os.path.join(sc.ws, "target", "debug", "p1"), kept_a)
+    sc.finish(B, "B", within=LOST)
+    for tag, p in (("A", A), ("B", B)):
+        if p.returncode != 0:
+            sc.fail(f"{tag}'s build exited {p.returncode} (no deadline may end it): {p.err[-600:]}")
+    got = subprocess.run([kept_a], capture_output=True, text=True).stdout if os.path.exists(kept_a) else None
+    if got != expected["p1"]:
+        sc.fail(f"A: p1 printed {got!r}, the oracle's {expected['p1']!r}")
+    got = sc.program("p3")
+    if got != expected["p3"]:
+        sc.fail(f"B: p3 printed {got!r}, the oracle's {expected['p3']!r}")
+    sc.notes["runs"] = sc.runs()
+    for want in ("x:x1", "y:y2", "x:x2", "y:y3"):
+        if want not in sc.runs():
+            sc.fail(f"the script that logs {want!r} did not run: {sc.runs()}")
+    sc.timeouts()
+
+
+def internal(sc, source_sha):
+    extra = {"GEN_ARCHIVE": "same"}
+    one = ("--bin", "gen-one")
+    exp_b = sc.oracle("b", extra)
+    sc.project()
+    A1 = sc.client("a", one, GEN="a", **extra)
+    sc.finish(A1, "A1")
+    if A1.returncode != 0:
+        sc.fail(f"the first build exited {A1.returncode}: {A1.err[-600:]}")
+        return
+    sc.stop()
+    # A worker that takes the checkout from the store, and builds it again after it has answered.
+    sc.arm("a", "consume")
+    A2 = sc.client("a", one, GEN="a", **extra)
+    first = sc.reached("a", "consume", A2)
+    if first is None:
+        return
+    sc.release("a", "consume", first)
+    sc.finish(A2, "A2")
+    if A2.returncode != 0:
+        sc.fail(f"A2's build exited {A2.returncode}: {A2.err[-600:]}")
+        return
+    deadline, nobody = time.time() + 60, None
+    while time.time() < deadline and nobody is None:
+        for path in glob.glob(os.path.join(sc.barrier("a"), "consume.*.reached")):
+            n = int(os.path.basename(path).split(".")[1])
+            if n != first:
+                nobody = n
+        time.sleep(0.2)
+    log = sc.log_of("a")
+    if nobody is None:
+        sc.fail("no build nobody asked for was held before its compile and link: the case was not exercised "
+                f"({'dehydrate' if 'compiling what the store had' in log else 'the worker did not take the checkout from the store'})")
+        return
+    sc.disarm("a", "consume")
+    held = tree_hash(sc.run_dir())
+    B = sc.client("b", one, GEN="b", **extra)
+    sc.notes["b-waits"] = sc.wait_event("b", "waits")
+    sc.unchanged(held, "B asking while a build nobody asked for is held before its compile and link", B)
+    if B.poll() is not None:
+        sc.fail(f"B ended ({B.returncode}) while the build nobody asked for was held")
+    sc.release("a", "consume", nobody)
+    sc.finish(B, "B", within=LOST)
+    if B.returncode != 0:
+        sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
+    sc.check_programs("B", {}, {"gen-one": exp_b["gen-one"], "gen-two": exp_b["gen-two"]}, "b") \
+        if os.path.exists(os.path.join(sc.ws, "target", "debug", "gen-two")) else None
+    if not any(e[0] == "holds" and e[1] == nobody and "loaded" in e[4] for e in sc.events("a")):
+        sc.fail("the build nobody asked for did not log that it holds the scripts' output")
+    sc.timeouts()
+
+
 def link_control(sc, source_sha):
     """No concurrency, no barrier: GEN=a, then GEN=b, a static library named for the value. Not
     about leases: whether a warm worker, which finds only the script's output changed, links the
@@ -717,6 +892,8 @@ SCENARIOS = {
     "lost-wake": lost_wake,
     "reload-busy": reload_busy,
     "direct": direct,
+    "coab": coab,
+    "internal": internal,
     "archive-control": archive_control,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),
