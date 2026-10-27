@@ -2876,7 +2876,12 @@ fn compiled_instance<'db>(
     if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
         eprintln!("input-codegen: instance {:?}", instance.def);
     }
-    let krate = env.krate;
+    // The code can be instantiated in a caller crate, but its included literals
+    // belong to the definition's crate, not the monomorphization environment.
+    let krate = match instance.def {
+        InstanceDef::Fn(func) => func.krate(db),
+        _ => env.krate,
+    };
     let code = tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code);
     db.depend_on_included_inputs(krate);
     code
