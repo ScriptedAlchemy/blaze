@@ -280,11 +280,13 @@ impl Server {
                     .status(status)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::ACCEPT_RANGES, "bytes")
-                    .header(
+                    .header(header::CONTENT_LENGTH, count.to_string());
+                if object.kind != crate::blob::Kind::Packed {
+                    answer = answer.header(
                         header::ETAG,
                         format!("\"{}\"", hex(&object.digest.expect("a blob digest"))),
-                    )
-                    .header(header::CONTENT_LENGTH, count.to_string());
+                    );
+                }
                 if let Some(written) = written
                     && let Ok(value) = HeaderValue::from_str(&written_ms(written).to_string())
                 {
@@ -612,7 +614,9 @@ fn method_not_allowed(method: &Method, allowed: &str) -> Error {
 /// The digest a bare `/v1/blob/<sha256>` names, when the name is one.
 fn bare_digest(name: &str) -> Option<Digest> {
     let mut digest = [0u8; 32];
-    if name.len() != 64 || !name.bytes().all(|it| it.is_ascii_hexdigit()) {
+    if name.len() != 64
+        || !name.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+    {
         return None;
     }
     for (byte, pair) in digest.iter_mut().zip(name.as_bytes().chunks(2)) {
@@ -691,6 +695,11 @@ fn key_of(dir: &Path) -> Result<SigningKey, Error> {
             let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 Error::internal(format!("{} is not the 32 bytes of a key", at.display()))
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600))?;
+            }
             Ok(SigningKey::from_bytes(&seed))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -700,8 +709,14 @@ fn key_of(dir: &Path) -> Result<SigningKey, Error> {
             let partial = temporary(&at);
             let written = (|| -> std::io::Result<()> {
                 use std::io::Write as _;
-                let mut file =
-                    std::fs::File::options().write(true).create_new(true).open(&partial)?;
+                let mut options = std::fs::File::options();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&partial)?;
                 file.write_all(&seed)?;
                 ra_jit_store::name_file_whole(&file, &partial, &at)
             })();

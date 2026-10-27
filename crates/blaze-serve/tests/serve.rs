@@ -492,3 +492,91 @@ fn a_bare_digest_finds_the_object_named_by_it() {
     assert_eq!(bare.status, 200);
     assert_eq!(bare.body, keys);
 }
+
+#[test]
+fn a_compressed_pack_requires_its_named_route_and_has_no_raw_digest_etag() {
+    let served = Served::start();
+    let raw = pack(&[(digest(b"key"), b"a value")]);
+    let compressed = zstd::bulk::compress(&raw, 3).unwrap();
+    let d = hex(&digest(&raw));
+    let path = format!("/v1/blob/packs/{d}.pack.zst");
+    assert_eq!(served.ask("PUT", &path, &[], &compressed).status, 204);
+    for method in ["GET", "HEAD"] {
+        assert_eq!(served.ask(method, &format!("/v1/blob/{d}"), &[], &[]).status, 404);
+        let answer = served.ask(method, &path, &[], &[]);
+        assert_eq!(answer.status, 200);
+        assert!(answer.header("etag").is_none());
+        assert_eq!(answer.header("content-length"), Some(compressed.len().to_string().as_str()));
+        if method == "GET" {
+            assert_eq!(answer.body, compressed);
+        } else {
+            assert!(answer.body.is_empty());
+        }
+    }
+}
+
+#[test]
+fn uppercase_digest_routes_are_rejected_without_creating_aliases() {
+    let served = Served::start();
+    let bytes = b"canonical lowercase";
+    let d = hex(&digest(bytes));
+    assert_ne!(d, d.to_uppercase());
+    for name in [
+        format!("units/{}", d.to_uppercase()),
+        format!("keys/{}", d.to_uppercase()),
+        format!("packs/{}.pack", d.to_uppercase()),
+        d.to_uppercase(),
+    ] {
+        assert_eq!(served.ask("PUT", &format!("/v1/blob/{name}"), &[], bytes).status, 404);
+    }
+    let path = format!("/v1/blob/units/{d}");
+    assert_eq!(served.ask("PUT", &path, &[], bytes).status, 204);
+    assert_eq!(served.ask("GET", &path, &[], &[]).body, bytes);
+    let listed = served.ask("GET", "/v1/objects?prefix=units/", &[], &[]);
+    let objects = blaze_serve::listed(&listed.body).unwrap();
+    assert_eq!(objects.iter().map(|it| &it.0).collect::<Vec<_>>(), vec![&format!("units/{d}")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_server_key_is_private_when_created_and_when_reopened() {
+    use std::os::unix::fs::PermissionsExt;
+    let served = Served::start();
+    let at = served.dir().join("key");
+    assert_eq!(std::fs::metadata(&at).unwrap().permissions().mode() & 0o777, 0o600);
+    let original = std::fs::read(&at).unwrap();
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Server::open(&Config::at(served.dir(), 0)).unwrap();
+    assert_eq!(std::fs::read(&at).unwrap(), original);
+    assert_eq!(std::fs::metadata(&at).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn http_reads_reject_symlink_objects_and_oversize_upload_length() {
+    let served = Served::start();
+    let outside = tempfile::tempdir().unwrap();
+    let bytes = b"outside";
+    let name = format!("units/{}", hex(&digest(bytes)));
+    std::fs::write(outside.path().join("secret"), bytes).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), served.dir().join(&name)).unwrap();
+    assert_eq!(served.ask("GET", &format!("/v1/blob/{name}"), &[], &[]).status, 400);
+    let mut stream = TcpStream::connect(("127.0.0.1", served.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let request = format!(
+        "PUT /v1/blob/units/{} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "01".repeat(32),
+        Limits::DOCUMENTED.blob + 1
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    assert_eq!(Answer::parse(&answer).status, 413);
+    assert!(
+        std::fs::read_dir(served.dir().join("units")).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.'))
+    );
+}
