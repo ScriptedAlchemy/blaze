@@ -744,6 +744,35 @@ Regression on the fixed binary: `first-join`, `first-join-shared`, `join`, `worl
 `scripts::` and `recovery::` tests. Not shown: several file-alike candidates, mixed placed/split roots, a file
 changed between the choice and the load.
 
+### One choice of the checkout a project is read through (`b09055d3` → this head)
+
+The sixth independent review found the same invariant broken in time: the checkout an unloaded project
+is read through was decided twice, by the quick test of two moments. Before the check (which judges its scripts) a
+base that is relinking in the background is not quick, so with `RA_JIT_SPLIT=0` nothing was judged; the
+worker then settles (it waits for the link, and turns to the request's variables), the link ends, the base is
+quick, and `view_of` took the view. V was read through a base whose scripts were not run for V's variables
+(the program had the base's directives), and the pin of that base's `a` world succeeded.
+`Checkouts::sharing` now decides once, before the check; its checkout is the one judged (`stale` takes it), and
+the view taken later is accepted only if it is that one (`judged_view`; a loaded project's own view is
+never in question). Otherwise the project is loaded on its own, as the first choice said, which is legal. Not changed: the
+policy matrix, the join's variables, the executor's admission. A test hook holds a build as it begins to link
+(`linking`, inert without the barrier directory).
+
+| Linux, `RA_JIT_SPLIT=0`, quick overlay; R loaded `GEN=a`; V file-alike; R's executable taken away so a request for R relinks in the background and is held as it enters the link; V's first request, `GEN=b`, waits for it; the link is let go | baseline `b8a011fe` (= `b09055d3` + the hook) | fixed |
+|---|---|---|
+| route | `view: …/v as …/r` (V read through R) | V loaded on its own (no view line) |
+| V's script | never ran (trail empty), no V program | ran once, for `b` (trail `b B`) |
+| R's script | `a load, a serve, a A` (R's own request) | the same, no `b` |
+| V's program | none (`first.bin` is not written) | `include=b env=b cfg=b native=98` = cargo's |
+
+`first-join-shared` and `first-join-private` pass on the fixed binary in the same batch. Component:
+`judged_view` over loaded / unjudged / judged / other base; 42 passed with the other `scripts::`, `recovery::` and
+policy tests. Not shown: the same with splitting on (the base is judged before and after by the same
+rule), several candidates, a base that becomes quick after the check in other modes (Always never depends on it).
+The container's HTTPS to crates.io was intercepted in this session, so the Linux build used the registry
+crates of `Cargo.lock` as `cargo vendor --locked` wrote them on the Mac (mounted read-only) and the host's
+`rust-src` component; the failed batches before that are kept.
+
 ### What is not shown, not fixed, or wider
 
 - **A warm worker does not relink for a library the script now names**: the `native` of an edited program is
