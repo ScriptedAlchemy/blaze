@@ -1173,14 +1173,15 @@ def join(sc, source_sha):
 
 def edited_program(pkg):
     """`one.rs` as an editor writes it when it adds a read of the generated file in the body
-    (`include_bytes!`), and prints whether it has the other value."""
+    (`include_bytes!`), and prints the byte that is the value (`pub const GEN: &str = "<v>"`)."""
     text = PROGRAM.replace("@NAME@", f"{pkg}-one")
     old = 'native());'
     assert old in text
+    # Only what the executable has: a patch needs the functions of std it calls to be in it
+    # (`bool`'s `Display` is not), and an `i32` is printed.
     text = text.replace(
         'native={}", env!("GEN_VALUE"), native());',
-        'native={} bytes_has_b={}", env!("GEN_VALUE"), native(), '
-        'String::from_utf8_lossy(GENERATED).contains("\\"b\\""));')
+        'native={} bytes={}", env!("GEN_VALUE"), native(), GENERATED.get(23).copied().unwrap_or(0) as i32);')
     return text + '\nstatic GENERATED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gen.rs"));\n'
 
 
