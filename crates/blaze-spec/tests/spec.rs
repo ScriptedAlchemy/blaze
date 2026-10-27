@@ -65,7 +65,10 @@ fn build(
 }
 
 fn app(command: Subcommand, args: &[&str]) -> Spec {
-    build(&Fixture::new(), command, args, units(), vec![0])
+    // This component helper supplies an already-selected graph. Doctest requests
+    // select its library rather than its binary; real selection is tested in build_spec.rs.
+    let roots = if args.contains(&"--doc") { vec![1] } else { vec![0] };
+    build(&Fixture::new(), command, args, units(), roots)
         .unwrap_or_else(|e| panic!("{command:?} {args:?}: {e}"))
 }
 
