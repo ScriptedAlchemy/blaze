@@ -500,7 +500,7 @@ struct BuildSpec {                  // 0..=12, schema version 2
     platform: Digest,               // 5, ExecPlatform's digest
     rustflags: Vec<String>,         // 6, resolved from RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS
                                     //    and config, only flags blaze honours
-    config_env: Vec<(String, String)>, // 7, set: [env] of .cargo/config.toml, resolved
+    config_env: Vec<(String, ConfigEnvValue)>, // 7, set, tagged resolved configuration values (v2)
     script_env: Vec<(String, String)>, // 8, set: variables build scripts may read, fixed
     cwd: String,                    // 9, relative to the workspace root
     command: Command,               // 10
@@ -510,6 +510,10 @@ struct BuildSpec {                  // 0..=12, schema version 2
 
 ```rust
 struct SourcePath(String);          // normalized source-relative UTF-8 path
+enum ConfigEnvValue {
+    Literal(String),               // 0, [0, text], including absolute literal values
+    WorkspaceRelative(SourcePath), // 1, [1, path], joined to the selected workspace on the worker
+}
 ```
 
 `SourcePath` is normalized UTF-8 text with `/` separators (`.` for the root).
@@ -517,6 +521,11 @@ Empty paths/components, `.` or `..` components, absolute paths, backslashes, NUL
 and drive prefixes are malformed wire inputs, not paths to normalize at execution.
 `workspace_manifest` names a file and cannot be `.`. `cwd` keeps its original
 workspace-relative meaning and is validated by the same path rules on decode.
+Schema 2 replaces field 7's schema-1 string values with these explicit enum tags;
+the old string encoding is rejected, never guessed from the text. Ambient overrides
+of non-forced `[env]` entries are literals. A config-relative value is normalized
+against the config file's origin and represented relative to the selected workspace.
+Materialization consumes the serialized tag, not an out-of-band list of names.
 The selected workspace is the parent of that manifest; replay first locates it
 under the materialized source root, then joins `cwd` there and revalidates with
 the explicit saved manifest. No repository-root fallback or project-name inference.

@@ -480,6 +480,7 @@ wire_types! {
     RootRef,
     BuildSpec,
     SourcePath,
+    ConfigEnvValue,
     UnitSpec,
     ProfileSpec,
     LocalPolicy,

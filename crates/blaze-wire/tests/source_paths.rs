@@ -53,3 +53,35 @@ fn legacy_missing_location_unknown_fields_and_unsafe_cwd_are_refused() {
     );
     assert_eq!(blaze_wire::VERSION, 2);
 }
+
+#[test]
+fn configuration_tags_are_required_and_relative_paths_are_validated() {
+    use blaze_wire::ConfigEnvValue;
+    let literal = ConfigEnvValue::Literal("data".to_owned());
+    let relative = ConfigEnvValue::WorkspaceRelative(SourcePath::new("data".to_owned()).unwrap());
+    assert_ne!(blaze_wire::encode(&literal), blaze_wire::encode(&relative));
+    assert_eq!(
+        blaze_wire::decode::<ConfigEnvValue>(&blaze_wire::encode(&relative), &Limits::default())
+            .unwrap(),
+        relative
+    );
+    // Schema 1's bare string is not interpreted as a literal in schema 2.
+    assert!(
+        blaze_wire::decode::<ConfigEnvValue>(
+            &blaze_wire::encode(&"data".to_owned()),
+            &Limits::default()
+        )
+        .is_err()
+    );
+    let mut bad = Encoder::new();
+    bad.array(2);
+    bad.uint(1);
+    "../outside".to_owned().encode(&mut bad);
+    assert_eq!(
+        blaze_wire::decode::<ConfigEnvValue>(&bad.into_bytes(), &Limits::default())
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidPath
+    );
+    assert!(blaze_wire::decode::<ConfigEnvValue>(&[0x82, 2, 0xf6], &Limits::default()).is_err());
+}
