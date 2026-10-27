@@ -1225,7 +1225,9 @@ def generation(sc, source_sha):
     time.sleep(1.2)
     with open(value, "w") as f:
         f.write("b\n")
-    B = sc.client("b", one, **extra)
+    # B builds the other program of the package, so that it does not write the executable that
+    # A's edit is spliced into: the script is one, and runs again for it.
+    B = sc.client("b", ("--bin", "gen-two"), **extra)
     sc.finish(B, "B")
     if B.returncode != 0:
         sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
