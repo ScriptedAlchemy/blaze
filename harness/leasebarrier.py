@@ -48,9 +48,9 @@ coab          Three daemons over one project and target directory and the review
               script and then needs p2's, which C reads; B (-p p3) finds p2 fresh and needs p4's.
               Neither may wait for the other: with no deadline that ends them, they all end when C
               is retired.
-internal      A build nobody asked for: a worker that took the code of the checkout from the store
-              builds it again after it has answered. It is held before its compile and link while
-              another worker, with another `GEN`, asks for the scripts; it must wait.
+internal      An editor's `edit` of a source file, which the worker builds for a client that names no
+              build. It is held before its compile and link while another worker, with another
+              `GEN`, asks for the scripts; it must wait.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
               name whose contents change. What blaze prints differing from cargo's is recorded as a
               gap, not a failure of the lease scenarios.
@@ -796,7 +796,22 @@ def coab(sc, source_sha):
     sc.timeouts()
 
 
+def send_edit(home_dir, path, text):
+    """An editor's `edit` of a source file, as the daemon takes it (docs/live.md): the whole text on
+    one line. Its answer, or the error of not getting one."""
+    import socket
+    escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(WAIT)
+        s.connect(os.path.join(home_dir, "daemon.sock"))
+        s.sendall(f"edit\t{path}\t{escaped}\n".encode())
+        return s.makefile().readline().strip()
+
+
 def internal(sc, source_sha):
+    """An edit is built by the worker for a client that names no build: its compile and link read
+    the scripts' output as the process last judged it, and another worker must not change it."""
+    import threading
     extra = {"GEN_ARCHIVE": "same"}
     one = ("--bin", "gen-one")
     exp_b = sc.oracle("b", extra)
@@ -806,45 +821,38 @@ def internal(sc, source_sha):
     if A1.returncode != 0:
         sc.fail(f"the first build exited {A1.returncode}: {A1.err[-600:]}")
         return
-    sc.stop()
-    # A worker that takes the checkout from the store, and builds it again after it has answered.
     sc.arm("a", "consume")
-    A2 = sc.client("a", one, GEN="a", **extra)
-    first = sc.reached("a", "consume", A2)
-    if first is None:
-        return
-    sc.release("a", "consume", first)
-    sc.finish(A2, "A2")
-    if A2.returncode != 0:
-        sc.fail(f"A2's build exited {A2.returncode}: {A2.err[-600:]}")
-        return
-    deadline, nobody = time.time() + 60, None
-    while time.time() < deadline and nobody is None:
-        for path in glob.glob(os.path.join(sc.barrier("a"), "consume.*.reached")):
-            n = int(os.path.basename(path).split(".")[1])
-            if n != first:
-                nobody = n
-        time.sleep(0.2)
-    log = sc.log_of("a")
+    path = os.path.join(sc.ws, "src", "one.rs")
+    text = open(path).read() + "// an edit\n"
+    answer = {}
+    editor = threading.Thread(target=lambda: answer.update(said=send_edit(sc.env("a")["RA_JIT_HOME"], path, text)))
+    editor.start()
+    nobody = sc.reached("a", "consume", None, within=120)
     if nobody is None:
-        sc.fail("no build nobody asked for was held before its compile and link: the case was not exercised "
-                f"({'dehydrate' if 'compiling what the store had' in log else 'the worker did not take the checkout from the store'})")
         return
     sc.disarm("a", "consume")
     held = tree_hash(sc.run_dir())
     B = sc.client("b", one, GEN="b", **extra)
     sc.notes["b-waits"] = sc.wait_event("b", "waits")
-    sc.unchanged(held, "B asking while a build nobody asked for is held before its compile and link", B)
+    sc.unchanged(held, "B asking while an edit is held before its compile and link", B)
     if B.poll() is not None:
-        sc.fail(f"B ended ({B.returncode}) while the build nobody asked for was held")
+        sc.fail(f"B ended ({B.returncode}) while the edit was held")
     sc.release("a", "consume", nobody)
+    editor.join(WAIT)
+    sc.notes["edit-said"] = answer.get("said")
+    if not str(answer.get("said", "")).startswith("ok"):
+        sc.fail(f"the edit was answered {answer.get('said')!r}")
     sc.finish(B, "B", within=LOST)
     if B.returncode != 0:
         sc.fail(f"B's build exited {B.returncode}: {B.err[-600:]}")
-    sc.check_programs("B", {}, {"gen-one": exp_b["gen-one"], "gen-two": exp_b["gen-two"]}, "b") \
-        if os.path.exists(os.path.join(sc.ws, "target", "debug", "gen-two")) else None
-    if not any(e[0] == "holds" and e[1] == nobody and "loaded" in e[4] for e in sc.events("a")):
-        sc.fail("the build nobody asked for did not log that it holds the scripts' output")
+    got = sc.program("gen-one")
+    if got != exp_b["gen-one"]:
+        sc.fail(f"B: gen-one printed {got!r}, the oracle's {exp_b['gen-one']!r}")
+    mine = [e for e in sc.events("a") if e[0] == "holds" and e[1] == nobody and "loaded" in e[4]]
+    sc.notes["edit-holds"] = mine
+    if not mine:
+        sc.fail("the edit's build did not log that it holds the scripts' output (a build with no number "
+                "holds nothing in the binary under test)")
     sc.timeouts()
 
 
