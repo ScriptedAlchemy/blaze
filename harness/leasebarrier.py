@@ -93,6 +93,9 @@ first-join    A worker started by hand with R loaded (`GEN=a`; its script is val
 first-join-private  The same with V file-alike to R (the same bytes), `RA_JIT_SPLIT=0` and `RA_JIT_OVERLAY=0`, and a script that
               fails for `b` in R's directory only: V is read through R by neither policy, so R's script is not run
               for it, V's own is, and V is built, as cargo builds it.
+quick-choice  `RA_JIT_SPLIT=0`, quick overlay: a request for R is held as it enters its link (the executable was taken
+              away), V's first request arrives (R is no candidate while it links), the worker settles and the link is let
+              go: V is loaded on its own and judged for its variables, not read through R's world.
 first-join-shared  The same with V, a checkout of R's repository with R's scripts: V reads R's scripts, which are
               judged for `b` (the trail says so), and fail as cargo's would.
 archive-control  Not about leases, no concurrency: GEN=a then GEN=c with a static archive of one
@@ -1750,6 +1753,82 @@ def first_join_private(sc, source_sha):
     first_join(sc, source_sha, True, private=True)
 
 
+def quick_choice(sc, source_sha):
+    """`RA_JIT_SPLIT=0` and the default (quick) overlay; R loaded `GEN=a`; V file-alike to R with the same
+    script, which succeeds for `a` and `b` and writes its value into the program. A request for R under
+    `GEN=a` is relinking in the background (the executable was taken away) and is held as it enters the
+    link; V's first request, `GEN=b`, arrives then. R is no overlay candidate while it links, so nothing of
+    R is judged for V; the worker settles (it waits for the link) and turns to `b`, and when the link is
+    let go R is quick again. V has to be loaded on its own and judged for `b`, not read through R's `a`."""
+    import threading
+    once = os.path.join(sc.dir, "once")
+    os.makedirs(once)
+    extra = shared_projects(sc, worktrees=True)
+    v = os.path.join(sc.dir, "v")
+    subprocess.run(["git", "-c", "user.name=probe", "-c", "user.email=probe@localhost", "worktree", "add", "-q",
+                    "-b", "third", v], cwd=sc.r, capture_output=True, check=True)
+    extra = dict(extra, ONCE_DIR=once, ONCE_ONLY="none", ONCE_BY_DIR="1", RA_JIT_SPLIT="0")
+    oracle = sc.oracle("b", {"GEN_ARCHIVE": "same"})
+    worker, sock, env = by_hand(sc, dict(extra, ONCE_TAG="load"), gen_="a")
+    try:
+        if not serving(sc, sock, dict(env, ONCE_TAG="serve")):
+            return
+        r_trail, v_trail = os.path.join(once, "trail-r"), os.path.join(once, "trail-v")
+        trail = lambda f: open(f).read().split("\n")[:-1] if os.path.exists(f) else []
+        before = trail(r_trail)
+        # The executable is taken away: the next request for R links again.
+        os.remove(os.path.join(sc.dir, "w.bin"))
+        sc.arm("a", "linking")
+        said = {}
+        r_req = threading.Thread(target=lambda: said.update(r=sync(sc, sock, dict(env, ONCE_TAG="A", RA_JIT_BUILD="4001"),
+                                                                    within=LOST)))
+        r_req.start()
+        held = sc.reached("a", "linking", None, within=120)
+        if held is None:
+            return
+        sc.disarm("a", "linking")
+        out, exe = os.path.join(sc.dir, "first.o"), os.path.join(sc.dir, "first.bin")
+        env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD="4002", GEN="b")
+        v_req = threading.Thread(target=lambda: said.update(v=sync(sc, sock, env_b, "--project", v, "--crate",
+                                                                    "gen_one", "--out", out, "--exe", exe, within=LOST)))
+        v_req.start()
+        # The worker settles on R's link: V's request waits for it.
+        time.sleep(4)
+        sc.notes["v-waited-for-the-link"] = v_req.is_alive()
+        if not v_req.is_alive():
+            sc.fail("V's request was not waiting for R's link: the case was not exercised")
+        sc.release("a", "linking", held)
+        r_req.join(LOST)
+        v_req.join(LOST)
+        sc.notes["r-request"], sc.notes["v-request"] = said.get("r"), said.get("v")
+        log = open(os.path.join(sc.dir, "worker.log"), errors="replace").read()
+        sc.notes["view-lines"] = [l for l in log.splitlines() if l.startswith("view:")]
+        sc.notes["r-trail"], sc.notes["v-trail"] = trail(r_trail), trail(v_trail)
+        if not said.get("r") or said["r"][0] != 0:
+            sc.fail(f"R's request (the link that was held) did not end well: {said.get('r')}")
+        rv = said.get("v")
+        if not rv or rv[0] != 0:
+            sc.fail(f"V's request did not end well: {rv}")
+        if sc.notes["view-lines"]:
+            sc.fail(f"V was read through R, whose scripts were not judged for b: {sc.notes['view-lines']}")
+        if trail(r_trail) != before:
+            sc.fail(f"R's script ran for the request of V: {before} -> {trail(r_trail)}")
+        if sc.notes["v-trail"] != ["b B"]:
+            sc.fail(f"V's own script was to run once, for b: its trail is {sc.notes['v-trail']}")
+        got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
+        sc.notes["programs"] = {"V": got}
+        want = oracle["gen-one"]
+        strip = lambda it: re.sub(r"native=\d+", "native=*", it or "")
+        if strip(got) != strip(want):
+            sc.fail(f"V printed {got!r}, cargo's {want!r}")
+        elif got != want:
+            sc.gaps.append(f"V: {got!r}, cargo's {want!r} (the warm worker's native link)")
+        sc.notes["retire"] = (retire(sc, sock, "4001"), retire(sc, sock, "4002"))
+        sc.timeouts()
+    finally:
+        worker.kill()
+
+
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
     which reads nothing of S's, is built: S's moved world is not R's to wait for or to refuse."""
@@ -1836,6 +1915,7 @@ SCENARIOS = {
     "first-join": first_join_independent,
     "first-join-shared": first_join_shared,
     "first-join-private": first_join_private,
+    "quick-choice": quick_choice,
     "overlay": overlay,
     "worlds": worlds,
     "join": join,
