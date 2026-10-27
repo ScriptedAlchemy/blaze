@@ -1348,7 +1348,12 @@ def same_build(sc, source_sha, fails):
             shutil.copy2(os.path.join(sc.dir, "w.bin"), kept_a)
         # B: another build, another value; it needs the output A holds (when A ran the script).
         env_b = dict(env, ONCE_TAG="B", RA_JIT_BUILD=B, GEN="b")
-        b = in_background(sync, sc, sock, env_b, within=LOST)
+        def b_build():
+            # As the daemon ends a build: the worker's answer, then `retire` at once.
+            result = sync(sc, sock, env_b, within=LOST)
+            sc.notes["retire-b"] = retire(sc, sock, B)
+            return result
+        b = in_background(b_build)
         if not fails:
             deadline = time.time() + 120
             while time.time() < deadline and not any(e[0] == "put-off" and e[1] == int(B) for e in worker_events(sc)):
@@ -1399,7 +1404,6 @@ def same_build(sc, source_sha, fails):
         sc.notes["b"] = (rcb, saidb[-300:])
         if rcb != 0:
             sc.fail(f"B exited {rcb}: {saidb[-400:]}")
-        sc.notes["retire-b"] = retire(sc, sock, B)
         # The worker's own account: no build ran one script twice.
         runs = {}
         for e in worker_events(sc):
