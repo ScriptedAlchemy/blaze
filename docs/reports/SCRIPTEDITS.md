@@ -707,7 +707,8 @@ and its variables. A split that could not be loaded again is asked to be by the 
 and by no other. Not changed: the initial load, the first join's variables, the recovery's variables, the
 executor's admission, a loaded project's own request (`asked`). A view the daemon makes (`view_of`) needs
 `builds_alike`, as `alike` does, so the two agree; `RA_JIT_SPLIT=0` makes a project load whole although
-`alike` finds a base, and then that base is judged needlessly (as it always was).
+`alike` finds a base, and then that base is judged needlessly (as it always was). That was the next
+finding, below.
 
 | Linux, hand-started worker, R loaded with `GEN=a` (valid for `a`, fails for `b`, keeps a trail) | baseline `c0a64de1` | fixed |
 |---|---|---|
@@ -719,6 +720,29 @@ executor's admission, a loaded project's own request (`asked`). A view the daemo
 binary). Component: `reached` has no arm for an unknown project (40 passed with the other `scripts::` and
 `recovery::` tests). The program V prints is recorded, not asserted: the viewed request builds an object and
 the worker's executable is R's.
+
+### The same policy as the consumption (`da9c551b` → this head)
+
+The fifth independent review found that `alike` alone is not the policy: `add_once` shares only when
+`RA_JIT_SPLIT` is not `0`, and `view_of` reads a checkout as a loaded one only when overlays are on (always,
+or quick). With both off a file-alike V loads on its own, but the check still judged R: R's script, legal for
+V and failing in R (a script may read its manifest directory, or a watched file), failed the request before V
+was reached. `Checkouts::sharing` now takes the decision the consumption takes, before any script is judged:
+`viewing(overlay, quick)` (the test `view_of` applies, which now uses the same `alike`) or `splitting()` (the
+test `add_once` applies). `quick` is built before the check as it is after (`Quick::of`). Not changed: the
+join's variables, the loaded project's own request, the base a sharing project reads (judged with the request's
+variables), the executor's admission.
+
+| Linux, `RA_JIT_SPLIT=0`, `RA_JIT_OVERLAY=0`, R loaded with `GEN=a`, V file-alike with the same bytes; R's script fails for `b` in R's directory only | baseline `da9c551b` | fixed |
+|---|---|---|
+| `first-join-private`: ONE first request for V, `GEN=b`, build 3001 | fails with R's message (`gen … /r`); R's trail `a load, a serve, b B`; V's trail empty | V built: `include=b env=b cfg=b native=98` = cargo's; R's trail unchanged; V's own script ran once, for `b` |
+| `first-join-shared` (default policies) | R judged once for `b`, object built | the same: the base it reads is still judged |
+
+Regression on the fixed binary: `first-join`, `first-join-shared`, `join`, `worlds`, `unrelated`, `once`,
+`once-failed` pass (second batch, same source). Component: the policy matrix on the production `viewing` and
+`sharing_allowed` (overlay never / quick / always, quick or not, split on or off), with `reached`; 41 passed with the other
+`scripts::` and `recovery::` tests. Not shown: several file-alike candidates, mixed placed/split roots, a file
+changed between the choice and the load.
 
 ### What is not shown, not fixed, or wider
 
