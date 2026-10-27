@@ -178,12 +178,18 @@ contains `(part-key, part-kind, offset, length, SHA-256)`; payloads are 64-byte 
 The map is read-only and shared. `Frozen.bytes` keeps the map alive with an `Arc` and an
 offset range. There is no language-rule change and no new rustc/cargo path.
 
-The image may cover a subset of a worker's dependencies. Missing, unreadable or corrupted
-parts use the existing store; new parts are not appended to a mapped image. Rebuild or
+The image may cover a subset of a worker's dependencies. Missing keys or checksum-damaged
+parts use the existing store. A part whose file-table validation fails is rejected and
+normally resolved; that branch does not retry the store (the same file may still be unavailable).
+Mapped lookups and accepted installations are counted separately; only accepted mapped
+parts validate an image arm. New parts are not appended to a mapped image. Rebuild or
 remove the image to refresh it. Writing currently gathers all encoded parts into memory:
 this is a bounded prototype design limitation, not the full streaming implementation.
 
-The measurement driver is `harness/dist/frontimage.py`. It seeds once and interleaves
+The measurement driver is `harness/dist/frontimage.py`. Its separate seed attribution run
+performs census, which may resolve unrelated workspace members. Timed arms and profiling
+arms all use `RA_JIT_FRONT_STATS=1`, never census, so attribution cannot add unrelated
+semantic work to only the off baseline. It seeds once and interleaves
 off/store/image arms, three runs per arm. A measurement-only hold at `front-end ready`
 prevents codegen from racing the footprint sample. `memory::report` writes the ingredient
 table at resolve when `RA_JIT_MEMORY` is enabled. Readiness is load + resolve + frozen
@@ -253,6 +259,17 @@ its 300 s timeout; a seed attempt exited zero after existing build-script and da
 fallback bugs, not after reaching front-end readiness. No arm ran and no timing or memory
 comparison is valid. The harness now rejects those fallback logs explicitly. No new
 fallback path was added. The guard peaked at 5,495 MB with no memory/swap trip.
+
+**Correction after independent review:** the preserved seed `r/logs/daemon.log` is present
+and explains three daemon startup failures: its staging socket path
+`seed/home.noindex/daemon.sock.new/s` was 105 bytes, exceeding macOS SUN_LEN. The earlier
+client message about an absent log did not diagnose the cause. This path-length failure
+is distinct from build-script codegen's block-switch error and subsequent rustc fallback.
+The driver now allocates per-run short private homes under `--runtime-root` (default
+`/Users/bytedance/code`), independent of long artifacts and TMPDIR. `loadmem.py --home`
+preflights the actual staging path. Runtime homes are removed after private-daemon stop;
+on stop failure they are retained with an actionable error. Logs remain in the artifact tree.
+Subset `--arms` runs are explicitly labelled diagnostic, not complete comparative acceptance.
 
 ## Deviations
 

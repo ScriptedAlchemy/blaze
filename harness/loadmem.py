@@ -116,12 +116,21 @@ def kill(pids, sig=signal.SIGKILL):
             pass
 
 
+def check_runtime_home(home):
+    staging = os.path.join(home, "daemon.sock.new", "s")
+    # Darwin sun_path is 104 bytes including the terminating NUL.
+    if DARWIN and len(os.fsencode(staging)) >= 104:
+        raise ValueError(f"daemon staging socket is too long ({len(os.fsencode(staging))} bytes): "
+                         f"{staging}; use --home with a shorter private directory")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--td", required=True, help="the checkout to build")
     ap.add_argument("--blaze-bin", required=True, help="the directory of blaze, cargo-blaze and ra-jit")
     ap.add_argument("--work", required=True, help="where the home, the store, CARGO_HOME and the results go")
     ap.add_argument("--name", default=time.strftime("%m%d-%H%M%S"))
+    ap.add_argument("--home", help="private runtime home independent of the artifact directory")
     ap.add_argument("--cargo-home-from", help="a CARGO_HOME to clone (copy on write) as --work/cargo-home")
     ap.add_argument("--target-name", default="loadmem.noindex", help="below DIR/target, which .gitignore names")
     ap.add_argument("--watchdog-mb", type=int, default=24 * GB)
@@ -149,7 +158,8 @@ def main():
     out = os.path.join(work, a.name)
     for sub in ("snap", "mem", "logs"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
-    home, store = os.path.join(work, "home.noindex"), os.path.join(work, "store.noindex")
+    home = os.path.abspath(a.home) if a.home else os.path.join(work, "home.noindex")
+    store = os.path.join(work, "store.noindex")
     cargo_home = os.path.join(work, "cargo-home")
     if not os.path.isdir(cargo_home) and a.cargo_home_from:
         if not DARWIN or sh(["cp", "-cR", a.cargo_home_from, cargo_home]).returncode:
@@ -172,6 +182,8 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
+    home = env["RA_JIT_HOME"]
+    check_runtime_home(home)
     command = a.command or ["blaze", "build", "--locked", "-p", "tracedecay-cli"]
     if command and command[0] == "--":
         command = command[1:]

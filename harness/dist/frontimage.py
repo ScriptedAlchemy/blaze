@@ -29,12 +29,21 @@ resolving (its own timers), what reading the parts took, and what it held when i
 physical footprint on macOS, which leaves out a mapped file's clean pages, and the resident set,
 which counts them).
 """
-import argparse, json, os, re, shutil, statistics, subprocess, sys
+import argparse, json, os, re, shutil, statistics, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOADMEM = os.path.join(os.path.dirname(HERE), "loadmem.py")
 READY = r"front-end ready"
 UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
+
+def arm_env(arm, image):
+    """Timed arms never run the all-workspace attribution census."""
+    return {"off": ["RA_JIT_FROZEN=off"], "store": [],
+            "image": [f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_IMAGE_WATCH=500"]}[arm]
+
+
+def comparison_kind(arms):
+    return "comparative" if set(arms) == {"off", "store", "image"} else "diagnostic"
 
 
 def seconds(number, unit):
@@ -64,7 +73,13 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
     os.makedirs(work, exist_ok=False)
     if store_from:
         clone(store_from, os.path.join(work, "store.noindex"))
+    # macOS's staging socket appends /daemon.sock.new/s. Artifact paths can be
+    # arbitrarily long; runtime homes must not inherit that nesting or TMPDIR.
+    runtime = tempfile.mkdtemp(prefix=".fi-", dir=getattr(a, "runtime_root", "/Users/bytedance/code"))
+    with open(os.path.join(work, "runtime-home.txt"), "w") as file:
+        file.write(runtime + "\n")
     cmd = [sys.executable, "-I", LOADMEM, "--td", a.td, "--blaze-bin", blaze_bin or a.blaze_bin, "--work", work,
+           "--home", runtime,
            "--name", "r", "--cargo-home-from", a.cargo_home_from, "--target-name", "d3m.noindex",
            "--timeout", str(a.timeout),
            "--memory-every", "0.5", "--every", "0.5", "--env", f"RUSTUP_TOOLCHAIN={a.toolchain}",
@@ -85,9 +100,10 @@ def loadmem(a, name, env=(), stop=True, prof=False, blaze_bin=None, store_from=N
     finally:
         # Stop only this run's private daemon; other lanes may use the same binary.
         stopped = sh([os.path.join(os.path.abspath(blaze_bin or a.blaze_bin), "ra-jit"), "stop"],
-                     env=dict(os.environ, RA_JIT_HOME=os.path.join(work, "home.noindex")), timeout=20)
+                     env=dict(os.environ, RA_JIT_HOME=runtime), timeout=20)
         if stopped.returncode:
-            raise RuntimeError(f"could not stop the measurement daemon in {work}: {stopped.stdout}")
+            raise RuntimeError(f"could not stop daemon in {runtime}; home retained: {stopped.stdout}")
+        shutil.rmtree(runtime)
     with open(os.path.join(work, "loadmem.out"), "w") as kept:
         kept.write(out.stdout)
     return os.path.join(work, "r")
@@ -140,6 +156,9 @@ def parse(run):
     m = find(r"^front-end serve: ([\d.]+)(\S+) in all, ([\d.]+)(\S+) of it reading parts, (\d+) of (\d+) parts from the image")
     if m:
         row.update(serve_s=seconds(m[0], m[1]), fetch_s=seconds(m[2], m[3]), from_image=int(m[4]), parts=int(m[5]))
+    m = find(r"^front-end image usage: (\d+) attempted, (\d+) accepted parts")
+    if m:
+        row.update(image_attempted=int(m[0]), image_accepted=int(m[1]))
     m = find(r"^front-end parts: def maps ([\d.]+) MB, impls ([\d.]+) MB, lang items ([\d.]+) MB")
     if m:
         row["parts_mb"] = dict(zip(("def_maps", "impls", "lang_items"), map(float, m)))
@@ -176,9 +195,10 @@ def invalid(row, arm):
         return "missing readiness timings or memory samples"
     if arm == "seed" and not row.get("image_written_parts", 0):
         return "the seed wrote no frozen parts"
-    if arm == "image" and not row.get("from_image", 0):
+    if arm == "image" and (not row.get("image_accepted", 0)
+                           or row["image_accepted"] > row.get("parts", 0)):
         return "the image arm read no mapped parts"
-    if arm == "store" and (row.get("from_image", 0) or not row.get("parts", 0)):
+    if arm == "store" and (row.get("image_accepted", 0) or row.get("from_image", 0) or not row.get("parts", 0)):
         return "the store arm did not read frozen parts exclusively from the store"
     if arm == "off" and (row.get("parts", 0) or row.get("frozen", {}).get("def_maps", 0)):
         return "the off arm used frozen parts"
@@ -206,6 +226,8 @@ def main():
     ap.add_argument("--arms", default="off,store,image")
     ap.add_argument("--toolchain", default="1.99.0")
     ap.add_argument("--skip-build", action="store_true", help="cargo's target directory is whole already")
+    ap.add_argument("--runtime-root", default="/Users/bytedance/code",
+                    help="short directory for private temporary daemon homes (not artifact storage)")
     a = ap.parse_args()
     arms = a.arms.split(",")
     if a.runs < 1 or not arms or len(arms) != len(set(arms)) or set(arms) - {"off", "store", "image"}:
@@ -213,7 +235,8 @@ def main():
     a.td, a.work = os.path.abspath(a.td), os.path.abspath(a.work)
     os.makedirs(a.work, exist_ok=True)
     image = os.path.join(a.work, "front.image")
-    summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {}}
+    summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {},
+               "comparison": comparison_kind(arms)}
 
     if not a.skip_build:
         run = loadmem(a, "build", stop=False)
@@ -235,8 +258,7 @@ def main():
         return 1
     summary["image_bytes"] = os.path.getsize(image)
     store = os.path.join(a.work, "seed", "store.noindex")
-    env = {"off": ["RA_JIT_FROZEN=off", "RA_JIT_FRONT_STATS=census"], "store": [],
-           "image": [f"RA_JIT_FRONT_IMAGE={image}", "RA_JIT_FRONT_IMAGE_WATCH=500"]}
+    env = {arm: arm_env(arm, image) for arm in ("off", "store", "image")}
     rows = {arm: [] for arm in arms}
     for n in range(1, a.runs + 1):
         for arm in arms:
@@ -253,7 +275,7 @@ def main():
             summary["prof"][arm]["dir"] = run
     json.dump(summary, open(os.path.join(a.work, "summary.json"), "w"), indent=1)
 
-    print(f"\n{a.package}: mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
+    print(f"\n{a.package}: {summary['comparison']}; mean (min-max) of {a.runs} runs; seconds are the worker's own timers\n")
     print("| arm | ready seen s | load s | resolve s | serve s | reading parts s | ready footprint MB | ready rss MB | live MB |")
     print("|---|---|---|---|---|---|---|---|---|")
     for arm in arms:

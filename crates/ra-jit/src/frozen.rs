@@ -40,6 +40,8 @@ pub(crate) struct Served {
     /// How many of each part came out of the image, and the bytes of each part served or
     /// written, in the order of [`Part::ALL`].
     from_image: [usize; 3],
+    /// Successful image lookups, including bytes subsequently rejected as unreadable.
+    image_attempted: [usize; 3],
     bytes: [u64; 3],
     /// What reading the parts took, and what all of `serve` took.
     fetch_took: Duration,
@@ -256,19 +258,16 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
             }
             let fetched = Instant::now();
             let from_image = image.as_ref().and_then(|it| it.get(index as u8, &part.key(key)));
+            let mapped = from_image.is_some();
             let bytes = match from_image {
-                Some(bytes) => {
-                    served.from_image[index] += 1;
-                    bytes
-                }
+                Some(bytes) => bytes,
                 None => match store.and_then(|it| it.get(&part.key(key))) {
                     Some(bytes) => Bytes::from(bytes),
                     None => continue,
                 },
             };
             served.fetch_took += fetched.elapsed();
-            if part.unreadable(db, krate, &bytes).is_some() {
-                served.unreadable += 1;
+            if !served.accept_part(index, mapped, || part.unreadable(db, krate, &bytes).is_none()) {
                 continue;
             }
             served.bytes[index] += bytes.len() as u64;
@@ -283,6 +282,19 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
     served.image = image;
     served.serve_took = started.elapsed();
     served
+}
+
+impl Served {
+    /// Count mapped lookups separately from parts admitted to the frozen input.
+    fn accept_part(&mut self, index: usize, mapped: bool, readable: impl FnOnce() -> bool) -> bool {
+        self.image_attempted[index] += usize::from(mapped);
+        if !readable() {
+            self.unreadable += 1;
+            return false;
+        }
+        self.from_image[index] += usize::from(mapped);
+        true
+    }
 }
 
 /// Writes to the store what can be frozen of the crates that were resolved, and fails on a
@@ -403,6 +415,11 @@ fn front_image_report(
         .collect();
     eprintln!("front-end parts: {}", held.join(", "));
     eprintln!(
+        "front-end image usage: {} attempted, {} accepted parts",
+        served.image_attempted.iter().sum::<usize>(),
+        served.from_image.iter().sum::<usize>(),
+    );
+    eprintln!(
         "front-end serve: {:.0?} in all, {:.0?} of it reading parts, {} of {} parts from the image",
         served.serve_took,
         served.fetch_took,
@@ -427,6 +444,36 @@ fn front_image_report(
 
 fn census_wanted() -> bool {
     std::env::var("RA_JIT_FRONT_STATS").as_deref() == Ok("census")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_image_is_not_accepted_even_with_another_store_part() {
+        use test_fixture::WithFixture;
+        let original = ide_db::RootDatabase::with_files(
+            "//- /lib.rs crate:lib\nmod included;\n//- /included.rs\npub fn f() {}\n",
+        );
+        let missing = ide_db::RootDatabase::with_files("//- /lib.rs crate:lib\nmod included;\n");
+        let original_crate = ide_db::base_db::all_crates(&original)[0];
+        let missing_crate = ide_db::base_db::all_crates(&missing)[0];
+        let bytes = Part::DefMap.encode(&original, original_crate).unwrap();
+        let mut served = Served::default();
+        // The real file-table validator sees a module missing from this database.
+        assert!(!served.accept_part(0, true, || {
+            Part::DefMap.unreadable(&missing, missing_crate, &bytes).is_none()
+        }));
+        assert_eq!(served.image_attempted, [1, 0, 0]);
+        assert_eq!(served.from_image, [0, 0, 0]);
+        assert_eq!(served.unreadable, 1);
+        assert!(served.accept_part(0, false, || true));
+        assert_eq!(served.from_image, [0, 0, 0]);
+        assert!(served.accept_part(1, true, || true));
+        assert_eq!(served.image_attempted, [1, 1, 0]);
+        assert_eq!(served.from_image, [0, 1, 0]);
+    }
 }
 
 /// What the front end holds of each kind of crate, for docs/research/front-end-image.md:

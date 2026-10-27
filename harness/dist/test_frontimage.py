@@ -28,6 +28,7 @@ class FrontImageTests(unittest.TestCase):
             (root / "logs" / "worker.log").write_text(
                 "load workspace: 1.2s\nresolve: 42 crates in 30.0ms\n"
                 "front-end serve: 10ms in all, 2ms of it reading parts, 3 of 3 parts from the image\n"
+                "front-end image usage: 4 attempted, 3 accepted parts\n"
                 "front-end parts: def maps 1.0 MB, impls 2.0 MB, lang items 0.1 MB\n"
                 "front-end census: dependency, not frozen: 2 crates, 5 modules, 4 files, 0.3 MB\n"
                 "front-end ready\n"
@@ -35,6 +36,8 @@ class FrontImageTests(unittest.TestCase):
             row = driver.parse(work)
             self.assertEqual(row["crates"], 42)
             self.assertEqual(row["from_image"], 3)
+            self.assertEqual(row["image_attempted"], 4)
+            self.assertEqual(row["image_accepted"], 3)
             self.assertEqual(row["resolve_s"], 0.03)
             self.assertEqual(row["ready_footprint_mb"], 100)
             self.assertEqual(row["census"]["dependency, not frozen"]["crates"], 2)
@@ -47,7 +50,13 @@ class FrontImageTests(unittest.TestCase):
         self.assertIn("did not read frozen parts", driver.invalid(row, "store"))
         self.assertIn("no frozen parts", driver.invalid(row, "seed"))
         self.assertIsNone(driver.invalid(row, "off"))
-        self.assertIsNone(driver.invalid(dict(row, from_image=3, parts=3), "image"))
+        self.assertIsNone(driver.invalid(dict(row, from_image=3, image_accepted=3, parts=3), "image"))
+        self.assertIsNotNone(driver.invalid(dict(row, from_image=1, image_attempted=1,
+                                                 image_accepted=0, parts=0), "image"))
+        # A separately installed store part is not evidence that the unreadable
+        # mapped part was installed.
+        self.assertIsNotNone(driver.invalid(dict(row, image_attempted=1,
+                                                 image_accepted=0, parts=1), "image"))
         self.assertIsNone(driver.invalid(dict(row, from_image=0, parts=3), "store"))
         self.assertIsNone(driver.invalid(dict(row, image_written_parts=3), "seed"))
         self.assertIsNotNone(driver.invalid(dict(row, from_image=3, parts=3), "store"))
@@ -75,7 +84,9 @@ class FrontImageTests(unittest.TestCase):
                 self.assertIn("RA_JIT_FROZEN=on", cmd)
                 self.assertLess(cmd.index("RA_JIT_FRONT_IMAGE=off"), cmd.index("RA_JIT_FRONT_IMAGE=/chosen.image"))
                 self.assertEqual(stop.args[0], ["/shared/bin/ra-jit", "stop"])
-                self.assertEqual(stop.kwargs["env"]["RA_JIT_HOME"], str(Path(work) / "image/home.noindex"))
+                home = stop.kwargs["env"]["RA_JIT_HOME"]
+                self.assertIn(home, cmd)
+                self.assertFalse(Path(home).exists())
                 with self.assertRaises(FileExistsError):
                     driver.loadmem(args, "image")
 
@@ -141,6 +152,52 @@ class FrontImageTests(unittest.TestCase):
                    from_image=3, parts=3, image_written_parts=3, no_rustc_violation=True)
         for arm in ("seed", "off", "store", "image"):
             self.assertIn("fallback", driver.invalid(row, arm))
+
+    def test_long_artifacts_use_short_isolated_runtime_homes(self):
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            artifacts = Path(work) / ("long-artifacts-" * 12)
+            args = SimpleNamespace(work=str(artifacts), td=work, blaze_bin="/shared/bin",
+                                   cargo_home_from=work, timeout=30, toolchain="1.99.0", package="selected")
+            homes = []
+            with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")) as sh:
+                for arm in ("off", "store", "image"):
+                    driver.loadmem(args, arm)
+                    home = sh.call_args_list[-1].kwargs["env"]["RA_JIT_HOME"]
+                    homes.append(home)
+                    self.assertLess(len((home + "/daemon.sock.new/s").encode()), 104)
+                    self.assertFalse(Path(home).exists())
+                    self.assertTrue((artifacts / arm / "runtime-home.txt").exists())
+            self.assertEqual(len(set(homes)), 3)
+
+    def test_timed_arms_never_resolve_unrelated_members_for_census(self):
+        driver = module("frontimage")
+        # Loaded workspace includes an unrelated package outside selected's closure.
+        # Model the census's extra query calls, driven by the actual launch flags.
+        workspace = {"selected": ["dependency"], "dependency": [], "unrelated": []}
+        with tempfile.TemporaryDirectory() as work:
+            args = SimpleNamespace(work=work, td=work, blaze_bin="/shared/bin", cargo_home_from=work,
+                                   timeout=30, toolchain="1.99.0", package="selected")
+            coverage = []
+            with mock.patch.object(driver, "sh", return_value=SimpleNamespace(returncode=0, stdout="")) as sh:
+                for arm in ("off", "store", "image"):
+                    driver.loadmem(args, arm, env=driver.arm_env(arm, "/chosen.image"))
+                    cmd = sh.call_args_list[-2].args[0]
+                    stats = [cmd[i + 1] for i, v in enumerate(cmd[:-1]) if v == "--env"
+                             and cmd[i + 1].startswith("RA_JIT_FRONT_STATS=")][-1]
+                    queried = set(workspace) if stats.endswith("=census") else {"selected", "dependency"}
+                    self.assertNotIn("unrelated", queried)
+                    coverage.append(queried)
+            self.assertEqual(coverage[0], coverage[1])
+            self.assertEqual(coverage[1], coverage[2])
+        self.assertEqual(driver.comparison_kind(["image"]), "diagnostic")
+        self.assertEqual(driver.comparison_kind(["off", "store", "image"]), "comparative")
+
+    def test_long_explicit_runtime_home_has_actionable_preflight(self):
+        watchdog = module("loadmem", Path(__file__).parents[1] / "loadmem.py")
+        with mock.patch.object(watchdog, "DARWIN", True):
+            with self.assertRaisesRegex(ValueError, "use --home"):
+                watchdog.check_runtime_home("/" + "x" * 104)
 
 
 if __name__ == "__main__":
