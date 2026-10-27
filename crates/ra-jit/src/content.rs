@@ -23,6 +23,9 @@ type Hash = [u8; 32];
 pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     source_hashes: Mutex<FxHashMap<Crate, Hash>>,
+    /// Direct discovery/hash work is done once per crate, even when many roots
+    /// share its dependency closure. No mutex is held while salsa lowers bodies.
+    direct_hashes: Mutex<FxHashMap<Crate, std::sync::Arc<OnceLock<Hash>>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -37,9 +40,20 @@ impl Contents {
         {
             return *hash;
         }
-        let hash = library_source_hash(db, krate);
+        let hash = library_source_hash(self, db, krate);
         self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, hash);
         hash
+    }
+
+    fn direct_source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
+        let slot = self
+            .direct_hashes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(krate)
+            .or_default()
+            .clone();
+        *slot.get_or_init(|| library_own_source_hash(db, krate))
     }
 
     /// `None` for a crate that depends on one `stable_crate_id` has nothing for and that is
@@ -343,23 +357,28 @@ fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
 /// Cover the loaded source root, including included binary/text files. Relative names
 /// preserve portability; source bytes ensure equal vendor locations do not alias edits.
 /// Hashing the whole source root is conservative when it contains multiple packages.
-pub(crate) fn library_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
-    fn closure(db: &RootDatabase, krate: Crate, seen: &mut FxHashSet<Crate>) -> Hash {
+fn library_source_hash(contents: &Contents, db: &RootDatabase, krate: Crate) -> Hash {
+    fn closure(
+        contents: &Contents,
+        db: &RootDatabase,
+        krate: Crate,
+        seen: &mut FxHashSet<Crate>,
+    ) -> Hash {
         if !seen.insert(krate) {
             return Sha256::digest(b"already hashed library dependency").into();
         }
         let mut hasher = Sha256::new();
-        hasher.update(library_own_source_hash(db, krate));
+        hasher.update(contents.direct_source_hash(db, krate));
         let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dep in dependencies {
             hasher.update((dep.name.as_str().len() as u64).to_le_bytes());
             hasher.update(dep.name.as_str().as_bytes());
-            hasher.update(closure(db, dep.crate_id, seen));
+            hasher.update(closure(contents, db, dep.crate_id, seen));
         }
         hasher.finalize().into()
     }
-    closure(db, krate, &mut FxHashSet::default())
+    closure(contents, db, krate, &mut FxHashSet::default())
 }
 
 fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
@@ -536,7 +555,17 @@ mod tests {
                 let caller_hash = caller_first.then(|| contents.source_hash(&db, app));
                 let dep_hash = contents.source_hash(&db, dep);
                 assert_eq!(db.included_by(dep)[0].1.as_deref(), Some(&[byte][..]));
-                (dep_hash, caller_hash.unwrap_or_else(|| contents.source_hash(&db, app)))
+                let app_hash = caller_hash.unwrap_or_else(|| contents.source_hash(&db, app));
+                assert_eq!(contents.direct_hashes.lock().unwrap().len(), 2);
+                assert!(
+                    contents
+                        .direct_hashes
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|slot| slot.get().is_some())
+                );
+                (dep_hash, app_hash)
             })
         };
         let one = hash(1);

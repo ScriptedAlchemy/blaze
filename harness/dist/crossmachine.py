@@ -453,6 +453,43 @@ def pinned_run(name):
     return list({f["name"]: f for f in fetch.fixtures()}[name].get("program_args", []))
 
 
+def warm_payload_report(work, bin_dir, machines, sources):
+    """Same daemon, binary-only mutation/delete/recreate, repeated after relocation."""
+    from cargo_ra_jit import Side, program_output, wait_warm, how_built
+    spec = dict(FIXTURES["vendor-payload"])
+    rows = []
+    for machine in machines:
+        ws = os.path.join(machine.checkout("warm-payload", sources["vendor-payload"]), "vendored")
+        env = machine.env(bin_dir, os.path.join(machine.top, "warm-store"),
+                          daemon_home("warm", machine.name))
+        side = Side(ws, env, True)
+        try:
+            for step, value in [("initial", 1), ("binary-edit", 2), ("deleted", None), ("recreated", 3)]:
+                if value is None:
+                    os.remove(os.path.join(ws, "vendor", "fastrand", "src", "payload.bin"))
+                else:
+                    vendor_payload(ws, value)
+                # No Rust source changes and no stop/restart between these builds.
+                _, built = side.cargo("build", "-p", "app", timeout=1800)
+                wait_warm(side, ws)
+                status = side.cargo("status")[1].stdout
+                if value is None:
+                    oracle = sh(["cargo", "build", "--offline", "--locked", "-p", "app"],
+                                cwd=ws, env=dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
+                    actual, expected = None, None
+                    right = built.returncode != 0 and oracle.returncode != 0
+                else:
+                    expected = reference(machine, bin_dir, ws, spec, env["RA_JIT_CACHE"], env["RA_JIT_HOME"])
+                    actual = program_output(side.cargo("run", "-p", "app", "--", timeout=600)[1])
+                    right = built.returncode == 0 and actual == expected
+                rows.append(dict(machine=machine.name, step=step, right=right,
+                                 actual=actual, expected=expected, status=status,
+                                 classification=how_built(built.stderr), build_log=built.stderr))
+        finally:
+            side.cargo("stop")
+    return rows
+
+
 # --- one build -----------------------------------------------------------------------------------------
 
 class Run:
@@ -997,6 +1034,8 @@ def main():
     p.add_argument("--json", help="write the results here")
     p.add_argument("--reference-only", action="store_true",
                    help="build and run only with plain cargo on both machines: no daemon is loaded")
+    p.add_argument("--warm-payload", action="store_true",
+                   help="same-daemon binary payload edit/delete/recreate on two checkout paths")
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
     p.add_argument("--watchdog-mb", type=int, default=24 * 1024)
@@ -1012,7 +1051,7 @@ def main():
     if a.remote or a.b_docker:
         sys.exit("--remote and --b-docker belong to unit C5 (a server remote, a machine of another libc); "
                  "crossmachine.py has a directory remote and two machines of this host")
-    names = ALL if a.all else a.fixtures
+    names = ["vendor-payload"] if a.warm_payload else (ALL if a.all else a.fixtures)
     if not names:
         p.error("name a fixture, or --all")
     unknown = [n for n in names if n not in FIXTURES]
@@ -1055,6 +1094,12 @@ def main():
                  f"machine B: home {b_m.home}\n           checkouts {b_m.checkouts}")
         if a.reference_only:
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
+        if a.warm_payload:
+            rows = warm_payload_report(work, bin_dir, (a_m, b_m), sources)
+            with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
+                json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
+            print(json.dumps(rows, indent=1))
+            return 1 if any(not r["right"] or r["classification"] != "daemon" for r in rows) or watchdog.tripped else 0
         for n in names:
             try:
                 results.append(fixture_report(n, a, work, bin_dir, (a_m, b_m), sources, progress))
