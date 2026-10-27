@@ -8909,6 +8909,12 @@ fn run_holding(
                     if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
                         touched.remove(&index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                    } else if matches!(file.file, Watched::Included(_))
+                        && file.mtime != SystemTime::UNIX_EPOCH
+                    {
+                        file.mtime = SystemTime::UNIX_EPOCH;
+                        touched.insert(index);
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
                     continue;
                 };
@@ -9069,12 +9075,15 @@ fn run_holding(
             });
         }
         // Asked after the change: a file can have joined a crate with it.
-        if !included.is_empty() {
-            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
-            listed.touch(&db, None);
-        }
+        let included_changed = !included.is_empty();
         for path in included {
             db.reload_included_file(&path);
+        }
+        // Invalidate memoized code/listings only after the tracked input revision
+        // advances, so patch bases cannot recapture the old included bytes.
+        if included_changed {
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+            listed.touch(&db, None);
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
         for program in &mut programs {
