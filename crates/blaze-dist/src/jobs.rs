@@ -10,9 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_wire::job_terminal_v2::{
-    SubscriberTerminalV2, TerminationReasonV2, TerminationV2, VERSION as TERMINAL_VERSION,
-};
 use blaze_wire::{
     AssignedEvent, Attempt, BatchResult, Digest, DoneEvent, EventItem, ExecutionId, JobAnswer,
     JobContent, JobContentInput, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome,
@@ -24,6 +21,8 @@ use crate::admission::{Admission, Waiting};
 use crate::work::{self, EndWhy, WorkConfig, WorkSet};
 use crate::{Millis, Refusal};
 
+mod ingress;
+
 /// An execution's timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -33,29 +32,11 @@ pub struct ExecutionConfig {
     pub missed_heartbeats: u64,
     /// The work set's.
     pub work: WorkConfig,
-    /// Admission's explicit compile requirement. Never inferred from worker events.
-    pub completion: CompletionMode,
-}
-
-/// Whether the admitted job needs distributed compile work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompletionMode {
-    /// Success requires the current lead's agreed, completed work set.
-    WorkProtocol,
-    /// Admission established that no compile work is required (for example verified cached
-    /// artifacts or an already-built test shard). The lead still reports the final verdict.
-    /// This is a driver decision, not a worker claim or inference from an empty BuildSpec.
-    NoCompileWork,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> ExecutionConfig {
-        ExecutionConfig {
-            heartbeat_ms: 5_000,
-            missed_heartbeats: 3,
-            work: WorkConfig::default(),
-            completion: CompletionMode::WorkProtocol,
-        }
+        ExecutionConfig { heartbeat_ms: 5_000, missed_heartbeats: 3, work: WorkConfig::default() }
     }
 }
 
@@ -113,7 +94,7 @@ pub enum Effect {
     /// An item was appended to the execution's event stream.
     Event(EventItem),
     /// The lead was lost: the driver assigns a new lead (admission's choice), or ends the
-    /// execution `Failed` when there is none.
+    /// execution `Lost` when there is none.
     NeedLead,
     /// Stop an executor's process group: the agent kills it.
     Kill {
@@ -130,8 +111,6 @@ pub enum Effect {
         outcome: Outcome,
         /// What it does next on its side.
         policy: LocalPolicy,
-        /// The versioned delivery used by the terminal endpoint and client policy.
-        terminal: SubscriberTerminalV2,
     },
     /// The work set's log.
     Work(work::Effect),
@@ -159,7 +138,6 @@ pub struct Execution {
     events: Vec<EventItem>,
     stages: Vec<(Stage, Millis)>,
     compiled: Option<(Attempt, u64)>,
-    terminals: BTreeMap<u64, SubscriberTerminalV2>,
     refused: bool,
     state: ExecState,
 }
@@ -192,7 +170,6 @@ impl Execution {
             events: Vec::new(),
             stages: Vec::new(),
             compiled: None,
-            terminals: BTreeMap::new(),
             refused: false,
             state: ExecState::Queued,
         };
@@ -203,11 +180,6 @@ impl Execution {
     /// Where it is.
     pub fn state(&self) -> ExecState {
         self.state.clone()
-    }
-
-    /// The immutable typed terminal endpoint response for a subscriber, once it ended.
-    pub fn terminal(&self, subscriber: u64) -> Option<&SubscriberTerminalV2> {
-        self.terminals.get(&subscriber)
     }
 
     /// Its current attempt.
@@ -389,9 +361,6 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
-        if self.config.completion == CompletionMode::NoCompileWork {
-            return Err(Refusal::Malformed("work call in no-compile-work execution".to_owned()));
-        }
         self.heard.insert(from.to_owned(), now);
         let work = self.work.as_mut().ok_or(Refusal::NotJoined)?;
         let mut log = Vec::new();
@@ -439,7 +408,7 @@ impl Execution {
     /// `POST /v1/workers/events`: a heartbeat, and events for the stream. A dead attempt's are
     /// refused. A `Done` from the lead ends the execution with its outcome; a `Refused` before
     /// it makes that outcome `Refused`, whatever the lead says, since a job is never turned
-    /// green past a refusal.
+    /// green past a refusal. The entire event batch is validated before any report is published.
     pub fn worker_events(
         &mut self,
         now: Millis,
@@ -457,61 +426,36 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
-        // Validate the entire batch before it changes liveness, refusal state or the stream.
-        // A rejected tail must not leave an accepted prefix in the public event log.
-        let lead = self.lead.as_deref() == Some(from);
-        let mut done = None;
-        for event in &req.events {
-            match event {
-                JobEvent::Stage(_) | JobEvent::Assigned(_) => {
-                    return Err(Refusal::Malformed("coordinator-owned event".to_owned()));
-                }
-                JobEvent::Published(_) | JobEvent::Program(_) | JobEvent::Verdict(_) if !lead => {
-                    return Err(Refusal::NotHolder);
-                }
-                JobEvent::Done(d) => {
-                    if !lead {
-                        return Err(Refusal::NotHolder);
-                    }
-                    if done.is_some()
-                        || !matches!(
-                            d.outcome,
-                            Outcome::Passed | Outcome::Failed | Outcome::Refused
-                        )
-                    {
-                        return Err(Refusal::Malformed("invalid worker verdict batch".to_owned()));
-                    }
-                    if d.outcome == Outcome::Passed
-                        && self.attached().any(|s| now <= s.deadline_ms)
-                        && !self.success_ready()
-                    {
-                        return Err(Refusal::Malformed(
-                            "success before authoritative completion".to_owned(),
-                        ));
-                    }
-                    done = Some(d.outcome.clone());
-                }
-                JobEvent::Output(_) | JobEvent::Refused(_) => {}
-                _ => {}
-            }
-        }
         self.expire_subscribers(now, out);
         if self.attached().next().is_none() {
             self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
             return Ok(WorkersEventsAnswer::CANCEL);
         }
+        let lead = self.lead.as_deref() == Some(from);
+        self.validate_events(lead, &req.events)?;
         self.heard.insert(from.to_owned(), now);
         if lead {
             self.lead_heard = now;
         }
+        let mut done = None;
         for event in &req.events {
             match event {
                 JobEvent::Refused(_) => self.refused = true,
-                JobEvent::Done(_) => {
-                    // Publish only the coordinator's final verdict, once. A raw Passed
-                    // here could otherwise escape into replay before refusal normalization.
+                JobEvent::Stage(event) => {
+                    // Use the coordinator's clock and update the same stage view checked by
+                    // the model. Retransmission of the latest stage does not append it twice.
+                    if self.reported_stage() != Some(&event.stage) {
+                        self.stage(now, event.stage.clone(), out);
+                    }
                     continue;
                 }
+                JobEvent::Done(d) if lead => {
+                    // Publish only the coordinator's final verdict, once. A raw Passed
+                    // here could otherwise escape into replay before refusal normalization.
+                    done = Some(d.outcome.clone());
+                    continue;
+                }
+                JobEvent::Done(_) => return Err(Refusal::NotHolder),
                 _ => {}
             }
             self.push(event.clone(), out);
@@ -530,16 +474,6 @@ impl Execution {
         out.extend(log.into_iter().map(Effect::Work));
         self.after_work(now, out);
         Ok(answer)
-    }
-
-    /// Current-attempt/root-epoch authority, not a worker's Compiled notification.
-    fn success_ready(&self) -> bool {
-        self.config.completion == CompletionMode::NoCompileWork
-            || self.work.as_ref().is_some_and(|work| {
-                work.is_done()
-                    && work.lead_joined()
-                    && self.compiled == Some((self.attempt, work.root_epoch()))
-            })
     }
 
     /// `GET /v1/jobs/<execution>/events?from=N`: the items after sequence `from`.
@@ -599,7 +533,7 @@ impl Execution {
     /// Ends the execution: the work set drops its leases, every executor is stopped, and every
     /// attached subscriber gets the outcome. Deadlines apply even when a completion arrives
     /// before the driver's next timer tick.
-    pub(crate) fn end(
+    pub fn end(
         &mut self,
         now: Millis,
         mut outcome: Outcome,
@@ -608,6 +542,11 @@ impl Execution {
     ) {
         if let ExecState::Ended(_) = self.state {
             return;
+        }
+        // No available replacement lead is infrastructure loss, not a compiler/test verdict.
+        // Preserve that distinction in both subscriber effects and the serialized Done event.
+        if matches!(&why, EndWhy::NoLead) {
+            outcome = Outcome::Lost;
         }
         if self.expire_subscribers(now, out) && self.attached().next().is_none() {
             outcome = Outcome::Cancelled;
@@ -619,12 +558,7 @@ impl Execution {
             work.end(why, &mut log);
             out.extend(log.into_iter().map(Effect::Work));
         }
-        self.finish(now, outcome, why, out);
-    }
-
-    /// Cancel an execution administratively, preserving a typed cancellation for subscribers.
-    pub fn cancel(&mut self, now: Millis, out: &mut Vec<Effect>) {
-        self.end(now, Outcome::Cancelled, EndWhy::Cancelled, out);
+        self.finish(now, outcome, out);
     }
 
     /// Detaches subscribers whose own deadlines have passed, once, before either a timer or
@@ -636,56 +570,26 @@ impl Execution {
         for id in late {
             let subscriber = self.subscribers.get_mut(&id).expect("attached");
             subscriber.state = SubscriberState::TimedOut;
-            let terminal = SubscriberTerminalV2 {
-                execution: self.id,
-                attempt: self.attempt,
-                subscriber: id,
-                termination: TerminationV2 {
-                    version: TERMINAL_VERSION,
-                    outcome: Outcome::TimedOut,
-                    reason: TerminationReasonV2::SubscriberDeadline,
-                },
-            };
-            self.terminals.insert(id, terminal.clone());
             out.push(Effect::SubscriberEnded {
                 subscriber: id,
                 outcome: Outcome::TimedOut,
                 policy: subscriber.policy.clone(),
-                terminal,
             });
         }
         expired
     }
 
-    fn finish(&mut self, now: Millis, outcome: Outcome, why: EndWhy, out: &mut Vec<Effect>) {
+    fn finish(&mut self, now: Millis, outcome: Outcome, out: &mut Vec<Effect>) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
         for subscriber in self.subscribers.values_mut() {
             if subscriber.state == SubscriberState::Attached {
                 subscriber.state = SubscriberState::Ended;
-                let terminal = SubscriberTerminalV2 {
-                    execution: self.id,
-                    attempt: self.attempt,
-                    subscriber: subscriber.id,
-                    termination: TerminationV2 {
-                        version: TERMINAL_VERSION,
-                        outcome: outcome.clone(),
-                        reason: match why {
-                            EndWhy::Reported => TerminationReasonV2::Reported,
-                            EndWhy::NoLead => TerminationReasonV2::NoLead,
-                            EndWhy::LeadLostTwice => TerminationReasonV2::LeadLostTwice,
-                            EndWhy::Cancelled => TerminationReasonV2::Cancelled,
-                            EndWhy::Deadline => TerminationReasonV2::Deadline,
-                        },
-                    },
-                };
-                self.terminals.insert(subscriber.id, terminal.clone());
                 out.push(Effect::SubscriberEnded {
                     subscriber: subscriber.id,
                     outcome: outcome.clone(),
                     policy: subscriber.policy.clone(),
-                    terminal,
                 });
             }
         }
@@ -718,19 +622,14 @@ pub enum LocalAction {
     Fail,
 }
 
-/// The action for a versioned, classified terminal delivery under `policy`. `Passed`, `Failed`
-/// and `Refused` are taken as verdicts; other outcomes fail under `Never` and build locally
-/// under `Fallback`. `Race` was building locally from the start, and the first verdict wins,
-/// a build error or failed test included.
-///
-/// Unknown versions or inconsistent outcome/reason pairs are refused, never guessed from
-/// the v1 stream. `NoLead` is infrastructure even though its outcome is `Failed`.
-pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<LocalAction, Refusal> {
-    if !remote.is_valid() {
-        return Err(Refusal::Malformed("invalid terminal contract".to_owned()));
-    }
-    let verdict = remote.reason == TerminationReasonV2::Reported;
-    Ok(match policy {
+/// The action for a remote outcome under `policy`. `Passed`, `Failed` and `Refused` are
+/// completed verdicts; infrastructure loss (including no available replacement lead) is
+/// delivered as `Lost`, not `Failed`, before either subscriber or wire delivery. Other
+/// outcomes fail under `Never` and build locally under `Fallback`. `Race` was building
+/// locally from the start, and the first verdict wins, a build error or failed test included.
+pub fn local_action(policy: &LocalPolicy, remote: &Outcome) -> LocalAction {
+    let verdict = matches!(remote, Outcome::Passed | Outcome::Failed | Outcome::Refused);
+    match policy {
         LocalPolicy::Never => {
             if verdict {
                 LocalAction::Take
@@ -753,7 +652,7 @@ pub fn local_action(policy: &LocalPolicy, remote: &TerminationV2) -> Result<Loca
                 LocalAction::BuildLocally
             }
         }
-    })
+    }
 }
 
 /// The server's executions: one per running `JobContent`, admitted in section 5's order.
@@ -807,16 +706,6 @@ impl Jobs {
     /// One execution.
     pub fn execution(&self, id: ExecutionId) -> Option<&Execution> {
         self.executions.get(&id)
-    }
-
-    /// Typed response for the additive v2 subscriber-terminal endpoint. A v1 Done event is
-    /// not enough to synthesize it: infrastructure and completed failures share an outcome.
-    pub fn terminal(
-        &self,
-        execution: ExecutionId,
-        subscriber: u64,
-    ) -> Option<&SubscriberTerminalV2> {
-        self.executions.get(&execution)?.terminal(subscriber)
     }
 
     /// Every execution.
@@ -1033,7 +922,7 @@ impl Jobs {
                             self.assignments.insert(lead, (e.assignment(), false));
                         }
                     }
-                    None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
+                    None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
                 for effect in more {
