@@ -2,11 +2,12 @@
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::jobs::{
-    Effect, ExecState, Execution, ExecutionConfig, Jobs, Subscriber, SubscriberState,
+    AssignmentToken, Effect, ExecState, Execution, ExecutionConfig, Jobs, Subscriber,
+    SubscriberState,
 };
 use blaze_dist::work::EndWhy;
 use blaze_wire::{
-    Attempt, BuildSpec, Command, DoneEvent, ExecutionId, JobContent, JobEvent, JobRequest,
+    Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobContent, JobEvent, JobRequest,
     LocalPolicy, Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, RootRef,
     Set, SourceRef, StoreIdentity, WorkersEventsRequest,
 };
@@ -57,7 +58,10 @@ fn a_reassigned_execution_refuses_the_old_attempts_events() {
     let mut effects = Vec::new();
     e.assign(1, "helper", &[], &mut effects).unwrap();
     assert_eq!(e.attempt(), Attempt(2));
-    assert!(effects.contains(&Effect::Kill { executor: "lead".to_owned(), attempt: Attempt(1) }));
+    assert!(effects.contains(&Effect::Kill {
+        executor: "lead".to_owned(),
+        assignment: AssignmentToken { execution: e.id, attempt: Attempt(1) }
+    }));
     let request = WorkersEventsRequest { execution: e.id, attempt: Attempt(1), events: Vec::new() };
     assert_eq!(
         e.worker_events(2, "lead", &request, &mut Vec::new()),
@@ -217,13 +221,23 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
         let first = jobs.submit(0, &request(1), reservation(), &mut effects).unwrap();
         jobs.tick(0, &mut effects);
         jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
-        jobs.killed(1, &builder, first.execution, Attempt(1), true);
+        jobs.killed(
+            1,
+            &builder,
+            AssignmentToken { execution: first.execution, attempt: Attempt(1) },
+            true,
+        );
 
         let second = jobs.submit(2, &request(2), reservation(), &mut effects).unwrap();
         jobs.tick(2, &mut effects);
         assert_eq!(jobs.execution(second.execution).unwrap().lead(), Some(builder.as_str()));
         // A duplicated or reordered acknowledgement belongs to the first assignment.
-        jobs.killed(3, &builder, first.execution, Attempt(1), alive);
+        jobs.killed(
+            3,
+            &builder,
+            AssignmentToken { execution: first.execution, attempt: Attempt(1) },
+            alive,
+        );
         assert_eq!(
             jobs.admission_view().executor(&builder).unwrap().busy,
             Some((second.execution, Attempt(1))),
@@ -365,5 +379,261 @@ fn review_a_replacement_lead_gets_its_own_compiled_event() {
             })
             .collect();
         assert_eq!(compiled, vec![Attempt(1), Attempt(2)]);
+    }
+}
+
+fn done(e: &Execution) -> WorkersEventsRequest {
+    WorkersEventsRequest {
+        execution: e.id,
+        attempt: e.attempt(),
+        events: vec![JobEvent::Done(DoneEvent { outcome: Outcome::Passed, counters: Vec::new() })],
+    }
+}
+
+#[test]
+fn completion_and_timer_order_preserve_each_subscribers_deadline() {
+    for timer_first in [false, true] {
+        for last in [false, true] {
+            for now in [10, 11] {
+                let mut e = Execution::new(
+                    0,
+                    ExecutionId(1),
+                    JobContent([1; 32]),
+                    Namespace::Main,
+                    subscriber(1, 10),
+                    ExecutionConfig::default(),
+                    &mut Vec::new(),
+                );
+                if !last {
+                    let mut b = subscriber(2, 100);
+                    b.policy = LocalPolicy::Fallback;
+                    e.subscribe(b).unwrap();
+                }
+                e.assign(0, "lead", &[], &mut Vec::new()).unwrap();
+                let request = done(&e);
+                let mut out = Vec::new();
+                if timer_first {
+                    e.tick(now, &mut out);
+                }
+                e.worker_events(now, "lead", &request, &mut out).unwrap();
+                e.tick(now, &mut out);
+                e.worker_events(now + 1, "lead", &request, &mut out).unwrap();
+                let outcomes: Vec<_> = out
+                    .iter()
+                    .filter_map(|fx| match fx {
+                        Effect::SubscriberEnded { subscriber, outcome, policy } => {
+                            Some((*subscriber, outcome.clone(), policy.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let mut expected = vec![(
+                    1,
+                    if now > 10 { Outcome::TimedOut } else { Outcome::Passed },
+                    LocalPolicy::Never,
+                )];
+                if !last {
+                    expected.push((2, Outcome::Passed, LocalPolicy::Fallback));
+                }
+                assert_eq!(outcomes, expected, "timer_first={timer_first}, last={last}, now={now}");
+                assert_eq!(
+                    e.state(),
+                    ExecState::Ended(if last && now > 10 {
+                        Outcome::Cancelled
+                    } else {
+                        Outcome::Passed
+                    })
+                );
+                assert_eq!(
+                    e.events(0).iter().filter(|x| matches!(x.event, JobEvent::Done(_))).count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+fn registry() -> (blaze_dist::jobs::Jobs, String) {
+    let mut a = blaze_dist::admission::Admission::new(Default::default());
+    a.add_machine("machine", [1; 32], reservation());
+    let slot = a.add_builder(0, "machine", reservation()).unwrap();
+    (blaze_dist::jobs::Jobs::new(a, Default::default()), slot)
+}
+
+fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64) -> ExecutionId {
+    jobs.submit(
+        0,
+        &blaze_wire::JobRequest {
+            spec: spec([1; 32], tag),
+            namespace: Namespace::Main,
+            deadline_ms: 100_000,
+            local: LocalPolicy::Never,
+            test_timeout_ms: None,
+        },
+        reservation(),
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .execution
+}
+
+#[test]
+fn a_duplicate_kill_ack_cannot_release_a_new_assignment_or_its_draining_slot() {
+    use blaze_dist::admission::ExecutorPhase;
+    for draining in [false, true] {
+        for alive in [false, true] {
+            let (mut jobs, slot) = registry();
+            let a = submit(&mut jobs, 1);
+            jobs.tick(0, &mut Vec::new());
+            let request = done(jobs.execution(a).unwrap());
+            let mut out = Vec::new();
+            jobs.worker_events(1, &slot, &request, &mut out).unwrap();
+            let token = out
+                .iter()
+                .find_map(|(_, fx)| match fx {
+                    Effect::Kill { executor, assignment } if executor == &slot => Some(*assignment),
+                    _ => None,
+                })
+                .unwrap();
+            jobs.killed(2, &slot, token, true);
+            jobs.killed(2, &slot, token, true); // duplicate before reuse is inert too
+            let b = submit(&mut jobs, 2);
+            jobs.tick(3, &mut Vec::new());
+            assert_eq!(jobs.admission_view().executor(&slot).unwrap().busy, Some((b, Attempt(1))));
+            if draining {
+                assert!(jobs.admission().rebuild(4, &slot, reservation()).is_none());
+            }
+            let before = jobs.admission_view().executor(&slot).unwrap().clone();
+            jobs.killed(5, &slot, token, alive);
+            // Even the current token cannot acknowledge a stop that has not been requested.
+            jobs.killed(5, &slot, jobs.execution(b).unwrap().assignment(), true);
+            assert_eq!(jobs.admission_view().executor(&slot), Some(&before));
+            let c = submit(&mut jobs, 3);
+            jobs.tick(6, &mut Vec::new());
+            assert_eq!(jobs.execution(c).unwrap().state(), ExecState::Queued);
+            assert_eq!(jobs.admission_view().executors().count(), 1);
+            assert_eq!(
+                before.phase,
+                if draining { ExecutorPhase::Draining } else { ExecutorPhase::Ready }
+            );
+            let request = done(jobs.execution(b).unwrap());
+            let b_token = jobs.execution(b).unwrap().assignment();
+            jobs.worker_events(7, &slot, &request, &mut Vec::new()).unwrap();
+            jobs.killed(8, &slot, b_token, true);
+            jobs.tick(9, &mut Vec::new());
+            assert_eq!(jobs.execution(c).unwrap().state(), ExecState::Running);
+            if draining {
+                assert_eq!(
+                    jobs.admission_view().executor(&slot).unwrap().phase,
+                    ExecutorPhase::Stopped
+                );
+                assert_ne!(jobs.execution(c).unwrap().lead(), Some(slot.as_str()));
+            }
+        }
+    }
+}
+
+#[test]
+fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage() {
+    use blaze_wire::{BatchResult, RootSet, Set, WorkJoinRequest, WorkLeaseRequest};
+    let mut config = ExecutionConfig::default();
+    config.heartbeat_ms = 5;
+    config.work.progress_first_ms = 10;
+    let mut e = Execution::new(
+        0,
+        ExecutionId(1),
+        JobContent([1; 32]),
+        Namespace::Main,
+        subscriber(1, 50),
+        config,
+        &mut Vec::new(),
+    );
+    e.assign(0, "lead", &["stuck".to_owned(), "healthy".to_owned()], &mut Vec::new()).unwrap();
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let heartbeat = |e: &Execution| WorkersEventsRequest {
+        execution: e.id,
+        attempt: e.attempt(),
+        events: Vec::new(),
+    };
+    // The original lead disappears. The helper keeps heartbeating and is promoted.
+    e.worker_events(16, "stuck", &heartbeat(&e), &mut Vec::new()).unwrap();
+    let old = e.assignment();
+    let mut out = Vec::new();
+    e.tick(16, &mut out);
+    assert!(out.contains(&Effect::Kill { executor: "lead".to_owned(), assignment: old }));
+    assert!(out.contains(&Effect::NeedLead));
+    e.assign(16, "stuck", &["healthy".to_owned()], &mut out).unwrap();
+    e.join(
+        16,
+        "stuck",
+        &WorkJoinRequest {
+            execution: e.id,
+            attempt: e.attempt(),
+            roots,
+            rejected: Set::new(Vec::new()),
+        },
+        &mut out,
+    )
+    .unwrap();
+    let grant = e
+        .lease(16, "stuck", &WorkLeaseRequest { execution: e.id, attempt: e.attempt() }, &mut out)
+        .unwrap()
+        .grant
+        .unwrap();
+    // Never deliver a Compiled event. Heartbeats continue, but progress revokes the lease.
+    for now in [21, 26, 31, 36, 41, 46, 50] {
+        e.worker_events(now, "stuck", &heartbeat(&e), &mut out).unwrap();
+        e.tick(now, &mut out);
+    }
+    assert_eq!(e.state(), ExecState::Running);
+    assert_eq!(e.lead(), Some("stuck"));
+    assert!(!e.work().unwrap().is_done());
+    let late = BatchResult {
+        lease: grant.lease,
+        seq: 1,
+        items: Vec::new(),
+        packs: Vec::new(),
+        returned_roots: grant.roots,
+        returned_names: Set::new(Vec::new()),
+    };
+    assert_eq!(e.result(50, "stuck", &late, &mut out), Err(blaze_dist::Refusal::DeadLease));
+    let current = e.assignment();
+    e.tick(51, &mut out);
+    assert_eq!(e.state(), ExecState::Ended(Outcome::Cancelled));
+    assert_eq!(e.work().unwrap().ended(), Some(EndWhy::Deadline));
+    assert!(!e.work().unwrap().is_done());
+    assert!(out.contains(&Effect::Kill { executor: "stuck".to_owned(), assignment: current }));
+    assert!(out.contains(&Effect::Kill { executor: "healthy".to_owned(), assignment: current }));
+    assert!(!out.iter().any(|fx| matches!(fx, Effect::Work(blaze_dist::work::Effect::Done))));
+    assert_eq!(e.result(52, "stuck", &late, &mut out), Err(blaze_dist::Refusal::Ended));
+}
+
+fn spec(platform: Digest, i: u64) -> BuildSpec {
+    let profile = ProfileSpec {
+        name: "dev".to_owned(),
+        opt_level: 0,
+        debug: 1,
+        debug_assertions: true,
+        overflow_checks: true,
+        panic: 0,
+        strip: 0,
+        split_debuginfo: 0,
+        backend: 0,
+        mir_opt: 0,
+    };
+    BuildSpec {
+        source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
+        lock: [1; 32],
+        units: Vec::new(),
+        asked: blaze_wire::Set::new(Vec::new()),
+        profile,
+        platform,
+        rustflags: Vec::new(),
+        config_env: blaze_wire::Set::new(Vec::new()),
+        script_env: blaze_wire::Set::new(Vec::new()),
+        cwd: String::new(),
+        command: Command::Build,
+        toolchain: StoreIdentity([2; 32]),
     }
 }

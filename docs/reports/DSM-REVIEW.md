@@ -4,12 +4,19 @@ Review of PR #19, starting at `79c80c7051f9f4fc4982b5ad83b70334c823fa78`, on
 2026-10-27. This covers the sans-IO `blaze-dist` protocol core and its deterministic simulation.
 It does not claim a working distributed compiler or HTTP integration.
 
+During the review, the owner advanced the branch to
+`fc565b0e7ab7c6d8185a2c394022e184ea99ba24`. The final review tree incorporates that commit,
+including its assignment-token API, pending-stop check, stronger simulation tracking and
+additional draining and permanent-stall regressions. Overlapping fixes were reconciled with the
+admission guard, source tracking, root-epoch notification and holder/work corrections below.
+
 ## Corrections
 
 ### Assignment identity survives delayed callbacks
 
-Kill effects identify the attempt they target. Admission records both execution and attempt,
-and a completion or kill acknowledgment only releases the matching assignment. A duplicated
+Kill effects identify the execution and attempt they target. Admission records both, and a
+kill acknowledgment releases only the matching assignment with a pending stop. Admission's
+completion guard independently checks execution and attempt. A duplicated
 acknowledgment for an earlier job can no longer free the slot of a newer job on the same
 executor. Reassignment emits kills for the previous attempt and reserves the replacement only
 after assignment succeeds.
@@ -89,19 +96,20 @@ BLAZE_DIST_SEEDS=10000 BLAZE_DIST_SEED= \
 cargo +1.99.0 test --locked -p blaze-dist -- --nocapture --test-threads=2
 ```
 
-Result: **51 tests passed**, no failures or ignored tests.
+After reconciling the owner's concurrent update, the full command was run again on the combined
+source. Result: **54 tests passed**, no failures or ignored tests.
 
 | Suite | Passing tests |
 | --- | ---: |
 | Library | 3 |
 | Admission | 5 |
 | Holder | 4 |
-| Jobs | 9 |
+| Jobs | 12 |
 | Simulation | 14 |
 | Work | 16 |
 
 The simulation passed **10,000 work seeds and 10,000 jobs seeds** (0 through 9,999 for each).
-The simulation test binary took 59.66 seconds in this shared Linux environment; that is a test
+The simulation test binary took 64.28 seconds in this shared Linux environment; that is a test
 run duration, not a performance benchmark. Work runs may end with the specified named failures
 after lead loss or when no lead remains; they are not all successful compiles. The deterministic
 replay equality test also passed.
@@ -111,8 +119,8 @@ needed formatting only; no wire behavior or encoding changed.
 
 ## Mutation checks
 
-Three independent scratch copies of the corrected `blaze-dist` source were compiled with Rust
-1.99.0 against the tested `blaze-wire` library. Each copy changed one protocol rule. A small
+Three independent scratch copies of the final combined `blaze-dist` source were compiled with
+Rust 1.99.0 against the tested `blaze-wire` library. Each copy changed one protocol rule. A small
 driver ran work seeds in increasing order starting at zero, with a bound of 512 and stopping on
 the first invariant violation. **These were bounded detection checks, not full 10,000-seed
 mutation sweeps.** Production source and the simulator's assertions remained unchanged.

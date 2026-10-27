@@ -5,6 +5,7 @@
 //! leads die or stall and come back with a dead attempt's events; builders are rebuilt. The
 //! checker holds after every step:
 //!
+//! - **assignment**: one live assignment per slot, retained until its own kill acknowledgment;
 //! - **capacity**: no machine's reservations sum past its capacity;
 //! - **order**: a pull request's job is admitted only while no `Main` job waits on its
 //!   platform, and every job only after the jobs of its class queued before it;
@@ -56,7 +57,7 @@ const HEARTBEAT_MS: Millis = 5_000;
 #[derive(Clone, Debug)]
 struct Lead {
     executor: String,
-    attempt: blaze_wire::Attempt,
+    attempt: Attempt,
     finish_at: Millis,
     dead: bool,
     stall_until: Millis,
@@ -78,8 +79,9 @@ struct World {
     ended_subs: BTreeSet<u64>,
     left: BTreeSet<u64>,
     leads: BTreeMap<ExecutionId, Lead>,
-    late: Vec<(ExecutionId, String, blaze_wire::Attempt)>,
-    kills: Vec<(Millis, String, ExecutionId, Attempt)>,
+    late: Vec<(ExecutionId, String, Attempt)>,
+    kills: Vec<(Millis, String, jobs::AssignmentToken, bool)>,
+    live: BTreeMap<String, jobs::AssignmentToken>,
     dead: BTreeSet<String>,
     summary: Summary,
 }
@@ -132,6 +134,7 @@ impl World {
             leads: BTreeMap::new(),
             late: Vec::new(),
             kills: Vec::new(),
+            live: BTreeMap::new(),
             dead: BTreeSet::new(),
             summary: Summary {
                 seed,
@@ -156,11 +159,13 @@ impl World {
             let mut out = Vec::new();
             self.jobs.tick(self.now, &mut out);
             self.effects(out)?;
+            self.check_assignments()?;
             self.jobs.admission_view().check().map_err(|e| self.violation("capacity", e))?;
             self.assignments()?;
             if self.now >= horizon
-                && self.jobs.executions().all(|e| matches!(e.state(), ExecState::Ended(_)))
                 && self.kills.is_empty()
+                && self.live.is_empty()
+                && self.jobs.executions().all(|e| matches!(e.state(), ExecState::Ended(_)))
             {
                 break;
             }
@@ -200,6 +205,7 @@ impl World {
                 let gone = self.jobs.admission().close_pr(n);
                 for (executor, busy) in gone {
                     self.dead.insert(executor.clone());
+                    self.live.remove(&executor);
                     if let Some((execution, _)) = busy
                         && let Some(lead) = self.leads.get_mut(&execution)
                         && lead.executor == executor
@@ -427,17 +433,37 @@ impl World {
         let (due, later): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.kills).into_iter().partition(|(at, ..)| *at <= now);
         self.kills = later;
-        for (_, executor, execution, attempt) in due {
-            let alive = !self.dead.contains(&executor);
-            self.jobs.killed(now, &executor, execution, attempt, alive);
+        for (_, executor, assignment, alive) in due {
+            // The simulated agent stops only the named assignment. Delayed duplicates
+            // cannot stop the newer process occupying this slot.
+            if self.live.get(&executor) == Some(&assignment) {
+                self.live.remove(&executor);
+            }
+            self.jobs.killed(now, &executor, assignment, alive);
         }
+    }
+
+    fn check_assignments(&self) -> Result<(), Violation> {
+        for (executor, assignment) in &self.live {
+            let slot = self.jobs.admission_view().executor(executor);
+            if !slot.is_some_and(|s| {
+                s.busy == Some((assignment.execution, assignment.attempt))
+                    && s.phase != crate::admission::ExecutorPhase::Stopped
+            }) {
+                return Err(self.violation(
+                    "assignment",
+                    format!("live assignment {assignment:?} lost its slot {executor}: {slot:?}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn effects(&mut self, out: Vec<(ExecutionId, jobs::Effect)>) -> Result<(), Violation> {
         for (id, effect) in out {
             match effect {
                 jobs::Effect::Event(item) => self.event(id, &item.event, item.attempt)?,
-                jobs::Effect::Kill { executor, attempt } => {
+                jobs::Effect::Kill { executor, assignment } => {
                     if let Some(lead) = self.leads.get(&id)
                         && lead.executor == executor
                         && lead.dead
@@ -445,11 +471,11 @@ impl World {
                         self.dead.insert(executor.clone());
                     }
                     let at = self.now + self.rng.range(0, 10_000);
-                    self.kills.push((at, executor.clone(), id, attempt));
-                    if self.rng.chance(250_000) {
-                        let replay_at = at + self.rng.range(10_000, 30_000);
-                        self.kills.push((replay_at, executor, id, attempt));
-                    }
+                    let alive = !self.dead.contains(&executor);
+                    self.kills.push((at, executor.clone(), assignment, alive));
+                    // A second acknowledgment can arrive after the slot has been reused.
+                    let duplicate_at = at + self.rng.range(1_000, 60_000);
+                    self.kills.push((duplicate_at, executor, assignment, alive));
                 }
                 jobs::Effect::SubscriberEnded { subscriber, outcome, .. } => {
                     if self.left.contains(&subscriber) {
@@ -489,7 +515,7 @@ impl World {
         &mut self,
         id: ExecutionId,
         event: &JobEvent,
-        attempt: blaze_wire::Attempt,
+        attempt: Attempt,
     ) -> Result<(), Violation> {
         let (platform, namespace, need) = self.meta.get(&id).cloned().expect("submitted");
         match event {
@@ -515,6 +541,16 @@ impl World {
                 }
             }
             JobEvent::Assigned(assigned) => {
+                let token = jobs::AssignmentToken { execution: id, attempt: assigned.attempt };
+                if let Some(old) = self.live.insert(assigned.executor.clone(), token) {
+                    return Err(self.violation(
+                        "assignment",
+                        format!(
+                            "slot {} assigned {token:?} while {old:?} is still live",
+                            assigned.executor
+                        ),
+                    ));
+                }
                 let executor = self.jobs.admission_view().executor(&assigned.executor).cloned();
                 match executor {
                     Some(e)

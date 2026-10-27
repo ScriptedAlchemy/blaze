@@ -77,6 +77,15 @@ pub enum ExecState {
     Ended(Outcome),
 }
 
+/// Identity of one assignment on an executor. A stop and its acknowledgment must name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssignmentToken {
+    /// The execution assigned to the slot.
+    pub execution: ExecutionId,
+    /// Its attempt, including reassignments within the same execution.
+    pub attempt: Attempt,
+}
+
 /// What an execution asks its driver to do, or tells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -85,13 +94,12 @@ pub enum Effect {
     /// The lead was lost: the driver assigns a new lead (admission's choice), or ends the
     /// execution `Failed` when there is none.
     NeedLead,
-    /// Stop this attempt's process group on an executor. A delayed kill must not stop a
-    /// newer assignment on the same executor.
+    /// Stop an executor's process group: the agent kills it.
     Kill {
-        /// The executor.
+        /// The executor to stop.
         executor: String,
-        /// The assignment to stop, within this execution.
-        attempt: Attempt,
+        /// Stop only this assignment, never a newer one on the same executor.
+        assignment: AssignmentToken,
     },
     /// A subscriber is done with the execution: its own outcome and policy.
     SubscriberEnded {
@@ -175,6 +183,11 @@ impl Execution {
     /// Its current attempt.
     pub fn attempt(&self) -> Attempt {
         self.attempt
+    }
+
+    /// The token used by the driver to fence assignment stops and acknowledgments.
+    pub fn assignment(&self) -> AssignmentToken {
+        AssignmentToken { execution: self.id, attempt: self.attempt }
     }
 
     /// The current attempt's lead.
@@ -274,13 +287,13 @@ impl Execution {
         if let ExecState::Ended(_) = self.state {
             return Err(Refusal::Ended);
         }
-        let previous_attempt = self.attempt;
+        let previous = self.assignment();
         if self.lead.is_some() || self.work.is_some() {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
         for old in self.executors().map(str::to_owned).collect::<Vec<_>>() {
             if old != lead && !helpers.contains(&old) {
-                out.push(Effect::Kill { executor: old, attempt: previous_attempt });
+                out.push(Effect::Kill { executor: old, assignment: previous });
             }
         }
         self.lead = Some(lead.to_owned());
@@ -411,6 +424,11 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
+        self.expire_subscribers(now, out);
+        if self.attached().next().is_none() {
+            self.end(now, Outcome::Cancelled, EndWhy::Deadline, out);
+            return Ok(WorkersEventsAnswer::CANCEL);
+        }
         self.heard.insert(from.to_owned(), now);
         let lead = self.lead.as_deref() == Some(from);
         if lead {
@@ -471,7 +489,7 @@ impl Execution {
         if self.lead.is_some() && now > self.lead_heard + window {
             let lost = self.lead.take().expect("lead");
             self.lost.insert(lost.clone());
-            out.push(Effect::Kill { executor: lost, attempt: self.attempt });
+            out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
             self.losses += 1;
             if self.losses >= 2 {
                 return self.end(now, Outcome::Lost, EndWhy::LeadLostTwice, out);
@@ -547,7 +565,7 @@ impl Execution {
 
     fn finish(&mut self, now: Millis, outcome: Outcome, out: &mut Vec<Effect>) {
         for executor in self.executors().map(str::to_owned).collect::<Vec<_>>() {
-            out.push(Effect::Kill { executor, attempt: self.attempt });
+            out.push(Effect::Kill { executor, assignment: self.assignment() });
         }
         for subscriber in self.subscribers.values_mut() {
             if subscriber.state == SubscriberState::Attached {
@@ -635,6 +653,7 @@ pub struct Jobs {
     running: BTreeMap<JobContent, ExecutionId>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation)>,
     pr_jobs: BTreeMap<u64, PrJobs>,
+    assignments: BTreeMap<String, (AssignmentToken, bool)>,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -657,6 +676,7 @@ impl Jobs {
             running: BTreeMap::new(),
             platforms: BTreeMap::new(),
             pr_jobs: BTreeMap::new(),
+            assignments: BTreeMap::new(),
             next_execution: 1,
             next_subscriber: 1,
         }
@@ -815,19 +835,23 @@ impl Jobs {
         &mut self,
         now: Millis,
         executor: &str,
-        execution: ExecutionId,
-        attempt: Attempt,
+        assignment: AssignmentToken,
         alive: bool,
     ) {
+        // An acknowledgment is meaningful only for a stop we requested on this assignment.
+        if self.assignments.get(executor) != Some(&(assignment, true)) {
+            return;
+        }
+        self.assignments.remove(executor);
         if self
             .admission
             .executor(executor)
-            .is_none_or(|slot| slot.busy != Some((execution, attempt)))
+            .is_none_or(|slot| slot.busy != Some((assignment.execution, assignment.attempt)))
         {
             return;
         }
         if alive {
-            self.admission.finished(now, executor, execution, attempt);
+            self.admission.finished(now, executor, assignment.execution, assignment.attempt);
         } else {
             self.admission.lost(now, executor);
         }
@@ -849,8 +873,19 @@ impl Jobs {
             let e = self.executions.get_mut(&admitted.execution).expect("queued");
             let mut log = Vec::new();
             e.admitted(now, &mut log);
-            let _ = e.assign(now, &admitted.executor, &[], &mut log);
+            if e.assign(now, &admitted.executor, &[], &mut log).is_ok() {
+                self.assignments.insert(admitted.executor.clone(), (e.assignment(), false));
+            }
             self.after(now, admitted.execution, log, out);
+        }
+    }
+
+    fn track_stop(&mut self, effect: &Effect) {
+        if let Effect::Kill { executor, assignment } = effect
+            && let Some((current, stopping)) = self.assignments.get_mut(executor)
+            && current == assignment
+        {
+            *stopping = true;
         }
     }
 
@@ -873,14 +908,19 @@ impl Jobs {
                     Some(lead) => {
                         if e.assign(now, &lead, &[], &mut more).is_ok() {
                             self.admission.take(&lead, id, e.attempt());
+                            self.assignments.insert(lead, (e.assignment(), false));
                         }
                     }
                     None => e.end(now, Outcome::Failed, EndWhy::NoLead, &mut more),
                 }
                 out.push((id, effect));
-                out.extend(more.into_iter().map(|e| (id, e)));
+                for effect in more {
+                    self.track_stop(&effect);
+                    out.push((id, effect));
+                }
                 continue;
             }
+            self.track_stop(&effect);
             out.push((id, effect));
         }
         let e = &self.executions[&id];
