@@ -44,14 +44,14 @@ fn legacy_missing_location_unknown_fields_and_unsafe_cwd_are_refused() {
         blaze_wire::decode::<BuildSpec>(&unknown, &Limits::default()).unwrap_err().kind,
         ErrorKind::UnknownKey(13)
     );
-    value.cwd = "../out".to_owned();
+    value.workspace_manifest = SourcePath::new("left/src".to_owned()).unwrap();
     assert_eq!(
         blaze_wire::decode::<BuildSpec>(&blaze_wire::encode(&value), &Limits::default())
             .unwrap_err()
             .kind,
         ErrorKind::InvalidPath
     );
-    assert_eq!(blaze_wire::VERSION, 2);
+    assert_eq!(blaze_wire::VERSION, 3);
 }
 
 #[test]
@@ -84,4 +84,34 @@ fn configuration_tags_are_required_and_relative_paths_are_validated() {
         ErrorKind::InvalidPath
     );
     assert!(blaze_wire::decode::<ConfigEnvValue>(&[0x82, 2, 0xf6], &Limits::default()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn byte_components_are_lossless_distinct_and_canonical() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    for bytes in [
+        b"my:proj".to_vec(),
+        b"literal\\name".to_vec(),
+        b"C:".to_vec(),
+        vec![b'n', 0xff],
+        "n\u{fffd}".as_bytes().to_vec(),
+        b"percent%FF".to_vec(),
+    ] {
+        let native = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+        let logical = SourcePath::from_native(&native).unwrap();
+        let back =
+            blaze_wire::decode::<SourcePath>(&blaze_wire::encode(&logical), &Limits::default())
+                .unwrap();
+        assert_eq!(back.to_native().unwrap().as_os_str().as_bytes(), bytes);
+    }
+    let raw = SourcePath::from_native(std::path::Path::new(&std::ffi::OsString::from_vec(vec![
+        b'n', 0xff,
+    ])))
+    .unwrap();
+    let replacement = SourcePath::from_native(std::path::Path::new("n\u{fffd}")).unwrap();
+    assert_ne!(raw, replacement);
+    for malformed in ["%41", "%2f", "%2F", "%00", "%2E%2E", "%ff", "a/%", "a/%GG", "/a"] {
+        assert!(SourcePath::new(malformed.to_owned()).is_err(), "{malformed}");
+    }
 }

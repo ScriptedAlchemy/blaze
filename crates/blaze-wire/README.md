@@ -73,24 +73,29 @@ byte strings as lowercase hex, sets as arrays, and an enum as the wire's two-ele
 (`[discriminant, payload]`, `Namespace::Main` as `[0,null]`). It is never the wire and nothing's
 identity is taken from it.
 
-## Schema version 2
+## Schema version 3
 
-Version 2 requires `BuildSpec.workspace_manifest` (field 12), a normalized path
+Version 3 retains required `BuildSpec.workspace_manifest` (field 12), a logical path
 relative to the declared source root, and carries it in FrontEndKeyInput (5) and
 ConfigKeyInput (6). `cwd` remains relative to that workspace's directory. These
 are not absolute checkout paths or replacements for the source Git tree.
-SourcePath decoding rejects non-normalized paths; BuildSpec decoding also checks cwd.
+SourcePath escapes native byte components reversibly: ASCII letters/digits and
+`-_.` are literal, all other bytes use uppercase `%HH`. `/` separates components;
+`.` denotes the root. Colon/backslash and raw Unix bytes are not path separators.
+Decoded slash/NUL, empty/dot/parent components and noncanonical escapes are rejected.
+cwd is SourcePath at generation and decode. Manifest basename must be Cargo.toml.
 Missing location fields and unknown fields are rejected, not defaulted.
 Field 7's config values are now `[0, literal_text]` or `[1, workspace_relative_path]`.
 The old string encoding is invalid in schema 2. The serialized tag determines
 whether a worker keeps the literal or joins the selected workspace path.
 
-This crate speaks schema 2 only. Version 1 requires a separately pinned codec at
+This crate speaks schema 3 only. Prior versions require a separately pinned codec at
 the transport negotiation boundary; this implementation does not advertise it or
-silently interpret its records as version 2. Every typed digest/signature domain
-is now `/v2`; golden vectors were regenerated. `/v1` HTTP routes and the
+silently assign their records version-3 identity. Unchanged structural types may
+decode older bytes; version negotiation and typed domains must gate their identity.
+Every typed digest/signature domain is now `/v3`; golden vectors were regenerated. `/v1` HTTP routes and the
 `blaze/req/v1` request-authentication framing are transport contracts, unchanged.
-No version-1 cache identity can be reused as a version-2 typed digest.
+No prior-version typed digest identity can be reused as a version-3 typed digest.
 
 ## Limits
 
