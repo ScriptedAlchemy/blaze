@@ -2725,7 +2725,7 @@ impl Checkouts {
             // Compile-time artifact freshness must not be keyed only by mtimes.
             // Reuse the existing producer operation in a content generation.
             config.target_dir_config = TargetDirectoryConfig::Directory(
-                AbsPathBuf::assert_utf8(root.join("target/rust-analyzer/producers").join(generation)),
+                AbsPathBuf::assert_utf8(root.join("target/rust-analyzer/producers").join(generation)).into(),
             );
         }
         let (workspace, debug) =
