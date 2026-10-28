@@ -16,13 +16,15 @@ proxy or needs to kill the service.
     python3 remote.py --measure WORKSPACE -p PACKAGE --bin NAME --crate A,B,C [--run ARG]
                                                    a fresh machine with and without the remote
 """
-import argparse, hashlib, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
+import argparse, hashlib, http.client, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
 from difftest import RA_JIT, RUNNER, TARGET_ARGS, linker_line, sysroot_rlibs
-from s3fake import ACCESS, SECRET, Bucket, Proxy, Server, find
+from s3fake import ACCESS, SECRET, Bucket, Proxy, Server, find, free_port, wait_for
 
 from packs import FORMAT, sealed as pack_of, records as records_of
 
@@ -30,6 +32,9 @@ MIB = 1 << 20
 # Enough for three parts of a multipart upload.
 BIG = 20 * MIB
 REAL = os.environ.get("RA_JIT_S3_REMOTE")
+# `--server`: run the checks against `ra-jit serve` too, as a third leg beside the S3 services.
+SERVER = False
+TRANSFERS_ONLY = False
 # An object the harness keeps in a bucket of its own to see that the service reads again.
 PROBE = "harness-probe"
 # The longest a service may be away, in seconds, for a fetch to have to ride it out.
@@ -45,6 +50,19 @@ def check(what, ok, detail=""):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+def server_kind(remote):
+    return getattr(remote.server, "kind", None)
+
+
+def breaking_transfers(top, remote):
+    kind = server_kind(remote)
+    if kind == "serve":
+        serve_transfers(top, remote)
+    elif kind is not None:
+        transfers(top, remote)
+    else:
+        print("given: the transfers that break are left out: they need the proxy and a service to kill")
 
 
 def packed(data):
@@ -118,6 +136,144 @@ class Remote:
         bucket = Bucket(self.endpoint, self.bucket_name, prefix, os.environ.get("AWS_ACCESS_KEY_ID", ""),
                         os.environ.get("AWS_SECRET_ACCESS_KEY", ""), self.region, os.environ.get("AWS_SESSION_TOKEN"))
         return f"s3://{self.bucket_name}/{prefix}" + ("?" + query if query else ""), bucket
+
+
+class CacheServer:
+    """`ra-jit serve` on a directory of the harness's own, which can be killed and started again
+    on the same data: the third leg's service, where MinIO is the second's.
+
+    One run, one server: the server serves one cache directory at its address, so a prefix of a
+    run is a directory of its own with a server of its own, and a run that spoils its objects
+    spoils none of another's."""
+    kind = "serve"
+
+    def __init__(self, top, name):
+        self.dir, self.process, self.port = os.path.join(top, "serve", name), None, None
+        os.makedirs(self.dir, exist_ok=True)
+        self.log = open(os.path.join(top, "serve", name + ".log"), "ab")
+
+    def start(self):
+        if not self.port:
+            self.port = free_port()
+        self.process = subprocess.Popen([RA_JIT, "serve", "--cache", self.dir, "--listen", f"127.0.0.1:{self.port}"],
+                                        stdout=self.log, stderr=self.log, start_new_session=True)
+        wait_for(self.port, 60)
+
+    def kill(self):
+        if self.process and self.process.poll() is None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.process.pid)], capture_output=True)
+            else:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.wait()
+        self.process = None
+
+
+class Directory:
+    """The server's cache directory as the harness reads and writes it: the objects, as the
+    service holds them. What the harness spoils is put there past the server, which is what it
+    does to a bucket with `Bucket.put`; what the server writes is read from it."""
+    def __init__(self, root):
+        self.root = root
+
+    def at(self, name):
+        return os.path.join(self.root, name)
+
+    def objects(self):
+        """The names under the cache, and the size of each."""
+        found = {}
+        for base, _, names in os.walk(self.root):
+            for name in names:
+                if base == self.root and name == "key":
+                    continue
+                path = os.path.join(base, name)
+                found[os.path.relpath(path, self.root)] = os.path.getsize(path)
+        return found
+
+    def get(self, name):
+        try:
+            with open(self.at(name), "rb") as file:
+                return file.read()
+        except OSError:
+            return None
+
+    def put(self, name, body):
+        path = self.at(name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as file:
+            file.write(body)
+
+    def delete(self, name):
+        try:
+            os.remove(self.at(name))
+        except OSError:
+            pass
+
+    def uploads(self):
+        """Nothing goes up in parts to a server: a pack is one request."""
+        return []
+
+    def empty(self):
+        for name in self.objects():
+            self.delete(name)
+
+    def age(self, seconds):
+        """Makes every object look `seconds` older: a collection goes by when a file was written."""
+        then = time.time() - seconds
+        for base, _, names in os.walk(self.root):
+            for name in names:
+                os.utime(os.path.join(base, name), (then, then))
+
+
+class Serve(Remote):
+    """The cache server as one of the remotes the checks run against: `ra-jit serve` on a
+    directory of its own for each run, reached at `blaze+http://127.0.0.1:PORT`, with a proxy in
+    front of it as there is one in front of MinIO, and the directory itself as the harness's view
+    of what the service holds."""
+    def __init__(self, top):
+        self.name, self.top, self.count = "serve", top, 0
+        self.keys = os.path.join(top, "serve-keys")
+        os.makedirs(self.keys)
+        self.servers, self.server, self.proxy = [], None, None
+        self.env, self.secrets = {}, []
+
+    def start(self):
+        # Each run starts its own server in `fresh()`: there is nothing to start yet.
+        pass
+
+    def stop(self):
+        for server in self.servers:
+            server.kill()
+
+    def fresh(self):
+        self.count += 1
+        server = CacheServer(self.top, f"run-{os.getpid()}-{self.count}")
+        server.start()
+        self.servers.append(server)
+        self.server, self.proxy = server, Proxy(server.port)
+        return f"blaze+http://127.0.0.1:{self.proxy.port}", Directory(server.dir)
+
+    def restart(self):
+        """Starts the server of the run that was just killed again, on the same directory and
+        port, and waits until it answers."""
+        self.server.start()
+        end = time.time() + 60
+        while True:
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=1)
+                connection.request("GET", "/")
+                if connection.getresponse().status == 200:
+                    return
+            except OSError:
+                pass
+            if time.time() > end:
+                raise SystemExit("the cache server does not answer after it was started again")
+            time.sleep(0.1)
+
+    def age(self, seconds, one=True):
+        """Makes every object of the run look older, which a collection goes by. A file has one
+        time, so `one` is what all of them are."""
+        Directory(self.server.dir).age(seconds)
 
 
 # How a daemon is told to end, and how it ends then. On Windows that is Ctrl-Break, which
@@ -196,7 +352,9 @@ class Machine:
     def cargo(self, target):
         """Builds with cargo and keeps the line it links with. Returns the seconds it took."""
         start = time.time()
-        out = subprocess.run(["cargo", "rustc", *target, *TARGET_ARGS, "--", "--print", "link-args", "-C", "save-temps"],
+        metadata = "remote-" + digest(self.ws.encode())[:16]
+        out = subprocess.run(["cargo", "rustc", *target, *TARGET_ARGS, "--", "--print", "link-args", "-C", "save-temps",
+                              "-C", "metadata=" + metadata],
                              cwd=self.ws, capture_output=True, text=True, env=self.env)
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
@@ -308,7 +466,8 @@ def configuration(top, remote, a, address, bucket):
           out.returncode != 0 and "RA_JIT_REMOTE_READONLY" in out.stderr and bucket.objects() == before, out.stderr.strip()[-80:])
     out = c.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_READONLY": "1"})
     check("and pulls", out.returncode == 0 and all(c.packs().values()) and c.packs(), out.stdout.strip())
-    if not remote.server:
+    if not remote.server or server_kind(remote) == "serve":
+        print("  given: the checks that need a bucket's credentials, region and addressing are left out", flush=True)
         return
     shared = os.path.join(c.home, ".aws")
     os.makedirs(shared)
@@ -333,10 +492,10 @@ def configuration(top, remote, a, address, bucket):
     c.empty()
     out = c.ra_jit("cache", "pull", address + "&region=eu-west-1&path-style=true")
     check("another region and addressing by path asked for", out.returncode == 0 and c.packs(), out.stderr.strip()[-80:])
-    if remote.server.kind == "minio" and os.name == "nt":
+    if server_kind(remote) == "minio" and os.name == "nt":
         # glibc and macOS answer for every name under `localhost`; Windows asks the network.
         print("  the bucket in the name of the host: left out, Windows resolves no name under `localhost`", flush=True)
-    elif remote.server.kind == "minio":
+    elif server_kind(remote) == "minio":
         c.empty()
         remote.proxy.clear()
         by_host = address.replace("127.0.0.1", "localhost") + "&path-style=false"
@@ -571,6 +730,202 @@ def transfers(top, remote):
           out.stdout.strip() or out.stderr.strip()[-200:])
 
 
+def serve_transfers(top, remote):
+    """The ways a line to the cache server breaks that the proxy can make: an answer that says
+    no, a connection cut in a fetch and in a push, a fetch that stalls, and the server killed
+    under a transfer and started again on the same data.
+
+    What is not here is what only a bucket has: a pack sent in parts, an upload left unfinished,
+    and an endpoint that changes the address of a bucket."""
+    print(f"{remote.name}: transfers that break", flush=True)
+    proxy, counter = remote.proxy, [0]
+    quick = {"RA_JIT_REMOTE_TIMEOUT": "2"}
+
+    def pair(what):
+        nonlocal proxy
+        counter[0] += 1
+        address, bucket = remote.fresh()
+        proxy = remote.proxy
+        a, b = (Machine(top, f"t{counter[0]}-{remote.name}-{it}", remote) for it in "ab")
+        name = big_store(a, f"{remote.name} {what} {counter[0]}")
+        proxy.clear()
+        return a, b, address, bucket, name
+
+    def pushed(what):
+        a, b, address, bucket, name = pair(what)
+        out = a.ra_jit("cache", "push", address)
+        if out.returncode != 0:
+            raise SystemExit(f"the push before `{what}` failed: {out.stderr}")
+        proxy.clear()
+        return a, b, address, bucket, name
+
+    def whole(machine, name):
+        return machine.packs() == {name: True} and not machine.partials()
+
+    a, b, address, bucket, name = pair("one request")
+    out = a.ra_jit("cache", "push", address)
+    check("a big pack goes up as one request, and is what its name says in the cache",
+          out.returncode == 0 and len(proxy.seen("PUT", "/v1/blob/packs/")) == 1
+          and digest(bucket.get("packs/" + name)) == name[:-5], f"{len(proxy.seen('PUT', '/v1/blob/'))} requests")
+    check("ra-jit counts the requests the proxy saw", said_number(out.stderr, "requests") == len(proxy.requests),
+          f"{said_number(out.stderr, 'requests')} and {len(proxy.requests)}")
+    proxy.clear()
+    out = b.ra_jit("cache", "pull", address)
+    check("and comes down whole", out.returncode == 0 and whole(b, name) and said_number(out.stderr, "bytes received") >= BIG)
+    check("in the requests the proxy saw", said_number(out.stderr, "requests") == len(proxy.requests),
+          f"{said_number(out.stderr, 'requests')} and {len(proxy.requests)}")
+
+    a, b, address, bucket, name = pushed("503 down")
+    fault = proxy.fault("GET", "/v1/blob/", times=2, status=503)
+    out = b.ra_jit("cache", "pull", address)
+    check("503 twice on a fetch: asked again", out.returncode == 0 and whole(b, name) and fault.hits == 2
+          and said_number(out.stderr, "transfers resumed") >= 2, out.stderr.strip().split("\n")[0][-70:])
+
+    a, b, address, bucket, name = pair("503 up")
+    fault = proxy.fault("PUT", "/v1/blob/", times=2, status=500)
+    out = a.ra_jit("cache", "push", address)
+    check("5xx on a pack and on the manifest: sent again",
+          out.returncode == 0 and fault.hits == 2 and digest(bucket.get("packs/" + name)) == name[:-5])
+
+    a, b, address, bucket, name = pushed("always 503")
+    proxy.fault("GET", "/v1/blob/", times=1000, status=503)
+    start = time.time()
+    out = b.ra_jit("cache", "pull", address)
+    check("503 every time: given up, said, nothing left as a pack", out.returncode != 0 and not b.packs() and "503" in out.stderr,
+          f"{time.time() - start:.1f}s, {len(proxy.requests)} requests")
+
+    a, b, address, bucket, name = pushed("cut down")
+    fault = proxy.fault("GET", "/v1/blob/", times=2, cut=5 * MIB)
+    out = b.ra_jit("cache", "pull", address)
+    ranges = [it[2] for it in proxy.seen("GET", "/v1/blob/")]
+    check("the connection dropped twice in a fetch: taken up where it stopped",
+          out.returncode == 0 and whole(b, name) and said_number(out.stderr, "transfers resumed") == 2
+          and ranges[0] is None and all(ranges[1:]) and said_number(out.stderr, "bytes received") < BIG + MIB, f"{ranges}")
+
+    a, b, address, bucket, name = pushed("reset")
+    fault = proxy.fault("GET", "/v1/blob/", times=2, reset=True)
+    out = b.ra_jit("cache", "pull", address)
+    check("the connection closed with no answer, twice", out.returncode == 0 and whole(b, name) and fault.hits == 2)
+
+    a, b, address, bucket, name = pair("cut up")
+    fault = proxy.fault("PUT", "/v1/blob/", times=1, cut_request=2 * MIB)
+    out = a.ra_jit("cache", "push", address)
+    check("the connection dropped in the middle of a pack: sent again",
+          out.returncode == 0 and fault.hits == 1 and digest(bucket.get("packs/" + name)) == name[:-5])
+
+    a, b, address, bucket, name = pushed("stall")
+    fault = proxy.fault("GET", "/v1/blob/", times=1, stall=(3 * MIB, 6))
+    start = time.time()
+    out = b.ra_jit("cache", "pull", address, env=quick)
+    check("a fetch that stops for 6s with 2s of patience: taken up",
+          out.returncode == 0 and whole(b, name) and said_number(out.stderr, "transfers resumed") >= 1 and time.time() - start < 6,
+          f"{time.time() - start:.1f}s")
+
+    a, b, address, bucket, name = pushed("ra-jit killed")
+    proxy.rate = 4 * MIB
+    process = subprocess.Popen([RA_JIT, "cache", "pull", address], env=b.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    process.kill()
+    process.wait()
+    left = b.partials()
+    size = os.path.getsize(os.path.join(b.store, left[0])) if left else 0
+    check("ra-jit killed in a fetch leaves no pack", not b.packs() and len(left) == 1 and 0 < size < BIG, f"{size} bytes kept aside")
+    whole_store, _, _ = b.cache("verify")
+    counted = b.cache("stats")[1]
+    check("the store is whole, and counts what was kept aside as a temporary file",
+          whole_store and counted.get("packs") == 0 and counted.get("temporary files") == 1 and counted.get("temporary bytes") == size)
+    proxy.rate = None
+    aside = os.path.join(b.store, left[0]) if left else None
+    if aside:
+        os.utime(aside, (time.time() - 3600,) * 2)
+    b.cache("gc")
+    check("a collection an hour later leaves what was kept aside", b.partials() == left and aside
+          and os.path.getsize(aside) == size)
+    out = b.ra_jit("cache", "pull", address)
+    check("the next one fetches the rest only", out.returncode == 0 and whole(b, name)
+          and said_number(out.stderr, "bytes received") < BIG - size + MIB, out.stderr.strip().split("\n")[0][-60:])
+
+    a, b, address, bucket, name = pushed("two at once")
+    proxy.rate = 8 * MIB
+    both = [subprocess.Popen([RA_JIT, "cache", "pull", address], env=b.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(2)]
+    ends = [it.communicate() for it in both]
+    check("two processes fetching into one store: one fetches, both end well",
+          all(it.returncode == 0 for it in both) and whole(b, name) and len(proxy.seen("GET", "/v1/blob/")) == 1)
+    proxy.rate = None
+
+    counter[0] += 1
+    address, bucket = remote.fresh()
+    proxy = remote.proxy
+    a, b = (Machine(top, f"t{counter[0]}-{remote.name}-{it}", remote) for it in "ab")
+    for at in range(12):
+        a.add_pack(filler(f"{remote.name} small {at}", 64 << 10))
+    proxy.clear()
+    proxy.hold = 0.05
+    out = a.ra_jit("cache", "push", address, env={"RA_JIT_REMOTE_JOBS": "3"})
+    most = proxy.most_flying
+    proxy.most_flying = 0
+    out2 = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_JOBS": "3"})
+    check("twelve packs with three requests at a time: never more in flight",
+          out.returncode == 0 and out2.returncode == 0 and 2 <= most <= 3 and 2 <= proxy.most_flying <= 3 and len(b.packs()) == 12
+          and all(b.packs().values()),
+          f"{most} up, {proxy.most_flying} down, {len(b.packs())} packs, ended {out.returncode} and {out2.returncode}")
+    proxy.hold = 0
+
+    a, b, address, bucket, name = pushed("server killed and back")
+    proxy.rate = 4 * MIB
+    down = []
+    def bounce():
+        time.sleep(1.5)
+        remote.server.kill()
+        start = time.time()
+        time.sleep(1)
+        remote.restart()
+        down.append(time.time() - start)
+    bouncing = threading.Thread(target=bounce)
+    bouncing.start()
+    out = b.ra_jit("cache", "pull", address)
+    bouncing.join()
+    if down[0] < RIDDEN_OUT or out.returncode == 0:
+        taken_up = out.returncode == 0 and whole(b, name) and said_number(out.stderr, "transfers resumed") >= 1
+    else:
+        proxy.rate = None
+        taken_up = out.returncode != 0 and not b.packs() and b.ra_jit("cache", "pull", address).returncode == 0 and whole(b, name)
+    check("the server killed in a fetch and back: taken up", taken_up,
+          f"reading again after {down[0]:.1f}s; " + out.stderr.strip().split("\n")[0][-90:])
+
+    a, b, address, bucket, name = pushed("server killed")
+    proxy.rate = 4 * MIB
+    killing = threading.Timer(1.5, remote.server.kill)
+    killing.start()
+    start = time.time()
+    out = b.ra_jit("cache", "pull", address)
+    killing.join()
+    left = b.partials()
+    check("the server killed in a fetch and gone: given up, said, no pack",
+          out.returncode != 0 and not b.packs() and len(left) == 1 and "fetching packs/" in out.stderr, f"{time.time() - start:.1f}s")
+    remote.restart()
+    proxy.rate = None
+    out = b.ra_jit("cache", "pull", address)
+    check("back: the rest is fetched", out.returncode == 0 and whole(b, name) and said_number(out.stderr, "bytes received") < BIG,
+          out.stderr.strip()[-200:])
+
+    a, b, address, bucket, name = pair("server killed in a push")
+    proxy.rate = 4 * MIB
+    killing = threading.Timer(1.5, remote.server.kill)
+    killing.start()
+    out = a.ra_jit("cache", "push", address)
+    killing.join()
+    remote.restart()
+    proxy.rate = None
+    objects = bucket.objects()
+    check("the server killed in a push: said, no pack and no manifest in the cache",
+          out.returncode != 0 and "packs/" + name not in objects and "manifests/default" not in objects, out.stderr.strip()[-60:])
+    out = a.ra_jit("cache", "push", address)
+    check("back: the push goes through", out.returncode == 0 and digest(bucket.get("packs/" + name)) == name[:-5],
+          out.stdout.strip() or out.stderr.strip()[-200:])
+
+
 def stored(top, remote):
     """What is fetched is the store's: counted, kept under the limit, evicted, fetched again."""
     print(f"{remote.name}: the store a pull fills", flush=True)
@@ -666,7 +1021,10 @@ def collected(top, remote):
 
     def aged(seconds, one=True):
         remote.proxy.clear()
-        remote.proxy.age, remote.proxy.age_one = seconds, one
+        if hasattr(remote, "age"):
+            remote.age(seconds, one)
+        else:
+            remote.proxy.age, remote.proxy.age_one = seconds, one
 
     address, bucket = remote.fresh()
     a, b = (Machine(top, f"g-{remote.name}-{it}", remote) for it in "ab")
@@ -697,10 +1055,13 @@ def collected(top, remote):
     check("--dry-run says what would go and removes nothing", out.returncode == 0
           and said.get("objects that would be removed") == [3] and bucket.objects() == before
           and not remote.proxy.seen("DELETE"), out.stdout.replace("\n", "; ")[:110])
-    aged(3 * DAYS, one=False)
-    out, said = gc(a, address)
-    check("an object written again since it was listed stays", out.returncode == 0 and said.get("objects removed") == [0]
-          and bucket.objects() == before)
+    if server_kind(remote) == "serve":
+        print("  given: a service whose two clocks disagree is left out: a cache server reads one time per file", flush=True)
+    else:
+        aged(3 * DAYS, one=False)
+        out, said = gc(a, address)
+        check("an object written again since it was listed stays", out.returncode == 0 and said.get("objects removed") == [0]
+              and bucket.objects() == before)
     aged(3 * DAYS)
     out, said = gc(a, address)
     left = bucket.objects()
@@ -730,6 +1091,9 @@ def collected(top, remote):
     check("a push sends again what has been there unlisted for long", out.returncode == 0
           and len(remote.proxy.seen("PUT", "/packs/")) == 1, out.stdout.strip()[:80])
 
+    if server_kind(remote) == "serve":
+        # Unlike the S3 proxy, a direct timestamp edit does not age a new upload automatically.
+        aged(3 * DAYS)
     out, said = gc(a, address, "--older-than", "1d")
     aged(0)
     check("--older-than takes old packs off the lists and out of the remote", out.returncode == 0
@@ -850,7 +1214,7 @@ def packs_fetched(remote):
 
 def over_tls(top, remote):
     """The same service behind a certificate: what ra-jit's TLS trusts and what it does not."""
-    if remote.name != "minio" or not shutil.which("openssl"):
+    if server_kind(remote) != "minio" or not shutil.which("openssl"):
         print(f"{remote.name}: TLS is left out: it needs MinIO and openssl", flush=True)
         return
     print(f"{remote.name}: over TLS", flush=True)
@@ -1187,7 +1551,8 @@ def lazy(top, remote, a, crates, target, workspace, expected):
 
 
 def checks():
-    top = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-remote-"))
+    top = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-remote-",
+                                          dir="/tmp" if sys.platform == "darwin" else None))
     workspace, crates, target = os.path.join(HERE, "stress"), ["sapp", "sbase", "smid"], ["-p", "sapp"]
     remotes = []
     if REAL:
@@ -1199,11 +1564,20 @@ def checks():
                 remotes.append(Remote(kind, Server(kind, binary, top), top))
             else:
                 print(f"{kind}: not found ({variable} names it), left out")
+    if SERVER:
+        remotes.append(Serve(top))
     if not remotes:
-        raise SystemExit("no S3 service to run against")
+        raise SystemExit("no S3 service and no --server to run against")
     try:
         for remote in remotes:
             remote.start()
+            if TRANSFERS_ONLY:
+                stored(top, remote)
+                guarded(top, remote)
+                collected(top, remote)
+                spoiled(top, remote)
+                breaking_transfers(top, remote)
+                continue
             a, b, address, bucket, expected = round_trip(top, remote, remote.name, crates, target, workspace)
             configuration(top, remote, a, address, bucket)
             if remote.server:
@@ -1215,13 +1589,12 @@ def checks():
             spoiled(top, remote)
             poisoned(top, remote, a, crates, target, workspace, address, bucket, expected)
             lazy(top, remote, a, crates, target, workspace, expected)
-            if remote.server:
-                transfers(top, remote)
-            else:
-                print("given: the transfers that break are left out: they need the proxy and a service to kill")
+            breaking_transfers(top, remote)
     finally:
         for remote in remotes:
-            if remote.server:
+            if hasattr(remote, "stop"):
+                remote.stop()
+            elif remote.server:
                 remote.server.kill()
     print(f"{right}/{total} right")
     if right == total:
@@ -1305,6 +1678,54 @@ def measure(args):
             shutil.rmtree(top, ignore_errors=True)
 
 
+def selftest():
+    import contextlib, io
+    for kind in (None, "serve", "minio", "weed"):
+        remote = SimpleNamespace(server=None if kind is None else SimpleNamespace(kind=kind),
+                                 name="given" if kind is None else kind)
+        assert server_kind(remote) == kind
+        with mock.patch(__name__ + ".serve_transfers") as serve, \
+             mock.patch(__name__ + ".transfers") as s3, contextlib.redirect_stdout(io.StringIO()):
+            breaking_transfers("unused", remote)
+            assert serve.call_count == int(kind == "serve")
+            assert s3.call_count == int(kind in ("minio", "weed"))
+        with mock.patch(__name__ + ".shutil.which", return_value=None), \
+             mock.patch(__name__ + ".Server") as started, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            over_tls("unused", remote)
+            assert not started.called
+            assert "needs MinIO and openssl" in output.getvalue()
+        if kind != "minio":
+            with mock.patch(__name__ + ".shutil.which", return_value="/openssl"), \
+                 mock.patch(__name__ + ".Server") as started, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                over_tls("unused", remote)
+                assert not started.called
+                assert "needs MinIO and openssl" in output.getvalue()
+    # Exercise the given-remote early return through configuration, not just the helper.
+    machine = mock.Mock()
+    machine.ra_jit.return_value = SimpleNamespace(
+        returncode=0, stdout="", stderr="RA_JIT_REMOTE_READONLY")
+    machine.packs.return_value = {"a.pack": True}
+    bucket = mock.Mock()
+    bucket.objects.return_value = {}
+    remote = SimpleNamespace(name="given", server=None)
+    with mock.patch(__name__ + ".Machine", return_value=machine), \
+         mock.patch(__name__ + ".check") as checked, \
+         contextlib.redirect_stdout(io.StringIO()):
+        configuration("unused", remote, machine, "s3://given", bucket)
+        assert checked.call_count == 2
+    machine.add_pack.return_value = "a.pack"
+    remote = SimpleNamespace(name="given", server=None, proxy=None,
+                             fresh=lambda: ("s3://given", bucket))
+    with mock.patch(__name__ + ".Machine", return_value=machine), \
+         mock.patch(__name__ + ".packed", return_value=b"compressed"), \
+         mock.patch(__name__ + ".check"), contextlib.redirect_stdout(io.StringIO()) as output:
+        collected("unused", remote)
+        assert "checks that need old objects are left out" in output.getvalue()
+    print("remote.py selftest: None, serve, minio and weed dispatch passed; TLS is MinIO-only")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--measure", dest="workspace")
@@ -1313,8 +1734,17 @@ if __name__ == "__main__":
     parser.add_argument("--crate")
     parser.add_argument("--run", default="--version")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--server", action="store_true",
+                        help="also run the checks against `ra-jit serve` on a directory of its own")
+    parser.add_argument("--transfers-only", action="store_true",
+                        help="run transfers, damage, signing and collection without compiler round trips")
+    parser.add_argument("--selftest", action="store_true", help="check dispatch without services or credentials")
     args = parser.parse_args()
-    if args.workspace:
+    if args.selftest:
+        selftest()
+    elif args.workspace:
         measure(args)
     else:
+        SERVER = args.server
+        TRANSFERS_ONLY = args.transfers_only
         checks()

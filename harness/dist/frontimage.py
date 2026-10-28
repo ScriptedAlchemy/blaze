@@ -343,7 +343,10 @@ def main():
     if a.runs < 1 or not arms or len(arms) != len(set(arms)) or set(arms) - {"off", "store", "image"}:
         ap.error("--runs must be positive and --arms must name distinct off, store or image arms")
     a.td, a.work = os.path.abspath(a.td), os.path.abspath(a.work)
-    os.makedirs(a.work, exist_ok=True)
+    # Reserve the whole invocation before writing progress or deleting its image.
+    # Per-arm checks are too late to preserve an earlier run's evidence and cannot
+    # stop two invocations from racing on the shared seed and summary.
+    os.makedirs(a.work, exist_ok=False)
     image = os.path.join(a.work, "front.image")
     summary = {"td": a.td, "package": a.package, "runs": a.runs, "arms": {},
                "requested_arms": arms,

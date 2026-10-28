@@ -47,6 +47,8 @@ pub struct CargoWorkspace {
     requires_rustc_private: bool,
     /// The directory the build put the executables of the workspace in.
     executables: Option<AbsPathBuf>,
+    /// Source bytes supplied by the owned manifest reader, before scripts can edit them.
+    sources: Vec<(std::path::PathBuf, Vec<u8>)>,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -168,7 +170,7 @@ type Metadata = dyn Fn(
         Option<&str>,
         &[cfg::CfgAtom],
         &FxHashMap<String, Option<String>>,
-    ) -> anyhow::Result<cargo_metadata::Metadata>
+    ) -> anyhow::Result<(cargo_metadata::Metadata, Vec<(std::path::PathBuf, Vec<u8>)>)>
     + Send
     + Sync;
 
@@ -177,12 +179,22 @@ type Metadata = dyn Fn(
 pub struct OwnMetadata {
     pub root: std::sync::Arc<Root>,
     pub metadata: std::sync::Arc<Metadata>,
+    pub sysroot: std::sync::Arc<
+        dyn Fn(
+                &ManifestPath,
+                &CargoMetadataConfig,
+                &[cfg::CfgAtom],
+            ) -> anyhow::Result<cargo_metadata::Metadata>
+            + Send
+            + Sync,
+    >,
 }
 
 impl PartialEq for OwnMetadata {
     fn eq(&self, other: &OwnMetadata) -> bool {
         std::sync::Arc::ptr_eq(&self.root, &other.root)
             && std::sync::Arc::ptr_eq(&self.metadata, &other.metadata)
+            && std::sync::Arc::ptr_eq(&self.sysroot, &other.sysroot)
     }
 }
 
@@ -226,6 +238,7 @@ pub struct PackageData {
     /// What the profile cargo builds the package with changes of the toolchain's cfg, when the
     /// build is known.
     pub profile_cfg: Option<cfg::CfgDiff>,
+    pub codegen_flags: Vec<String>,
     /// Whether the package is one the build was asked for, which cargo tells its crates with
     /// `CARGO_PRIMARY_PACKAGE`.
     pub primary: bool,
@@ -245,6 +258,9 @@ pub struct PackageData {
     pub readme: Option<Utf8PathBuf>,
     /// Rust version as given in the `Cargo.toml`
     pub rust_version: Option<semver::Version>,
+    /// `links` as given in the `Cargo.toml`: the native library its build script links, whose
+    /// metadata the scripts of its dependents are given (blaze's runner of build scripts).
+    pub links: Option<String>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
     /// If this package is a member of the workspace, store all direct and transitive
@@ -347,6 +363,8 @@ pub struct CargoMetadataConfig {
     /// The toolchain version, if known.
     /// Used to conditionally enable unstable cargo features.
     pub toolchain_version: Option<semver::Version>,
+    /// The embedder's resolver also owns the standard library workspace.
+    pub own_metadata: Option<OwnMetadata>,
 }
 
 // Deserialize helper for the cargo metadata
@@ -397,6 +415,7 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 ..
             } = meta_pkg;
             let id = Arc::new(id);
@@ -435,10 +454,12 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
                 profile_cfg: None,
+                codegen_flags: Vec::new(),
                 primary: false,
                 metadata: meta.rust_analyzer.unwrap_or_default(),
                 all_member_deps: None,
@@ -537,6 +558,7 @@ impl CargoWorkspace {
             is_virtual_workspace,
             requires_rustc_private,
             executables: None,
+            sources: Vec::new(),
             is_sysroot,
             env: cargo_env,
         }
@@ -548,9 +570,21 @@ impl CargoWorkspace {
         self.packages[package].active_features = features;
     }
 
+    pub fn set_sources(&mut self, sources: Vec<(std::path::PathBuf, Vec<u8>)>) {
+        self.sources = sources;
+    }
+
+    pub fn sources(&self) -> &[(std::path::PathBuf, Vec<u8>)] {
+        &self.sources
+    }
+
     /// Sets what the profile the package is built with changes of the toolchain's cfg.
     pub fn set_profile_cfg(&mut self, package: Package, cfg: cfg::CfgDiff) {
         self.packages[package].profile_cfg = Some(cfg);
+    }
+
+    pub fn set_codegen_flags(&mut self, package: Package, flags: Vec<String>) {
+        self.packages[package].codegen_flags = flags;
     }
 
     /// Sets whether the package is one the build was asked for.

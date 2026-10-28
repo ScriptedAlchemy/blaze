@@ -20,11 +20,14 @@ mod live;
 mod macro_list;
 mod memory;
 mod mirdump;
+mod native_inputs;
 mod outline;
 mod plan;
 mod process;
+mod recovery;
 mod remote;
 mod sandbox;
+mod scripts;
 mod shipped;
 mod socket;
 mod solving;
@@ -52,7 +55,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _, TargetKind};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
@@ -147,6 +150,10 @@ struct Args {
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
+    /// Where to write, after `exe` is linked, the dep-info of every crate it links but the
+    /// standard library's: what blaze's runner of build scripts compiles a script again for
+    /// (`scripts.rs`), the script's own crate and its build dependencies alike.
+    inputs: Option<PathBuf>,
     /// The build is of the standard library alone ([`std_unit`]): a crate it names is the
     /// library's, not another of that name the program has too.
     library: bool,
@@ -242,6 +249,7 @@ impl Args {
         let mut exe = None;
         let mut shared = false;
         let mut dep_info = None;
+        let mut inputs = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
         let mut own_target = false;
@@ -286,6 +294,7 @@ impl Args {
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--shared" => shared = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
+                "--inputs" => inputs = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
@@ -336,6 +345,7 @@ impl Args {
             exe,
             shared,
             dep_info,
+            inputs,
             library: false,
             cfg_test,
             own_target,
@@ -543,9 +553,10 @@ pub(crate) fn unlinked_panic_runtime(db: &RootDatabase, program: &[Crate]) -> &'
     if abort { "panic_unwind" } else { "panic_abort" }
 }
 
-/// The names an object defines for others to link to.
+/// The names an object defines for others to link to, as ra-jit's code names them: without
+/// the `_` Mach-O puts before each.
 fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
-    use object::{Object as _, ObjectSymbol as _, SymbolScope};
+    use object::{BinaryFormat, Object as _, ObjectSymbol as _, SymbolScope};
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let objects: Vec<&[u8]> = if link::split::is_archive(&bytes) {
         let archive = object::read::archive::ArchiveFile::parse(&*bytes)
@@ -563,10 +574,23 @@ fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
         let file =
             object::File::parse(bytes).with_context(|| format!("parsing {}", path.display()))?;
         // A hidden one stands in for a function ra-jit could not compile, which a program
-        // compiles itself to be told why. A thread-local is not a "definition" to `object`.
-        let defined =
-            file.symbols().filter(|it| !it.is_undefined() && it.scope() == SymbolScope::Dynamic);
-        names.extend(defined.filter_map(|it| it.name().ok().map(str::to_owned)));
+        // compiles itself to be told why. On Mach-O what the object defines for others is
+        // private to the program too, and weak where a stand-in is not (`weaken::library`).
+        // A thread-local is not a "definition" to `object`.
+        let macho = file.format() == BinaryFormat::MachO;
+        let defined = file.symbols().filter(|it| {
+            !it.is_undefined()
+                && match it.scope() {
+                    SymbolScope::Dynamic => true,
+                    SymbolScope::Linkage => macho && it.is_weak(),
+                    _ => false,
+                }
+        });
+        let named = defined.filter_map(|it| it.name().ok());
+        names.extend(named.map(|it| match macho {
+            true => it.strip_prefix('_').unwrap_or(it).to_owned(),
+            false => it.to_owned(),
+        }));
     }
     Ok(names)
 }
@@ -1280,6 +1304,15 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
     names.filter(|it| named(it)).map(|it| dir.join(it)).collect()
 }
 
+/// Dependent helper callbacks use their parent's admission slot. Keep this around the work
+/// itself, independently of the database handle that owns the helper's solver-cache lifetime.
+fn admitted_parallel_work<'a>(
+    work: &'a ParallelWork<'a>,
+) -> impl Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a {
+    let job = hir_ty_codegen::budget::job_context();
+    move |db, resolver, at| job.run(|| work(db, resolver, at))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -1288,6 +1321,8 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = admitted_parallel_work(work);
+        let work = &work;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (solving::Handle::of(&self.db), &next, self.parts());
@@ -2292,13 +2327,14 @@ fn load(
         load_config,
         selection,
         inputs: inputs::Inputs::default(),
+        unloaded: FxHashSet::default(),
         debug: Vec::new(),
         beside,
         scripts_said,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
-    checkouts.add(projects, &mut db, &mut vfs)?;
+    checkouts.add(projects, &mut db, &mut vfs, load_owner(), None, &Sharing::Open)?;
     Ok((db, vfs, checkouts))
 }
 
@@ -2319,6 +2355,10 @@ struct Checkouts {
     load_config: LoadCargoConfig,
     /// What the checkouts loaded in full were loaded from besides their source.
     inputs: inputs::Inputs,
+    /// The checkouts that read as another (a split) whose workspace could not be loaded again
+    /// after the one they share was: they are the world they were, not the fallback one, and
+    /// are loaded again at the next request.
+    unloaded: FxHashSet<usize>,
     /// Which build of each project is loaded.
     selection: plan::Selection,
     /// For each of `roots`, what its plan says of the program as a whole.
@@ -2363,12 +2403,24 @@ impl Checkouts {
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
     /// root of its own. `None` when the two are not built alike.
     fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
+        self.alike_by(project, &Sharing::Open)
+    }
+
+    /// The same, among the loaded checkouts `sharing` allows.
+    fn alike_by(&self, project: &Path, sharing: &Sharing) -> Option<(usize, PathBuf)> {
         let project = dunce::canonicalize(project).ok()?;
         // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
         project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
             let (loaded, base) = &self.roots[at];
-            if self.splits[at].is_some() {
+            if self.splits[at].is_some() || !sharing.allows(base) {
+                return None;
+            }
+            // `builds_alike` reads the targets of the workspace as it was loaded: a checkout whose
+            // manifests or configuration changed since says nothing sure of which scripts it selects
+            // now, and is no checkout to read another through. Loading it again to see runs its
+            // scripts, for a project that does not read them.
+            if !self.inputs.describes(base) {
                 return None;
             }
             let inside = loaded.strip_prefix(base).ok()?;
@@ -2472,6 +2524,7 @@ impl Checkouts {
         project: &Path,
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
+        sharing: &Sharing,
     ) -> Option<View> {
         let project = dunce::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
@@ -2481,20 +2534,34 @@ impl Checkouts {
             return None;
         }
         // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
-        whole.into_iter().find_map(|(loaded, base)| {
-            let inside = loaded.strip_prefix(base).ok()?;
-            let mut over = project.clone();
-            for part in inside.components().rev() {
-                if over.file_name() != Some(part.as_os_str()) {
-                    return None;
-                }
-                over.pop();
-            }
-            let alike = (overlay == Overlay::Always || quick(base, &over))
-                && self.builds_alike(base, &over);
-            alike.then(|| View { base: base.clone(), over, project: loaded.clone() })
+        let (at, over) = self.alike_by(&project, sharing)?;
+        let (loaded, base) = &self.roots[at];
+        viewing(overlay, quick(base, &over)).then(|| View {
+            base: base.clone(),
+            over,
+            project: loaded.clone(),
         })
+    }
+
+    /// The loaded checkout a project that is not loaded will be read through when it is asked for:
+    /// the one it is read as (`view_of`) or splits packages with (`add_once`), as the policy
+    /// allows either, and none when it will load on its own. Nothing is run to say it.
+    fn sharing(
+        &self,
+        project: &Path,
+        overlay: Overlay,
+        quick: &dyn Fn(&Path, &Path) -> bool,
+    ) -> Sharing {
+        let Ok(project) = dunce::canonicalize(project) else { return Sharing::Alone };
+        if self.roots.iter().any(|(it, _)| *it == project) {
+            return Sharing::Open;
+        }
+        let Some((at, over)) = self.alike(&project) else { return Sharing::Alone };
+        let viewed = viewing(overlay, quick(&self.roots[at].1, &over));
+        match sharing_allowed(viewed, splitting()) {
+            true => Sharing::From(self.roots[at].1.clone()),
+            false => Sharing::Alone,
+        }
     }
 
     /// The checkout that the one at `root` has packages of, when it has.
@@ -2542,20 +2609,62 @@ impl Checkouts {
         })
     }
 
-    /// Loads the checkouts of `projects` into `db`, next to those there are.
+    /// Loads the checkouts of `projects` into `db`, next to those there are, for `owner`: the
+    /// build, or the request, whose output of their build scripts it reads. The scripts of all
+    /// of them are looked at again before the database has them, and a world that moved
+    /// meanwhile (a build that yielded what it held to wait for another group) is loaded again.
     fn add(
         &mut self,
         projects: &[&Path],
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
+        owner: u64,
+        env: Option<&BTreeMap<String, String>>,
+        sharing: &Sharing,
     ) -> anyhow::Result<()> {
+        // All the checkouts' scripts are judged under one admission, which no other build is
+        // between the groups of.
+        let mut operation = scripts::operation(owner);
+        for attempt in 1.. {
+            match self.add_once(projects, db, vfs, owner, env, sharing) {
+                // Each time the groups are judged again, over the output as it is now.
+                Err(error) if error.downcast_ref::<scripts::Stale>().is_some() && attempt < 16 => {
+                    eprintln!(
+                        "load: the scripts' output moved while it was loaded, again: {error}"
+                    );
+                }
+                done => {
+                    if done.as_ref().is_err_and(|it| it.downcast_ref::<scripts::Busy>().is_some()) {
+                        operation.wait();
+                    }
+                    return done;
+                }
+            }
+        }
+        unreachable!("the loop ends in a return")
+    }
+
+    fn add_once(
+        &mut self,
+        projects: &[&Path],
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+        owner: u64,
+        env: Option<&BTreeMap<String, String>>,
+        sharing: &Sharing,
+    ) -> anyhow::Result<()> {
+        let mut world = scripts::World::new();
+        // What is watched of each, which is not told to the inputs until the database has them.
+        let mut watched = Vec::new();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
-        // A checkout like a loaded one shares the packages they have alike, unless told not to.
-        let share = std::env::var_os("RA_JIT_SPLIT").is_none_or(|it| it != "0");
+        // A checkout like a loaded one shares the packages they have alike, unless told not to, or
+        // unless the request that joins it chose to read it through another checkout, or none
+        // (`sharing`): only the checkout whose scripts were judged for it supplies its packages.
+        let share = splitting();
         for project in projects {
-            if share && let Some((base, over)) = self.alike(project) {
+            if share && let Some((base, over)) = self.alike_by(project, sharing) {
                 let own = self.differing(base, &over);
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
@@ -2573,13 +2682,20 @@ impl Checkouts {
             // Cargo's lines are of the build of the project asked for first.
             let said =
                 if Some(project) == projects.first() { self.scripts_said.take() } else { None };
-            let (workspace, told) = workspace_at(
+            // Loaded for `owner`, whose scripts the load runs, with the variables of the process
+            // that asked for it: the request's own when a checkout joins a worker that is running
+            // (`env`), and the process whose build started the worker for its first load.
+            let build = owner;
+            let load_env = env.cloned().unwrap_or_else(scripts::load_env);
+            let (workspace, told, own) = workspace_at(
                 project,
                 &self.cargo_config,
                 &self.load_config,
                 &self.selection,
                 beside,
                 said,
+                None,
+                Some((&load_env, build)),
             )?;
             debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
@@ -2598,15 +2714,38 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            self.inputs.watch(&root, &workspace, &self.cargo_config);
+            world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
+            watched.push((root.clone(), workspace.clone(), self.cargo_config.clone(), build, own));
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
+            scripts::barrier::hold("group", owner);
         }
+        // What the database is about to be loaded from is what the scripts left: the leases of
+        // a group a build gave up to wait for another are taken again, and the tokens looked at.
+        world.sort();
+        world.dedup();
+        let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        for (root, workspace, config, build, own) in watched {
+            self.inputs.watch(&root, &workspace, &config, &FxHashMap::default(), build, own);
+        }
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
         Ok(())
+    }
+
+    /// The scripts the programs at `ats` read the output of through the database: those of the
+    /// checkouts they are built from, with the generation of each run it was loaded from. A
+    /// stale group of a checkout none of them reads is not theirs to wait for or to refuse.
+    fn world_for(&self, programs: &[Program], ats: &[usize]) -> scripts::World {
+        let mut roots = Vec::new();
+        for &at in ats {
+            let args = &programs[at].args;
+            roots.push(args.checkout.clone());
+            roots.extend(args.base.clone());
+        }
+        self.inputs.world_of(&roots)
     }
 
     /// The checkouts that are no longer what they were loaded from, for a build of
@@ -2614,24 +2753,56 @@ impl Checkouts {
     /// when its manifests, cargo's configuration or what its build scripts say changed, and
     /// when the build is of it and the process has other flags for rustc. One that shares
     /// packages with another is one when the build is of it and the two no longer build alike.
-    fn stale(&mut self, project: &Path, env: &ide_db::base_db::Env) -> anyhow::Result<Vec<usize>> {
+    fn stale(
+        &mut self,
+        project: &Path,
+        env: &ide_db::base_db::Env,
+        build: u64,
+        shares: Option<&Path>,
+    ) -> anyhow::Result<Vec<usize>> {
         let project = dunce::canonicalize(project).ok();
         let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
-        // The checkout whose variables are those of the build: any, when it is not loaded.
+        // The checkout whose scripts the build reads: the project's own (the one it shares
+        // packages with, for a split), or, for a project that is not loaded, the one chosen to be
+        // read through (`shares`, from `Checkouts::sharing`; nothing else is accepted later, see
+        // `Sharing`), if any. A project that will be loaded on its own reads no
+        // checkout that is loaded: its own scripts are judged when it is, with its own owner and
+        // variables.
         let built = match asked {
             Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
-            None => None,
+            None => {
+                shares.and_then(|it| self.roots.iter().map(|it| &it.1).find(|root| *root == it))
+            }
         };
         let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
         for (at, (_, root)) in self.roots.iter().enumerate() {
+            if self.unloaded.contains(&at) {
+                // A split that could not be loaded again is asked to be, by a request that reads
+                // it or the checkout it shares packages with, and by no other.
+                let reads = asked == Some(at)
+                    || self.splits[at]
+                        .as_ref()
+                        .is_some_and(|it| built.is_some_and(|b| *b == it.base));
+                if reads {
+                    stale.push(at);
+                }
+                continue;
+            }
             let changed = match &self.splits[at] {
                 Some(split) => asked == Some(at) && !self.builds_alike(&split.base, root),
                 None => match known.get(&**root) {
                     Some(&changed) => changed,
                     None => {
-                        let env = (asked.is_none() || built == Some(root)).then_some(env);
-                        let changed = self.inputs.stale(root, env)?;
+                        // Only a checkout the request reads is judged for its build, with the
+                        // variables of the request: the scripts run, and their result is the
+                        // build's for good. Another loaded checkout is not the request's to run
+                        // scripts of, nor to load again with its variables: it is judged for the
+                        // build that asks for it, when one does.
+                        let changed = match reached(built.map(|it| it.as_path()), root) {
+                            true => self.inputs.stale(root, Some(env), build)?,
+                            false => false,
+                        };
                         known.insert(root, changed);
                         changed
                     }
@@ -2653,15 +2824,16 @@ impl Checkouts {
         &mut self,
         stale: &[usize],
         env: &ide_db::base_db::Env,
+        build: u64,
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
     ) -> anyhow::Result<()> {
         let mut loaded = Vec::new();
         for &at in stale {
-            loaded.push(self.loaded_again(at, env)?);
+            loaded.push(self.loaded_again(at, env, build)?);
         }
-        for (&at, (workspace, debug, config)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config);
+        for (&at, (workspace, debug, config, given, own)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config, &given, build, own);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2672,12 +2844,18 @@ impl Checkouts {
             };
             let over = self.roots[at].1.clone();
             if !self.builds_alike(&self.roots[base].1, &over) {
-                match self.loaded_again(at, env) {
-                    Ok((workspace, debug, config)) => {
-                        self.place(at, workspace, debug, &config);
+                match self.loaded_again(at, env, build) {
+                    Ok((workspace, debug, config, given, own)) => {
+                        self.place(at, workspace, debug, &config, &given, build, own);
                         continue;
                     }
-                    Err(error) => failed = Err(error),
+                    // Not the fallback: it is a world nothing was loaded from. This one stays
+                    // what it was, and is asked to be loaded again.
+                    Err(error) => {
+                        self.unloaded.insert(at);
+                        failed = Err(error);
+                        continue;
+                    }
                 }
             }
             let own = self.differing(base, &over);
@@ -2690,30 +2868,65 @@ impl Checkouts {
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
-    /// variables `env`, what a build of it has a debugger told, and how it was loaded.
+    /// variables `env`, what a build of it has a debugger told, how it was loaded, and the
+    /// variables that process gave it over the daemon's.
     fn loaded_again(
-        &self,
+        &mut self,
         at: usize,
         env: &ide_db::base_db::Env,
-    ) -> anyhow::Result<(ProjectWorkspace, plan::Whole, CargoConfig)> {
-        let (project, root) = &self.roots[at];
+        build: u64,
+    ) -> anyhow::Result<(
+        ProjectWorkspace,
+        plan::Whole,
+        CargoConfig,
+        FxHashMap<String, Option<String>>,
+        Option<scripts::Own>,
+    )> {
+        let (project, root) = self.roots[at].clone();
         let mut config = self.cargo_config.clone();
-        config.extra_env.extend(self.inputs.variables(root, env));
-        let (workspace, debug) =
-            workspace_at(project, &config, &self.load_config, &self.selection, None, None)?;
-        Ok((workspace, debug, config))
+        let given = self.inputs.variables(&root, env);
+        config.extra_env.extend(given.clone());
+        // The scripts the check for this build ran are not run again for the load.
+        let (ready, ready_world) = match self.inputs.ready(&root) {
+            Some((ready, world)) => (Some(ready), Some(world)),
+            None => (None, None),
+        };
+        let asked: BTreeMap<String, String> =
+            env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+        let (workspace, debug, own) = workspace_at(
+            &project,
+            &config,
+            &self.load_config,
+            &self.selection,
+            None,
+            None,
+            ready,
+            Some((&asked, build)),
+        )?;
+        let own = own.map(|mut own| {
+            if let Some(world) = ready_world {
+                own.world = world;
+            }
+            own
+        });
+        Ok((workspace, debug, config, given, own))
     }
 
-    /// Has the checkout at `at` be `workspace`, loaded in full with `config`.
+    /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
+    /// is what the process it was loaded for added to the daemon's variables.
     fn place(
         &mut self,
         at: usize,
         workspace: ProjectWorkspace,
         debug: plan::Whole,
         config: &CargoConfig,
+        given: &FxHashMap<String, Option<String>>,
+        build: u64,
+        own: Option<scripts::Own>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.inputs.watch(&root, &workspace, config);
+        self.unloaded.remove(&at);
+        self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
         self.splits[at] = None;
@@ -2878,6 +3091,110 @@ enum Overlay {
     Always,
 }
 
+/// Whether a checkout that is not loaded shares the packages it has alike with a loaded one when
+/// it is (`RA_JIT_SPLIT=0` turns that off).
+fn splitting() -> bool {
+    std::env::var_os("RA_JIT_SPLIT").is_none_or(|it| it != "0")
+}
+
+/// Whether a checkout that is file-alike to a loaded one is read as it: always, or when it is quick
+/// (`quick`), and never when overlays are off.
+fn viewing(overlay: Overlay, quick: bool) -> bool {
+    overlay != Overlay::Never && (overlay == Overlay::Always || quick)
+}
+
+/// Whether a file-alike checkout is read through the loaded one at all: as a view of it, or split from it.
+fn sharing_allowed(viewed: bool, splitting: bool) -> bool {
+    viewed || splitting
+}
+
+/// Which loaded checkout a project that is not loaded is read through, as the check of the request that
+/// asks for it decided it, once, before it judged the scripts of that checkout: by a view of it, and by
+/// the packages it shares with it when it is loaded. What the worker settles and turns, or the files
+/// that change meanwhile, can make another checkout the one the files then say: its scripts were not
+/// run for this request, and the project is loaded on its own instead.
+#[derive(Clone, Debug, PartialEq)]
+enum Sharing {
+    /// Nothing is decided: a load that is not a request's join (the first, with `--also`), and a
+    /// project that is loaded.
+    Open,
+    /// The check judged no loaded checkout for the request: it loads on its own.
+    Alone,
+    /// The check judged the scripts of the checkout at this root: no other supplies its packages.
+    From(PathBuf),
+}
+
+impl Sharing {
+    /// Whether the loaded checkout at `root` may supply packages to the project.
+    fn allows(&self, root: &Path) -> bool {
+        match self {
+            Sharing::Open => true,
+            Sharing::Alone => false,
+            Sharing::From(from) => from == root,
+        }
+    }
+
+    /// The checkout whose scripts were judged.
+    fn judged(&self) -> Option<&Path> {
+        match self {
+            Sharing::From(from) => Some(from),
+            _ => None,
+        }
+    }
+}
+
+/// What it takes for a checkout to be read as a loaded one quickly (`Overlay::Quick`): the
+/// checkouts built whole, and whether files are loaded that nothing watches yet.
+struct Quick {
+    pending: bool,
+    built: Vec<PathBuf>,
+}
+
+impl Quick {
+    fn of(
+        files: &[WatchedFile],
+        db: &RootDatabase,
+        programs: &[Program],
+        running: &Builds,
+    ) -> Quick {
+        let built = programs
+            .iter()
+            .enumerate()
+            .filter(|(at, it)| it.whole.is_some() && !running.running.contains_key(at))
+            .map(|(_, it)| it.args.checkout.to_path_buf())
+            .collect();
+        Quick { pending: WatchedFile::unwatched(files, db), built }
+    }
+
+    fn allows(&self, base: &Path, over: &Path, given_up: &FxHashSet<PathBuf>) -> bool {
+        !self.pending && self.built.iter().any(|it| it == base) && !given_up.contains(over)
+    }
+}
+
+/// The reply for a request that failed, on one line: what cargo says of a script that failed has several
+/// (the cause, the script's output), and the client reads one. Newlines and backslashes are escaped
+/// ([`unfailed`] reads them back).
+fn failed_reply(why: &str) -> String {
+    let mut line = String::from("failed: ");
+    ra_jit_live::format::escape(why, &mut line);
+    line
+}
+
+/// A reply [`failed_reply`] wrote, as the message it was; any other reply as it is.
+pub(crate) fn unfailed(reply: &str) -> String {
+    match reply.strip_prefix("failed: ") {
+        Some(why) => format!("failed: {}", ra_jit_live::format::unescape(why)),
+        None => reply.to_owned(),
+    }
+}
+
+/// Whether a request reads the checkout loaded at `root`, when `built` is the one whose scripts it
+/// reads: its own checkout, or the one it shares packages with, and none when it reads no
+/// loaded checkout (a project that will be loaded on its own).
+fn reached(built: Option<&Path>, root: &Path) -> bool {
+    built == Some(root)
+}
+
 /// A checkout as the daemon looks at it.
 struct View {
     /// The loaded checkout it is built as.
@@ -2888,6 +3205,11 @@ struct View {
     project: PathBuf,
 }
 
+/// The workspace of the build `selection` names of the package at `project`, with what its
+/// build scripts say: what `ready`, `said` or cargo's build `beside` it says, or, in the whole
+/// build, what blaze's runs of them for the daemon's build `asked.1` by a process with the
+/// variables `asked.0` say (`scripts.rs`), which it then also returns the ask of.
+#[expect(clippy::too_many_arguments, reason = "each says where what the scripts said comes from")]
 fn workspace_at(
     project: &Path,
     cargo_config: &CargoConfig,
@@ -2895,7 +3217,9 @@ fn workspace_at(
     selection: &plan::Selection,
     beside: Option<&mut Beside>,
     said: Option<Vec<String>>,
-) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
+    ready: Option<WorkspaceBuildScripts>,
+    asked: Option<(&BTreeMap<String, String>, u64)>,
+) -> anyhow::Result<(ProjectWorkspace, plan::Whole, Option<scripts::Own>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
@@ -2912,6 +3236,7 @@ fn workspace_at(
     let mut debug =
         plan::Whole { debug: plan::Described::NOTHING, lto: false, lints_capped: false };
     let mut scripts = None;
+    let mut own = None;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
         if !selection.dev_deps {
             cargo.drop_dev_dependencies();
@@ -2925,10 +3250,60 @@ fn workspace_at(
             &cargo_config.extra_env,
         )?;
         let triple = triple.first().context("no target to build for")?;
-        let asked = plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
-        let plan = plan::Plan::of(manifest.manifest_path().as_ref(), selection, &asked)?;
+        let plan_asked =
+            plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
+        let whole = scripts::own();
+        let plan = match whole {
+            // The whole build asks no cargo for its plan either.
+            true => {
+                plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?
+            }
+            false => plan::Plan::of(manifest.manifest_path().as_ref(), selection, &plan_asked)?,
+        };
         debug = plan.whole()?;
+        let mut sources = cargo.sources().to_vec();
+        sources.extend_from_slice(plan.sources());
+        cargo.set_sources(sources);
         let packages: Vec<_> = cargo.packages().collect();
+        // A proc macro of the build is still built by cargo's check of the load (step J), which
+        // then runs the scripts too: blaze runs them where the build has none.
+        let built = |it: &&project_model::Package| plan.package(&cargo[**it].id.repr).is_some();
+        let is_macro = |it: &&project_model::Package| {
+            cargo[**it].targets.iter().any(|&target| {
+                matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+            })
+        };
+        let proc_macro = packages.iter().filter(built).find(is_macro);
+        if whole && let Some(found) = proc_macro {
+            eprintln!(
+                "build scripts: the build has the proc macro `{}`, which blaze does not build \
+                 without cargo's check yet (no-rustc step J): the check runs the scripts",
+                cargo[*found].name
+            );
+        }
+        if whole
+            && proc_macro.is_none()
+            && let Some((env, _)) = asked
+        {
+            let host = project_model::toolchain_info::target_tuple::get(
+                project_model::toolchain_info::QueryConfig::Rustc(&workspace.sysroot, dir.as_ref()),
+                None,
+                &cargo_config.extra_env,
+            )?;
+            let ids = packages.iter().map(|&it| &cargo[it].id.repr);
+            own = Some(scripts::Own {
+                env: env.clone(),
+                profile: selection.profile.clone(),
+                config: selection.config.clone(),
+                host: host.first().context("no host to run build scripts on")?.clone(),
+                target: triple.clone(),
+                explicit_target: selection.target.is_some(),
+                packages: ids
+                    .filter_map(|id| plan.package(id).map(|it| (id.clone(), it.for_target)))
+                    .collect(),
+                world: Vec::new(),
+            });
+        }
         if let Some(beside) = beside {
             let built = packages.iter().filter(|it| plan.package(&cargo[**it].id.repr).is_some());
             beside.awaits(cargo, built.copied());
@@ -2950,6 +3325,7 @@ fn workspace_at(
                 cargo.set_profile_cfg(package, profile.cfg());
             }
             let Some(built) = built else { continue };
+            cargo.set_codegen_flags(package, built.codegen_flags.clone());
             cargo.set_active_features(package, built.features.iter().cloned().collect());
             cargo.set_primary(package, built.primary);
         }
@@ -2957,13 +3333,25 @@ fn workspace_at(
     if let Some(scripts) = scripts {
         workspace.set_build_scripts(scripts);
     } else if load_config.load_out_dirs_from_check {
-        let build_scripts = match (&workspace.kind, said) {
+        let build_scripts = match (ready, &workspace.kind, said) {
+            // The scripts the daemon ran for this build said what they did.
+            (Some(ready), _, _) => ready,
             // Cargo's build that is over said it all: the scripts it ran said what they did,
             // and it built the proc macros where they are.
-            (ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
+            (None, ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
                 WorkspaceBuildScripts::of_messages(cargo, said.iter().map(String::as_str))
             }
-            (kind, _) => {
+            // The whole build's scripts are blaze's to compile and run, with no cargo.
+            (None, _, _) if own.is_some() => {
+                let ask = own.as_ref().expect("the whole build's ask");
+                let build = asked.map_or(0, |it| it.1);
+                let (said, world) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
+                if let Some(own) = own.as_mut() {
+                    own.world = world;
+                }
+                said
+            }
+            (None, kind, _) => {
                 if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
                     && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
                 {
@@ -2980,7 +3368,7 @@ fn workspace_at(
         }
         workspace.set_build_scripts(build_scripts);
     }
-    Ok((workspace, debug))
+    Ok((workspace, debug, own))
 }
 
 /// Starts ra-jit's own target directory from what cargo built in `target`, so that the build
@@ -4315,22 +4703,33 @@ fn link_executable(
 }
 
 /// What a whole build's daemon links the program at `--exe` with and splices its edits into:
-/// G's line. `None` when it is not one, or has it already.
+/// G's line, regenerated from the current native directives before every link.
 fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(String, PathBuf)>> {
-    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some() && args.link_cmd.is_none())
-    else {
+    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some()) else {
         return Ok(None);
     };
     let mut program = Vec::new();
     for named in args.crates() {
         program.extend(crates_named(db, named, args)?);
     }
-    let objects: Vec<&Path> =
-        std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
+    // The patch is ahead of the object, as on the line of a build over rustc's: a link the
+    // splice declines has the edit too.
+    let objects: Vec<&Path> = (args.patch.iter().map(PathBuf::as_path))
+        .chain([args.out.as_path()])
+        .chain(args.prebuilt.as_deref())
+        .collect();
     let sysroot = SYSROOT.get().and_then(Option::as_deref);
     let cmd = link::command(db, &program, &objects, sysroot, exe)?;
+    lock(&OWN_LINES).insert(cmd.clone());
     Ok(Some((cmd, exe.clone())))
 }
+
+/// The link lines of whole builds ([`own_link_line`]), which the daemon writes itself. They
+/// have the patch ahead of the object it patches and tell the linker nothing of duplicate
+/// definitions: the daemon makes the object's definitions of what the patch defines weak
+/// before it links ([`weaken::replaced`]).
+static OWN_LINES: std::sync::LazyLock<std::sync::Mutex<FxHashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
 /// one rule naming the files of its modules, the root first, and a rule of no files for each.
@@ -4341,9 +4740,47 @@ fn write_dep_info(
     exe: &Path,
     path: &Path,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::new();
     let krates = crates_named(db, &args.krate, args)?;
-    for &krate in &krates {
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+}
+
+/// Writes to `path` the dep-info of every crate `exe` links but those of the standard library:
+/// the crate asked for and all it depends on, as [`write_dep_info`] writes that of one. A
+/// build script is compiled again, as cargo compiles it, when a file or a variable of a build
+/// dependency of it changed, which rustc's dep-info of the script alone does not name.
+fn write_inputs(
+    db: &RootDatabase,
+    args: &Args,
+    vfs: &vfs::Vfs,
+    exe: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut krates = crates_named(db, &args.krate, args)?;
+    let mut linked: Vec<ide_db::base_db::Crate> = Vec::new();
+    for krate in &krates {
+        linked.extend(deps_of(db, (*krate).into()));
+    }
+    for krate in linked {
+        let krate = Crate::from(krate);
+        if !krate.origin(db).is_lang() && !krates.contains(&krate) {
+            krates.push(krate);
+        }
+    }
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+}
+
+/// The dep-info of `krates`, the files of their modules and what `include!` and its kin read,
+/// and the variables `env!` and `option_env!` read of them, to `path`.
+fn write_dep_info_of(
+    db: &RootDatabase,
+    krates: &[Crate],
+    asked: &str,
+    vfs: &vfs::Vfs,
+    exe: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    for &krate in krates {
         let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
         files.extend(modules.map(|it| it.original_file(db).file_id(db)));
         let included = hir_def::include_macro_invoc(db, krate.into()).iter();
@@ -4359,7 +4796,7 @@ fn write_dep_info(
             paths.push(path);
         }
     }
-    anyhow::ensure!(!paths.is_empty(), "no file of `{}` was loaded", args.krate);
+    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
     let target = dep_info::escaped(&exe.display().to_string());
     let mut text = format!("{target}: {}\n\n", escaped.join(" "));
@@ -4504,6 +4941,7 @@ fn build(
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some() || in_harness(db, *it)),
+        allocator: args.exe.as_ref().and_then(|_| local.first().copied()).map(Into::into),
         shared: args.shared,
         whole: local.iter().all(|&krate| resolver.own_crate_id(krate.into()).is_some()),
         kept: &kept,
@@ -4528,7 +4966,7 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
+    let stale: Result<Option<Vec<_>>, CodegenError> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
                 let (db, known, local, next) = (solving::Handle::of(&db), &*known, &local, &next);
@@ -4553,8 +4991,13 @@ fn build(
                 })
             })
             .collect();
-        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
+        let parts: Result<Vec<_>, CodegenError> = parts
+            .into_iter()
+            .map(|it| it.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        parts.map(|parts| parts.into_iter().collect())
     });
+    let stale = stale.map_err(anyhow::Error::new)?;
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
@@ -4564,7 +5007,7 @@ fn build(
     let unit = hir::attach_db(db, || {
         CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
     })
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::new)?;
     let Some(mut unit) = unit else { return Ok(None) };
     known.stats.onto_rustcs = unit.object.is_some() && resolver.onto_rustcs();
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
@@ -4592,7 +5035,11 @@ fn build(
     if let Some(mut object) = unit.object.take() {
         // A patch defines again what the object does, and the linker of Mach-O takes two
         // definitions of a name only when one of them gives way.
-        weaken::ours(&mut object);
+        if args.library {
+            weaken::library(&mut object);
+        } else {
+            weaken::ours(&mut object);
+        }
         // The files a debugger is sent to are there before the object that sends it.
         for file in std::mem::take(&mut unit.apart) {
             unwritten.push((PathBuf::from(file.name), file.bytes));
@@ -4617,8 +5064,10 @@ fn build(
         unset: unset_in(db, &local),
         unwritten,
     };
-    // A patch is of the last full build and replaces nothing the next edit is built from.
-    if !undoable || known.stats.patched.is_some() {
+    // An edit may need another build after checking tiered code. Keep even a complete
+    // patch unpublished until that decision finishes: a failed retry must leave the
+    // last published object, patch and executable together.
+    if !undoable {
         build.keep(known)?;
     }
     if let Some(path) = &args.report {
@@ -4634,6 +5083,7 @@ fn build(
                     entries: &[func],
                     on_demand: &[],
                     start: None,
+                    allocator: None,
                     shared: false,
                     whole: false,
                     kept: &[],
@@ -4683,7 +5133,10 @@ fn with_failed_macro(
     let frontend = match &error {
         CodegenError::Frontend(_) => true,
         CodegenError::Unsupported(why) => why.contains("frontend:"),
-        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+        CodegenError::Backend(_)
+        | CodegenError::NoSymbol
+        | CodegenError::Private
+        | CodegenError::OverBudget(_) => false,
     };
     if !frontend {
         return error;
@@ -4842,6 +5295,7 @@ impl std::error::Error for RustcLinkedLost {}
 #[expect(clippy::too_many_arguments)]
 fn link(
     cmd: Option<&str>,
+    env: &link::Environment,
     splice: Option<&Path>,
     patch: Option<&Path>,
     object: &Path,
@@ -5028,24 +5482,52 @@ fn link(
         return Err(RustcLinkedLost { why: declined, onto: true }.into());
     }
     let reading = whole::read(object)?;
+    let replaced = if let Some(patch) = patch.filter(|_| lock(&OWN_LINES).contains(cmd)) {
+        weaken::replaced(object, patch).with_context(|| {
+            format!(
+                "making the definitions of {} that {} replaces weak",
+                object.display(),
+                patch.display()
+            )
+        })?
+    } else {
+        None
+    };
+    let replaced_cmd = replaced
+        .as_ref()
+        .map(|copy| -> anyhow::Result<String> {
+            let mut args =
+                shlex::split(cmd).context("the whole build's link line is not quoted")?;
+            let base = object.display().to_string();
+            let input = args
+                .iter_mut()
+                .find(|arg| **arg == base)
+                .context("the whole build's link line does not name its base object")?;
+            *input = copy.path().display().to_string();
+            shlex::try_join(args.iter().map(String::as_str))
+                .context("a link argument has a NUL in it")
+        })
+        .transpose()?;
+    let original_cmd = cmd;
+    let cmd = replaced_cmd.as_deref().unwrap_or(cmd);
     if let Some(binary) = splice {
         headerpad_ahead(binary)?;
     }
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
-        Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
-            run_link(reached, start, &declined)?;
+        Some(reached) if lock(&REACHED_ONLY).contains(original_cmd) => {
+            run_link(reached, env, start, &declined)?;
             reached
         }
-        _ => match (run_link(cmd, start, &declined), reached.as_deref()) {
+        _ => match (run_link(cmd, env, start, &declined), reached.as_deref()) {
             (Err(why), Some(reached))
                 if why
                     .downcast_ref::<LinkFailed>()
                     .is_some_and(|it| it.names_undefined_outside([Some(object), patch])) =>
             {
-                lock(&REACHED_ONLY).insert(cmd.to_owned());
+                lock(&REACHED_ONLY).insert(original_cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
-                run_link(reached, Instant::now(), again)?;
+                run_link(reached, env, Instant::now(), again)?;
                 reached
             }
             (linked, _) => {
@@ -5059,8 +5541,9 @@ fn link(
     {
         cargo::plan::write_headerpad(binary, pad)?;
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
-        run_link(cmd, Instant::now(), &again)?;
+        run_link(cmd, env, Instant::now(), &again)?;
     }
+    drop(replaced);
     drop(reading);
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
@@ -5088,8 +5571,10 @@ fn packs_whole(args: &Args) -> bool {
 
 /// Runs the link command `cmd` and says how long it took since `start` and how it ended, with
 /// `note` after.
-fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
-    let linked = shell(cmd).output()?;
+fn run_link(cmd: &str, env: &link::Environment, start: Instant, note: &str) -> anyhow::Result<()> {
+    let mut command = shell(cmd);
+    env.apply(&mut command);
+    let linked = command.output()?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr).into_owned();
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
@@ -5240,12 +5725,12 @@ fn can_call(binary: &Path, name: &str) -> bool {
     }
 }
 
-/// A symbol the patch at `patch` refers to that the executable at `binary` does not give it;
+/// A symbol the uncommitted patch refers to that the executable does not give it;
 /// none while the executable is being read, which a splice then says.
-fn missing_in(binary: &Path, patch: &Path) -> Option<String> {
+fn missing_in(binary: &Path, patch: &[u8]) -> Option<String> {
     let linked = lock(&LINKED);
     let Some(Executable::Read(baseline)) = linked.get(binary) else { return None };
-    baseline.missing_in(&std::fs::read(patch).ok()?)
+    baseline.missing_in(patch)
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -5461,6 +5946,8 @@ enum Refused {
     Error(errors::Said),
     /// The source is one ra-jit does not build as it is, or ra-jit failed to: cargo builds it.
     Cargos(String),
+    /// A transient host-pressure failure leaves the worker and last published build intact.
+    Pressure(String),
 }
 
 impl Refused {
@@ -5469,6 +5956,7 @@ impl Refused {
         match self {
             Refused::Error(said) => said.reply(),
             Refused::Cargos(why) => format!("cargo: {}", why.replace('\n', " ")),
+            Refused::Pressure(why) => format!("error: {}", why.replace('\n', " ")),
         }
     }
 }
@@ -5478,7 +5966,28 @@ impl std::fmt::Display for Refused {
         match self {
             Refused::Error(said) => said.fmt(f),
             Refused::Cargos(why) => f.write_str(why),
+            Refused::Pressure(why) => f.write_str(why),
         }
+    }
+}
+
+/// Every build attempt in an edit, including retries for tiered code, has this boundary.
+/// Preserve typed host-pressure failures without terminating the worker or asking Cargo.
+/// This preserves published files; retaining an in-memory base is the patch path's rule,
+/// not a guarantee for a full rebuild that has already discarded its old base.
+fn recover_pressure<T>(
+    built: anyhow::Result<T>,
+    unbuilt: &mut Unbuilt,
+) -> anyhow::Result<Result<T, Refused>> {
+    match built {
+        Err(why)
+            if matches!(why.downcast_ref::<CodegenError>(), Some(CodegenError::OverBudget(_))) =>
+        {
+            eprintln!("pressure: edit not published; last published files retained: {why:#}");
+            unbuilt.stale = true;
+            Ok(Err(Refused::Pressure(format!("{why:#}"))))
+        }
+        other => other.map(Ok),
     }
 }
 
@@ -5956,6 +6465,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             exe: args.exe.clone(),
             shared: args.shared,
             dep_info: None,
+            inputs: None,
             library: args.library,
             cfg_test: args.cfg_test,
             own_target: args.own_target,
@@ -6072,9 +6582,13 @@ impl Target {
             checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
+        // A program of the checkout the daemon was started for is built with the crates it was started
+        // with; one of another checkout (a join) is of its own crate: the daemon's crates are of
+        // another workspace, and their native libraries are not its link's.
+        let same_checkout = checkout == daemon.checkout;
         let batch = batch.unwrap_or_else(|| {
             let started_with = std::iter::once(&daemon.krate).chain(&daemon.batch);
-            started_with.filter(|&it| *it != krate).cloned().collect()
+            started_with.filter(|&it| same_checkout && *it != krate).cloned().collect()
         });
         Ok(Args {
             project,
@@ -6300,19 +6814,77 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    /// The build of the daemon's the request is for: a build is one request to the daemon and
+    /// may be several to a worker. A request that names none has a number of its own
+    /// ([`Client::of`]), which it holds the output of the scripts under until it is dropped.
+    build: u64,
+    /// Whether `build` is the request's own, and ends with it.
+    own_build: bool,
+    /// The client reading the output of the scripts of the database ([`scripts::pin`]) for as
+    /// long as it lives: the compile, the link, the errors and the link that is detached.
+    pin: Option<scripts::Pin>,
+    /// What the request remembers of the world it reads moving, and of the recovery it waits for.
+    recovery: recovery::Recovery,
+    /// Held by the requests that load a world again for another: the recovery is over when the
+    /// last is dropped ([`recovery::Recovery::under_way`]).
+    _recovering: Option<Arc<recovery::Token>>,
 }
 
 impl Client {
+    /// A client of the build `build`, or when that is `0` of one of its own.
+    fn of(stream: UnixStream, env: ide_db::base_db::Env, build: u64) -> Client {
+        match build {
+            0 => Client {
+                stream,
+                env,
+                build: scripts::anonymous(),
+                own_build: true,
+                pin: None,
+                recovery: recovery::Recovery::default(),
+                _recovering: None,
+            },
+            build => Client {
+                stream,
+                env,
+                build,
+                own_build: false,
+                pin: None,
+                recovery: recovery::Recovery::default(),
+                _recovering: None,
+            },
+        }
+    }
+
+    /// Has the client read the output of `world`, before it reads any.
+    fn read(&mut self, world: &scripts::World) -> Result<(), scripts::Stale> {
+        if self.pin.is_none() {
+            self.pin = Some(scripts::pin(self.build, world)?);
+            scripts::barrier::event("pins", self.build, &format!("world={}", world.len()));
+        }
+        Ok(())
+    }
+
     /// A client that hears nothing: the one a build the daemon asks for itself answers.
     #[cfg(unix)]
     fn nobody() -> Option<Client> {
         let (stream, _) = UnixStream::pair().ok()?;
-        Some(Client { stream, env: ide_db::base_db::Env::default() })
+        Some(Client::of(stream, ide_db::base_db::Env::default(), 0))
     }
 
     #[cfg(not(unix))]
     fn nobody() -> Option<Client> {
         None
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // The request is over, answered or not: what it read of the scripts' output is free.
+        if self.own_build {
+            scripts::release(self.build);
+            // A test holds a request here, with its owner released and its token not yet gone.
+            scripts::barrier::hold("released", self.build);
+        }
     }
 }
 
@@ -6508,6 +7080,9 @@ enum Event {
     Tiered(usize, Tiered),
     /// The daemon's own base of the program at the index holds more memory than it may.
     OverBudget(usize),
+    /// A build of the daemon's is over: the output of the build scripts it held is free to be
+    /// written, which the requests put off for it can now ask for.
+    Retired,
 }
 
 /// The functions of a program compiled at a higher level, for its next patch.
@@ -6540,6 +7115,9 @@ static LINKING: Mutex<usize> = Mutex::new(0);
 thread_local! {
     /// Whether the build on this thread is one of [`LINKING`].
     static LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The numbered builds the build on this thread is for, which a test holds as it begins to
+    /// link (`RA_JIT_SCRIPT_BARRIER_DIR`; nothing without it).
+    static LINK_FOR: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Called before a build links, which it does not once an interruption has begun: it then
@@ -6554,7 +7132,11 @@ fn begin_link() {
         std::panic::resume_unwind(Box::new(ide_db::base_db::salsa::Cancelled::PendingWrite));
     }
     *linking += 1;
+    drop(linking);
     LINKS.set(true);
+    for build in LINK_FOR.with_borrow(Clone::clone) {
+        scripts::barrier::hold("linking", build);
+    }
 }
 
 /// After a build on this thread is over: it holds up no interruption.
@@ -6612,6 +7194,14 @@ struct Builds {
     waiting: std::collections::VecDeque<Asked>,
     /// Whether the requests that wait can only be built once something else happens.
     stuck: bool,
+    /// The [`scripts::generation`] when the first request was put off for a script's output
+    /// that another build holds, while the requests that wait are asked again: the worker does
+    /// not sleep through a generation that has moved since, however the event that moved it
+    /// was taken.
+    busy_since: Option<u64>,
+    /// Requests were put back to be asked again at once (a world that moved is loaded again):
+    /// the worker does not sleep before it asks them.
+    again: bool,
     /// The edits that wait, the newest of each file: one typed over before it was built is
     /// answered as superseded.
     edits: Vec<Edited>,
@@ -6631,6 +7221,12 @@ struct Builds {
 }
 
 impl Builds {
+    /// A request is put off for a script's output that another build holds, and asks again
+    /// once [`scripts::generation`] is not `generation` any more.
+    fn put_off(&mut self, generation: u64) {
+        self.busy_since = Some(self.busy_since.map_or(generation, |it| it.min(generation)));
+    }
+
     /// Gives the programs that are not being built what was compiled of them at a higher
     /// level, and has each patched with it.
     fn install_tiered(&mut self, programs: &mut [Program]) {
@@ -6722,6 +7318,7 @@ impl Builds {
                 }
                 return Ok(false);
             }
+            Event::Retired => return Ok(false),
         };
         let Some(Running { clients, own_base, .. }) = self.running.remove(&at) else {
             return Ok(false);
@@ -6755,7 +7352,12 @@ impl Builds {
                 return Ok(false);
             }
             program.interrupted += 1;
-            clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
+            // Not reading while they wait to be built again: no pin of theirs holds up what
+            // the build they wait for needs.
+            clients.into_iter().rev().for_each(|mut it| {
+                it.2.pin = None;
+                self.waiting.push_front(it);
+            });
             return Ok(false);
         };
         (program.interrupted, program.moved) = (0, false);
@@ -6854,22 +7456,36 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     let reply = reply.trim_end();
-    anyhow::ensure!(reply.starts_with("ok"), "daemon: {reply}");
+    anyhow::ensure!(reply.starts_with("ok"), "daemon: {}", unfailed(reply));
     println!("{}", trace::without_spans(reply));
     Ok(())
+}
+
+/// Who the load of a worker that starts is for: the build of the daemon's that started it, or
+/// when no daemon did (a process run by hand), a number of its own that its first program is
+/// built under. A checkout that joins later is loaded for the request that asks for it.
+fn load_owner() -> u64 {
+    std::env::var(cargo::daemon::LOAD_BUILD)
+        .ok()
+        .and_then(|it| it.parse().ok())
+        .filter(|&it| it != 0)
+        .unwrap_or_else(scripts::load_build)
 }
 
 /// Loads the checkout of `project` into the database of a daemon that is running, and
 /// watches its files.
 fn join(
     project: &Path,
+    owner: u64,
+    env: Option<&BTreeMap<String, String>>,
+    sharing: &Sharing,
     checkouts: &mut Checkouts,
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
     let read_from = SystemTime::now();
-    checkouts.add(&[project], db, tree.vfs())?;
+    checkouts.add(&[project], db, tree.vfs(), owner, env, sharing)?;
     watch_loaded(db, tree, files, read_from);
     Ok(())
 }
@@ -6918,12 +7534,26 @@ fn requested(stream: UnixStream) -> Option<Event> {
     trace::arrived();
     let (name, rest) = request.split_once('\t').unwrap_or((&request, ""));
     eprintln!("request: {name} at_us={}", live::epoch_us());
+    // The daemon has answered a client: what the build held of the build scripts' output is
+    // let go at once, whatever the worker is busy with.
+    if name == "retire" {
+        let answer = match rest.trim().parse::<u64>() {
+            Ok(build) => {
+                scripts::retire(build);
+                "ok retired".to_owned()
+            }
+            Err(_) => format!("failed: no build in {request:?}"),
+        };
+        let _ = writeln!(&stream, "{answer}");
+        return Some(Event::Retired);
+    }
     if name == "edit"
         && let Some((path, text)) = rest.split_once('\t')
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let client = Client { stream, env: process::decode(&env) };
+        let (env, build) = process::decode_request(&env);
+        let client = Client::of(stream, env, build);
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
@@ -6931,7 +7561,8 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let client = Client { stream, env: process::decode(&env) };
+        let (env, build) = process::decode_request(&env);
+        let client = Client::of(stream, env, build);
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -7001,6 +7632,8 @@ usage: ra-jit <command>
   cargo <command>   what `cargo blaze <command>` runs: build, run, test, check
   cache <verb>      the disk store: stats, gc, verify, push, pull, keygen
                     (`cargo blaze cache clear` forgets what `#[ra_jit::cache]` kept)
+  serve --cache DIR --listen ADDR
+                    a cache server other machines reach at blaze+http://ADDR
   mir <dir> --crate <name> [--level 0|1|2] [--time]
                     a crate's MIR as blaze compiles it, written as rustc's -Zunpretty=mir
   --help, --version
@@ -7071,6 +7704,7 @@ fn main() -> anyhow::Result<()> {
             end_with_reader();
             return remote::command(std::env::args().skip(2));
         }
+        Some("serve") => return remote::serve(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         _ => {}
     }
@@ -7372,7 +8006,14 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
-        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs) {
+        if let Err(why) = self.checkouts.add(
+            projects,
+            &mut self.db,
+            &mut self.vfs,
+            load_owner(),
+            None,
+            &Sharing::Open,
+        ) {
             eprintln!("spare: not used: {why:#}");
             return None;
         }
@@ -7394,7 +8035,7 @@ impl Held {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Told {
     pub(crate) args: Vec<String>,
-    pub(crate) env: std::collections::BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     pub(crate) cwd: PathBuf,
     /// The build is one cargo has only started: these are the workspace and its crates, and
     /// what cargo wrote is in the arguments of the line that follows.
@@ -7767,6 +8408,9 @@ fn run_holding(
     held: Option<Held>,
     ahead: bool,
 ) -> anyhow::Result<()> {
+    // A build that links the program itself, a whole build's worker among them, runs the
+    // build scripts of the workspace it loads itself.
+    scripts::set_own(args.exe.is_some());
     // As cargo does: the flag, then the environment, then the host.
     if args.selection.target.is_none() {
         args.selection.target =
@@ -7786,6 +8430,7 @@ fn run_holding(
     }
     process_wide();
     memory::ticks();
+    memory::bound_builds()?;
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -7942,6 +8587,10 @@ fn run_holding(
     if let Some(said) = ra_jit_expand::report() {
         eprintln!("{said}");
     }
+    // Resolution lets go of a third of what it held at its peak, and the allocator keeps the
+    // pages: 4 GB of tracedecay's (docs/reports/LOADMEM.md). The build that comes next is bounded
+    // by what the process holds.
+    memory::give_back();
     // With `RA_JIT_MEMORY`: the table of ingredients and the heap's profile as the front end
     // stands before any build (`checkpoint` says the footprint, as it did here).
     memory::report(&mut db, "resolve")?;
@@ -8089,6 +8738,9 @@ fn run_holding(
             if let Some((cmd, exe)) = own_link_line(&db, &args)? {
                 (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
             }
+            // The scripts of the load are judged, and its program is compiled and linked next:
+            // that is what the build that started this process holds their output for.
+            scripts::barrier::hold("consume", load_owner());
             let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
             // An `include!` in a body is first seen when the body is compiled.
             if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -8110,6 +8762,7 @@ fn run_holding(
             report_stats(&known.stats);
             link(
                 args.link_cmd.as_deref(),
+                &link::Environment::of(&db),
                 args.splice.as_deref(),
                 args.patch.as_deref(),
                 &args.out,
@@ -8128,7 +8781,13 @@ fn run_holding(
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
+                if let Some(path) = &args.inputs {
+                    write_inputs(&db, &args, tree.vfs(), exe, path)?;
+                }
             }
+            // The first program is compiled and linked: a process no daemon's build started
+            // holds the scripts' output no more.
+            scripts::release_load();
             Some(cold)
         }
     };
@@ -8186,6 +8845,13 @@ fn run_holding(
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
+    if serving {
+        // A request that is put off for a script's output another build holds is asked again
+        // when it is free: a build's end, an admission let go, or a file freed wakes the loop.
+        scripts::set_deferrable(true);
+        let wake = sender.clone();
+        scripts::set_waker(move || _ = wake.send(Event::Retired));
+    }
     if let Some(served) = listener {
         let sender = sender.clone();
         // Each connection is read by a thread of its own: one that sends nothing, or
@@ -8239,6 +8905,8 @@ fn run_holding(
         running: FxHashMap::default(),
         waiting: Default::default(),
         stuck: false,
+        busy_since: None,
+        again: false,
         edits: Vec::new(),
         tier_asks: Vec::new(),
         tiered: Vec::new(),
@@ -8343,6 +9011,9 @@ fn run_holding(
                 if !builds.over_budget.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
                 }
+                // Every request that waits is asked now: one that is still put off says so.
+                builds.busy_since = None;
+                builds.again = false;
                 loop {
                     // Asked again after each: a checkout that joins takes long enough for the
                     // requests sent with its own to arrive.
@@ -8373,7 +9044,22 @@ fn run_holding(
                     // taken for this turn are of the checkout as it was.
                     let project = target.as_ref().and_then(|it| it.project.as_ref());
                     let project = project.unwrap_or(&programs[0].args.project);
-                    match checkouts.stale(project, &stream.env) {
+                    // Read before anything is asked of the scripts, so that what moves while
+                    // they are is seen by the worker before it sleeps.
+                    let generation = scripts::generation();
+                    // The scripts of all the checkouts are judged under one admission.
+                    let mut operation = scripts::operation(stream.build);
+                    given_up.extend(lock(&unlinked).drain(..));
+                    // The checkout a project that is not loaded is read through is chosen here,
+                    // once, and its scripts are judged for the request; a view chosen later, after
+                    // the worker has settled and the variables are turned, is accepted only if it
+                    // is this one (`Sharing`, which the view and the join are given).
+                    let sharing = {
+                        let quick = Quick::of(&files, &db, &programs, &builds);
+                        let quick = |base: &Path, over: &Path| quick.allows(base, over, &given_up);
+                        checkouts.sharing(project, overlay, &quick)
+                    };
+                    match checkouts.stale(project, &stream.env, stream.build, sharing.judged()) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
                             later.push((request, asked, stream));
@@ -8384,8 +9070,13 @@ fn run_holding(
                             let start = Instant::now();
                             let before = CratesAsLoaded::of(&db);
                             let read_from = SystemTime::now();
-                            let reloaded =
-                                checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
+                            let reloaded = checkouts.reload(
+                                &stale,
+                                &stream.env,
+                                stream.build,
+                                &mut db,
+                                tree.vfs(),
+                            );
                             watch_loaded(&mut db, &mut tree, &mut files, read_from);
                             let new = before.changed(&db);
                             eprintln!(
@@ -8413,12 +9104,37 @@ fn run_holding(
                             listed.touch(&db, Some(&new));
                             lock(&as_built).clear();
                             if let Err(error) = reloaded.and(started) {
-                                let _ = writeln!(&stream, "failed: {error:#}");
+                                // A script that another build holds is waited for here too:
+                                // the load failed before it changed any checkout.
+                                if error.downcast_ref::<scripts::Busy>().is_some() {
+                                    scripts::barrier::event(
+                                        "put-off",
+                                        stream.build,
+                                        &format!("reload: {error}"),
+                                    );
+                                    builds.put_off(generation);
+                                    operation.wait();
+                                    scripts::barrier::hold("deferred", stream.build);
+                                    later.push((request, asked, stream));
+                                    continue;
+                                }
+                                let _ =
+                                    writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
                                 continue;
                             }
                         }
+                        // Another build of this worker reads the output of a script this one
+                        // is to run: it is asked for again once that build is retired.
+                        Err(error) if error.downcast_ref::<scripts::Busy>().is_some() => {
+                            scripts::barrier::event("put-off", stream.build, &format!("{error}"));
+                            builds.put_off(generation);
+                            operation.wait();
+                            scripts::barrier::hold("deferred", stream.build);
+                            later.push((request, asked, stream));
+                            continue;
+                        }
                         Err(error) => {
-                            let _ = writeln!(&stream, "failed: {error:#}");
+                            let _ = writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
                             continue;
                         }
                     }
@@ -8439,23 +9155,26 @@ fn run_holding(
                             lock(&as_built).clear();
                         }
                     }
+                    // Read native inputs with the admitted request's environment too.
+                    // Script directives and Rust crate identity can stay the same while
+                    // library search selects another archive. Check before no-op reuse.
+                    if native_inputs::stale(&db, &programs) {
+                        if !clients.is_empty() {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        builds.settle(&mut db, &mut programs)?;
+                        native_inputs::invalidate(&db, &mut programs);
+                        lock(&as_built).clear();
+                    }
                     given_up.extend(lock(&unlinked).drain(..));
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
                         Some(project) => {
                             // What a checkout reads is known once a build of it is over.
-                            let pending = WatchedFile::unwatched(&files, &db);
-                            let built: Vec<&Path> = programs
-                                .iter()
-                                .enumerate()
-                                .filter(|(at, it)| {
-                                    it.whole.is_some() && !builds.running.contains_key(at)
-                                })
-                                .map(|(_, it)| &*it.args.checkout)
-                                .collect();
-                            let quick = |base: &Path, over: &Path| {
-                                !pending && built.contains(&base) && !given_up.contains(over)
-                            };
-                            checkouts.view_of(project, overlay, &quick)
+                            let quick = Quick::of(&files, &db, &programs, &builds);
+                            let quick =
+                                |base: &Path, over: &Path| quick.allows(base, over, &given_up);
+                            checkouts.view_of(project, overlay, &quick, &sharing)
                         }
                         None => {
                             let base = programs[0].args.checkout.clone();
@@ -8541,13 +9260,39 @@ fn run_holding(
                         Some(project) if view.is_none() => {
                             builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
-                            let joined =
-                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                            // The scripts of the checkout run with the variables of the
+                            // request that joins it, as those of a checkout loaded do.
+                            let asked: BTreeMap<String, String> = stream
+                                .env
+                                .iter()
+                                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                                .collect();
+                            let joined = join(
+                                project,
+                                stream.build,
+                                (!asked.is_empty()).then_some(&asked),
+                                &sharing,
+                                &mut checkouts,
+                                &mut db,
+                                &mut tree,
+                                &mut files,
+                            );
                             eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
                             joined
                         }
                         _ => Ok(()),
                     };
+                    // A script group of the joined checkout that another build holds is waited
+                    // for: the checkout is not placed until it is loaded whole.
+                    if let Err(error) = &joined
+                        && error.downcast_ref::<scripts::Busy>().is_some()
+                    {
+                        scripts::barrier::event("put-off", stream.build, &format!("join: {error}"));
+                        builds.put_off(generation);
+                        operation.wait();
+                        later.push((request, asked, stream));
+                        continue;
+                    }
                     if let Some(view) = view {
                         looked.insert(view.base, view.over);
                     }
@@ -8622,7 +9367,7 @@ fn run_holding(
                         }
                         // A request for what can't be built is the client's mistake.
                         Err(e) => {
-                            let _ = writeln!(&stream, "failed: {e:#}");
+                            let _ = writeln!(&stream, "{}", failed_reply(&format!("{e:#}")));
                         }
                     }
                 }
@@ -8713,6 +9458,41 @@ fn run_holding(
                         builds.edits.push(edited);
                         continue;
                     }
+                    // A recovery this edit asked for is waited for: the checkouts are loaded again
+                    // by the requests it queued, and the edit is looked at again when they are
+                    // over, not at every turn the worker takes meanwhile.
+                    if edited.client.recovery.under_way() {
+                        builds.edits.push(edited);
+                        continue;
+                    }
+                    // The edit is built from the world its programs' checkouts were loaded from.
+                    // If another worker ran their scripts since, that world is another than the
+                    // disk's: the checkouts are asked for as a request for each of the programs
+                    // would, with the variables the edit is built for, and the edit, with its
+                    // text, waits until they are loaded again.
+                    let world = checkouts.world_for(&programs, &owners);
+                    if let Err(stale) = edited.client.read(&world) {
+                        scripts::barrier::event("refused", edited.client.build, &stale.to_string());
+                        let Some(recovery) = edited.client.recovery.moved(&stale, scripts::wake)
+                        else {
+                            let _ = writeln!(&edited.client, "failed: {stale}; ask again");
+                            continue;
+                        };
+                        let env = ide_db::base_db::ProcessEnv::try_get(&db)
+                            .map(|it| it.vars(&db).clone())
+                            .unwrap_or_default();
+                        for &at in &owners {
+                            let Some(mut client) = Client::nobody() else { continue };
+                            client.env = env.clone();
+                            client._recovering = Some(recovery.clone());
+                            let target = (at != 0).then(|| Target::of(&programs[at].args));
+                            builds.waiting.push_back((Request::Sync, target, client));
+                        }
+                        drop(recovery);
+                        builds.edits.push(edited);
+                        builds.again = true;
+                        continue;
+                    }
                     let rust = path.extension().is_some_and(|it| it == "rs");
                     let text = std::mem::take(&mut edited.text);
                     let text = if rust { load_cargo::source_text(text) } else { text };
@@ -8728,7 +9508,7 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client { stream, env: edited.client.env.clone() };
+                            let client = Client::of(stream, edited.client.env.clone(), 0);
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
@@ -8747,7 +9527,38 @@ fn run_holding(
                     clients.push((at, (Request::Sync, target, client)));
                 }
                 // What waited for the build that was interrupted is asked again at once.
-                builds.stuck = clients.is_empty() && !interrupt;
+                // Not asleep when a build that held what a request waits for ended meanwhile.
+                let moved = builds.busy_since.is_some_and(|it| it != scripts::generation());
+                builds.stuck = clients.is_empty() && !interrupt && !moved && !builds.again;
+                if clients.is_empty() {
+                    continue;
+                }
+                // Whatever is built reads the output of the database's scripts, in every mode
+                // there is to build: the clients read it from here on, the numbered ones with
+                // what their builds hold, an edit or a rebuild nobody asked for with what they
+                // take now. A world that moved is not read.
+                let mut reading = Vec::new();
+                for (at, (request, target, mut client)) in std::mem::take(&mut clients) {
+                    let world = checkouts.world_for(&programs, &[at]);
+                    let Err(stale) = client.read(&world) else {
+                        reading.push((at, (request, target, client)));
+                        continue;
+                    };
+                    scripts::barrier::event("refused", client.build, &stale.to_string());
+                    // A request that came through the check of the scripts asks it again, with
+                    // its own variables: the world that moved is loaded as it is now.
+                    let asks = matches!(request, Request::Sync | Request::Patch);
+                    if asks
+                        && client.env.iter().next().is_some()
+                        && client.recovery.advances(&stale)
+                    {
+                        builds.waiting.push_back((request, target, client));
+                        builds.again = true;
+                    } else {
+                        let _ = writeln!(&client, "failed: {stale}; ask again");
+                    }
+                }
+                clients = reading;
                 if clients.is_empty() {
                     continue;
                 }
@@ -9121,6 +9932,10 @@ fn run_holding(
                     tests_now: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
+                // The builds whose scripts this program is compiled and linked from.
+                let mut consumes: Vec<u64> = clients.iter().map(|it| it.2.build).collect();
+                consumes.sort();
+                consumes.dedup();
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
@@ -9149,6 +9964,10 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    LINK_FOR.with_borrow_mut(|it| it.clone_from(&consumes));
+                    for build in consumes {
+                        scripts::barrier::hold("consume", build);
+                    }
                     // The write that interrupts waits for the clone to be dropped, and the
                     // collection of types asks that the solver cache of this thread, which
                     // outlives the clone until the thread ends, is cleared first: `solve`
@@ -9189,7 +10008,12 @@ fn run_holding(
                         let (db, listed, paths, edit) =
                             (solving::Handle::of(&db), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
+                        let reads: Vec<u64> =
+                            clients.iter().filter(|it| it.0 == at).map(|it| it.1.2.build).collect();
                         let build = scope.spawn(move || {
+                            for build in reads {
+                                scripts::barrier::hold("consume", build);
+                            }
                             db.solve(|db| {
                                 let answer =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9287,13 +10111,15 @@ fn run_holding(
             let sender = sender.clone();
             let base = &programs[at].args.checkout;
             let over = viewed.get(base).unwrap_or(base);
-            let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
+            let mut from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let packs = packs_whole(&programs[at].args);
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
+            let link_env = link::Environment::of(&db);
             let linked = std::thread::spawn(move || {
                 let failed = link(
                     link_cmd.as_deref(),
+                    &link_env,
                     splice.as_deref(),
                     spliced.as_deref(),
                     &object,
@@ -9304,13 +10130,21 @@ fn run_holding(
                     packs,
                 )
                 .err();
+                lock(&as_built).remove(&object);
                 if failed.is_none() {
-                    lock(&as_built).insert(object, from);
+                    if from
+                        .published(
+                            std::iter::once(&object).chain(splice.iter()).chain(spliced.iter()),
+                        )
+                        .is_ok()
+                    {
+                        lock(&as_built).insert(object, from);
+                    }
                 }
                 for (_, _, client) in clients {
                     let _ = match &failed {
                         None => writeln!(&client, "ok {built}"),
-                        Some(why) => writeln!(&client, "failed: {why}"),
+                        Some(why) => writeln!(&client, "{}", failed_reply(&why.to_string())),
                     };
                 }
                 if let (Some(_), Some((over, unlinked))) = (&failed, read_as) {
@@ -9341,6 +10175,8 @@ struct Settled {
     own: Vec<(PathBuf, Option<SystemTime>)>,
     /// When each file outside the checkout was written.
     others: u64,
+    /// Exact artifacts this successful publication left at shared output paths.
+    artifacts: Vec<(PathBuf, [u8; 32])>,
 }
 
 impl Settled {
@@ -9367,7 +10203,14 @@ impl Settled {
             own.push((path, Some(file.mtime)));
         }
         let others = Settled::others(files, base, |file| Some(file.mtime));
-        Settled { over: over.to_owned(), patch, link_cmd, own, others }
+        Settled { over: over.to_owned(), patch, link_cmd, own, others, artifacts: Vec::new() }
+    }
+
+    fn published<'a>(&mut self, paths: impl Iterator<Item = &'a PathBuf>) -> std::io::Result<()> {
+        self.artifacts = paths
+            .map(|path| Ok((path.clone(), native_inputs::output_digest(path)?)))
+            .collect::<std::io::Result<_>>()?;
+        Ok(())
     }
 
     fn others(
@@ -9401,6 +10244,10 @@ impl Settled {
             && linked
             && (self.link_cmd.is_none() || self.link_cmd == target.link_cmd)
             && target.out.exists()
+            && !self.artifacts.is_empty()
+            && self.artifacts.iter().all(|(path, digest)| {
+                native_inputs::output_digest(path).ok().as_ref() == Some(digest)
+            })
             && self.patch.as_ref().is_none_or(|it| it.exists())
             && self.own.iter().all(|(path, at)| written(path) == *at)
             && self.others == Settled::others(files, &view.base, outside)
@@ -9434,6 +10281,18 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 }
 
 impl Program {
+    /// Drop this program's link/patch baseline, not its compiled queries or other
+    /// programs. A shared output can have been replaced by another worker.
+    fn forget_link_baseline(&mut self, binary: Option<&Path>) {
+        if let Some(binary) = binary {
+            native_inputs::forget_binary(binary);
+        }
+        self.known.forget_base();
+        self.whole = None;
+        self.unbuilt.stale = true;
+        self.unbuilt.unlinked = true;
+    }
+
     /// Whether to build it again with nobody asking, for the code of the checkout its last
     /// build took from the store: no patch replaces that, so the first edit would wait for
     /// all of it to be compiled.
@@ -9669,10 +10528,10 @@ impl Program {
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
-        let Program { args, table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
-        if let Some((cmd, exe)) = own_link_line(db, args)? {
-            (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
+        if let Some((cmd, exe)) = own_link_line(db, &self.args)? {
+            (self.args.link_cmd, self.args.splice) = (Some(cmd), Some(exe));
         }
+        let args = &self.args;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         // A whole build's link line is the worker's own, which no client names.
@@ -9680,7 +10539,15 @@ impl Program {
             Some(_) => (link_cmd.or(args.link_cmd.clone()), splice.or(args.splice.clone())),
             None => (link_cmd, splice),
         };
-        let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
+        let effective = Args { out, patch, link_cmd, splice, ..args.clone() };
+        // Capture the effective output's identity, not another checkout's or alias's. Recheck
+        // here too: a native input may have changed after the request was admitted.
+        let native_link = native_inputs::begin(db, &effective);
+        if native_link.as_ref().is_some_and(|link| link.changed() || link.output_changed()) {
+            self.forget_link_baseline(effective.splice.as_deref().or(effective.exe.as_deref()));
+        }
+        let Program { table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
+        let args = &effective;
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {
@@ -9749,30 +10616,40 @@ impl Program {
             eprintln!("edit-to-binary: {:.1?}", start.elapsed());
             why
         };
-        let Some(mut warm) = warm? else { return Ok(Err(held(known))) };
+        let warm = match recover_pressure(warm, unbuilt)? {
+            Ok(warm) => warm,
+            Err(pressure) => return Ok(Err(pressure)),
+        };
+        let Some(mut warm) = warm else { return Ok(Err(held(known))) };
         // Code compiled at a higher level can call what rustc built into its callers and left
         // no symbol of. The executable can't take a patch with it, and a full link would start
         // the program over, so the code goes instead; of several functions installed
         // together, the others are installed again one by one, a build each.
         loop {
             let missing = match (&args.splice, &args.patch) {
-                (Some(binary), Some(patch)) if known.stats.patched.is_some() => {
-                    missing_in(binary, patch)
-                }
+                (Some(binary), Some(patch)) if known.stats.patched.is_some() => warm
+                    .unwritten
+                    .iter()
+                    .find(|(path, _)| path == patch)
+                    .and_then(|(_, bytes)| missing_in(binary, bytes)),
                 _ => None,
             };
             let again = match missing {
                 Some(missing) => known.tiers.refuse(&format!(
                     "no patch can hold its code: {missing} is not in the executable"
                 )),
-                None => known.tiers.held(),
+                None => known.tiers.held() || hir_ty_codegen::budget::testing::tier_retry(),
             };
             if !again {
                 break;
             }
-            match build(db, table, args, known, listed, Some(&hold))? {
-                Some(again) => warm = again,
-                None => return Ok(Err(held(known))),
+            hir_ty_codegen::budget::testing::checkpoint("tier_rebuild");
+            let retry =
+                recover_pressure(build(db, table, args, known, listed, Some(&hold)), unbuilt)?;
+            match retry {
+                Err(pressure) => return Ok(Err(pressure)),
+                Ok(Some(again)) => warm = again,
+                Ok(None) => return Ok(Err(held(known))),
             }
         }
         let full = known.stats.patched.is_none();
@@ -9845,8 +10722,19 @@ impl Program {
             let (over_rustc, onto) = (known.stats.over_rustc, known.stats.onto_rustcs);
             begin_link();
             let packs = packs_whole(args);
-            let unlinked =
-                link(cmd, splice, patch, &args.out, patched, over_rustc, onto, defer, packs).err();
+            let unlinked = link(
+                cmd,
+                &link::Environment::of(db),
+                splice,
+                patch,
+                &args.out,
+                patched,
+                over_rustc,
+                onto,
+                defer,
+                packs,
+            )
+            .err();
             if let Some(lost) =
                 unlinked.as_ref().and_then(|it| it.downcast_ref::<RustcLinkedLost>())
             {
@@ -9935,6 +10823,12 @@ impl Program {
         if let Some(why) = failed {
             return Ok(Err(why));
         }
+        // A failed, compile-only or deferred link never publishes a reusable native identity.
+        if link_it && !defer {
+            if let Some(native_link) = native_link {
+                native_link.commit()?;
+            }
+        }
         // What the caller has to load to be up to date: the functions that differ from the
         // first object when the edit could be a patch, and all of them when it could not.
         let (kind, object) = match (&args.patch, known.stats.patched) {
@@ -10006,7 +10900,161 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("patch.o");
+        std::fs::write(&patch, b"last published patch").unwrap();
+        let candidate = || Build {
+            compiled: 1,
+            skipped: Vec::new(),
+            instances: 0,
+            codegen: Duration::ZERO,
+            emit: Duration::ZERO,
+            steps: [Duration::ZERO; 3],
+            looked: Default::default(),
+            unset: None,
+            unwritten: vec![(patch.clone(), b"new complete patch".to_vec())],
+        };
+        let mut unbuilt = Unbuilt::default();
+        let first = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("first attempt failed"))
+            .unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let error = anyhow::Error::new(CodegenError::OverBudget("host memory pressure".into()))
+            .context("second tier build");
+        let second: Result<Option<Build>, Refused> =
+            recover_pressure(Err(error), &mut unbuilt).unwrap();
+        let reply = match second {
+            Err(why) => why.reply(),
+            Ok(_) => panic!("second build did not fail"),
+        };
+        assert!(reply.starts_with("error: second tier build: "));
+        assert!(reply.contains("host memory pressure"));
+        assert!(unbuilt.stale);
+        drop(first);
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let mut retry = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("recovery failed"))
+            .unwrap();
+        retry.keep(&mut Rejections::default()).unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"new complete patch");
+        let unrelated =
+            recover_pressure::<()>(Err(anyhow::anyhow!("ordinary error")), &mut unbuilt);
+        assert_eq!(unrelated.err().unwrap().to_string(), "ordinary error");
+    }
+
+    #[test]
+    fn pressure_reply_is_a_transient_error_not_a_cargo_request() {
+        let reply = super::Refused::Pressure("host memory pressure".into()).reply();
+        assert_eq!(reply, "error: host memory pressure");
+        let error = anyhow::Error::new(hir_ty_codegen::CodegenError::OverBudget(
+            "host memory pressure".into(),
+        ));
+        assert!(matches!(
+            error.downcast_ref::<hir_ty_codegen::CodegenError>(),
+            Some(hir_ty_codegen::CodegenError::OverBudget(_))
+        ));
+    }
+
     use super::*;
+
+    #[test]
+    fn settled_noop_requires_the_artifacts_this_publication_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("object");
+        let exe = dir.path().join("program");
+        std::fs::write(&out, b"object").unwrap();
+        std::fs::write(&exe, b"+machine").unwrap();
+        let db = RootDatabase::default();
+        let view = View {
+            base: dir.path().to_owned(),
+            over: dir.path().to_owned(),
+            project: dir.path().to_owned(),
+        };
+        let target = Target {
+            project: Some(view.project.clone()),
+            krate: "main".to_owned(),
+            batch: None,
+            out: out.clone(),
+            patch: None,
+            link_cmd: Some("cc".to_owned()),
+            splice: Some(exe.clone()),
+            exe: Some(exe.clone()),
+            symbol_files: Vec::new(),
+        };
+        let mut settled =
+            Settled::of(&[], &db, dir.path(), dir.path(), None, target.link_cmd.clone());
+        settled.published([&out, &exe].into_iter()).unwrap();
+        assert!(settled.still(&[], &db, &view, &target, Request::Sync));
+        let stamp = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::fs::write(&exe, b"-machine").unwrap();
+        std::fs::File::options().write(true).open(&exe).unwrap().set_modified(stamp).unwrap();
+        assert!(!settled.still(&[], &db, &view, &target, Request::Sync));
+        std::fs::write(&exe, b"+machine").unwrap();
+        assert!(settled.still(&[], &db, &view, &target, Request::Sync));
+    }
+
+    #[test]
+    fn a_file_alike_checkout_is_read_through_a_loaded_one_by_the_policy_that_will_do_it() {
+        use Overlay::{Always, Never, Quick};
+        // (overlay, quick, splitting) -> does the checkout read the loaded one's scripts?
+        for (overlay, quick, split, reads) in [
+            (Never, true, false, false),  // both off: it loads on its own
+            (Never, true, true, true),    // split
+            (Quick, true, false, true),   // viewed
+            (Quick, false, false, false), // not quick, no split: on its own
+            (Quick, false, true, true),   // split takes it
+            (Always, false, false, true),
+            (Always, false, true, true),
+        ] {
+            let viewed = viewing(overlay, quick);
+            assert_eq!(sharing_allowed(viewed, split), reads, "{quick} {split}");
+        }
+    }
+
+    #[test]
+    fn a_project_is_read_through_only_the_checkout_whose_scripts_were_judged_for_the_request() {
+        let (r1, r2) = (Path::new("/r1"), Path::new("/r2"));
+        // A load that is not a request's join, or a loaded project: nothing is decided.
+        assert!(Sharing::Open.allows(r1) && Sharing::Open.allows(r2));
+        assert_eq!(Sharing::Open.judged(), None);
+        // The check judged no checkout: the project loads on its own, by view or by split.
+        assert!(!Sharing::Alone.allows(r1) && !Sharing::Alone.allows(r2));
+        // The check judged `r1`: its metadata may change so that `r2` is the one that is alike
+        // then, and `r2`, whose scripts were not judged, supplies nothing.
+        let from = Sharing::From(r1.to_owned());
+        assert!(from.allows(r1) && !from.allows(r2));
+        assert_eq!(from.judged(), Some(r1));
+    }
+
+    #[test]
+    fn a_failure_is_one_line_to_the_client_and_all_of_it_to_the_user() {
+        let why = "failed to run custom build command for `a v0.1.0 (/r)`\n\nCaused by:\n  process didn't exit \
+                   successfully (exit status: 3)\n  --- stderr\n  script failed for a\\n done\n";
+        let line = failed_reply(why);
+        assert!(!line.contains('\n'), "a reply is one line: {line:?}");
+        assert!(line.starts_with("failed: failed to run custom build command"));
+        assert_eq!(unfailed(&line), format!("failed: {why}"));
+        // Any other reply is left as it is.
+        assert_eq!(unfailed("ok object=x"), "ok object=x");
+        assert_eq!(unfailed("cargo: a b"), "cargo: a b");
+    }
+
+    #[test]
+    fn a_request_judges_the_scripts_of_the_checkouts_it_reads_and_no_other() {
+        let (r, s, base) = (Path::new("/r"), Path::new("/s"), Path::new("/base"));
+        // A project of the checkout `r`, or one that will share packages with it: its is read.
+        assert!(reached(Some(r), r));
+        assert!(!reached(Some(r), s));
+        // A project that shares packages with `base`: the checkout it shares them with is read.
+        assert!(reached(Some(base), base));
+        assert!(!reached(Some(base), r));
+        // A project that will be loaded on its own reads no checkout that is loaded.
+        assert!(!reached(None, r) && !reached(None, s));
+    }
 
     #[test]
     fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {
@@ -10159,6 +11207,67 @@ fn main() {}
             "ld: cannot find -lmissing | collect2: error: ld returned 1"
         );
         assert_eq!(last_lines("", 2), "");
+    }
+
+    /// A program built over the standard library's unit refers to what the unit defines, by
+    /// the names ra-jit's code gives it, and compiles its own copy of a function the unit only
+    /// has a stand-in for, to be told why. On Mach-O the unit's names have the format's `_`
+    /// before them and are private to the program, the stand-ins' as well: the program found
+    /// none of std's statics there, and refused every program at the first writable one it
+    /// reached, `CLEANUP` (#255).
+    #[test]
+    fn a_program_over_the_library_unit_finds_what_it_defines_and_not_its_stand_ins() {
+        use object::write::{Mangling, Object, StandardSection, Symbol, SymbolSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
+        };
+        let symbols = [
+            ("ra-jit.5502588822008fc7.CLEANUP.7a84b0f1da45afe8", StandardSection::Data),
+            ("ra-jit.5502588822008fc7.std::rt::cleanup", StandardSection::Text),
+            ("ra-jit.a65469441c0c3297.core::core_arch::aarch64::svaba_s8", StandardSection::Text),
+            ("__rust_probestack", StandardSection::Text),
+            (".Ldata1", StandardSection::ReadOnlyData),
+        ];
+        // As the code generator declares them: exported, hidden (a stand-in), and local.
+        let scopes = [
+            SymbolScope::Dynamic,
+            SymbolScope::Dynamic,
+            SymbolScope::Linkage,
+            SymbolScope::Dynamic,
+            SymbolScope::Compilation,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for format in [BinaryFormat::MachO, BinaryFormat::Elf] {
+            let mut object = Object::new(format, Architecture::Aarch64, Endianness::Little);
+            object.set_mangling(Mangling::None);
+            let prefix = if format == BinaryFormat::MachO { "_" } else { "" };
+            for (&(name, standard), scope) in symbols.iter().zip(scopes) {
+                let section = object.section_id(standard);
+                let value = object.append_section_data(section, &[0; 8], 8);
+                let kind = match standard {
+                    StandardSection::Text => SymbolKind::Text,
+                    _ => SymbolKind::Data,
+                };
+                object.add_symbol(Symbol {
+                    name: format!("{prefix}{name}").into_bytes(),
+                    value,
+                    size: 8,
+                    kind,
+                    scope,
+                    weak: false,
+                    section: SymbolSection::Section(section),
+                    flags: SymbolFlags::None,
+                });
+            }
+            let mut bytes = object.write().unwrap();
+            weaken::library(&mut bytes);
+            let path = dir.path().join(format!("std-{format:?}.o"));
+            std::fs::write(&path, &bytes).unwrap();
+            let mut defined: Vec<String> = defined_symbols(&path).unwrap().into_iter().collect();
+            defined.sort_unstable();
+            let want = [symbols[3].0, symbols[0].0, symbols[1].0];
+            assert_eq!(defined, want, "{format:?}");
+        }
     }
 
     #[test]

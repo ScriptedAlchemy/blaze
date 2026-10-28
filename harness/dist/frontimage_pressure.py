@@ -150,9 +150,15 @@ def host(a):
                 press = limit - a.extra_mb - 60
                 code, steps, err = docker(limit, path, scratch, prep,
                                           f"inside-pressure {mode} /data.img {a.extra_mb} {press}")
-                pressed = any(s["step"] == "pressed" for s in steps)
+                pressed = next((s for s in steps if s["step"] == "pressed"), None)
+                # The holder can survive because the kernel killed the allocator.
+                # That is not survival under the requested pressure: B must have
+                # obtained its memory and still hold it after A rereads the file.
+                survived = (code == 0 and pressed is not None
+                            and pressed.get("b_got_its_memory") is True
+                            and "b_exit" in pressed and pressed["b_exit"] is None)
                 print(json.dumps(dict(run=n, mode=mode, size_mb=size_mb, limit_mb=limit, press_mb=press, exit=code,
-                                      survived=code == 0 and pressed, steps=steps, stderr=err if code else "")), flush=True)
+                                      survived=survived, steps=steps, stderr=err if code else "")), flush=True)
         if a.share:
             for mode in ("heap", "map"):
                 limit = 2 * size_mb + 200

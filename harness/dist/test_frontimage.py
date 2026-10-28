@@ -318,6 +318,45 @@ class FrontImageTests(unittest.TestCase):
                 self.assertFalse(summary["valid"])
                 self.assertFalse(summary["comparable"])
 
+    def test_reusing_work_keeps_prior_summary_and_image_untouched(self):
+        driver = module("frontimage")
+        with tempfile.TemporaryDirectory() as work:
+            artifacts = Path(work) / "artifacts"
+            (artifacts / "seed").mkdir(parents=True)
+            prior = {"summary.json": b'{"status":"complete","valid":true}\n',
+                     "front.image": b"the previous run's image"}
+            for name, data in prior.items():
+                (artifacts / name).write_bytes(data)
+            argv = ["frontimage", "--td", work, "--package", "selected", "--blaze-bin", "/shared/bin",
+                    "--work", str(artifacts), "--cargo-home-from", work, "--skip-build"]
+            with mock.patch.object(driver.sys, "argv", argv):
+                with self.assertRaises(FileExistsError):
+                    driver.main()
+            for name, data in prior.items():
+                self.assertEqual((artifacts / name).read_bytes(), data)
+
+    def test_pressure_survival_requires_the_allocator_to_stay_alive(self):
+        pressure = module("frontimage_pressure")
+        import argparse
+        import contextlib
+        import io
+        for allocated, allocator_exit, expected in ((True, None, True), (False, -9, False),
+                                                     (True, -9, False), (True, 0, False)):
+            with self.subTest(allocated=allocated, allocator_exit=allocator_exit), \
+                 tempfile.TemporaryDirectory() as work:
+                image = Path(work) / "front.image"
+                image.write_bytes(b"small synthetic image")
+                args = argparse.Namespace(path=str(image), size_mb=None, extra_mb=0, runs=1, share=False)
+                steps = [{"step": "loaded"}, {"step": "pressed", "b_got_its_memory": allocated,
+                                              "b_exit": allocator_exit}]
+                output = io.StringIO()
+                with mock.patch.object(pressure, "docker", return_value=(0, steps, "")), \
+                     contextlib.redirect_stdout(output):
+                    self.assertEqual(pressure.host(args), 0)
+                rows = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["survived"] is expected for row in rows))
+
     def test_interrupt_and_failed_stop_still_archive_and_retain_provenance(self):
         driver = module("frontimage")
         with tempfile.TemporaryDirectory() as work:

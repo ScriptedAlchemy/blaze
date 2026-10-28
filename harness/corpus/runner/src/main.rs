@@ -578,6 +578,7 @@ fn main() {
     println!("repeated statics {:?}", cases::repeated_statics::twice());
     println!("repeated statics {:?}", cases::repeated_statics::twice());
     println!("async_frames shared {:?}", cases::async_frames::shared());
+    println!("async_frames generic {:?}", cases::async_frames::generic());
     println!("raw_newline {:?}", cases::raw_newline::run());
     println!("tail_temporaries {:?}", cases::tail_temporaries::run(true));
     println!("tail_temporaries {:?}", cases::tail_temporaries::run(false));

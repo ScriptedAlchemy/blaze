@@ -113,6 +113,7 @@ impl Selection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Built {
     pub(crate) features: BTreeSet<String>,
+    pub(crate) codegen_flags: Vec<String>,
     pub(crate) profile: Profile,
     /// Whether the package is one cargo was asked to build, not one those depend on.
     pub(crate) primary: bool,
@@ -263,7 +264,7 @@ pub(crate) enum PanicStrategy {
 }
 
 impl PanicStrategy {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             PanicStrategy::Unwind => "unwind",
             PanicStrategy::Abort | PanicStrategy::ImmediateAbort => "abort",
@@ -272,6 +273,15 @@ impl PanicStrategy {
 }
 
 impl Profile {
+    /// Host script units use the same profile/flag precedence as ordinary owned units.
+    pub(crate) fn for_script(
+        profile: &blaze_manifest::profiles::Profile,
+        flags: &[String],
+    ) -> anyhow::Result<Profile> {
+        let profile: Profile = serde_json::from_value(serde_json::to_value(profile)?)?;
+        Ok(profile.with(&Flags::parse(flags.iter().map(String::as_str))))
+    }
+
     /// The profile as rustc ends up with it once `flags` follow what cargo passes for it.
     fn with(&self, flags: &Flags) -> Profile {
         // cargo names a check only where it is not what rustc has for the level by itself, so
@@ -366,6 +376,7 @@ impl Profile {
 /// after the profile's own on the command line and so win.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Flags {
+    codegen_flags: Vec<String>,
     opt_level: Option<String>,
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
@@ -416,7 +427,10 @@ impl Flags {
     }
 
     fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Flags {
+        let all: Vec<&str> = words.by_ref().collect();
+        let mut words = all.iter().copied();
         let mut flags = Flags::default();
+        flags.codegen_flags = all.iter().map(|it| (*it).to_owned()).collect();
         while let Some(word) = words.next() {
             if ["--cap-lints", "--force-warn"].iter().any(|it| {
                 word.strip_prefix(it).is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
@@ -503,6 +517,8 @@ pub(crate) struct Plan {
     lto: bool,
     frame_pointers: bool,
     lints_capped: bool,
+    /// Profiles and workspace configuration read by the owned planner.
+    sources: Vec<(PathBuf, Vec<u8>)>,
 }
 
 /// What a plan says of a program as a whole.
@@ -533,8 +549,176 @@ impl Plan {
             }
             None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
         };
+        // Cargo reads external --config files internally. Retain the owned reading of
+        // that configuration before asking for the graph, including its include closure.
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (name, value) in asked.env {
+            match value {
+                Some(value) => env.insert(name.clone(), value.clone()),
+                None => env.remove(name),
+            };
+        }
+        let mut config = blaze_manifest::Config::load(dir, env, &[])?;
+        config.start("build", &selection.config)?;
+        let sources = config.sources();
         let graph = UnitGraph::of(dir, manifest, selection, &[], asked.env)?;
-        graph.plan(&Flags::of(dir, asked)?)
+        let mut plan = graph.plan(&Flags::of(dir, asked)?, selection.target.is_some())?;
+        plan.sources = sources;
+        Ok(plan)
+    }
+
+    /// [`Plan::of`] made by blaze with no cargo, for the whole build: the packages of `cargo`,
+    /// the workspace blaze read and resolved itself for this build (`cargo/metadata.rs`), each
+    /// with the features that reading has and the profile blaze-manifest gives it as cargo's
+    /// `Profiles::get_profile` does (for the target when the packages the build selects reach
+    /// it without a build script or proc macro between, for the host otherwise), and the
+    /// flags for rustc of the process that asks and of cargo's configuration.
+    pub(crate) fn own(
+        cargo: &project_model::CargoWorkspace,
+        manifest: &Path,
+        selection: &Selection,
+        asked: &Asked<'_>,
+    ) -> anyhow::Result<Plan> {
+        use blaze_manifest::profiles::{Profiles, UnitFor};
+        use project_model::DepKind;
+        let root: &Path = cargo.workspace_root().as_ref();
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (name, value) in asked.env {
+            match value {
+                Some(value) => env.insert(name.clone(), value.clone()),
+                None => env.remove(name),
+            };
+        }
+        let mut config = blaze_manifest::Config::load(root, env.clone(), &[])?;
+        config.start("build", &selection.config)?;
+        let ctx = blaze_manifest::Context::new(config);
+        let root_manifest =
+            blaze_manifest::metadata::root_manifest(Some(&root.join("Cargo.toml")), &ctx)?;
+        let ws = blaze_manifest::Workspace::new(&root_manifest, &ctx)?;
+        let host = selection.target.is_none();
+        let profiles = Profiles::new(
+            ws.profiles(),
+            ws.unstable_features(),
+            &ctx.config,
+            &selection.profile,
+            asked.triple,
+        )?;
+        let flags = crate::scripts::rustflags(&ctx.config, asked.triple, asked.cfg)?;
+        let flags = Flags::parse(flags.iter().map(String::as_str));
+        anyhow::ensure!(
+            !flags.lto,
+            "`-C lto` is among the flags: rustc compiles the whole program again as it links \
+             it and leaves no library on the link line for ra-jit's functions to be linked against"
+        );
+        // The packages the build selects: those `-p` names, every member for `--workspace`,
+        // else the one asked in, or every member of a virtual workspace.
+        let asked_in = match &selection.asked_in {
+            Some(it) if it.is_dir() => it.join("Cargo.toml"),
+            Some(it) => it.clone(),
+            None => manifest.to_owned(),
+        };
+        let members: Vec<project_model::Package> =
+            cargo.packages().filter(|&it| cargo[it].is_member).collect();
+        let named = |it: &project_model::Package| {
+            selection
+                .packages
+                .iter()
+                .any(|name| name.split('@').next() == Some(cargo[*it].name.as_str()))
+        };
+        let excluded = |it: &project_model::Package| {
+            selection.excludes.iter().any(|name| *name == cargo[*it].name)
+        };
+        let manifest_of = |it: &project_model::Package| -> PathBuf {
+            AsRef::<Path>::as_ref(&cargo[*it].manifest).to_owned()
+        };
+        let roots: Vec<project_model::Package> = if !selection.packages.is_empty() {
+            members.iter().copied().filter(named).collect()
+        } else if selection.workspace {
+            members.iter().copied().filter(|it| !excluded(it)).collect()
+        } else {
+            let at: Vec<_> =
+                members.iter().copied().filter(|it| manifest_of(it) == asked_in).collect();
+            if at.is_empty() { members.clone() } else { at }
+        };
+        // Reached from the roots for the target, and for the host.
+        let mut target: FxHashSet<project_model::Package> = FxHashSet::default();
+        let mut hosted: FxHashSet<project_model::Package> = FxHashSet::default();
+        let is_macro = |it: project_model::Package| {
+            cargo[it].targets.iter().any(|&t| {
+                matches!(cargo[t].kind, ide_db::base_db::TargetKind::Lib { is_proc_macro: true })
+            })
+        };
+        let mut pending: Vec<(project_model::Package, bool)> =
+            roots.iter().map(|&it| (it, is_macro(it))).collect();
+        while let Some((package, for_host)) = pending.pop() {
+            let seen = match for_host {
+                true => &mut hosted,
+                false => &mut target,
+            };
+            if !seen.insert(package) {
+                continue;
+            }
+            for dep in &cargo[package].dependencies {
+                let dep_host = for_host || dep.kind == DepKind::Build || is_macro(dep.pkg);
+                if dep.kind != DepKind::Dev || selection.dev_deps {
+                    pending.push((dep.pkg, dep_host));
+                }
+            }
+        }
+        let kind = match &selection.target {
+            Some(triple) => blaze_manifest::config::CompileKind::Target(triple.clone()),
+            None => blaze_manifest::config::CompileKind::Host,
+        };
+        let mut packages = FxHashMap::default();
+        let mut lto = false;
+        for package in target.iter().chain(hosted.iter().filter(|it| !target.contains(it))) {
+            let data = &cargo[*package];
+            let for_target = target.contains(package);
+            let unit_for = match for_target {
+                true => UnitFor::new_normal(),
+                false => UnitFor::new_host(false),
+            };
+            let kind = match for_target && !host {
+                true => kind.clone(),
+                false => blaze_manifest::config::CompileKind::Host,
+            };
+            let named = crate::scripts::named(data);
+            let profile =
+                profiles.get_profile(&named, data.is_member, data.is_local, unit_for, &kind);
+            let profile: Profile = serde_json::from_value(serde_json::to_value(&profile)?)
+                .context("blaze-manifest's profile is not the unit graph's form")?;
+            lto |= for_target && profile.links_from_bitcode();
+            let built = Built {
+                features: data.active_features.iter().cloned().collect(),
+                codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
+                    .chain(
+                        flags
+                            .codegen_flags
+                            .iter()
+                            .filter(|_| for_target || selection.target.is_none())
+                            .cloned(),
+                    )
+                    .collect(),
+                profile: profile.with(&flags),
+                primary: roots.contains(package),
+                for_target,
+            };
+            packages.insert(package_named(&data.id.repr), built);
+        }
+        if lto {
+            eprintln!("{LTO_ACCEPTED}");
+        }
+        Ok(Plan {
+            packages,
+            lto,
+            frame_pointers: flags.frame_pointers,
+            lints_capped: flags.lints_capped,
+            sources: ctx.sources(),
+        })
+    }
+
+    pub(crate) fn sources(&self) -> &[(PathBuf, Vec<u8>)] {
+        &self.sources
     }
 
     /// The programs the build `selection` names, of the targets `targets` picks (`--bin`,
@@ -723,7 +907,7 @@ impl UnitGraph {
         reached
     }
 
-    fn plan(self, flags: &Flags) -> anyhow::Result<Plan> {
+    fn plan(self, flags: &Flags, explicit_target: bool) -> anyhow::Result<Plan> {
         let for_target = self.for_target();
         // The flag is not cargo's to know: the libraries are then built for a link without it
         // and rustc finds no bitcode in them.
@@ -751,9 +935,27 @@ impl UnitGraph {
             .into_iter()
             .map(|(id, (index, unit))| {
                 let features = unit.features.iter().cloned().collect();
-                let (profile, primary) = (unit.profile.with(flags), roots.contains(id));
                 let for_target = for_target.contains(&index);
-                (package_named(id), Built { features, profile, primary, for_target })
+                // Cargo's unstable host.rustflags/target-applies-to-host overrides are
+                // not modeled here yet; this is the ordinary explicit-target rule.
+                let applies = for_target || !explicit_target;
+                let profile = if applies { unit.profile.with(flags) } else { unit.profile.clone() };
+                let primary = roots.contains(id);
+                (
+                    package_named(id),
+                    Built {
+                        features,
+                        profile,
+                        primary,
+                        for_target,
+                        codegen_flags: std::iter::once(format!(
+                            "-Copt-level={}",
+                            unit.profile.opt_level
+                        ))
+                        .chain(flags.codegen_flags.iter().filter(|_| applies).cloned())
+                        .collect(),
+                    },
+                )
             })
             .collect();
         Ok(Plan {
@@ -761,13 +963,49 @@ impl UnitGraph {
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,
+            sources: Vec::new(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Flags;
+    use super::{Flags, UnitGraph};
+
+    #[test]
+    fn explicit_target_flags_are_not_given_to_host_only_proc_macro_units() {
+        let profile = serde_json::json!({
+            "opt_level": "0", "lto": "false", "debug_assertions": true,
+            "overflow_checks": true, "panic": "unwind", "debuginfo": 0,
+            "split_debuginfo": null, "strip": {"resolved": "None"}
+        });
+        let graph = serde_json::json!({
+            "roots": [0],
+            "units": [
+                {"pkg_id":"path+file:///w/app#app@0.1.0",
+                 "target":{"kind":["bin"],"crate_types":["bin"]},
+                 "profile":profile, "features":[], "dependencies":[{"index":1}]},
+                {"pkg_id":"path+file:///w/mac#mac@0.1.0",
+                 "target":{"kind":["proc-macro"],"crate_types":["proc-macro"]},
+                 "profile":profile, "features":[], "dependencies":[]}
+            ]
+        });
+        let flags = Flags::parse(
+            ["-Ctarget-cpu=haswell", "-Ctarget-feature=+avx2", "-Cpanic=abort"].into_iter(),
+        );
+        for explicit in [false, true] {
+            let graph: UnitGraph = serde_json::from_value(graph.clone()).unwrap();
+            let plan = graph.plan(&flags, explicit).unwrap();
+            let hosted = plan.package("path+file:///w/mac#mac@0.1.0").unwrap();
+            let targeted = plan.package("path+file:///w/app#app@0.1.0").unwrap();
+            assert!(targeted.codegen_flags.iter().any(|flag| flag == "-Ctarget-cpu=haswell"));
+            assert_eq!(
+                hosted.codegen_flags.iter().any(|flag| flag == "-Ctarget-cpu=haswell"),
+                !explicit
+            );
+            assert_eq!(hosted.profile.panic.name(), if explicit { "unwind" } else { "abort" });
+        }
+    }
 
     #[test]
     fn force_frame_pointers_is_read_in_each_spelling() {

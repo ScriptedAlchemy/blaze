@@ -432,7 +432,10 @@ def check_nix_native(out):
             # Not static: an ELF header we cannot read is a failure, never a waiver.
             sys.exit(f"error: build_release: {e}: a nix-native artifact must be a readable ELF; "
                      "build the portable tarball with --artifact-mode portable")
-        if interp is not None and not interp.startswith(NIX_STORE):
+        # A prefix alone also accepts /nix/store/../../lib64/ld.so. Store loader
+        # paths must not traverse parents; do not resolve them on the checking host,
+        # which may have a different store (or none when checking a foreign ELF).
+        if interp is not None and (not interp.startswith(NIX_STORE) or ".." in interp.split("/")):
             stray.append(f"{binary.name} is loaded by {interp}")
         version = glibc_asked(binary)
         if version:

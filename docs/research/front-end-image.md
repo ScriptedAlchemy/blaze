@@ -195,6 +195,14 @@ prevents codegen from racing the footprint sample. `memory::report` writes the i
 table at resolve when `RA_JIT_MEMORY` is enabled. Readiness is load + resolve + frozen
 serving/writing/reporting; the individual timers are not the whole readiness time.
 OS filesystem caches are not purged: “off” means cold semantic state, not cold disk.
+`--work` must name a directory that does not yet exist. The driver reserves it before
+writing a summary or image, so a repeated or concurrent invocation cannot overwrite a
+previous run's evidence.
+
+The pressure driver's `survived` field requires both the holder to finish and its
+allocator to obtain and retain the requested memory through the reread. A holder that
+outlives an OOM-killed allocator is not a successful pressure observation; the child
+status stays in the recorded steps.
 
 ### Clean-page pressure mechanism (read: predecessor's completed experiment)
 

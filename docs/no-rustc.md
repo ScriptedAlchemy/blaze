@@ -518,6 +518,32 @@ AArch64's target specs came from answers.py's run in CI there, and its cold buil
 `force-frame-pointers`, `force-unwind-tables`) no longer send a question to rustc: count.py's
 `RUSTFLAGS` have the first, so every question of ripgrep's went to rustc until then.
 
+Done in a scoped whole-build fixture (PR12, 2026-10-27): the remaining Cargo queries
+are answered in process. The configuration query uses blaze-manifest, the version and
+rustc-print queries use the installed toolchain's records and owned target answers, and
+the real standard library workspace is resolved by blaze-metadata with its own lockfile
+and features. An owned std load reports a resolution error, rather than stitching a
+subset or asking Cargo. Its manifest feature gates follow the bootstrap invocation's
+channel, including profile-rustflags and public-dependency.
+
+Author evidence at production `9d9bc99c` on Linux AArch64: cold build, two edits and
+no-op of the hello/build-dependency fixture succeeded with zero compiler and zero Cargo
+execs; the program printed `hello helper=two edit=2`. The earlier ten-query failure and
+an intermediate zero-query failed build are retained, not relabeled. This closes that
+fixture's P0-A bar, not every target/query or full Rust parity. Target-feature, target-cpu,
+deployment overrides and other unmodeled options remain open; no broader acceptance or
+performance claim follows.
+
+#### Unmodeled CPU cfg queries
+
+A `cfg` print with an unmodeled `-C target-cpu` (for example, `native`) is a
+named ownership gap. A build that needs it fails at the query: blaze does not
+run Cargo or rustc to answer it, and it does not silently use baseline target
+features. Owning it needs host CPU detection, rustc 1.99's per-CPU feature
+tables, and the architecture's implied features, applied in effective flag
+order. Both the cfg answer and generated instructions need differential
+tests. This is unfinished Rust support, not an allowed subset or a waiver.
+
 **C. `asm!` assembled in process.** ([#83](https://github.com/indexable-inc/ra-jit/issues/83)) The assembly text ra-jit already produces goes to LLVM's
 assembler (the LLVM backend links LLVM already) or to an assembler crate, in process. Risk is
 low: the cache key and the output are the same, and `harness/asmedits.py` compares.
@@ -884,8 +910,31 @@ its threads happen to look). Three scripts fail under cargo for want of a system
 two things the port missed: a `cargo check` has no artifact directory, so `target/debug` is
 not in the library path, and the certificates above. Not yet: the description filled by
 blaze's own manifest reader and resolver (the harness fills it from cargo), the run inside
-`ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs`,
-`inputs.rs` and `link.rs` reading output with this crate.
+`ra-jit sandbox`, keeping runs in the store under the keys of #105, and `cargo/script.rs` and
+`link.rs` reading output with this crate. Until 2026-10-26 (unit p05r) the whole build ran its
+scripts in the `cargo check --compile-time-deps` of the daemon's load, in `target/rust-analyzer`,
+and that check had rustc compile each script and its build dependencies (**measured** by
+p05w-verify: two checks and four rustc compiles for a script and one build dependency over a cold
+build and an edit); only the decision to ask for it again was blaze's (`inputs.rs`, `apply::Rerun`,
+`output::reads`).
+
+Since then the whole build (`RA_JIT_WHOLE_BUILD=1`) runs no cargo and no rustc for its scripts
+(`crates/ra-jit/src/scripts.rs`): the daemon's load describes each script and its build
+dependencies from blaze's own reading of the workspace, has blaze compile and link them
+(`own_script::link_planned`, every crate from source over the standard library's unit), runs the
+script with this crate (`env`, `run`, `output::parse`) in an `OUT_DIR` of its own below
+`target/ra-jit/build-scripts`, and loads the crates with what it said. When a script is compiled
+or run again is cargo 1.99's rule, ported (`blaze_build_script::fresh`, `files`), over blaze's own
+records: the dep-info of every crate the script links (`--inputs`), the variables `env!` and
+`option_env!` read among it; the fingerprint of the run (what the last run said, the package's
+files as `PathSource::list_files` lists them, git's lists included, the compile of the script and
+the runs of its `links` dependencies); and the output of the last run, which has to be there. A run
+is never replayed from the store. Each build of the daemon's judges a script once, by the number
+its request carries. The whole build's plan is blaze's too (`plan::Plan::own`: blaze-manifest's
+profiles and flags, no `cargo build --unit-graph` or `cargo config get`). A build dependency that
+is a proc macro is refused with the reason; `harness/scriptedits.py` holds the rest to cargo, and
+`harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole build
+([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md), "blaze runs the scripts").
 
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,
@@ -1051,7 +1100,11 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   putting it where cargo does; no `cargo build` runs, and a function the program can reach that
   ra-jit cannot compile fails the build with which and why ([cargo.md](cargo.md#what-a-build-does)).
   `harness/coldbuild.py` holds a fixture's programs, an example and a build script's output equal
-  to cargo's. Measured on the bench projects ([self-contained.md](self-contained.md)): ripgrep,
+  to cargo's, and a program whose source is the same under two feature sets: each set's build
+  prints what cargo's does, also when the other set's program is already at the one path cargo
+  has. Member builds from below their root, including a relative `--manifest-path`, also use
+  the member's feature graph rather than distinct workspace default members.
+  Measured on the bench projects ([self-contained.md](self-contained.md)): ripgrep,
   fd, hyperfine, just, bat and nushell build whole and run as cargo's builds; axum and biome missed
   a build script's variable, until the loads read the graph of the build with blaze's own
   resolution ([resolve.md](resolve.md), 2026-10-25): axum then builds, and biome reaches 9
@@ -1078,6 +1131,20 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   0.37 s (0.46 s), ripgrep 0.25 s (0.58 s), nushell 0.99 s (5.16 s). A whole build takes no
   crate over from rustc on an edit (`Program::widen`): every crate is the worker's already,
   and taking one over wrote the whole object again (ripgrep's signature edit 2.9 s before).
+- Done (2026-10-26): the same on macOS (#255). The line asks Apple's linker for fixups in
+  tables and the room after the load commands, as the daemon's links of cargo's builds do,
+  where the splice had refused every edit (an executable "fixed up in chains"); and it has the
+  patch ahead of the object, so that a link the splice declines has the edit too: it had
+  linked the program as it was before the edit and said it was built. On ELF the daemon makes
+  a link-private copy's definitions of what the patch defines weak before each such link
+  (`weaken::replaced`), the way Mach-O's are, and tells the linker nothing of duplicates: two
+  definitions of any other name, in a library of the program, stay the linker's error, as they
+  are in rustc's link (a first version of the line passed `--allow-multiple-definition`, and
+  a verifier showed it linking two C objects that both define `clash()` with exit 0). On a Mac (arm64, 1 run): `harness/coldbuild.py` all right, and two edits to
+  hello's body spliced in 31 ms and 20 ms, or linked in 67 ms and 65 ms with
+  `RA_JIT_SPLICE=0`, each printing the edit. On Linux AArch64 (Docker's VM, 1 run) the same
+  two edits linked with `RA_JIT_SPLICE=0` had printed `hello` both times, and print the edit
+  now.
 - Next: the cold builds, which are slower than cargo's but axum's (dev-aws-14, quiet,
   2026-10-26: ripgrep 4.8 s against 4.0 s, fd 22.1 s against 16.8 s, bat 12.6 s against
   7.0 s, hyperfine 7.0 s against 3.8 s, just 11.0 s against 5.5 s, axum 6.1 s against 6.1 s,

@@ -8,6 +8,68 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `RA_JIT_WORKER_MEMORY`: a soft target for a worker or `ra-jit` run, defaulting to
+  `RA_JIT_MEMORY_MAX`. Past three quarters it purges freed pages and admits fewer compile jobs,
+  never none. Exceeding it never fails a build. A process-wide OS memory-pressure monitor
+  pauses new jobs only under critical host pressure; jobs in flight finish. Persistent critical
+  pressure without progress after `RA_JIT_PRESSURE_GRACE_SECS` (60 by default) can fail
+  admission. Linux uses PSI and available memory against `RA_JIT_MEMORY_RESERVE`;
+  macOS uses memorystatus. Unknown signals are logged once. Historical hard-cap results
+  are labelled in [docs/reports/LOADMEM.md](docs/reports/LOADMEM.md), section 8.
+- The whole build (`RA_JIT_WHOLE_BUILD=1`) compiles and runs its build scripts itself, with no
+  cargo and no rustc (`crates/ra-jit/src/scripts.rs`): each script and its build dependencies are
+  compiled by blaze from source, run as cargo 1.99 runs them in an `OUT_DIR` below
+  `target/ra-jit/build-scripts`, and what they print is given to the crates the load reads. When
+  one is compiled or run again is cargo's rule, ported into `blaze-build-script` (`fresh`,
+  `files`) over blaze's own records: the files and the variables (`env!`, `option_env!`) every
+  crate the script links read, what the last run said, the package's files as cargo's
+  `PathSource` lists them (git's tracked and untracked files, `include`, `exclude`, hidden files,
+  packages inside), the output of the last run, and the runs of the `links` dependencies. Its
+  plan is blaze's too (blaze-manifest's profiles and flags, no `cargo build --unit-graph` or
+  `cargo config get`). A build whose graph has a proc macro still has cargo's check build it and
+  run the scripts (no-rustc step J). `harness/scriptedits.py` holds 42 probes of it to cargo, and
+  `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole
+  build. A build holds the output of the scripts it judged until it ends (`scripts/leases.rs`), and
+  a script runs once in each build whatever other builds ask in between. A consumer of that output (a
+  compile, a link, a detached link, an editor's edit, a rebuild nobody asked for) takes a `Pin` on the
+  world the database was loaded from, in every mode, before it reads: shared leases on the scripts of
+  every loaded checkout with the token of each run looked at again, and a world that moved is refused,
+  not read. A build that holds leases and is refused the admission or a lease yields what no consumer of
+  its reads and waits holding nothing, so builds that take script groups in opposite orders, a reader
+  that needs a group it did not judge, and builds that join checkouts cannot wait for each other or be
+  refused. A request that must wait is put off and asked again when `scripts::generation` moved, never
+  by a sleep or a deadline of the worker's main loop; a reload and a join are put off like a stale
+  check; a checkout joined later is loaded for the request that asks. A failing script fails each
+  request of its build with one message. A run has a generation of its own, written as it begins and
+  read under the lease (the fingerprint says what a run was made from, not which run left the output), a
+  consumer's world is of generations, and a world that moved is loaded again through the ordinary check of
+  the scripts, with an edit's text and variables kept; a build that yields keeps its decisions, so a script
+  cargo runs once in a build runs once, and a build that ran a script keeps its output and the admission until it is retired, so no other build can make it run the script again (a build that only found the output fresh yields as before); an editor's edit whose world moved waits for the recovery it queued, is not counted at every turn, and is woken when the last request of that recovery is gone; a checkout that joins a running worker runs its first scripts with the joining request's variables; a request judges (and loads again) the scripts of the checkouts it reads and no other loaded one (for a project that is not loaded, the checkout it will be read through by the sharing policy that is on, and none when it loads on its own, chosen once as the request's `Sharing`: the view and the join's split fallback take packages only from the checkout that was judged, or the project loads on its own, from a checkout whose manifests, lock and configuration hold what they held when it was loaded: compared by content, not by size and time), so a build's first judgment of a checkout is the one that checkout's request asks for; the flags for rustc of a script's compile are applied where they change the crate (`--cfg`, `-C debug-assertions`) and an explicit `--target` is cargo's cross build (the scripts get none of them); a script's whole failure message reaches the client; the inputs of a link (its line and the content of each file it can name) are its identity, so a native archive that changes without a directive, a source or a size changing links the program in full (`native_inputs.rs`, adapted from the prepared `repair/pr12-native-inputs`); a request's judging of all its checkouts has one admission. `script-lease:` lines say each step, and
+  `RA_JIT_SCRIPT_BARRIER_DIR` holds a worker by files, which `harness/leasebarrier.py` drives through
+  the daemon (Linux).
+- `blaze-dist-local`: a bounded length-framed CBOR Unix coordinator/client facade
+  over the actual distributed protocol, with session retry journals, typed terminal
+  binding, monotonic timers and a CLI. Real socket/process-callback tests cover
+  transport behavior; a compiler-holder backend remains to be connected.
+
+- Distributed job ingress reserves authoritative stages/assignments to the coordinator, validates whole
+  event batches, and requires authoritative current-attempt completion before success.
+  Explicit no-compile admission covers verified cache-only work. An additive terminal-v2
+  response preserves infrastructure and subscriber termination reasons through CBOR and
+  client policy without changing this lane's BuildSpec or JobEvent.
+
+- `crates/blaze-dist`: distributed compile's work set (claimed discovery, docs/distributed.md
+  section 4), an executor's side of it, executions of jobs with subscribers and attempts, and
+  section 5's admission, as sans-IO state machines over `blaze-wire`'s messages, with no IO,
+  thread or clock of their own. A deterministic simulation drives them through message loss,
+  duplication, reordering, partitions, executor deaths at any step, clock skew, differing front
+  ends and dropped findings, and checks the protocol's invariants (exclusive leases, fencing,
+  exactly-once accounting with every item terminal or `Local`, unknown names never dropped,
+  progress, `Main` first, reservations within capacity) over 10,000 seeds each; a failure prints
+  the seed that replays it. Kill acknowledgments name their execution and attempt, so stale
+  duplicates cannot free a reused or draining slot. Worker completion expires subscribers
+  before awarding outcomes; timer delivery order does not change their deadlines.
+
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
@@ -444,6 +506,17 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- `RA_JIT_MEMORY_MAX` is soft: passing it does not discard incremental caches. Persistent
+  critical host pressure can reclaim idle workers; tombstones suppress identical load retries.
+  Busy workers own their compile pause and progress grace.
+- A cold build holds less: the layout of a future and the debugger's description of it read the
+  coroutine's generic body and monomorphize only the types of what it keeps across yields
+  (`hir_ty::mir::held_frame`), where the database kept a copy of the whole body for every
+  instance (1.5 GB of a cold tracedecay build at 30 GB); `inlinable` is asked only of a body small
+  enough to inline, so the others leave no memo; and a worker gives back the pages name
+  resolution freed before its first build. At the same number of functions compiled, 208,371, a
+  cold tracedecay worker's footprint was 15.1 GB where it was 17.0 GB (n=1 each, LOADMEM.md
+  section 8).
 - The first edit after a daemon starts on the store no longer compiles every function from
   the store in the edited file to tell what changed. Each entry names the items of the
   checkout its code comes from, by a hash of their text: the body it is written in, the
@@ -791,6 +864,56 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- A whole build (`RA_JIT_WHOLE_BUILD=1`) links each program into a directory of its own
+  build under `target/ra-jit/whole/`, not one directory for every build of the checkout, so
+  a build with other features, another profile, another target or other flags is the program
+  cargo would have built, and not the one a build of other flags linked before. Before, the
+  second of two builds of one program shared the linked file, so `cargo blaze build
+  --features x` then `cargo blaze build` left the program built with `x`. The directory is
+  the build's own key, which the daemon already names the checkout of, so the same mechanism
+  covers every part of the resolved configuration that key has in it.
+  Worker resolution keeps the original invocation directory and relative `--manifest-path`,
+  so a member build does not load the root's default members instead. Starting another build
+  does not delete older linked directories: an old directory can still have an active client
+  reading or placing its output.
+- In the whole build (`RA_JIT_WHOLE_BUILD=1`) a build script runs again exactly when cargo 1.99
+  runs it, which the daemon's own rule did not: a script whose `rerun-if-changed` names a file
+  that is not there runs every build; one that starts to watch a variable, or says other than it
+  did, is run again as cargo does; the script's own modules and a build dependency of the
+  workspace are watched; a build's requests to the worker run a script once, and a load takes
+  what the check ran; and a script sees the variables of the process that asks, not those of the
+  process that started the daemon. `harness/scriptedits.py` holds 34 probes of it to cargo.
+- A build script run is no longer replayed from the store (`ra-jit build-script`): what a
+  script reads besides the files it names, and what it does beside its `OUT_DIR` (a file
+  elsewhere, an extended attribute), are in no key a run is kept under, so a run that is to
+  happen happens.
+- Two builds that ask one daemon at once are two builds: each request carries the number of
+  its own build to the worker, where the worker kept the last one asked, and a script cargo runs
+  every build runs for each.
+
+- On macOS an edit after a whole build (`RA_JIT_WHOLE_BUILD=1`) reaches the program. The
+  splice refused every one, the executable having its fixups in chains, and the link it fell
+  back to left the patch out: the build said it was done and the program ran the code from
+  before the edit, on Linux too wherever a splice is declined. The whole build's line now
+  asks Apple's linker for fixups in tables and the room the splice needs, as the daemon's
+  other links do, and has the patch ahead of the object. On ELF the daemon makes the object's
+  definitions of what the patch defines weak before it links and tells the linker nothing of
+  duplicates, so two definitions of any other name stay the linker's error, as in rustc's link
+  (the line had `--allow-multiple-definition`, which linked two C objects that both define
+  one name with exit 0). `harness/coldbuild.py` passes on macOS and runs there in CI.
+- On macOS a build with nothing of rustc's finds what the standard library's unit defines, so
+  a whole build (`RA_JIT_WHOLE_BUILD=1`), a doctest and a build script blaze compiles are
+  blaze's: each stopped at the first writable static of std it reached, ``writable static
+  `CLEANUP` without a rustc symbol`` ([#255](https://github.com/indexable-inc/blaze/issues/255)).
+  blaze makes the Rust names of its Mach-O objects private and weak, and the build of a
+  program over the unit read only public names, with Mach-O's `_` before them, so it found
+  none of the unit's functions or statics. The unit's stand-ins now stay hidden and strong, as
+  in the unit of ELF, which tells them apart from what it defines. On a Mac (arm64, 18 cores,
+  1 run each): hello-world and ripgrep 15.1.0 build whole and print what cargo's builds do (12
+  of 12 ripgrep commands, timings aside), where both failed after 28 s and 18 s;
+  `harness/doctestonce.py` passes with every example blaze's (0 of 4 steps before) and no
+  longer excuses macOS; the 6 build scripts of a package with a copy of tracedecay-cli's
+  script are compiled by blaze, where all 6 were left to rustc.
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).
   The jump goes over the `int3`s and `nop`s the linker padded the function with. When there
