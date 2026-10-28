@@ -156,7 +156,7 @@ pub(crate) fn compile_as(
     let rustc = crate::answers::toolchain_rustc_of(rustc).ok_or("its toolchain is not known")?;
     let sysroot = rustc.parent().and_then(Path::parent).ok_or("its toolchain is not known")?;
     let env: BTreeMap<String, String> =
-        std::env::vars().filter(|(name, _)| read_by_crates(name)).collect();
+        crate::process::vars().filter(|(name, _)| read_by_crates(name)).collect();
     let asked = Asked { args, cwd };
     compile_in(sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
 }

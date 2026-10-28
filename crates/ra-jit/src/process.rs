@@ -12,9 +12,20 @@ const BETWEEN: char = '\u{1f}';
 
 /// The variables of this process. One that is not Unicode is one `env!` can't read either.
 pub(crate) fn own() -> Env {
-    std::env::vars_os()
+    vars().collect()
+}
+
+/// The Unicode view used by source inputs, configuration and local identities.
+/// Ignore non-Unicode pairs consistently rather than panicking in `env::vars`.
+pub(crate) fn vars() -> impl Iterator<Item = (String, String)> {
+    unicode(std::env::vars_os())
+}
+
+pub(crate) fn unicode(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    vars.into_iter()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .collect()
 }
 
 /// `env` on one line with no tab in it.
@@ -100,6 +111,21 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_pairs_are_ignored_without_losing_unicode_values() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        let bad = OsString::from_vec(vec![0xff, 0xfe]);
+        let vars = unicode([
+            (OsString::from("PLAIN"), OsString::from("value")),
+            (OsString::from("EMPTY"), OsString::new()),
+            (bad.clone(), OsString::from("bad-key")),
+            (OsString::from("BAD_VALUE"), bad),
+        ])
+        .collect::<Vec<_>>();
+        assert_eq!(vars, [("PLAIN".into(), "value".into()), ("EMPTY".into(), String::new())]);
+    }
 
     #[test]
     fn a_line_is_read_back_as_it_was_written() {

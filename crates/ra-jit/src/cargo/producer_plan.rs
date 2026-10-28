@@ -132,7 +132,7 @@ impl Producers {
             .filter(|unit| unit.host)
             .map(|unit| (unit.package.clone(), false))
             .collect();
-        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        let mut env: BTreeMap<String, String> = crate::process::vars().collect();
         let probe = dir.join("producer-rustc");
         crate::answers::producer_launcher(&probe)?;
         env.insert("RUSTC".into(), probe.display().to_string());
@@ -407,13 +407,13 @@ pub(crate) fn command(
     };
     anyhow::ensure!(args.next().is_none(), "unexpected producer plan argument");
     let selection = serde_json::from_slice(&std::fs::read(selection)?)?;
-    let mut planned = of(&manifest, &selection, &host, &target, std::env::vars().collect())?;
+    let mut planned = of(&manifest, &selection, &host, &target, crate::process::vars().collect())?;
     if let Some(dir) = dir {
         std::fs::create_dir_all(&dir)?;
         let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
             .map(std::path::PathBuf::from)
             .context("the source toolchain is not named")?;
-        let env = std::env::vars().collect::<Vec<_>>();
+        let env = crate::process::vars().collect::<Vec<_>>();
         // Reject nested producer graphs before any script or compiler child. This
         // boundary is removed only when the nested scheduler supplies their images.
         let mut preflight = Producers {

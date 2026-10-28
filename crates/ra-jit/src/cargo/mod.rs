@@ -35,12 +35,8 @@ use daemon::{Checkout, NotBuilt, Reply, Request};
 use state::{Built, Counts, Held, Staged, State};
 pub(crate) use units::Record;
 
-pub(crate) fn producer_env() -> BTreeMap<String, String> {
-    let mut env = cli::worker_env();
-    for name in cli::MEMORY_ENV {
-        env.remove(*name);
-    }
-    env
+pub(crate) fn producer_env_in(env: &[(String, String)]) -> BTreeMap<String, String> {
+    cli::producer_env_in(env)
 }
 
 /// `ra-jit cargo ...`: runs the command and ends with the status cargo would end with.
@@ -598,7 +594,7 @@ fn asking(checkout: &Checkout) -> Checkout {
             || name == "RA_JIT_TRACE"
     };
     let mut env: BTreeMap<String, String> =
-        std::env::vars().filter(|(name, _)| !wraps(name)).collect();
+        crate::process::vars().filter(|(name, _)| !wraps(name)).collect();
     env.extend(checkout.env.clone());
     Checkout { env, ..checkout.clone() }
 }

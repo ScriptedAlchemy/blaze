@@ -457,16 +457,38 @@ pub(crate) fn worker_env() -> BTreeMap<String, String> {
     env
 }
 
+pub(crate) fn producer_env_in(env: &[(String, String)]) -> BTreeMap<String, String> {
+    env.iter().filter(|(name, _)| named(name, WORKER_ENV)).cloned().collect()
+}
+
+fn named(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|it| if it.ends_with('_') { name.starts_with(it) } else { name == *it })
+}
+
 fn env_named(names: &[&str]) -> BTreeMap<String, String> {
-    let named = |name: &str| {
-        names.iter().any(|it| if it.ends_with('_') { name.starts_with(it) } else { name == *it })
-    };
-    std::env::vars().filter(|(name, _)| named(name)).collect()
+    crate::process::vars().filter(|(name, _)| named(name, names)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_identity_reads_the_supplied_environment_without_memory_policy() {
+        let env = [
+            ("RUSTFLAGS".into(), "--cfg caller".into()),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL".into(), "1".into()),
+            ("RA_JIT_MEMORY_MAX".into(), "16G".into()),
+            ("CARGO_PKG_NAME".into(), "wrapper-only".into()),
+        ];
+        assert_eq!(
+            producer_env_in(&env),
+            BTreeMap::from([
+                ("RUSTFLAGS".into(), "--cfg caller".into()),
+                ("CARGO_PROFILE_DEV_OPT_LEVEL".into(), "1".into()),
+            ])
+        );
+    }
 
     fn build(subcommand: &str, args: &str) -> Invocation {
         let words = std::iter::once(subcommand).chain(args.split_whitespace());

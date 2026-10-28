@@ -238,7 +238,7 @@ pub(crate) fn load_env() -> BTreeMap<String, String> {
             .iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect(),
-        None => std::env::vars().collect(),
+        None => crate::process::vars().collect(),
     }
 }
 

@@ -551,7 +551,7 @@ impl Plan {
         };
         // Cargo reads external --config files internally. Retain the owned reading of
         // that configuration before asking for the graph, including its include closure.
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (name, value) in asked.env {
             match value {
                 Some(value) => env.insert(name.clone(), value.clone()),
@@ -582,7 +582,7 @@ impl Plan {
         use blaze_manifest::profiles::{Profiles, UnitFor};
         use project_model::DepKind;
         let root: &Path = cargo.workspace_root().as_ref();
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (name, value) in asked.env {
             match value {
                 Some(value) => env.insert(name.clone(), value.clone()),

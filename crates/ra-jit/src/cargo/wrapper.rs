@@ -112,25 +112,16 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         let capture = || -> anyhow::Result<Option<crate::macro_inputs::ArtifactInputs>> {
             let cargo = Cargo::above().map_err(anyhow::Error::msg)?;
             let asked = cli::of_cargo(&cargo.args).context("no producer build selection")?;
-            let env = cargo
-                .env
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        key.to_str().context("Cargo environment key is not UTF-8")?.to_owned(),
-                        value.to_str().context("Cargo environment value is not UTF-8")?.to_owned(),
-                    ))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let env = crate::process::unicode(cargo.env).collect::<Vec<_>>();
             let metadata = super::metadata::no_deps_in(
                 &cargo.cwd,
                 asked.flags.manifest_path.as_deref(),
                 &asked.flags.config,
-                env,
+                env.clone(),
             )?;
             let project =
                 super::state::project(&asked, &cargo.cwd, &metadata).map_err(anyhow::Error::msg)?;
-            crate::macro_inputs::ArtifactInputs::capture(&project, &asked.selection())
+            crate::macro_inputs::ArtifactInputs::capture_in(&project, &asked.selection(), env)
         };
         match capture() {
             Ok(inputs) => inputs,
@@ -648,10 +639,10 @@ impl Unit {
             stamp,
             copies,
             link_line,
-            env: std::env::vars()
+            env: crate::process::vars()
                 .filter(|(name, _)| name.starts_with(PROGRAM_OF) || name == SCRATCH)
                 .collect(),
-            crate_env: std::env::vars()
+            crate_env: crate::process::vars()
                 .filter(|(name, _)| super::own_script::read_by_crates(name))
                 .collect(),
         }

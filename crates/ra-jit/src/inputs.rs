@@ -565,7 +565,7 @@ impl Inputs {
         // The daemon was started by one of the processes that ask it for builds, and has its
         // variables.
         if self.asked_with.is_empty() {
-            self.asked_with.extend(std::env::vars().map(|it| it.0));
+            self.asked_with.extend(crate::process::vars().map(|it| it.0));
         }
         let mut scripts = Scripts::of(workspace, config, given, build, own);
         // A checkout loaded again has run its scripts again, where cargo found one to: a script

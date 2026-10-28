@@ -279,7 +279,9 @@ def ps_table(env=True):
     The wide form costs about 20 ms more than a plain `ps` on this Mac, which is why the
     one-second sampler asks without it."""
     flags = ["-Eww" if env else "-ww", "-Ao"] if platform.system() == "Darwin" else (["eww", "-Ao"] if env else ["-Ao"])
-    out = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="]).stdout
+    # `ps` appends raw environment bytes. A non-Unicode variable must not blind
+    # the memory guard while exercising the product's OsString environment.
+    out = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="], errors="replace").stdout
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 3)

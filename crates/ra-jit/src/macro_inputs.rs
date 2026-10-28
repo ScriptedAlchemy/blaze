@@ -70,6 +70,14 @@ impl ArtifactInputs {
         project: &Path,
         selection: &crate::plan::Selection,
     ) -> anyhow::Result<Option<Self>> {
+        Self::capture_in(project, selection, crate::process::vars().collect())
+    }
+
+    pub(crate) fn capture_in(
+        project: &Path,
+        selection: &crate::plan::Selection,
+        env: Vec<(String, String)>,
+    ) -> anyhow::Result<Option<Self>> {
         // Cargo may ask through a directory symlink while its compiler and daemon
         // work in the physical checkout. Resolve before metadata, config ancestry
         // and package paths enter this identity, on every capture path.
@@ -77,9 +85,10 @@ impl ArtifactInputs {
             .with_context(|| format!("resolving macro producer project {}", project.display()))?;
         let project = project.as_path();
         let manifest = project.join("Cargo.toml");
+        let producer_env = crate::cargo::producer_env_in(&env);
         let asked = blaze_metadata::Asked {
             cwd: project,
-            env: std::env::vars().collect(),
+            env,
             manifest_path: Some(&manifest),
             config: &selection.config,
             features: &selection.features,
@@ -125,7 +134,7 @@ impl ArtifactInputs {
         // Selection includes profile, target, features and config. The worker's build
         // environment is stable across client and worker; output/safety env is not input.
         metadata.target_directory = Default::default();
-        let context = serde_json::to_vec(&(selection, crate::cargo::producer_env(), &metadata))?;
+        let context = serde_json::to_vec(&(selection, producer_env, &metadata))?;
         let mut configuration = Vec::new();
         let workspace_root = metadata.workspace_root.as_std_path();
         for path in [workspace_root.join("Cargo.toml"), workspace_root.join("Cargo.lock")] {

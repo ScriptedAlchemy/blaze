@@ -28,7 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--blaze-bin", type=Path, required=True)
-    parser.add_argument("--scenario", choices=["B", "D", "E", "F", "H", "I", "J", "all"], default="all")
+    parser.add_argument("--scenario", choices=["B", "D", "E", "F", "H", "I", "J", "K", "L", "all"], default="all")
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -47,13 +47,21 @@ def main():
         env = machine.env(binary, os.path.join(machine.top, "store"),
                           crossmachine.daemon_home("f2" + name, "a"),
                           crossmachine.FIXTURES["macros"].get("env"))
-        if name in ("D", "E", "I"):
+        if name in ("D", "E", "I", "K"):
             env = cargo_ra_jit.enabled_home(str(work / ("enabled-" + name)), env)
-        side = Side(ws, env, "plain" if name in ("D", "E", "I") else True)
+        if name in ("K", "L"):
+            assert os.name == "posix"
+            env["BLAZE_NON_UTF8"] = os.fsdecode(b"\xff\xfe")
+            env[os.fsdecode(b"BLAZE_KEY_\xff")] = "non-Unicode key"
+        side = Side(ws, env, "plain" if name in ("D", "E", "I", "K") else True)
         rows = []
 
         def step(label):
             _, built = side.cargo("build", "-p", "app")
+            if built.returncode != 0:
+                rows.append(dict(label=label, build_rc=built.returncode,
+                                 stdout=built.stdout, stderr=built.stderr))
+                raise AssertionError(rows[-1])
             _, states = wait_warm(side, ws)
             _, ran = side.cargo("run", "-p", "app")
             row = dict(label=label, build_rc=built.returncode, states=states,
@@ -152,13 +160,13 @@ def main():
                 assert step("B3 restart")["output"] == first["output"]
             else:
                 time.sleep(3)
-                assert step("D2")["output"] == first["output"]
+                assert step(name + "2")["output"] == first["output"]
         finally:
             side.cargo("stop")
             report[name] = rows
 
     try:
-        for name in ["B", "D", "E", "F", "H", "I", "J"] if args.scenario == "all" else [args.scenario]:
+        for name in ["B", "D", "E", "F", "H", "I", "J", "K", "L"] if args.scenario == "all" else [args.scenario]:
             run_scenario(name)
         print("F2/F3: warmth, relative manifest and nonfatal capture errors pass", flush=True)
     finally:

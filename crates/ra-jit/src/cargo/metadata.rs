@@ -14,7 +14,7 @@ use cargo_metadata::Metadata;
 /// its message, status 101.
 pub(crate) fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     let cwd = std::env::current_dir().unwrap_or_default();
-    match no_deps_in(&cwd, manifest_path, config, std::env::vars().collect()) {
+    match no_deps_in(&cwd, manifest_path, config, crate::process::vars().collect()) {
         Ok(metadata) => metadata,
         Err(err) => {
             refused(&err, &cwd);
@@ -56,7 +56,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     let root = |manifest: &project_model::ManifestPath| {
         let manifest: &Path = manifest.as_ref();
         let cwd = manifest.parent().unwrap_or(Path::new("/"));
-        let root = blaze_metadata::workspace_root(cwd, std::env::vars().collect(), manifest)?;
+        let root = blaze_metadata::workspace_root(cwd, crate::process::vars().collect(), manifest)?;
         let root = paths::AbsPathBuf::assert_utf8(root);
         Ok(project_model::ManifestPath::try_from(root).expect("a manifest is a file"))
     };
@@ -74,7 +74,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             }
             None => (loaded.parent().unwrap_or(Path::new("/")).to_owned(), Some(loaded)),
         };
-        let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (key, value) in env {
             match value {
                 Some(value) => vars.insert(key.clone(), value.clone()),
@@ -122,7 +122,7 @@ fn sysroot_metadata(
 ) -> anyhow::Result<Metadata> {
     let manifest: &Path = manifest.as_ref();
     let cwd = manifest.parent().context("std manifest has no directory")?;
-    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
     for (name, value) in &config.extra_env {
         match value {
             Some(value) => vars.insert(name.clone(), value.clone()),
@@ -189,7 +189,7 @@ pub(crate) fn programs(
         let cfg = cfg.collect::<anyhow::Result<Vec<_>>>()?;
         let asked = blaze_metadata::Asked {
             cwd,
-            env: std::env::vars().collect(),
+            env: crate::process::vars().collect(),
             manifest_path: manifest,
             config: &selection.config,
             features: &selection.features,

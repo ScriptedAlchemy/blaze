@@ -257,7 +257,7 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
     let args: Vec<String> =
         command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
     let var = |name: &str| var_of(command, name);
-    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
     for (name, value) in command.get_envs() {
         let name = name.to_str()?.to_owned();
         match value {
