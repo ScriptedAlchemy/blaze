@@ -21,6 +21,7 @@ mod generation_tests;
 pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
+pub mod producer_lifetime;
 pub mod snapshot_dir;
 pub mod transport;
 
@@ -405,8 +406,8 @@ impl ProcMacroClient {
     /// Checks if the proc-macro server has exited.
     pub fn exited(&self) -> Option<ServerError> {
         self.epochs
-            .lock()
-            .unwrap()
+            .try_lock()
+            .ok()?
             .live
             .iter()
             .filter_map(Weak::upgrade)

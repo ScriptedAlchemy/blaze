@@ -51,6 +51,7 @@ pub struct LoadCargoConfig {
     pub proc_macro_processes: usize,
 }
 
+pub use proc_macro_api::producer_lifetime as proc_macro_producer_lifetime;
 /// Worker snapshot allocation and post-wait cleanup use the same API-owned layout.
 pub use proc_macro_api::snapshot_dir as proc_macro_snapshot_dir;
 

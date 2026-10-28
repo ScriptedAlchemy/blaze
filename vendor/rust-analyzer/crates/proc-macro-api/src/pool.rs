@@ -19,6 +19,7 @@ pub(crate) struct ProcMacroServerPool {
 pub(crate) struct PreparedLibrary {
     snapshot: Arc<LibrarySnapshot>,
     pub(crate) content: [u8; 32],
+    _producer_lease: Arc<Option<std::fs::File>>,
 }
 
 impl PreparedLibrary {
@@ -26,10 +27,14 @@ impl PreparedLibrary {
         dylib: &MacroDylib,
         root: Option<&std::path::Path>,
     ) -> Result<Self, ServerError> {
+        let lease =
+            crate::producer_lifetime::lease_for_library(dylib.path.as_ref()).map_err(|error| {
+                ServerError { message: "leasing macro producer".into(), io: Some(Arc::new(error)) }
+            })?;
         let (snapshot, content) = LibrarySnapshot::copy(&dylib.path, root).map_err(|error| {
             ServerError { message: "copying macro library".into(), io: Some(Arc::new(error)) }
         })?;
-        Ok(Self { snapshot: Arc::new(snapshot), content })
+        Ok(Self { snapshot: Arc::new(snapshot), content, _producer_lease: Arc::new(lease) })
     }
 }
 
@@ -83,14 +88,12 @@ impl ProcMacroServerPool {
         // Reuse the immutable pathname for unchanged bytes. Native loaders cannot
         // unload individual images; duplicates must not accumulate within an epoch.
         let prepared = {
-            let mut loaded = self.loaded.lock().unwrap();
-            let entry = loaded.entry(dylib.path.clone()).or_insert_with(|| prepared.clone());
-            if entry.content != prepared.content {
-                // The non-replayable test transport cannot rotate pools, but still
-                // must use a new immutable pathname for changed bytes.
-                *entry = prepared;
-            }
-            entry.clone()
+            let loaded = self.loaded.lock().unwrap();
+            loaded
+                .get(&dylib.path)
+                .filter(|old| old.content == prepared.content)
+                .cloned()
+                .unwrap_or(prepared)
         };
         let dylib_path =
             Arc::new(paths::AbsPathBuf::assert_utf8(prepared.snapshot.snapshot_path()));
@@ -110,6 +113,10 @@ impl ProcMacroServerPool {
                     .map_err(|e| ServerError { message: e, io: None })
             })
             .collect::<Result<(), _>>()?;
+
+        // A rejected library is not a loaded generation. In particular, fixing
+        // its bytes must not rotate the pool that other valid libraries use.
+        self.loaded.lock().unwrap().insert(dylib.path.clone(), prepared.clone());
 
         Ok(macros
             .into_iter()

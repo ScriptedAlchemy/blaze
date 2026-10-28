@@ -16,6 +16,7 @@ mod frozen;
 mod inputs;
 mod link;
 mod live;
+mod macro_inputs;
 mod macro_list;
 mod memory;
 mod mirdump;
@@ -2353,6 +2354,7 @@ fn load(
         debug: Vec::new(),
         beside,
         scripts_said,
+        macro_generations: FxHashMap::default(),
     };
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         checkouts.loaded.set_proc_macro_snapshot_root(Some(cargo::daemon::home()?));
@@ -2363,9 +2365,8 @@ fn load(
     Ok((db, vfs, checkouts))
 }
 
-/// A file of a checkout that was compared with the one it is in a loaded checkout: the size
-/// and the time of the last write of both, and whether the two were alike. They are not read
-/// again until one is written.
+/// Content digests of a checkout pair and whether they were alike. Bytes are read again
+/// before reusing a comparison: restored metadata is not evidence of unchanged inputs.
 type Compared = std::sync::Mutex<FxHashMap<PathBuf, ([u8; 32], [u8; 32], bool)>>;
 
 /// The checkouts the daemon has loaded.
@@ -2393,6 +2394,7 @@ struct Checkouts {
     beside: Option<Beside>,
     /// The same of a build of the first checkout that is over, a line of cargo's each.
     scripts_said: Option<Vec<String>>,
+    macro_generations: FxHashMap<PathBuf, macro_inputs::Generation>,
 }
 
 impl Checkouts {
@@ -2712,7 +2714,7 @@ impl Checkouts {
             // (`env`), and the process whose build started the worker for its first load.
             let build = owner;
             let load_env = env.cloned().unwrap_or_else(scripts::load_env);
-            let (workspace, told, own) = workspace_at(
+            let (workspace, told, own, generation) = workspace_at(
                 project,
                 &self.cargo_config,
                 &self.load_config,
@@ -2739,6 +2741,9 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
+            if let Some(generation) = generation {
+                self.macro_generations.insert(root.clone(), generation);
+            }
             world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
             watched.push((root.clone(), workspace.clone(), self.cargo_config.clone(), build, own));
             roots.push((dunce::canonicalize(project)?, root));
@@ -2754,6 +2759,7 @@ impl Checkouts {
         for (root, workspace, config, build, own) in watched {
             self.inputs.watch(&root, &workspace, &config, &FxHashMap::default(), build, own);
         }
+        self.collect_macro_generations();
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
@@ -2857,8 +2863,8 @@ impl Checkouts {
         for &at in stale {
             loaded.push(self.loaded_again(at, env, build)?);
         }
-        for (&at, (workspace, debug, config, given, own)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config, &given, build, own);
+        for (&at, (workspace, debug, config, given, own, generation)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config, &given, build, own, generation);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2870,8 +2876,8 @@ impl Checkouts {
             let over = self.roots[at].1.clone();
             if !self.builds_alike(&self.roots[base].1, &over) {
                 match self.loaded_again(at, env, build) {
-                    Ok((workspace, debug, config, given, own)) => {
-                        self.place(at, workspace, debug, &config, &given, build, own);
+                    Ok((workspace, debug, config, given, own, generation)) => {
+                        self.place(at, workspace, debug, &config, &given, build, own, generation);
                         continue;
                     }
                     // Not the fallback: it is a world nothing was loaded from. This one stays
@@ -2889,7 +2895,20 @@ impl Checkouts {
             self.debug[at] = self.debug[base];
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.collect_macro_generations();
         failed
+    }
+
+    fn collect_macro_generations(&self) {
+        for generation in self.macro_generations.values() {
+            match generation.collect() {
+                Ok(removed) if !removed.is_empty() => {
+                    eprintln!("macro producers: collected {} retired generations", removed.len())
+                }
+                Err(error) => eprintln!("macro producers: collection deferred: {error}"),
+                _ => {}
+            }
+        }
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
@@ -2906,21 +2925,12 @@ impl Checkouts {
         CargoConfig,
         FxHashMap<String, Option<String>>,
         Option<scripts::Own>,
+        Option<macro_inputs::Generation>,
     )> {
         let (project, root) = self.roots[at].clone();
         let mut config = self.cargo_config.clone();
         let given = self.inputs.variables(&root, env);
         config.extra_env.extend(given.clone());
-        if let Some(generation) = self.inputs.macro_generation(&root) {
-            // Compile-time artifact freshness must not be keyed only by mtimes.
-            // Reuse the existing producer operation in a content generation.
-            config.target_dir_config = TargetDirectoryConfig::Directory(
-                AbsPathBuf::assert_utf8(
-                    root.join("target/rust-analyzer/producers").join(generation),
-                )
-                .into(),
-            );
-        }
         // The scripts the check for this build ran are not run again for the load.
         let (ready, ready_world) = match self.inputs.ready(&root) {
             Some((ready, world)) => (Some(ready), Some(world)),
@@ -2928,7 +2938,7 @@ impl Checkouts {
         };
         let asked: BTreeMap<String, String> =
             env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
-        let (workspace, debug, own) = workspace_at(
+        let (workspace, debug, own, generation) = workspace_at(
             &project,
             &config,
             &self.load_config,
@@ -2944,7 +2954,7 @@ impl Checkouts {
             }
             own
         });
-        Ok((workspace, debug, config, given, own))
+        Ok((workspace, debug, config, given, own, generation))
     }
 
     /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
@@ -2958,8 +2968,13 @@ impl Checkouts {
         given: &FxHashMap<String, Option<String>>,
         build: u64,
         own: Option<scripts::Own>,
+        generation: Option<macro_inputs::Generation>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
+        self.macro_generations.remove(&root);
+        if let Some(generation) = generation {
+            self.macro_generations.insert(root.clone(), generation);
+        }
         self.unloaded.remove(&at);
         self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
@@ -3249,10 +3264,23 @@ fn workspace_at(
     said: Option<Vec<String>>,
     ready: Option<WorkspaceBuildScripts>,
     asked: Option<(&BTreeMap<String, String>, u64)>,
-) -> anyhow::Result<(ProjectWorkspace, plan::Whole, Option<scripts::Own>)> {
+) -> anyhow::Result<(
+    ProjectWorkspace,
+    plan::Whole,
+    Option<scripts::Own>,
+    Option<macro_inputs::Generation>,
+)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
-    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut config = cargo_config.clone();
+    let mut workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
+    // Discover the actual producer closure on both cold and reload paths before
+    // choosing the existing compile-time producer operation's output directory.
+    let generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
+    if generation.is_some() {
+        workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
+    }
+    let cargo_config = &config;
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
@@ -3398,7 +3426,7 @@ fn workspace_at(
         }
         workspace.set_build_scripts(build_scripts);
     }
-    Ok((workspace, debug, own))
+    Ok((workspace, debug, own, generation))
 }
 
 /// Starts ra-jit's own target directory from what cargo built in `target`, so that the build
@@ -11586,4 +11614,30 @@ fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate(
     assert_eq!(missing_required_input(vec![(path.clone(), None)], discover), Some(path.clone()));
     assert_eq!(calls.get(), 1);
     assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
+}
+#[test]
+#[ignore = "bounded same-session full-read cost observation"]
+fn input_comparison_full_read_cost() {
+    let root = std::env::temp_dir().join(format!("c4-read-cost-{}", std::process::id()));
+    let (base, over) = (root.join("base"), root.join("over"));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&over).unwrap();
+    let bytes = vec![b'x'; 4096];
+    for index in 0..128 {
+        let name = format!("input-{index}.txt");
+        std::fs::write(base.join(&name), &bytes).unwrap();
+        std::fs::write(over.join(name), &bytes).unwrap();
+    }
+    let compared = Compared::default();
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let began = Instant::now();
+        assert!(package_alike(&base, &base, &over, &FxHashSet::default(), &compared));
+        samples.push(began.elapsed().as_secs_f64() * 1000.0);
+    }
+    let stamp_samples = crate::inputs::measure_full_read_cost(&base, 7);
+    println!(
+        "full_read_cost files=128 bytes_per_side=524288 runs=7 package_ms={samples:?} stamp_ms={stamp_samples:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }

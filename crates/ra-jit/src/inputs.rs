@@ -56,7 +56,6 @@ struct Checkout {
     /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
     scripts: Option<Scripts>,
-    macro_producers: Vec<PathBuf>,
     /// Compile-time producer content, separate from workspace structural reads.
     macro_reads: Vec<Watched>,
 }
@@ -518,7 +517,6 @@ impl Inputs {
         own: Option<crate::scripts::Own>,
     ) {
         let mut files = Vec::new();
-        let mut macro_producers = Vec::new();
         let mut macro_reads = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
@@ -533,24 +531,8 @@ impl Inputs {
             // A macro is a producer used while loading its callers. Source,
             // included assets and dependency producers are content inputs, even
             // when their size and timestamps were restored.
-            let mut macro_inputs = std::collections::BTreeSet::new();
-            let mut pending: Vec<_> = cargo
-                .packages()
-                .filter(|&package| {
-                    cargo[package].targets.iter().any(|&target| cargo[target].kind.is_proc_macro())
-                })
-                .collect();
-            while let Some(package) = pending.pop() {
-                if !macro_inputs.insert(package) {
-                    continue;
-                }
-                pending.extend(cargo[package].dependencies.iter().map(|dependency| dependency.pkg));
-            }
-            for package in macro_inputs {
-                let manifest: &Path = cargo[package].manifest.as_ref();
-                let producer = manifest.parent().unwrap().to_owned();
+            for producer in crate::macro_inputs::producers(workspace) {
                 macro_reads.push(Watched::new(producer.clone(), true));
-                macro_producers.push(producer);
             }
             // These are the bytes that produced the resolved graph, including its features,
             // not the bytes a script may have left behind. Retain every structural read.
@@ -603,25 +585,8 @@ impl Inputs {
             consistent,
             flags,
             scripts,
-            macro_producers,
             macro_reads,
         });
-    }
-
-    pub(crate) fn macro_generation(&self, root: &Path) -> Option<String> {
-        use sha2::{Digest as _, Sha256};
-        let checkout = self.checkouts.iter().find(|checkout| checkout.root == root)?;
-        if checkout.macro_producers.is_empty() {
-            return None;
-        }
-        let mut hash = Sha256::new();
-        for producer in &checkout.macro_producers {
-            let name = producer.as_os_str().as_encoded_bytes();
-            hash.update((name.len() as u64).to_le_bytes());
-            hash.update(name);
-            fingerprint_producer(producer, producer, &mut hash).ok()?;
-        }
-        Some(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
@@ -714,33 +679,6 @@ impl Inputs {
         let own = |name: &str| std::env::var(name).ok();
         run_env(&own, &self.asked_with, env, FLAGS.iter().copied().chain(read))
     }
-}
-
-fn fingerprint_producer(root: &Path, path: &Path, hash: &mut sha2::Sha256) -> std::io::Result<()> {
-    use sha2::Digest as _;
-    if path.is_dir() {
-        let mut entries: Vec<_> = std::fs::read_dir(path)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()?;
-        entries.sort();
-        for entry in entries {
-            if entry.ends_with(".git")
-                || entry.join("CACHEDIR.TAG").exists()
-                || entry.join("Cargo.toml").exists()
-            {
-                continue;
-            }
-            fingerprint_producer(root, &entry, hash)?;
-        }
-    } else {
-        let name = path.strip_prefix(root).unwrap().as_os_str().as_encoded_bytes();
-        let bytes = std::fs::read(path)?;
-        hash.update((name.len() as u64).to_le_bytes());
-        hash.update(name);
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-    }
-    Ok(())
 }
 
 impl Scripts {
@@ -961,6 +899,17 @@ fn stamp(path: &Path, package: bool) -> u64 {
     stamp_upto(path, package, None)
 }
 
+#[cfg(test)]
+pub(crate) fn measure_full_read_cost(path: &Path, runs: usize) -> Vec<f64> {
+    (0..runs)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            std::hint::black_box(stamp(path, true));
+            began.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect()
+}
+
 /// [`stamp`] of what was written before `limit`, when there is one.
 fn stamp_upto(path: &Path, package: bool, limit: Option<SystemTime>) -> u64 {
     let mut hasher = FxHasher::default();
@@ -1080,7 +1029,6 @@ mod tests {
             consistent: true,
             flags: Vec::new(),
             scripts: None,
-            macro_producers: Vec::new(),
             macro_reads: Vec::new(),
         });
         inputs

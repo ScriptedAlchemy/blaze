@@ -59,11 +59,15 @@ fn thirty_generations_retire_only_after_the_last_consumer() {
                     let response = match request {
                         Request::ApiVersionCheck {} => Response::ApiVersionCheck(0),
                         Request::ListMacros { dylib_path } => {
-                            assert!(std::fs::read(dylib_path).is_ok());
-                            Response::ListMacros(Ok(vec![(
-                                "Macro".into(),
-                                crate::ProcMacroKind::CustomDerive,
-                            )]))
+                            let bytes = std::fs::read(dylib_path).unwrap();
+                            if bytes.starts_with(b"rejected") {
+                                Response::ListMacros(Err("invalid macro library".into()))
+                            } else {
+                                Response::ListMacros(Ok(vec![(
+                                    "Macro".into(),
+                                    crate::ProcMacroKind::CustomDerive,
+                                )]))
+                            }
                         }
                         _ => panic!("unexpected request"),
                     };
@@ -82,6 +86,19 @@ fn thirty_generations_retire_only_after_the_last_consumer() {
     )
     .unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 1);
+    let first = client.load_dylib(MacroDylib::new(path.clone())).unwrap();
+    let rejected = paths::AbsPathBuf::assert_utf8(
+        std::path::Path::new(path.as_str()).with_extension("rejected"),
+    );
+    std::fs::write(&rejected, b"rejected library").unwrap();
+    assert!(client.load_dylib(MacroDylib::new(rejected.clone())).is_err());
+    std::fs::write(&rejected, b"fixed library").unwrap();
+    let fixed = client.load_dylib(MacroDylib::new(rejected.clone())).unwrap();
+    assert!(Arc::ptr_eq(&first[0].pool, &fixed[0].pool), "rejection never registered an image");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    drop(first);
+    drop(fixed);
+    std::fs::remove_file(&rejected).unwrap();
     for generation in 0..30 {
         std::fs::write(&path, format!("generation {generation}")).unwrap();
         let handles = client.load_dylib(MacroDylib::new(path.clone())).unwrap();
