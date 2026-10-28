@@ -19,6 +19,33 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+/// An included expression is allowed to be non-item source, but the expression
+/// parser's ERROR recovery root is not evidence of a valid expression. That
+/// parser can consume trailing items without reporting an error for them.
+pub(crate) fn expression_input(text: &str, edition: syntax::Edition) -> bool {
+    use syntax::ast::AstNode as _;
+    let parse = syntax::ast::Expr::parse(text, edition);
+    parse.errors().is_empty() && syntax::ast::Expr::cast(parse.syntax_node()).is_some()
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_item_recovery_does_not_hide_a_dependency_syntax_error() {
+        let text = r#"include!(concat!(env!("OUT_DIR"), "/shared.rs"));
+pub fn value() -> u8 { 1 }
+pub fn broken() -> u8 { 1 + }
+"#;
+        assert!(!syntax::SourceFile::parse(text, syntax::Edition::Edition2021).errors().is_empty());
+        assert!(!expression_input(text, syntax::Edition::Edition2021));
+        assert!(expression_input("1 + 2", syntax::Edition::Edition2021));
+        assert!(expression_input("include!(\"value.rs\")", syntax::Edition::Edition2021));
+        assert!(!expression_input("1 +", syntax::Edition::Edition2021));
+    }
+}
+
 /// Syntax failures in source-only builds must be reported before codegen/linking.
 /// Walk semantic modules rather than all loaded source-root files.
 pub(crate) fn syntax(

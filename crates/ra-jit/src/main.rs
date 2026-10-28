@@ -6326,7 +6326,7 @@ fn unparsed(
         if let Some(error) = parse.errors().first() {
             let text = db.file_text(file).text(db);
             // A file that is included where an expression goes is not one of items.
-            if syntax::ast::Expr::parse(text, edition).errors().is_empty() {
+            if check::expression_input(text, edition) {
                 continue;
             }
             let range = syntax::TextRange::empty(error.range().start());

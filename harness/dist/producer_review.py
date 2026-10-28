@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--owned-server", type=Path, required=True)
     parser.add_argument("--raw-env", action="store_true")
     parser.add_argument("--syntax-error", action="store_true")
+    parser.add_argument("--syntax-dependency", action="store_true")
     args = parser.parse_args()
     work = args.work.resolve()
     assert not work.exists(), "use a fresh witness directory"
@@ -72,10 +73,13 @@ def main():
         RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1")
     host = "aarch64-apple-darwin"
     rows = []
-    if args.syntax_error:
+    if args.syntax_error or args.syntax_dependency:
         for root in (ours, oracle):
-            script = root / "derive/build.rs"
-            script.write_text("fn main() { let broken = 'unterminated; }\n")
+            script = root / ("shared/src/lib.rs" if args.syntax_dependency else "derive/build.rs")
+            if args.syntax_dependency:
+                script.write_text(script.read_text() + "\npub fn broken() -> u8 { 1 + }\n")
+            else:
+                script.write_text("fn main() { let broken = 'unterminated; }\n")
         selected = work / "syntax-selection.json"
         selected.write_text(json.dumps(dict(profile="dev", features=[], no_default_features=False,
             all_features=False, packages=["app"], workspace=False,
@@ -89,13 +93,14 @@ def main():
         (work / "syntax-owned.log").write_text(ours_run.stdout + ours_run.stderr)
         (work / "syntax-oracle.log").write_text(oracle_run.stdout + oracle_run.stderr)
         assert ours_run.returncode != 0 and oracle_run.returncode != 0
-        assert "derive/build.rs" in ours_run.stderr, ours_run.stderr
+        expected_path = "shared/src/lib.rs" if args.syntax_dependency else "derive/build.rs"
+        assert expected_path in ours_run.stderr, ours_run.stderr
         assert "linker command failed" not in ours_run.stderr, ours_run.stderr
         assert "error:" in ours_run.stderr, ours_run.stderr
         calls = producer_plan.norustc.runs(str(audit_log))
         (work / "product-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
         assert not calls, calls
-        print("P67 script syntax-error fixture: source diagnostic before linking; both builds fail; zero product compilers")
+        print(f"P8 {expected_path} syntax-error fixture: source diagnostic before linking; both builds fail; zero product compilers")
         return
     try:
         steps = [("native", None, None), ("explicit-native", host, None),
