@@ -359,6 +359,10 @@ fn retry_args(asked: &[String], retry: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     let mut words = asked.iter();
     while let Some(word) = words.next() {
+        // After libtest's own `--` every word is a filter, which the retry's names replace.
+        if word == "--" {
+            break;
+        }
         let (name, joined) = match word.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(value)),
             _ => (word.as_str(), None),
@@ -565,6 +569,16 @@ mod tests {
         assert_eq!(
             retry_of(&["--include-ignored", "--color", "never"], &["tests::flaky_once"]),
             ["--include-ignored", "--color", "never", "--exact", "tests::flaky_once"]
+        );
+        // libtest's own `--` ends its options: the filters after it are replaced, and the
+        // retry's `--exact` stays an option rather than becoming a filter.
+        assert_eq!(
+            retry_of(&["--exact", "--", "tests::flaky"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        assert_eq!(
+            retry_of(&["--test-threads", "1", "--", "--odd-name"], &["tests::flaky_once"]),
+            ["--test-threads", "1", "--exact", "tests::flaky_once"]
         );
         // Two tests that failed both name themselves.
         assert_eq!(
