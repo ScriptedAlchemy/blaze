@@ -250,15 +250,21 @@ def downloads(home):
 
 class Side:
     """One of the builds of a checkout: `cargo ra-jit` (`True`), plain cargo once `ra-jit
-    enable` was run (`"plain"`), or cargo alone into `target-ref` (`False`)."""
+    enable` was run (`"plain"`), or cargo alone into `target-ref` (`False`).
+    `product_cli` runs the same product request directly, without Cargo's launcher."""
 
-    def __init__(self, ws, env, ra_jit):
+    def __init__(self, ws, env, ra_jit, *, product_cli=None):
         self.ws, self.ra_jit, self.plain = ws, bool(ra_jit), ra_jit == "plain"
+        if product_cli is not None and (not self.ra_jit or self.plain):
+            raise ValueError("direct product dispatch needs the ra-jit side")
+        self.product_cli = product_cli
         self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
         self.tally = os.path.join(env["RA_JIT_HOME"], "plain-cargo.log")
         self.read = 0
 
     def argv(self, command, *args):
+        if self.product_cli is not None:
+            return [self.product_cli, "cargo", command, *args]
         if self.plain:
             return [RA_JIT, command] if command in ("status", "stop") else ["cargo", command, *args]
         return ["cargo", *(["ra-jit"] if self.ra_jit else []), command, *args]

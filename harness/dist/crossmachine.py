@@ -572,7 +572,9 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     env["PATH"] = os.path.join(audit_bin, "bin") + os.pathsep + env["PATH"]
     for variable, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo")):
         env[variable] = os.path.join(audit_bin, "bin", tool)
-    side = Side(ws, env, True)
+    # The subject is the product CLI, not Cargo's subcommand launcher. The audit
+    # remains around the entire request, including every process the product starts.
+    side = Side(ws, env, True, product_cli=os.path.join(bin_dir, "ra-jit"))
     rows = []
     previous_pids, previous_builds = None, -1
     previous_dylibs = None
@@ -1178,6 +1180,11 @@ def failing(results):
     return [d for r in results for d in r["differences"] if not d["pending"]]
 
 
+def strict_macro_rows(rows):
+    """Every row must be right and have no product tool calls. Queries count too."""
+    return bool(rows) and all(row["right"] and not row["product_tool_calls"] for row in rows)
+
+
 # --- self test -----------------------------------------------------------------------------------------
 
 def self_test():
@@ -1188,6 +1195,36 @@ def self_test():
         nonlocal ok
         ok &= bool(good)
         print(f"  {what:70} {'right' if good else 'WRONG'}")
+
+    from cargo_ra_jit import Side
+    from unittest import mock
+    env = {"RA_JIT_HOME": "/home/daemon", "CARGO": "/audit/cargo", "RUSTC": "/audit/rustc",
+           "PATH": "/audit:/product"}
+    direct = Side("/checkout", env, True, product_cli="/product/ra-jit")
+    for command, args in [("build", ("-p", "app")), ("status", ()),
+                          ("run", ("-p", "app", "--", "argument")), ("stop", ())]:
+        check(f"direct {command} keeps the product request",
+              direct.argv(command, *args) == ["/product/ra-jit", "cargo", command, *args])
+    with mock.patch("cargo_ra_jit.timed", return_value=(0, None)) as timed:
+        direct.cargo("build", "-p", "app", timeout=123)
+        check("direct dispatch preserves the audited environment and timeout",
+              timed.call_args.args == (["/product/ra-jit", "cargo", "build", "-p", "app"],
+                                       "/checkout", env, 123))
+    check("Cargo launcher coverage elsewhere stays unchanged",
+          Side("/checkout", env, True).argv("build", "-p", "app")
+          == ["cargo", "ra-jit", "build", "-p", "app"])
+    check("reference builds still use Cargo",
+          Side("/checkout", env, False).argv("build", "-p", "app")
+          == ["cargo", "build", "-p", "app"])
+    check("zero product calls pass strict rows",
+          strict_macro_rows([dict(right=True, product_tool_calls=[])]))
+    for tool in ("cargo", "rustc", "rustdoc"):
+        check(f"strict rows never exclude a {tool} query",
+              not strict_macro_rows([dict(right=True, product_tool_calls=[
+                  dict(tool=tool, argv="--version")])]))
+    check("zero-call wrong output still fails strict rows",
+          not strict_macro_rows([dict(right=False, product_tool_calls=[])]))
+    check("missing witness fails strict rows", not strict_macro_rows([]))
 
     h = lambda s: hashlib.sha256(s.encode()).hexdigest()
     id_a, id_b = h("crate a")[:16], h("crate b")[:16]
@@ -1376,6 +1413,8 @@ def main():
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
                 json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
             print(json.dumps(rows, indent=1))
+            if a.warm_macro_content:
+                return 1 if not strict_macro_rows(rows) or watchdog.tripped else 0
             if a.warm_nonfunction or a.warm_macro_content:
                 return 1 if any(not row["right"] for row in rows) or watchdog.tripped else 0
             return 1 if any(
