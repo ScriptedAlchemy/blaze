@@ -174,6 +174,8 @@ pub(crate) fn tests(
     let mut failed = Vec::new();
     let (mut left, mut always_run) = (0, 0);
     let sandbox = sandboxed::wanted(affected::on());
+    let declared_env = affected::declared_env(state);
+    let attempts = affected::attempts(state);
     if let Some(Err(why)) = &sandbox {
         say::fallback(
             &format!("tests run outside a sandbox: {why}"),
@@ -186,14 +188,11 @@ pub(crate) fn tests(
         let shown = shown_path(&test.executable, cwd);
         let mut running = format!("{unit}{} ({shown})", source.display());
         let mut picked = Vec::new();
-        let mut command = Command::new(&test.executable);
-        configured(&mut command, state);
-        command.envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_built(&mut command)?;
-        let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
+        let mut command = test_command(state, test)?;
+        let sandbox_env =
+            matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command, &declared_env));
         let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
-        let pick = affected::pick(asked, state, test, identity.as_deref());
+        let pick = affected::pick(asked, state, test, identity.as_deref(), &command);
         if let Pick::Some { names: Some(names), total, .. } = &pick {
             left += total - names.len();
             if names.is_empty() {
@@ -228,19 +227,80 @@ pub(crate) fn tests(
             }
         }
         command.args(asked.program_args()).args(&picked);
-        let ran = match &pick {
-            Pick::Some { .. } => listing_failures(&mut command, held.take(), state),
-            Pick::Asked => ended(&mut command, held.take(), state).map(|it| (it, None)),
+        // The tests a sandbox runs, which a run again of some of them is given too.
+        let sandbox_list = command
+            .get_envs()
+            .find(|(name, _)| *name == crate::test_harness::SANDBOXED)
+            .and_then(|(_, list)| list.map(|it| it.to_owned()));
+        let listing = matches!(pick, Pick::Some { .. }) || attempts.any();
+        let ran = match listing {
+            true => listing_failures(&mut command, held.take(), state),
+            false => ended(&mut command, held.take(), state).map(|it| (it, None)),
         };
-        let (status, failures) = ran.with_context(|| format!("could not execute {shown}"))?;
+        let (mut status, mut failures) =
+            ran.with_context(|| format!("could not execute {shown}"))?;
+        // A test that fails runs again while it has attempts left (Bazel's
+        // `flaky_test_attempts`), and only the tests that failed do.
+        let (mut attempt, mut retried) = (1, Vec::new());
+        let mut exhausted = Vec::new();
+        while !status.success() {
+            let Some(failed) = failures.take() else { break };
+            let (retry, done) = retryable(&attempts, &test.package, failed, attempt);
+            exhausted.extend(done);
+            if retry.is_empty() {
+                failures = Some(exhausted.clone());
+                break;
+            }
+            attempt += 1;
+            say::status(
+                asked.flags.quiet,
+                "Retrying",
+                &format!("{running}: {} (attempt {attempt})", counted(retry.len())),
+            );
+            retried.extend(retry.iter().cloned());
+            let mut again = test_command(state, test)?;
+            if let Some(list) = &sandbox_list {
+                again.env(crate::test_harness::SANDBOXED, list);
+            }
+            // Each attempt is built from what the command asked, never from the argv of the
+            // attempt before: libtest refuses an option it is given twice.
+            again.args(retry_args(&asked.program_args().cloned().collect::<Vec<_>>(), &retry));
+            (status, failures) = listing_failures(&mut again, None, state)
+                .with_context(|| format!("could not execute {shown}"))?;
+        }
+        if status.success() && !exhausted.is_empty() {
+            failures = Some(exhausted);
+        } else if let Some(failures) = failures.as_mut() {
+            failures.extend(exhausted);
+            failures.sort();
+            failures.dedup();
+        }
+        let success = status.success() && failures.as_ref().is_none_or(Vec::is_empty);
+        // Those that passed on a later attempt are flaky, but still passed: Bazel's auto
+        // caching reuses a successful result even when it took retries.
+        retried.sort();
+        retried.dedup();
+        if !status.success() && failures.is_none() {
+            // A crashed retry has no summary proving which of its tests passed.
+            retried.clear();
+        }
+        retried.retain(|it| !failures.as_ref().is_some_and(|failed| failed.contains(it)));
+        if !retried.is_empty() {
+            let names = retried.join(", ");
+            say::status(
+                asked.flags.quiet,
+                "Flaky",
+                &format!("{names}: passed on attempt {attempt}"),
+            );
+        }
         match pick {
-            Pick::Some { passed, names, .. } if !status.success() => {
+            Pick::Some { passed, names, .. } if !success => {
                 passed.failed(names.as_deref(), failures.as_deref())
             }
             Pick::Some { passed, .. } => passed.passed(),
             Pick::Asked => {}
         }
-        if !status.success() {
+        if !success {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
@@ -272,6 +332,59 @@ pub(crate) fn tests(
             Ok(FAILED)
         }
     }
+}
+
+/// A failure that exhausted its own attempts must not prevent another test from retrying.
+fn retryable(
+    attempts: &affected::Attempts,
+    package: &str,
+    failed: Vec<String>,
+    attempt: usize,
+) -> (Vec<String>, Vec<String>) {
+    failed.into_iter().partition(|name| attempts.of(package, name) > attempt)
+}
+
+/// What a retry of the tests `retry` runs the test executable with, built from what the
+/// command asked the tests (`asked`: the words before `--` and after it) rather than from the
+/// argv of the attempt that failed. libtest refuses an option it is given twice, so the
+/// command's own `--exact` and the names it selected are replaced by the one selection of
+/// these tests: `cargo ra-jit test -- --exact tests::flaky_once` retries with one `--exact`.
+/// The options that say how the tests run, and the ones that pick them out of the selection
+/// (`--skip`, `--ignored`, `--include-ignored`), stay the command's, with their values.
+fn retry_args(asked: &[String], retry: &[String]) -> Vec<String> {
+    // libtest's options that take a value, which is the next word when it is not `=joined`:
+    // `--skip` is given several times, the rest once.
+    const VALUED: [&str; 7] =
+        ["--logfile", "--test-threads", "--skip", "--color", "--format", "-Z", "--shuffle-seed"];
+    let mut args = Vec::new();
+    let mut words = asked.iter();
+    while let Some(word) = words.next() {
+        // After libtest's own `--` every word is a filter, which the retry's names replace.
+        if word == "--" {
+            break;
+        }
+        let (name, joined) = match word.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (word.as_str(), None),
+        };
+        if !name.starts_with('-') {
+            // A filter naming tests: the tests of this retry name themselves.
+            continue;
+        }
+        // The command's own selection is given once, below.
+        if name == "--exact" {
+            continue;
+        }
+        args.push(word.clone());
+        if joined.is_none() && VALUED.contains(&name) {
+            if let Some(value) = words.next() {
+                args.push(value.clone());
+            }
+        }
+    }
+    args.push("--exact".to_owned());
+    args.extend(retry.iter().cloned());
+    args
 }
 
 /// Runs the doc tests with cargo, which hands them to ra-jit in rustdoc's place: ra-jit
@@ -364,6 +477,16 @@ fn says_doc_tests(line: &[u8]) -> bool {
     name.is_some_and(|it| !it.is_empty() && !it.contains(' '))
 }
 
+/// The command that runs the test executable of `test` as cargo does.
+fn test_command(state: &State, test: &Program) -> anyhow::Result<Command> {
+    let mut command = Command::new(&test.executable);
+    configured(&mut command, state);
+    command.envs(test.env.iter().cloned());
+    command.current_dir(&test.package_dir);
+    as_built(&mut command)?;
+    Ok(command)
+}
+
 fn counted(count: usize) -> String {
     match count {
         1 => "1 test".to_owned(),
@@ -400,7 +523,81 @@ pub(crate) fn exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::failures;
+    use super::{failures, retry_args};
+
+    fn retry_of(asked: &[&str], retry: &[&str]) -> Vec<String> {
+        let asked: Vec<String> = asked.iter().map(|it| (*it).to_owned()).collect();
+        let retry: Vec<String> = retry.iter().map(|it| (*it).to_owned()).collect();
+        retry_args(&asked, &retry)
+    }
+
+    #[test]
+    fn a_retry_selects_its_tests_once_from_what_was_asked() {
+        // `cargo ra-jit test -p flaky -- --exact tests::flaky_once`: libtest refuses a second
+        // `--exact`, so the command's is the one the retry is given, not a second one.
+        assert_eq!(
+            retry_of(&["--exact", "tests::flaky_once"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        // A filter that is not exact is the retry's own selection too: the names replace it.
+        assert_eq!(
+            retry_of(&["flaky_once"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        // How the tests run, and what picks them out of the selection, stay as they were.
+        assert_eq!(
+            retry_of(
+                &[
+                    "--test-threads=2",
+                    "--skip",
+                    "tests::steady",
+                    "--ignored",
+                    "--exact",
+                    "flaky_once"
+                ],
+                &["tests::flaky_once"]
+            ),
+            [
+                "--test-threads=2",
+                "--skip",
+                "tests::steady",
+                "--ignored",
+                "--exact",
+                "tests::flaky_once"
+            ]
+        );
+        assert_eq!(
+            retry_of(&["--include-ignored", "--color", "never"], &["tests::flaky_once"]),
+            ["--include-ignored", "--color", "never", "--exact", "tests::flaky_once"]
+        );
+        // libtest's own `--` ends its options: the filters after it are replaced, and the
+        // retry's `--exact` stays an option rather than becoming a filter.
+        assert_eq!(
+            retry_of(&["--exact", "--", "tests::flaky"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        assert_eq!(
+            retry_of(&["--test-threads", "1", "--", "--odd-name"], &["tests::flaky_once"]),
+            ["--test-threads", "1", "--exact", "tests::flaky_once"]
+        );
+        // Two tests that failed both name themselves.
+        assert_eq!(
+            retry_of(&[], &["tests::flaky_once", "tests::steady"]),
+            ["--exact", "tests::flaky_once", "tests::steady"]
+        );
+    }
+
+    #[test]
+    fn a_non_flaky_failure_does_not_block_a_flaky_tests_attempts() {
+        let attempts = super::affected::Attempts::with_flaky(&["flaky"]);
+        let failed = ["ordinary", "flaky"].map(str::to_owned).to_vec();
+        let (retry, exhausted) = super::retryable(&attempts, "p", failed, 1);
+        assert_eq!(retry, ["flaky"]);
+        assert_eq!(exhausted, ["ordinary"]);
+        let (retry, exhausted) = super::retryable(&attempts, "p", retry, 3);
+        assert!(retry.is_empty());
+        assert_eq!(exhausted, ["flaky"]);
+    }
 
     #[test]
     fn the_summary_names_the_failures() {

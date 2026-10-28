@@ -65,15 +65,25 @@ pub(crate) fn wanted(affected: bool) -> Option<Result<(), String>> {
 }
 
 /// The environment the test `command` runs would have, cut down to what a sandboxed test
-/// keeps: what the command sets itself, and of the rest only [`KEPT`] and what [`PASS`] names.
-pub(crate) fn env(command: &Command) -> Vec<(String, String)> {
+/// keeps: what the command sets itself, and of the rest [`KEPT`], [`PASS`] and manifest declarations.
+pub(crate) fn env(command: &Command, declared: &[String]) -> Vec<(String, String)> {
     let passed = std::env::var(PASS).unwrap_or_default();
+    env_from(command, declared, &passed, std::env::vars_os())
+}
+
+fn env_from(
+    command: &Command,
+    declared: &[String],
+    passed: &str,
+    inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
     let kept = |name: &str| {
         KEPT.contains(&name)
             || name.starts_with("LC_")
             || passed.split(',').any(|it| it.trim() == name)
+            || declared.iter().any(|it| it == name)
     };
-    let mut env: BTreeMap<String, String> = std::env::vars_os()
+    let mut env: BTreeMap<String, String> = inherited
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .filter(|(name, _)| kept(name))
         .collect();
@@ -85,6 +95,42 @@ pub(crate) fn env(command: &Command) -> Vec<(String, String)> {
         }
     }
     env.into_iter().collect()
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn declared_inherited_poison_is_forwarded_and_command_override_wins() {
+        let inherited = || {
+            [("T1_DECLARED".into(), "poison".into()), ("UNDECLARED".into(), "hidden".into())]
+                .into_iter()
+        };
+        let declared = vec!["T1_DECLARED".to_owned()];
+        let mut command = Command::new("test");
+        let forwarded = env_from(&command, &declared, "", inherited());
+        assert_eq!(forwarded, vec![("T1_DECLARED".to_owned(), "poison".to_owned())]);
+        #[cfg(unix)]
+        let rejects_poison = |env: &[(String, String)]| {
+            Command::new("/bin/sh")
+                .args(["-c", "test \"$T1_DECLARED\" != poison"])
+                .env_clear()
+                .envs(env.iter().cloned())
+                .status()
+                .unwrap()
+                .success()
+        };
+        #[cfg(unix)]
+        assert!(!rejects_poison(&forwarded));
+        command.env("T1_DECLARED", "forced");
+        let forwarded = env_from(&command, &declared, "", inherited());
+        assert_eq!(forwarded, vec![("T1_DECLARED".to_owned(), "forced".to_owned())]);
+        #[cfg(unix)]
+        assert!(rejects_poison(&forwarded));
+        command.env_remove("T1_DECLARED");
+        assert!(env_from(&command, &declared, "", inherited()).is_empty());
+    }
 }
 
 /// What stands for the environment `env` in a sandboxed test's identity.
