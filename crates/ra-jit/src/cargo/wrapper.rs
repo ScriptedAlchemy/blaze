@@ -112,7 +112,22 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         let capture = || -> anyhow::Result<Option<crate::macro_inputs::ArtifactInputs>> {
             let cargo = Cargo::above().map_err(anyhow::Error::msg)?;
             let asked = cli::of_cargo(&cargo.args).context("no producer build selection")?;
-            let metadata = super::state::metadata(&asked);
+            let env = cargo
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.to_str().context("Cargo environment key is not UTF-8")?.to_owned(),
+                        value.to_str().context("Cargo environment value is not UTF-8")?.to_owned(),
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let metadata = super::metadata::no_deps_in(
+                &cargo.cwd,
+                asked.flags.manifest_path.as_deref(),
+                &asked.flags.config,
+                env,
+            )?;
             let project =
                 super::state::project(&asked, &cargo.cwd, &metadata).map_err(anyhow::Error::msg)?;
             crate::macro_inputs::ArtifactInputs::capture(&project, &asked.selection())

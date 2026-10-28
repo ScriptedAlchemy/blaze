@@ -14,17 +14,27 @@ use cargo_metadata::Metadata;
 /// its message, status 101.
 pub(crate) fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let config = Config::from_process().and_then(|mut process| {
-        process.start("metadata", config)?;
-        Ok(process)
-    });
-    match config.and_then(|config| read(config, manifest_path)) {
+    match no_deps_in(&cwd, manifest_path, config, std::env::vars().collect()) {
         Ok(metadata) => metadata,
         Err(err) => {
             refused(&err, &cwd);
             std::process::exit(101)
         }
     }
+}
+
+/// Read from the invoking Cargo's directory, not the directory it runs rustc in.
+/// A caller that only collects provenance must not end a compile on a reader error.
+pub(super) fn no_deps_in(
+    cwd: &Path,
+    manifest_path: Option<&Path>,
+    config: &[String],
+    env: Vec<(String, String)>,
+) -> anyhow::Result<Metadata> {
+    let mut process = Config::load(cwd, env, &[])?;
+    process.start("metadata", config)?;
+    let manifest = manifest_path.map(|path| cwd.join(path));
+    read(process, manifest.as_deref())
 }
 
 fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata> {
@@ -243,6 +253,30 @@ mod tests {
                 std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn provenance_reader_uses_cargo_cwd_and_returns_errors() {
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-provenance-cwd-{}", std::process::id()));
+        let workspace = root.join("macros");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='producer'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "").unwrap();
+        let env = vec![("CARGO_HOME".into(), root.join("home").display().to_string())];
+        let read = super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env.clone());
+        assert_eq!(read.unwrap().packages[0].name.as_str(), "producer");
+        assert!(
+            super::no_deps_in(&workspace, Some(Path::new("macros/Cargo.toml")), &[], env.clone())
+                .is_err()
+        );
+        std::fs::write(workspace.join("Cargo.toml"), "invalid = [").unwrap();
+        assert!(super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Each workspace of blaze-manifest's fixtures that cargo reads is, as `cargo_metadata`
