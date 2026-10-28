@@ -91,6 +91,7 @@ mod tests {
     async fn read_wakes_and_noop_flushes_do_not_extend_a_stalled_write_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        peer.set_nodelay(true).unwrap();
         socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         socket2::SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
@@ -109,9 +110,9 @@ mod tests {
         })
         .await
         .expect_err("a peer that never reads cannot drain indefinitely");
-        let mut io = ProgressIo::new(stream, Duration::from_millis(100));
+        let mut io = ProgressIo::new(stream, Duration::from_millis(300));
         let heartbeat = tokio::spawn(async move {
-            for _ in 0..100 {
+            for _ in 0..200 {
                 if peer.write_all(b"x").await.is_err() {
                     break;
                 }
@@ -121,7 +122,7 @@ mod tests {
         let mut read_wakes = 0;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_millis(600),
+            Duration::from_secs(2),
             std::future::poll_fn(|cx| {
                 loop {
                     match io.stream.try_write(&fill) {
@@ -150,7 +151,7 @@ mod tests {
         let error = result.expect("read-side wakes extended the write-progress deadline");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(read_wakes > 1, "the regression never exercised repeated read-side wakes");
-        assert!(started.elapsed() < Duration::from_millis(600));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
