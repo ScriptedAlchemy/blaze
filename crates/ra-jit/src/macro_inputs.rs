@@ -142,7 +142,9 @@ impl ArtifactInputs {
         let root = metadata
             .workspace_root
             .as_std_path()
-            .join("target/rust-analyzer/producer-inputs")
+            // Artifact proof outlives a loaded generation and a daemon restart. It is
+            // not a build output and must not share Generation::collect's namespace.
+            .join("target/rust-analyzer/producer-records")
             .join(&identity);
         let lease = load_cargo::proc_macro_producer_lifetime::lease(&root)?;
         Ok(Some(Self { paths, context, configuration, root, identity, _lease: lease }))
@@ -168,17 +170,24 @@ impl ArtifactInputs {
             return Ok(());
         }
         for library in artifact.filenames.iter().filter(|path| is_dylib(path.as_std_path())) {
-            let bytes = std::fs::read(library)?;
-            // Do not publish a record when hashing the artifact straddled an input edit.
-            if !self.current()? {
-                return Ok(());
-            }
-            let hash = Sha256::digest(&bytes);
-            let name: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
-            // Complete contents are visible atomically. An interrupted write is not proof.
-            let path = self.root.join(format!("artifact-{name}"));
-            crate::replace(&path, self.identity.as_bytes())?;
+            self.record_library(library.as_std_path())?;
         }
+        Ok(())
+    }
+
+    /// The workspace wrapper has no Cargo message. It observes the same successful
+    /// compilation directly; a later fresh message never establishes proof.
+    pub(crate) fn record_library(&self, library: &Path) -> anyhow::Result<()> {
+        if !self.current()? {
+            return Ok(());
+        }
+        let bytes = std::fs::read(library)?;
+        if !self.current()? {
+            return Ok(());
+        }
+        let hash = Sha256::digest(&bytes);
+        let name: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+        crate::replace(&self.root.join(format!("artifact-{name}")), self.identity.as_bytes())?;
         Ok(())
     }
 

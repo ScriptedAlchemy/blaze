@@ -491,11 +491,18 @@ impl Built {
         let started = stamp_now();
         // Take producer bytes before the existing cargo build starts, not when a worker
         // happens to load. Failure loses warmth, never adds a compiling cargo invocation.
-        let producer_inputs = ahead.and_then(|ahead| {
-            match crate::macro_inputs::ArtifactInputs::capture(
-                &ahead.root.join(&ahead.config.project),
-                &ahead.config.selection,
-            ) {
+        let producer = match ahead {
+            Some(ahead) => {
+                Ok((ahead.root.join(&ahead.config.project), ahead.config.selection.clone()))
+            }
+            None => std::env::current_dir().and_then(|cwd| {
+                project(asked, &cwd, &metadata(asked))
+                    .map(|project| (project, asked.selection()))
+                    .map_err(std::io::Error::other)
+            }),
+        };
+        let producer_inputs = producer.ok().and_then(|(project, selection)| {
+            match crate::macro_inputs::ArtifactInputs::capture(&project, &selection) {
                 Ok(inputs) => inputs,
                 Err(error) => {
                     eprintln!("macro provenance: warm load unavailable: {error:#}");
@@ -1214,7 +1221,11 @@ fn used_by(artifacts: &[&Artifact], records: &[Record]) -> Vec<Record> {
 
 /// The directory of the package the build is of, whose features the daemon loads the
 /// workspace with. `Err` is why the selection is one it does not load.
-fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBuf, String> {
+pub(super) fn project(
+    asked: &Invocation,
+    cwd: &Path,
+    metadata: &Metadata,
+) -> Result<PathBuf, String> {
     let root = metadata.workspace_root.as_std_path();
     if let Some(named) = asked.flags.packages.first() {
         let name = named.split('@').next().unwrap_or(named);
