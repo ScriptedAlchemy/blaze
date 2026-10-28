@@ -17,9 +17,11 @@ pub struct Config {
     pub max_frame: u32,
     /// Concurrent accepted sockets.
     pub max_connections: usize,
-    /// Sessions retained, including disconnected ones.
+    /// Concurrent live sessions. An expired session is removed, so its capacity returns;
+    /// this is not a lifetime quota of session identities.
     pub max_sessions: usize,
-    /// Fixed session lifetime in monotonic milliseconds. Hello does not extend it.
+    /// Fixed session lifetime in monotonic milliseconds. Hello does not extend it; a client
+    /// that outlives it creates a new session and resumes its subscriptions explicitly.
     pub session_ms: u64,
     /// Maximum successful request IDs per session.
     pub max_requests: usize,
@@ -66,6 +68,8 @@ struct Session {
     next: u64,
     bytes: usize,
     replies: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+    /// The client's creation nonce, so a retried creation Hello returns this same lifetime.
+    nonce: Digest,
 }
 
 /// Single-owner facade. A reactor owns it; no locks around individual core transitions.
@@ -75,7 +79,12 @@ pub struct Coordinator {
     /// Instance identity; a restart cannot replay the previous daemon's request IDs.
     pub epoch: Digest,
     jobs: Jobs,
+    /// Live sessions only. Expiry removes the entry, so its capacity returns. A label is
+    /// never issued twice, so nothing has to be remembered to refuse a revival.
     sessions: BTreeMap<Digest, Session>,
+    /// Monotonic label counter. Labels are not capabilities: they only need to be unique
+    /// within this daemon, and the epoch check carries the authority.
+    issued: u64,
     ended: BTreeMap<ExecutionId, u64>,
     work_bytes: BTreeMap<ExecutionId, usize>,
     last_now: u64,
@@ -93,10 +102,20 @@ impl Coordinator {
             config,
             epoch,
             sessions: BTreeMap::new(),
+            issued: 0,
             ended: BTreeMap::new(),
             work_bytes: BTreeMap::new(),
             last_now: 0,
         }
+    }
+
+    /// The label a created session is issued, derived from the epoch and the counter only.
+    /// Two daemons differ by epoch; two creations differ by counter. Neither is a secret.
+    fn label(&self, counter: u64) -> Digest {
+        let mut bytes = [0u8; 40];
+        bytes[..32].copy_from_slice(&self.epoch);
+        bytes[32..].copy_from_slice(&counter.to_be_bytes());
+        blaze_wire::digest_of_encoded_name("blaze/session", &bytes)
     }
 
     /// Monotonic clock, including injected clocks: a rollback never extends a lease.
@@ -110,14 +129,10 @@ impl Coordinator {
         let now = self.now(now);
         let mut effects = Vec::new();
         self.jobs.tick(now, &mut effects);
-        // Retain bounded tombstones until daemon shutdown: reusing an expired session ID
-        // must never make an old sequence become a fresh transition in the same epoch.
-        for session in self.sessions.values_mut() {
-            if now > session.expires {
-                session.replies.clear();
-                session.bytes = 0;
-            }
-        }
+        // A session is capacity only while it is live. Expiry removes the entry and its
+        // journal, which is safe because an issued identity is never issued again: a request
+        // naming an expired session is refused as unknown, never replayed into a new one.
+        self.sessions.retain(|_, session| now <= session.expires);
         for e in self.jobs.executions() {
             if matches!(e.state(), ExecState::Ended(_)) {
                 self.ended.entry(e.id).or_insert(now);
@@ -158,7 +173,9 @@ impl Coordinator {
         effects
     }
 
-    /// Fixed-lifetime session negotiation. Unknown resumption never creates a replacement.
+    /// Version negotiation, then either creation or resume. Creation issues a fresh label
+    /// and is idempotent for its nonce only while that lifetime is live; resume never
+    /// creates, so an expired or unknown label stays refused in this daemon epoch.
     pub fn hello(&mut self, now: u64, hello: &LocalHello) -> Result<LocalWelcome, WireError> {
         let now = self.now(now);
         if hello.transport != TRANSPORT_VERSION
@@ -167,49 +184,78 @@ impl Coordinator {
         {
             return Err(error(ErrorCode::Conflict, "version-mismatch"));
         }
-        match hello.epoch {
-            Some(epoch) if epoch != self.epoch => {
-                return Err(error(ErrorCode::Conflict, "daemon-moved"));
-            }
-            Some(_) => {
-                if self.sessions.get(&hello.session).is_none_or(|s| now > s.expires) {
-                    return Err(error(ErrorCode::NotFound, "session-expired"));
+        match (&hello.epoch, &hello.resume) {
+            (None, None) => self.create(now, hello),
+            (Some(epoch), Some(session)) => {
+                if *epoch != self.epoch {
+                    return Err(error(ErrorCode::Conflict, "daemon-moved"));
                 }
+                let live =
+                    self.sessions.get(session).filter(|s| now <= s.expires).ok_or_else(|| {
+                        error(
+                            ErrorCode::NotFound,
+                            "session-expired: resume names no live lifetime of this daemon",
+                        )
+                    })?;
+                Ok(self.welcome(now, *session, live, false))
             }
-            None => {
-                if self.sessions.get(&hello.session).is_some_and(|s| now > s.expires) {
-                    return Err(error(
-                        ErrorCode::Conflict,
-                        "session-expired: never reuse its identity",
-                    ));
-                }
-                if !self.sessions.contains_key(&hello.session)
-                    && self.sessions.len() >= self.config.max_sessions
-                {
-                    return Err(error(ErrorCode::Busy, "session-capacity"));
-                }
-                // A lost Hello answer is retried with the same random ID. Creation is
-                // idempotent, but never recreates an expired tombstone in this daemon.
-                self.sessions.entry(hello.session).or_insert_with(|| Session {
-                    expires: now.saturating_add(self.config.session_ms),
-                    next: 1,
-                    bytes: 0,
-                    replies: BTreeMap::new(),
-                });
-            }
+            _ => Err(error(
+                ErrorCode::Malformed,
+                "hello-shape: creation names no epoch/resume, resume names both",
+            )),
         }
-        let session = &self.sessions[&hello.session];
-        Ok(LocalWelcome {
+    }
+
+    /// A creation is one issued label per live nonce. Retrying it returns that same
+    /// lifetime; it never migrates another session's pending request into the new one.
+    /// Expired lifetimes are purged here, so ordinary expiry needs no separate tick to make
+    /// capacity available again on the Hello path.
+    fn create(&mut self, now: u64, hello: &LocalHello) -> Result<LocalWelcome, WireError> {
+        self.sessions.retain(|_, session| now <= session.expires);
+        let existing =
+            self.sessions.iter().find(|(_, s)| s.nonce == hello.nonce).map(|(session, _)| *session);
+        if let Some(session) = existing {
+            let live = &self.sessions[&session];
+            return Ok(self.welcome(now, session, live, false));
+        }
+        if self.sessions.len() >= self.config.max_sessions {
+            return Err(error(ErrorCode::Busy, "session-capacity: live sessions are full"));
+        }
+        // A label is never issued twice. Exhausting the counter is a typed capacity
+        // refusal, never a wrap that would reissue an old identity.
+        let counter = self
+            .issued
+            .checked_add(1)
+            .ok_or_else(|| error(ErrorCode::Busy, "session-label-exhausted"))?;
+        let session = self.label(counter);
+        self.sessions.insert(
+            session,
+            Session {
+                expires: now.saturating_add(self.config.session_ms),
+                next: 1,
+                bytes: 0,
+                replies: BTreeMap::new(),
+                nonce: hello.nonce,
+            },
+        );
+        self.issued = counter;
+        let live = &self.sessions[&session];
+        Ok(self.welcome(now, session, live, true))
+    }
+
+    fn welcome(&self, now: u64, session: Digest, live: &Session, created: bool) -> LocalWelcome {
+        LocalWelcome {
             transport: TRANSPORT_VERSION,
             codec: blaze_wire::VERSION,
             terminal: blaze_wire::job_terminal_v2::VERSION,
-            session: hello.session,
+            session,
             epoch: self.epoch,
             now_ms: now,
-            expires_ms: session.expires,
+            expires_ms: live.expires,
             max_frame: self.config.max_frame,
-            next_request: session.next,
-        })
+            next_request: live.next,
+            created,
+        }
     }
 
     /// Execute once, journal the exact encoded response before it is written to the socket.
@@ -276,6 +322,13 @@ impl Coordinator {
         session.bytes += raw.len() + reply.len();
         session.next += 1;
         session.replies.insert(request.sequence, (raw, reply.clone()));
+        // A release is terminal: its answer is journaled above, then the lifetime and its
+        // journal are removed. Capacity and memory return at once, and nothing is kept to
+        // revive. A release performs no core transition, so a client that never saw this
+        // answer and retries meets `session-expired` and has lost no effect, only a lifetime.
+        if matches!(request.command, Command::Release(_)) {
+            self.sessions.remove(&request.session);
+        }
         Ok((reply, effects))
     }
 
@@ -490,6 +543,7 @@ impl Coordinator {
                     value: self.jobs.terminal(s.execution, s.subscriber).cloned(),
                 }))
             }
+            Command::Release(_) => Ok(Answer::Ack(Ack {})),
         }
     }
 }

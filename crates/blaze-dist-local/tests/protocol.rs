@@ -6,20 +6,34 @@ use blaze_wire::{Limits, decode, encode};
 #[test]
 fn hello_golden_separates_transport_global_codec_and_terminal_versions() {
     let value = ClientFrame::Hello(LocalHello {
-        transport: 1,
+        transport: 2,
         codec: 1,
         terminal: 2,
-        session: [0; 32],
+        nonce: [0; 32],
         epoch: None,
+        resume: None,
     });
-    let mut expected = vec![0x82, 0, 0xa5, 0, 1, 1, 1, 2, 2, 3, 0x58, 0x20];
+    let mut expected = vec![0x82, 0, 0xa6, 0, 2, 1, 1, 2, 2, 3, 0x58, 0x20];
     expected.extend([0; 32]);
-    expected.extend([4, 0xf6]);
+    expected.extend([4, 0xf6, 5, 0xf6]);
     assert_eq!(encode(&value), expected);
     assert_eq!(decode::<ClientFrame>(&expected, &Limits::DOCUMENTED).unwrap(), value);
     let framed = blaze_dist_local::server::frame(&expected);
     assert_eq!(u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize, expected.len());
     assert_eq!(&framed[4..], expected);
+}
+
+#[test]
+fn resume_hello_carries_the_issued_label_and_daemon_epoch_together() {
+    // Transport 2 names a lifetime by the daemon's issued label, and creation by a nonce.
+    // A resume carries both the label and the epoch; neither is the creation nonce.
+    let created = ClientFrame::Hello(blaze_dist_local::protocol::hello([7; 32]));
+    let resumed = ClientFrame::Hello(blaze_dist_local::protocol::resume([9; 32], [8; 32]));
+    assert_ne!(encode(&created), encode(&resumed));
+    let ClientFrame::Hello(hello) = resumed else { panic!() };
+    assert_eq!(hello.nonce, [0; 32]);
+    assert_eq!(hello.resume, Some([9; 32]));
+    assert_eq!(hello.epoch, Some([8; 32]));
 }
 
 #[test]

@@ -1,5 +1,12 @@
-//! Local transport version 1. This carrier version is independent of the selected global
+//! Local transport version 2. This carrier version is independent of the selected global
 //! wire codec and terminal contract version 2. Every body is one canonical CBOR value.
+//!
+//! Version 2 changed who names a session. Version 1 echoed a client-chosen session ID in
+//! `Hello`, so refusing to revive an expired ID meant remembering every ID forever, which
+//! exhausted capacity in ordinary use. Version 2 has the daemon issue a monotonic session
+//! label and keeps the client's random nonce only to make a retried creation idempotent
+//! while that session is live. An older peer is refused by the version mismatch, not
+//! reinterpreted.
 
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
 use blaze_wire::{
@@ -10,21 +17,26 @@ use blaze_wire::{
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
-pub const TRANSPORT_VERSION: u32 = 1;
+pub const TRANSPORT_VERSION: u32 = 2;
 
 wire_struct! {
-    /// Hello resumes an existing session with its daemon epoch, or creates one with no epoch.
+    /// Creates a lifetime with `resume: None, epoch: None`, where `nonce` makes a retried
+    /// creation idempotent while that lifetime is live, or resumes one by naming both its
+    /// issued session and the daemon epoch. Naming only one of the two is malformed.
     LocalHello {
         0 => transport: u32,
         1 => codec: u32,
         2 => terminal: u32,
-        3 => session: Digest,
+        3 => nonce: Digest,
         4 => epoch: Option<Digest>,
+        5 => resume: Option<Digest>,
     }
 }
 wire_struct! {
     /// Negotiated versions, clock origin, lifetime and bounds. Absolute job deadlines use
-    /// this daemon's monotonic milliseconds, not wall-clock Unix timestamps.
+    /// this daemon's monotonic milliseconds, not wall-clock Unix timestamps. `created` says
+    /// this Hello issued a new lifetime, so a client holding a request for another session
+    /// must not replay it here.
     LocalWelcome {
         0 => transport: u32,
         1 => codec: u32,
@@ -35,8 +47,10 @@ wire_struct! {
         6 => expires_ms: u64,
         7 => max_frame: u32,
         8 => next_request: u64,
+        9 => created: bool,
     }
 }
+
 wire_struct! {
     /// Execution identity without an attempt, used only for immutable terminal/resume lookup.
     Subscription {
@@ -122,6 +136,8 @@ wire_struct! {
 }
 wire_enum! {
     /// Requests after Hello. Reconnect uses Resume; Subscribe creates an additional interest.
+    /// Release ends this lifetime deliberately, so a finished client returns its capacity
+    /// instead of holding it until the fixed lifetime elapses.
     Command {
         Submit => 0 (Submission),
         Subscribe => 1 (Subscribe),
@@ -134,7 +150,12 @@ wire_enum! {
         WorkerEvents => 8 (WorkerEvents),
         KillAck => 9 (KillAck),
         Terminal => 10 (Subscription),
+        Release => 11 (Release),
     }
+}
+wire_struct! {
+    /// Deliberately ends the calling session. No core transition is performed or reversed.
+    Release {}
 }
 wire_struct! {
     /// At-most-once transition key within a bounded daemon/session lifetime.
@@ -218,15 +239,21 @@ pub fn submission(request: &blaze_wire::JobRequest, need: Reservation) -> Submis
     }
 }
 
-/// The carrier advertises only its actual compiled global codec, not permissive fallbacks.
-pub fn hello(session: Digest, epoch: Option<Digest>) -> LocalHello {
+/// A creation Hello. The nonce makes a retried creation idempotent while it is live.
+pub fn hello(nonce: Digest) -> LocalHello {
     LocalHello {
         transport: TRANSPORT_VERSION,
         codec: blaze_wire::VERSION,
         terminal: blaze_wire::job_terminal_v2::VERSION,
-        session,
-        epoch,
+        nonce,
+        epoch: None,
+        resume: None,
     }
+}
+
+/// A resume Hello: both the daemon epoch and the issued session label are required.
+pub fn resume(session: Digest, epoch: Digest) -> LocalHello {
+    LocalHello { resume: Some(session), epoch: Some(epoch), ..hello([0; 32]) }
 }
 
 /// Versions this implementation speaks, as a deterministic set for diagnostic rendering.

@@ -1607,8 +1607,9 @@ not a schema-2 decoder accepting old shapes.
 The codec, effect-to-response model and client-policy function are implemented and tested.
 The local Unix driver in [blaze-dist-local](../crates/blaze-dist-local/README.md) now implements
 length-framed deterministic CBOR, explicit transport/global-codec/terminal negotiation,
-actual registry routing and immutable typed terminal/pending lookup. It retains exact
-request replies over reconnect, enforces bounds and forwards real effects to the backend.
+daemon-issued session labels with deliberate release, actual registry routing and immutable
+typed terminal/pending lookup. It retains exact request replies over reconnect, enforces
+bounds and forwards real effects to the backend.
 Its CLI and socket tests do not supply a compiler holder or execute a fallback/race build.
 HTTP/fleet transport, source/store/compiler execution and production client-race behavior
 remain D1/E3 integration work.
