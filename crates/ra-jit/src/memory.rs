@@ -543,10 +543,20 @@ fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
 
 #[cfg(target_os = "linux")]
 fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    read_linux_pressure(|path| std::fs::read_to_string(path), pressure_reserve().ok()?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_linux_pressure(
+    read: impl Fn(&str) -> std::io::Result<String>,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    // Either source can be restricted independently. Read both before classifying, so
+    // an unavailable MemAvailable reading cannot hide critical pressure reported by PSI.
     linux_pressure(
-        &std::fs::read_to_string("/proc/meminfo").ok()?,
-        &std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default(),
-        pressure_reserve().ok()?,
+        &read("/proc/meminfo").unwrap_or_default(),
+        &read("/proc/pressure/memory").unwrap_or_default(),
+        reserve,
     )
 }
 
@@ -620,6 +630,30 @@ mod tests {
         // Incomplete quiet signals do not claim that all pressure sources are normal.
         assert_eq!(linux_pressure("", "full avg10=0 total=0\n", 1 << 20), None);
         assert_eq!(linux_pressure("", "", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_reader_keeps_independently_readable_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let read = |meminfo: Option<&str>, psi: Option<&str>| {
+            read_linux_pressure(
+                |path| {
+                    let text = match path {
+                        "/proc/meminfo" => meminfo,
+                        "/proc/pressure/memory" => psi,
+                        _ => panic!("unexpected pressure source: {path}"),
+                    };
+                    text.map(str::to_owned)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                },
+                1 << 20,
+            )
+        };
+        assert_eq!(read(None, Some("full avg10=10 total=0\n")), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=10 total=0\n")), Some(Warning));
+        assert_eq!(read(Some("MemAvailable: 1024 kB"), None), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=0\nfull avg10=0\n")), None);
+        assert_eq!(read(None, None), None);
     }
 
     #[test]
