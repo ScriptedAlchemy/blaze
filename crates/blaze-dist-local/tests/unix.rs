@@ -90,12 +90,22 @@ impl Fixture {
         self.clock.0.store(now, Ordering::Release);
         std::thread::sleep(Duration::from_millis(10));
     }
+    /// Stop the reactor deliberately, keeping the path so a later call fails on IO rather
+    /// than on a missing socket. Drop then finds the thread already joined.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.thread.take().unwrap().join().unwrap();
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
         assert!(!self.path.exists());
     }
 }
@@ -582,6 +592,63 @@ fn expired_lifetime_creation_retry_is_not_mistaken_for_the_old_one() {
         .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)))))
         .unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+}
+
+#[test]
+fn pending_request_is_never_migrated_into_a_fresh_lifetime() {
+    // A client whose answer was lost holds an unresolved request. It may not renew into a
+    // new lifetime while that request is pending: renewing would re-issue the work as a new
+    // request and repeat the effect. Abandoning is explicit and returns the exact bytes.
+    let mut f = Fixture::new(true, Config::default());
+    let mut c = f.client();
+    let first = c.welcome.clone();
+    let b = submit(&mut c, 100_000);
+    let count_assigned = |f: &Fixture| {
+        f.effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, Effect::Event(i) if matches!(i.event, JobEvent::Assigned(_))),
+            )
+            .count()
+    };
+    assert_eq!(count_assigned(&f), 1);
+    // Stop the daemon so the next call cannot be answered: the client keeps the request.
+    f.stop();
+    assert!(c.call(Command::Resume(b.subscription.clone())).is_err());
+    // Renewal is refused before any connection, so the request cannot be re-issued.
+    let refused = c.renew(&f.path, [32; 32]).unwrap_err();
+    assert!(format!("{refused:?}").contains("pending-request"));
+    // Abandoning is explicit, returns the exact pending bytes, and only then is renewal
+    // ordinary: a genuinely fresh lifetime, not the old one under a new label.
+    let abandoned = c.abandon_pending().expect("the unresolved request is returned");
+    assert_eq!(abandoned.session, first.session);
+    assert_eq!(abandoned.sequence, 2);
+    // With nothing pending the guard is gone; a dead path now fails on IO, not on the guard.
+    let renewed = c.renew(&f.path, [32; 32]).unwrap_err();
+    assert!(!format!("{renewed:?}").contains("pending-request"));
+    // The work was submitted exactly once: abandoning and failing to renew repeats no effect.
+    assert_eq!(count_assigned(&f), 1);
+}
+
+#[test]
+fn renew_after_release_creates_a_distinct_lifetime_and_old_label_stays_dead() {
+    let f = Fixture::new(false, Config::default());
+    let mut c = f.client();
+    let first = c.welcome.clone();
+    c.release().unwrap();
+    // The released label is not resumable, so renew must create, never adopt it.
+    c.renew(&f.path, [42; 32]).unwrap();
+    assert!(c.welcome.created);
+    assert_ne!(c.welcome.session, first.session);
+    let mut stream = raw(&f);
+    stream
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)))))
+        .unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    // The renewed lifetime itself resumes normally.
+    c.reconnect(&f.path).unwrap();
 }
 
 #[test]
