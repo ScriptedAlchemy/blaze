@@ -148,7 +148,7 @@ fn macos_machine<'a>(
     env: &'a BTreeMap<String, std::ffi::OsString>,
     linker: Option<&'a str>,
 ) -> Machine<'a> {
-    Machine { triple: TRIPLE, cpu: CPU, env, linker }
+    Machine { cwd: Path::new("/"), triple: TRIPLE, cpu: CPU, env, linker }
 }
 
 fn macos_env() -> BTreeMap<String, std::ffi::OsString> {
@@ -214,7 +214,13 @@ fn linux_glibc_platform() {
         .run("/usr/bin/getconf", &["GNU_LIBC_VERSION"], "glibc 2.39\n");
     let env = vars(&[("PATH", "/usr/local/bin:/usr/bin:/bin")]);
     let platform = exec_platform(
-        &Machine { triple: "x86_64-unknown-linux-gnu", cpu: "x86-64", env: &env, linker: None },
+        &Machine {
+            cwd: Path::new("/"),
+            triple: "x86_64-unknown-linux-gnu",
+            cpu: "x86-64",
+            env: &env,
+            linker: None,
+        },
         &fake,
     )
     .unwrap();
@@ -271,7 +277,13 @@ fn linux_musl_platform() {
         .run("/lib/ld-musl-x86_64.so.1", &["--version"], "musl libc (x86_64)\nVersion 1.2.5\n");
     let env = vars(&[("PATH", "/usr/bin:/bin")]);
     let platform = exec_platform(
-        &Machine { triple: "x86_64-unknown-linux-musl", cpu: "x86-64", env: &env, linker: None },
+        &Machine {
+            cwd: Path::new("/"),
+            triple: "x86_64-unknown-linux-musl",
+            cpu: "x86-64",
+            env: &env,
+            linker: None,
+        },
         &fake,
     )
     .unwrap();
@@ -462,7 +474,13 @@ fn a_linux_machine_without_a_libc_is_refused() {
         .run("/usr/bin/cc", &["--version"], "cc 13\n");
     let env = vars(&[("PATH", "/usr/bin")]);
     let refused = exec_platform(
-        &Machine { triple: "x86_64-unknown-linux-gnu", cpu: "x86-64", env: &env, linker: None },
+        &Machine {
+            cwd: Path::new("/"),
+            triple: "x86_64-unknown-linux-gnu",
+            cpu: "x86-64",
+            env: &env,
+            linker: None,
+        },
         &fake,
     )
     .unwrap_err();
@@ -514,7 +532,14 @@ fn the_system_probe_reads_this_machine() {
         let abi = if cfg!(target_env = "musl") { "musl" } else { "gnu" };
         format!("{}-unknown-linux-{abi}", std::env::consts::ARCH)
     };
-    let machine = Machine { triple: &triple, cpu: std::env::consts::ARCH, env: &env, linker: None };
+    let cwd = std::env::current_dir().unwrap();
+    let machine = Machine {
+        cwd: &cwd,
+        triple: &triple,
+        cpu: std::env::consts::ARCH,
+        env: &env,
+        linker: None,
+    };
     let platform: ExecPlatform = exec_platform(&machine, &System).unwrap();
     eprintln!("{platform:#?}");
     assert_eq!(platform.triple, triple);

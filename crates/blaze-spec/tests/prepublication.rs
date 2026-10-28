@@ -250,6 +250,47 @@ fn invalid_script_origin_returns_refusal_not_panic() {
     assert!(blaze_spec::run::candidates(&made).is_err());
 }
 
+#[test]
+fn custom_launcher_setting_survives_spec_decode_and_reproduction() {
+    let f = fixture();
+    let root = f.root();
+    let host = common::host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    for wrapper in [OsString::from("custom-wrapper"), OsString::from_vec(b"wrapper-\xff".to_vec())]
+    {
+        let mut native: std::collections::BTreeMap<_, _> =
+            f.env().into_iter().map(|(name, value)| (name, OsString::from(value))).collect();
+        let mut cc = wrapper.clone();
+        cc.push(" cc");
+        native.insert("CC".into(), cc);
+        native.insert("CC_KNOWN_WRAPPER_CUSTOM".into(), wrapper.clone());
+        let env = blaze_spec::environment::text_view(&native).unwrap();
+        let mut ctx = common::context(&f, &env, &host, &root);
+        ctx.native_env = Some(&native);
+        let made = build_spec(&request, &ctx).unwrap();
+        let decoded: BuildSpec =
+            blaze_wire::decode(&blaze_wire::encode(&made.build), &blaze_wire::Limits::DOCUMENTED)
+                .unwrap();
+        let carried = decoded
+            .script_env
+            .iter()
+            .find(|(name, _)| name == "CC_KNOWN_WRAPPER_CUSTOM")
+            .expect("the platform's custom launcher setting must travel to the build script");
+        assert_eq!(carried.1.materialize(&root).unwrap(), wrapper);
+        assert!(blaze_spec::run::governed("CC_KNOWN_WRAPPER_CUSTOM"));
+        for candidate in blaze_spec::run::candidates(&decoded).unwrap() {
+            assert_eq!(
+                candidate
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == "CC_KNOWN_WRAPPER_CUSTOM")
+                    .map(|(_, value)| value),
+                Some(&wrapper)
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn raw_home_path_is_discovered_not_defaulted() {

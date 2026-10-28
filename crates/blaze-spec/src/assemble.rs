@@ -313,8 +313,13 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
                 );
             }
         }
-        let machine =
-            Machine { triple: &host.triple, cpu: &host.cpu, env: &machine_env, linker: None };
+        let machine = Machine {
+            cwd: ctx.cwd,
+            triple: &host.triple,
+            cpu: &host.cpu,
+            env: &machine_env,
+            linker: None,
+        };
         let platform = platform::exec_platform(&machine, ctx.probe)?;
         let platform_digest = digest_of(&platform);
 

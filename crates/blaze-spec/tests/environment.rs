@@ -115,6 +115,7 @@ fn a_build_script_reads_the_listed_variables_with_the_requesters_values() {
         ("LDFLAGS", "-L/x"),
         ("CRATE_CC_NO_DEFAULTS", "1"),
         ("CC_ENABLE_DEBUG_OUTPUT", "1"),
+        ("CC_KNOWN_WRAPPER_CUSTOM", "custom-wrapper"),
         ("CC_KNOWN_WRAPPER_MAP", "a:b"),
         ("SDKROOT", "/sdk"),
         ("MACOSX_DEPLOYMENT_TARGET", "14.0"),

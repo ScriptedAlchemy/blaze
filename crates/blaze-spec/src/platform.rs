@@ -4,8 +4,9 @@
 //!
 //! [`exec_platform`] is a pure function of a [`Machine`] and a [`Probe`]: every variable it
 //! reads is in `Machine::env`, and every program it runs and file it reads goes through the
-//! probe. It reads no variable of the process's own environment, so two calls with one machine
-//! and probe give one platform, and a variable the build does not see cannot change it.
+//! probe in `Machine::cwd`. It reads no variable of the process's own environment, so two calls
+//! with one machine and probe give one platform, and a variable the build does not see cannot
+//! change it.
 //! [`System`] is the probe that runs this machine's programs and reads its files.
 //!
 //! # What each field is
@@ -43,8 +44,9 @@
 //! the digest, so the same compiler behind a different launcher is a different platform. A
 //! launcher that cannot be resolved is not there to run the compiler, so the tool is absent.
 //!
-//! The program is resolved with [`Probe::which`] in the directories of `Machine::env`'s `PATH`
-//! (an absolute path is used as it is). No program by that name means the field is `None`: a
+//! The program is resolved in the directories of `Machine::env`'s `PATH`, with relative paths
+//! and empty PATH entries rooted at `Machine::cwd`. Probes run in that directory without
+//! changing the serving process's cwd. No program by that name means the field is `None`: a
 //! build with no C dependency needs no compiler, and two machines that differ only in that one
 //! has a compiler do not share a platform, which is the safe direction.
 //!
@@ -210,6 +212,84 @@ pub trait Probe {
 
     /// The operating system and its version: `"macos 26.6.2"`, `"linux 6.8"`.
     fn os(&self) -> Option<String>;
+
+    /// Native lookup in a request's directory. Canned probes may keep their existing lookup;
+    /// filesystem probes must resolve relative and empty PATH entries against `cwd`.
+    fn which_native_in(
+        &self,
+        _cwd: &Path,
+        name: &std::ffi::OsStr,
+        path: &std::ffi::OsStr,
+    ) -> Option<PathBuf> {
+        self.which_native(name, path)
+    }
+
+    /// Text lookup in a request's directory, with the same defaults as native lookup.
+    fn which_in(&self, _cwd: &Path, name: &str, path: &str) -> Option<PathBuf> {
+        self.which(name, path)
+    }
+
+    /// Invoke the resolved program in a request's directory. Canned probes can ignore `cwd`.
+    fn run_in(&self, _cwd: &Path, program: &Path, args: &[&str]) -> Option<String> {
+        self.run(program, args)
+    }
+
+    /// Native invocation in a request's directory.
+    fn run_native_in(
+        &self,
+        _cwd: &Path,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<String> {
+        self.run_native(program, args)
+    }
+
+    /// Pathname-query invocation in a request's directory.
+    fn run_path_in(
+        &self,
+        _cwd: &Path,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<Vec<u8>> {
+        self.run_path(program, args)
+    }
+
+    /// Operating-system queries in a request's directory.
+    fn os_in(&self, _cwd: &Path) -> Option<String> {
+        self.os()
+    }
+}
+
+/// Bind path resolution and child processes to one request, leaving its environment values
+/// unchanged for serialization. In particular, do not rebuild PATH with an absolute prefix:
+/// the request's directory may itself contain a PATH separator.
+struct InDirectory<'a> {
+    probe: &'a dyn Probe,
+    cwd: &'a Path,
+}
+
+impl Probe for InDirectory<'_> {
+    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
+        self.probe.which_native_in(self.cwd, name, path).map(|path| self.cwd.join(path))
+    }
+    fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
+        self.probe.which_in(self.cwd, name, path).map(|path| self.cwd.join(path))
+    }
+    fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        self.probe.run_in(self.cwd, &self.cwd.join(program), args)
+    }
+    fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        self.probe.run_native_in(self.cwd, &self.cwd.join(program), args)
+    }
+    fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        self.probe.run_path_in(self.cwd, &self.cwd.join(program), args)
+    }
+    fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        self.probe.read(&self.cwd.join(path))
+    }
+    fn os(&self) -> Option<String> {
+        self.probe.os_in(self.cwd)
+    }
 }
 
 /// The real probe: it runs this machine's programs and reads its files.
@@ -225,38 +305,67 @@ impl Probe for System {
     }
 
     fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
-        let output = Command::new(program).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text += &String::from_utf8_lossy(&output.stderr);
-        Some(text)
+        text_output(Command::new(program).args(args))
     }
     fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
         std::env::split_paths(path).map(|dir| dir.join(name)).find(|it| it.is_file())
     }
 
     fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
-        let output = Command::new(program).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text += &String::from_utf8_lossy(&output.stderr);
-        Some(text)
+        text_output(Command::new(program).args(args))
     }
 
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
         std::fs::read(path).ok()
     }
 
+    fn which_native_in(
+        &self,
+        cwd: &Path,
+        name: &std::ffi::OsStr,
+        path: &std::ffi::OsStr,
+    ) -> Option<PathBuf> {
+        std::env::split_paths(path).map(|dir| cwd.join(dir).join(name)).find(|it| it.is_file())
+    }
+
+    fn which_in(&self, cwd: &Path, name: &str, path: &str) -> Option<PathBuf> {
+        self.which_native_in(cwd, name.as_ref(), path.as_ref())
+    }
+
+    fn run_in(&self, cwd: &Path, program: &Path, args: &[&str]) -> Option<String> {
+        text_output(Command::new(program).current_dir(cwd).args(args))
+    }
+
+    fn run_native_in(
+        &self,
+        cwd: &Path,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<String> {
+        text_output(Command::new(program).current_dir(cwd).args(args))
+    }
+
+    fn run_path_in(
+        &self,
+        cwd: &Path,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<Vec<u8>> {
+        let output = Command::new(program).current_dir(cwd).args(args).output().ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+
     fn os(&self) -> Option<String> {
+        self.os_in(Path::new("."))
+    }
+
+    fn os_in(&self, cwd: &Path) -> Option<String> {
         // The OS this binary was built for, which blaze's triple says it is not cross-building
         // away from.
         match std::env::consts::OS {
             "macos" => {
-                let version = self.run(Path::new("/usr/bin/sw_vers"), &["-productVersion"])?;
+                let version =
+                    self.run_in(cwd, Path::new("/usr/bin/sw_vers"), &["-productVersion"])?;
                 let version = version.trim();
                 (!version.is_empty()).then(|| format!("macos {version}"))
             }
@@ -264,7 +373,7 @@ impl Probe for System {
                 // coreutils' `uname`, in either of the two places a distribution puts it.
                 let release = ["/usr/bin/uname", "/bin/uname"]
                     .iter()
-                    .find_map(|it| self.run(Path::new(it), &["-r"]))?;
+                    .find_map(|it| self.run_in(cwd, Path::new(it), &["-r"]))?;
                 let release = release.trim();
                 (!release.is_empty()).then(|| format!("linux {}", major_minor(release)))
             }
@@ -273,8 +382,20 @@ impl Probe for System {
     }
 }
 
+fn text_output(command: &mut Command) -> Option<String> {
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text += &String::from_utf8_lossy(&output.stderr);
+    Some(text)
+}
+
 /// The machine a platform is computed for: what cargo's configuration and the environment say.
 pub struct Machine<'a> {
+    /// The requester's working directory, absolute, for relative native inputs and probes.
+    pub cwd: &'a Path,
     /// The target triple of the blaze binary: blaze does not cross-build.
     pub triple: &'a str,
     /// The target CPU and features codegen assumes.
@@ -288,6 +409,8 @@ pub struct Machine<'a> {
 /// The `ExecPlatform` of `machine`, read through `probe`, or a [`Refusal`] naming the field
 /// blaze cannot name.
 pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
+    let scoped = InDirectory { probe, cwd: machine.cwd };
+    let probe: &dyn Probe = &scoped;
     let os = probe
         .os()
         .ok_or_else(|| Refusal::new("os", "the machine's operating system cannot be named"))?;

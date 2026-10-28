@@ -111,7 +111,13 @@ fn native_probe_uses_raw_path_and_custom_wrapper_not_ambient() {
     let mut env = BTreeMap::from([("PATH".to_owned(), OsString::from("/ambient"))]);
     fn platform(env: &BTreeMap<String, OsString>, probe: &dyn Probe) -> blaze_wire::ExecPlatform {
         blaze_spec::platform::exec_platform(
-            &Machine { triple: "aarch64-apple-darwin", cpu: "apple-m1", env, linker: None },
+            &Machine {
+                cwd: Path::new("/"),
+                triple: "aarch64-apple-darwin",
+                cpu: "apple-m1",
+                env,
+                linker: None,
+            },
             probe,
         )
         .unwrap()
@@ -190,7 +196,13 @@ fn xcrun_path_stdout_preserves_raw_sdk_bytes_separately_from_version_text() {
     }
     let env = BTreeMap::from([("PATH".into(), OsString::from("/usr/bin"))]);
     let result = blaze_spec::platform::exec_platform(
-        &Machine { triple: "aarch64-apple-darwin", cpu: "apple-m1", env: &env, linker: None },
+        &Machine {
+            cwd: Path::new("/"),
+            triple: "aarch64-apple-darwin",
+            cpu: "apple-m1",
+            env: &env,
+            linker: None,
+        },
         &RawSdk,
     );
     let result = result.unwrap();

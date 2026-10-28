@@ -32,8 +32,10 @@ names and non-UTF-8 bytes. Generation/decoding use the same validated type; nati
 materialization decodes components rather than joining the escaped text. Git API
 callers must supply the actual materialized repository root.
 Native probing receives OsString values, including configured PATH and custom
-compiler wrappers, without substituting ambient variables. Logical path decoding
-uses the message budget rather than the ordinary string budget. Git path stdout
+compiler wrappers, without substituting ambient variables. Relative native inputs and
+empty PATH entries resolve from the request's saved cwd; probe children run there without
+changing the serving process's cwd or rewriting serialized environment values. Logical path
+decoding uses the message budget rather than the ordinary string budget. Git path stdout
 is read as native bytes with only its line terminator removed.
 Schema 4 gives free-form env/flag values message-sized typed budgets and preserves
 raw Unix env values as tagged bytes. Ordinary identifiers retain their string limits.
