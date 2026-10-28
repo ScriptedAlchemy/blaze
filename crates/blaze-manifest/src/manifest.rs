@@ -382,7 +382,10 @@ pub fn read_manifest(
     (|| {
         let empty = Vec::new();
         let cargo_features = original_toml.cargo_features.as_ref().unwrap_or(&empty);
-        let features = Features::new(cargo_features, &mut warnings, source_id.is_path())?;
+        let channel =
+            ctx.config.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS").unwrap_or("stable");
+        let features =
+            Features::for_channel(cargo_features, &mut warnings, source_id.is_path(), channel)?;
         let workspace_config = to_workspace_config(&original_toml, path, &mut warnings)?;
         if let WorkspaceConfig::Root(ws_root_config) = &workspace_config {
             let package_root = path.parent().unwrap();

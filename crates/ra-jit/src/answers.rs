@@ -480,7 +480,9 @@ mod tests {
             "[build]\nrustflags = [\"--cfg\", \"from_file\"]\n",
         )
         .unwrap();
-        let mut command = Command::new("/nonexistent/toolchain/bin/cargo");
+        // A deliberately nonexistent executable: this query must be answered in-process.
+        let executable = dir.path().join("absent-query-tool");
+        let mut command = Command::new(&executable);
         command.current_dir(dir.path()).args([
             "-Z",
             "unstable-options",
