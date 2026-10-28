@@ -394,4 +394,28 @@ mod machine_tests {
         assert_eq!(setting(&no), Some(false));
         assert_eq!(setting(&target.isa("backtracking", false).unwrap()), Some(false));
     }
+
+    #[test]
+    fn a_named_cpu_preset_configures_the_x86_instruction_selector() {
+        let target = Target::parse("x86_64-unknown-linux-gnu").unwrap();
+        let options = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-cpu=haswell".to_owned(),
+        ]);
+        let isa = target.isa_for("backtracking", false, &options).unwrap();
+        let avx2 = isa.isa_flags().into_iter().find(|flag| flag.name == "has_avx2").unwrap();
+        assert_eq!(avx2.as_bool(), Some(true));
+        let baseline = target.isa("backtracking", false).unwrap();
+        let avx2 = baseline.isa_flags().into_iter().find(|flag| flag.name == "has_avx2").unwrap();
+        assert_eq!(avx2.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn opt_level_selects_real_backend_passes() {
+        let target = Target::parse("aarch64-unknown-linux-gnu").unwrap();
+        let options =
+            hir_ty::mir::codegen_options::TargetMachine::from_flags(&["-Copt-level=3".to_owned()]);
+        let optimized = target.isa_for("backtracking", false, &options).unwrap();
+        let baseline = target.isa("backtracking", false).unwrap();
+        assert_ne!(optimized.flags().opt_level(), baseline.flags().opt_level());
+    }
 }

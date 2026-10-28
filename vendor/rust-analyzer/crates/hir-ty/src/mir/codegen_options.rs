@@ -76,4 +76,17 @@ mod tests {
         assert_eq!(options.cpu.as_deref(), Some("apple-m1"));
         assert_eq!(options.llvm_features(), "+dotprod,+fp16,-lse");
     }
+
+    #[test]
+    fn profile_options_precede_flags_and_feature_dependencies_are_arch_specific() {
+        let flags = ["-Copt-level=0", "-C", "opt_level=3", "-Ctarget-feature=+avx2,-sse2"]
+            .map(str::to_owned);
+        let options = TargetMachine::from_flags(&flags);
+        assert_eq!(options.opt_level.as_deref(), Some("3"));
+        let x86 = options.effective_features("x86_64", ["sse2".to_owned()]);
+        assert!(!x86.contains("avx2") && !x86.contains("sse2"));
+        let options = TargetMachine::from_flags(&["-Ctarget-feature=+fp16".to_owned()]);
+        let arm = options.effective_features("aarch64", []);
+        assert!(arm.contains("fp16") && arm.contains("neon"));
+    }
 }

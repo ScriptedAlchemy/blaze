@@ -32,6 +32,7 @@ struct Inputs {
     directives: Vec<Vec<u8>>,
     paths: BTreeSet<PathBuf>,
     native: BTreeSet<PathBuf>,
+    bytes_only: BTreeSet<PathBuf>,
     search: BTreeSet<PathBuf>,
     cwd: PathBuf,
     opaque: bool,
@@ -294,6 +295,13 @@ impl Inputs {
                 })
                 .cloned(),
         );
+        self.bytes_only.extend(bytes_only);
+        self.bytes_only.extend(
+            self.paths
+                .iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "tbd"))
+                .cloned(),
+        );
     }
 }
 
@@ -372,6 +380,7 @@ impl Inputs {
                 &self.cwd,
                 &self.search,
                 self.native.contains(path),
+                !self.bytes_only.contains(path),
             )?;
         }
         Ok(hash.finalize().into())
@@ -390,6 +399,7 @@ fn hash_path(
     cwd: &Path,
     search: &BTreeSet<PathBuf>,
     script: bool,
+    inspect: bool,
 ) -> io::Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -404,7 +414,7 @@ fn hash_path(
         let target = fs::read_link(path)?;
         frame(hash, target.as_os_str().as_encoded_bytes());
         match path.canonicalize() {
-            Ok(target) => return hash_path(&target, hash, active, cwd, search, script),
+            Ok(target) => return hash_path(&target, hash, active, cwd, search, script, inspect),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 frame(hash, b"missing-target");
                 return Ok(());
@@ -440,7 +450,8 @@ fn hash_path(
                 // script, or a .so symlink may resolve to one. Binary archives/objects
                 // keep the single streaming pass and never allocate a whole-file buffer.
                 let binary = native_binary(bytes);
-                let textual = !binary
+                let textual = inspect
+                    && !binary
                     && (script
                         || path
                             .extension()
@@ -490,7 +501,7 @@ fn hash_path(
                 frame(hash, dependency.as_bytes());
                 for candidate in candidates {
                     frame(hash, candidate.as_os_str().as_encoded_bytes());
-                    hash_path(&candidate, hash, active, cwd, &dirs, true)?;
+                    hash_path(&candidate, hash, active, cwd, &dirs, true, true)?;
                 }
             }
         }
@@ -513,7 +524,7 @@ fn hash_path(
     frame(hash, &(entries.len() as u64).to_le_bytes());
     for entry in entries {
         frame(hash, entry.file_name().as_encoded_bytes());
-        hash_path(&entry.path(), hash, active, cwd, search, false)?;
+        hash_path(&entry.path(), hash, active, cwd, search, false, true)?;
     }
     active.remove(&real);
     Ok(())
@@ -756,7 +767,7 @@ mod tests {
     #[test]
     fn linker_maps_and_text_stubs_are_byte_inputs_not_dependency_scripts() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("exports.map"), "{ global: entry; local: *; };").unwrap();
+        fs::write(dir.path().join("exports.map"), "{ global: INPUT_entry; local: *; };").unwrap();
         fs::write(dir.path().join("libchoice.tbd"), "--- !tapi-tbd\nexports: []\n").unwrap();
         let mut inputs = Inputs::default();
         inputs.link_inputs(
