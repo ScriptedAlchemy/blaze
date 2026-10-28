@@ -111,10 +111,10 @@ CACHE = [
 # does not take, which it says as `error: ...` and ends 101 with, before running any test.
 REJECTS = {
     "a cached pass cannot hide an invalid color":
-        r"^error: argument for --color must be auto, always, or never \(was bogus\)$",
-    "a cached pass cannot hide a repeated flag": r"^error: Option 'quiet' given more than once$",
+        [r"^error: argument for --color must be auto, always, or never \(was bogus\)$"],
+    "a cached pass cannot hide a repeated flag": [r"^error: Option 'quiet' given more than once$"],
     "a cached pass cannot hide repeated thread options":
-        r"^error: Option 'test-threads' given more than once$",
+        [r"^error: Option 'test-threads' given more than once$"],
 }
 # What has to be said (-v) at a step, by its position in CACHE.
 SAYS = {
@@ -506,8 +506,16 @@ def self_test():
     for what, said in REJECTS.items():
         if what in by_name and by_name[what][5] != NONE:
             wrong.append(f"{what} expects a refusal but expects tests to run")
-        if not said.startswith(r"^error: ") or not said.endswith("$"):
-            wrong.append(f"{what}: the diagnostic is not libtest's whole `error: ...` line")
+        # One diagnostic line per step, and libtest's whole `error: ...` line: a bare string
+        # is read as one character a pattern, which is not what a run is held to.
+        if not isinstance(said, list) or not said:
+            wrong.append(f"{what}: the diagnostic is not a list of patterns")
+            continue
+        for it in said:
+            if not isinstance(it, str) or not it.startswith(r"^error: ") or not it.endswith("$"):
+                wrong.append(f"{what}: {it!r} is not libtest's whole `error: ...` line")
+            elif not re.compile(it):
+                wrong.append(f"{what}: {it!r} is not a pattern")
     for line in wrong:
         print("WRONG:", line)
     print("ok" if not wrong else f"{len(wrong)} wrong")
