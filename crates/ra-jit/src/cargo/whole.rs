@@ -1,4 +1,4 @@
-//! The cold build by blaze (docs/no-rustc.md, step K, #91): with `RA_JIT_WHOLE_BUILD=1`,
+//! The cold build by blaze (docs/no-rustc.md, step K, #91):
 //! `cargo blaze build` and `run` from nothing build each program of the build whole, every
 //! crate from source over the shipped standard library and linked by blaze (step G), and put
 //! it where cargo would. No `cargo build` runs, and what blaze cannot compile that the program
@@ -28,9 +28,6 @@ use super::{
     },
 };
 
-/// The setting that has a build from nothing be blaze's whole build.
-const VARIABLE: &str = "RA_JIT_WHOLE_BUILD";
-
 /// How many of the functions blaze could not compile a failed build names.
 const SHOWN: usize = 8;
 
@@ -38,10 +35,9 @@ const SHOWN: usize = 8;
 /// the programs a build picks by default or one named with `--bin` or `--example`, for one
 /// target at most.
 pub(super) fn asked_for(asked: &Invocation) -> bool {
-    let on = std::env::var_os(VARIABLE).is_some_and(|it| !it.is_empty() && it != "0");
     let flags = &asked.flags;
     let named = flags.bin.is_some() || flags.example.is_some();
-    on && matches!(asked.subcommand, Subcommand::Build | Subcommand::Run)
+    matches!(asked.subcommand, Subcommand::Build | Subcommand::Run)
         && (!flags.selects_targets || named)
         && !flags.cargos_plan
         && flags.targets.len() <= 1
@@ -81,7 +77,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
         let at = super::state::package_dir(package);
         say::status(
             asked.flags.quiet,
-            "Compiling",
+            "Building",
             &format!("{} v{} ({})", package.name, package.version, at.display()),
         );
     }

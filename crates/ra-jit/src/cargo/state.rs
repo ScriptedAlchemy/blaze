@@ -1196,6 +1196,15 @@ pub(super) fn metadata(asked: &Invocation) -> Metadata {
     super::metadata::no_deps(asked.flags.manifest_path.as_deref(), &asked.flags.config)
 }
 
+/// Program builds, cold or warm, use owned host producers and an owned whole
+/// app build. No wrapper state or earlier Cargo executable enters that path.
+pub(super) fn owned(asked: &Invocation) -> anyhow::Result<Option<i32>> {
+    if super::whole::asked_for(asked) {
+        return super::whole::build(asked);
+    }
+    Ok(None)
+}
+
 pub(super) fn package_dir(package: &Package) -> PathBuf {
     package.manifest_path.parent().map(|it| it.as_std_path().to_owned()).unwrap_or_default()
 }

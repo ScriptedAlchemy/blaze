@@ -233,6 +233,9 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     note("client start", CLIENT, crate::trace::began());
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
+    if let Some(code) = state::owned(asked)? {
+        return Ok(code);
+    }
     let key = asked.key(&cwd);
     let finished = |state: &State| {
         let took = started.elapsed().as_secs_f64();
@@ -269,11 +272,6 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             }
         }
         Err(unread) => {
-            if whole::asked_for(asked)
-                && let Some(code) = whole::build(asked)?
-            {
-                return Ok(code);
-            }
             if let Some(why) = unread {
                 say::cargo_builds(why, "building with cargo", say::COLD);
             }
