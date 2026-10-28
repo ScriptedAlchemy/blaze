@@ -6306,6 +6306,24 @@ enum Loaded {
     New,
 }
 
+fn hydrate_includes(
+    db: &mut RootDatabase,
+    tree: &mut tree::Tree,
+    files: &mut Vec<WatchedFile>,
+    mut resolve: impl FnMut(&RootDatabase),
+) -> Loaded {
+    let mut loaded = Loaded::Nothing;
+    loop {
+        resolve(db);
+        match WatchedFile::include_sources(files, tree, db) {
+            Loaded::Nothing => return loaded,
+            Loaded::AsRustcRead if loaded == Loaded::Nothing => loaded = Loaded::AsRustcRead,
+            Loaded::AsRustcRead => {}
+            Loaded::New => loaded = Loaded::New,
+        }
+    }
+}
+
 impl WatchedFile {
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
@@ -7482,11 +7500,14 @@ fn join(
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Vec<ide_db::base_db::Crate>, Loaded)> {
     let read_from = SystemTime::now();
+    let before = CratesAsLoaded::of(db);
     checkouts.add(&[project], db, tree.vfs(), owner, env, sharing)?;
     watch_loaded(db, tree, files, read_from);
-    Ok(())
+    let new = before.changed(db);
+    let loaded = hydrate_includes(db, tree, files, |db| resolve_names(db, &new));
+    Ok((new, loaded))
 }
 
 /// Watches the source files that were loaded since the last were, which were read from
@@ -8569,13 +8590,12 @@ fn run_holding(
         listed.touch(&db, None);
         served = frozen::serve(&mut db, &built);
     }
-    let mut resolved = resolve_crates(&db, &args, cores())?;
-    // Resolving the names finds the files `include!` names that were not loaded. With those
-    // in, there may be more.
-    while WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
+    let resolved = built.len();
+    if hydrate_includes(&mut db, &mut tree, &mut files, |db| resolve_all(db, &built, cores()))
+        != Loaded::Nothing
+    {
         // A crate listed beside cargo's build was listed without what they declare.
         listed.touch(&db, None);
-        resolved = resolve_crates(&db, &args, cores())?;
     }
     // A tests' program starts in ra-jit's harness, which what rustc linked does not have.
     let texts = harnesses(&db, [&args], None);
@@ -9066,6 +9086,9 @@ fn run_holding(
                             );
                             watch_loaded(&mut db, &mut tree, &mut files, read_from);
                             let new = before.changed(&db);
+                            let loaded = hydrate_includes(&mut db, &mut tree, &mut files, |db| {
+                                resolve_names(db, &new)
+                            });
                             eprintln!(
                                 "reload: {} crates are others in {:.1?}",
                                 new.len(),
@@ -9088,7 +9111,17 @@ fn run_holding(
                                 let again = program.start_over(&db, parts, linked, &new, &files);
                                 started = started.and(again);
                             }
-                            listed.touch(&db, Some(&new));
+                            match loaded {
+                                Loaded::Nothing => {}
+                                Loaded::AsRustcRead => {
+                                    programs.iter_mut().for_each(|it| it.known.touch_own(&db));
+                                }
+                                Loaded::New => {
+                                    programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+                                }
+                            }
+                            listed
+                                .touch(&db, (loaded == Loaded::Nothing).then_some(new.as_slice()));
                             lock(&as_built).clear();
                             if let Err(error) = reloaded.and(started) {
                                 // A script that another build holds is waited for here too:
@@ -9267,7 +9300,7 @@ fn run_holding(
                             eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
                             joined
                         }
-                        _ => Ok(()),
+                        _ => Ok((Vec::new(), Loaded::Nothing)),
                     };
                     // A script group of the joined checkout that another build holds is waited
                     // for: the checkout is not placed until it is loaded whole.
@@ -9299,7 +9332,25 @@ fn run_holding(
                     let mut known = Rejections::default();
                     known.patching = target.patch.is_some();
                     let loaded = joined
-                        .and_then(|()| target.args(&programs[0].args, &checkouts))
+                        .and_then(|(new, loaded)| {
+                            for program in &mut programs {
+                                if !new.is_empty() {
+                                    program.known.touch(&db, Some(&new));
+                                }
+                                match loaded {
+                                    Loaded::Nothing => {}
+                                    Loaded::AsRustcRead => program.known.touch_own(&db),
+                                    Loaded::New => program.known.touch(&db, None),
+                                }
+                            }
+                            if !new.is_empty() || loaded != Loaded::Nothing {
+                                listed.touch(
+                                    &db,
+                                    (loaded == Loaded::Nothing).then_some(new.as_slice()),
+                                );
+                            }
+                            target.args(&programs[0].args, &checkouts)
+                        })
                         .and_then(|args| {
                             // The symbols of a checkout are those of the one it shares
                             // packages with, which rustc built.
@@ -9555,8 +9606,11 @@ fn run_holding(
                 if !differences.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
                     let read_from = SystemTime::now();
+                    let before = CratesAsLoaded::of(&db);
                     checkouts.share(&mut db, tree.vfs(), differences)?;
                     watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                    let new = before.changed(&db);
+                    hydrate_includes(&mut db, &mut tree, &mut files, |db| resolve_names(db, &new));
                     for program in &mut programs {
                         let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
                         program.moved |= program.args.members != members;
@@ -10947,6 +11001,97 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_out_dir_reload_resolves_generated_declarations_and_nested_includes_in_one_turn() {
+        use test_fixture::WithFixture;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("out-a"), dir.path().join("out-b"));
+        for out in [&a, &b] {
+            std::fs::create_dir_all(out).unwrap();
+        }
+        std::fs::write(
+            a.join("generated.rs"),
+            "pub static LOGGER: u32 = 1; pub static RUNS: u32 = 1; pub struct FromA;",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("generated.rs"),
+            "pub static LOGGER: u32 = 2; include!(\"nested.rs\"); pub struct FromB;",
+        )
+        .unwrap();
+        std::fs::write(b.join("nested.rs"), "pub static RUNS: u32 = 2;").unwrap();
+        let (mut db, file) = RootDatabase::with_single_file(
+            r#"
+//- /main.rs crate:logger
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+fn main() { let _ = LOGGER + RUNS; }
+"#,
+        );
+        let file = file.file_id(&db);
+        let path = dir.path().join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = db.file_text(file).text(&db).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let at = VfsPath::from(AbsPathBuf::assert_utf8(path.clone()));
+        let mut vfs = Vfs::default();
+        vfs.set_file_contents(at.clone(), Some(text.into_bytes()));
+        assert_eq!(vfs.file_id(&at).unwrap().0, file);
+        let mut root = vfs::file_set::FileSet::default();
+        root.insert(file, at);
+        let mut change = ChangeWithProcMacros::default();
+        change.set_roots(vec![ide_db::base_db::SourceRoot::new_local(root)]);
+        db.apply_change(change);
+        let krate = ide_db::base_db::all_crates(&db)[0];
+        let env_for = |out: &Path| {
+            ide_db::base_db::Env::from_iter([(
+                "OUT_DIR".to_owned(),
+                out.to_str().unwrap().to_owned(),
+            )])
+        };
+        db.set_env(krate, env_for(&a));
+        let mut files = WatchedFile::sources(&vfs, &db, SystemTime::now());
+        let mut tree = tree::Tree::new(&db, vfs, &[(file, &path)]);
+        let declarations = |db: &RootDatabase| {
+            hir::attach_db(db, || {
+                hir::Crate::from(krate)
+                    .root_module(db)
+                    .declarations(db)
+                    .into_iter()
+                    .filter_map(|it| it.name(db))
+                    .map(|it| it.display(db, syntax::Edition::CURRENT).to_string())
+                    .collect::<BTreeSet<_>>()
+            })
+        };
+        hydrate_includes(&mut db, &mut tree, &mut files, |db| resolve_names(db, &[krate]));
+        let initial = declarations(&db);
+        for name in ["LOGGER", "RUNS", "FromA"] {
+            assert!(initial.contains(name), "initial declaration {name}");
+        }
+        let before = CratesAsLoaded::of(&db);
+        db.set_env(krate, env_for(&b));
+        let new = before.changed(&db);
+        assert_eq!(new, [krate]);
+        resolve_names(&db, &new);
+        let unhydrated = declarations(&db);
+        assert!(!unhydrated.contains("LOGGER"));
+        assert!(!unhydrated.contains("RUNS"));
+
+        let loaded = hydrate_includes(&mut db, &mut tree, &mut files, |db| resolve_names(db, &new));
+        assert!(loaded == Loaded::New);
+        let reloaded = declarations(&db);
+        for name in ["LOGGER", "RUNS", "FromB"] {
+            assert!(reloaded.contains(name), "reloaded declaration {name}");
+        }
+        assert!(!reloaded.contains("FromA"));
+    }
 
     #[test]
     fn settled_noop_requires_the_artifacts_this_publication_wrote() {
