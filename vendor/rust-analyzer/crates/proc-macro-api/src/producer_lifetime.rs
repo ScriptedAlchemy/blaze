@@ -11,6 +11,9 @@ use std::{
 const MARKER: &str = ".blaze-producer-generation";
 const LEASE: &str = ".blaze-producer-lease";
 const FORMAT: &str = "blaze producer generation 1\n";
+const INVALID: &str = ".blaze-producer-invalid";
+const PENDING: &str = ".blaze-producer-pending-";
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn ordinary(path: &Path) -> io::Result<()> {
     // Check the owned path and its parent, not platform aliases such as /var -> /private/var.
@@ -40,19 +43,57 @@ pub fn lease(generation: &Path) -> io::Result<File> {
     let root = generation.parent().ok_or_else(|| io::Error::other("producer without root"))?;
     let _root = locked_root(root)?;
     ordinary(generation)?;
-    let created = match std::fs::create_dir(generation) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-        Err(error) => return Err(error),
-    };
+    if !generation.exists() {
+        let pending = root.join(format!(
+            "{PENDING}{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&pending)?;
+        // Only a complete marker and lease are ever published under the content id.
+        // A crash leaves a pending directory that collection can reclaim under this lock.
+        let published = (|| {
+            let mut marker =
+                File::options().write(true).create_new(true).open(pending.join(MARKER))?;
+            marker.write_all(FORMAT.as_bytes())?;
+            marker.sync_all()?;
+            File::options().write(true).create_new(true).open(pending.join(LEASE))?;
+            std::fs::rename(&pending, generation)
+        })();
+        if published.is_err() {
+            let _ = std::fs::remove_dir_all(&pending);
+        }
+        published?;
+    } else if generation
+        .file_name()
+        .and_then(|it| it.to_str())
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        && std::fs::read_dir(generation)?.next().is_none()
+    {
+        // Recover an empty content-id directory left by the older non-atomic lease.
+        std::fs::remove_dir(generation)?;
+        drop(_root);
+        return lease(generation);
+    }
     ordinary(&generation.join(MARKER))?;
     ordinary(&generation.join(LEASE))?;
-    if created {
-        let mut marker =
-            File::options().write(true).create_new(true).open(generation.join(MARKER))?;
-        marker.write_all(FORMAT.as_bytes())?;
-    } else if std::fs::read_to_string(generation.join(MARKER))? != FORMAT {
+    if std::fs::read_to_string(generation.join(MARKER))? != FORMAT {
         return Err(io::Error::other("unrecognized producer generation"));
+    }
+    ordinary(&generation.join(INVALID))?;
+    if generation.join(INVALID).try_exists()? {
+        // Retain OUT_DIR paths of older consumers. Retry is possible when they retire.
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(generation.join(LEASE))?;
+        lock.try_lock()
+            .map_err(|_| io::Error::other("invalid producer generation still leased"))?;
+        std::fs::remove_dir_all(generation)?;
+        drop(_root);
+        return lease(generation);
     }
     let lock = File::options()
         .read(true)
@@ -62,6 +103,14 @@ pub fn lease(generation: &Path) -> io::Result<File> {
         .open(generation.join(LEASE))?;
     lock.lock_shared()?;
     Ok(lock)
+}
+
+/// A failed build keeps its directory for live OUT_DIR consumers, but it is never reused.
+pub fn invalidate(generation: &Path) -> io::Result<()> {
+    let _root = locked_root(generation.parent().ok_or_else(|| io::Error::other("no root"))?)?;
+    ordinary(&generation.join(INVALID))?;
+    File::options().write(true).create(true).truncate(false).open(generation.join(INVALID))?;
+    Ok(())
 }
 
 pub(crate) fn lease_for_library(library: &Path) -> io::Result<Option<File>> {
@@ -81,22 +130,46 @@ pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
     }
     let _root = locked_root(root)?;
     for entry in std::fs::read_dir(root)? {
-        let generation = entry?.path();
+        let generation = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                eprintln!("macro producers: skipped collection entry: {error}");
+                continue;
+            }
+        };
+        let pending = generation
+            .file_name()
+            .and_then(|it| it.to_str())
+            .is_some_and(|name| name.starts_with(PENDING));
         if generation == current
             || ordinary(&generation).is_err()
             || !generation.is_dir()
-            || std::fs::read_to_string(generation.join(MARKER)).ok().as_deref() != Some(FORMAT)
+            || !pending
+                && std::fs::read_to_string(generation.join(MARKER)).ok().as_deref() != Some(FORMAT)
         {
             continue;
         }
-        ordinary(&generation.join(MARKER))?;
-        ordinary(&generation.join(LEASE))?;
-        let lock = File::options().read(true).write(true).open(generation.join(LEASE))?;
-        if lock.try_lock().is_err() {
-            continue;
+        let remove = (|| {
+            ordinary(&generation.join(MARKER))?;
+            ordinary(&generation.join(LEASE))?;
+            // A complete old marker without a lease is unleased, not a fatal GC error.
+            let lock = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(generation.join(LEASE))?;
+            if lock.try_lock().is_err() {
+                return Ok(false);
+            }
+            std::fs::remove_dir_all(&generation)?;
+            Ok::<_, io::Error>(true)
+        })();
+        match remove {
+            Ok(true) => removed.push(generation),
+            Ok(false) => {}
+            Err(error) => eprintln!("macro producers: skipped {}: {error}", generation.display()),
         }
-        std::fs::remove_dir_all(&generation)?;
-        removed.push(generation);
     }
     Ok(removed)
 }
@@ -104,6 +177,37 @@ pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_claims_and_collection_are_recoverable() {
+        let root = stdx::tempfile::NamedTempDir::new("producer-crash").unwrap();
+        let bare = root.path().join("a".repeat(64));
+        std::fs::create_dir(&bare).unwrap();
+        let held = lease(&bare).unwrap();
+        assert_eq!(std::fs::read_to_string(bare.join(MARKER)).unwrap(), FORMAT);
+        let pending = root.path().join(format!("{PENDING}crashed"));
+        std::fs::create_dir(&pending).unwrap();
+        let marker_only = root.path().join("marker-only");
+        std::fs::create_dir(&marker_only).unwrap();
+        std::fs::write(marker_only.join(MARKER), FORMAT).unwrap();
+        let malformed = root.path().join("malformed-lease");
+        std::fs::create_dir(&malformed).unwrap();
+        std::fs::write(malformed.join(MARKER), FORMAT).unwrap();
+        std::fs::create_dir(malformed.join(LEASE)).unwrap();
+        let healthy = root.path().join("healthy");
+        drop(lease(&healthy).unwrap());
+        let removed = collect(root.path(), &bare).unwrap();
+        assert!(removed.contains(&pending) && removed.contains(&marker_only));
+        assert!(removed.contains(&healthy), "one bad entry must not stop collection");
+        assert!(collect(root.path(), &bare).unwrap().is_empty());
+        invalidate(&bare).unwrap();
+        assert!(lease(&bare).is_err(), "live invalid OUT_DIR must not be deleted");
+        drop(held);
+        let recovered = lease(&bare).unwrap();
+        assert!(!bare.join(INVALID).exists());
+        drop(recovered);
+        assert_eq!(collect(root.path(), &root.path().join("current")).unwrap(), [bare]);
+    }
 
     #[test]
     fn collector_keeps_live_generations_and_foreign_directories() {

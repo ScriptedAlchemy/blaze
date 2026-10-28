@@ -13,6 +13,56 @@ use std::{
 use crate::{MacroDylib, ProcMacroClient, ServerError, process::ProcessExit};
 
 struct ExitCounter(Arc<AtomicUsize>);
+
+#[test]
+fn poisoned_epochs_report_exit_without_waiting() {
+    let path = paths::AbsPathBuf::assert_utf8(std::env::temp_dir().join("poison-test-server"));
+    let client = ProcMacroClient::with_generation_io_channels(
+        &path,
+        |_| {
+            let (client, server) = UnixStream::pair()?;
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(server.try_clone().unwrap());
+                let mut writer = server;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) != 0 {
+                    writeln!(
+                        writer,
+                        "{}",
+                        serde_json::to_string(
+                            &crate::legacy_protocol::msg::Response::ApiVersionCheck(0),
+                        )
+                        .unwrap()
+                    )
+                    .unwrap();
+                    line.clear();
+                }
+            });
+            Ok((
+                Box::new(ExitCounter(Arc::new(AtomicUsize::new(1)))),
+                Box::new(client.try_clone()?),
+                Box::new(BufReader::new(client)),
+            ))
+        },
+        None,
+        1,
+    )
+    .unwrap();
+    let held = client.epochs.lock().unwrap();
+    assert!(client.exited().is_none(), "contended health polling stays nonblocking");
+    drop(held);
+    let epochs = client.epochs.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _held = epochs.lock().unwrap();
+            panic!("simulate load panic");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(client.exited().unwrap().message.contains("poisoned"));
+}
+
 impl ProcessExit for ExitCounter {
     fn exit_err(&mut self) -> Option<ServerError> {
         None

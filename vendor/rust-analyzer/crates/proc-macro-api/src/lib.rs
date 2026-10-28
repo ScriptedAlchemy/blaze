@@ -405,13 +405,17 @@ impl ProcMacroClient {
 
     /// Checks if the proc-macro server has exited.
     pub fn exited(&self) -> Option<ServerError> {
-        self.epochs
-            .try_lock()
-            .ok()?
-            .live
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find_map(|pool| pool.exited().cloned())
+        let epochs = match self.epochs.try_lock() {
+            Ok(epochs) => epochs,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some(ServerError {
+                    message: "proc-macro epoch state poisoned".into(),
+                    io: None,
+                });
+            }
+        };
+        epochs.live.iter().filter_map(Weak::upgrade).find_map(|pool| pool.exited().cloned())
     }
 }
 

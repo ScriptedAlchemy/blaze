@@ -291,6 +291,27 @@ impl Generation {
     pub(crate) fn collect(&self) -> std::io::Result<Vec<PathBuf>> {
         load_cargo::proc_macro_producer_lifetime::collect(self.path.parent().unwrap(), &self.path)
     }
+
+    pub(crate) fn verify(
+        &self,
+        workspace: &ProjectWorkspace,
+        config: &CargoConfig,
+    ) -> anyhow::Result<()> {
+        let expected = self.path.file_name().unwrap().to_str().unwrap();
+        match generation(workspace, config) {
+            Ok(Some(actual)) if actual == expected => Ok(()),
+            result => {
+                load_cargo::proc_macro_producer_lifetime::invalidate(&self.path)?;
+                match result {
+                    Err(error) => Err(error)
+                        .context("macro producer changed or became unreadable during build"),
+                    _ => {
+                        anyhow::bail!("macro producer changed during build; generation invalidated")
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Follow actual symlink input bytes, with an active-directory cycle check. A broken link,

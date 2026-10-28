@@ -3419,7 +3419,16 @@ fn workspace_at(
                 {
                     seed_own_target(cargo.target_directory().as_ref());
                 }
-                workspace.run_build_scripts(cargo_config, &|_| {})?
+                if let Some(generation) = &generation {
+                    generation.verify(&workspace, cargo_config)?;
+                }
+                let built = workspace.run_build_scripts(cargo_config, &|_| {});
+                // Validate even an unsuccessful build: partial cargo outputs cannot certify
+                // a generation after the source it was keyed by changed.
+                if let Some(generation) = &generation {
+                    generation.verify(&workspace, cargo_config)?;
+                }
+                built?
             }
         };
         // A crate whose script did not run is read without what it writes: thiserror's
@@ -11842,6 +11851,23 @@ fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
     .err()
     .expect("streamed artifact must also fail closed");
     assert!(format!("{error:#}").contains("no matching producer record"));
+    // A producer operation that completes after an edit must invalidate its output id.
+    let manifest =
+        ProjectManifest::discover_single(&AbsPathBuf::assert_utf8(project.clone())).unwrap();
+    let workspace = ProjectWorkspace::load(manifest, &config, &|_| {}).unwrap();
+    let mut build_config = config.clone();
+    let generation =
+        macro_inputs::Generation::prepare(&workspace, &mut build_config).unwrap().unwrap();
+    let generation_path = generation.path().to_owned();
+    std::fs::write(generation_path.join("compiled-during-edit"), b"untrusted output").unwrap();
+    std::fs::write(&source, &original).unwrap();
+    assert!(generation.verify(&workspace, &build_config).is_err());
+    std::fs::write(&source, &replacement).unwrap();
+    assert!(macro_inputs::Generation::prepare(&workspace, &mut build_config).is_err());
+    drop(generation);
+    let clean = macro_inputs::Generation::prepare(&workspace, &mut build_config).unwrap().unwrap();
+    assert!(!clean.path().join("compiled-during-edit").exists());
+    drop(clean);
     // A build straddling an edit must not publish even a fresh:false message for the new id.
     let edited = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
     std::fs::write(&source, &original).unwrap();
