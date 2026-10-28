@@ -142,12 +142,30 @@ nothing is handed to cargo:
     error: `kuses` can reach functions blaze could not compile, so it is not built:
       `khalf::halved`: unsupported: f16 and f128
 
-Build scripts and proc macros are still built and run as the daemon's load does
-(`target/rust-analyzer`). A build of libraries alone and `test` are as without the setting.
+Build scripts are compiled and run by blaze itself (`crates/ra-jit/src/scripts.rs`), with
+no cargo and no rustc: each script and its build dependencies are compiled by blaze from source,
+and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the environment cargo
+1.99 gives it. A build whose graph has a proc macro still has the daemon's load build it with
+cargo's check (`target/rust-analyzer`), which then runs the scripts too (no-rustc step J). A script runs again when cargo 1.99 would run it: for a file it named
+with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
+every build), for a variable it named whose value is another (unset, empty and set are three), for
+any file of its package when it named nothing, for a change to the script, its modules or a
+package it is built with (a file, or a variable `env!` or `option_env!` read there), for the
+output of its last run being gone, and once more for having said other than it did the run before.
+It is run once for a build, with the variables of the process that asks; two builds at once are two. `harness/scriptedits.py` holds
+that to cargo ([harness.md](harness.md)). A build of libraries alone and `test` are as without the
+setting.
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which builds what was
 edited since on what it loaded and links the programs again; a changed manifest or lock file
-has a new worker load the workspace.
+has a new worker load the workspace. Each build links its programs into a directory of its own
+under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
+checkout of it, so a build with other features, another profile, another target or other
+flags is the program cargo would have built, not the one another build linked before.
+The worker resolves the build from the original invocation directory, including relative
+`--manifest-path` arguments, not from the workspace root. These linked directories stay until
+the target directory is cleaned while no build uses it; a directory's age does not say whether
+another client is still reading or placing its output.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit

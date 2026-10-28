@@ -405,6 +405,8 @@ pub struct CrateData<Id> {
     /// Extra crate-level attributes, including the surrounding `#![]`.
     pub crate_attrs: Box<[Box<str>]>,
     pub target_kind: TargetKind,
+    /// Effective compiler flags, separate from cfgs and macro environment.
+    pub codegen_flags: Vec<String>,
     /// The working directory to run proc-macros in invoked in the context of this crate.
     /// This is the workspace root of the cargo workspace for workspace members, the crate manifest
     /// dir otherwise.
@@ -610,6 +612,7 @@ impl CrateGraphBuilder {
                 origin,
                 crate_attrs: crate_attrs.into_boxed_slice(),
                 target_kind,
+                codegen_flags: Vec::new(),
                 proc_macro_cwd,
             },
             extra: ExtraCrateData { version, display_name, potential_cfg_options },
@@ -639,6 +642,10 @@ impl CrateGraphBuilder {
 
         self.arena[from].basic.dependencies.push(dep);
         Ok(())
+    }
+
+    pub fn set_codegen_flags(&mut self, krate: CrateBuilderId, flags: Vec<String>) {
+        self.arena[krate].basic.codegen_flags = flags;
     }
 
     pub fn set_in_db(self, db: &mut dyn SourceDatabase) -> CratesIdMap {
@@ -708,6 +715,7 @@ impl CrateGraphBuilder {
                 dependencies,
                 edition: krate.basic.edition,
                 target_kind: krate.basic.target_kind,
+                codegen_flags: krate.basic.codegen_flags.clone(),
                 origin: krate.basic.origin.clone(),
                 crate_attrs: krate.basic.crate_attrs.clone(),
                 root_file_id: krate.basic.root_file_id,

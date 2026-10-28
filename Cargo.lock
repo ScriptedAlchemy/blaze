@@ -663,6 +663,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-dist"
+version = "0.1.0"
+dependencies = [
+ "blaze-wire",
+]
+
+[[package]]
+name = "blaze-dist-local"
+version = "0.1.0"
+dependencies = [
+ "blaze-dist",
+ "blaze-wire",
+]
+
+[[package]]
 name = "blaze-manifest"
 version = "0.1.0"
 dependencies = [
@@ -2052,9 +2067,11 @@ dependencies = [
  "cranelift-module",
  "cranelift-object",
  "either",
+ "hir",
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "ide-db",
  "indexmap",
  "inkwell",
  "intern",
@@ -2079,6 +2096,7 @@ dependencies = [
  "stdx",
  "syntax",
  "target-lexicon",
+ "test-fixture",
  "tracing",
  "triomphe",
  "wasm-encoder",
@@ -3474,6 +3492,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
+ "blaze-build-script",
  "blaze-manifest",
  "blaze-metadata",
  "blaze-serve",

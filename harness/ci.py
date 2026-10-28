@@ -43,6 +43,8 @@ HARNESSES = [
     ("core", ["wholeprogram.py"], {}, on("linux", "macos"), 2),
     # `cargo blaze build` from nothing with RA_JIT_WHOLE_BUILD=1: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux", "macos"), 2),
+    # A build script rerun across edits in that whole build as cargo 1.99 reruns it: 34 probes.
+    ("core", ["scriptedits.py"], {}, on("linux"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
@@ -103,6 +105,9 @@ HARNESSES = [
     ("store", ["storeguards.py"], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
+    # The D0 export round trip's oracle: rustc builds the exported fixture's source, and the
+    # program assembled from the imported entries has to agree with it (crates/hir-ty-codegen).
+    ("store", ["d0export.py"], {}, on("linux", "macos"), 2),
     ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
     # MinIO as one program in ~/s3tools, which CI puts there on Linux.

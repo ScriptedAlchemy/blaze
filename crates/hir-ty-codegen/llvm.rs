@@ -207,7 +207,7 @@ fn compiled(
     let defined: Vec<Defined<'_>> = std::iter::zip(&names, defined)
         .map(|(&name, defined)| Defined { name, ..defined })
         .collect();
-    Machine::with(optimization, |context, machine| {
+    Machine::with_options(optimization, &recorder.machine, |context, machine| {
         let module = context.create_module("ra-jit");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
@@ -900,7 +900,7 @@ impl Optimization {
 #[derive(Default)]
 struct Machine {
     // Before the context, which has to outlive them.
-    machines: FxHashMap<Optimization, TargetMachine>,
+    machines: FxHashMap<(Optimization, hir_ty::mir::codegen_options::TargetMachine), TargetMachine>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -915,6 +915,14 @@ impl Machine {
         optimization: Optimization,
         work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
+        Self::with_options(optimization, &Default::default(), work)
+    }
+
+    fn with_options<T>(
+        optimization: Optimization,
+        options: &hir_ty::mir::codegen_options::TargetMachine,
+        work: impl FnOnce(&Context, &TargetMachine) -> Result<T, Unhandled>,
+    ) -> Result<T, Unhandled> {
         thread_local! {
             static MACHINE: RefCell<Machine> = RefCell::default();
         }
@@ -923,15 +931,18 @@ impl Machine {
                 *this = Machine::default();
             }
             this.modules += 1;
-            let machine = match this.machines.entry(optimization) {
+            let machine = match this.machines.entry((optimization, options.clone())) {
                 Entry::Occupied(known) => known.into_mut(),
-                Entry::Vacant(slot) => slot.insert(Self::create(optimization)?),
+                Entry::Vacant(slot) => slot.insert(Self::create(optimization, options)?),
             };
             work(this.context.get_or_insert_with(Context::create), machine)
         })
     }
 
-    fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+    fn create(
+        optimization: Optimization,
+        options: &hir_ty::mir::codegen_options::TargetMachine,
+    ) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
         set_options(emitted.arch);
         match emitted.arch {
@@ -941,6 +952,18 @@ impl Machine {
             Arch::Wasm32 => return Err(Unhandled::Llvm("no LLVM producer for wasm32".to_owned())),
         }
         let name = emitted.triple();
+        let cpu = match options.cpu.as_deref() {
+            Some("native") => TargetMachine::get_host_cpu_name().to_string_lossy().into_owned(),
+            Some(cpu) => cpu.to_owned(),
+            None => emitted.cpu().to_owned(),
+        };
+        let features = match options.cpu.as_deref() {
+            Some("native") => {
+                let host = TargetMachine::get_host_cpu_features().to_string_lossy().into_owned();
+                format!("{host},{}", options.llvm_features())
+            }
+            _ => options.llvm_features(),
+        };
         let triple = TargetTriple::create(name);
         let target = Target::from_triple(&triple)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
@@ -949,8 +972,8 @@ impl Machine {
         target
             .create_target_machine(
                 &triple,
-                emitted.cpu(),
-                "",
+                &cpu,
+                &features,
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,
@@ -1254,7 +1277,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
 
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(optimization, &Default::default()).unwrap();
         let pipeline = optimization.pipeline().unwrap();
         module.run_passes(pipeline, &machine, PassBuilderOptions::create()).unwrap();
         module.run_passes("elim-avail-extern", &machine, PassBuilderOptions::create()).unwrap();
@@ -1316,7 +1339,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
 
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(optimization, &Default::default()).unwrap();
         let pipeline = optimization.pipeline().unwrap();
         module.run_passes(pipeline, &machine, PassBuilderOptions::create()).unwrap();
         module.run_passes("elim-avail-extern", &machine, PassBuilderOptions::create()).unwrap();
@@ -1495,7 +1518,7 @@ attributes #0 = { alwaysinline }
     fn instruction_combining_short_of_a_fixpoint_does_not_abort() {
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(optimization, &Default::default()).unwrap();
         let context = Context::create();
         // LLVM reads to a nul.
         let text = format!("{SHORT_OF_A_FIXPOINT}\0");

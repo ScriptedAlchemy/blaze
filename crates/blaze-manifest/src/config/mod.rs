@@ -258,6 +258,7 @@ pub struct Config {
     build_config: OnceCell<CargoBuildConfig>,
     target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     warnings: RefCell<Vec<String>>,
+    sources: RefCell<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 impl Config {
@@ -279,9 +280,15 @@ impl Config {
             build_config: OnceCell::new(),
             target_cfgs: OnceCell::new(),
             warnings: RefCell::new(Vec::new()),
+            sources: RefCell::new(Vec::new()),
         };
         config.merge_cli_args(cli)?;
         Ok(config)
+    }
+
+    /// Configuration source bytes used by this invocation, including included files.
+    pub fn sources(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.sources.borrow().clone()
     }
 
     /// What `cargo <command>` does with its configuration on start, with `--config` arguments
@@ -389,6 +396,7 @@ impl Config {
         }
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
+        self.sources.borrow_mut().push((path.to_owned(), contents.as_bytes().to_vec()));
         let toml: toml::Table = contents.parse().with_context(|| {
             format!("could not parse TOML configuration in `{}`", path.display())
         })?;

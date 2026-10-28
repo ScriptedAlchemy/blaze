@@ -365,6 +365,8 @@ pub(super) struct Recorder<'db> {
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
     pub(super) isa: &'static dyn TargetIsa,
+    /// Captured from the crate input for this compile; detached tiers retain it too.
+    pub(super) machine: hir_ty::mir::codegen_options::TargetMachine,
     pub(super) requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -379,6 +381,7 @@ impl Wants {
     pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
         Wants {
             isa,
+            machine: Default::default(),
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -389,6 +392,11 @@ impl Wants {
 
     pub(super) fn into_requests(self) -> Requests {
         self.requests
+    }
+
+    #[cfg(test)]
+    fn moved_machine(self) -> hir_ty::mir::codegen_options::TargetMachine {
+        self.machine
     }
 
     /// The bytes of each data object asked for so far that is read-only and points nowhere,
@@ -646,6 +654,24 @@ impl Wants {
     }
 }
 
+#[cfg(test)]
+mod machine_transport_tests {
+    use super::*;
+
+    #[test]
+    fn wants_owns_the_machine_retained_when_the_recorder_is_detached() {
+        let isa = super::super::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        let machine = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-feature=+lse".to_owned(),
+            "-Ctarget-cpu=generic".to_owned(),
+            "-Copt-level=3".to_owned(),
+        ]);
+        wants.machine = machine.clone();
+        assert_eq!(wants.moved_machine(), machine);
+    }
+}
+
 impl<'db> std::ops::Deref for Recorder<'db> {
     type Target = Wants;
 
@@ -661,6 +687,12 @@ impl<'db> std::ops::DerefMut for Recorder<'db> {
 }
 
 impl<'db> Recorder<'db> {
+    /// Recorder dereferences to Wants, so the machine is already carried by detach.
+    /// Set it explicitly to make that producer/tier transport unambiguous.
+    pub(super) fn set_machine(&mut self, machine: hir_ty::mir::codegen_options::TargetMachine) {
+        self.wants.machine = machine;
+    }
+
     /// The stack slots that hold a local written with a name.
     pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
         self.named.iter().map(|it| it.slot)

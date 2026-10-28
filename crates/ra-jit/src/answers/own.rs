@@ -98,6 +98,7 @@ struct Given<'a> {
     unstable_options: bool,
     from_stdin: bool,
     extra_filename: bool,
+    target_features: Vec<&'a str>,
 }
 
 /// The flags that take a value and change no answer.
@@ -160,6 +161,11 @@ fn yes(value: Option<&str>) -> Option<bool> {
 
 impl<'a> Given<'a> {
     fn of(args: &'a [&'a str]) -> Option<Given<'a>> {
+        let flag_sensitive = args.iter().enumerate().any(|(at, word)| {
+            word.strip_prefix("--print=")
+                .or_else(|| (*word == "--print").then(|| args.get(at + 1).copied()).flatten())
+                .is_some_and(|kind| matches!(kind, "cfg" | "check-cfg"))
+        });
         let mut given = Given::default();
         let mut words = args.iter().copied();
         while let Some(word) = words.next() {
@@ -194,13 +200,18 @@ impl<'a> Given<'a> {
                         "debug-assertions" => given.debug_assertions = Some(yes(value)?),
                         "overflow-checks" => given.overflow_checks = Some(yes(value)?),
                         "panic" => given.panic = Some(value?),
+                        "target-feature" => given.target_features.push(value?),
                         "extra-filename" => given.extra_filename = true,
                         name if IGNORED_CODEGEN.contains(&name) => {}
+                        // CPU, relocation and instrumentation do not affect a path or
+                        // target-spec print. Do not pretend their cfg effects are known.
+                        _ if !flag_sensitive => {}
                         _ => return None,
                     }
                 }
                 "-Z" => match value()? {
                     "unstable-options" => given.unstable_options = true,
+                    _ if !flag_sensitive => {}
                     _ => return None,
                 },
                 _ if LINTS.contains(&flag) || IGNORED_VALUED.contains(&flag) => {
@@ -217,6 +228,109 @@ impl<'a> Given<'a> {
     fn debug_assertions(&self) -> bool {
         self.debug_assertions.unwrap_or(matches!(self.opt_level, None | Some("0")))
     }
+}
+
+pub(super) fn flag_sensitive(args: &[OsString]) -> bool {
+    args.iter().enumerate().any(|(at, arg)| {
+        arg.to_str()
+            .and_then(|word| {
+                word.strip_prefix("--print=")
+                    .or_else(|| (word == "--print").then(|| args.get(at + 1)?.to_str()).flatten())
+            })
+            .is_some_and(|kind| matches!(kind, "cfg" | "check-cfg"))
+    })
+}
+
+/// The built-in cfgs of `target`, without running a compiler. Unlike a general query,
+/// this asks for neither version output nor a target specification, so an SDK or version
+/// override does not invalidate the answer. Build dependencies need the host's cfgs even
+/// when their workspace was loaded for another target.
+pub(crate) fn target_cfg(
+    sysroot: &Path,
+    target: &str,
+    env: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let nightly = match env.get("RUSTC_BOOTSTRAP").map(String::as_str) {
+        None => false,
+        Some("1") => true,
+        Some(_) => return None,
+    };
+    let toolchain = Toolchain::of(&sysroot.join("bin/rustc"))?;
+    let target = toolchain.release.targets.get(target)?;
+    let given = Given { opt_level: Some("2"), ..Given::default() };
+    cfgs(target, &given, nightly)
+}
+
+pub(super) fn host_tuple(rustc: &Path) -> Option<String> {
+    Some(Toolchain::of(rustc)?.host)
+}
+
+/// Cargo's release version from the installed channel manifest, not from executing it.
+pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
+    let toolchain = Toolchain::of(rustc)?;
+    let manifest = std::fs::read_to_string(
+        toolchain.sysroot.join("lib/rustlib/multirust-channel-manifest.toml"),
+    )
+    .ok()?;
+    let (_, rest) = manifest.split_once("\n[pkg.cargo]\nversion = \"")?;
+    let (version, _) = rest.split_once('"')?;
+    // Cargo's package version (0.100.0) differs from its release version (1.99.0).
+    // The channel's rustc release supplies that prefix; Cargo supplies its own commit/date.
+    let release = toolchain.release.version.split_whitespace().next()?;
+    let (_, commit) = version.split_once(' ')?;
+    Some(format!("cargo {release} {commit}\n").into_bytes())
+}
+
+fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {
+    let mut cfgs = target.cfg.clone();
+    if !given.target_features.is_empty() {
+        let arch = cfgs.iter().find_map(|cfg| cfg.strip_prefix("target_arch=\""))?;
+        let arch = arch.trim_end_matches('"').to_owned();
+        let initial = cfgs
+            .iter()
+            .filter_map(|cfg| cfg.strip_prefix("target_feature=\""))
+            .map(|name| name.trim_end_matches('"').to_owned())
+            .collect::<Vec<_>>();
+        let flags = given
+            .target_features
+            .iter()
+            .map(|flags| format!("-Ctarget-feature={flags}"))
+            .collect::<Vec<_>>();
+        let features = hir_ty::mir::codegen_options::TargetMachine::from_flags(&flags)
+            .effective_features(&arch, initial);
+        cfgs.retain(|cfg| !cfg.starts_with("target_feature="));
+        cfgs.extend(features.into_iter().map(|feature| format!("target_feature={feature:?}")));
+    }
+    if nightly {
+        cfgs.extend(target.nightly_cfg.iter().cloned());
+    }
+    let debug_assertions = given.debug_assertions();
+    if debug_assertions {
+        cfgs.push("debug_assertions".to_owned());
+    }
+    if nightly && given.overflow_checks.unwrap_or(debug_assertions) {
+        cfgs.push("overflow_checks".to_owned());
+    }
+    if nightly && debug_assertions {
+        cfgs.push("ub_checks".to_owned());
+    }
+    let panic = given.panic.unwrap_or(&target.panic);
+    if panic != target.panic && panic != "abort" {
+        return None;
+    }
+    cfgs.push(format!("panic=\"{panic}\""));
+    if given.crate_types.contains(&"proc-macro") {
+        cfgs.push("proc_macro".to_owned());
+    }
+    for cfg in &given.cfgs {
+        if !is_plain_cfg(cfg) {
+            return None;
+        }
+        cfgs.push((*cfg).to_owned());
+    }
+    cfgs.sort();
+    cfgs.dedup();
+    Some(cfgs)
 }
 
 /// The variables rustc reads for a question that ra-jit answers only when unset.
@@ -344,36 +458,7 @@ pub(super) fn answer(
                 }
             }
             "cfg" => {
-                let mut cfgs: Vec<String> = target.cfg.clone();
-                if nightly {
-                    cfgs.extend(target.nightly_cfg.iter().cloned());
-                }
-                let debug_assertions = given.debug_assertions();
-                if debug_assertions {
-                    cfgs.push("debug_assertions".to_owned());
-                }
-                if nightly && given.overflow_checks.unwrap_or(debug_assertions) {
-                    cfgs.push("overflow_checks".to_owned());
-                }
-                if nightly && debug_assertions {
-                    cfgs.push("ub_checks".to_owned());
-                }
-                let panic = given.panic.unwrap_or(&target.panic);
-                if panic != target.panic && panic != "abort" {
-                    return None;
-                }
-                cfgs.push(format!("panic=\"{panic}\""));
-                if given.crate_types.contains(&"proc-macro") {
-                    cfgs.push("proc_macro".to_owned());
-                }
-                for cfg in &given.cfgs {
-                    if !is_plain_cfg(cfg) {
-                        return None;
-                    }
-                    cfgs.push((*cfg).to_owned());
-                }
-                cfgs.sort();
-                cfgs.dedup();
+                let cfgs = cfgs(target, &given, nightly)?;
                 cfgs.iter().for_each(|it| out += &format!("{it}\n"));
             }
             "target-spec-json" if given.unstable_options && nightly => {
@@ -415,7 +500,20 @@ mod tests {
         assert!(Given::of(&["-C", "opt-level=0"]).is_some_and(|it| it.debug_assertions()));
         // What may change the target's features is rustc's to answer.
         assert!(Given::of(&["-C", "target-cpu=native", "--print", "cfg"]).is_none());
-        assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_none());
+        assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_some());
         assert!(Given::of(&["-Z", "ub-checks", "--print", "cfg"]).is_none());
+    }
+
+    #[test]
+    fn independent_prints_do_not_require_a_cpu_or_codegen_model() {
+        for kind in ["sysroot", "target-libdir", "target-spec-json", "file-names"] {
+            let args = ["-Ctarget-cpu=native", "-Crelocation-model=pic", "--print", kind];
+            assert!(Given::of(&args).is_some(), "{kind}");
+        }
+        assert!(
+            Given::of(&["-Ctarget-cpu=native", "--print", "target-libdir", "--print", "cfg"])
+                .is_none(),
+            "a combined cfg answer must not silently ignore CPU semantics"
+        );
     }
 }

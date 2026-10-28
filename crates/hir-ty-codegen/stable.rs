@@ -260,6 +260,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
         Some(out)
     }
 
+    /// A portable type identity for backend metadata. Unlike StoredTy's Hash this
+    /// contains no process-local interner key. Long types retain all SHA-256 bits.
+    pub(super) fn type_name(&self, ty: Ty<'db>) -> Option<String> {
+        let mut name = String::new();
+        self.ty(&mut name, ty)?;
+        Some(name)
+    }
+
     /// The vtable of a type for a trait object, or the one with no methods.
     pub(super) fn vtable(
         &self,
@@ -476,7 +484,19 @@ impl<'a, 'db> StableNames<'a, 'db> {
             write!(out, "{OF_CHECKOUT}{id}:").ok()?;
         } else {
             match self.symbols.stable_crate_id(krate) {
-                Some(id) => write!(out, "{id:x}:").ok()?,
+                Some(id) => {
+                    use std::hash::{Hash as _, Hasher as _};
+                    let flags = &krate.data(self.db).codegen_flags;
+                    let id = if flags.is_empty() {
+                        id
+                    } else {
+                        let mut hash = rustc_hash::FxHasher::default();
+                        id.hash(&mut hash);
+                        flags.hash(&mut hash);
+                        hash.finish()
+                    };
+                    write!(out, "{id:x}:").ok()?;
+                }
                 None => match self.symbols.content_id(krate) {
                     Some(id) => write!(out, "{OF_LIBRARY}{id}:").ok()?,
                     None => return self.miss("no crate id"),
@@ -582,7 +602,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             let root = source.file_id.parse_or_expand(self.db);
             let text = source.value.syntax_node_ptr().to_node(&root).text().to_string();
             let digest = Sha256::digest(text.as_bytes());
-            digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
+            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
         });
         self.written.borrow_mut().insert(closure, written.clone());
         written
