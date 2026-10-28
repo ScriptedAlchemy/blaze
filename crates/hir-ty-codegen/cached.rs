@@ -599,7 +599,7 @@ impl Entry {
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
     store: EntryStore,
-    accepted: Option<FxHashSet<String>>,
+    accepted: Option<FxHashMap<String, [u8; KEY]>>,
     /// What a debugger is told by the entries asked for.
     debug: Told,
     /// The one program the entries are of, when they are not of any: see [`Entry::key`].
@@ -882,7 +882,7 @@ impl Entries {
     /// the accepted set cannot be read through a side door.
     pub(super) fn owned(
         store: Arc<Store>,
-        accepted: FxHashSet<String>,
+        accepted: FxHashMap<String, [u8; KEY]>,
         debug: Told,
         program: Option<[u8; 32]>,
         cargo_home: Option<String>,
@@ -914,9 +914,13 @@ impl Entries {
     }
 
     pub(super) fn get(&self, name: &str) -> Option<Arc<Entry>> {
-        if self.accepted.as_ref().is_some_and(|accepted| !accepted.contains(name)) {
-            return None;
-        }
+        // A receipt admits an exact key, not every variant of its function name.
+        // Packs may contain other settings' entries, and process-wide compiler policy
+        // can change between builds. Only the ordinary global cache recomputes a key.
+        let admitted_key = match &self.accepted {
+            Some(accepted) => Some(*accepted.get(name)?),
+            None => None,
+        };
         let cell = {
             let mut known = self.known();
             match known.entries.get(name) {
@@ -925,7 +929,8 @@ impl Entries {
             }
         };
         let read = || {
-            let key = Entry::key(name, self.debug, self.program.as_ref())?;
+            let key =
+                admitted_key.or_else(|| Entry::key(name, self.debug, self.program.as_ref()))?;
             let mut entry = Entry::decode(&self.store.get(&key)?)?;
             if let Some(debug) = &mut entry.debug {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
@@ -1065,6 +1070,40 @@ mod tests {
         assert_eq!(why.matches("writer panicked").count(), 2);
         assert!(writer.finish_checked().is_err());
         drop(writer);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn owned_entries_read_only_the_key_admitted_for_a_name() {
+        super::super::store::compiles_against("1.99.0");
+        let directory =
+            std::env::temp_dir().join(format!("blaze-d0-admitted-key-{}", std::process::id()));
+        let store = Arc::new(Store::owned(&directory).unwrap());
+        let name = "receipt-selected-function";
+        let admitted_key = Entry::key(name, Told::Nothing, None).unwrap();
+        let other_key = Entry::key(name, Told::Lines, None).unwrap();
+        assert_ne!(admitted_key, other_key);
+        let mut admitted = entry();
+        admitted.debug = None;
+        admitted.label = "admitted".into();
+        store.insert(&admitted_key, &admitted.encode().unwrap());
+        let mut other = entry();
+        other.debug = None;
+        other.label = "not in the receipt".into();
+        store.insert(&other_key, &other.encode().unwrap());
+        store.seal_checked().unwrap();
+        let entries = Entries::owned(
+            store.clone(),
+            FxHashMap::from_iter([(name.to_owned(), admitted_key)]),
+            Told::Lines,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(entries.get(name).unwrap().label, "admitted");
+        assert!(entries.get("another-function").is_none());
+        drop(entries);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

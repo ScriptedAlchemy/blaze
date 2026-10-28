@@ -203,6 +203,13 @@ impl<'a, 'db> ExportContext<'a, 'db> {
         self.digest
     }
 
+    fn check_settings(&self) -> std::result::Result<(), String> {
+        if settings()? != self.settings {
+            return Err("compiler settings mismatch with the export context".into());
+        }
+        Ok(())
+    }
+
     /// Work identity for the local registry. Nonempty caller bounds require the semantic
     /// environment-key query not present on this base; do not silently alias them to an
     /// empty environment. The original request remains compilable and locally held.
@@ -542,6 +549,7 @@ fn validate_receipt(
     store: &store::Store,
     receipt: &Receipt,
 ) -> std::result::Result<(), String> {
+    context.check_settings()?;
     if context.digest != receipt.context || store.producer() != receipt.producer {
         return Err("receipt context or store producer mismatch".into());
     }
@@ -704,6 +712,7 @@ pub fn import_batch(
     directory: &Path,
     mut fetch: impl FnMut(&str) -> std::io::Result<Vec<u8>>,
 ) -> std::result::Result<Imported, String> {
+    context.check_settings()?;
     if directory.exists() {
         return Err("batch import requires a fresh staging directory".into());
     }
@@ -804,21 +813,28 @@ impl Imported {
             .find(|it| &it.key == key)
             .ok_or("entry is not in the admitted set")?;
         let entry = self
-            .entries(context)
+            .entries(context)?
             .get(&exported.work.name)
             .ok_or("admitted entry cannot be rebound")?;
         entry.encode().ok_or("rebound entry encoding failed".into())
     }
 
-    pub(super) fn entries(&self, context: &ExportContext<'_, '_>) -> cached::Entries {
-        cached::Entries::owned(
+    pub(super) fn entries(
+        &self,
+        context: &ExportContext<'_, '_>,
+    ) -> std::result::Result<cached::Entries, String> {
+        if context.digest != self.receipt.context {
+            return Err("imported entry requested under a different context".into());
+        }
+        context.check_settings()?;
+        Ok(cached::Entries::owned(
             self.store.clone(),
-            self.receipt.entries.iter().map(|it| it.work.name.clone()).collect(),
+            self.receipt.entries.iter().map(|it| (it.work.name.clone(), it.key)).collect(),
             cached::Told::of(context.policy.debug, context.policy.variables),
             context.policy.program,
             context.symbols.cargo_home(),
             context.symbols.library_sources(),
-        )
+        ))
     }
 }
 

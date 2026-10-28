@@ -375,6 +375,81 @@ fn real_object_bindings_and_batch_bindings_construct_identical_entries() {
 }
 
 #[test]
+fn imported_receipts_refuse_changed_compiler_settings() {
+    const TEST: &str = "export::tests::imported_receipts_refuse_changed_compiler_settings";
+    const CHILD: &str = "BLAZE_D0_SETTINGS_CHILD";
+    // Frame-pointer policy is process-wide and may change when the next build starts.
+    // Isolate that transition from other tests' compiler contexts.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    store::compiles_against("1.99.0");
+    backend::keep_frame_pointers(false);
+    let (db, roots, _) = fixture();
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: false };
+        let context = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &roots,
+            policy(false),
+        )
+        .unwrap();
+        let root = roots
+            .iter()
+            .find(|it| FunctionSignature::of(&db, **it).name.as_str() == "helper")
+            .unwrap();
+        let directory = scratch("settings-source");
+        let store = store::Store::owned(&directory).unwrap();
+        let batch = compile_batch(&context, context.digest(), &[LocalRequest::root(*root)], &store)
+            .unwrap();
+        require_exported(&batch, 1);
+        let staging = scratch("settings-import");
+        let imported =
+            import_batch(&context, &batch.receipt, &staging, |name| store.pack(name)).unwrap();
+        let key = batch.receipt.entries[0].key;
+        assert!(imported.rebound_entry_bytes(&context, &key).is_ok());
+
+        backend::keep_frame_pointers(true);
+        assert!(imported.entries(&context).err().unwrap().contains("compiler settings"));
+        assert!(
+            imported.rebound_entry_bytes(&context, &key).unwrap_err().contains("compiler settings")
+        );
+        let publication = directory.join("stale.receipt");
+        assert!(batch.receipt.publish(&context, &store, &publication).is_err());
+        assert!(!publication.exists());
+        let refused = scratch("settings-refused");
+        assert!(
+            import_batch(&context, &batch.receipt, &refused, |_| {
+                panic!("stale compiler context must fail before fetching packs")
+            })
+            .err()
+            .unwrap()
+            .contains("compiler settings")
+        );
+        assert!(!refused.exists());
+        backend::keep_frame_pointers(false);
+        assert!(imported.rebound_entry_bytes(&context, &key).is_ok());
+        drop(imported);
+        drop(store);
+        std::fs::remove_dir_all(staging).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    });
+}
+
+#[test]
 fn mismatches_corruption_and_missing_types_never_admit_a_receipt() {
     store::compiles_against("1.99.0");
     let (db, roots, _) = fixture();
@@ -765,7 +840,7 @@ fn independently_loaded_processes_produce_identical_entry_digests_and_import() {
         );
         let mut object =
             ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
-        object.entries = Some(std::sync::Arc::new(imported.entries(&context)));
+        object.entries = Some(std::sync::Arc::new(imported.entries(&context).unwrap()));
         object.root_names = context.roots.clone();
         for root in &roots {
             let work = context.work_name(&LocalRequest::root(*root)).unwrap();
