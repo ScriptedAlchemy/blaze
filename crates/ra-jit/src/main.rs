@@ -9984,7 +9984,7 @@ fn run_holding(
             let sender = sender.clone();
             let base = &programs[at].args.checkout;
             let over = viewed.get(base).unwrap_or(base);
-            let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
+            let mut from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let packs = packs_whole(&programs[at].args);
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
@@ -10004,7 +10004,14 @@ fn run_holding(
                 )
                 .err();
                 if failed.is_none() {
-                    lock(&as_built).insert(object, from);
+                    if from
+                        .published(
+                            std::iter::once(&object).chain(splice.iter()).chain(spliced.iter()),
+                        )
+                        .is_ok()
+                    {
+                        lock(&as_built).insert(object, from);
+                    }
                 }
                 for (_, _, client) in clients {
                     let _ = match &failed {
@@ -10040,6 +10047,8 @@ struct Settled {
     own: Vec<(PathBuf, Option<SystemTime>)>,
     /// When each file outside the checkout was written.
     others: u64,
+    /// Exact artifacts this successful publication left at shared output paths.
+    artifacts: Vec<(PathBuf, [u8; 32])>,
 }
 
 impl Settled {
@@ -10066,7 +10075,14 @@ impl Settled {
             own.push((path, Some(file.mtime)));
         }
         let others = Settled::others(files, base, |file| Some(file.mtime));
-        Settled { over: over.to_owned(), patch, link_cmd, own, others }
+        Settled { over: over.to_owned(), patch, link_cmd, own, others, artifacts: Vec::new() }
+    }
+
+    fn published<'a>(&mut self, paths: impl Iterator<Item = &'a PathBuf>) -> std::io::Result<()> {
+        self.artifacts = paths
+            .map(|path| Ok((path.clone(), native_inputs::output_digest(path)?)))
+            .collect::<std::io::Result<_>>()?;
+        Ok(())
     }
 
     fn others(
@@ -10100,6 +10116,10 @@ impl Settled {
             && linked
             && (self.link_cmd.is_none() || self.link_cmd == target.link_cmd)
             && target.out.exists()
+            && !self.artifacts.is_empty()
+            && self.artifacts.iter().all(|(path, digest)| {
+                native_inputs::output_digest(path).ok().as_ref() == Some(digest)
+            })
             && self.patch.as_ref().is_none_or(|it| it.exists())
             && self.own.iter().all(|(path, at)| written(path) == *at)
             && self.others == Settled::others(files, &view.base, outside)
@@ -10744,6 +10764,42 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settled_noop_requires_the_artifacts_this_publication_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("object");
+        let exe = dir.path().join("program");
+        std::fs::write(&out, b"object").unwrap();
+        std::fs::write(&exe, b"+machine").unwrap();
+        let db = RootDatabase::default();
+        let view = View {
+            base: dir.path().to_owned(),
+            over: dir.path().to_owned(),
+            project: dir.path().to_owned(),
+        };
+        let target = Target {
+            project: Some(view.project.clone()),
+            krate: "main".to_owned(),
+            batch: None,
+            out: out.clone(),
+            patch: None,
+            link_cmd: Some("cc".to_owned()),
+            splice: Some(exe.clone()),
+            exe: Some(exe.clone()),
+            symbol_files: Vec::new(),
+        };
+        let mut settled =
+            Settled::of(&[], &db, dir.path(), dir.path(), None, target.link_cmd.clone());
+        settled.published([&out, &exe].into_iter()).unwrap();
+        assert!(settled.still(&[], &db, &view, &target, Request::Sync));
+        let stamp = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::fs::write(&exe, b"-machine").unwrap();
+        std::fs::File::options().write(true).open(&exe).unwrap().set_modified(stamp).unwrap();
+        assert!(!settled.still(&[], &db, &view, &target, Request::Sync));
+        std::fs::write(&exe, b"+machine").unwrap();
+        assert!(settled.still(&[], &db, &view, &target, Request::Sync));
+    }
 
     #[test]
     fn a_file_alike_checkout_is_read_through_a_loaded_one_by_the_policy_that_will_do_it() {

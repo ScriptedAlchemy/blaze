@@ -391,7 +391,7 @@ fn pending(binary: PathBuf, inputs: Inputs) -> Pending {
     Pending { binary, inputs, before, changed, output_changed }
 }
 
-fn output_digest(path: &Path) -> io::Result<Digest> {
+pub(crate) fn output_digest(path: &Path) -> io::Result<Digest> {
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
