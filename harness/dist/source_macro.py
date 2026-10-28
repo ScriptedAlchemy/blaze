@@ -12,6 +12,7 @@ The full test requires --owned-server built by blaze, with its matching proc_mac
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -102,17 +103,20 @@ def oracle(plan, sysroot, work):
     return built[0]
 
 
-def expansions(server, library, work):
-    env = {**os.environ, "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"}
+def expansions(server, library, work, env=None, transcript=None):
+    env = {**(env or os.environ), "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"}
     process = subprocess.Popen([str(server)], env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    messages = []
     def request(value):
         process.stdin.write(json.dumps(value) + "\n")
         process.stdin.flush()
         line = process.stdout.readline()
         if not line:
             raise RuntimeError(f"server exited: {process.stderr.read()}")
-        return json.loads(line)
+        response = json.loads(line)
+        messages.append(dict(request=value, response=response))
+        return response
     try:
         assert request({"ApiVersionCheck": {}})["ApiVersionCheck"] == 6
         listed = request({"ListMacros": {"dylib_path": str(library)}})["ListMacros"]
@@ -138,6 +142,8 @@ def expansions(server, library, work):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        if transcript:
+            transcript.write_text(json.dumps(messages, indent=2) + "\n")
 
 
 def normalize(tree):
@@ -215,7 +221,20 @@ def main():
     real = Path(norustc.real_toolchain())  # reference-only toolchain query
     reference = oracle(plan, real, work)
     theirs = expansions(real / "libexec" / "rust-analyzer-proc-macro-srv", reference, work)
-    ours = expansions(args.owned_server.resolve(), library, work)
+    # Loading and expansion belong to the product slice too. The reference server runs
+    # separately without the stand-ins; its compilation is never subtracted from an audit.
+    server = args.owned_server.resolve()
+    before = len(norustc.runs(str(audit_log)))
+    try:
+        ours = expansions(server, library, work, env, work / "owned-transcript.json")
+    finally:
+        calls = norustc.runs(str(audit_log))[before:]
+        (work / "expansion-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
+        assert not calls, f"owned expansion ran counted tools: {calls}"
+    pins = {name: dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            for name, path in [("blaze", args.blaze.resolve()), ("server", server),
+                               ("producer", library), ("oracle", reference)]}
+    (work / "image-pins.json").write_text(json.dumps(pins, indent=2) + "\n")
     (work / "expansions.json").write_text(json.dumps(dict(ours=ours, oracle=theirs), indent=2))
     assert ours == theirs, "owned expansion differs from rustc oracle"
     print("derive/function-like expansions equal oracle; separate host/target features; no product cargo/rustc")

@@ -57,6 +57,20 @@ the matching proc_macro bridge. It compares normalized token structure/text;
 server-local span ids are ignored. It does not claim span parity.
 `--build-only` explicitly does not pass that expansion gate.
 
+`harness/dist/owned_macro_server.py --blaze <blaze> --work <server-build>`
+builds the matching server executable through blaze, including its source
+`proc_macro`. It does not substitute the toolchain's server. The server's
+bootstrap still expands its own derives through the existing compile-time-deps
+handoff. `bootstrap-audit.json` retains every compiler/Cargo call, without
+excluding compile lines. This bootstrap is not a strict-gate pass.
+
+The full source-producer witness audits both producer compilation and owned
+server loading/expansion. It retains the actual owned request/response
+transcript, normalized comparisons and SHA256 pins of blaze, server, producer
+and independent oracle images. Run it twice, with `--light` and without, over
+fresh work directories. A matching token result does not prove host planning,
+default registry features, build scripts or span parity.
+
 On this Mac, Python injects `SDKROOT`. The owned query model currently refuses
 SDK overrides. `--default-sdk` selects the default SDK witness and records
 that choice; product code does not erase the user's SDK. Closing the SDK query
