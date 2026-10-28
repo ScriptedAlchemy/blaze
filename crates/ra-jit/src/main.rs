@@ -1279,6 +1279,15 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
     names.filter(|it| named(it)).map(|it| dir.join(it)).collect()
 }
 
+/// Dependent helper callbacks use their parent's admission slot. Keep this around the work
+/// itself, independently of the database handle that owns the helper's solver-cache lifetime.
+fn admitted_parallel_work<'a>(
+    work: &'a ParallelWork<'a>,
+) -> impl Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a {
+    let job = hir_ty_codegen::budget::job_context();
+    move |db, resolver, at| job.run(|| work(db, resolver, at))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -1287,6 +1296,8 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = admitted_parallel_work(work);
+        let work = &work;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (solving::Handle::of(&self.db), &next, self.parts());
@@ -4527,7 +4538,7 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
+    let stale: Result<Option<Vec<_>>, CodegenError> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
                 let (db, known, local, next) = (solving::Handle::of(&db), &*known, &local, &next);
@@ -4552,8 +4563,13 @@ fn build(
                 })
             })
             .collect();
-        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
+        let parts: Result<Vec<_>, CodegenError> = parts
+            .into_iter()
+            .map(|it| it.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        parts.map(|parts| parts.into_iter().collect())
     });
+    let stale = stale.map_err(anyhow::Error::new)?;
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
@@ -4563,7 +4579,7 @@ fn build(
     let unit = hir::attach_db(db, || {
         CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
     })
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::new)?;
     let Some(mut unit) = unit else { return Ok(None) };
     known.stats.onto_rustcs = unit.object.is_some() && resolver.onto_rustcs();
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
@@ -4616,8 +4632,10 @@ fn build(
         unset: unset_in(db, &local),
         unwritten,
     };
-    // A patch is of the last full build and replaces nothing the next edit is built from.
-    if !undoable || known.stats.patched.is_some() {
+    // An edit may need another build after checking tiered code. Keep even a complete
+    // patch unpublished until that decision finishes: a failed retry must leave the
+    // last published object, patch and executable together.
+    if !undoable {
         build.keep(known)?;
     }
     if let Some(path) = &args.report {
@@ -4682,7 +4700,10 @@ fn with_failed_macro(
     let frontend = match &error {
         CodegenError::Frontend(_) => true,
         CodegenError::Unsupported(why) => why.contains("frontend:"),
-        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+        CodegenError::Backend(_)
+        | CodegenError::NoSymbol
+        | CodegenError::Private
+        | CodegenError::OverBudget(_) => false,
     };
     if !frontend {
         return error;
@@ -5239,12 +5260,12 @@ fn can_call(binary: &Path, name: &str) -> bool {
     }
 }
 
-/// A symbol the patch at `patch` refers to that the executable at `binary` does not give it;
+/// A symbol the uncommitted patch refers to that the executable does not give it;
 /// none while the executable is being read, which a splice then says.
-fn missing_in(binary: &Path, patch: &Path) -> Option<String> {
+fn missing_in(binary: &Path, patch: &[u8]) -> Option<String> {
     let linked = lock(&LINKED);
     let Some(Executable::Read(baseline)) = linked.get(binary) else { return None };
-    baseline.missing_in(&std::fs::read(patch).ok()?)
+    baseline.missing_in(patch)
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -5460,6 +5481,8 @@ enum Refused {
     Error(errors::Said),
     /// The source is one ra-jit does not build as it is, or ra-jit failed to: cargo builds it.
     Cargos(String),
+    /// A transient host-pressure failure leaves the worker and last published build intact.
+    Pressure(String),
 }
 
 impl Refused {
@@ -5468,6 +5491,7 @@ impl Refused {
         match self {
             Refused::Error(said) => said.reply(),
             Refused::Cargos(why) => format!("cargo: {}", why.replace('\n', " ")),
+            Refused::Pressure(why) => format!("error: {}", why.replace('\n', " ")),
         }
     }
 }
@@ -5477,7 +5501,28 @@ impl std::fmt::Display for Refused {
         match self {
             Refused::Error(said) => said.fmt(f),
             Refused::Cargos(why) => f.write_str(why),
+            Refused::Pressure(why) => f.write_str(why),
         }
+    }
+}
+
+/// Every build attempt in an edit, including retries for tiered code, has this boundary.
+/// Preserve typed host-pressure failures without terminating the worker or asking Cargo.
+/// This preserves published files; retaining an in-memory base is the patch path's rule,
+/// not a guarantee for a full rebuild that has already discarded its old base.
+fn recover_pressure<T>(
+    built: anyhow::Result<T>,
+    unbuilt: &mut Unbuilt,
+) -> anyhow::Result<Result<T, Refused>> {
+    match built {
+        Err(why)
+            if matches!(why.downcast_ref::<CodegenError>(), Some(CodegenError::OverBudget(_))) =>
+        {
+            eprintln!("pressure: edit not published; last published files retained: {why:#}");
+            unbuilt.stale = true;
+            Ok(Err(Refused::Pressure(format!("{why:#}"))))
+        }
+        other => other.map(Ok),
     }
 }
 
@@ -7788,6 +7833,7 @@ fn run_holding(
     }
     process_wide();
     memory::ticks();
+    memory::bound_builds()?;
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -7944,6 +7990,10 @@ fn run_holding(
     if let Some(said) = ra_jit_expand::report() {
         eprintln!("{said}");
     }
+    // Resolution lets go of a third of what it held at its peak, and the allocator keeps the
+    // pages: 4 GB of tracedecay's (docs/reports/LOADMEM.md). The build that comes next is bounded
+    // by what the process holds.
+    memory::give_back();
     memory::checkpoint("resolve");
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
@@ -9739,30 +9789,40 @@ impl Program {
             eprintln!("edit-to-binary: {:.1?}", start.elapsed());
             why
         };
-        let Some(mut warm) = warm? else { return Ok(Err(held(known))) };
+        let warm = match recover_pressure(warm, unbuilt)? {
+            Ok(warm) => warm,
+            Err(pressure) => return Ok(Err(pressure)),
+        };
+        let Some(mut warm) = warm else { return Ok(Err(held(known))) };
         // Code compiled at a higher level can call what rustc built into its callers and left
         // no symbol of. The executable can't take a patch with it, and a full link would start
         // the program over, so the code goes instead; of several functions installed
         // together, the others are installed again one by one, a build each.
         loop {
             let missing = match (&args.splice, &args.patch) {
-                (Some(binary), Some(patch)) if known.stats.patched.is_some() => {
-                    missing_in(binary, patch)
-                }
+                (Some(binary), Some(patch)) if known.stats.patched.is_some() => warm
+                    .unwritten
+                    .iter()
+                    .find(|(path, _)| path == patch)
+                    .and_then(|(_, bytes)| missing_in(binary, bytes)),
                 _ => None,
             };
             let again = match missing {
                 Some(missing) => known.tiers.refuse(&format!(
                     "no patch can hold its code: {missing} is not in the executable"
                 )),
-                None => known.tiers.held(),
+                None => known.tiers.held() || hir_ty_codegen::budget::testing::tier_retry(),
             };
             if !again {
                 break;
             }
-            match build(db, table, args, known, listed, Some(&hold))? {
-                Some(again) => warm = again,
-                None => return Ok(Err(held(known))),
+            hir_ty_codegen::budget::testing::checkpoint("tier_rebuild");
+            let retry =
+                recover_pressure(build(db, table, args, known, listed, Some(&hold)), unbuilt)?;
+            match retry {
+                Err(pressure) => return Ok(Err(pressure)),
+                Ok(Some(again)) => warm = again,
+                Ok(None) => return Ok(Err(held(known))),
             }
         }
         let full = known.stats.patched.is_none();
@@ -9996,6 +10056,65 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("patch.o");
+        std::fs::write(&patch, b"last published patch").unwrap();
+        let candidate = || Build {
+            compiled: 1,
+            skipped: Vec::new(),
+            instances: 0,
+            codegen: Duration::ZERO,
+            emit: Duration::ZERO,
+            steps: [Duration::ZERO; 3],
+            looked: Default::default(),
+            unset: None,
+            unwritten: vec![(patch.clone(), b"new complete patch".to_vec())],
+        };
+        let mut unbuilt = Unbuilt::default();
+        let first = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("first attempt failed"))
+            .unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let error = anyhow::Error::new(CodegenError::OverBudget("host memory pressure".into()))
+            .context("second tier build");
+        let second: Result<Option<Build>, Refused> =
+            recover_pressure(Err(error), &mut unbuilt).unwrap();
+        let reply = match second {
+            Err(why) => why.reply(),
+            Ok(_) => panic!("second build did not fail"),
+        };
+        assert!(reply.starts_with("error: second tier build: "));
+        assert!(reply.contains("host memory pressure"));
+        assert!(unbuilt.stale);
+        drop(first);
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let mut retry = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("recovery failed"))
+            .unwrap();
+        retry.keep(&mut Rejections::default()).unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"new complete patch");
+        let unrelated =
+            recover_pressure::<()>(Err(anyhow::anyhow!("ordinary error")), &mut unbuilt);
+        assert_eq!(unrelated.err().unwrap().to_string(), "ordinary error");
+    }
+
+    #[test]
+    fn pressure_reply_is_a_transient_error_not_a_cargo_request() {
+        let reply = super::Refused::Pressure("host memory pressure".into()).reply();
+        assert_eq!(reply, "error: host memory pressure");
+        let error = anyhow::Error::new(hir_ty_codegen::CodegenError::OverBudget(
+            "host memory pressure".into(),
+        ));
+        assert!(matches!(
+            error.downcast_ref::<hir_ty_codegen::CodegenError>(),
+            Some(hir_ty_codegen::CodegenError::OverBudget(_))
+        ));
+    }
+
     use super::*;
 
     #[test]

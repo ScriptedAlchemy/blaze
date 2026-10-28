@@ -38,8 +38,8 @@ use hir_ty::{
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
-    mir::is_by_move_coroutine,
     mir::type_name::rustc_debug_name,
+    mir::{held_frame, is_by_move_coroutine},
     next_solver::{
         DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -564,21 +564,10 @@ impl<'db> Types<'db> {
         let offset_of = |it| layout.fields.offset(it).bytes();
         let captured =
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
-        let parent_args = GenericArgs::new_from_slice(args.parent_args());
-        let body = match is_by_move_coroutine(self.db, id.0, args) {
-            true => self.db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-            false => self.db.monomorphized_runtime_mir_body_for_coroutine(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-        }
-        .ok()?;
-        let held = body.locals_held_across_yields();
+        let parent_args = GenericArgs::new_from_slice(args.parent_args()).store();
+        let by_move = is_by_move_coroutine(self.db, id.0, args);
+        let frame = held_frame(self.db, id.0, by_move, &parent_args, &self.env.store()).ok()?;
+        let (body, held) = (frame.body, &frame.held);
         let closure = id.0.loc(self.db);
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
         let bindings = body.local_to_binding_map();
@@ -591,8 +580,8 @@ impl<'db> Types<'db> {
         for (nth, (point, kept)) in held.yields.iter().zip(waiting).enumerate() {
             let mut fields = Vec::new();
             let awaited = body.awaited(point);
-            for (field, &local) in point.kept.iter().enumerate() {
-                let local = held.locals[local];
+            for (field, &at) in point.kept.iter().enumerate() {
+                let local = held.locals[at];
                 // A value the body keeps without a name for it is not told of, but for the
                 // future it waits for there, which rustc has a name for.
                 let name = match bindings.get(local) {
@@ -601,7 +590,7 @@ impl<'db> Types<'db> {
                     None => continue,
                 };
                 let offset = kept.field_offsets[RustcFieldIdx::new(field)].bytes();
-                if let Some(ty) = self.ty(body.locals[local].ty.as_ref(), pointers) {
+                if let Some(ty) = self.ty(frame.types[at].as_ref(), pointers) {
                     fields.push(Field { name: name.to_owned(), offset, ty });
                 }
             }
