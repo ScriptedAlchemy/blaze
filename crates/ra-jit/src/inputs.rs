@@ -767,6 +767,8 @@ impl Scripts {
             return Ok(true);
         }
         if let Some(own) = &self.own {
+            let _native =
+                env.is_none().then(|| crate::process::enter_native(own.native_env.clone()));
             // blaze judges each script itself, as cargo does at every build: a script whose
             // last run stands is not run, and the workspace is another only when what one
             // said is.

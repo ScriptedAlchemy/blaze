@@ -33,8 +33,12 @@ impl std::fmt::Debug for Environment {
 impl Environment {
     pub(crate) fn of(db: &RootDatabase) -> Self {
         let vars = match base_db::ProcessEnv::try_get(db) {
-            Some(env) => env.vars(db).iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            None => std::env::vars_os().collect(),
+            Some(env) => crate::process::native()
+                .vars()
+                .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
+                .chain(env.vars(db).iter().map(|(k, v)| (k.into(), v.into())))
+                .collect(),
+            None => crate::process::native().vars().collect(),
         };
         Self(vars)
     }
@@ -92,6 +96,41 @@ mod environment_tests {
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("LIBRARY_PATH={want}\n"));
         }
+    }
+
+    #[test]
+    fn detached_link_snapshots_keep_native_bytes_after_the_operation_turns() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut db = RootDatabase::default();
+        base_db::set_process_env(
+            &mut db,
+            [("SOURCE".to_owned(), "same".to_owned())].into_iter().collect(),
+        );
+        let capture = |byte| {
+            let _native = crate::process::enter_native(crate::process::Native::of([(
+                "BYTE_VALUE".into(),
+                OsString::from_vec(vec![0xff, byte]),
+            )]));
+            Environment::of(&db)
+        };
+        let first = capture(b'a');
+        let second = capture(b'b');
+        std::thread::scope(|scope| {
+            for (env, byte) in [(first, b'a'), (second, b'b')] {
+                scope.spawn(move || {
+                    let mut command = Command::new("/usr/bin/printenv");
+                    env.apply(&mut command);
+                    command.env("SOURCE", "same");
+                    let output = command.output().unwrap();
+                    let want = [
+                        b'B', b'Y', b'T', b'E', b'_', b'V', b'A', b'L', b'U', b'E', b'=', 0xff,
+                        byte, b'\n',
+                    ];
+                    assert!(output.status.success());
+                    assert!(output.stdout.windows(want.len()).any(|it| it == want));
+                });
+            }
+        });
     }
 }
 

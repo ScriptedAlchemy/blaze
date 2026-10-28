@@ -213,7 +213,23 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         },
     ];
     let leases = Leases::default();
+    #[cfg(unix)]
+    let _native = {
+        use std::os::unix::ffi::OsStringExt as _;
+        crate::process::enter_native(crate::process::Native::of([
+            ("BYTE_VALUE".into(), OsString::from_vec(vec![0xff, 0xfe])),
+            ("CLIENT_ONLY".into(), "request".into()),
+        ]))
+    };
     let mut runner = Runner::new(&leases, &cargo, &asked, sysroot, &target_cfg).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let child = runner.child_env();
+        assert_eq!(child[std::ffi::OsStr::new("BYTE_VALUE")].as_bytes(), &[0xff, 0xfe]);
+        assert_eq!(child[std::ffi::OsStr::new("CLIENT_ONLY")], "request");
+        assert_eq!(child[std::ffi::OsStr::new("SDKROOT")], root.join("unused-sdk").as_os_str());
+    }
     let profile = runner.profile(package, UnitFor::new_normal(), &runner.kind(false));
     let target = runner.unit(package, false, &profile, root.join("script"), Vec::new()).unwrap();
     let profile = runner.profile(package, UnitFor::new_host(false), &runner.kind(true));

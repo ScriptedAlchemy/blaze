@@ -3342,6 +3342,7 @@ fn workspace_at(
             let ids = packages.iter().map(|&it| &cargo[it].id.repr);
             own = Some(scripts::Own {
                 env: env.clone(),
+                native_env: process::native(),
                 profile: selection.profile.clone(),
                 config: selection.config.clone(),
                 host: host.first().context("no host to run build scripts on")?.clone(),
@@ -7024,6 +7025,7 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    native_env: process::Native,
     /// The build of the daemon's the request is for: a build is one request to the daemon and
     /// may be several to a worker. A request that names none has a number of its own
     /// ([`Client::of`]), which it holds the output of the scripts under until it is dropped.
@@ -7047,6 +7049,7 @@ impl Client {
             0 => Client {
                 stream,
                 env,
+                native_env: process::native(),
                 build: scripts::anonymous(),
                 own_build: true,
                 pin: None,
@@ -7056,6 +7059,7 @@ impl Client {
             build => Client {
                 stream,
                 env,
+                native_env: process::native(),
                 build,
                 own_build: false,
                 pin: None,
@@ -7661,7 +7665,7 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     let mut stream =
         socket::connect(socket).with_context(|| format!("no daemon at {}", socket.display()))?;
     let target = target.map(|it| it.fields()).unwrap_or_default();
-    let env = process::encode(&process::own());
+    let env = process::encode_native(&process::native(), 0);
     stream.write_all(format!("{}{target}\n{env}\n", request.name()).as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
@@ -7741,6 +7745,14 @@ fn requested(stream: UnixStream) -> Option<Event> {
             return None;
         }
     };
+    let (native_env, build) = match process::decode_native(&env) {
+        Ok(env) => env,
+        Err(why) => {
+            let _ = writeln!(&stream, "failed: {why}");
+            return None;
+        }
+    };
+    let _native = process::enter_native(native_env.clone());
     trace::arrived();
     let (name, rest) = request.split_once('\t').unwrap_or((&request, ""));
     eprintln!("request: {name} at_us={}", live::epoch_us());
@@ -7762,7 +7774,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let (env, build) = process::decode_request(&env);
+        let env = native_env.unicode();
         let client = Client::of(stream, env, build);
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
@@ -7771,7 +7783,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let (env, build) = process::decode_request(&env);
+        let env = native_env.unicode();
         let client = Client::of(stream, env, build);
         return Some(Event::Asked((request, target, client)));
     }
@@ -8258,6 +8270,10 @@ impl Held {
 pub(crate) struct Told {
     pub(crate) args: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) native_env: Option<process::Native>,
+    #[serde(default)]
+    pub(crate) load_env: Option<PathBuf>,
     pub(crate) cwd: PathBuf,
     /// The build is one cargo has only started: these are the workspace and its crates, and
     /// what cargo wrote is in the arguments of the line that follows.
@@ -8596,6 +8612,21 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
     let held = Held::load(dir).inspect_err(|why| eprintln!("spare: nothing held: {why:#}")).ok();
     let Some(line) = input_line() else { return Ok(()) };
     let told: Told = serde_json::from_str(&line).context("what the spare worker is told")?;
+    if let Some(env) = &told.native_env {
+        // SAFETY: same quiescent spare boundary as the configuration variables below.
+        unsafe {
+            for (name, _) in std::env::vars_os() {
+                std::env::remove_var(name);
+            }
+            for (name, value) in env.vars() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    if let Some(file) = &told.load_env {
+        // SAFETY: the spare's library-loading threads have ended.
+        unsafe { std::env::set_var(cargo::daemon::LOAD_ENV, file) };
+    }
     for (name, value) in &told.env {
         // SAFETY: the threads that loaded the library have ended, and the ones that remain
         // wait for files to change or for a proc macro to expand: none reads a variable.
@@ -8642,6 +8673,15 @@ fn run_holding(
 ) -> anyhow::Result<()> {
     // A build that links the program itself, a whole build's worker among them, runs the
     // build scripts of the workspace it loads itself.
+    let native = match std::env::var_os(cargo::daemon::LOAD_ENV) {
+        Some(file) => {
+            process::decode_native(std::fs::read_to_string(file)?.trim_end())
+                .map_err(anyhow::Error::msg)?
+                .0
+        }
+        None => process::Native::own(),
+    };
+    let _native = process::enter_native(native);
     scripts::set_own(args.exe.is_some());
     // As cargo does: the flag, then the environment, then the host.
     if args.selection.target.is_none() {
@@ -9164,7 +9204,9 @@ fn run_holding(
     let mut placed = Placed::default();
     // The programs whose tests ra-jit's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
+    let mut current_native = process::native();
     loop {
+        let _current_native = process::enter_native(current_native.clone());
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
         }
@@ -9252,6 +9294,7 @@ fn run_holding(
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    let _native = process::enter_native(stream.native_env.clone());
                     // What a client asks of is the executable on disk: the splices that wait
                     // for the edits to stop are done first.
                     for binary in splicer::flush() {
@@ -9364,12 +9407,13 @@ fn run_holding(
                         }
                     }
                     // One build is for one process: its variables are what `env!` reads.
-                    if process::differs(&db, &stream.env) {
+                    if process::differs(&db, &stream.env) || current_native != stream.native_env {
                         if !clients.is_empty() {
                             later.push((request, asked, stream));
                             continue;
                         }
                         builds.settle(&mut db, &mut programs)?;
+                        current_native = stream.native_env.clone();
                         let reading = process::turn(&mut db, stream.env.clone());
                         if !reading.is_empty() {
                             for program in &mut programs {
@@ -9709,6 +9753,7 @@ fn run_holding(
                         for &at in &owners {
                             let Some(mut client) = Client::nobody() else { continue };
                             client.env = env.clone();
+                            client.native_env = current_native.clone();
                             client._recovering = Some(recovery.clone());
                             let target = (at != 0).then(|| Target::of(&programs[at].args));
                             builds.waiting.push_back((Request::Sync, target, client));
@@ -9728,12 +9773,14 @@ fn run_holding(
                     edited.client.env = ide_db::base_db::ProcessEnv::try_get(&db)
                         .map(|it| it.vars(&db).clone())
                         .unwrap_or_default();
+                    edited.client.native_env = current_native.clone();
                     // Asked as a client of each would: one interrupted asks again.
                     let target = |at: usize| (at != 0).then(|| Target::of(&programs[at].args));
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client::of(stream, edited.client.env.clone(), 0);
+                            let mut client = Client::of(stream, edited.client.env.clone(), 0);
+                            client.native_env = edited.client.native_env.clone();
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
@@ -9808,6 +9855,11 @@ fn run_holding(
             }
             false => std::thread::sleep(Duration::from_millis(5)),
         }
+        // The accepted batch has one environment, just like its Unicode source view.
+        // Keep it through command construction; detached commands own their snapshot.
+        let _native = clients
+            .first()
+            .map(|(_, (_, _, client))| process::enter_native(client.native_env.clone()));
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
         let mut switched = Vec::new();
@@ -10200,6 +10252,7 @@ fn run_holding(
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
                 let done = Arc::new(AtomicBool::new(false));
+                let native = process::native();
                 if own_base && let Some(budget) = own_base_budget() {
                     let (done, sender) = (done.clone(), sender.clone());
                     let krate = program.args.krate.clone();
@@ -10223,6 +10276,7 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    let _native = process::enter_native(native);
                     LINK_FOR.with_borrow_mut(|it| it.clone_from(&consumes));
                     for build in consumes {
                         scripts::barrier::hold("consume", build);
@@ -10269,7 +10323,9 @@ fn run_holding(
                         let wanted = outputs.get(&at);
                         let reads: Vec<u64> =
                             clients.iter().filter(|it| it.0 == at).map(|it| it.1.2.build).collect();
+                        let native = process::native();
                         let build = scope.spawn(move || {
+                            let _native = process::enter_native(native);
                             for build in reads {
                                 scripts::barrier::hold("consume", build);
                             }

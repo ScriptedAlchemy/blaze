@@ -209,6 +209,7 @@ fn checkout(
         programs: plans.collect(),
         sources: manifests.chain(sources).collect(),
         env: BTreeMap::new(),
+        native_env: None,
         scripts: None,
     }
 }

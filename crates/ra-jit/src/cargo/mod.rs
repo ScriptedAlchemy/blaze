@@ -596,7 +596,9 @@ fn asking(checkout: &Checkout) -> Checkout {
     let mut env: BTreeMap<String, String> =
         crate::process::vars().filter(|(name, _)| !wraps(name)).collect();
     env.extend(checkout.env.clone());
-    Checkout { env, ..checkout.clone() }
+    let native_env =
+        Some(crate::process::native().over(env.iter().map(|(k, v)| (k.into(), v.into()))));
+    Checkout { env, native_env, ..checkout.clone() }
 }
 
 /// Tells the daemon to load `checkout` as cargo just built it, starting one when there is

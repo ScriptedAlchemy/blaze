@@ -342,6 +342,8 @@ impl WorkerConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct Ahead {
     pub(crate) config: WorkerConfig,
+    #[serde(default)]
+    pub(crate) native_env: Option<crate::process::Native>,
     /// The root of the checkout.
     pub(crate) root: PathBuf,
     /// Where the source of each crate the daemon compiles starts.
@@ -368,6 +370,9 @@ pub(crate) struct Checkout {
     /// programs are, and in a request under them the ones of the process that asks.
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
+    /// Full client snapshot, including native values and absence. Never rendered in logs.
+    #[serde(default)]
+    pub(crate) native_env: Option<crate::process::Native>,
     /// The file of what cargo said of the build scripts it ran and the proc macros it
     /// built, which a worker loads the checkout with.
     #[serde(default)]
@@ -462,7 +467,7 @@ struct Worker {
     log: PathBuf,
     /// The variables the process runs with. A request says them with the ones of its
     /// checkout over them.
-    env: ide_db::base_db::Env,
+    env: crate::process::Native,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
@@ -550,12 +555,26 @@ impl Worker {
             args.push("--scripts-from".into());
             args.push(scripts.into());
         }
-        let mut env = crate::process::own();
-        for (name, value) in &config.env {
-            env.set(name, value);
-        }
-        env.set(ENDS_WITH_INPUT, "1");
-        let told = spare.and_then(|it| it.told(&args, &checkout.config, &checkout.root, false));
+        let env = checkout
+            .native_env
+            .clone()
+            .unwrap_or_else(crate::process::Native::own)
+            .over(config.env.iter().map(|(k, v)| (k.into(), v.into())))
+            .over([(ENDS_WITH_INPUT.into(), "1".into())]);
+        let file = dir.join("load-env");
+        let asked = checkout.native_env.as_ref().unwrap_or(&env);
+        private_file(OpenOptions::new().write(true).create(true).truncate(true), &file)?
+            .write_all(crate::process::encode_native(asked, build).as_bytes())?;
+        let told = spare.and_then(|it| {
+            it.told(
+                &args,
+                &checkout.config,
+                &checkout.root,
+                false,
+                Some(env.clone()),
+                Some(file.clone()),
+            )
+        });
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -563,6 +582,7 @@ impl Worker {
             }
             None => {
                 let mut command = Command::new(std::env::current_exe()?);
+                env.apply(&mut command);
                 clear_worker_memory(&mut command);
                 command.args(&args);
                 match store() {
@@ -573,16 +593,7 @@ impl Worker {
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
                 command.env(LOAD_BUILD, build.to_string());
-                if !checkout.env.is_empty() {
-                    let asked: ide_db::base_db::Env = checkout.env.clone().into_iter().collect();
-                    let file = dir.join("load-env");
-                    private_file(
-                        OpenOptions::new().write(true).create(true).truncate(true),
-                        &file,
-                    )?
-                    .write_all(crate::process::encode(&asked).as_bytes())?;
-                    command.env(LOAD_ENV, file);
-                }
+                command.env(LOAD_ENV, &file);
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -769,19 +780,14 @@ impl Worker {
         // A client says all of its variables (`asking`): one it has not is not one the process
         // asking has, whatever the daemon, started by another, was started with. A request
         // that says none has the worker's own.
-        let mut env = match checkout.env.is_empty() {
-            true => self.env.clone(),
-            false => ide_db::base_db::Env::default(),
-        };
-        for (name, value) in &checkout.env {
-            env.set(name, value);
-        }
-        if build != 0 {
-            env.set(BUILD, build.to_string());
-        }
+        let env = checkout
+            .native_env
+            .clone()
+            .unwrap_or_else(|| self.env.clone())
+            .over(checkout.env.iter().map(|(k, v)| (k.into(), v.into())));
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream
-            .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
+            .write_all(format!("{}\n", crate::process::encode_native(&env, build)).as_bytes())
             .with_context(failed)?;
         let mut reply = String::new();
         BufReader::new(stream).read_line(&mut reply).with_context(failed)?;
@@ -929,12 +935,20 @@ impl Spare {
         config: &WorkerConfig,
         cwd: &Path,
         ahead: bool,
+        native_env: Option<crate::process::Native>,
+        load_env: Option<PathBuf>,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told =
-                crate::Told { args: args?, env: config.env.clone(), cwd: cwd.to_owned(), ahead };
+            let told = crate::Told {
+                args: args?,
+                env: config.env.clone(),
+                native_env,
+                load_env,
+                cwd: cwd.to_owned(),
+                ahead,
+            };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -988,6 +1002,9 @@ impl Checker {
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
         let mut command = Command::new(std::env::current_exe()?);
+        if let Some(env) = &ahead.native_env {
+            env.apply(&mut command);
+        }
         clear_worker_memory(&mut command);
         command.args(&args);
         match store() {
@@ -1633,7 +1650,15 @@ impl Daemon {
     /// by loading it again. The one asked longest ago makes way for it when there are
     /// [`CHECKERS`].
     fn check(&self, ahead: &Ahead) -> Reply {
-        let id = ahead.config.id();
+        // Checkers have no per-request source/environment turn. A different client
+        // snapshot must load a different checker, not inherit its predecessor's values.
+        let id = Sha256::digest(
+            serde_json::to_vec(&(&ahead.config, &ahead.native_env)).expect("checker identity"),
+        )
+        .iter()
+        .take(8)
+        .map(|it| format!("{it:02x}"))
+        .collect::<String>();
         let mut held = lock(&self.checkers);
         held.retain_mut(|it| {
             let ended = it.ended().is_some();
@@ -1689,7 +1714,8 @@ impl Daemon {
         let Some(spare) = waiting.or_else(|| self.new_spare()) else { return };
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
         args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config, &ahead.root, true)
+        if let Some(spare) =
+            spare.told(&args, &ahead.config, &ahead.root, true, ahead.native_env.clone(), None)
             && let Some(mut other) = lock(&self.ahead).insert(id, spare)
         {
             other.stop();
@@ -1957,7 +1983,7 @@ mod tests {
             project: checkout.project(),
             socket: dir.path().join("unused.sock"),
             log: dir.path().join("log"),
-            env: crate::process::own(),
+            env: crate::process::Native::own(),
             child: Mutex::new(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
             checkouts: Mutex::new(FxHashMap::from_iter([(
                 checkout.key.clone(),
@@ -2058,6 +2084,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn requests_that_ask_at_once_each_say_their_own_build() {
+        use std::os::unix::ffi::OsStringExt as _;
         use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!("ra-jit-daemon-builds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2074,7 +2101,14 @@ mod tests {
                 let (mut sync, mut env) = (String::new(), String::new());
                 reader.read_line(&mut sync).unwrap();
                 reader.read_line(&mut env).unwrap();
-                builds.push(crate::process::decode_request(env.trim_end()).1);
+                let (env, build) = crate::process::decode_native(env.trim_end()).unwrap();
+                let env = env.vars().collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    env[std::ffi::OsStr::new("BYTE_VALUE")],
+                    OsString::from_vec(vec![0xff, build as u8])
+                );
+                assert!(!env.contains_key(std::ffi::OsStr::new("DAEMON_ONLY")));
+                builds.push(build);
                 streams.push(stream);
             }
             for mut stream in streams {
@@ -2088,7 +2122,7 @@ mod tests {
             project: dir.clone(),
             socket,
             log: dir.join("log"),
-            env: ide_db::base_db::Env::default(),
+            env: crate::process::Native::of([("DAEMON_ONLY".into(), "not-the-client".into())]),
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::default()),
             asked: Mutex::new(Instant::now()),
@@ -2127,11 +2161,33 @@ mod tests {
             programs: vec![plan.clone()],
             sources: Vec::new(),
             env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
+            native_env: None,
             scripts: None,
         };
+        let checkout_for = |build| {
+            let native_env = Some(crate::process::Native::of([
+                ("BYTE_VALUE".into(), OsString::from_vec(vec![0xff, build])),
+                ("EMPTY".into(), OsString::new()),
+            ]));
+            let checkout = Checkout { native_env, ..checkout.clone() };
+            let wire = serde_json::to_string(&Envelope {
+                version: "test".into(),
+                replaces: false,
+                request: Request::Build(checkout),
+            })
+            .unwrap();
+            let Envelope { request: Request::Build(checkout), .. } =
+                serde_json::from_str(&wire).unwrap()
+            else {
+                panic!("build envelope")
+            };
+            checkout
+        };
+        let first_checkout = checkout_for(5);
+        let second_checkout = checkout_for(6);
         let answers = std::thread::scope(|scope| {
-            let first = scope.spawn(|| worker.ask(&checkout, &plan, 5));
-            let second = scope.spawn(|| worker.ask(&checkout, &plan, 6));
+            let first = scope.spawn(|| worker.ask(&first_checkout, &plan, 5));
+            let second = scope.spawn(|| worker.ask(&second_checkout, &plan, 6));
             [first.join().unwrap().unwrap(), second.join().unwrap().unwrap()]
         });
         assert!(answers.iter().all(|it| it.as_ref().is_ok_and(|it| it == "ok")));

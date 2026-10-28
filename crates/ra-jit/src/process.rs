@@ -7,6 +7,193 @@ use ide_db::{
     base_db::{Crate, Env, ProcessEnv, process_env_var, set_process_env},
 };
 
+use std::{cell::RefCell, collections::BTreeMap, ffi::OsString, process::Command};
+
+/// Native process variables at child-process boundaries. Source inputs use `unicode`
+/// separately. A vector on the wire preserves non-Unicode keys, unlike a JSON object.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct Native(Vec<(OsString, OsString)>);
+
+impl serde::Serialize for Native {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.encoded())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Native {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::decoded(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The canonical native snapshot schema is `(platform, [(key-bytes, value-bytes)])`.
+/// Hex is framing for the existing line socket, not the identity/encoding of the snapshot.
+type NativeWire = (u8, u8, Vec<(blaze_wire::Bytes, blaze_wire::Bytes)>);
+
+#[cfg(unix)]
+fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Ok(OsString::from_vec(value))
+}
+
+#[cfg(windows)]
+fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+    value.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+#[cfg(windows)]
+fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+    use std::os::windows::ffi::OsStringExt as _;
+    if value.len() % 2 != 0 {
+        return Err("invalid native environment");
+    }
+    Ok(OsString::from_wide(
+        &value.chunks_exact(2).map(|it| u16::from_le_bytes([it[0], it[1]])).collect::<Vec<_>>(),
+    ))
+}
+
+impl std::fmt::Debug for Native {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Native")
+            .field("names", &self.0.iter().map(|it| &it.0).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl Native {
+    fn encoded(&self) -> String {
+        let wire: NativeWire = (
+            1,
+            u8::from(cfg!(windows)),
+            self.0
+                .iter()
+                .map(|(k, v)| {
+                    (blaze_wire::Bytes::new(os_bytes(k)), blaze_wire::Bytes::new(os_bytes(v)))
+                })
+                .collect(),
+        );
+        blaze_wire::encode(&wire).iter().map(|it| format!("{it:02x}")).collect()
+    }
+
+    fn decoded(text: &str) -> Result<Self, &'static str> {
+        let fail = "invalid native environment";
+        if text.len() % 2 != 0 || text.len() > crate::socket::LONGEST_REQUEST as usize {
+            return Err(fail);
+        }
+        let bytes = text
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let nibble = |it| match it {
+                    b'0'..=b'9' => Ok(it - b'0'),
+                    b'a'..=b'f' => Ok(it - b'a' + 10),
+                    _ => Err(fail),
+                };
+                Ok(nibble(pair[0])? * 16 + nibble(pair[1])?)
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        let wire: NativeWire =
+            blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED).map_err(|_| fail)?;
+        if wire.0 != 1 || wire.1 != u8::from(cfg!(windows)) {
+            return Err(fail);
+        }
+        let vars = wire
+            .2
+            .into_iter()
+            .map(|(k, v)| {
+                if k.bytes.is_empty() {
+                    return Err(fail);
+                }
+                #[cfg(unix)]
+                if k.bytes.contains(&0) || v.bytes.contains(&0) || k.bytes.contains(&b'=') {
+                    return Err(fail);
+                }
+                #[cfg(windows)]
+                if k.bytes.chunks_exact(2).chain(v.bytes.chunks_exact(2)).any(|it| it == [0, 0]) {
+                    return Err(fail);
+                }
+                Ok((from_os_bytes(k.bytes)?, from_os_bytes(v.bytes)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = Self::of(vars.clone());
+        if result.0 != vars {
+            return Err(fail);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn of(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Self(vars.into_iter().collect::<BTreeMap<_, _>>().into_iter().collect())
+    }
+
+    pub(crate) fn own() -> Self {
+        Self::of(std::env::vars_os())
+    }
+
+    pub(crate) fn vars(&self) -> impl Iterator<Item = (OsString, OsString)> + '_ {
+        self.0.iter().cloned()
+    }
+
+    pub(crate) fn unicode(&self) -> Env {
+        unicode(self.vars()).collect()
+    }
+
+    pub(crate) fn over(&self, vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Self::of(self.vars().chain(vars))
+    }
+
+    pub(crate) fn apply(&self, command: &mut Command) {
+        command.env_clear().envs(self.vars());
+    }
+}
+
+thread_local! {
+    /// The operation running on this thread. Detached children capture it before leaving
+    /// the thread, never consult mutable process-global variables.
+    static NATIVE: RefCell<Option<Native>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn native() -> Native {
+    NATIVE.with(|it| it.borrow().clone()).unwrap_or_else(Native::own)
+}
+
+pub(crate) struct NativeScope(Option<Native>, std::marker::PhantomData<std::rc::Rc<()>>);
+
+pub(crate) fn enter_native(env: Native) -> NativeScope {
+    NativeScope(NATIVE.with(|it| it.replace(Some(env))), std::marker::PhantomData)
+}
+
+impl Drop for NativeScope {
+    fn drop(&mut self) {
+        NATIVE.with(|it| it.replace(self.0.take()));
+    }
+}
+
+/// The native worker protocol is tagged so existing Unicode socket clients remain readable.
+const NATIVE_LINE: &str = "native-env-v1:";
+
+pub(crate) fn encode_native(env: &Native, build: u64) -> String {
+    format!("{NATIVE_LINE}{}", serde_json::to_string(&(env, build)).expect("native environment"))
+}
+
+pub(crate) fn decode_native(line: &str) -> Result<(Native, u64), &'static str> {
+    match line.strip_prefix(NATIVE_LINE) {
+        Some(line) => serde_json::from_str(line).map_err(|_| "invalid native request environment"),
+        None => {
+            let (env, build) = decode_request(line);
+            Ok((Native::of(env.iter().map(|(k, v)| (k.into(), v.into()))), build))
+        }
+    }
+}
+
 /// Between two variables on the line of a request.
 const BETWEEN: char = '\u{1f}';
 
@@ -18,7 +205,7 @@ pub(crate) fn own() -> Env {
 /// The Unicode view used by source inputs, configuration and local identities.
 /// Ignore non-Unicode pairs consistently rather than panicking in `env::vars`.
 pub(crate) fn vars() -> impl Iterator<Item = (String, String)> {
-    unicode(std::env::vars_os())
+    unicode(native().0)
 }
 
 pub(crate) fn unicode(
@@ -111,6 +298,61 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_requests_preserve_bytes_absence_and_build_without_logging_values() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = OsString::from_vec(vec![0xff, b'\n', b'\t']);
+        let secret = "c4-native-secret-not-a-real-token";
+        let env = Native::of([
+            ("TOKEN".into(), secret.into()),
+            ("EMPTY".into(), OsString::new()),
+            ("BYTE_VALUE".into(), bad.clone()),
+            (bad.clone(), "byte-key".into()),
+        ]);
+        let serialized = serde_json::to_string(&env).unwrap();
+        assert_eq!(serde_json::from_str::<Native>(&serialized).unwrap(), env);
+        let line = encode_native(&env, 42);
+        assert!(!line.contains(['\n', '\t']));
+        assert_eq!(decode_native(&line).unwrap(), (env.clone(), 42));
+        assert!(!format!("{env:?}").contains(secret));
+        assert!(!decode_native("native-env-v1:bad-secret").unwrap_err().contains("bad-secret"));
+        assert_eq!(env.unicode().get("EMPTY"), Some(String::new()));
+        assert_eq!(env.unicode().get("BYTE_VALUE"), None);
+        let mut command = Command::new("/usr/bin/printenv");
+        command.env("DAEMON_ONLY", "must-not-leak");
+        env.apply(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.windows(b"DAEMON_ONLY".len()).any(|it| it == b"DAEMON_ONLY"));
+        let mut want = b"BYTE_VALUE=".to_vec();
+        want.extend(bad.into_vec());
+        want.push(b'\n');
+        assert!(output.stdout.windows(want.len()).any(|it| it == want));
+        let empty = Native::default();
+        assert_eq!(decode_native(&encode_native(&empty, 0)).unwrap(), (empty, 0));
+        assert_eq!(decode_native("A=1").unwrap().0.unicode().get("A"), Some("1".to_owned()));
+    }
+
+    #[test]
+    fn native_operation_scopes_restore_and_do_not_cross_threads() {
+        let first = Native::of([("INPUT".into(), "first".into())]);
+        let second = Native::of([("INPUT".into(), "second".into())]);
+        let _first = enter_native(first.clone());
+        {
+            let _second = enter_native(second.clone());
+            assert_eq!(native(), second);
+        }
+        assert_eq!(native(), first);
+        std::thread::spawn(move || {
+            let _second = enter_native(second.clone());
+            assert_eq!(native(), second);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(native(), first);
+    }
 
     #[cfg(unix)]
     #[test]

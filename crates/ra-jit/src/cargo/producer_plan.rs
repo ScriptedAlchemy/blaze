@@ -171,7 +171,7 @@ impl Producers {
             explicit_target: selection.target.is_some(),
             packages: Some(&packages),
         };
-        let mut raw: BTreeMap<_, _> = std::env::vars_os().collect();
+        let mut raw: BTreeMap<_, _> = crate::process::native().vars().collect();
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));
         raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
         raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));

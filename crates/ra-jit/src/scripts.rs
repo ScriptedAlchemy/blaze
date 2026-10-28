@@ -234,7 +234,10 @@ pub(crate) fn own() -> bool {
 pub(crate) fn load_env() -> BTreeMap<String, String> {
     let told = std::env::var_os(crate::cargo::daemon::LOAD_ENV);
     match told.and_then(|it| std::fs::read_to_string(it).ok()) {
-        Some(line) => crate::process::decode(line.trim_end_matches('\n'))
+        Some(line) => crate::process::decode_native(line.trim_end_matches('\n'))
+            .expect("native load environment")
+            .0
+            .unicode()
             .iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect(),
@@ -248,6 +251,7 @@ pub(crate) fn load_env() -> BTreeMap<String, String> {
 pub(crate) struct Own {
     /// The variables of the process the load was for.
     pub(crate) env: BTreeMap<String, String>,
+    pub(crate) native_env: crate::process::Native,
     pub(crate) profile: String,
     pub(crate) config: Vec<String>,
     pub(crate) host: String,
@@ -576,7 +580,7 @@ impl<'a> Runner<'a> {
             host_flags,
             cross,
             config_env,
-            raw_env: BTreeMap::new(),
+            raw_env: crate::process::native().vars().collect(),
             profiles,
             rustc,
             done: FxHashMap::default(),

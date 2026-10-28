@@ -425,7 +425,7 @@ impl Staged {
                 env: worker_env(),
                 whole: false,
             };
-            daemon::Ahead { config, crates: roots.clone(), root }
+            daemon::Ahead { config, crates: roots.clone(), root, native_env: None }
         });
         Ok(Ok(Staged { roots, ahead }))
     }
@@ -458,7 +458,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         env: worker_env(),
         whole: false,
     };
-    Ok(daemon::Ahead { config, crates, root })
+    Ok(daemon::Ahead { config, crates, root, native_env: None })
 }
 
 impl Built {
@@ -916,6 +916,7 @@ impl State {
             programs: Vec::new(),
             sources: Vec::new(),
             env: env.clone(),
+            native_env: None,
             scripts: scripts.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
