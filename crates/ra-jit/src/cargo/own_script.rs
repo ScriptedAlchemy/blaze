@@ -12,6 +12,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -254,10 +255,25 @@ fn build(
 ) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
     let project = dir.join("rust-project.json");
-    std::fs::write(&project, described).map_err(|it| it.to_string())?;
+    let mut public: Value = serde_json::from_str(described).map_err(|it| it.to_string())?;
+    for krate in public["crates"].as_array_mut().ok_or("project crates")? {
+        krate["env_names"] = json!(
+            krate["env"].as_object().map(|it| it.keys().collect::<Vec<_>>()).unwrap_or_default()
+        );
+        krate["env"] = json!({});
+    }
+    std::fs::write(&project, public.to_string()).map_err(|it| it.to_string())?;
     let executable = std::env::current_exe().map_err(|it| it.to_string())?;
     let mut ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
-    let built = ra_jit.output().map_err(|it| format!("ra-jit did not run: {it}"))?;
+    ra_jit.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = ra_jit.spawn().map_err(|it| format!("ra-jit did not run: {it}"))?;
+    let sent = child.stdin.take().ok_or("project pipe")?.write_all(described.as_bytes());
+    if let Err(error) = sent {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("sending owned project: {error}"));
+    }
+    let built = child.wait_with_output().map_err(|it| format!("waiting for ra-jit: {it}"))?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
@@ -502,7 +518,9 @@ fn read_otherwise(
     info: &crate::dep_info::DepInfo,
     rustc_has: impl Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
-    match info.env.iter().find(|(name, value)| rustc_has(name) != *value) {
+    match info.env.iter().find(|(name, value)| {
+        !crate::env_identity::matches(rustc_has(name).as_deref(), value.as_deref())
+    }) {
         Some((name, _)) => Err(format!("it reads `{name}`, which ra-jit's build is not given")),
         None => Ok(()),
     }

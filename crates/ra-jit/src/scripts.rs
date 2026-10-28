@@ -230,20 +230,23 @@ pub(crate) fn own() -> bool {
     OWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The variables of the process whose build started this worker, which its load runs the
-/// scripts with (`daemon::LOAD_ENV`); this process's own when none is said.
+static LOAD_ENV: std::sync::OnceLock<crate::process::Native> = std::sync::OnceLock::new();
+
+pub(crate) fn set_load_env(env: crate::process::Native) {
+    assert!(LOAD_ENV.set(env).is_ok(), "load environment already set");
+}
+
+pub(crate) fn load_native_env() -> crate::process::Native {
+    LOAD_ENV.get().cloned().unwrap_or_else(crate::process::native)
+}
+
+/// The load snapshot is in memory before loading starts. Lazy readers never open a file.
 pub(crate) fn load_env() -> BTreeMap<String, String> {
-    let told = std::env::var_os(crate::cargo::daemon::LOAD_ENV);
-    match told.and_then(|it| std::fs::read_to_string(it).ok()) {
-        Some(line) => crate::process::decode_native(line.trim_end_matches('\n'))
-            .expect("native load environment")
-            .0
-            .unicode()
-            .iter()
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-            .collect(),
-        None => crate::process::vars().collect(),
-    }
+    load_native_env()
+        .unicode()
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
 }
 
 /// What a whole build's load asked its scripts for, owned, for the builds after it to ask
@@ -826,9 +829,12 @@ impl<'a> Runner<'a> {
             deps: std::iter::once(("build-script-build".to_owned(), compiled.0))
                 .chain(deps.iter().map(|(name, hash, _)| (name.clone(), *hash)))
                 .collect(),
-            local: fresh::local(said.as_ref(), &package_dir, &|name| self.value(name), &|| {
-                self.package_fingerprint(package)
-            }),
+            local: fresh::local(
+                said.as_ref(),
+                &package_dir,
+                &|name| self.value_identity(name),
+                &|| self.package_fingerprint(package),
+            ),
         };
         let was: Option<Fingerprint> =
             std::fs::read(&record).ok().and_then(|it| serde_json::from_slice(&it).ok());
@@ -890,7 +896,8 @@ impl<'a> Runner<'a> {
                     files: printed.rerun_if_changed.clone(),
                     env: printed.rerun_if_env_changed.clone(),
                 };
-                let after = fresh::after_run(&now, &reads, &package_dir, &|name| self.value(name));
+                let after =
+                    fresh::after_run(&now, &reads, &package_dir, &|name| self.value_identity(name));
                 let json = serde_json::to_vec(&after).map_err(|it| it.to_string())?;
                 std::fs::write(&record, json)
                     .map_err(|it| format!("{}: {it}", record.display()))?;
@@ -1159,8 +1166,18 @@ impl<'a> Runner<'a> {
             .map_err(|it| format!("{}: {it}", inputs.display()))?;
         let read =
             crate::dep_info::DepInfo::parse(&std::fs::read_to_string(&inputs).unwrap_or_default());
-        let env: Vec<(String, Option<String>)> =
-            read.env.iter().filter(|(name, _)| !set_for_crates(name)).cloned().collect();
+        let env: Vec<(String, Option<String>)> = read
+            .env
+            .iter()
+            .filter(|(name, _)| !set_for_crates(name))
+            .map(|(name, _)| {
+                (
+                    name.clone(),
+                    crate::env_identity::value(self.compiled_with(name).as_deref())
+                        .expect("environment freshness identity"),
+                )
+            })
+            .collect();
         let record_json = json!({ "fingerprint": fingerprint, "env": env });
         std::fs::write(&record, record_json.to_string())
             .map_err(|it| format!("{}: {it}", record.display()))?;
@@ -1194,7 +1211,10 @@ impl<'a> Runner<'a> {
         }
         let env: Vec<(String, Option<String>)> =
             serde_json::from_value(record["env"].clone()).ok()?;
-        if env.iter().any(|(name, was)| self.compiled_with(name) != *was) {
+        if env.iter().any(|(name, was)| {
+            crate::env_identity::value(self.compiled_with(name).as_deref()).ok().as_ref()
+                != Some(was)
+        }) {
             return None;
         }
         Some(made)
@@ -1207,6 +1227,11 @@ impl<'a> Runner<'a> {
             || name.starts_with("RUSTC_")
             || name.starts_with("RA_JIT_");
         if theirs { None } else { self.value(name) }
+    }
+
+    fn value_identity(&self, name: &str) -> Option<String> {
+        crate::env_identity::value(self.value(name).as_deref())
+            .expect("environment freshness identity")
     }
 
     /// Adds the library of `package` and what it links to `crates`, as a build script's

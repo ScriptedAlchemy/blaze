@@ -49,7 +49,7 @@ run's whole process tree. Heavy work: run it as
 
 Python 3 standard library only. macOS and Linux.
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, base64, hashlib, json, os, re, secrets, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.dirname(HERE)
@@ -555,6 +555,43 @@ def valid_macro_mutation(step, same_size, same_mtime, before, after,
         return before == after and old_dylibs == dylibs and reloads == old_reloads
     return reloads == old_reloads
 
+def token_scan(roots, token):
+    """Scan while the daemon home still exists. Results never contain the token.
+
+    Native load framing is hex CBOR. Also catch plain, JSON-escaped, UTF-16
+    and base64 at every byte alignment. Overlapping roots count files once.
+    """
+    raw = token.encode()
+    forms = {"plain": raw, "hex": raw.hex().encode(), "HEX": raw.hex().upper().encode(),
+             "utf16le": token.encode("utf-16-le"), "utf16be": token.encode("utf-16-be"),
+             "json": json.dumps(token)[1:-1].encode()}
+    for index in range(3):
+        encoded = base64.b64encode(b"\0" * index + raw)
+        forms[f"base64-{index}"] = encoded[4 if index else 0:][:(len(raw) * 4) // 3 - 4]
+    hits, errors, seen = [], [], set()
+    for root in roots:
+        for directory, _, names in os.walk(root):
+            for name in names:
+                path = os.path.realpath(os.path.join(directory, name))
+                if path in seen or not os.path.isfile(path):
+                    continue
+                seen.add(path)
+                try:
+                    with open(path, "rb") as source:
+                        tail = b""
+                        found = set()
+                        while True:
+                            block = source.read(1024 * 1024)
+                            if not block:
+                                break
+                            data = tail + block
+                            found.update(form for form, needle in forms.items() if needle in data)
+                            tail = data[-max(map(len, forms.values())):]
+                    hits.extend(dict(path=path, encoding=form) for form in sorted(found))
+                except OSError:
+                    errors.append(path)
+    return dict(scanned=len(seen), hits=hits, errors=errors, roots=roots)
+
 def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     from cargo_ra_jit import Side, program_output, wait_warm
     import norustc
@@ -567,6 +604,8 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
         output.write(text)
     env = machine.env(bin_dir, os.path.join(machine.top, "macro-store"), daemon_home("pm", "a"),
                       FIXTURES["macros"].get("env"))
+    token = "c4-witness-" + secrets.token_hex(24)
+    env["C4_PLANTED_TOKEN"] = token
     audit_log = os.path.join(work, "product-tools.log")
     audit_bin = norustc.stand_ins(os.path.join(work, "product-audit"), audit_log)
     env["PATH"] = os.path.join(audit_bin, "bin") + os.pathsep + env["PATH"]
@@ -655,8 +694,20 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
                              retention=retention,
                              product_tool_calls=norustc.runs(audit_log)[audit_before:],
                              dylibs=dylibs))
+            # This must precede stop/cleanup, especially DAEMON_ROOT removal in main.
+            scan = token_scan([work, env["RA_JIT_HOME"], env["RA_JIT_CACHE"]], token)
+            rows[-1]["token_scan"] = scan
+            rows[-1]["right"] &= not scan["hits"] and not scan["errors"]
     finally:
+        scan = token_scan([work, env["RA_JIT_HOME"], env["RA_JIT_CACHE"]], token)
+        with open(os.path.join(work, "token-scan-before-stop.json"), "w") as output:
+            json.dump(scan, output, indent=1)
         side.cargo("stop")
+        scan = token_scan([work, env["RA_JIT_HOME"], env["RA_JIT_CACHE"]], token)
+        with open(os.path.join(work, "token-scan-after-stop.json"), "w") as output:
+            json.dump(scan, output, indent=1)
+        if rows:
+            rows[-1]["right"] &= not scan["hits"] and not scan["errors"]
         with open(os.path.join(work, "snapshot-cleanup.json"), "w") as output:
             json.dump(dict(owned_files=[os.path.relpath(os.path.join(root, name), env["RA_JIT_HOME"])
                                        for root, _, files in os.walk(os.path.join(env["RA_JIT_HOME"], "macro-snapshots"))
@@ -1225,6 +1276,15 @@ def self_test():
     check("zero-call wrong output still fails strict rows",
           not strict_macro_rows([dict(right=False, product_tool_calls=[])]))
     check("missing witness fails strict rows", not strict_macro_rows([]))
+    with tempfile.TemporaryDirectory() as root:
+        token = "synthetic-scanner-credential"
+        with open(os.path.join(root, "load-env"), "wb") as output:
+            output.write(token.encode().hex().encode())
+        scan = token_scan([root, root], token)
+        check("live token scan catches hex CBOR and overlapping roots", scan["scanned"] == 1
+              and len(scan["hits"]) == 1 and scan["hits"][0]["encoding"] == "hex")
+        os.unlink(os.path.join(root, "load-env"))
+        check("clean token scan passes", not token_scan([root], token)["hits"])
 
     h = lambda s: hashlib.sha256(s.encode()).hexdigest()
     id_a, id_b = h("crate a")[:16], h("crate b")[:16]

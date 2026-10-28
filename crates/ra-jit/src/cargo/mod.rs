@@ -7,7 +7,7 @@ pub(crate) mod wrapper;
 mod affected;
 mod ancestor;
 mod cli;
-mod client;
+pub(crate) mod client;
 mod messages;
 pub(crate) mod metadata;
 pub(crate) mod own_macro;

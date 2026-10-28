@@ -413,7 +413,7 @@ impl Remembered {
         let same_file = |(file, was): &(PathBuf, _)| stamp(file) == *was;
         let same_variable = |(name, was): &(String, Option<String>)| {
             let given = env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str());
-            given.or_else(|| asked.var(name)) == was.as_deref()
+            crate::env_identity::value(given.or_else(|| asked.var(name))).ok().as_ref() == Some(was)
         };
         (it.files.iter().all(same_file) && it.env.iter().all(same_variable)).then_some(it.compiled)
     }
@@ -429,7 +429,17 @@ impl Remembered {
         let it = Remembered {
             compiled: Compiled { success: compiled.success, stderr: compiled.stderr.clone() },
             files: files.collect(),
-            env: read.env,
+            env: read
+                .env
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name,
+                        crate::env_identity::captured(value.as_deref())
+                            .expect("doctest freshness identity"),
+                    )
+                })
+                .collect(),
         };
         let Ok(text) = serde_json::to_vec(&it) else { return };
         let written = dir.join(format!("{}.{}", Self::FILE, std::process::id()));
@@ -474,14 +484,17 @@ fn var_in<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a str> {
 struct Recorded {
     args: Vec<OsString>,
     cwd: PathBuf,
+    #[serde(skip)]
     env: Vec<(OsString, OsString)>,
+    #[serde(default)]
+    env_names: Vec<String>,
 }
 
 impl Recorded {
     /// The run this process is.
     fn own(args: Vec<OsString>) -> anyhow::Result<Recorded> {
         let env = std::env::vars_os().filter(|(name, _)| name != RECORD).collect();
-        Ok(Recorded { args, cwd: std::env::current_dir()?, env })
+        Ok(Recorded { args, cwd: std::env::current_dir()?, env, env_names: Vec::new() })
     }
 
     fn var(&self, name: &str) -> Option<&str> {
@@ -522,7 +535,20 @@ impl Recorded {
     fn write(&self, dir: &Path) -> anyhow::Result<()> {
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
         let file = dir.join(format!("{:039}-{}.json", since.as_nanos(), std::process::id()));
-        std::fs::write(file, serde_json::to_vec(self)?)?;
+        crate::cargo::client::ask(
+            crate::cargo::daemon::Request::RememberScript {
+                dir: file.clone(),
+                env: crate::process::Native::of(self.env.clone()),
+            },
+            crate::cargo::client::Start::Never,
+        )?;
+        let kept = Recorded {
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
+            env: Vec::new(),
+            env_names: self.env.iter().map(|(name, _)| crate::env_identity::name(name)).collect(),
+        };
+        std::fs::write(file, serde_json::to_vec(&kept)?)?;
         Ok(())
     }
 
@@ -534,7 +560,14 @@ impl Recorded {
         }
         files.retain(|it| it.extension().is_some_and(|it| it == "json"));
         files.sort();
-        let read = |file: &PathBuf| Ok(serde_json::from_slice(&std::fs::read(file)?)?);
+        let read = |file: &PathBuf| {
+            let mut kept: Recorded = serde_json::from_slice(&std::fs::read(file)?)?;
+            kept.env = crate::cargo::script::environment(file)
+                .context("doctest environment is no longer in daemon memory")?
+                .vars()
+                .collect();
+            Ok(kept)
+        };
         files.iter().map(read).collect()
     }
 }

@@ -11,6 +11,7 @@ mod content;
 mod dep_info;
 mod deps;
 mod doctest;
+mod env_identity;
 mod errors;
 mod frozen;
 mod inputs;
@@ -3272,7 +3273,23 @@ fn workspace_at(
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut config = cargo_config.clone();
-    let mut workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
+    let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && matches!(manifest, ProjectManifest::ProjectJson(_))
+    {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        let data: project_model::ProjectJsonData = serde_json::from_str(&text)
+            .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
+        let json = project_model::ProjectJson::new(
+            Some(manifest.manifest_path().to_owned()),
+            manifest.manifest_path().parent(),
+            data,
+        );
+        ProjectWorkspace::load_inline(json, &config, &|_| {})?
+    } else {
+        ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?
+    };
     // Discover the actual producer closure on both cold and reload paths before
     // choosing the existing compile-time producer operation's output directory.
     let mut generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
@@ -4969,8 +4986,8 @@ fn write_dep_info_of(
     for file in &escaped {
         text += &format!("{file}:\n");
     }
-    // The variables `env!` and `option_env!` read, with what each was, so that cargo builds
-    // again when one changes.
+    // Keyed identities, not values. Freshness readers can compare what source
+    // read without retaining credentials in dep-info.
     let mut env: Vec<(String, Option<String>)> = db
         .env_read()
         .into_iter()
@@ -4988,10 +5005,8 @@ fn write_dep_info_of(
     }
     for (key, value) in env {
         let key = dep_info::escaped_variable(&key);
-        match value {
-            Some(value) => {
-                text += &format!("# env-dep:{key}={}\n", dep_info::escaped_variable(&value))
-            }
+        match env_identity::value(value.as_deref())? {
+            Some(identity) => text += &format!("# env-dep:{key}={identity}\n"),
             None => text += &format!("# env-dep:{key}\n"),
         }
     }
@@ -7949,6 +7964,14 @@ fn main() -> anyhow::Result<()> {
         trace::install();
         return spare(Path::new(&dir));
     }
+    // Read exactly one load line before end_with_input can consume stdin. Keep it
+    // for scripts::load_env and run_holding, whose load happens later.
+    if std::env::var_os(cargo::daemon::LOAD_ENV).is_some() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let (env, _) = process::decode_native(line.trim_end()).map_err(anyhow::Error::msg)?;
+        scripts::set_load_env(env);
+    }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);
     }
@@ -8255,7 +8278,7 @@ pub(crate) struct Told {
     #[serde(default)]
     pub(crate) native_env: Option<process::Native>,
     #[serde(default)]
-    pub(crate) load_env: Option<PathBuf>,
+    pub(crate) load_env: Option<process::Native>,
     pub(crate) cwd: PathBuf,
     /// The build is one cargo has only started: these are the workspace and its crates, and
     /// what cargo wrote is in the arguments of the line that follows.
@@ -8605,9 +8628,8 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(file) = &told.load_env {
-        // SAFETY: the spare's library-loading threads have ended.
-        unsafe { std::env::set_var(cargo::daemon::LOAD_ENV, file) };
+    if let Some(env) = told.load_env {
+        scripts::set_load_env(env);
     }
     for (name, value) in &told.env {
         // SAFETY: the threads that loaded the library have ended, and the ones that remain
@@ -8655,14 +8677,7 @@ fn run_holding(
 ) -> anyhow::Result<()> {
     // A build that links the program itself, a whole build's worker among them, runs the
     // build scripts of the workspace it loads itself.
-    let native = match std::env::var_os(cargo::daemon::LOAD_ENV) {
-        Some(file) => {
-            process::decode_native(std::fs::read_to_string(file)?.trim_end())
-                .map_err(anyhow::Error::msg)?
-                .0
-        }
-        None => process::Native::own(),
-    };
+    let native = scripts::load_native_env();
     let _native = process::enter_native(native);
     scripts::set_own(args.exe.is_some());
     // As cargo does: the flag, then the environment, then the host.

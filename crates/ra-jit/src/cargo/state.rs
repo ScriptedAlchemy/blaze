@@ -248,8 +248,11 @@ impl Guard {
             Guard::AsLeft { file, written } => {
                 (written_at(file) != *written).then(|| format!("{} changed", file.display()))
             }
-            Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
-                .then(|| format!("the environment variable {name} changed")),
+            Guard::Env { name, value } => {
+                (crate::env_identity::value(std::env::var(&*name).ok().as_deref()).ok().as_ref()
+                    != Some(value))
+                .then(|| format!("the environment variable {name} changed"))
+            }
         }
     }
 
@@ -594,9 +597,9 @@ impl State {
     /// is something.
     pub(crate) fn read(key: &str) -> Result<State, Option<&'static str>> {
         let path = State::path(key).map_err(|_| None)?;
-        let text = std::fs::read_to_string(path).map_err(|_| None)?;
+        let value = crate::env_identity::read_json(&path).map_err(|_| None)?;
         let another = "this build's state was written by another build of ra-jit";
-        let state = serde_json::from_str::<State>(&text).map_err(|_| another)?;
+        let state = serde_json::from_value::<State>(value).map_err(|_| another)?;
         if state.version != daemon::version() {
             return Err(Some(another));
         }
@@ -651,7 +654,7 @@ impl State {
         let path = State::path(&self.key)?;
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
-        std::fs::write(&new, serde_json::to_vec(self)?)?;
+        std::fs::write(&new, crate::env_identity::disk_json(&path, &serde_json::to_value(self)?)?)?;
         std::fs::rename(&new, &path)?;
         for unit in self.programs.iter().filter_map(|it| it.unit.as_deref()) {
             if !State::of_unit(unit).contains(&self.key) {
@@ -1466,7 +1469,13 @@ fn guards(
     };
     for unit in used {
         let env = unit.inputs().env.into_iter().filter(|(name, _)| !set_for_rustc(name));
-        guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
+        guards.extend(
+            env.map(|(name, value)| Guard::Env {
+                name,
+                value: crate::env_identity::captured(value.as_deref())
+                    .expect("environment guard identity"),
+            }),
+        );
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
@@ -1534,7 +1543,8 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
             });
         }
         if let Some(name) = directive(line, "rerun-if-env-changed") {
-            let value = std::env::var(&name).ok();
+            let value = crate::env_identity::value(std::env::var(&name).ok().as_deref())
+                .expect("environment guard identity");
             variables.push(Guard::Env { name, value });
         }
     }

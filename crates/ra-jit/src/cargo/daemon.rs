@@ -160,9 +160,8 @@ pub(crate) const BUILD: &str = "RA_JIT_BUILD";
 /// The variable that tells a worker which build started it, whose load runs the scripts for it.
 pub(crate) const LOAD_BUILD: &str = "RA_JIT_LOAD_BUILD";
 
-/// The variable that names the file of the variables of the process whose build started a
-/// worker ([`crate::process::encode`]): its load runs the build scripts with them, as cargo
-/// run by that process would, and not with the daemon's, which another process started.
+/// A worker with this marker reads its load snapshot from stdin before any reader starts.
+/// Values stay in the pipe and in memory, never in the worker directory.
 pub(crate) const LOAD_ENV: &str = "RA_JIT_LOAD_ENV";
 
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
@@ -204,6 +203,12 @@ pub(crate) enum Request {
     /// `cargo ra-jit check` of a build the daemon has no programs of: what a checker that
     /// loaded the workspace as it would finds in its crates, with no rustc.
     Check(Ahead),
+    /// The legacy script wrapper hands its run environment to daemon memory, not disk.
+    RememberScript {
+        dir: PathBuf,
+        env: crate::process::Native,
+    },
+    ScriptEnvironment(PathBuf),
     Status,
     Stop,
 }
@@ -227,6 +232,7 @@ pub(crate) enum Reply {
         spans: Vec<crate::trace::Span>,
     },
     Warming,
+    ScriptEnvironment(Option<crate::process::Native>),
     /// What the checker of a [`Request::Check`] found: no error, or the errors.
     Checked {
         errors: Option<crate::errors::Said>,
@@ -561,10 +567,7 @@ impl Worker {
             .unwrap_or_else(crate::process::Native::own)
             .over(config.env.iter().map(|(k, v)| (k.into(), v.into())))
             .over([(ENDS_WITH_INPUT.into(), "1".into())]);
-        let file = dir.join("load-env");
         let asked = checkout.native_env.as_ref().unwrap_or(&env);
-        private_file(OpenOptions::new().write(true).create(true).truncate(true), &file)?
-            .write_all(crate::process::encode_native(asked, build).as_bytes())?;
         let told = spare.and_then(|it| {
             it.told(
                 &args,
@@ -572,7 +575,7 @@ impl Worker {
                 &checkout.root,
                 false,
                 Some(env.clone()),
-                Some(file.clone()),
+                Some(asked.clone()),
             )
         });
         let child = match told {
@@ -593,11 +596,20 @@ impl Worker {
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
                 command.env(LOAD_BUILD, build.to_string());
-                command.env(LOAD_ENV, &file);
+                command.env(LOAD_ENV, "stdin");
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
-                command.spawn().context("starting a worker")?
+                let mut child = command.spawn().context("starting a worker")?;
+                let sent = child.stdin.as_mut().context("worker load pipe")?.write_all(
+                    format!("{}\n", crate::process::encode_native(asked, build)).as_bytes(),
+                );
+                if let Err(error) = sent {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("sending worker load environment");
+                }
+                child
             }
         };
         let loading = Loaded {
@@ -936,7 +948,7 @@ impl Spare {
         cwd: &Path,
         ahead: bool,
         native_env: Option<crate::process::Native>,
-        load_env: Option<PathBuf>,
+        load_env: Option<crate::process::Native>,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
@@ -1376,6 +1388,13 @@ impl Daemon {
                 reply
             }
             Request::Check(ahead) => self.check(&ahead),
+            Request::RememberScript { dir, env } => {
+                super::script::remember(dir, env);
+                Reply::Warming
+            }
+            Request::ScriptEnvironment(dir) => {
+                Reply::ScriptEnvironment(super::script::remembered(&dir))
+            }
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
                 version: self.version.clone(),
