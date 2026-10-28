@@ -245,11 +245,33 @@ pub(crate) fn pick(
 /// them, runs as asked.
 fn plain(trailing: &[String]) -> bool {
     let mut args = trailing.iter();
+    let mut seen = BTreeSet::new();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-q" | "--quiet" | "--nocapture" | "--no-capture" | "--show-output" => {}
-            "--test-threads" | "--color" if args.next().is_some() => {}
-            _ if arg.starts_with("--test-threads=") || arg.starts_with("--color=") => {}
+        let (name, value) =
+            arg.split_once('=').map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        let name = match name {
+            "-q" => "--quiet",
+            name => name,
+        };
+        // A cache hit must not turn an invalid libtest invocation into success.
+        // These options are single-use, including -q/--quiet's shared spelling.
+        if !seen.insert(name) {
+            return false;
+        }
+        match name {
+            "--quiet" | "--nocapture" | "--no-capture" | "--show-output" if value.is_none() => {}
+            "--test-threads" | "--color" => {
+                let value = value.or_else(|| args.next().map(String::as_str));
+                let valid = match name {
+                    "--test-threads" => value
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .is_some_and(|threads| threads > 0),
+                    _ => matches!(value, Some("auto" | "always" | "never")),
+                };
+                if !valid {
+                    return false;
+                }
+            }
             _ => return false,
         }
     }
@@ -547,6 +569,27 @@ mod tests {
         assert!(!of(&["--list"]));
         assert!(!of(&["--test-threads"]));
         assert!(!of(&["some_test"]));
+    }
+
+    #[test]
+    fn invalid_libtest_options_cannot_reuse_a_cached_pass() {
+        for args in [
+            vec!["--color=bogus"],
+            vec!["--color", ""],
+            vec!["--color=never", "--color=always"],
+            vec!["--test-threads=0"],
+            vec!["--test-threads=invalid"],
+            vec!["--test-threads=1", "--test-threads=0"],
+            vec!["--test-threads", "1", "--test-threads=2"],
+            vec!["-q", "--quiet"],
+            vec!["--nocapture", "--nocapture"],
+            vec!["--show-output", "--show-output"],
+        ] {
+            assert!(!of(&args), "libtest must diagnose {args:?}, even after a cached pass");
+        }
+        // Libtest registers these two spellings as separate flags.
+        assert!(of(&["--nocapture", "--no-capture"]));
+        assert!(of(&["--test-threads=+1", "--color=auto"]));
     }
 
     fn manifest(text: &str) -> Manifest {

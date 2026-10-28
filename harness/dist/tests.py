@@ -94,6 +94,12 @@ CACHE = [
     ("configured declared environment", [(".cargo/config.toml", 'T1_DECLARED = "first"', 'T1_DECLARED = "second"')],
      None, [], {}, ALL, True),
     ("configured environment unchanged", [], None, [], {}, NONE, True),
+    ("a cached pass cannot hide an invalid color", [], None, ["--color=bogus"], {}, NONE, False),
+    ("a cached pass cannot hide a repeated flag", [], None, ["-q", "--quiet"], {}, NONE, False),
+    ("warm the thread configuration", [], None, ["--test-threads=2"], {}, ALL, True),
+    ("a cached pass cannot hide repeated thread options", [], None,
+     ["--test-threads=2", "--test-threads=0"], {}, NONE, False),
+    ("the valid thread configuration stays cached", [], None, ["--test-threads=2"], {}, NONE, True),
 ]
 # What has to be said (-v) at a step, by its position in CACHE.
 SAYS = {
