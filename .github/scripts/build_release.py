@@ -51,6 +51,22 @@ On Linux every binary in DIR, the server's included, is refused when it asks for
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
 oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
 (GitHub issue #351). install.sh says the same floor to a system below it.
+
+`--artifact-mode` names which contract DIR has to meet, because two artifacts of the same
+recipe are not the same thing:
+
+  portable    (the default, and what `--out` means everywhere else) ships a tarball to unknown
+              systems, so every binary must start on RHEL 9: it is refused when it asks for a
+              glibc newer than `GLIBC`. Do not relax this to make a build pass.
+  nix-native  the package in a Nix derivation, which is bound to the store it was built in and
+              runs only against that store's glibc. Its contract is that binding, not RHEL 9, so
+              it is refused when a binary's loader is not the store's (`PT_INTERP` outside
+              `/nix/store`), and it is accepted only inside a Nix build. The asked-for glibc is
+              reported, not capped.
+
+A Nix build that wants a portable tarball must still ask for `--artifact-mode portable` and
+build on the release's Ubuntu; the mode is a declaration of the artifact, never a way to skip
+a check.
 """
 
 import argparse
@@ -61,6 +77,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -91,9 +108,14 @@ STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # (the crates that did not change below, none of the workspace's), and says nothing.
 CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6ra_jit")
 # The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and
-# how a binary names the versions it asks for (in its dynamic string table).
+# how a binary names the versions it asks for (in its dynamic string table). This is the
+# portable artifact's floor and must not be raised: a tarball has to start on RHEL 9.
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
+# The artifact contracts `--artifact-mode` chooses between (see the module docstring).
+ARTIFACT_MODES = ("portable", "nix-native")
+# Where a Nix build puts the store it linked against; a nix-native artifact must name it.
+NIX_STORE = "/nix/store/"
 
 
 def run(argv, **kwargs):
@@ -290,19 +312,82 @@ def glibc_asked(binary):
     return max(found, default=None)
 
 
+def interpreter(binary):
+    """The `PT_INTERP` path a Linux ELF names, or None when it names none (static or not ELF)."""
+    data = binary.read_bytes()
+    if data[:4] != b"\x7fELF":
+        return None
+    wide = data[4] == 2  # ELFCLASS64
+    if wide:
+        phoff, = struct.unpack_from("<Q", data, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+        # p_offset and p_filesz in an Elf64_Phdr.
+        wide_fmt, wide_off, size_off = "<Q", 0x08, 0x20
+    else:
+        phoff, = struct.unpack_from("<I", data, 0x1C)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x2A)
+        # p_offset and p_filesz in an Elf32_Phdr.
+        wide_fmt, wide_off, size_off = "<I", 0x04, 0x10
+    for i in range(phnum):
+        at = phoff + i * phentsize
+        kind, = struct.unpack_from("<I", data, at)
+        if kind != 3:  # PT_INTERP
+            continue
+        offset, = struct.unpack_from(wide_fmt, data, at + wide_off)
+        size, = struct.unpack_from(wide_fmt, data, at + size_off)
+        return data[offset:offset + size].split(b"\0", 1)[0].decode(errors="replace")
+    return None
+
+
+def elf_binaries(out):
+    """The ELF files in `out`, sorted."""
+    return [p for p in sorted(out.iterdir()) if p.is_file() and p.read_bytes()[:4] == b"\x7fELF"]
+
+
 def check_glibc(out):
-    """Refuses the build when a binary in `out` asks for a glibc newer than `GLIBC`."""
+    """The portable contract: refuses the build when a binary asks for a glibc newer than `GLIBC`."""
     shown = ".".join(map(str, GLIBC))
     newer = []
-    for binary in sorted(out.iterdir()):
-        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
-            asked = glibc_asked(binary)
-            if asked and asked > GLIBC:
-                newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
+    for binary in elf_binaries(out):
+        asked = glibc_asked(binary)
+        if asked and asked > GLIBC:
+            newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
     if newer:
         sys.exit(f"error: build_release: {'; '.join(newer)}, newer than RHEL 9's {shown}, so it does not start "
                  "there: build on Ubuntu 22.04, as the release does")
     print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
+
+
+def check_nix_native(out):
+    """The Nix contract: every binary is bound to the store it was built in.
+
+    A package in a derivation runs only against its own store, so its glibc need not be RHEL
+    9's. What it must be is store-bound: a binary whose interpreter is not under `/nix/store`
+    would be a portable build claiming to be this one. The asked-for glibc is reported so a
+    surprising value is visible, but it is not capped here -- `portable` is that check.
+    """
+    stray, asked = [], []
+    for binary in elf_binaries(out):
+        interp = interpreter(binary)
+        if interp is not None and not interp.startswith(NIX_STORE):
+            stray.append(f"{binary.name} is loaded by {interp}")
+        version = glibc_asked(binary)
+        if version:
+            asked.append(f"{binary.name} glibc {'.'.join(map(str, version))}")
+    if stray:
+        sys.exit(f"error: build_release: {'; '.join(stray)}, outside {NIX_STORE}: a nix-native artifact must be "
+                 "bound to its store; build the portable tarball with --artifact-mode portable")
+    said = f"build_release: the binaries in {out} are bound to {NIX_STORE}"
+    print(f"{said} ({'; '.join(asked)})" if asked else said, flush=True)
+
+
+def check_artifact(out, mode):
+    """Applies the contract `mode` names; anything but a known mode is a caller's error."""
+    if mode == "portable":
+        return check_glibc(out)
+    if mode == "nix-native":
+        return check_nix_native(out)
+    raise SystemExit(f"error: build_release: unknown --artifact-mode {mode!r}; one of {', '.join(ARTIFACT_MODES)}")
 
 
 def main():
@@ -315,8 +400,21 @@ def main():
     parser.add_argument("--features", help="cargo features of ra-jit (`llvm`); a release has none")
     parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
+    parser.add_argument("--artifact-mode", choices=ARTIFACT_MODES, default="portable",
+                        help="the contract --out must meet: portable keeps RHEL 9's glibc floor "
+                             "(the default); nix-native is a store-bound Nix package")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     args = parser.parse_args()
+    # `nix-native` is a claim about the artifact, so it is only honoured inside a Nix build. A
+    # release job that passed it would otherwise skip the portable floor it exists to enforce.
+    if args.artifact_mode == "nix-native" and not os.environ.get("NIX_BUILD_TOP"):
+        parser.error("--artifact-mode nix-native is for a Nix build (NIX_BUILD_TOP is unset): a release's "
+                     "tarball must pass --artifact-mode portable and keep RHEL 9's glibc floor")
+    if args.artifact_mode == "portable" and os.environ.get("NIX_BUILD_TOP") and args.out:
+        # Not an error: a Nix build may legitimately produce a portable tarball, but say so, so
+        # that a store package silently asking for the portable contract is visible in the log.
+        print("build_release: --artifact-mode portable inside a Nix build: this artifact promises RHEL 9's "
+              f"glibc {'.'.join(map(str, GLIBC))} floor", flush=True)
     if args.pin:
         return pin(args.pin)
     if not args.target:
@@ -351,7 +449,7 @@ def main():
         if args.server:
             proc_macro_server(args.out / "ra-jit", args.out)
         if "linux" in args.target:
-            check_glibc(args.out)
+            check_artifact(args.out, args.artifact_mode)
     shown = args.out or binaries[0].parent
     print(f"build_release: {', '.join(b.name for b in binaries)} in {shown}, with the profile trained at "
           f"{chosen['commit'][:10]}; {stale} functions changed since and are not optimized by it", flush=True)
