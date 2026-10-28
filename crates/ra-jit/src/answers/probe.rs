@@ -131,7 +131,9 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
             edition: probe.edition,
             cfg: probe.cfg,
             codegen_flags: probe.flags,
-            env,
+            // Caller variables are already in the checker process. Crate overrides
+            // would persist credentials in a temporary source description.
+            env: BTreeMap::new(),
             deps: vec![],
         }],
     );
