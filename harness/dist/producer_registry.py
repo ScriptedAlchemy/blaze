@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the existing token producer with real registry default features.
+"""Compile or loudly refuse the token producer with real registry defaults.
 
 The sources and macro body are source_macro's existing fixture. Cargo/rustc are
 reference-only. All product compilation and expansion use the owned compiler
@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import producer_plan
@@ -79,13 +80,23 @@ def main():
             assert "default" in unit["features"], unit
             if name != "syn":
                 assert "proc-macro" in unit["features"], unit
-        built = json.loads(run([args.blaze.resolve(), "proc-macro-build",
-            root / "Cargo.toml", selection, host, host, work / "producer"],
-            root, product, work / "product-build.log"))
-        assert len(built) == 1, built
-        library = Path(built[0]["library"])
-        ours = source_macro.expansions(args.owned_server.resolve(), library, work, product,
-            work / "owned-transcript.json")
+        argv = [args.blaze.resolve(), "proc-macro-build",
+                root / "Cargo.toml", selection, host, host, work / "producer"]
+        result = subprocess.run(list(map(str, argv)), cwd=root, env=product,
+                                capture_output=True, text=True)
+        (work / "product-build.log").write_text(result.stdout + result.stderr)
+        refused = result.returncode != 0
+        if refused:
+            assert "could not compile a producer's compiler probe" in result.stderr, result.stderr
+            assert "owned compiler probe acceptance is not proven" in result.stderr, result.stderr
+            assert not result.stdout.strip(), "a refused build published an image"
+            assert not list((work / "producer").rglob("complete.json")), "refused image admitted"
+        else:
+            built = json.loads(result.stdout)
+            assert len(built) == 1, built
+            library = Path(built[0]["library"])
+            ours = source_macro.expansions(args.owned_server.resolve(), library, work, product,
+                work / "owned-transcript.json")
     finally:
         calls = norustc.runs(str(audit_log))
         (work / "product-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
@@ -93,6 +104,13 @@ def main():
     run([real / "bin/cargo", "build", "--offline", "-p", "app"],
         root, dict(env, CARGO_TARGET_DIR=str(work / "oracle-target")),
         work / "oracle-build.log")
+    if refused:
+        (work / "verdict.json").write_text(json.dumps({
+            "status": "loud-refusal", "oracle": "accepted", "product_calls": [],
+            "reason": "compiler probe acceptance remains unproven; no image admitted",
+        }, indent=2) + "\n")
+        print("registry defaults: oracle accepts, product refuses unproven probes; no image, zero product calls")
+        return
     def outputs(top, package):
         paths = list(top.rglob("output"))
         return [path.read_text() for path in paths if path.parent.name.startswith(package + "-")]
