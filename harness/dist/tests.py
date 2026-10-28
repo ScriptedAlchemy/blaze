@@ -54,13 +54,19 @@ ALL = {"tests::unchanged", "tests::other", "tests::reads_data", "tests::reads_en
 # Reach files and the environment: run every time where nothing records what they read.
 WORLD = {"tests::reads_data", "tests::reads_env"}
 NONE = set()
+# libtest refused the invocation: an option it does not have, a value it does not take, or an
+# option given twice. It says `error: ...` and ends 101 before running a test, so a step that
+# expects this expects a nonzero exit, no test outcome at all, and nothing cached of it.
+REJECTED = "rejected"
+# The exit status libtest ends a refused invocation with (test::ERROR_EXIT_CODE).
+REJECTED_EXIT = 101
 MANIFEST = 'data = ["cache/data.txt"]\nenv = ["T1_DECLARED"]\n'
 FLAKY_MANIFEST = 'data = ["flaky/data.txt"]\nflaky = ["tests::flaky_once"]\n'
 
 # What each step of `--contract` does to the workspace, how it is run, and the tests that run.
 # (what the step is, edits, manifest, args, extra environment, tests that run, outcome)
 #   edits:    [(file, old, new)]       manifest: its text, or None to leave it as it is
-#   outcome:  True passes, False fails
+#   outcome:  True passes, False fails, REJECTED libtest refuses the invocation before any test
 CACHE = [
     ("nothing edited, no manifest", [], None, [], {}, NONE if SANDBOXED else WORLD, True),
     ("a manifest declaring data and env", [], MANIFEST, [], {}, ALL, True),
@@ -94,13 +100,22 @@ CACHE = [
     ("configured declared environment", [(".cargo/config.toml", 'T1_DECLARED = "first"', 'T1_DECLARED = "second"')],
      None, [], {}, ALL, True),
     ("configured environment unchanged", [], None, [], {}, NONE, True),
-    ("a cached pass cannot hide an invalid color", [], None, ["--color=bogus"], {}, NONE, False),
-    ("a cached pass cannot hide a repeated flag", [], None, ["-q", "--quiet"], {}, NONE, False),
+    ("a cached pass cannot hide an invalid color", [], None, ["--color=bogus"], {}, NONE, REJECTED),
+    ("a cached pass cannot hide a repeated flag", [], None, ["-q", "--quiet"], {}, NONE, REJECTED),
     ("warm the thread configuration", [], None, ["--test-threads=2"], {}, ALL, True),
     ("a cached pass cannot hide repeated thread options", [], None,
-     ["--test-threads=2", "--test-threads=0"], {}, NONE, False),
+     ["--test-threads=2", "--test-threads=0"], {}, NONE, REJECTED),
     ("the valid thread configuration stays cached", [], None, ["--test-threads=2"], {}, NONE, True),
 ]
+# libtest's own refusal, by the step's name in CACHE: an option given twice, or a value it
+# does not take, which it says as `error: ...` and ends 101 with, before running any test.
+REJECTS = {
+    "a cached pass cannot hide an invalid color":
+        r"^error: argument for --color must be auto, always, or never \(was bogus\)$",
+    "a cached pass cannot hide a repeated flag": r"^error: Option 'quiet' given more than once$",
+    "a cached pass cannot hide repeated thread options":
+        r"^error: Option 'test-threads' given more than once$",
+}
 # What has to be said (-v) at a step, by its position in CACHE.
 SAYS = {
     15: [r"Always tests::opted_out: `blaze-tests\.toml` opts it out of the cache \(`no_cache`: `tests::opted_out`\)"],
@@ -200,6 +215,8 @@ class Harness:
         return verdict == "ok"
 
     def verdict(self, run, expected, passes, says=(), served=True, failed=None):
+        if passes == REJECTED:
+            return self.rejected(run, expected, says)
         if failed is None and (passes or len(expected) == 1):
             failed = NONE if passes else expected
         if served and "[ra-jit]" not in run.out:
@@ -217,6 +234,25 @@ class Harness:
             return f"DID NOT SAY {' NOR '.join(unsaid)}"
         return "ok"
 
+    def rejected(self, run, expected, says, served=True):
+        """A run libtest refuses: it says `error: ...`, ends 101 and runs no test at all, so
+        there is no test outcome to judge and nothing of it to keep. This is a different
+        result from a test that failed, which the steps that expect `False` still require."""
+        if served and "[ra-jit]" not in run.out:
+            return "NOT SERVED BY THE DAEMON"
+        if run.ran != expected:
+            return f"RAN {', '.join(sorted(run.ran)) or 'no test'}: A REFUSED INVOCATION RAN TESTS"
+        if run.code != REJECTED_EXIT:
+            return f"ENDED {run.code}, NOT {REJECTED_EXIT}, WHERE LIBTEST REFUSES THE INVOCATION"
+        if "test result:" in run.out:
+            return "SAID A TEST RESULT WHERE LIBTEST REFUSES THE INVOCATION"
+        # libtest says why it refuses, as `error: ...`, and says nothing else of the run.
+        if not re.search(r"^error: ", run.out, re.M):
+            return "REFUSED WITHOUT LIBTEST'S `error:` LINE"
+        if unsaid := [it for it in says if not re.search(it, run.out, re.M)]:
+            return f"DID NOT SAY {' NOR '.join(unsaid)}"
+        return "ok"
+
     def contract(self):
         self.warm("cache")
         for at, (what, edits, manifest, args, extra, expected, passes) in enumerate(CACHE):
@@ -226,7 +262,17 @@ class Harness:
                 self.write("blaze-tests.toml", manifest)
             says = SAYS.get(at, [])
             run = self.cargo("affected", "cache", args, verbose=bool(says), extra=extra)
-            if what == "configured declared environment" and "[ra-jit]" not in run.out:
+            if passes == REJECTED:
+                verdict = self.verdict(run, expected, passes, [*says, *REJECTS.get(what, [])])
+                if verdict == "ok":
+                    # The refused invocation cached nothing: asked again, it is refused again
+                    # before any test runs, where a kept pass would be served and end 0.
+                    again = self.cargo("affected", "cache", args, extra=extra)
+                    repeated = self.verdict(again, expected, passes, [*says, *REJECTS.get(what, [])])
+                    if repeated != "ok":
+                        verdict = f"A KEPT PASS HID THE REFUSAL: {repeated}"
+                self.check(what, verdict)
+            elif what == "configured declared environment" and "[ra-jit]" not in run.out:
                 # Cargo configuration invalidates the whole build state. The cold build
                 # must rerun every test; warm its replacement state before checking reuse.
                 verdict = self.verdict(run, expected, passes, says, served=False)
@@ -307,6 +353,32 @@ class Harness:
         run = self.cargo("affected", "flaky", extra=off)
         self.check("only the exhausted failure runs again", self.verdict(run, {"tests::steady"}, False))
 
+    def selected_retry(self):
+        """A retry of a test the command selected itself: `-- --exact tests::flaky_once` runs
+        the one test, which fails its first attempt, and the retry must run that test once
+        more with the command's own selection, not a second `--exact` libtest refuses."""
+        self.write("blaze-tests.toml", FLAKY_MANIFEST)
+        off = {"RA_JIT_SANDBOX": "off"}
+        attempts = os.path.join(self.ws, "flaky", "attempts.txt")
+        self.warm("flaky", positional=["steady"])
+        if os.path.exists(attempts):
+            os.remove(attempts)
+        one = {"tests::flaky_once"}
+        for what, args in (
+            ("an exact selection", ["--exact", "tests::flaky_once"]),
+            ("a test filter", ["flaky_once"]),
+            ("a skip beside the selection", ["--exact", "tests::flaky_once", "--skip", "tests::steady"]),
+            ("ignored tests included", ["--include-ignored", "--exact", "tests::flaky_once"]),
+        ):
+            if os.path.exists(attempts):
+                os.remove(attempts)
+            run = self.cargo("affected", "flaky", args, verbose=True, extra=off)
+            verdict = self.verdict(run, one, True,
+                                   [r"Retrying .*\(attempt 2\)", r"Flaky .*tests::flaky_once: passed on attempt 2"])
+            if verdict == "ok" and [end for name, end in run.outcomes if name == "tests::flaky_once"] != ["FAILED", "ok"]:
+                verdict = "THE TEST DID NOT FAIL ONCE AND THEN PASS"
+            self.check(f"a selected flaky test retried with {what}", verdict)
+
     def before(self):
         """The opt-out and the declared inputs with the ra-jit before the unit: ignored."""
         self.write("blaze-tests.toml", MANIFEST + 'no_cache = ["tests::opted_out"]\n')
@@ -358,6 +430,19 @@ def contract(args):
     sys.exit(1 if wrong else 0)
 
 
+def selected_retry(args):
+    """The retries of a test the command selected itself (`harness/dist/tests.py --selected-retry`)."""
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    tools(bin_dir)
+    h = Harness(bin_dir, args.keep)
+    try:
+        h.selected_retry()
+    finally:
+        wrong = h.finish()
+    print(f"{h.total - wrong} of {h.total} right; under {h.root}, the daemon's home {h.home}")
+    sys.exit(1 if wrong else 0)
+
+
 def self_test():
     """The tables are consistent with the fixture, and the parsing reads what libtest prints."""
     wrong = []
@@ -393,9 +478,36 @@ def self_test():
                 wrong.append("ignored/inconsistent terminal outcome accepted")
     if h.verdict(Run(1, "[ra-jit]\ntest a ... FAILED\n"), {"a"}, False, failed={"b"}) == "ok":
         wrong.append("wrong failing test accepted")
+    # A refused invocation is a result of its own: libtest says `error: ...` and ends 101
+    # before running a test. A step that expects REJECTED accepts that and only that, and a
+    # step that expects a failing test (`False`) still demands the failed test's outcome.
+    refused = "[ra-jit]\nerror: Option 'quiet' given more than once\n"
+    says = [r"^error: Option 'quiet' given more than once$"]
+    if h.verdict(Run(REJECTED_EXIT, refused), NONE, REJECTED, says) != "ok":
+        wrong.append("a refused invocation was not accepted where it is expected")
+    if h.verdict(Run(REJECTED_EXIT, refused), NONE, False) == "ok":
+        wrong.append("a refusal accepted where a failed test is expected")
+    if h.verdict(Run(REJECTED_EXIT, "[ra-jit]\n"), NONE, REJECTED) == "ok":
+        wrong.append("a run that said no `error:` line accepted as a refusal")
+    for why, run in (
+        ("a failed test", Run(REJECTED_EXIT, "[ra-jit]\ntest a ... FAILED\n")),
+        ("a test result", Run(REJECTED_EXIT, refused + "test result: FAILED. 0 passed\n")),
+        ("another exit status", Run(1, refused)),
+        ("a refused run that ran a test", Run(REJECTED_EXIT, refused + "test a ... ok\n")),
+    ):
+        if h.verdict(run, NONE, REJECTED, says) == "ok":
+            wrong.append(f"accepted as a refusal: {why}")
     for at in SAYS:
         if not 0 <= at < len(CACHE) or "opt" not in CACHE[at][0]:
             wrong.append(f"SAYS names step {at}, which is not one that opts a test out")
+    by_name = {row[0]: row for row in CACHE}
+    if set(REJECTS) != {what for what, *_, passes in CACHE if passes == REJECTED}:
+        wrong.append("REJECTS is not the steps that expect a refused invocation, and only those")
+    for what, said in REJECTS.items():
+        if what in by_name and by_name[what][5] != NONE:
+            wrong.append(f"{what} expects a refusal but expects tests to run")
+        if not said.startswith(r"^error: ") or not said.endswith("$"):
+            wrong.append(f"{what}: the diagnostic is not libtest's whole `error: ...` line")
     for line in wrong:
         print("WRONG:", line)
     print("ok" if not wrong else f"{len(wrong)} wrong")
@@ -405,6 +517,8 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--contract", action="store_true", help="unit T1: Bazel's test-result caching")
+    parser.add_argument("--selected-retry", action="store_true",
+                        help="retries of a flaky test the command selected itself (--exact, a filter, --skip, --ignored)")
     parser.add_argument("--before", metavar="DIR", help="with --contract: also run the opt-out steps with the ra-jit in DIR")
     parser.add_argument("--keep", action="store_true", help="keep the workspace and daemon home even when right")
     parser.add_argument("--self-test", action="store_true")
@@ -413,8 +527,10 @@ def main():
         self_test()
     elif args.contract:
         contract(args)
+    elif args.selected_retry:
+        selected_retry(args)
     else:
-        parser.error("say what to run: --contract or --self-test")
+        parser.error("say what to run: --contract, --selected-retry or --self-test")
 
 
 if __name__ == "__main__":

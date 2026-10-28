@@ -262,7 +262,9 @@ pub(crate) fn tests(
             if let Some(list) = &sandbox_list {
                 again.env(crate::test_harness::SANDBOXED, list);
             }
-            again.args(&asked.trailing).arg("--exact").args(&retry);
+            // Each attempt is built from what the command asked, never from the argv of the
+            // attempt before: libtest refuses an option it is given twice.
+            again.args(retry_args(&asked.program_args().cloned().collect::<Vec<_>>(), &retry));
             (status, failures) = listing_failures(&mut again, None, state)
                 .with_context(|| format!("could not execute {shown}"))?;
         }
@@ -340,6 +342,45 @@ fn retryable(
     attempt: usize,
 ) -> (Vec<String>, Vec<String>) {
     failed.into_iter().partition(|name| attempts.of(package, name) > attempt)
+}
+
+/// What a retry of the tests `retry` runs the test executable with, built from what the
+/// command asked the tests (`asked`: the words before `--` and after it) rather than from the
+/// argv of the attempt that failed. libtest refuses an option it is given twice, so the
+/// command's own `--exact` and the names it selected are replaced by the one selection of
+/// these tests: `cargo ra-jit test -- --exact tests::flaky_once` retries with one `--exact`.
+/// The options that say how the tests run, and the ones that pick them out of the selection
+/// (`--skip`, `--ignored`, `--include-ignored`), stay the command's, with their values.
+fn retry_args(asked: &[String], retry: &[String]) -> Vec<String> {
+    // libtest's options that take a value, which is the next word when it is not `=joined`:
+    // `--skip` is given several times, the rest once.
+    const VALUED: [&str; 7] =
+        ["--logfile", "--test-threads", "--skip", "--color", "--format", "-Z", "--shuffle-seed"];
+    let mut args = Vec::new();
+    let mut words = asked.iter();
+    while let Some(word) = words.next() {
+        let (name, joined) = match word.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (word.as_str(), None),
+        };
+        if !name.starts_with('-') {
+            // A filter naming tests: the tests of this retry name themselves.
+            continue;
+        }
+        // The command's own selection is given once, below.
+        if name == "--exact" {
+            continue;
+        }
+        args.push(word.clone());
+        if joined.is_none() && VALUED.contains(&name) {
+            if let Some(value) = words.next() {
+                args.push(value.clone());
+            }
+        }
+    }
+    args.push("--exact".to_owned());
+    args.extend(retry.iter().cloned());
+    args
 }
 
 /// Runs the doc tests with cargo, which hands them to ra-jit in rustdoc's place: ra-jit
@@ -478,7 +519,59 @@ pub(crate) fn exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::failures;
+    use super::{failures, retry_args};
+
+    fn retry_of(asked: &[&str], retry: &[&str]) -> Vec<String> {
+        let asked: Vec<String> = asked.iter().map(|it| (*it).to_owned()).collect();
+        let retry: Vec<String> = retry.iter().map(|it| (*it).to_owned()).collect();
+        retry_args(&asked, &retry)
+    }
+
+    #[test]
+    fn a_retry_selects_its_tests_once_from_what_was_asked() {
+        // `cargo ra-jit test -p flaky -- --exact tests::flaky_once`: libtest refuses a second
+        // `--exact`, so the command's is the one the retry is given, not a second one.
+        assert_eq!(
+            retry_of(&["--exact", "tests::flaky_once"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        // A filter that is not exact is the retry's own selection too: the names replace it.
+        assert_eq!(
+            retry_of(&["flaky_once"], &["tests::flaky_once"]),
+            ["--exact", "tests::flaky_once"]
+        );
+        // How the tests run, and what picks them out of the selection, stay as they were.
+        assert_eq!(
+            retry_of(
+                &[
+                    "--test-threads=2",
+                    "--skip",
+                    "tests::steady",
+                    "--ignored",
+                    "--exact",
+                    "flaky_once"
+                ],
+                &["tests::flaky_once"]
+            ),
+            [
+                "--test-threads=2",
+                "--skip",
+                "tests::steady",
+                "--ignored",
+                "--exact",
+                "tests::flaky_once"
+            ]
+        );
+        assert_eq!(
+            retry_of(&["--include-ignored", "--color", "never"], &["tests::flaky_once"]),
+            ["--include-ignored", "--color", "never", "--exact", "tests::flaky_once"]
+        );
+        // Two tests that failed both name themselves.
+        assert_eq!(
+            retry_of(&[], &["tests::flaky_once", "tests::steady"]),
+            ["--exact", "tests::flaky_once", "tests::steady"]
+        );
+    }
 
     #[test]
     fn a_non_flaky_failure_does_not_block_a_flaky_tests_attempts() {
