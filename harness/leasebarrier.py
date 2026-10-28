@@ -2167,7 +2167,7 @@ HOSTFLAGS_PROGRAM = r"""fn main() {
 """
 
 
-def hostflags(sc, source_sha, codegen=False):
+def hostflags(sc, source_sha, codegen=False, program_cfg=False):
     """The flags for rustc cargo gives a build script's compile. With RUSTFLAGS and no `--target`, the scripts are
     compiled with them (`cfg!(hostflag)` is true in the script); with `--target`, even the host's triple, they are
     not, and the script still runs with the target's flags in `CARGO_ENCODED_RUSTFLAGS`; the program's crate has them
@@ -2176,6 +2176,9 @@ def hostflags(sc, source_sha, codegen=False):
     sc.notes["host"] = host
     flags = "--cfg hostflag"
     build_rs, program_rs = HOSTFLAGS_BUILD_RS, HOSTFLAGS_PROGRAM
+    if program_cfg:
+        program_rs = r'''#[cfg(hostflag)] fn selected() -> &'static str { "selected" }
+fn main() { println!("program-cfg={}", selected()); }'''
     if codegen:
         flags = "-C overflow-checks=yes -C panic=unwind"
         build_rs = r'''fn main() {
@@ -2240,6 +2243,12 @@ def host_codegen(sc, source_sha):
     """Overflow checks affect executed arithmetic in the build script, with flags
     applied for an implicit host and omitted for an explicit host target as Cargo does."""
     hostflags(sc, source_sha, codegen=True)
+
+
+def program_flag_cfg(sc, source_sha):
+    """An item needed by the program exists only under RUSTFLAGS --cfg, not a
+    build-script cfg. Both implicit and explicit target loads must retain it."""
+    hostflags(sc, source_sha, program_cfg=True)
 
 
 def unrelated(sc, source_sha):
@@ -2489,6 +2498,7 @@ SCENARIOS = {
     "feature-capture": feature_capture,
     "hostflags": hostflags,
     "host-codegen": host_codegen,
+    "program-flag-cfg": program_flag_cfg,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,

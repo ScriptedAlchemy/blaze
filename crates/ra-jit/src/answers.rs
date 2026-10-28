@@ -281,7 +281,37 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         if !is_question(&rustc_args) {
             return None;
         }
-        return own::answer(&rustc, &rustc_args, &[], &var)
+        // Cargo appends its effective flags before the rustc-only tail. In particular,
+        // --cfg participates in both program parsing and platform dependency resolution.
+        let explicit_target = rustc_args
+            .windows(2)
+            .find(|args| args[0] == "--target")
+            .and_then(|args| args[1].to_str())
+            .or_else(|| rustc_args.iter().find_map(|arg| arg.to_str()?.strip_prefix("--target=")));
+        let target = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))?;
+        let builtin = own::target_cfg(rustc.parent()?.parent()?, &target, &env)?;
+        let cfg = builtin
+            .iter()
+            .map(|cfg| match cfg.split_once('=') {
+                Some((key, value)) => cfg::CfgAtom::KeyValue {
+                    key: intern::Symbol::intern(key),
+                    value: intern::Symbol::intern(value.trim_matches('"')),
+                },
+                None => cfg::CfgAtom::Flag(intern::Symbol::intern(cfg)),
+            })
+            .collect::<Vec<_>>();
+        let configured = || -> anyhow::Result<Vec<String>> {
+            let mut config = blaze_manifest::Config::load(&cwd, env.clone(), &[])?;
+            config.start("rustc", &[])?;
+            crate::scripts::rustflags(&config, &target, &cfg)
+        };
+        let flags = match configured() {
+            Ok(flags) => flags,
+            Err(error) => return Some(Err(io::Error::other(format!("{error:#}")))),
+        };
+        let mut effective = flags.into_iter().map(OsString::from).collect::<Vec<_>>();
+        effective.extend(rustc_args);
+        return own::answer(&rustc, &effective, &[], &var)
             .map(|stdout| Ok(output(stdout, Vec::new(), 0)));
     }
     None

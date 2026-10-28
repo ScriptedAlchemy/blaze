@@ -239,6 +239,10 @@ pub(crate) fn target_cfg(
     cfgs(target, &given, nightly)
 }
 
+pub(super) fn host_tuple(rustc: &Path) -> Option<String> {
+    Some(Toolchain::of(rustc)?.host)
+}
+
 /// Cargo's release version from the installed channel manifest, not from executing it.
 pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
     let toolchain = Toolchain::of(rustc)?;
