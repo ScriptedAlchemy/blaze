@@ -30,6 +30,7 @@ struct Checkout {
     /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
     scripts: Option<Scripts>,
+    macro_producers: Vec<PathBuf>,
 }
 
 /// A file or a directory, and what it was when the daemon read it.
@@ -155,6 +156,7 @@ impl Inputs {
         config: &CargoConfig,
     ) {
         let mut files = Vec::new();
+        let mut macro_producers = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
                 files.push(Watched::new(dir.join(".cargo").join(name), false));
@@ -182,7 +184,9 @@ impl Inputs {
             }
             for package in macro_inputs {
                 let manifest: &Path = cargo[package].manifest.as_ref();
-                files.push(Watched::new(manifest.parent().unwrap().to_owned(), true));
+                let producer = manifest.parent().unwrap().to_owned();
+                files.push(Watched::new(producer.clone(), true));
+                macro_producers.push(producer);
             }
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
@@ -194,7 +198,23 @@ impl Inputs {
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
         let scripts = Scripts::of(workspace, config);
         self.checkouts.retain(|it| it.root != root);
-        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
+        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts, macro_producers });
+    }
+
+    pub(crate) fn macro_generation(&self, root: &Path) -> Option<String> {
+        use sha2::{Digest as _, Sha256};
+        let checkout = self.checkouts.iter().find(|checkout| checkout.root == root)?;
+        if checkout.macro_producers.is_empty() {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for producer in &checkout.macro_producers {
+            let name = producer.as_os_str().as_encoded_bytes();
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name);
+            fingerprint_producer(producer, producer, &mut hash).ok()?;
+        }
+        Some(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
@@ -226,6 +246,32 @@ impl Inputs {
         let read = scripts.into_iter().flat_map(|it| it.variables.iter().map(|it| &*it.0));
         FLAGS.iter().copied().chain(read).map(|it| (it.to_owned(), env.get(it))).collect()
     }
+}
+
+fn fingerprint_producer(root: &Path, path: &Path, hash: &mut sha2::Sha256) -> std::io::Result<()> {
+    use sha2::Digest as _;
+    if path.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<_, _>>()?;
+        entries.sort();
+        for entry in entries {
+            if entry.ends_with(".git") || entry.join("CACHEDIR.TAG").exists()
+                || entry.join("Cargo.toml").exists()
+            {
+                continue;
+            }
+            fingerprint_producer(root, &entry, hash)?;
+        }
+    } else {
+        let name = path.strip_prefix(root).unwrap().as_os_str().as_encoded_bytes();
+        let bytes = std::fs::read(path)?;
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name);
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    Ok(())
 }
 
 impl Scripts {

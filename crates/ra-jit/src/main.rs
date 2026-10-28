@@ -2721,6 +2721,13 @@ impl Checkouts {
         let (project, root) = &self.roots[at];
         let mut config = self.cargo_config.clone();
         config.extra_env.extend(self.inputs.variables(root, env));
+        if let Some(generation) = self.inputs.macro_generation(root) {
+            // Compile-time artifact freshness must not be keyed only by mtimes.
+            // Reuse the existing producer operation in a content generation.
+            config.target_dir_config = TargetDirectoryConfig::Directory(
+                AbsPathBuf::assert_utf8(root.join("target/rust-analyzer/producers").join(generation)),
+            );
+        }
         let (workspace, debug) =
             workspace_at(project, &config, &self.load_config, &self.selection, None, None)?;
         Ok((workspace, debug, config))
