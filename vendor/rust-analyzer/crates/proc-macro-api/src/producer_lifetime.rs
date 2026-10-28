@@ -15,6 +15,24 @@ const INVALID: &str = ".blaze-producer-invalid";
 const PENDING: &str = ".blaze-producer-pending-";
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Retire under the root lock before recursive removal can destroy the marker. A crash
+/// halfway through removal then leaves only a pending name, never a blocked content id.
+fn retire(generation: &Path) -> io::Result<PathBuf> {
+    let root = generation.parent().ok_or_else(|| io::Error::other("producer without root"))?;
+    loop {
+        let pending = root.join(format!(
+            "{PENDING}remove-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if pending.try_exists()? {
+            continue;
+        }
+        std::fs::rename(generation, &pending)?;
+        return Ok(pending);
+    }
+}
+
 fn ordinary(path: &Path) -> io::Result<()> {
     // Check the owned path and its parent, not platform aliases such as /var -> /private/var.
     for ancestor in path.ancestors().take(2) {
@@ -91,7 +109,7 @@ pub fn lease(generation: &Path) -> io::Result<File> {
             .open(generation.join(LEASE))?;
         lock.try_lock()
             .map_err(|_| io::Error::other("invalid producer generation still leased"))?;
-        std::fs::remove_dir_all(generation)?;
+        std::fs::remove_dir_all(retire(generation)?)?;
         drop(_root);
         return lease(generation);
     }
@@ -162,7 +180,8 @@ pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
             if lock.try_lock().is_err() {
                 return Ok(false);
             }
-            std::fs::remove_dir_all(&generation)?;
+            let pending = if pending { generation.clone() } else { retire(&generation)? };
+            std::fs::remove_dir_all(pending)?;
             Ok::<_, io::Error>(true)
         })();
         match remove {
@@ -177,6 +196,26 @@ pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_removal_never_blocks_the_content_id() {
+        let root = stdx::tempfile::NamedTempDir::new("producer-remove-crash").unwrap();
+        let generation = root.path().join("a".repeat(64));
+        drop(lease(&generation).unwrap());
+        let pending = {
+            let _root = locked_root(root.path()).unwrap();
+            retire(&generation).unwrap()
+        };
+        // A SIGKILL during removal can leave payloads after the marker is gone.
+        std::fs::remove_file(pending.join(MARKER)).unwrap();
+        std::fs::write(pending.join("partially-removed"), b"old output").unwrap();
+        let new = lease(&generation).unwrap();
+        assert_eq!(std::fs::read_to_string(generation.join(MARKER)).unwrap(), FORMAT);
+        assert_eq!(collect(root.path(), &generation).unwrap(), [pending.clone()]);
+        assert!(!pending.exists());
+        assert!(!generation.join("partially-removed").exists());
+        drop(new);
+    }
 
     #[test]
     fn interrupted_claims_and_collection_are_recoverable() {
