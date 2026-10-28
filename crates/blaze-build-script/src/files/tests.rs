@@ -142,12 +142,50 @@ fn a_package_git_tracks_is_listed_from_git() {
 }
 
 #[cfg(unix)]
+fn supports_non_utf8_paths(root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let file = root.join(std::ffi::OsStr::from_bytes(b"probe-\xff"));
+    match std::fs::write(&file, "") {
+        Ok(()) => {
+            std::fs::remove_file(file).unwrap();
+            true
+        }
+        Err(error) => {
+            // APFS can reject ill-formed names. This is a filesystem capability probe,
+            // not a platform-wide exclusion: Unix byte-path decoding is tested below,
+            // and the complete tracked/untracked/directory fixtures still run on Linux.
+            #[cfg(target_vendor = "apple")]
+            if error.raw_os_error() == Some(libc::EILSEQ) {
+                eprintln!(
+                    "filesystem rejects non-UTF-8 names (EILSEQ); byte decoding is tested separately"
+                );
+                return false;
+            }
+            panic!("non-UTF-8 path capability probe failed: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_path_decodes_non_utf8_bytes_without_a_filesystem() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = b"checkout-\xff/tracked-\xfe";
+    assert_eq!(git_path(bytes).unwrap().as_os_str().as_bytes(), bytes);
+}
+
+#[cfg(unix)]
 #[test]
 fn git_listed_paths_do_not_need_to_be_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let dir = package("git-bytes", &[("Cargo.toml", "[package]\n")]);
     let root = dir.path();
+    if !supports_non_utf8_paths(root) {
+        return;
+    }
     assert!(git(root, &["init", "-q"]));
     let tracked = root.join(std::ffi::OsStr::from_bytes(b"tracked-\xff"));
     std::fs::write(&tracked, "old").unwrap();
@@ -165,6 +203,9 @@ fn a_non_utf8_checkout_is_still_listed_from_git() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let dir = package("git-root-bytes", &[("placeholder", "")]);
+    if !supports_non_utf8_paths(dir.path()) {
+        return;
+    }
     let root = dir.path().join(std::ffi::OsStr::from_bytes(b"checkout-\xff"));
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
