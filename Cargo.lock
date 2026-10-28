@@ -745,6 +745,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-serve"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blaze-wire",
+ "bytes",
+ "crc32fast",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.3.4",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "ra-jit-store",
+ "sha2 0.10.9",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
 name = "blaze-wire"
 version = "0.1.0"
 dependencies = [
@@ -2120,6 +2144,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2142,6 +2172,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -3445,6 +3476,8 @@ dependencies = [
  "aws-smithy-http-client",
  "blaze-manifest",
  "blaze-metadata",
+ "blaze-serve",
+ "blaze-wire",
  "cargo-platform",
  "cargo_metadata",
  "cfg",
@@ -4530,7 +4563,19 @@ dependencies = [
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

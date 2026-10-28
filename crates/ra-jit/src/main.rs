@@ -7000,6 +7000,8 @@ usage: ra-jit <command>
   cargo <command>   what `cargo blaze <command>` runs: build, run, test, check
   cache <verb>      the disk store: stats, gc, verify, push, pull, keygen
                     (`cargo blaze cache clear` forgets what `#[ra_jit::cache]` kept)
+  serve --cache DIR --listen ADDR
+                    a cache server other machines reach at blaze+http://ADDR
   mir <dir> --crate <name> [--level 0|1|2] [--time]
                     a crate's MIR as blaze compiles it, written as rustc's -Zunpretty=mir
   --help, --version
@@ -7070,6 +7072,7 @@ fn main() -> anyhow::Result<()> {
             end_with_reader();
             return remote::command(std::env::args().skip(2));
         }
+        Some("serve") => return remote::serve(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         _ => {}
     }

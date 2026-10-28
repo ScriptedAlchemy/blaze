@@ -69,6 +69,9 @@ hir-ty-codegen.workspace = true
 ra-jit-expand.workspace = true
 ra-jit-store.workspace = true
 blaze-manifest.workspace = true
+# The cache server `ra-jit serve` runs: `crates/blaze-serve`.
+blaze-serve.workspace = true
+blaze-wire.workspace = true
 blaze-metadata.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
