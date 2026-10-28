@@ -11,7 +11,8 @@ fn the_credentials_match_their_golden_file() {
     let checked_in = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("no credentials golden file at {path}: {e}"));
     assert_eq!(
-        checked_in, golden_text(),
+        checked_in,
+        golden_text(),
         "the credentials' golden file is not what this build makes"
     );
 }
@@ -58,7 +59,8 @@ fn field(text: &str, section: &str, name: &str) -> String {
             inside = line == section;
             continue;
         }
-        if inside && let Some((key, value)) = line.split_once(": ")
+        if inside
+            && let Some((key, value)) = line.split_once(": ")
             && key == name
         {
             return value.to_owned();
