@@ -27,6 +27,8 @@ pub(crate) struct Producers {
     pub(crate) crates: Vec<Planned>,
     pub(crate) sources: Vec<(std::path::PathBuf, Vec<u8>)>,
     scripts: BTreeSet<String>,
+    /// Native host script units whose complete key matches a target-domain unit.
+    shared_script_units: BTreeSet<String>,
 }
 
 impl Producers {
@@ -131,7 +133,7 @@ impl Producers {
             .iter()
             .filter(|unit| unit.host)
             .map(|unit| {
-                let shared = self.units.iter().any(|it| !it.host && it.package == unit.package);
+                let shared = self.shared_script_units.contains(&unit.package);
                 (unit.package.clone(), shared)
             })
             .collect();
@@ -299,6 +301,37 @@ pub(crate) fn of(
         ide_db::base_db::Env::default(),
         false,
     );
+    let mut shared_script_units = BTreeSet::new();
+    for unit in units.iter().filter(|it| it.host && it.build_script) {
+        let Some(other) = units.iter().find(|it| !it.host && it.package == unit.package) else {
+            continue;
+        };
+        let package = cargo
+            .packages()
+            .find(|&it| cargo[it].id.repr == unit.package)
+            .with_context(|| format!("no package for script unit {}", unit.package))?;
+        let data = &cargo[package];
+        let named = crate::scripts::named(data);
+        let host_profile = profiles.get_profile(
+            &named,
+            data.is_member,
+            data.is_local,
+            UnitFor::new_host(false),
+            &CompileKind::Host,
+        );
+        let target_profile = profiles.get_profile(
+            &named,
+            data.is_member,
+            data.is_local,
+            UnitFor::new_normal(),
+            &requested,
+        );
+        if script_units_share(&unit.features, &other.features, &host_profile, &target_profile)
+            && host_flags == target_flags
+        {
+            shared_script_units.insert(unit.package.clone());
+        }
+    }
     let mut crates = Vec::new();
     for unit in &units {
         let package = cargo
@@ -387,7 +420,27 @@ pub(crate) fn of(
         });
     }
     sources.extend(ctx.sources());
-    Ok(Producers { metadata, units, crates, sources, scripts: BTreeSet::new() })
+    Ok(Producers {
+        metadata,
+        units,
+        crates,
+        sources,
+        scripts: BTreeSet::new(),
+        shared_script_units,
+    })
+}
+
+fn script_units_share(
+    host_features: &[String],
+    target_features: &[String],
+    host: &blaze_manifest::profiles::Profile,
+    target: &blaze_manifest::profiles::Profile,
+) -> bool {
+    // Cargo's profile equality ignores deferred vs resolved debug-info wrappers
+    // and compares their canonical values, plus the other codegen settings.
+    let host_features = host_features.iter().collect::<BTreeSet<_>>();
+    let target_features = target_features.iter().collect::<BTreeSet<_>>();
+    host_features == target_features && host == target
 }
 
 /// A diagnostic rendering for the independent harness, not an alternate Cargo unit graph.
@@ -428,6 +481,7 @@ pub(crate) fn command(
             units: planned.units.clone(),
             crates: planned.crates.clone(),
             sources: vec![],
+            shared_script_units: planned.shared_script_units.clone(),
             scripts: planned
                 .units
                 .iter()
@@ -522,7 +576,25 @@ mod tests {
             crates,
             sources: vec![],
             scripts: BTreeSet::new(),
+            shared_script_units: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn script_sharing_requires_features_and_canonical_profile_equality() {
+        use blaze_manifest::profiles::{DebugInfo, Profile};
+        let mut host = Profile::default();
+        let mut target = host.clone();
+        let features = vec!["common".to_owned()];
+        assert!(script_units_share(&features, &features, &host, &target));
+        assert!(!script_units_share(&features, &["other".into()], &host, &target));
+        target.opt_level = "1".into();
+        assert!(!script_units_share(&features, &features, &host, &target));
+        target = host.clone();
+        host.debuginfo = DebugInfo::Deferred(target.debuginfo.into_inner());
+        assert!(script_units_share(&features, &features, &host, &target));
+        target.debug_assertions = !host.debug_assertions;
+        assert!(!script_units_share(&features, &features, &host, &target));
     }
 
     #[test]

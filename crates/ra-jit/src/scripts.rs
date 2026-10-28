@@ -875,9 +875,9 @@ impl<'a> Runner<'a> {
         dependencies: Vec<unit::Dependency>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
-        // Cargo weakens deferred debuginfo for build-only units in a native
-        // graph. A unit also reached by the target keeps the target's setting;
-        // explicit --target builds keep the separate host setting.
+        // Cargo keeps deferred native host debuginfo only when a target unit
+        // has the same complete key. The source-producer adapter supplies that
+        // sharing proof, not merely package reachability in both domains.
         let build_only =
             self.asked.packages.is_some_and(|packages| packages.get(&data.id.repr) == Some(&false));
         let debuginfo = if for_host && !self.cross && build_only && lib.debuginfo.is_deferred() {
