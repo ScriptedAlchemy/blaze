@@ -56,7 +56,7 @@ impl ProcMacroServerPool {
         // The server may cache native loaded libraries by pathname/mtime. Give
         // this immutable loaded generation its own file, retained by its handles.
         let snapshot = LibrarySnapshot::copy(&dylib.path)
-        .map_err(|error| ServerError { message: error.to_string(), io: None })?;
+            .map_err(|error| ServerError { message: error.to_string(), io: None })?;
         let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.snapshot_path()));
         let snapshot = Arc::new(snapshot);
         use sha2::{Digest as _, Sha256};

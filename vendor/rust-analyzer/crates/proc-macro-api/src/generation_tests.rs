@@ -4,17 +4,24 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::{MacroDylib, ProcMacroClient, ServerError, process::ProcessExit};
 
 struct ExitCounter(Arc<AtomicUsize>);
 impl ProcessExit for ExitCounter {
-    fn exit_err(&mut self) -> Option<ServerError> { None }
+    fn exit_err(&mut self) -> Option<ServerError> {
+        None
+    }
 }
 impl Drop for ExitCounter {
-    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -36,34 +43,43 @@ fn thirty_generations_retire_only_after_the_last_consumer() {
         std::env::temp_dir().join(format!("macro-generation-test-{}", std::process::id())),
     );
     std::fs::write(&path, b"generation bytes").unwrap();
-    let client = ProcMacroClient::with_generation_io_channels(&path, move |_| {
-        let (client, server) = UnixStream::pair()?;
-        count.fetch_add(1, Ordering::SeqCst);
-        std::thread::spawn(move || {
-            use crate::legacy_protocol::msg::{Request, Response};
-            let mut reader = BufReader::new(server.try_clone().unwrap());
-            let mut writer = server;
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) != 0 {
-                let request: Request = serde_json::from_str(&line).unwrap();
-                let response = match request {
-                    Request::ApiVersionCheck {} => Response::ApiVersionCheck(0),
-                    Request::ListMacros { dylib_path } => {
-                        assert!(std::fs::read(dylib_path).is_ok());
-                        Response::ListMacros(Ok(vec![("Macro".into(), crate::ProcMacroKind::CustomDerive)]))
-                    }
-                    _ => panic!("unexpected request"),
-                };
-                writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-                line.clear();
-            }
-        });
-        Ok((
-            Box::new(ExitCounter(count.clone())),
-            Box::new(client.try_clone()?),
-            Box::new(BufReader::new(client)),
-        ))
-    }, None, 1).unwrap();
+    let client = ProcMacroClient::with_generation_io_channels(
+        &path,
+        move |_| {
+            let (client, server) = UnixStream::pair()?;
+            count.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use crate::legacy_protocol::msg::{Request, Response};
+                let mut reader = BufReader::new(server.try_clone().unwrap());
+                let mut writer = server;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) != 0 {
+                    let request: Request = serde_json::from_str(&line).unwrap();
+                    let response = match request {
+                        Request::ApiVersionCheck {} => Response::ApiVersionCheck(0),
+                        Request::ListMacros { dylib_path } => {
+                            assert!(std::fs::read(dylib_path).is_ok());
+                            Response::ListMacros(Ok(vec![(
+                                "Macro".into(),
+                                crate::ProcMacroKind::CustomDerive,
+                            )]))
+                        }
+                        _ => panic!("unexpected request"),
+                    };
+                    writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                    line.clear();
+                }
+            });
+            Ok((
+                Box::new(ExitCounter(count.clone())),
+                Box::new(client.try_clone()?),
+                Box::new(BufReader::new(client)),
+            ))
+        },
+        None,
+        1,
+    )
+    .unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 1);
     for _ in 0..30 {
         let handles = client.load_dylib(MacroDylib::new(path.clone())).unwrap();
@@ -97,12 +113,17 @@ fn actual_server_process_is_killed_and_waited_when_generation_retires() {
     std::fs::write(&source, b"generation").unwrap();
     let server = paths::AbsPathBuf::assert_utf8(script);
     let source = paths::AbsPathBuf::assert_utf8(source);
-    let client = ProcMacroClient::spawn(
-        &server, std::iter::empty::<(&str, &Option<String>)>(), None, 1,
-    ).unwrap();
+    let client =
+        ProcMacroClient::spawn(&server, std::iter::empty::<(&str, &Option<String>)>(), None, 1)
+            .unwrap();
     let alive = |pid: &str| {
-        std::process::Command::new("ps").args(["-p", pid, "-o", "pid="])
-            .output().unwrap().stdout.iter().any(|byte| byte.is_ascii_digit())
+        std::process::Command::new("ps")
+            .args(["-p", pid, "-o", "pid="])
+            .output()
+            .unwrap()
+            .stdout
+            .iter()
+            .any(|byte| byte.is_ascii_digit())
     };
     for _ in 0..30 {
         let handles = client.load_dylib(MacroDylib::new(source.clone())).unwrap();

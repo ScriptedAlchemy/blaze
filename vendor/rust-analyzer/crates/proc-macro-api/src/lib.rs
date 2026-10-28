@@ -16,12 +16,12 @@
 extern crate rustc_driver as _;
 
 pub mod bidirectional_protocol;
+#[cfg(test)]
+mod generation_tests;
 pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
 pub mod transport;
-#[cfg(test)]
-mod generation_tests;
 
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
@@ -169,7 +169,10 @@ impl LibrarySnapshot {
                 return Err(io::Error::other("macro snapshot owner mismatch"));
             }
             std::fs::write(marker, pid.to_string())?;
-            let path = dir.join(format!("generation-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let path = dir.join(format!(
+                "generation-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
             let snapshot = Self::WorkerOwned(path);
             io::copy(&mut input, &mut file)?;
@@ -244,7 +247,9 @@ impl ProcMacroClient {
         let path = process_path.to_owned();
         let vars: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = env
             .into_iter()
-            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned())))
+            .map(|(key, value)| {
+                (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned()))
+            })
             .collect();
         let version = version.cloned();
         let factory = move || {
@@ -283,9 +288,9 @@ impl ProcMacroClient {
     ) -> io::Result<ProcMacroClient> {
         let mut workers = Vec::with_capacity(num_process);
         for _ in 0..num_process {
-            workers.push(ProcMacroServerProcess::run(
-                spawn.clone(), version, || "<unknown>".to_owned(),
-            )?);
+            workers.push(ProcMacroServerProcess::run(spawn.clone(), version, || {
+                "<unknown>".to_owned()
+            })?);
         }
         Ok(ProcMacroClient {
             pool: Arc::new(ProcMacroServerPool::new(workers)),
@@ -303,7 +308,10 @@ impl ProcMacroClient {
             Box<dyn process::ProcessExit>,
             Box<dyn io::Write + Send + Sync>,
             Box<dyn io::BufRead + Send + Sync>,
-        )> + Clone + Send + Sync + 'static,
+        )> + Clone
+        + Send
+        + Sync
+        + 'static,
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
@@ -311,9 +319,9 @@ impl ProcMacroClient {
         let factory = move || {
             let mut workers = Vec::with_capacity(num_process);
             for _ in 0..num_process {
-                workers.push(ProcMacroServerProcess::run(
-                    spawn.clone(), version.as_ref(), || "<unknown>".to_owned(),
-                )?);
+                workers.push(ProcMacroServerProcess::run(spawn.clone(), version.as_ref(), || {
+                    "<unknown>".to_owned()
+                })?);
             }
             Ok(ProcMacroServerPool::new(workers))
         };
@@ -334,7 +342,8 @@ impl ProcMacroClient {
         let Some(factory) = &self.spawn_generation else {
             return self.pool.load_dylib(&dylib);
         };
-        let pool = factory().map_err(|error| ServerError { message: error.to_string(), io: None })?;
+        let pool =
+            factory().map_err(|error| ServerError { message: error.to_string(), io: None })?;
         pool.load_dylib(&dylib)
     }
 
