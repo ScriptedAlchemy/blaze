@@ -67,6 +67,9 @@ edition = "2021"
     (derive / "src/lib.rs").write_text('''#[cfg(not(producer_generated))]
 compile_error!("missing producer script cfg");
 mod generated { include!(concat!(env!("OUT_DIR"), "/label.rs")); }
+const _: () = assert!(env!("PRODUCER_CONFIG_ENV").len() == 11);
+const _: () = assert!(env!("PRODUCER_KEEP_ENV").len() == 6);
+const _: () = assert!(env!("PRODUCER_FORCE_ENV").len() == 6);
 ''' + text)
     # Explicit membership also makes the helper's default profile a workspace profile.
     text = (root / "Cargo.toml").read_text().replace('"optional"]', '"optional", "build-helper"]')
@@ -177,6 +180,11 @@ def main():
     assert compiler_logs, "the regression must inspect actual producer compiler logs"
     for log in compiler_logs:
         assert secret not in log.read_text(), f"request environment leaked in {log}"
+    for plan in (work / "producer").rglob("rust-project.json"):
+        assert secret not in plan.read_text(), f"request environment serialized in {plan}"
+    rendered = run([args.blaze.resolve(), "proc-macro-plan", root / "Cargo.toml",
+                    selected, host, host], root, product, work / "redacted-plan.log")
+    assert secret not in rendered, "plan stdout must not expose the caller environment"
     # Deliberately swallow a compile probe failure as registry scripts do. The product
     # must refuse the whole producer build, not compile from that incomplete output.
     script = root / "derive/build.rs"

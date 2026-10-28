@@ -27,7 +27,7 @@ impl<'de> serde::Deserialize<'de> for Native {
     }
 }
 
-/// The canonical native snapshot schema is `(platform, [(key-bytes, value-bytes)])`.
+/// The canonical native snapshot schema is `(1, platform, [(key-bytes, value-bytes)])`.
 /// Hex is framing for the existing line socket, not the identity/encoding of the snapshot.
 type NativeWire = (u8, u8, Vec<(blaze_wire::Bytes, blaze_wire::Bytes)>);
 

@@ -151,9 +151,7 @@ def compare(plan, graph, explicit):
         if k[1]:
             assert ("native_flag" in crate["cfg"]) == (not explicit), (k, crate)
             assert "target_only_flag" not in crate["cfg"], (k, crate)
-            assert crate["env"]["PRODUCER_CONFIG_ENV"] == "from-config"
-            assert crate["env"]["PRODUCER_KEEP_ENV"] == "caller"
-            assert crate["env"]["PRODUCER_FORCE_ENV"] == "forced"
+            assert not any(name.startswith("PRODUCER_") for name in crate["env"])
             assert crate["env"]["CARGO_PKG_NAME"] == it["target"]["name"]
     shared = [it for it, crate in zip(units, plan["crates"]) if crate["name"] == "shared"]
     assert sorted((it["host"], sorted(it["features"])) for it in shared) == [

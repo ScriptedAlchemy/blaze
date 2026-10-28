@@ -29,6 +29,8 @@ pub(crate) struct Producers {
     scripts: BTreeSet<String>,
     /// Native host script units whose complete key matches a target-domain unit.
     shared_script_units: BTreeSet<String>,
+    /// Request/config values travel to compiler children, never into crate descriptions.
+    compile_env: crate::process::Native,
 }
 
 impl Producers {
@@ -137,7 +139,8 @@ impl Producers {
                 (unit.package.clone(), shared)
             })
             .collect();
-        let mut env: BTreeMap<String, String> = crate::process::vars().collect();
+        let mut env: BTreeMap<String, String> =
+            crate::process::unicode(self.compile_env.vars()).collect();
         let probe = dir.join("producer-rustc");
         crate::answers::producer_launcher(&probe)?;
         env.insert("RUSTC".into(), probe.display().to_string());
@@ -171,7 +174,7 @@ impl Producers {
             explicit_target: selection.target.is_some(),
             packages: Some(&packages),
         };
-        let mut raw: BTreeMap<_, _> = crate::process::native().vars().collect();
+        let mut raw: BTreeMap<_, _> = self.compile_env.vars().collect();
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));
         raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
         raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
@@ -374,8 +377,7 @@ pub(crate) fn of(
                 cfg.push(value.to_owned());
             }
         }
-        let mut crate_env = env.clone();
-        crate_env.extend(config_env.clone());
+        let mut crate_env = BTreeMap::new();
         let mut set = |name: &str, value: String| {
             crate_env.insert(name.into(), value);
         };
@@ -427,6 +429,9 @@ pub(crate) fn of(
         sources,
         scripts: BTreeSet::new(),
         shared_script_units,
+        compile_env: crate::process::native()
+            .over(env.iter().map(|(k, v)| (k.into(), v.into())))
+            .over(config_env.into_iter().map(|(k, v)| (k.into(), v.into()))),
     })
 }
 
@@ -473,7 +478,7 @@ pub(crate) fn command(
         let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
             .map(std::path::PathBuf::from)
             .context("the source toolchain is not named")?;
-        let env = std::env::vars_os().collect::<Vec<_>>();
+        let env = planned.compile_env.vars().collect::<Vec<_>>();
         // Reject nested producer graphs before any script or compiler child. This
         // boundary is removed only when the nested scheduler supplies their images.
         let mut preflight = Producers {
@@ -482,6 +487,7 @@ pub(crate) fn command(
             crates: planned.crates.clone(),
             sources: vec![],
             shared_script_units: planned.shared_script_units.clone(),
+            compile_env: planned.compile_env.clone(),
             scripts: planned
                 .units
                 .iter()
@@ -572,6 +578,7 @@ mod tests {
             sources: vec![],
             scripts: BTreeSet::new(),
             shared_script_units: BTreeSet::new(),
+            compile_env: crate::process::Native::default(),
         }
     }
 
