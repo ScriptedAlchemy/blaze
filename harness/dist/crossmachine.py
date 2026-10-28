@@ -630,7 +630,8 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
                                  owned_snapshots=[os.path.relpath(os.path.join(root, name), env["RA_JIT_HOME"])
                                                   for root, _, files in os.walk(os.path.join(env["RA_JIT_HOME"], "macro-snapshots"))
                                                   for name in files if name.startswith("generation-")],
-                                 producer_directories=[name for name in os.listdir(os.path.join(ws, "target/rust-analyzer/producer-inputs"))]
+                                 producer_directories=[name for name in os.listdir(os.path.join(ws, "target/rust-analyzer/producer-inputs"))
+                                                       if os.path.isdir(os.path.join(ws, "target/rust-analyzer/producer-inputs", name))]
                                  if os.path.isdir(os.path.join(ws, "target/rust-analyzer/producer-inputs")) else [])
             rows.append(dict(step=step, right=built.returncode == 0 and actual == expected and generation and mutation_valid and reload_valid and not recognized_fallback(built.stderr),
                              actual=actual, expected=expected, build_log=built.stderr, status=status, pids=pids,

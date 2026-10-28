@@ -11656,11 +11656,29 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     let source = root.join("derive/src/lib.rs");
     let original = std::fs::read(&source).unwrap();
     let time = std::fs::metadata(&source).unwrap().modified().unwrap();
-    let (_, _, _, first) =
+    let (first_workspace, _, _, first) =
         workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
             .unwrap();
     let first = first.unwrap();
     let first_path = first.path().to_owned();
+    let macro_libraries = |workspace: &ProjectWorkspace| {
+        let mut ids = FxHashMap::default();
+        let (_, paths) = workspace.to_crate_graph(
+            &mut |path| {
+                let next = vfs::FileId::from_raw(ids.len() as u32);
+                Some(*ids.entry(path.to_owned()).or_insert(next))
+            },
+            &FxHashMap::default(),
+        );
+        paths.into_values().map(|path| path.unwrap().1).collect::<Vec<_>>()
+    };
+    let first_libraries = macro_libraries(&first_workspace);
+    assert!(!first_libraries.is_empty());
+    assert!(
+        first_libraries.iter().all(|path| AsRef::<Path>::as_ref(path).starts_with(&first_path))
+    );
+    let first_bytes: Vec<_> =
+        first_libraries.iter().map(|path| std::fs::read(path).unwrap()).collect();
     let replacement =
         String::from_utf8(original.clone()).unwrap().replace("was described", "got described");
     assert_eq!(original.len(), replacement.len());
@@ -11668,11 +11686,21 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
     // No preceding Inputs::watch or manual Generation::prepare. This is the
     // production cold request ordering, with an existing producer target.
-    let (_, _, _, second) =
+    let (second_workspace, _, _, second) =
         workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
             .unwrap();
     let second = second.unwrap();
     assert_ne!(first_path, second.path());
+    let second_libraries = macro_libraries(&second_workspace);
+    assert!(
+        second_libraries.iter().all(|path| AsRef::<Path>::as_ref(path).starts_with(second.path()))
+    );
+    let second_bytes: Vec<_> =
+        second_libraries.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    assert_ne!(
+        first_bytes, second_bytes,
+        "actual producer body changed, not just its directory key"
+    );
     assert!(first_path.is_dir(), "the old workspace still leases its producer");
     assert!(second.collect().unwrap().is_empty());
     drop(first);
