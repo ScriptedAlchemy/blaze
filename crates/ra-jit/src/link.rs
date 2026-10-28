@@ -21,8 +21,14 @@ pub(crate) mod split;
 /// The request's linker environment, captured once per operation. Clearing the command's
 /// environment also honors variables absent in a request; process-global mutation would
 /// race detached links and scripts.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+
+impl std::fmt::Debug for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Environment").field("names", &self.0.keys().collect::<Vec<_>>()).finish()
+    }
+}
 
 impl Environment {
     pub(crate) fn of(db: &RootDatabase) -> Self {
@@ -45,6 +51,29 @@ impl Environment {
 #[cfg(all(test, unix))]
 mod environment_tests {
     use super::*;
+
+    #[test]
+    fn command_diagnostics_never_render_request_environment_values() {
+        let secret = "not-a-real-token-c4-regression";
+        let env = Environment(
+            [("PRIVATE_TOKEN".into(), secret.into()), ("PATH".into(), "/private/path".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut command = Command::new("cc");
+        env.apply(&mut command);
+        command.args(["-o", "/output/program", "/input/object.o"]);
+        let shown = diagnostic_command(&command);
+        assert!(shown.contains("cc") && shown.contains("/input/object.o"));
+        assert!(!shown.contains(secret) && !shown.contains("/private/path"));
+        assert!(!format!("{env:?}").contains(secret));
+        assert!(format!("{env:?}").contains("PRIVATE_TOKEN"));
+        assert_eq!(
+            command.get_envs().find(|(name, _)| *name == "PRIVATE_TOKEN").unwrap().1,
+            Some(std::ffi::OsStr::new(secret)),
+            "redaction must not change the child environment"
+        );
+    }
 
     #[test]
     fn a_link_command_retains_its_request_and_unsets_worker_variables() {
@@ -215,20 +244,29 @@ impl Line {
             }
         }
         cmd.args(&self.after).arg("-o").arg(exe);
-        eprintln!("link line: {cmd:?}");
+        let shown = diagnostic_command(&cmd);
+        eprintln!("link line: {shown}");
         let start = Instant::now();
-        let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+        let ran = cmd.output().with_context(|| format!("running {shown}"))?;
         if !ran.status.success() {
             bail!(
-                "the link of {} failed ({}):\n{:?}\n{}",
+                "the link of {} failed ({}):\n{}\n{}",
                 exe.display(),
                 ran.status,
-                cmd,
+                shown,
                 String::from_utf8_lossy(&ran.stderr)
             );
         }
         Ok(start.elapsed())
     }
+}
+
+/// Command's Debug includes all explicitly supplied environment values. A link
+/// diagnostic needs its argv, not credentials from the calling build request.
+fn diagnostic_command(command: &Command) -> String {
+    let mut argv = Command::new(command.get_program());
+    argv.args(command.get_args());
+    format!("{argv:?}")
 }
 
 /// The first bytes of the file at `path`, which tell an archive from an object.

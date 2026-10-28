@@ -104,6 +104,10 @@ def main():
                    RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1",
                    RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0",
                    RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"))
+    # A synthetic credential, not a real secret. Child processes receive the
+    # caller's environment, but producer/link diagnostics must not print it.
+    secret = "c4-not-a-real-token-log-regression"
+    product["C4_PRIVATE_TOKEN"] = secret
     try:
         built = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
                                selected, host, host, work / "producer"],
@@ -139,6 +143,10 @@ def main():
     after = {str(path): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
              for path in script_files + run_files}
     assert before == after, (before, after)
+    compiler_logs = list((work / "producer").rglob("ra-jit.log"))
+    assert compiler_logs, "the regression must inspect actual producer compiler logs"
+    for log in compiler_logs:
+        assert secret not in log.read_text(), f"request environment leaked in {log}"
     # Deliberately swallow a compile probe failure as registry scripts do. The product
     # must refuse the whole producer build, not compile from that incomplete output.
     script = root / "derive/build.rs"
