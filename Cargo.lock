@@ -745,6 +745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-wire"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3471,6 +3479,7 @@ dependencies = [
  "ra-jit-expand",
  "ra-jit-live",
  "ra-jit-store",
+ "rayon",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustls",

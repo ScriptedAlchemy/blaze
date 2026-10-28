@@ -212,7 +212,10 @@ pub use {
         mir::{MirEvalError, MirLowerError},
         mir_pretty::ConstEvalErrorPretty,
         next_solver::abi::Safety,
-        next_solver::{clear_tls_solver_cache, collect_ty_garbage},
+        next_solver::{
+            clear_tls_solver_cache, collect_ty_garbage, interned_counts,
+            live_solver_cache_on_this_thread, live_solver_caches,
+        },
         setup_tracing,
     },
     // FIXME: These are needed for import assets, properly encapsulate them.

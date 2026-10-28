@@ -1348,6 +1348,19 @@ pub struct Rejections {
 }
 
 impl Rejections {
+    /// How many functions, statics and crates it keeps of the builds that are over: rejected
+    /// instances, the statics functions left to rustc refer to, the crates where that is
+    /// unknown, the roots given up on, and the futures rustc's code makes.
+    pub fn held(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.rejected.len(),
+            self.theirs.len(),
+            self.unknown.len(),
+            self.left.len(),
+            self.futures.len(),
+        )
+    }
+
     /// Keeps the last full build: the next edit is a patch of it.
     pub fn keep_built(&mut self) {
         if self.undo.take().is_some() {

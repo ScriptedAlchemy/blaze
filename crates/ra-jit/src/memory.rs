@@ -127,6 +127,84 @@ pub(crate) fn live() -> Option<u64> {
     None
 }
 
+/// What jemalloc says of the pages it holds: the bytes allocated and not freed, the bytes in
+/// pages it maps and touches, the bytes it maps, and the bytes of freed pages it keeps to
+/// reuse rather than give back. None where the allocator does not count them.
+pub(crate) fn allocator() -> Option<Allocator> {
+    #[cfg(unix)]
+    {
+        use tikv_jemalloc_ctl::stats;
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        let read = |it: Result<usize, tikv_jemalloc_ctl::Error>| it.ok().map(|it| it as u64);
+        Some(Allocator {
+            allocated: read(stats::allocated::read())?,
+            resident: read(stats::resident::read())?,
+            mapped: read(stats::mapped::read())?,
+            retained: read(stats::retained::read())?,
+        })
+    }
+    #[cfg(windows)]
+    None
+}
+
+/// See [`allocator`].
+#[derive(Clone, Copy)]
+pub(crate) struct Allocator {
+    pub(crate) allocated: u64,
+    pub(crate) resident: u64,
+    pub(crate) mapped: u64,
+    pub(crate) retained: u64,
+}
+
+/// What an idle daemon gives back, from `RA_JIT_RECLAIM`: `0` or `off` for nothing, `1` or
+/// `on` for everything, or any of `gc`, `cache` and `purge`, separated by commas, for those
+/// steps alone. Everything is the default.
+///
+/// The collection of the types is never named without the caches cleared: `gc` clears them,
+/// on every thread, before it collects (a cache entry points at a type the collection frees),
+/// so `gc` alone and `gc,cache` are one step. `cache` alone clears them and collects nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reclaim {
+    /// `hir::collect_ty_garbage()`: the types, arguments and clauses interned for builds
+    /// that are over.
+    pub(crate) types: bool,
+    /// The trait solver's cache on every thread: always when `types` is.
+    pub(crate) solver_caches: bool,
+    /// `give_back()`: the pages of what was freed.
+    pub(crate) pages: bool,
+}
+
+impl Reclaim {
+    /// What `RA_JIT_RECLAIM` says: everything unless it says otherwise, and `0` or `off` for
+    /// nothing. Any of `gc`, `cache` and `purge`, separated by commas, asks for those steps
+    /// alone, which `harness/memgrowth.py`'s M4 runs one at a time to read what each gives back.
+    pub(crate) fn of_env() -> Reclaim {
+        Reclaim::of(std::env::var("RA_JIT_RECLAIM").ok().as_deref())
+    }
+
+    fn of(text: Option<&str>) -> Reclaim {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        let Some(text) = text else { return all };
+        match text.trim() {
+            "" | "1" | "on" | "all" => all,
+            "0" | "off" | "none" => Reclaim { types: false, solver_caches: false, pages: false },
+            steps => {
+                let named = |it: &str| steps.split(',').any(|step| step.trim() == it);
+                let types = named("gc") || named("types");
+                Reclaim {
+                    types,
+                    solver_caches: types || named("cache") || named("caches") || named("solver"),
+                    pages: named("purge") || named("pages"),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.types || self.solver_caches || self.pages
+    }
+}
+
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
 pub(crate) fn give_back() {
@@ -244,14 +322,83 @@ pub(crate) fn checkpoint(step: &str) {
     eprintln!("memory after {step}: {} MB resident{live}", resident().unwrap_or(0));
 }
 
-/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names.
+/// What the daemon holds that no ingredient of the database counts: the checkouts it has
+/// loaded, the files it has hashed, the symbols of rustc's executables it has read, the maps
+/// a patch keeps, and the addresses of an executable that patches put back. [`set_own`] says
+/// it before each report.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Own {
+    pub(crate) checkouts: usize,
+    pub(crate) files_hashed: usize,
+    /// How many executables rustc linked that the daemon holds the symbols of: an entry of
+    /// `RUSTC_SYMBOLS` each, not a symbol each. The row is still named `rustc symbols`.
+    pub(crate) rustc_symbols: usize,
+    /// The entries of every map a patch keeps of the builds that are over.
+    pub(crate) rejections: usize,
+    /// The addresses of the executable rustc linked that a patch put back.
+    pub(crate) patch_originals: usize,
+}
+
+static OWN: std::sync::Mutex<Own> = std::sync::Mutex::new(Own {
+    checkouts: 0,
+    files_hashed: 0,
+    rustc_symbols: 0,
+    rejections: 0,
+    patch_originals: 0,
+});
+
+/// Says what the daemon holds of its own, for the next [`report`] to write.
+pub(crate) fn set_own(own: Own) {
+    *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = own;
+}
+
+/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names:
+/// a line for every ingredient of the database, then what the daemon holds of its own, the
+/// tables of interned types and arguments, and what the allocator says.
+///
+/// The trait solver's cache is cleared first, here and on every thread of the pool, as
+/// rust-analyzer's `analysis_stats` clears it before it measures: the cache is per revision and
+/// a build's, not a holder of the daemon's, and what it keeps of its goals would be counted as
+/// held.
 pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
+    crate::solving::clear_caller_and_pool();
     std::fs::create_dir_all(&dir)?;
     write_heap_profile(&dir.join(format!("{step}.prof")))?;
-    std::fs::write(dir.join(format!("{step}.tsv")), ingredients(db))?;
+    std::fs::write(dir.join(format!("{step}.tsv")), table(db))?;
     Ok(())
+}
+
+/// Everything [`report`] writes, as one table: the ingredient rows, whose `count` is how many
+/// there are and whose `heap` is the bytes of what they own, then `own` and `interned` rows,
+/// whose `count` is a number of things, and `alloc` rows, whose `count` is bytes.
+fn table(db: &mut RootDatabase) -> String {
+    let mut table = ingredients(db);
+    let own = *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, count) in [
+        ("checkouts", own.checkouts),
+        ("files hashed", own.files_hashed),
+        ("rustc symbols", own.rustc_symbols),
+        ("rejections", own.rejections),
+        ("patch originals", own.patch_originals),
+    ] {
+        _ = writeln!(table, "own\t{count}\t\t\t\t{name}");
+    }
+    for (name, count) in hir::interned_counts() {
+        _ = writeln!(table, "interned\t{count}\t\t\t\t{name}");
+    }
+    if let Some(allocator) = allocator() {
+        for (name, bytes) in [
+            ("allocated", allocator.allocated),
+            ("resident", allocator.resident),
+            ("mapped", allocator.mapped),
+            ("retained", allocator.retained),
+        ] {
+            _ = writeln!(table, "alloc\t{bytes}\t\t\t\t{name}");
+        }
+    }
+    table
 }
 
 /// [`report`] once the daemon has answered a request, as `request-N`, N counting from 1.
@@ -522,6 +669,39 @@ mod tests {
         let machine = of_the_machine();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(held.is_some_and(|it| it > 0) && machine.is_some_and(|it| it > held.unwrap()));
+        }
+    }
+
+    #[test]
+    fn reclaim_never_collects_without_clearing() {
+        let steps = ["gc", "types", "gc,purge", "gc, cache", "cache", "purge", "pages,solver", "1"];
+        for text in steps {
+            let reclaim = Reclaim::of(Some(text));
+            assert!(!reclaim.types || reclaim.solver_caches, "{text}: {reclaim:?}");
+        }
+        assert!(Reclaim::of(Some("gc")).solver_caches, "gc alone clears the caches too");
+        assert_eq!(
+            Reclaim::of(Some("gc")),
+            Reclaim { types: true, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("cache")),
+            Reclaim { types: false, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("purge")),
+            Reclaim { types: false, solver_caches: false, pages: true }
+        );
+    }
+
+    #[test]
+    fn reclaim_says_everything_by_default_and_nothing_for_off() {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        for text in [None, Some(""), Some("1"), Some("on"), Some("all")] {
+            assert_eq!(Reclaim::of(text), all);
+        }
+        for text in ["0", "off", "none"] {
+            assert!(!Reclaim::of(Some(text)).any());
         }
     }
 }
