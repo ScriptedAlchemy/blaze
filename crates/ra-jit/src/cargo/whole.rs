@@ -14,7 +14,7 @@ use std::{
 use anyhow::Context as _;
 use cargo_metadata::{Metadata, Package};
 
-use crate::plan::{Plan, Selection};
+use crate::plan::Selection;
 
 use super::{
     FAILED,
@@ -368,20 +368,13 @@ fn prepare_dir(config: &WorkerConfig, target: &Path) -> anyhow::Result<PathBuf> 
 fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Result<Vec<Program>> {
     let manifest = asked.flags.manifest_path.as_ref().map(|it| cwd.join(it));
     let dir = manifest.as_deref().and_then(Path::parent).unwrap_or(cwd);
-    let mut targets = Vec::new();
-    if let Some(bin) = &asked.flags.bin {
-        targets.extend(["--bin".to_owned(), bin.clone()]);
-    }
-    if let Some(example) = &asked.flags.example {
-        targets.extend(["--example".to_owned(), example.clone()]);
-    }
     let selection = asked.selection();
     let named = blaze_metadata::Targets {
         bin: asked.flags.bin.as_deref(),
         example: asked.flags.example.as_deref(),
     };
     let own = super::metadata::programs(&selection, dir, manifest.as_deref(), named);
-    let planned = match own {
+    let planned: Vec<crate::plan::Program> = match own {
         Some(Ok(planned)) => planned
             .into_iter()
             .map(|it| crate::plan::Program {
@@ -393,10 +386,9 @@ fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Resul
             })
             .collect(),
         Some(Err(why)) => {
-            eprintln!("blaze could not plan the build itself, so cargo does: {why:#}");
-            Plan::programs(dir, manifest.as_deref(), &selection, &targets)?
+            anyhow::bail!("blaze could not plan the build: {why:#}; Cargo was not executed")
         }
-        None => Plan::programs(dir, manifest.as_deref(), &selection, &targets)?,
+        None => anyhow::bail!("the owned build planner is disabled; Cargo was not executed"),
     };
     // cargo's directory of a profile: `dev`'s is `debug`.
     let profile = match selection.profile.as_str() {

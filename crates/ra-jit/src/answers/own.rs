@@ -252,7 +252,7 @@ pub(crate) fn target_cfg(
     cfgs(target, &given, nightly)
 }
 
-pub(super) fn host_tuple(rustc: &Path) -> Option<String> {
+pub(crate) fn host_tuple(rustc: &Path) -> Option<String> {
     Some(Toolchain::of(rustc)?.host)
 }
 

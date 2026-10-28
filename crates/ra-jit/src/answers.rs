@@ -19,7 +19,7 @@ use std::{
 mod own;
 mod probe;
 
-pub(crate) use own::target_cfg;
+pub(crate) use own::{host_tuple, target_cfg};
 
 /// Build-script probes name this launcher rather than a compiler outside blaze.
 /// Unknown compile operations fail visibly; no wrapper fallback is reachable.

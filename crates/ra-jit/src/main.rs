@@ -3307,13 +3307,8 @@ fn workspace_at(
         let plan_asked =
             plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
         let whole = scripts::own();
-        let plan = match whole {
-            // The whole build asks no cargo for its plan either.
-            true => {
-                plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?
-            }
-            false => plan::Plan::of(manifest.manifest_path().as_ref(), selection, &plan_asked)?,
-        };
+        let plan =
+            plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?;
         debug = plan.whole()?;
         let mut sources = cargo.sources().to_vec();
         sources.extend_from_slice(plan.sources());
