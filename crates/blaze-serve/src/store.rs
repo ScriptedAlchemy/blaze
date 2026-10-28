@@ -427,6 +427,12 @@ impl Store {
                 if !temporary {
                     continue;
                 }
+                // Project names may themselves end in a numeric .tmp suffix. Published
+                // objects are never staging files, even when the suffix looks like one.
+                // Current dot-prefixed and excluded legacy staging names still qualify.
+                if !sub.is_empty() && ObjectName::parse(&format!("{sub}/{name}")).is_some() {
+                    continue;
+                }
                 if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                     continue;
                 }
@@ -606,6 +612,35 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn sweeping_staging_files_preserves_published_lists_with_temporary_like_names() {
+        let dir = scratch();
+        let store = Store::open(dir.path()).unwrap();
+        for prefix in ["manifests", "deps"] {
+            let name = format!("{prefix}/project.123-456-789.tmp");
+            assert!(store.put_list(&name, b"published\n", Expect::Absent).unwrap());
+            let published = store.dir().join(&name);
+            let stale = temporary(&published);
+            let legacy = store.dir().join(format!("{prefix}/project.123-456.tmp"));
+            for path in [&stale, &legacy] {
+                std::fs::write(path, b"abandoned\n").unwrap();
+            }
+            for path in [&published, &stale, &legacy] {
+                File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+                    .unwrap();
+            }
+            store.sweep_temporaries(std::time::Duration::from_secs(3600)).unwrap();
+            assert_eq!(store.read_small(&name, 100).unwrap(), Some(b"published\n".to_vec()));
+            assert_eq!(store.list(&format!("{prefix}/")).unwrap()[0].name, name);
+            assert!(!stale.exists(), "abandoned hidden staging file was not swept");
+            assert!(!legacy.exists(), "abandoned legacy staging file was not swept");
+        }
     }
 
     #[cfg(unix)]
