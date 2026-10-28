@@ -19,6 +19,81 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+/// A metadata-only compiler probe checks all source bodies, including unreachable
+/// ones. It loads an owned source description, not a Cargo workspace or rmeta.
+pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
+    crate::process_wide();
+    let config = crate::cargo_config(&args);
+    let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
+    let (mut db, vfs, _) =
+        crate::load(&[&args.project], &config, load, args.selection.clone(), None, None)?;
+    ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    let crates = crate::crates_named(&db, &args.krate, &args)?;
+    anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
+    let krate = crates[0];
+    let id = ide_db::base_db::Crate::from(krate);
+    if krate.feature_attributes_on_stable(&db) {
+        anyhow::ensure!(
+            !bootstrap,
+            "bootstrap feature probes require the owned release feature catalog"
+        );
+        eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
+        return Ok(false);
+    }
+    let files = WatchedFile::sources(&vfs, &db, SystemTime::now());
+    let paths: FxHashMap<_, _> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, it.path.clone())),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut checked: Vec<_> = krate
+        .modules(&db)
+        .into_iter()
+        .map(|module| module.definition_source_file_id(&db).original_file(&db).file_id(&db))
+        .collect();
+    checked.sort_unstable();
+    checked.dedup();
+    let sources = Sources { paths };
+    let diagnostics = ide_diagnostics::DiagnosticsConfig::test_sample();
+    for &file in &checked {
+        let hard = hir::attach_db(&db, || {
+            ide_diagnostics::semantic_diagnostics_within(
+                &db,
+                &diagnostics,
+                &ide_db::assists::AssistResolveStrategy::None,
+                file,
+                Some(std::sync::Arc::new(FxHashSet::from_iter([id]))),
+            )
+            .into_iter()
+            .filter(|it| it.severity == ide_db::Severity::Error)
+            .filter(|it| {
+                matches!(it.code, ide_diagnostics::DiagnosticCode::RustcHardError(_))
+                    || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
+            })
+            .map(|it| it.message)
+            .collect::<Vec<_>>()
+        });
+        if !hard.is_empty() {
+            for message in hard {
+                eprintln!("error: {message}");
+            }
+            return Ok(false);
+        }
+    }
+    let within = Some(std::sync::Arc::new(FxHashSet::from_iter([id])));
+    let broken = crate::broken_in(&db, &checked, &sources, &args.checkout, within, false);
+    let refused = hir::attach_db(&db, || {
+        crate::refusal(&db, &checked, &sources, &args.checkout, broken, None)
+    });
+    if let Some(refused) = refused {
+        eprintln!("{refused}");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// What a checker answers when the workspace changed in a way only loading it again takes
 /// in: a source file came or went, a manifest changed, or the source of a build script or a
 /// proc macro did, which run as they were built.

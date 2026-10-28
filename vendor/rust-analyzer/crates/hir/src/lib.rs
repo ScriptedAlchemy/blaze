@@ -23,6 +23,7 @@
 extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 mod attrs;
+mod channel_features;
 mod from_id;
 mod has_source;
 mod semantics;

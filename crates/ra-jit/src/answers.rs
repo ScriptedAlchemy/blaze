@@ -20,11 +20,12 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 mod own;
+mod probe;
 
 pub(crate) use own::target_cfg;
 
 /// Build-script probes name this launcher rather than a compiler outside blaze.
-/// Unsupported compile probes fail visibly; no wrapper fallback is reachable.
+/// Unknown compile operations fail visibly; no wrapper fallback is reachable.
 pub(crate) fn producer_launcher(path: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     #[cfg(unix)]
@@ -57,13 +58,18 @@ pub(crate) fn producer_probe(args: Vec<OsString>) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("the producer probe needs its absolute source toolchain"))?;
     let program = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     if !is_question(&args) {
-        // A script may treat a failed probe as an unsupported compiler feature. Until
-        // blaze checks these sources itself, that would silently choose the wrong cfg.
-        // The producer scheduler must fail the build instead of accepting that output.
-        if let Some(path) = std::env::var_os("BLAZE_PRODUCER_PROBE_FAILURE") {
-            std::fs::write(path, format!("{args:?}"))?;
+        match probe::check(&sysroot, &args) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                // Unknown operations are not proof that a language feature is absent.
+                // A script swallowing that failure cannot publish incomplete output.
+                if let Some(path) = std::env::var_os("BLAZE_PRODUCER_PROBE_FAILURE") {
+                    std::fs::write(path, format!("{args:?}: {error:#}"))?;
+                }
+                anyhow::bail!("blaze could not check this producer's compiler probe: {error:#}");
+            }
         }
-        anyhow::bail!("blaze does not yet compile this producer's compiler probe");
     }
     let var = |name: &str| std::env::var_os(name);
     let stdout = own::answer(&program, &args, &[], &var)
