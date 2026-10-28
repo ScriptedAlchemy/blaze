@@ -55,16 +55,14 @@ impl ProcMacroServerPool {
         let original_dylib_path = Arc::new(dylib.path.clone());
         // The server may cache native loaded libraries by pathname/mtime. Give
         // this immutable loaded generation its own file, retained by its handles.
-        let snapshot = stdx::tempfile::NamedTempFile::new_from_existing(
-            "proc-macro-content",
-            dylib.path.as_ref(),
-        )
+        let snapshot = LibrarySnapshot::copy(&dylib.path)
         .map_err(|error| ServerError { message: error.to_string(), io: None })?;
-        let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.path().to_owned()));
-        let snapshot = Arc::new(LibrarySnapshot(snapshot));
+        let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.snapshot_path()));
+        let snapshot = Arc::new(snapshot);
         use sha2::{Digest as _, Sha256};
-        let dylib_content =
-            std::fs::read(dylib_path.as_path()).ok().map(|bytes| Sha256::digest(bytes).into());
+        let bytes = std::fs::read(dylib_path.as_path())
+            .map_err(|error| ServerError { message: error.to_string(), io: None })?;
+        let dylib_content = Some(Sha256::digest(bytes).into());
 
         let (first, rest) = self.workers.split_first().expect("worker pool must not be empty");
 

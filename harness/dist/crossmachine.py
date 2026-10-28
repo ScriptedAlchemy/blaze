@@ -545,7 +545,7 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
-def macro_content_report(work, bin_dir, machines, sources):
+def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     from cargo_ra_jit import Side, program_output, wait_warm
     import norustc
     machine = machines[0]
@@ -565,8 +565,11 @@ def macro_content_report(work, bin_dir, machines, sources):
     side = Side(ws, env, True)
     rows = []
     previous_pids, previous_builds = None, -1
+    previous_dylibs = None
+    steps = ["initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"]
+    steps.extend(f"reload-{index:02}" for index in range(reloads))
     try:
-        for step in ("initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"):
+        for step in steps:
             audit_before = len(norustc.runs(audit_log))
             edited_source = producer if step == "dependency-restored-mtime" else source
             before = os.stat(edited_source)
@@ -581,6 +584,12 @@ def macro_content_report(work, bin_dir, machines, sources):
                 with open(producer, "w") as output:
                     output.write(replacement)
                 os.utime(producer, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif step.startswith("reload-"):
+                replacement = f"described {int(step[-2:]):03}"
+                text = re.sub(r"described (?:TWO|\d{3})", replacement, text)
+                with open(source, "w") as output:
+                    output.write(text)
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
             _, built = side.cargo("build", "-p", "app")
             _, ready = wait_warm(side, ws)
             status = side.cargo("status")[1].stdout
@@ -591,20 +600,47 @@ def macro_content_report(work, bin_dir, machines, sources):
             builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
             generation = valid_worker_generation(status, ready, pids, previous_pids, builds, previous_builds)
             previous_pids, previous_builds = pids, builds
-            rows.append(dict(step=step, right=actual == expected and generation and not recognized_fallback(built.stderr),
+            dylibs = {os.path.relpath(os.path.join(root, name), ws):
+                      hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
+                      for root, _, files in os.walk(os.path.join(ws, "target"))
+                      for name in files if "derive" in name and name.endswith((".dylib", ".so", ".dll"))}
+            new_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
+            same_size = os.stat(edited_source).st_size == before.st_size
+            same_mtime = os.stat(edited_source).st_mtime_ns == before.st_mtime_ns
+            mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
+            mutation_valid = (not mutation or (same_size and same_mtime and old_digest != new_digest
+                                               and dylibs != previous_dylibs))
+            if step == "unchanged-content":
+                mutation_valid &= old_digest == new_digest and dylibs == previous_dylibs
+            previous_dylibs = dylibs
+            retention = {}
+            if reloads:
+                from tracedecay import ps_table, descendants, footprints_mb
+                processes = ps_table(env=False)
+                own = descendants(processes, [int(pid) for pid in pids])
+                servers = [pid for pid, _, _, command in processes
+                           if pid in own and "proc-macro-srv" in command]
+                retention = dict(server_pids=servers, server_footprint_mb=footprints_mb(servers),
+                                 owned_snapshots=[os.path.relpath(os.path.join(root, name), env["RA_JIT_HOME"])
+                                                  for root, _, files in os.walk(os.path.join(env["RA_JIT_HOME"], "macro-snapshots"))
+                                                  for name in files if name.startswith("generation-")],
+                                 producer_directories=[name for name in os.listdir(os.path.join(ws, "target/rust-analyzer/producers"))]
+                                 if os.path.isdir(os.path.join(ws, "target/rust-analyzer/producers")) else [])
+            rows.append(dict(step=step, right=actual == expected and generation and mutation_valid and not recognized_fallback(built.stderr),
                              actual=actual, expected=expected, build_log=built.stderr, status=status, pids=pids,
                              worker_log=workers_log(side), old_sha256=old_digest,
-                             source_sha256=hashlib.sha256(open(edited_source, "rb").read()).hexdigest(),
+                             source_sha256=new_digest,
                              edited_source=os.path.relpath(edited_source, ws),
-                             same_size=os.stat(edited_source).st_size == before.st_size,
-                             same_mtime=os.stat(edited_source).st_mtime_ns == before.st_mtime_ns,
+                             same_size=same_size, same_mtime=same_mtime, mutation_valid=mutation_valid,
+                             retention=retention,
                              product_tool_calls=norustc.runs(audit_log)[audit_before:],
-                             dylibs={os.path.relpath(os.path.join(root, name), ws):
-                                     hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
-                                     for root, _, files in os.walk(os.path.join(ws, "target"))
-                                     for name in files if "derive" in name and name.endswith((".dylib", ".so", ".dll"))}))
+                             dylibs=dylibs))
     finally:
         side.cargo("stop")
+        with open(os.path.join(work, "snapshot-cleanup.json"), "w") as output:
+            json.dump(dict(owned_files=[os.path.relpath(os.path.join(root, name), env["RA_JIT_HOME"])
+                                       for root, _, files in os.walk(os.path.join(env["RA_JIT_HOME"], "macro-snapshots"))
+                                       for name in files]), output)
     return rows
 
 def nonfunction_report(work, bin_dir, machines, sources):
@@ -1250,6 +1286,7 @@ def main():
                    help="same-daemon binary payload edit/delete/recreate on two checkout paths")
     p.add_argument("--warm-nonfunction", action="store_true")
     p.add_argument("--warm-macro-content", action="store_true")
+    p.add_argument("--macro-reloads", type=int, default=0)
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
     p.add_argument("--watchdog-mb", type=int, default=24 * 1024)
@@ -1310,7 +1347,7 @@ def main():
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
         if a.warm_payload or a.warm_nonfunction or a.warm_macro_content:
             runner = macro_content_report if a.warm_macro_content else (nonfunction_report if a.warm_nonfunction else warm_payload_report)
-            rows = runner(work, bin_dir, (a_m, b_m), sources)
+            rows = runner(work, bin_dir, (a_m, b_m), sources, a.macro_reloads) if a.warm_macro_content else runner(work, bin_dir, (a_m, b_m), sources)
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
                 json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
             print(json.dumps(rows, indent=1))

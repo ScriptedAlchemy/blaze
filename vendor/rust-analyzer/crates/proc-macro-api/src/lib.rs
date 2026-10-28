@@ -20,6 +20,8 @@ pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
 pub mod transport;
+#[cfg(test)]
+mod generation_tests;
 
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
@@ -80,15 +82,24 @@ pub enum ProcMacroKind {
 
 /// A handle to proc-macro server process pool which load dylibs with macros (.so or .dll)
 /// and runs actual macro expansion functions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcMacroClient {
     /// Currently, the proc macro process expands all procedural macros sequentially.
     ///
     /// That means that concurrent salsa requests may block each other when expanding proc macros,
     /// which is unfortunate, but simple and good enough for the time being.
     pool: Arc<ProcMacroServerPool>,
+    /// New library generations get a pool whose lifetime follows their handles.
+    /// This releases native server images without changing either wire protocol.
+    spawn_generation: Option<Arc<dyn Fn() -> io::Result<ProcMacroServerPool> + Send + Sync>>,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
+}
+
+impl fmt::Debug for ProcMacroClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcMacroClient").field("path", &self.path).finish()
+    }
 }
 
 /// Represents a dynamically loaded library containing procedural macros.
@@ -118,11 +129,77 @@ pub struct ProcMacro {
     _snapshot: Arc<LibrarySnapshot>,
 }
 
-struct LibrarySnapshot(stdx::tempfile::NamedTempFile);
+enum LibrarySnapshot {
+    Temporary(stdx::tempfile::NamedTempDir),
+    WorkerOwned(std::path::PathBuf),
+}
+
+impl LibrarySnapshot {
+    fn copy(source: &AbsPath) -> io::Result<Self> {
+        // Open first: a missing producer must not leave an empty generation.
+        let mut input = std::fs::File::open(source)?;
+        // The daemon knows this private worker home and removes it only after
+        // killing/waiting for that worker group. This covers stop without Drop.
+        if std::env::var_os("RA_JIT_ENDS_WITH_INPUT").is_some()
+            && let Some(home) = std::env::var_os("RA_JIT_HOME")
+        {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let pid = std::process::id();
+            let dir = std::path::PathBuf::from(home).join("macro-snapshots").join(pid.to_string());
+            for ancestor in dir.ancestors().take(2) {
+                if std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(io::Error::other("symlink in owned macro snapshot directory"));
+                }
+            }
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let marker = dir.join("owner");
+            if std::fs::symlink_metadata(&marker)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(io::Error::other("symlink macro snapshot owner marker"));
+            }
+            if marker.exists() && std::fs::read_to_string(&marker)? != pid.to_string() {
+                return Err(io::Error::other("macro snapshot owner mismatch"));
+            }
+            std::fs::write(marker, pid.to_string())?;
+            let path = dir.join(format!("generation-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
+            let snapshot = Self::WorkerOwned(path);
+            io::copy(&mut input, &mut file)?;
+            return Ok(snapshot);
+        }
+        let dir = stdx::tempfile::NamedTempDir::new("proc-macro-content")?;
+        let mut file = std::fs::File::create(dir.path().join("library"))?;
+        io::copy(&mut input, &mut file)?;
+        Ok(Self::Temporary(dir))
+    }
+
+    fn snapshot_path(&self) -> std::path::PathBuf {
+        match self {
+            Self::Temporary(dir) => dir.path().join("library"),
+            Self::WorkerOwned(path) => path.clone(),
+        }
+    }
+}
+
+impl Drop for LibrarySnapshot {
+    fn drop(&mut self) {
+        if let Self::WorkerOwned(path) = self {
+            _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 impl fmt::Debug for LibrarySnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.path().fmt(f)
+        self.snapshot_path().fmt(f)
     }
 }
 
@@ -164,15 +241,29 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker = ProcMacroServerProcess::spawn(process_path, env.clone(), version)?;
-            workers.push(worker);
-        }
-
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+        let path = process_path.to_owned();
+        let vars: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = env
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned())))
+            .collect();
+        let version = version.cloned();
+        let factory = move || {
+            let mut workers = Vec::with_capacity(num_process);
+            for _ in 0..num_process {
+                workers.push(ProcMacroServerProcess::spawn(
+                    &path,
+                    vars.iter().map(|(key, value)| (key, value)),
+                    version.as_ref(),
+                )?);
+            }
+            Ok(ProcMacroServerPool::new(workers))
+        };
+        let pool = factory()?;
+        Ok(ProcMacroClient {
+            pool: Arc::new(pool),
+            path: process_path.to_owned(),
+            spawn_generation: Some(Arc::new(factory)),
+        })
     }
 
     /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
@@ -190,16 +281,47 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker =
-                ProcMacroServerProcess::run(spawn.clone(), version, || "<unknown>".to_owned())?;
-            workers.push(worker);
+        let mut workers = Vec::with_capacity(num_process);
+        for _ in 0..num_process {
+            workers.push(ProcMacroServerProcess::run(
+                spawn.clone(), version, || "<unknown>".to_owned(),
+            )?);
         }
+        Ok(ProcMacroClient {
+            pool: Arc::new(ProcMacroServerPool::new(workers)),
+            path: process_path.to_owned(),
+            spawn_generation: None,
+        })
+    }
 
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+    /// Test transport with replayable streams for each owned generation.
+    pub fn with_generation_io_channels(
+        process_path: &AbsPath,
+        spawn: impl Fn(
+            Option<ProtocolFormat>,
+        ) -> io::Result<(
+            Box<dyn process::ProcessExit>,
+            Box<dyn io::Write + Send + Sync>,
+            Box<dyn io::BufRead + Send + Sync>,
+        )> + Clone + Send + Sync + 'static,
+        version: Option<&Version>,
+        num_process: usize,
+    ) -> io::Result<ProcMacroClient> {
+        let version = version.cloned();
+        let factory = move || {
+            let mut workers = Vec::with_capacity(num_process);
+            for _ in 0..num_process {
+                workers.push(ProcMacroServerProcess::run(
+                    spawn.clone(), version.as_ref(), || "<unknown>".to_owned(),
+                )?);
+            }
+            Ok(ProcMacroServerPool::new(workers))
+        };
+        Ok(ProcMacroClient {
+            pool: Arc::new(factory()?),
+            path: process_path.to_owned(),
+            spawn_generation: Some(Arc::new(factory)),
+        })
     }
 
     /// Returns the absolute path to the proc-macro server.
@@ -209,7 +331,11 @@ impl ProcMacroClient {
 
     /// Loads a proc-macro dylib into the server process returning a list of `ProcMacro`s loaded.
     pub fn load_dylib(&self, dylib: MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
-        self.pool.load_dylib(&dylib)
+        let Some(factory) = &self.spawn_generation else {
+            return self.pool.load_dylib(&dylib);
+        };
+        let pool = factory().map_err(|error| ServerError { message: error.to_string(), io: None })?;
+        pool.load_dylib(&dylib)
     }
 
     /// Checks if the proc-macro server has exited.
