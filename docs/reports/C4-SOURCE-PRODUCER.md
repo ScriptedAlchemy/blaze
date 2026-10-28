@@ -98,10 +98,10 @@ and independent oracle images. Run it twice, with `--light` and without, over
 fresh work directories. A matching token result does not prove host planning,
 default registry features, build scripts or span parity.
 
-On this Mac, Python injects `SDKROOT`. The owned query model currently refuses
-SDK overrides. `--default-sdk` selects the default SDK witness and records
-that choice; product code does not erase the user's SDK. Closing the SDK query
-gap is still required, rather than waiving the audit.
+On this Mac, Python injects `SDKROOT`. Release, cfg, filename and target-spec
+queries do not read that linker input. Owned answers preserve it rather than
+clearing the environment; 63 SDK/target differential controls match Rust 1.99.0.
+Deployment-target override modelling remains incomplete and fails by name.
 
 No cold path was switched. The strict initial seven-row witness remains FAIL.
 
@@ -117,10 +117,14 @@ compilation. Generated cfg, env and OUT_DIR reach each host library; the link
 reads native inputs from the script output beside OUT_DIR as before.
 
 Scripts name an owned probe launcher. Version and print questions go straight
-to `answers.rs`'s owned answers, never its rustc fallback. Compile probes remain
-unfinished as a general compiler interface. Metadata-only status probes now
-check source through the owned frontend, including cfg-expanded channel gates.
-Unknown artifact operations and bootstrap feature attributes record a failure
+to `answers.rs`'s owned answers, never rustc. Compile probes remain
+unfinished as a general compiler interface. The frontend can report some
+source errors, including cfg-expanded channel gates, but cannot certify
+compiler acceptance: stability, privacy, const validity, dyn compatibility
+and unresolved signatures are not fully checked. An apparently valid probe
+therefore refuses loudly, as an undecided operation. No successful compile
+probe is published until those checks are complete. Unknown artifact
+operations and bootstrap feature attributes also record a failure
 which the runner checks before publishing successful script output. A script
 cannot swallow an unsupported operation and silently select incomplete cfgs.
 
@@ -134,9 +138,13 @@ Every product tool call, including queries and expansion, remains audited.
 
 `harness/dist/producer_registry.py` builds the existing source producer with
 real registry syn, quote and proc-macro2 default features and scripts. Script
-stdout and normalized expansion match the independent Cargo/rustc oracle.
-`producer_probes.py` compares twelve source statuses and checks the explicit
-bootstrap refusal. This is not a general metadata-emission or feature-catalog
-parity claim. Broader probes, nested producer scheduling and image generation
+stdout and normalized expansion matched the independent Cargo/rustc oracle
+at 623e738b. That partial checker failed open on broader compiler probes.
+The P8 review's 22 cases now require oracle parity or a loud undecided refusal.
+The default registry compiler-probe closure currently refuses; its earlier
+success is not current parity evidence. `producer_probes.py` also checks
+known errors and explicit undecided/bootstrap refusals. This is not a general
+metadata-emission or feature-catalog parity claim. Complete compiler checks,
+nested producer scheduling and image generation
 reuse still need implementation. Both cold paths and the native server
 bootstrap retain their old handoff. The PR stays draft and strict gate FAIL.
