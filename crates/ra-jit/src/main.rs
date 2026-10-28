@@ -8974,6 +8974,11 @@ fn run_holding(
             harnessed,
         );
     }
+    let image_native = args
+        .inputs
+        .as_ref()
+        .filter(|_| args.shared)
+        .and_then(|_| native_inputs::image_before(&db, &args));
     let cold = match rustcs_to_patch(&args, written.is_empty() && !harnessed) {
         Some(rustcs) => {
             let start = Instant::now();
@@ -9048,6 +9053,9 @@ fn run_holding(
                 }
                 if let Some(path) = &args.inputs {
                     write_inputs(&db, &args, tree.vfs(), exe, path)?;
+                    if let Some(native) = image_native {
+                        native.write(&path.with_extension("native.json"))?;
+                    }
                 }
             }
             // The first program is compiled and linked: a process no daemon's build started

@@ -132,17 +132,47 @@ def main():
     pins = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (args.blaze.resolve(), args.owned_server.resolve(), library, images[0])}
     (work / "pins.json").write_text(json.dumps(pins, indent=2) + "\n")
-    # A second build may rebuild its image, but must not compile or run fresh scripts.
+    # An unchanged image and its scripts must not be compiled or run again.
     script_files = list((work / "producer/scripts").rglob("build-script-build"))
     run_files = list((work / "producer/scripts").rglob("output"))
+    image_files = [library] + list((work / "producer").rglob("producer.inputs"))
+    image_files += [path for path in (work / "producer").rglob("ra-jit.log")
+                    if "images" in path.parts]
     before = {str(path): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
-              for path in script_files + run_files}
+              for path in script_files + run_files + image_files}
     assert len(script_files) == len(run_files) == 2, (script_files, run_files)
-    run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
-         selected, host, host, work / "producer"], root, product, work / "repeat-build.log")
+    repeat = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
+                            selected, host, host, work / "producer"],
+                           root, product, work / "repeat-build.log"))
+    assert Path(repeat[0]["library"]) == library
     after = {str(path): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
-             for path in script_files + run_files}
+             for path in script_files + run_files + image_files}
     assert before == after, (before, after)
+    assert list((work / "producer").rglob("complete.json")), "no admitted image"
+    import subprocess
+    # A damaged admitted output must not be overwritten while a reader could hold it.
+    saved_image = library.read_bytes()
+    library.write_bytes(b"not a library")
+    bad = subprocess.run([str(args.blaze.resolve()), "proc-macro-build", str(root / "Cargo.toml"),
+                          str(selected), host, host, str(work / "producer")],
+                         cwd=root, env=product, capture_output=True, text=True)
+    (work / "corrupt-image.log").write_text(bad.stdout + bad.stderr)
+    assert bad.returncode != 0 and "completed owned producer image is corrupt" in bad.stderr
+    assert library.read_bytes() == b"not a library", "must not replace a leased image"
+    library.write_bytes(saved_image)
+    # Same-length dependency bytes with the old mtime select another immutable image.
+    dependency = root / "shared/src/lib.rs"
+    original = dependency.read_text()
+    stamp = dependency.stat()
+    changed = original.replace("target-only", "target-edit")
+    assert len(changed) == len(original) and changed != original
+    dependency.write_text(changed)
+    os.utime(dependency, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    newer = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
+                           selected, host, host, work / "producer"],
+                          root, product, work / "changed-image.log"))
+    assert Path(newer[0]["library"]) != library
+    assert library.read_bytes() == saved_image
     compiler_logs = list((work / "producer").rglob("ra-jit.log"))
     assert compiler_logs, "the regression must inspect actual producer compiler logs"
     for log in compiler_logs:
@@ -156,7 +186,6 @@ def main():
         .arg("--crate-type=lib").arg("probe.rs").status().unwrap();
     assert!(!status.success());
     let generated ='''))
-    import subprocess
     result = subprocess.run([str(args.blaze.resolve()), "proc-macro-build", str(root / "Cargo.toml"),
                              str(selected), host, host, str(work / "producer")],
                             cwd=root, env=product, capture_output=True, text=True)

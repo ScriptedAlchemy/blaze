@@ -194,8 +194,9 @@ pub(crate) fn native_command(
     program: &[Crate],
     sysroot: Option<&Path>,
     exe: &Path,
+    shared: bool,
 ) -> anyhow::Result<(String, Environment)> {
-    let line = Line::of(db, program, sysroot, false)?;
+    let line = Line::of(db, program, sysroot, shared)?;
     let command = command_of(&line, &[], exe, CommandPurpose::NativeInputs)?;
     Ok((command, line.env))
 }

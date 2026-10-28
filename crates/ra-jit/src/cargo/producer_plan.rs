@@ -515,13 +515,8 @@ pub(crate) fn command(
             .collect::<Result<Vec<_>>>()?;
         let mut libraries = Vec::new();
         for (root, crates) in closures {
-            let library = super::own_script::link_macro_planned(
-                &sysroot,
-                crates,
-                &dir.join(root.to_string()),
-                &env,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let library =
+                super::producer_image::link(&sysroot, crates, &dir.join(root.to_string()), &env)?;
             libraries.push(json!({"package": planned.units[root].package, "library": library}));
         }
         println!("{}", json!(libraries));
