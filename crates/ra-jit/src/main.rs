@@ -5551,7 +5551,10 @@ fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// What cargo said of every crate when the checkouts were last loaded.
-struct CratesAsLoaded(FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>);
+struct CratesAsLoaded {
+    crates: FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>,
+    macros: FxHashMap<ide_db::base_db::Crate, triomphe::Arc<hir_expand::proc_macro::CrateProcMacros>>,
+}
 
 type CrateAsLoaded = (
     ide_db::base_db::BuiltCrateData,
@@ -5563,7 +5566,13 @@ type CrateAsLoaded = (
 impl CratesAsLoaded {
     fn of(db: &RootDatabase) -> CratesAsLoaded {
         let crates = ide_db::base_db::all_crates(db);
-        CratesAsLoaded(crates.iter().map(|&it| (it, Self::said(db, it))).collect())
+        let macros = hir_expand::proc_macro::ProcMacros::try_get(db)
+            .map(|macros| macros.by_crate(db).clone())
+            .unwrap_or_default();
+        CratesAsLoaded {
+            crates: crates.iter().map(|&it| (it, Self::said(db, it))).collect(),
+            macros,
+        }
     }
 
     fn said(db: &RootDatabase, krate: ide_db::base_db::Crate) -> CrateAsLoaded {
@@ -5578,8 +5587,23 @@ impl CratesAsLoaded {
     /// The crates of `db` that cargo says something else of now, or that were not there.
     fn changed(&self, db: &RootDatabase) -> Vec<ide_db::base_db::Crate> {
         let crates = ide_db::base_db::all_crates(db);
-        let same = |krate| self.0.get(&krate).is_some_and(|was| *was == Self::said(db, krate));
-        crates.iter().copied().filter(|&it| !same(it)).collect()
+        let now = hir_expand::proc_macro::ProcMacros::try_get(db)
+            .map(|macros| macros.by_crate(db).clone())
+            .unwrap_or_default();
+        let mut changed: FxHashSet<_> = crates
+            .iter()
+            .copied()
+            .filter(|&krate| {
+                !self.crates.get(&krate).is_some_and(|was| *was == Self::said(db, krate))
+                    || self.macros.get(&krate) != now.get(&krate)
+            })
+            .collect();
+        // A changed macro generation is an input change of its expansion users,
+        // even though cargo's crate description has not changed.
+        for krate in changed.clone() {
+            changed.extend(krate.transitive_rev_deps(db));
+        }
+        changed.into_iter().collect()
     }
 }
 

@@ -582,7 +582,11 @@ def macro_content_report(work, bin_dir, machines, sources):
                              worker_log=workers_log(side), old_sha256=old_digest,
                              source_sha256=hashlib.sha256(open(source, "rb").read()).hexdigest(),
                              same_size=os.stat(source).st_size == before.st_size,
-                             same_mtime=os.stat(source).st_mtime_ns == before.st_mtime_ns))
+                             same_mtime=os.stat(source).st_mtime_ns == before.st_mtime_ns,
+                             dylibs={os.path.relpath(os.path.join(root, name), ws):
+                                     hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
+                                     for root, _, files in os.walk(os.path.join(ws, "target"))
+                                     for name in files if "derive" in name and name.endswith((".dylib", ".so", ".dll"))}))
     finally:
         side.cargo("stop")
     return rows
