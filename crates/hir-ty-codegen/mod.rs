@@ -4360,13 +4360,14 @@ fn compile_as<'db>(
 ) -> Result<Produced> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
-    cg.machine =
+    let mut machine =
         hir_ty::mir::codegen_options::TargetMachine::from_flags(&env.krate.data(db).codegen_flags);
     if let Some(function) = body.and_then(|body| body.owner.as_function()) {
         for feature in AttrFlags::target_features(db, function) {
-            cg.machine.features.insert(feature.as_str().to_owned(), true);
+            machine.features.insert(feature.as_str().to_owned(), true);
         }
     }
+    cg.set_machine(machine);
     let tally = backend::Tally::global();
     /// `RA_JIT_PROMOTE=0` leaves every local in its slot of the frame.
     static PROMOTE: LazyLock<bool> =

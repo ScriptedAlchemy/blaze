@@ -394,6 +394,11 @@ impl Wants {
         self.requests
     }
 
+    #[cfg(test)]
+    fn moved_machine(self) -> hir_ty::mir::codegen_options::TargetMachine {
+        self.machine
+    }
+
     /// The bytes of each data object asked for so far that is read-only and points nowhere,
     /// by its place among the requests: what a load from it is known to give.
     #[cfg(feature = "llvm")]
@@ -649,6 +654,24 @@ impl Wants {
     }
 }
 
+#[cfg(test)]
+mod machine_transport_tests {
+    use super::*;
+
+    #[test]
+    fn wants_owns_the_machine_retained_when_the_recorder_is_detached() {
+        let isa = super::super::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        let machine = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-feature=+lse".to_owned(),
+            "-Ctarget-cpu=generic".to_owned(),
+            "-Copt-level=3".to_owned(),
+        ]);
+        wants.machine = machine.clone();
+        assert_eq!(wants.moved_machine(), machine);
+    }
+}
+
 impl<'db> std::ops::Deref for Recorder<'db> {
     type Target = Wants;
 
@@ -664,6 +687,12 @@ impl<'db> std::ops::DerefMut for Recorder<'db> {
 }
 
 impl<'db> Recorder<'db> {
+    /// Recorder dereferences to Wants, so the machine is already carried by detach.
+    /// Set it explicitly to make that producer/tier transport unambiguous.
+    pub(super) fn set_machine(&mut self, machine: hir_ty::mir::codegen_options::TargetMachine) {
+        self.wants.machine = machine;
+    }
+
     /// The stack slots that hold a local written with a name.
     pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
         self.named.iter().map(|it| it.slot)

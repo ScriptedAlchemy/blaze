@@ -562,7 +562,7 @@ impl Plan {
         config.start("build", &selection.config)?;
         let sources = config.sources();
         let graph = UnitGraph::of(dir, manifest, selection, &[], asked.env)?;
-        let mut plan = graph.plan(&Flags::of(dir, asked)?)?;
+        let mut plan = graph.plan(&Flags::of(dir, asked)?, selection.target.is_some())?;
         plan.sources = sources;
         Ok(plan)
     }
@@ -907,7 +907,7 @@ impl UnitGraph {
         reached
     }
 
-    fn plan(self, flags: &Flags) -> anyhow::Result<Plan> {
+    fn plan(self, flags: &Flags, explicit_target: bool) -> anyhow::Result<Plan> {
         let for_target = self.for_target();
         // The flag is not cargo's to know: the libraries are then built for a link without it
         // and rustc finds no bitcode in them.
@@ -935,8 +935,10 @@ impl UnitGraph {
             .into_iter()
             .map(|(id, (index, unit))| {
                 let features = unit.features.iter().cloned().collect();
-                let (profile, primary) = (unit.profile.with(flags), roots.contains(id));
                 let for_target = for_target.contains(&index);
+                let applies = for_target || !explicit_target;
+                let profile = if applies { unit.profile.with(flags) } else { unit.profile.clone() };
+                let primary = roots.contains(id);
                 (
                     package_named(id),
                     Built {
@@ -948,7 +950,7 @@ impl UnitGraph {
                             "-Copt-level={}",
                             unit.profile.opt_level
                         ))
-                        .chain(flags.codegen_flags.iter().cloned())
+                        .chain(flags.codegen_flags.iter().filter(|_| applies).cloned())
                         .collect(),
                     },
                 )
@@ -966,7 +968,42 @@ impl UnitGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::Flags;
+    use super::{Flags, UnitGraph};
+
+    #[test]
+    fn explicit_target_flags_are_not_given_to_host_only_proc_macro_units() {
+        let profile = serde_json::json!({
+            "opt_level": "0", "lto": "false", "debug_assertions": true,
+            "overflow_checks": true, "panic": "unwind", "debuginfo": 0,
+            "split_debuginfo": null, "strip": {"resolved": "None"}
+        });
+        let graph = serde_json::json!({
+            "roots": [0],
+            "units": [
+                {"pkg_id":"path+file:///w/app#app@0.1.0",
+                 "target":{"kind":["bin"],"crate_types":["bin"]},
+                 "profile":profile, "features":[], "dependencies":[{"index":1}]},
+                {"pkg_id":"path+file:///w/mac#mac@0.1.0",
+                 "target":{"kind":["proc-macro"],"crate_types":["proc-macro"]},
+                 "profile":profile, "features":[], "dependencies":[]}
+            ]
+        });
+        let flags = Flags::parse(
+            ["-Ctarget-cpu=haswell", "-Ctarget-feature=+avx2", "-Cpanic=abort"].into_iter(),
+        );
+        for explicit in [false, true] {
+            let graph: UnitGraph = serde_json::from_value(graph.clone()).unwrap();
+            let plan = graph.plan(&flags, explicit).unwrap();
+            let hosted = plan.package("path+file:///w/mac#mac@0.1.0").unwrap();
+            let targeted = plan.package("path+file:///w/app#app@0.1.0").unwrap();
+            assert!(targeted.codegen_flags.iter().any(|flag| flag == "-Ctarget-cpu=haswell"));
+            assert_eq!(
+                hosted.codegen_flags.iter().any(|flag| flag == "-Ctarget-cpu=haswell"),
+                !explicit
+            );
+            assert_eq!(hosted.profile.panic.name(), if explicit { "unwind" } else { "abort" });
+        }
+    }
 
     #[test]
     fn force_frame_pointers_is_read_in_each_spelling() {

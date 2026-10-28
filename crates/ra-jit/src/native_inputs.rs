@@ -24,7 +24,13 @@ use sha2::{Digest as _, Sha256};
 use crate::{Args, Program, RootDatabase};
 
 type Digest = [u8; 32];
-static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Digest>>> =
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Linked {
+    inputs: Digest,
+    output: Digest,
+}
+
+static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Linked>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[derive(Default)]
@@ -44,6 +50,7 @@ pub(crate) struct Pending {
     inputs: Inputs,
     before: Option<Digest>,
     changed: bool,
+    output_changed: bool,
 }
 
 impl Pending {
@@ -52,12 +59,17 @@ impl Pending {
         self.changed
     }
 
+    pub(crate) fn output_changed(&self) -> bool {
+        self.output_changed
+    }
+
     pub(crate) fn commit(self) -> anyhow::Result<()> {
         let Some(before) = self.before else { return Ok(()) };
         if self.inputs.digest().ok() != Some(before) {
             bail!("native link inputs changed while the executable was being linked");
         }
-        crate::lock(&LINKED_INPUTS).insert(self.binary, before);
+        let output = output_digest(&self.binary)?;
+        crate::lock(&LINKED_INPUTS).insert(self.binary, Linked { inputs: before, output });
         Ok(())
     }
 }
@@ -93,6 +105,10 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
         }
     }
     let mut inputs = Inputs::default();
+    for root in &roots {
+        let root: ide_db::base_db::Crate = (*root).into();
+        inputs.directives.push(format!("{:?}", root.data(db).codegen_flags).into_bytes());
+    }
     for out in &out_dirs {
         if let Some(printed) = crate::cargo::script::printed(out) {
             inputs.paths.insert(printed);
@@ -311,7 +327,11 @@ pub(crate) fn stale(db: &RootDatabase, programs: &[Program]) -> bool {
         // A program that was never linked by this worker has nothing to be stale against.
         let now = inputs.digest().ok();
         let linked = crate::lock(&LINKED_INPUTS).get(&binary).copied();
-        program.wrote.is_some() && (now.is_none() || linked != now)
+        program.wrote.is_some()
+            && (now.is_none()
+                || linked.is_none_or(|linked| {
+                    Some(linked.inputs) != now || output_digest(&binary).ok() != Some(linked.output)
+                }))
     })
 }
 
@@ -319,7 +339,19 @@ pub(crate) fn invalidate(db: &RootDatabase, programs: &mut [Program]) {
     for program in programs {
         let Some((binary, inputs)) = collect(db, &program.args) else { continue };
         let now = inputs.digest().ok();
-        if now.is_some() && crate::lock(&LINKED_INPUTS).get(&binary).copied() == now {
+        let linked = crate::lock(&LINKED_INPUTS).get(&binary).copied();
+        let inputs_same = linked.is_some_and(|linked| now == Some(linked.inputs));
+        if inputs_same {
+            if linked.is_some_and(|linked| output_digest(&binary).ok() == Some(linked.output)) {
+                continue;
+            }
+            // Another worker may have published a different machine's executable to this
+            // path. Retain compiled queries and objects: only publication/link reuse is lost.
+            forget_binary(&binary);
+            program.known.forget_base();
+            program.whole = None;
+            program.unbuilt.stale = true;
+            program.unbuilt.unlinked = true;
             continue;
         }
         if program.wrote.is_none() {
@@ -352,8 +384,25 @@ fn pending(binary: PathBuf, inputs: Inputs) -> Pending {
     let before = inputs.digest().ok();
     // A failed attempt cannot leave an old identity available for A -> B -> A reuse.
     let previous = crate::lock(&LINKED_INPUTS).remove(&binary);
-    let changed = before.is_none() || previous != before;
-    Pending { binary, inputs, before, changed }
+    let changed =
+        before.is_none() || previous.is_none_or(|previous| Some(previous.inputs) != before);
+    let output_changed =
+        previous.is_some_and(|previous| output_digest(&binary).ok() != Some(previous.output));
+    Pending { binary, inputs, before, changed, output_changed }
+}
+
+fn output_digest(path: &Path) -> io::Result<Digest> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
 }
 
 impl Inputs {
@@ -835,8 +884,10 @@ mod tests {
         let archive = dir.path().join("native.a");
         let binary = dir.path().join("program");
         fs::write(&archive, b"A").unwrap();
+        fs::write(&binary, b"linked A").unwrap();
         let a = inputs(&archive).digest().unwrap();
-        crate::lock(&LINKED_INPUTS).insert(binary.clone(), a);
+        let linked = Linked { inputs: a, output: output_digest(&binary).unwrap() };
+        crate::lock(&LINKED_INPUTS).insert(binary.clone(), linked);
         let failed = pending(binary.clone(), inputs(&archive));
         assert!(!failed.changed());
         drop(failed);
@@ -851,7 +902,27 @@ mod tests {
         assert!(restored.changed());
         assert!(!crate::lock(&LINKED_INPUTS).contains_key(&binary));
         restored.commit().unwrap();
-        assert_eq!(crate::lock(&LINKED_INPUTS).remove(&binary), Some(a));
+        assert_eq!(crate::lock(&LINKED_INPUTS).remove(&binary), Some(linked));
+    }
+
+    #[test]
+    fn another_workers_output_is_not_the_registered_machine_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("native.a");
+        let binary = dir.path().join("program");
+        fs::write(&archive, b"A").unwrap();
+        fs::write(&binary, b"+machine").unwrap();
+        pending(binary.clone(), inputs(&archive)).commit().unwrap();
+        let registered = crate::lock(&LINKED_INPUTS).get(&binary).copied().unwrap();
+        let stamp = fs::metadata(&binary).unwrap().modified().unwrap();
+        fs::write(&binary, b"-machine").unwrap();
+        fs::File::options().write(true).open(&binary).unwrap().set_modified(stamp).unwrap();
+        let link = pending(binary.clone(), inputs(&archive));
+        assert!(!link.changed(), "the native and machine inputs did not change");
+        assert!(link.output_changed(), "equal size/mtime cannot bless another executable");
+        fs::write(&binary, b"+machine").unwrap();
+        link.commit().unwrap();
+        assert_eq!(crate::lock(&LINKED_INPUTS).remove(&binary), Some(registered));
     }
 
     #[cfg(unix)]

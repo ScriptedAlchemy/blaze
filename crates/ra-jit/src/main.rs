@@ -10383,6 +10383,15 @@ impl Program {
         // Capture the effective output's identity, not another checkout's or alias's. Recheck
         // here too: a native input may have changed after the request was admitted.
         let native_link = native_inputs::begin(db, args);
+        if native_link.as_ref().is_some_and(|link| link.output_changed())
+            && let Some(binary) = args.splice.as_ref().or(args.exe.as_ref())
+        {
+            native_inputs::forget_binary(binary);
+            known.forget_base();
+            *whole = None;
+            unbuilt.stale = true;
+            unbuilt.unlinked = true;
+        }
         if native_link.as_ref().is_some_and(|link| link.changed()) {
             if let Some(binary) = args.splice.as_ref().or(args.exe.as_ref()) {
                 native_inputs::forget_binary(binary);
