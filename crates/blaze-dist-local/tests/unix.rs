@@ -633,6 +633,77 @@ fn pending_request_is_never_migrated_into_a_fresh_lifetime() {
 }
 
 #[test]
+fn committed_lost_answer_cannot_be_reissued_by_renewal_or_replayed_after_expiry() {
+    // The real sequence the guarantee is about: a Submit that COMMITTED, whose answer the
+    // client never saw, and then two ways the client could try to carry it forward — renewing
+    // into a fresh lifetime, and replaying the old bytes after expiry. Neither may repeat the
+    // effect. The client here is the production one; only the wire is raw, so the answer is
+    // genuinely lost rather than simulated by a flag.
+    let f = Fixture::new(true, Config { session_ms: 40, ..Config::default() });
+    let count_assigned = |f: &Fixture| {
+        f.effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, Effect::Event(i) if matches!(i.event, JobEvent::Assigned(_))),
+            )
+            .count()
+    };
+    let nonce = [61; 32];
+    let mut c = Client::connect(&f.path, nonce).unwrap();
+    let committed = c.welcome.clone();
+    // Submit on the client's own journaled path, then throw the answer away by dropping the
+    // connection after the daemon has committed: the request bytes stay reconstructible.
+    let mut stream = raw(&f);
+    let w = resume_raw(&mut stream, &committed);
+    assert_eq!(w.session, committed.session);
+    let submit_bytes = frame(&encode(&ClientFrame::Request(Request {
+        epoch: w.epoch,
+        session: w.session,
+        sequence: w.next_request,
+        command: Command::Submit(submission(&job(100_000), need())),
+    })));
+    stream.write_all(&submit_bytes).unwrap();
+    // The daemon answered, but this client never read it: drop the socket with the reply
+    // still queued. The commit is real, and exactly one Assigned effect exists.
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(count_assigned(&f), 1);
+    // (a) Renewal with the same nonce while the lifetime is live adopts it, so nothing new is
+    // submitted; the pending answer is recoverable by replaying the exact bytes, not by re-issuing.
+    let mut same = Client::connect(&f.path, nonce).unwrap();
+    assert!(!same.welcome.created, "the live nonce names the committed lifetime");
+    assert_eq!(same.welcome.session, committed.session);
+    let mut stream = raw(&f);
+    resume_raw(&mut stream, &committed);
+    stream.write_all(&submit_bytes).unwrap();
+    let ServerFrame::Response(Response { answer: Answer::Binding(b), .. }) = read(&mut stream)
+    else {
+        panic!("the journaled answer must replay")
+    };
+    assert_eq!(b.subscription.content, submission(&job(100_000), need()).content);
+    assert_eq!(count_assigned(&f), 1, "replay must not submit twice");
+    // (b) After expiry the same nonce creates a NEW lifetime, and the old bytes are refused
+    // rather than replayed into it: the committed work is never re-issued.
+    f.at(41);
+    let mut fresh = raw(&f);
+    let created = create_raw(&f, &mut fresh, nonce);
+    assert!(created.created);
+    assert_ne!(created.session, committed.session);
+    fresh.write_all(&submit_bytes).unwrap();
+    assert!(matches!(read(&mut fresh), ServerFrame::Error(_)));
+    assert_eq!(count_assigned(&f), 1, "expired replay must not submit twice");
+    // (c) The old label is not resumable either.
+    let mut stream = raw(&f);
+    stream
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(committed.session, committed.epoch)))))
+        .unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    let _ = b;
+}
+
+#[test]
 fn renew_after_release_creates_a_distinct_lifetime_and_old_label_stays_dead() {
     let f = Fixture::new(false, Config::default());
     let mut c = f.client();
