@@ -75,6 +75,11 @@ pub(crate) struct Generation {
 }
 
 impl Generation {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn prepare(
         workspace: &ProjectWorkspace,
         config: &mut CargoConfig,

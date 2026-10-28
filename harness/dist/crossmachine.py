@@ -566,6 +566,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     rows = []
     previous_pids, previous_builds = None, -1
     previous_dylibs = None
+    previous_reload_count = 0
     steps = ["initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"]
     steps.extend(f"reload-{index:02}" for index in range(reloads))
     try:
@@ -613,6 +614,11 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
             if step == "unchanged-content":
                 mutation_valid &= old_digest == new_digest and dylibs == previous_dylibs
             previous_dylibs = dylibs
+            worker = workers_log(side)
+            reload_count = len(re.findall(r"(?m)^reload:", worker))
+            reload_valid = (reload_count > previous_reload_count if mutation
+                            else reload_count == previous_reload_count)
+            previous_reload_count = reload_count
             retention = {}
             if reloads:
                 from tracedecay import ps_table, descendants, footprints_mb
@@ -624,11 +630,13 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
                                  owned_snapshots=[os.path.relpath(os.path.join(root, name), env["RA_JIT_HOME"])
                                                   for root, _, files in os.walk(os.path.join(env["RA_JIT_HOME"], "macro-snapshots"))
                                                   for name in files if name.startswith("generation-")],
-                                 producer_directories=[name for name in os.listdir(os.path.join(ws, "target/rust-analyzer/producers"))]
-                                 if os.path.isdir(os.path.join(ws, "target/rust-analyzer/producers")) else [])
-            rows.append(dict(step=step, right=actual == expected and generation and mutation_valid and not recognized_fallback(built.stderr),
+                                 producer_directories=[name for name in os.listdir(os.path.join(ws, "target/rust-analyzer/producer-inputs"))]
+                                 if os.path.isdir(os.path.join(ws, "target/rust-analyzer/producer-inputs")) else [])
+            rows.append(dict(step=step, right=built.returncode == 0 and actual == expected and generation and mutation_valid and reload_valid and not recognized_fallback(built.stderr),
                              actual=actual, expected=expected, build_log=built.stderr, status=status, pids=pids,
-                             worker_log=workers_log(side), old_sha256=old_digest,
+                             worker_log=worker, old_sha256=old_digest, reload_count=reload_count,
+                             reload_valid=reload_valid, blaze_returncode=built.returncode,
+                             cargo_returncode=expected[0],
                              source_sha256=new_digest,
                              edited_source=os.path.relpath(edited_source, ws),
                              same_size=same_size, same_mtime=same_mtime, mutation_valid=mutation_valid,

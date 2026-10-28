@@ -11641,3 +11641,53 @@ fn input_comparison_full_read_cost() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "production cold workspace-loader control with a copied proc-macro fixture"]
+fn cold_macro_loader_uses_content_and_rejects_input_io() {
+    let root = PathBuf::from(std::env::var_os("C4_COLD_MACRO_FIXTURE").unwrap());
+    let project = root.join("app");
+    let config = CargoConfig {
+        sysroot: Some(project_model::RustLibSource::Discover),
+        only_manifest_package: true,
+        ..Default::default()
+    };
+    let selection = plan::Selection { packages: vec!["app".into()], ..Default::default() };
+    let source = root.join("derive/src/lib.rs");
+    let original = std::fs::read(&source).unwrap();
+    let time = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let (_, _, _, first) =
+        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+            .unwrap();
+    let first = first.unwrap();
+    let first_path = first.path().to_owned();
+    let replacement =
+        String::from_utf8(original.clone()).unwrap().replace("was described", "got described");
+    assert_eq!(original.len(), replacement.len());
+    std::fs::write(&source, replacement).unwrap();
+    std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
+    // No preceding Inputs::watch or manual Generation::prepare. This is the
+    // production cold request ordering, with an existing producer target.
+    let (_, _, _, second) =
+        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+            .unwrap();
+    let second = second.unwrap();
+    assert_ne!(first_path, second.path());
+    assert!(first_path.is_dir(), "the old workspace still leases its producer");
+    assert!(second.collect().unwrap().is_empty());
+    drop(first);
+    assert_eq!(second.collect().unwrap(), [first_path]);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("absent-input"), root.join("derive/src/broken-input"))
+            .unwrap();
+        let error =
+            workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+                .err()
+                .expect("an unreadable producer must not use a default target");
+        assert!(format!("{error:#}").contains("reading macro producer inputs"));
+        std::fs::remove_file(root.join("derive/src/broken-input")).unwrap();
+    }
+    std::fs::write(&source, original).unwrap();
+    drop(second);
+}
