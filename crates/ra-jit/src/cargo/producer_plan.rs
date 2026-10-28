@@ -130,7 +130,10 @@ impl Producers {
             .units
             .iter()
             .filter(|unit| unit.host)
-            .map(|unit| (unit.package.clone(), false))
+            .map(|unit| {
+                let shared = self.units.iter().any(|it| !it.host && it.package == unit.package);
+                (unit.package.clone(), shared)
+            })
             .collect();
         let mut env: BTreeMap<String, String> = crate::process::vars().collect();
         let probe = dir.join("producer-rustc");

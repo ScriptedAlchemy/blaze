@@ -46,9 +46,10 @@ the implicit source `proc_macro` dependency.
 
 The diagnostic renders library or selected package roots, not all target
 kinds of a complete Cargo unit graph. The first executable witness selects
-one binary application and library producers without scripts. Build-script
-units are identified but not executed. `proc-macro-build` fails before any
-compiler child if a producer closure needs a script or nested proc macro.
+one binary application and library producers. Build-script units are compiled
+and run through the owned runner, with their host feature domain and generated
+cfg, environment and OUT_DIR. `proc-macro-build` still fails before any compiler
+child if a producer closure needs a nested proc macro.
 This is an unfinished scheduler boundary, not a restriction on the intended
 product. No cold path calls it yet.
 
@@ -62,10 +63,9 @@ not the product's serialized graph. The product tool audit retains queries
 as well as compile calls. A Rust regression compares unit features directly
 with the owned resolver's result under resolver 1, 2 and 3.
 
-Next: execute scripts through the owned runner and compiler, preserving unit
-domains, attach generated cfg/env/native inputs, and schedule nested producers
-topologically with leases. Then switch both cold paths. Never derive a plan
-from rustc artifacts.
+Next: schedule nested producers topologically with leases and unchanged image
+reuse. Close script parity gaps before switching both cold paths. Never derive
+a plan from rustc artifacts.
 
 ## Separate compiler witnesses
 
@@ -118,9 +118,11 @@ reads native inputs from the script output beside OUT_DIR as before.
 
 Scripts name an owned probe launcher. Version and print questions go straight
 to `answers.rs`'s owned answers, never its rustc fallback. Compile probes remain
-unfinished: they record a failure which the runner checks before publishing
-successful script output. A script cannot swallow that failure and silently
-select incomplete cfgs. This is not default-feature registry probe support.
+unfinished as a general compiler interface. Metadata-only status probes now
+check source through the owned frontend, including cfg-expanded channel gates.
+Unknown artifact operations and bootstrap feature attributes record a failure
+which the runner checks before publishing successful script output. A script
+cannot swallow an unsupported operation and silently select incomplete cfgs.
 
 `harness/dist/producer_scripts.py` uses the vendored token producer with a
 default feature and build script. It compares expansion with an independent
@@ -130,6 +132,11 @@ cfg and env, and an owned version query. A repeat checks that script executables
 and outputs stay unchanged. A swallowed compile probe is a negative control.
 Every product tool call, including queries and expansion, remains audited.
 
-Registry compile probes, nested producer scheduling and image generation
+`harness/dist/producer_registry.py` builds the existing source producer with
+real registry syn, quote and proc-macro2 default features and scripts. Script
+stdout and normalized expansion match the independent Cargo/rustc oracle.
+`producer_probes.py` compares twelve source statuses and checks the explicit
+bootstrap refusal. This is not a general metadata-emission or feature-catalog
+parity claim. Broader probes, nested producer scheduling and image generation
 reuse still need implementation. Both cold paths and the native server
 bootstrap retain their old handoff. The PR stays draft and strict gate FAIL.

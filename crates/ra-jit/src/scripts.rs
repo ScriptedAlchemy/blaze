@@ -863,6 +863,16 @@ impl<'a> Runner<'a> {
         dependencies: Vec<unit::Dependency>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
+        // Cargo weakens deferred debuginfo for build-only units in a native
+        // graph. A unit also reached by the target keeps the target's setting;
+        // explicit --target builds keep the separate host setting.
+        let build_only =
+            self.asked.packages.is_some_and(|packages| packages.get(&data.id.repr) == Some(&false));
+        let debuginfo = if for_host && !self.cross && build_only && lib.debuginfo.is_deferred() {
+            lib.debuginfo.weaken()
+        } else {
+            lib.debuginfo
+        };
         let mut features = data.active_features.clone();
         features.sort();
         let dir_name = self.profiles.get_dir_name().to_owned();
@@ -922,7 +932,7 @@ impl<'a> Runner<'a> {
                 name: self.asked.profile.to_owned(),
                 release: lib.root == blaze_manifest::profiles::ProfileRoot::Release,
                 opt_level: lib.opt_level.to_string(),
-                debuginfo: lib.debuginfo.is_turned_on(),
+                debuginfo: debuginfo.is_turned_on(),
                 debug_assertions: lib.debug_assertions,
             },
             target: target.to_owned(),
