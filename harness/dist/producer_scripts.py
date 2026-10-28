@@ -16,7 +16,7 @@ import producer_plan
 import source_macro
 
 
-def fixture(work):
+def fixture(work, nested=False):
     root = producer_plan.fixture(work)
     derive = root / "derive"
     with (derive / "Cargo.toml").open("a") as out:
@@ -74,6 +74,47 @@ const _: () = assert!(env!("PRODUCER_FORCE_ENV").len() == 6);
     # Explicit membership also makes the helper's default profile a workspace profile.
     text = (root / "Cargo.toml").read_text().replace('"optional"]', '"optional", "build-helper"]')
     (root / "Cargo.toml").write_text(text)
+    if nested:
+        # source_derive -> shared -> inner producer; the inner producer's script
+        # compiles a helper that itself uses a second producer.
+        for name in ("inner", "seed", "script-helper"):
+            path = root / name / "src"
+            path.mkdir(parents=True)
+            macro = name != "script-helper"
+            (path.parent / "Cargo.toml").write_text(
+                f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+                + ('[lib]\nproc-macro = true\n' if macro else ''))
+        (root / "seed/src/lib.rs").write_text('''extern crate proc_macro;
+#[proc_macro]
+pub fn seed(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    "pub fn label() -> &'static str { \\"host-only\\" }".parse().unwrap()
+}
+''')
+        with (root / "script-helper/Cargo.toml").open("a") as out:
+            out.write('[dependencies]\nseed = { path = "../seed" }\n')
+        (root / "script-helper/src/lib.rs").write_text("seed::seed!();\n")
+        with (root / "inner/Cargo.toml").open("a") as out:
+            out.write('[build-dependencies]\nscript-helper = { path = "../script-helper" }\n')
+        (root / "inner/build.rs").write_text('''fn main() {
+    let path = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("label.rs");
+    std::fs::write(path, format!("pub const LABEL: &str = {:?};", script_helper::label())).unwrap();
+    println!("cargo::rerun-if-changed=build.rs");
+}
+''')
+        (root / "inner/src/lib.rs").write_text('''extern crate proc_macro;
+mod generated { include!(concat!(env!("OUT_DIR"), "/label.rs")); }
+#[proc_macro]
+pub fn label(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    format!("{:?}", generated::LABEL).parse().unwrap()
+}
+''')
+        with (root / "shared/Cargo.toml").open("a") as out:
+            out.write('[dependencies]\ninner = { path = "../inner" }\n')
+        shared = root / "shared/src/lib.rs"
+        shared.write_text(shared.read_text().replace('"host-only"', 'inner::label!()'))
+        text = (root / "Cargo.toml").read_text().replace(
+            '"build-helper"]', '"build-helper", "inner", "seed", "script-helper"]')
+        (root / "Cargo.toml").write_text(text)
     return root
 
 
@@ -82,10 +123,11 @@ def main():
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--blaze", type=Path, required=True)
     parser.add_argument("--owned-server", type=Path, required=True)
+    parser.add_argument("--nested", action="store_true")
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    root = fixture(work)
+    root = fixture(work, args.nested)
     norustc = producer_plan.norustc
     real = Path(norustc.real_toolchain())
     host = "aarch64-apple-darwin"
@@ -105,7 +147,7 @@ def main():
     product = dict(env, RUSTUP_TOOLCHAIN=str(audit), PATH=str(audit / "bin") + os.pathsep + env["PATH"],
                    RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
                    RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1",
-                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0",
+                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER=str(args.owned_server.resolve()),
                    RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"))
     # A synthetic credential, not a real secret. Child processes receive the
     # caller's environment, but producer/link diagnostics must not print it.
@@ -115,8 +157,8 @@ def main():
         built = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
                                selected, host, host, work / "producer"],
                               root, product, work / "product-build.log"))
-        assert len(built) == 1
-        library = Path(built[0]["library"])
+        assert len(built) == (3 if args.nested else 1)
+        library = Path(next(it["library"] for it in built if "#source_derive@" in it["package"]))
         ours = source_macro.expansions(args.owned_server.resolve(), library, work, product,
                                        work / "owned-transcript.json")
     finally:
@@ -143,11 +185,11 @@ def main():
                     if "images" in path.parts]
     before = {str(path): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
               for path in script_files + run_files + image_files}
-    assert len(script_files) == len(run_files) == 2, (script_files, run_files)
+    assert len(script_files) == len(run_files) == (3 if args.nested else 2), (script_files, run_files)
     repeat = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
                             selected, host, host, work / "producer"],
                            root, product, work / "repeat-build.log"))
-    assert Path(repeat[0]["library"]) == library
+    assert repeat == built
     after = {str(path): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
              for path in script_files + run_files + image_files}
     assert before == after, (before, after)
@@ -174,7 +216,7 @@ def main():
     newer = json.loads(run([args.blaze.resolve(), "proc-macro-build", root / "Cargo.toml",
                            selected, host, host, work / "producer"],
                           root, product, work / "changed-image.log"))
-    assert Path(newer[0]["library"]) != library
+    assert Path(next(it["library"] for it in newer if "#source_derive@" in it["package"])) != library
     assert library.read_bytes() == saved_image
     compiler_logs = list((work / "producer").rglob("ra-jit.log"))
     assert compiler_logs, "the regression must inspect actual producer compiler logs"

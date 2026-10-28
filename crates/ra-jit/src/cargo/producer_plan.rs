@@ -147,7 +147,7 @@ impl Producers {
         host: &str,
         dir: &Path,
         build: u64,
-    ) -> Result<crate::scripts::World> {
+    ) -> Result<(crate::scripts::World, BTreeMap<String, std::path::PathBuf>)> {
         let metadata = self.host_metadata(&dir.join("scripts"))?;
         let manifest = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
             metadata.workspace_root.join("Cargo.toml").into_std_path_buf(),
@@ -208,7 +208,7 @@ impl Producers {
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));
         raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
         raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
-        let (outputs, world) =
+        let (outputs, images, world) =
             crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs, &raw)?;
         anyhow::ensure!(
             !failure.exists(),
@@ -225,7 +225,7 @@ impl Producers {
                 self.scripts.insert(unit.package.clone());
             }
         }
-        Ok(world)
+        Ok((world, images))
     }
 }
 
@@ -435,6 +435,7 @@ pub(crate) fn of(
         );
         set("CARGO_CRATE_NAME", target_data.name.replace('-', "_"));
         crates.push(Planned {
+            proc_macro: None,
             name: target_data.name.replace('-', "_"),
             root: AsRef::<Path>::as_ref(&target_data.root).to_owned(),
             edition: data.edition.to_string(),
@@ -508,29 +509,10 @@ pub(crate) fn command(
         let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
             .map(std::path::PathBuf::from)
             .context("the source toolchain is not named")?;
-        let env = planned.compile_env.vars().collect::<Vec<_>>();
-        // Reject nested producer graphs before any script or compiler child. This
-        // boundary is removed only when the nested scheduler supplies their images.
-        let mut preflight = Producers {
-            metadata: planned.metadata.clone(),
-            units: planned.units.clone(),
-            crates: planned.crates.clone(),
-            sources: vec![],
-            shared_script_units: planned.shared_script_units.clone(),
-            compile_env: planned.compile_env.clone(),
-            scripts: planned
-                .units
-                .iter()
-                .filter(|unit| unit.build_script)
-                .map(|unit| unit.package.clone())
-                .collect(),
-        };
-        for (root, unit) in preflight.units.iter().enumerate() {
-            if unit.proc_macro {
-                preflight.source_closure(root)?;
-            }
-        }
-        preflight.scripts.clear();
+        // Validate graph edges and cycles before any child; nested producer
+        // readiness is established by the recursive script/image scheduler.
+        super::own_script::planned_macro_description(&sysroot, planned.crates.clone())
+            .map_err(anyhow::Error::msg)?;
         let build = crate::scripts::anonymous();
         struct Release(u64);
         impl Drop for Release {
@@ -540,21 +522,12 @@ pub(crate) fn command(
         }
         let _release = Release(build);
         let _operation = crate::scripts::operation(build);
-        let world = planned.run_scripts(&selection, &sysroot, &host, &dir, build)?;
+        let (world, images) = planned.run_scripts(&selection, &sysroot, &host, &dir, build)?;
         let _pin = crate::scripts::pin(build, &world)?;
-        let closures = planned
-            .units
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.proc_macro)
-            .map(|(root, _)| planned.source_closure(root).map(|crates| (root, crates)))
-            .collect::<Result<Vec<_>>>()?;
-        let mut libraries = Vec::new();
-        for (root, crates) in closures {
-            let library =
-                super::producer_image::link(&sysroot, crates, &dir.join(root.to_string()), &env)?;
-            libraries.push(json!({"package": planned.units[root].package, "library": library}));
-        }
+        let libraries = images
+            .into_iter()
+            .map(|(package, library)| json!({"package": package, "library": library}))
+            .collect::<Vec<_>>();
         println!("{}", json!(libraries));
         return Ok(());
     }
@@ -588,6 +561,7 @@ mod tests {
         let crates = ["dep", "derive"]
             .into_iter()
             .map(|name| Planned {
+                proc_macro: None,
                 name: name.into(),
                 root: format!("/source/{name}/lib.rs").into(),
                 edition: "2021".into(),

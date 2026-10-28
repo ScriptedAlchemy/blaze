@@ -371,6 +371,10 @@ pub(crate) struct Planned {
     pub(crate) env: BTreeMap<String, String>,
     /// The name each library is linked under and where it is among the crates.
     pub(crate) deps: Vec<(String, usize)>,
+    /// An owned, content-admitted image of a dependency producer. The root being
+    /// compiled has no image; dependency producers expand rather than link as Rust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proc_macro: Option<PathBuf>,
 }
 
 /// The `rust-project.json` of the script that is the first of `crates`, over the standard
@@ -462,7 +466,7 @@ fn planned_source_description(sysroot: &Path, crates: Vec<Planned>, macro_root: 
             codegen_flags: it.codegen_flags,
             env: it.env,
             deps: it.deps,
-            proc_macro: None,
+            proc_macro: it.proc_macro,
             compiled_macro: macro_root && at == 0,
             inputs: None,
         })
@@ -590,6 +594,7 @@ mod tests {
                     codegen_flags: vec!["-Copt-level=1".into()],
                     env: [("PRODUCER".into(), "host".into())].into_iter().collect(),
                     deps: vec![("renamed_dependency".into(), 1)],
+                    proc_macro: None,
                 },
                 Planned {
                     name: "dependency".into(),
@@ -599,6 +604,7 @@ mod tests {
                     codegen_flags: vec![],
                     env: BTreeMap::new(),
                     deps: vec![],
+                    proc_macro: None,
                 },
             ]
         };
@@ -629,6 +635,7 @@ mod tests {
             codegen_flags: vec![],
             env: BTreeMap::new(),
             deps,
+            proc_macro: None,
         }
     }
 

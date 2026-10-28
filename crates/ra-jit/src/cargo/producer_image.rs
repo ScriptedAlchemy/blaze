@@ -62,6 +62,9 @@ fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Files> {
     let mut files = Files::new();
     let mut roots = BTreeSet::new();
     for krate in crates {
+        if let Some(image) = &krate.proc_macro {
+            files.insert(std::fs::canonicalize(image)?, digest(image)?);
+        }
         let package = krate
             .root
             .ancestors()
@@ -91,7 +94,7 @@ fn unchanged(files: &Files) -> bool {
 
 /// No rebuild of an admitted immutable image. A missing/corrupt completed generation
 /// fails rather than replacing bytes a live proc-macro client may still have mapped.
-pub(super) fn link(
+pub(crate) fn link(
     sysroot: &Path,
     crates: Vec<Planned>,
     dir: &Path,

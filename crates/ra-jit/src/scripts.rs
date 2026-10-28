@@ -303,7 +303,11 @@ pub(crate) fn run_producers(
     flags: Vec<String>,
     cfgs: Vec<String>,
     raw_env: &BTreeMap<OsString, OsString>,
-) -> anyhow::Result<(BTreeMap<String, (PathBuf, blaze_build_script::Output)>, World)> {
+) -> anyhow::Result<(
+    BTreeMap<String, (PathBuf, blaze_build_script::Output)>,
+    BTreeMap<String, PathBuf>,
+    World,
+)> {
     retrying(asked.build, false, || {
         let result = (|| {
             let mut runner = Runner::new(&LEASES, cargo, asked, sysroot.clone(), &[])?;
@@ -312,6 +316,11 @@ pub(crate) fn run_producers(
             runner.raw_env = raw_env.clone();
             let mut outputs = BTreeMap::new();
             for package in cargo.packages() {
+                if cargo[package].targets.iter().any(|&target| {
+                    matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+                }) {
+                    runner.producer(package).map_err(|why| Attempt::of(runner.busy.take(), why))?;
+                }
                 if runner.runs(package) {
                     let done = runner
                         .script(package, true)
@@ -322,7 +331,12 @@ pub(crate) fn run_producers(
                     );
                 }
             }
-            Ok((outputs, runner.judged))
+            let images = runner
+                .images
+                .iter()
+                .map(|(&package, path)| (cargo[package].id.repr.clone(), path.clone()))
+                .collect();
+            Ok((outputs, images, runner.judged))
         })();
         if matches!(result, Err(Attempt::Busy(_))) {
             LEASES.yield_world(asked.build);
@@ -511,6 +525,8 @@ struct Runner<'a> {
     judged: World,
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
+    images: FxHashMap<Package, PathBuf>,
+    making_images: Vec<Package>,
 }
 
 impl<'a> Runner<'a> {
@@ -589,6 +605,8 @@ impl<'a> Runner<'a> {
             done: FxHashMap::default(),
             judged: Vec::new(),
             making: Vec::new(),
+            images: FxHashMap::default(),
+            making_images: Vec::new(),
         })
     }
 
@@ -1133,6 +1151,31 @@ impl<'a> Runner<'a> {
 
     /// Adds the library of `package` and what it links to `crates`, as a build script's
     /// dependencies are compiled: for the host.
+    fn producer(&mut self, package: Package) -> Result<PathBuf, String> {
+        if let Some(path) = self.images.get(&package) {
+            return Ok(path.clone());
+        }
+        if self.making_images.contains(&package) {
+            return Err(format!(
+                "a producer/build-script cycle reaches `{}`",
+                self.cargo[package].name
+            ));
+        }
+        self.making_images.push(package);
+        let result = (|| {
+            let mut crates = Vec::new();
+            self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+            let dir = self.base.join("producers").join(format!("{package:?}"));
+            let env = self.child_env().into_iter().collect::<Vec<_>>();
+            crate::cargo::producer_image::link(&self.sysroot, crates, &dir, &env)
+                .map_err(|it| format!("{it:#}"))
+        })();
+        self.making_images.pop();
+        let image = result?;
+        self.images.insert(package, image.clone());
+        Ok(image)
+    }
+
     fn add(
         &mut self,
         package: Package,
@@ -1142,6 +1185,23 @@ impl<'a> Runner<'a> {
         if let Some(&it) = at.get(&package) {
             return Ok(it);
         }
+        if self.cargo[package].targets.iter().any(|&target| {
+            matches!(self.cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+        }) {
+            let image = self.producer(package)?;
+            let index = self.add_source_leaf(package, crates)?;
+            crates[index].proc_macro = Some(image);
+            at.insert(package, index);
+            return Ok(index);
+        }
+        self.add_source(package, crates, at)
+    }
+
+    fn add_source_leaf(
+        &mut self,
+        package: Package,
+        crates: &mut Vec<crate::cargo::own_script::Planned>,
+    ) -> Result<usize, String> {
         let cargo = self.cargo;
         let data = &cargo[package];
         let lib = data
@@ -1151,15 +1211,9 @@ impl<'a> Runner<'a> {
             .find(|it| matches!(it.kind, TargetKind::Lib { .. }));
         let lib =
             lib.ok_or_else(|| format!("`{}`, which it is built with, has no library", data.name))?;
-        if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true }) {
-            return Err(format!(
-                "it is built with the proc macro `{}`, which blaze does not compile for a build script yet",
-                data.name
-            ));
-        }
         let name = lib.name.replace('-', "_");
         let root = PathBuf::from(lib.root.as_str());
-        let host = self.profile(package, UnitFor::new_host(false), &CompileKind::Host);
+        let host = self.profile(package, UnitFor::new_host(true), &CompileKind::Host);
         // A library with a script of its own is compiled with what that script said.
         let ran = match self.runs(package) {
             true => Some(self.script(package, true)?),
@@ -1168,8 +1222,21 @@ impl<'a> Runner<'a> {
         let described = self.described(package, &name, &root, &host, ran.as_deref())?;
         let index = crates.len();
         crates.push(described);
+        Ok(index)
+    }
+
+    fn add_source(
+        &mut self,
+        package: Package,
+        crates: &mut Vec<crate::cargo::own_script::Planned>,
+        at: &mut FxHashMap<Package, usize>,
+    ) -> Result<usize, String> {
+        if let Some(&index) = at.get(&package) {
+            return Ok(index);
+        }
+        let index = self.add_source_leaf(package, crates)?;
         at.insert(package, index);
-        let normal: Vec<_> = cargo[package]
+        let normal: Vec<_> = self.cargo[package]
             .dependencies
             .iter()
             .filter(|it| it.kind == DepKind::Normal)
@@ -1265,6 +1332,7 @@ impl<'a> Runner<'a> {
                 .collect(),
             env,
             deps: Vec::new(),
+            proc_macro: None,
         })
     }
 }
