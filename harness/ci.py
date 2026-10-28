@@ -42,7 +42,7 @@ HARNESSES = [
     ("core", ["growth.py"], {}, on(backend="cranelift"), 1),
     ("core", ["wholeprogram.py"], {}, on("linux", "macos"), 2),
     # `cargo blaze build` from nothing with RA_JIT_WHOLE_BUILD=1: G's whole build, no cargo build.
-    ("core", ["coldbuild.py"], {}, on("linux"), 2),
+    ("core", ["coldbuild.py"], {}, on("linux", "macos"), 2),
     # A build script rerun across edits in that whole build as cargo 1.99 reruns it: 34 probes.
     ("core", ["scriptedits.py"], {}, on("linux"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),

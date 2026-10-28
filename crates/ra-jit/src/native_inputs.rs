@@ -117,9 +117,8 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
     let cwd = std::env::current_dir()?;
     let sysroot = crate::SYSROOT.get().and_then(Option::as_deref);
     // Use the real native link builder, including attribute-declared libraries and ordering.
-    // Do not put the Rust objects this build writes into its own input fingerprint.
-    let command = crate::link::command(db, &roots, &[], sysroot, binary)?;
-    let env = crate::link::Environment::of(db);
+    // Rust objects and the daemon's mutable layout options are outputs, not native inputs.
+    let (command, env) = crate::link::native_command(db, &roots, sysroot, binary)?;
     inputs.link_inputs_env(&command, &cwd, &out_dirs, &env);
     for name in ["LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH"] {
         let mut field = name.as_bytes().to_vec();
@@ -726,6 +725,137 @@ fn script_inputs(text: &str) -> io::Result<Vec<(String, bool)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the real native command builder for Apple without invoking a linker or
+    /// making the host's target or environment part of the fixture.
+    fn apple_program(dir: &Path) -> (RootDatabase, Args) {
+        use test_fixture::WithFixture;
+
+        let out = dir.join("out");
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("libgenerated.a"), b"!<arch>\nA").unwrap();
+        fs::write(
+            dir.join("output"),
+            format!("cargo:rustc-link-search=native={}\n", out.display()),
+        )
+        .unwrap();
+        let (mut db, _) = RootDatabase::with_single_file(&format!(
+            r#"
+//- /main.rs crate:app cfg:target_vendor=apple,target_arch=aarch64 env:OUT_DIR={}
+#[link(name = "generated", kind = "static")]
+unsafe extern "C" {{ fn generated(); }}
+fn main() {{}}
+"#,
+            out.display()
+        ));
+        ide_db::base_db::set_process_env(&mut db, Default::default());
+        let args = Args::parse(
+            [
+                dir.display().to_string(),
+                "--crate".to_owned(),
+                "app".to_owned(),
+                "--out".to_owned(),
+                dir.join("base.o").display().to_string(),
+                "--patch".to_owned(),
+                dir.join("patch.o").display().to_string(),
+                "--exe".to_owned(),
+                dir.join("program").display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        (db, args)
+    }
+
+    #[test]
+    fn apple_headerpad_growth_preserves_native_input_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, args) = apple_program(dir.path());
+        let binary = args.exe.as_ref().unwrap();
+        let headerpad = crate::cargo::plan::headerpad_file(binary);
+        let inputs = collect_known(&db, &args, binary).unwrap();
+        let before = inputs.digest().expect("Apple native inputs are known before linking");
+        assert!(!headerpad.exists(), "collecting inputs must not write link outputs");
+        let link = pending(binary.clone(), inputs);
+        assert!(link.changed());
+
+        let roots = crate::crates_named(&db, &args.krate, &args).unwrap();
+        let command = crate::link::command(&db, &roots, &[], None, binary).unwrap();
+        let words = shlex::split(&command).unwrap();
+        assert!(words.iter().any(|word| word == "-Wl,-no_fixup_chains"));
+        assert!(words.contains(&format!("@{}", headerpad.display())));
+        assert!(headerpad.exists(), "the actual link still writes its layout options");
+        crate::cargo::plan::write_headerpad(binary, 0x800000).unwrap();
+        fs::write(binary, b"linked program").unwrap();
+        link.commit().expect("layout can grow during a successful link");
+        assert_eq!(collect_known(&db, &args, binary).unwrap().digest().unwrap(), before);
+        let unchanged = begin(&db, &args).unwrap();
+        assert!(!unchanged.changed(), "layout output does not force a native relink");
+        assert!(!unchanged.output_changed());
+        unchanged.commit().unwrap();
+        crate::lock(&LINKED_INPUTS).remove(binary);
+    }
+
+    #[test]
+    fn apple_native_libraries_and_user_layout_flags_still_invalidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, args) = apple_program(dir.path());
+        let binary = args.exe.as_ref().unwrap();
+        fs::write(binary, b"linked program").unwrap();
+        let initial = collect_known(&db, &args, binary).unwrap();
+        let before = initial.digest().unwrap();
+        pending(binary.clone(), initial).commit().unwrap();
+
+        fs::write(dir.path().join("out/libgenerated.a"), b"!<arch>\nB").unwrap();
+        let changed = begin(&db, &args).unwrap();
+        assert!(changed.changed(), "attribute-declared native libraries remain inputs");
+        assert_ne!(changed.before, Some(before));
+        changed.commit().unwrap();
+
+        let native = collect_known(&db, &args, binary).unwrap().digest().unwrap();
+        fs::write(
+            dir.path().join("output"),
+            format!(
+                "cargo:rustc-link-search=native={}\ncargo:rustc-link-arg=-Wl,-headerpad,0x200000\n",
+                dir.path().join("out").display()
+            ),
+        )
+        .unwrap();
+        let inputs = collect_known(&db, &args, binary).unwrap();
+        assert!(
+            inputs
+                .directives
+                .iter()
+                .any(|line| { String::from_utf8_lossy(line).contains("-Wl,-headerpad,0x200000") })
+        );
+        assert_ne!(inputs.digest().unwrap(), native, "user layout flags remain inputs");
+        let changed = pending(binary.clone(), inputs);
+        assert!(changed.changed());
+        changed.commit().unwrap();
+        crate::lock(&LINKED_INPUTS).remove(binary);
+    }
+
+    #[test]
+    fn apple_user_response_files_remain_opaque_even_at_the_owned_headerpad_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, args) = apple_program(dir.path());
+        let binary = args.exe.as_ref().unwrap();
+        for response in [dir.path().join("native.rsp"), crate::cargo::plan::headerpad_file(binary)]
+        {
+            fs::write(&response, "-Wl,-headerpad,0x100000\n").unwrap();
+            fs::write(
+                dir.path().join("output"),
+                format!("cargo:rustc-link-arg=@{}\n", response.display()),
+            )
+            .unwrap();
+            let inputs = collect_known(&db, &args, binary).unwrap();
+            assert!(inputs.digest().is_err(), "user response grammars remain unknown");
+            let link = pending(binary.clone(), inputs);
+            assert!(link.changed());
+            link.commit().unwrap();
+            assert!(!crate::lock(&LINKED_INPUTS).contains_key(binary));
+        }
+    }
 
     fn inputs(path: &Path) -> Inputs {
         Inputs {

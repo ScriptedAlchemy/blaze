@@ -552,9 +552,10 @@ pub(crate) fn unlinked_panic_runtime(db: &RootDatabase, program: &[Crate]) -> &'
     if abort { "panic_unwind" } else { "panic_abort" }
 }
 
-/// The names an object defines for others to link to.
+/// The names an object defines for others to link to, as ra-jit's code names them: without
+/// the `_` Mach-O puts before each.
 fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
-    use object::{Object as _, ObjectSymbol as _, SymbolScope};
+    use object::{BinaryFormat, Object as _, ObjectSymbol as _, SymbolScope};
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let objects: Vec<&[u8]> = if link::split::is_archive(&bytes) {
         let archive = object::read::archive::ArchiveFile::parse(&*bytes)
@@ -572,10 +573,23 @@ fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
         let file =
             object::File::parse(bytes).with_context(|| format!("parsing {}", path.display()))?;
         // A hidden one stands in for a function ra-jit could not compile, which a program
-        // compiles itself to be told why. A thread-local is not a "definition" to `object`.
-        let defined =
-            file.symbols().filter(|it| !it.is_undefined() && it.scope() == SymbolScope::Dynamic);
-        names.extend(defined.filter_map(|it| it.name().ok().map(str::to_owned)));
+        // compiles itself to be told why. On Mach-O what the object defines for others is
+        // private to the program too, and weak where a stand-in is not (`weaken::library`).
+        // A thread-local is not a "definition" to `object`.
+        let macho = file.format() == BinaryFormat::MachO;
+        let defined = file.symbols().filter(|it| {
+            !it.is_undefined()
+                && match it.scope() {
+                    SymbolScope::Dynamic => true,
+                    SymbolScope::Linkage => macho && it.is_weak(),
+                    _ => false,
+                }
+        });
+        let named = defined.filter_map(|it| it.name().ok());
+        names.extend(named.map(|it| match macho {
+            true => it.strip_prefix('_').unwrap_or(it).to_owned(),
+            false => it.to_owned(),
+        }));
     }
     Ok(names)
 }
@@ -4697,12 +4711,24 @@ fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(Strin
     for named in args.crates() {
         program.extend(crates_named(db, named, args)?);
     }
-    let objects: Vec<&Path> =
-        std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
+    // The patch is ahead of the object, as on the line of a build over rustc's: a link the
+    // splice declines has the edit too.
+    let objects: Vec<&Path> = (args.patch.iter().map(PathBuf::as_path))
+        .chain([args.out.as_path()])
+        .chain(args.prebuilt.as_deref())
+        .collect();
     let sysroot = SYSROOT.get().and_then(Option::as_deref);
     let cmd = link::command(db, &program, &objects, sysroot, exe)?;
+    lock(&OWN_LINES).insert(cmd.clone());
     Ok(Some((cmd, exe.clone())))
 }
+
+/// The link lines of whole builds ([`own_link_line`]), which the daemon writes itself. They
+/// have the patch ahead of the object it patches and tell the linker nothing of duplicate
+/// definitions: the daemon makes the object's definitions of what the patch defines weak
+/// before it links ([`weaken::replaced`]).
+static OWN_LINES: std::sync::LazyLock<std::sync::Mutex<FxHashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
 /// one rule naming the files of its modules, the root first, and a rule of no files for each.
@@ -4914,6 +4940,7 @@ fn build(
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some() || in_harness(db, *it)),
+        allocator: args.exe.as_ref().and_then(|_| local.first().copied()).map(Into::into),
         shared: args.shared,
         whole: local.iter().all(|&krate| resolver.own_crate_id(krate.into()).is_some()),
         kept: &kept,
@@ -5007,7 +5034,11 @@ fn build(
     if let Some(mut object) = unit.object.take() {
         // A patch defines again what the object does, and the linker of Mach-O takes two
         // definitions of a name only when one of them gives way.
-        weaken::ours(&mut object);
+        if args.library {
+            weaken::library(&mut object);
+        } else {
+            weaken::ours(&mut object);
+        }
         // The files a debugger is sent to are there before the object that sends it.
         for file in std::mem::take(&mut unit.apart) {
             unwritten.push((PathBuf::from(file.name), file.bytes));
@@ -5051,6 +5082,7 @@ fn build(
                     entries: &[func],
                     on_demand: &[],
                     start: None,
+                    allocator: None,
                     shared: false,
                     whole: false,
                     kept: &[],
@@ -5449,12 +5481,40 @@ fn link(
         return Err(RustcLinkedLost { why: declined, onto: true }.into());
     }
     let reading = whole::read(object)?;
+    let replaced = if let Some(patch) = patch.filter(|_| lock(&OWN_LINES).contains(cmd)) {
+        weaken::replaced(object, patch).with_context(|| {
+            format!(
+                "making the definitions of {} that {} replaces weak",
+                object.display(),
+                patch.display()
+            )
+        })?
+    } else {
+        None
+    };
+    let replaced_cmd = replaced
+        .as_ref()
+        .map(|copy| -> anyhow::Result<String> {
+            let mut args =
+                shlex::split(cmd).context("the whole build's link line is not quoted")?;
+            let base = object.display().to_string();
+            let input = args
+                .iter_mut()
+                .find(|arg| **arg == base)
+                .context("the whole build's link line does not name its base object")?;
+            *input = copy.path().display().to_string();
+            shlex::try_join(args.iter().map(String::as_str))
+                .context("a link argument has a NUL in it")
+        })
+        .transpose()?;
+    let original_cmd = cmd;
+    let cmd = replaced_cmd.as_deref().unwrap_or(cmd);
     if let Some(binary) = splice {
         headerpad_ahead(binary)?;
     }
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
-        Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
+        Some(reached) if lock(&REACHED_ONLY).contains(original_cmd) => {
             run_link(reached, env, start, &declined)?;
             reached
         }
@@ -5464,7 +5524,7 @@ fn link(
                     .downcast_ref::<LinkFailed>()
                     .is_some_and(|it| it.names_undefined_outside([Some(object), patch])) =>
             {
-                lock(&REACHED_ONLY).insert(cmd.to_owned());
+                lock(&REACHED_ONLY).insert(original_cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
                 run_link(reached, env, Instant::now(), again)?;
                 reached
@@ -5482,6 +5542,7 @@ fn link(
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
         run_link(cmd, env, Instant::now(), &again)?;
     }
+    drop(replaced);
     drop(reading);
     if let (Some(binary), Some(patch)) = (splice, patch) {
         let linked = Executable::Linked(Linked::read(binary.to_owned(), patch, object));
@@ -11133,6 +11194,67 @@ fn main() {}
             "ld: cannot find -lmissing | collect2: error: ld returned 1"
         );
         assert_eq!(last_lines("", 2), "");
+    }
+
+    /// A program built over the standard library's unit refers to what the unit defines, by
+    /// the names ra-jit's code gives it, and compiles its own copy of a function the unit only
+    /// has a stand-in for, to be told why. On Mach-O the unit's names have the format's `_`
+    /// before them and are private to the program, the stand-ins' as well: the program found
+    /// none of std's statics there, and refused every program at the first writable one it
+    /// reached, `CLEANUP` (#255).
+    #[test]
+    fn a_program_over_the_library_unit_finds_what_it_defines_and_not_its_stand_ins() {
+        use object::write::{Mangling, Object, StandardSection, Symbol, SymbolSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
+        };
+        let symbols = [
+            ("ra-jit.5502588822008fc7.CLEANUP.7a84b0f1da45afe8", StandardSection::Data),
+            ("ra-jit.5502588822008fc7.std::rt::cleanup", StandardSection::Text),
+            ("ra-jit.a65469441c0c3297.core::core_arch::aarch64::svaba_s8", StandardSection::Text),
+            ("__rust_probestack", StandardSection::Text),
+            (".Ldata1", StandardSection::ReadOnlyData),
+        ];
+        // As the code generator declares them: exported, hidden (a stand-in), and local.
+        let scopes = [
+            SymbolScope::Dynamic,
+            SymbolScope::Dynamic,
+            SymbolScope::Linkage,
+            SymbolScope::Dynamic,
+            SymbolScope::Compilation,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for format in [BinaryFormat::MachO, BinaryFormat::Elf] {
+            let mut object = Object::new(format, Architecture::Aarch64, Endianness::Little);
+            object.set_mangling(Mangling::None);
+            let prefix = if format == BinaryFormat::MachO { "_" } else { "" };
+            for (&(name, standard), scope) in symbols.iter().zip(scopes) {
+                let section = object.section_id(standard);
+                let value = object.append_section_data(section, &[0; 8], 8);
+                let kind = match standard {
+                    StandardSection::Text => SymbolKind::Text,
+                    _ => SymbolKind::Data,
+                };
+                object.add_symbol(Symbol {
+                    name: format!("{prefix}{name}").into_bytes(),
+                    value,
+                    size: 8,
+                    kind,
+                    scope,
+                    weak: false,
+                    section: SymbolSection::Section(section),
+                    flags: SymbolFlags::None,
+                });
+            }
+            let mut bytes = object.write().unwrap();
+            weaken::library(&mut bytes);
+            let path = dir.path().join(format!("std-{format:?}.o"));
+            std::fs::write(&path, &bytes).unwrap();
+            let mut defined: Vec<String> = defined_symbols(&path).unwrap().into_iter().collect();
+            defined.sort_unstable();
+            let want = [symbols[3].0, symbols[0].0, symbols[1].0];
+            assert_eq!(defined, want, "{format:?}");
+        }
     }
 
     #[test]

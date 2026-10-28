@@ -101,7 +101,12 @@ pub(crate) fn executable(
 }
 
 /// The command that links `objects` into the executable `exe` as [`executable`] does, for a
-/// shell: the daemon's line, which its edits are spliced after.
+/// shell: the daemon's line, which its edits are spliced after. The first of `objects` is the
+/// patch of the object after it: a definition of the patch is the one that stays. On Apple
+/// that is the object's weak definitions giving way; on ELF the daemon makes the object's
+/// definitions of what the patch defines weak before the line runs
+/// ([`crate::weaken::replaced`]), and the line asks the linker for nothing of duplicates, so
+/// that two definitions of any other name are its error.
 pub(crate) fn command(
     db: &RootDatabase,
     program: &[Crate],
@@ -110,6 +115,34 @@ pub(crate) fn command(
     exe: &Path,
 ) -> anyhow::Result<String> {
     let line = Line::of(db, program, sysroot, false)?;
+    command_of(&line, objects, exe, CommandPurpose::WholeLink)
+}
+
+/// The native command and its request environment, before compiling the Rust objects. A
+/// native identity includes every user link argument, but not the Rust outputs or the
+/// daemon's mutable output-layout options: its headerpad file may grow during a link.
+pub(crate) fn native_command(
+    db: &RootDatabase,
+    program: &[Crate],
+    sysroot: Option<&Path>,
+    exe: &Path,
+) -> anyhow::Result<(String, Environment)> {
+    let line = Line::of(db, program, sysroot, false)?;
+    let command = command_of(&line, &[], exe, CommandPurpose::NativeInputs)?;
+    Ok((command, line.env))
+}
+
+enum CommandPurpose {
+    WholeLink,
+    NativeInputs,
+}
+
+fn command_of(
+    line: &Line,
+    objects: &[&Path],
+    exe: &Path,
+    purpose: CommandPurpose,
+) -> anyhow::Result<String> {
     let mut args = vec!["cc".to_owned()];
     args.extend(line.before.iter().cloned());
     for &object in objects {
@@ -126,6 +159,11 @@ pub(crate) fn command(
         }
     }
     args.extend(line.after.iter().cloned());
+    if let CommandPurpose::WholeLink = purpose {
+        let splices = crate::cargo::plan::whole_link_args(line.apple, exe)
+            .with_context(|| format!("writing what the link of {} asks for", exe.display()))?;
+        args.extend(splices);
+    }
     args.extend(["-o".to_owned(), exe.display().to_string()]);
     shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
 }
@@ -221,7 +259,7 @@ pub(crate) fn stand_ins(exe: &Path) -> anyhow::Result<Vec<String>> {
 
 /// The toolchain's directory with lld as `ld.lld`, for `cc -B`: the `gcc-ld` of the host's
 /// `lib/rustlib/<host>/bin`.
-fn lld_dir(sysroot: &Path) -> Option<PathBuf> {
+pub(crate) fn lld_dir(sysroot: &Path) -> Option<PathBuf> {
     std::fs::read_dir(sysroot.join("lib/rustlib"))
         .ok()?
         .filter_map(|it| Some(it.ok()?.path().join("bin/gcc-ld")))

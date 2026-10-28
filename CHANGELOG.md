@@ -891,6 +891,29 @@ All notable changes to ra-jit are written here. The format follows
   its own build to the worker, where the worker kept the last one asked, and a script cargo runs
   every build runs for each.
 
+- On macOS an edit after a whole build (`RA_JIT_WHOLE_BUILD=1`) reaches the program. The
+  splice refused every one, the executable having its fixups in chains, and the link it fell
+  back to left the patch out: the build said it was done and the program ran the code from
+  before the edit, on Linux too wherever a splice is declined. The whole build's line now
+  asks Apple's linker for fixups in tables and the room the splice needs, as the daemon's
+  other links do, and has the patch ahead of the object. On ELF the daemon makes the object's
+  definitions of what the patch defines weak before it links and tells the linker nothing of
+  duplicates, so two definitions of any other name stay the linker's error, as in rustc's link
+  (the line had `--allow-multiple-definition`, which linked two C objects that both define
+  one name with exit 0). `harness/coldbuild.py` passes on macOS and runs there in CI.
+- On macOS a build with nothing of rustc's finds what the standard library's unit defines, so
+  a whole build (`RA_JIT_WHOLE_BUILD=1`), a doctest and a build script blaze compiles are
+  blaze's: each stopped at the first writable static of std it reached, ``writable static
+  `CLEANUP` without a rustc symbol`` ([#255](https://github.com/indexable-inc/blaze/issues/255)).
+  blaze makes the Rust names of its Mach-O objects private and weak, and the build of a
+  program over the unit read only public names, with Mach-O's `_` before them, so it found
+  none of the unit's functions or statics. The unit's stand-ins now stay hidden and strong, as
+  in the unit of ELF, which tells them apart from what it defines. On a Mac (arm64, 18 cores,
+  1 run each): hello-world and ripgrep 15.1.0 build whole and print what cargo's builds do (12
+  of 12 ripgrep commands, timings aside), where both failed after 28 s and 18 s;
+  `harness/doctestonce.py` passes with every example blaze's (0 of 4 steps before) and no
+  longer excuses macOS; the 6 build scripts of a package with a copy of tracedecay-cli's
+  script are compiled by blaze, where all 6 were left to rustc.
 - On x86-64, an edit that replaces a function shorter than a jump (5 bytes) is spliced
   instead of built in full ([#242](https://github.com/indexable-inc/blaze/issues/242)).
   The jump goes over the `int3`s and `nop`s the linker padded the function with. When there

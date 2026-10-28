@@ -621,6 +621,9 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
+    /// The crate whose independently linked executable needs allocator shims, even when
+    /// `#![no_main]` supplies the C entry point instead of Rust's start function.
+    pub allocator: Option<Crate>,
     /// The object is linked into a shared library of its own, which has the allocator shim
     /// a program's `start` otherwise brings.
     pub shared: bool,
@@ -854,11 +857,13 @@ impl CodegenUnit {
             let mut next = 0;
             if let Some(main) = start {
                 cg.define_start(main)?;
-                cg.define_allocator_shim(main.krate(db))?;
-            } else if roots.shared
-                && let Some(first) = roots.entries.first()
-            {
-                cg.define_allocator_shim(first.krate(db))?;
+            }
+            let allocator =
+                roots.allocator.or_else(|| start.map(|main| main.krate(db))).or_else(|| {
+                    roots.shared.then(|| roots.entries.first().map(|it| it.krate(db))).flatten()
+                });
+            if let Some(krate) = allocator {
+                cg.define_allocator_shim(krate)?;
             }
             for &id in roots.kept {
                 cg.static_data(id)?;
