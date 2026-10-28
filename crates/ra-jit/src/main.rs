@@ -2725,9 +2725,8 @@ impl Checkouts {
                 Some((&load_env, build)),
             )?;
             debug.push(told);
-            // The checkouts after the first run their build scripts where the first did. A
-            // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
-            // crate for all.
+            // Non-producer workspaces retain the existing shared script target. Producer
+            // workspaces select and lease their own content generation in workspace_at.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
                 && !matches!(
                     self.cargo_config.target_dir_config,
@@ -3277,9 +3276,6 @@ fn workspace_at(
     // Discover the actual producer closure on both cold and reload paths before
     // choosing the existing compile-time producer operation's output directory.
     let mut generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
-    if generation.is_some() {
-        workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
-    }
     let cargo_config = &config;
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
