@@ -106,7 +106,8 @@ fn wrap(
         Mode::All | Mode::Check => false,
     } || config().compare
         || config().skip.iter().any(|it| **it == *name);
-    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, skipped })
+    let dylib = Dylib::at(dylib, inner.content_identity());
+    Arc::new(Kept { inner, dylib, name: name.into(), kind, skipped })
 }
 
 /// A loaded dylib generation, fingerprinted when its expansion wrapper is made.
@@ -125,22 +126,39 @@ mod dylib_identity_tests {
         let path = std::env::temp_dir().join(format!("c4-macro-{}.dylib", std::process::id()));
         std::fs::write(&path, b"macro-one").unwrap();
         let absolute = AbsPathBuf::assert_utf8(path.clone());
-        let first = Dylib::at(&absolute);
+        let first = Dylib::at(&absolute, None);
         let before = *first.hash().unwrap();
         let timestamp = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, b"macro-two").unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(timestamp).unwrap();
-        let second = Dylib::at(&absolute);
+        let second = Dylib::at(&absolute, None);
         assert_ne!(before, *second.hash().unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loaded_generation_identity_survives_producer_replacement_and_removal() {
+        let path =
+            std::env::temp_dir().join(format!("c4-loaded-macro-{}.dylib", std::process::id()));
+        let absolute = AbsPathBuf::assert_utf8(path.clone());
+        let loaded: [u8; KEY] = Sha256::digest(b"the server's immutable generation").into();
+        // The producer can replace its original path after the server copied the
+        // generation but before load-cargo wraps its expanders with this cache.
+        std::fs::write(&path, b"the next producer generation").unwrap();
+        assert_ne!(Dylib::at(&absolute, None).hash(), Some(&loaded));
+        assert_eq!(Dylib::at(&absolute, Some(loaded)).hash(), Some(&loaded));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(Dylib::at(&absolute, Some(loaded)).hash(), Some(&loaded));
+        assert_eq!(Dylib::at(&absolute, None).hash(), None);
     }
 }
 
 impl Dylib {
-    /// Snapshot the bytes for this loaded library generation. A process-global
-    /// pathname cache outlives replacements and would key new expanders as old code.
-    fn at(path: &AbsPath) -> Arc<Dylib> {
-        let hash = std::fs::read(path).ok().map(|bytes| Sha256::digest(bytes).into());
+    /// Use the loader's immutable generation when available. Its original pathname
+    /// may already name a newer producer by the time the expansion wrapper is made.
+    fn at(path: &AbsPath, loaded: Option<[u8; KEY]>) -> Arc<Dylib> {
+        let hash =
+            loaded.or_else(|| std::fs::read(path).ok().map(|bytes| Sha256::digest(bytes).into()));
         Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::from(hash) })
     }
 
