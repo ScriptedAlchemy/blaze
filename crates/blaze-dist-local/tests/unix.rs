@@ -850,6 +850,49 @@ fn bounded_retention_and_replay_identity_fail_closed() {
 }
 
 #[test]
+fn a_full_execution_pool_can_still_join_an_existing_job_within_its_subscriber_limit() {
+    let f =
+        Fixture::new(false, Config { max_executions: 1, max_subscribers: 2, ..Config::default() });
+    let mut c = f.client();
+    let first = submit(&mut c, 1000);
+    let second = submit(&mut c, 2000);
+    assert_eq!(first.subscription.execution, second.subscription.execution);
+    assert_ne!(first.subscription.subscriber, second.subscription.subscriber);
+    let Answer::Error(error) = c.call(Command::Submit(submission(&job(3000), need()))).unwrap()
+    else {
+        panic!("a third subscriber exceeded its execution's cap");
+    };
+    assert!(error.message.contains("subscriber-retention-capacity"));
+    let mut other = job(1000);
+    other.spec.source = blaze_wire::SourceRef::Root(blaze_wire::RootRef { root: [9; 32] });
+    let Answer::Error(error) = c.call(Command::Submit(submission(&other, need()))).unwrap() else {
+        panic!("a different job exceeded the execution cap");
+    };
+    assert!(error.message.contains("execution-retention-capacity"));
+}
+
+#[test]
+fn retained_terminals_do_not_spend_a_new_executions_subscriber_capacity() {
+    let f =
+        Fixture::new(false, Config { max_executions: 2, max_subscribers: 1, ..Config::default() });
+    let mut c = f.client();
+    let first = submit(&mut c, 1000);
+    assert!(matches!(c.call(Command::Cancel(first.clone())).unwrap(), Answer::Ack(_)));
+    let second = submit(&mut c, 2000);
+    assert_ne!(first.subscription.execution, second.subscription.execution);
+    let Answer::Terminal(terminal) = c.call(Command::Terminal(first.subscription)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(terminal.value.unwrap().termination.outcome, Outcome::Cancelled);
+    assert!(matches!(c.call(Command::Cancel(second)).unwrap(), Answer::Ack(_)));
+    let Answer::Error(error) = c.call(Command::Submit(submission(&job(3000), need()))).unwrap()
+    else {
+        panic!("terminal executions still count toward execution retention");
+    };
+    assert!(error.message.contains("execution-retention-capacity"));
+}
+
+#[test]
 fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
     let mut admission = Admission::new(AdmissionConfig::default());
     admission.add_machine("machine", [1; 32], Reservation { memory: 16, cpus: 4, disk: 16 });

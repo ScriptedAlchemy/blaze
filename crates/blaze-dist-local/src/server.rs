@@ -74,6 +74,8 @@ pub struct Server {
     coordinator: Coordinator,
     clock: Arc<dyn Clock>,
     effects: Box<dyn Effects>,
+    #[cfg(test)]
+    accept_errors: VecDeque<io::Error>,
 }
 
 fn fail(text: &str) -> Vec<u8> {
@@ -125,6 +127,8 @@ impl Server {
             coordinator: Coordinator::new(jobs, config, epoch),
             clock,
             effects: Box::new(effects),
+            #[cfg(test)]
+            accept_errors: VecDeque::new(),
         };
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         server.listener.set_nonblocking(true)?;
@@ -139,7 +143,7 @@ impl Server {
             let now = self.coordinator.now(self.clock.now_ms());
             self.effects.deliver(self.coordinator.tick(now));
             // One accept per loop prevents an accept flood starving existing clients/timers.
-            match self.listener.accept() {
+            match self.accept() {
                 Ok((stream, _)) => {
                     if connections.len() < self.coordinator.config.max_connections {
                         stream.set_nonblocking(true)?;
@@ -154,7 +158,14 @@ impl Server {
                         });
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) => {}
                 Err(e) => return Err(e.into()),
             }
             connections.retain_mut(|connection| self.step(now, connection));
@@ -165,6 +176,14 @@ impl Server {
         let effects = self.coordinator.shutdown(self.clock.now_ms());
         self.effects.deliver(effects);
         Ok(())
+    }
+
+    fn accept(&mut self) -> io::Result<(UnixStream, std::os::unix::net::SocketAddr)> {
+        #[cfg(test)]
+        if let Some(error) = self.accept_errors.pop_front() {
+            return Err(error);
+        }
+        self.listener.accept()
     }
 
     fn step(&mut self, now: u64, c: &mut Connection) -> bool {
@@ -267,5 +286,49 @@ impl Drop for Server {
         if fs::metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.inode) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_dist::admission::{Admission, AdmissionConfig};
+    use blaze_dist::jobs::{ExecutionConfig, Jobs};
+
+    #[test]
+    fn transient_accept_errors_leave_the_reactor_available_to_healthy_clients() {
+        let tag = random_id().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "blaze-accept-{}.sock",
+            tag[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        ));
+        let jobs =
+            Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
+        let mut server = Server::bind(
+            &path,
+            jobs,
+            Config::default(),
+            Arc::new(MonotonicClock::default()),
+            |_| {},
+        )
+        .unwrap();
+        server.accept_errors.extend(
+            [
+                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
+                io::ErrorKind::ConnectionReset,
+            ]
+            .into_iter()
+            .map(io::Error::from),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let thread = std::thread::spawn(move || server.run(signal));
+        let connected = crate::client::Client::connect(&path, random_id().unwrap());
+        stop.store(true, Ordering::Release);
+        let result = thread.join().unwrap();
+        assert!(result.is_ok(), "transient accept failure ended the reactor: {result:?}");
+        assert!(connected.is_ok(), "a healthy client could not connect: {:?}", connected.err());
+        assert!(!path.exists());
     }
 }
