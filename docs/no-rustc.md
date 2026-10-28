@@ -518,6 +518,22 @@ AArch64's target specs came from answers.py's run in CI there, and its cold buil
 `force-frame-pointers`, `force-unwind-tables`) no longer send a question to rustc: count.py's
 `RUSTFLAGS` have the first, so every question of ripgrep's went to rustc until then.
 
+Done in a scoped whole-build fixture (PR12, 2026-10-27): the remaining Cargo queries
+are answered in process. The configuration query uses blaze-manifest, the version and
+rustc-print queries use the installed toolchain's records and owned target answers, and
+the real standard library workspace is resolved by blaze-metadata with its own lockfile
+and features. An owned std load reports a resolution error, rather than stitching a
+subset or asking Cargo. Its manifest feature gates follow the bootstrap invocation's
+channel, including profile-rustflags and public-dependency.
+
+Author evidence at production `9d9bc99c` on Linux AArch64: cold build, two edits and
+no-op of the hello/build-dependency fixture succeeded with zero compiler and zero Cargo
+execs; the program printed `hello helper=two edit=2`. The earlier ten-query failure and
+an intermediate zero-query failed build are retained, not relabeled. This closes that
+fixture's P0-A bar, not every target/query or full Rust parity. Target-feature, target-cpu,
+deployment overrides and other unmodeled options remain open; no broader acceptance or
+performance claim follows.
+
 **C. `asm!` assembled in process.** ([#83](https://github.com/indexable-inc/ra-jit/issues/83)) The assembly text ra-jit already produces goes to LLVM's
 assembler (the LLVM backend links LLVM already) or to an assembler crate, in process. Risk is
 low: the cache key and the output are the same, and `harness/asmedits.py` compares.
