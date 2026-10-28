@@ -111,47 +111,43 @@ mod tests {
         .await
         .expect_err("a peer that never reads cannot drain indefinitely");
         let mut io = ProgressIo::new(stream, Duration::from_millis(300));
-        let heartbeat = tokio::spawn(async move {
-            for _ in 0..200 {
-                if peer.write_all(b"x").await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        let mut read_wakes = 0;
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
+        async fn probe(io: &mut ProgressIo, fill: &[u8]) -> io::Result<bool> {
             std::future::poll_fn(|cx| {
                 loop {
-                    match io.stream.try_write(&fill) {
+                    match io.stream.try_write(fill) {
                         Ok(count) => assert!(count != 0),
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) => panic!("maintaining TCP backpressure: {error}"),
                     }
                 }
-                match Pin::new(&mut io).poll_write(cx, &fill) {
-                    Poll::Ready(Err(error)) => return Poll::Ready(error),
+                Poll::Ready(match Pin::new(&mut *io).poll_write(cx, fill) {
+                    Poll::Pending => Ok(false),
+                    Poll::Ready(Err(error)) => Err(error),
                     Poll::Ready(Ok(_)) => panic!("the fixture permitted write progress"),
-                    Poll::Pending => {}
-                }
-                let mut input = [0; 32];
-                let mut read = ReadBuf::new(&mut input);
-                if Pin::new(&mut io).poll_read(cx, &mut read).is_ready() {
-                    read_wakes += usize::from(!read.filled().is_empty());
-                }
-                // Hyper flushes on read-side dispatcher wakes too. TCP flush moves no bytes.
-                assert!(matches!(Pin::new(&mut io).poll_flush(cx), Poll::Ready(Ok(()))));
-                Poll::Pending
-            }),
-        )
-        .await;
-        heartbeat.abort();
-        let error = result.expect("read-side wakes extended the write-progress deadline");
+                })
+            })
+            .await
+        }
+        assert!(!probe(&mut io, &fill).await.unwrap(), "the fixture did not arm a stalled write");
+        let mut received = 0;
+        for _ in 0..3 {
+            peer.write_all(b"x").await.unwrap();
+            let mut input = [0; 1];
+            tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut input))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(input, [b'x']);
+            received += 1;
+            // Hyper polls this no-op on read-side dispatcher wakes.
+            io.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        assert_eq!(received, 3);
+        let error = probe(&mut io, &fill)
+            .await
+            .expect_err("read wakes and flushes reset the write deadline");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(read_wakes > 1, "the regression never exercised repeated read-side wakes");
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
