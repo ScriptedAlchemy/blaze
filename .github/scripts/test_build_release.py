@@ -105,6 +105,17 @@ def main() -> int:
         note("nix-native refuses a loader outside the store", code == 1 and "outside /nix/store" in said,
              said[:90])
 
+        for name, loader in (
+            ("parent-escape", "/nix/store/../../lib64/ld-linux-x86-64.so.2"),
+            ("nested-escape", "/nix/store/glibc/../../../lib64/ld-linux-x86-64.so.2"),
+        ):
+            d = tmp / name
+            d.mkdir()
+            elf(d / "ra-jit", loader, ["GLIBC_2.43"])
+            code, said = run_check(d, "nix-native")
+            note(f"nix-native refuses a store prefix with {name}",
+                 code == 1 and "outside /nix/store" in said, said[:90])
+
         d = tmp / "nix-static"
         d.mkdir()
         elf(d / "ra-jit", None, ["GLIBC_2.34"])

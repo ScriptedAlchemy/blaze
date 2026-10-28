@@ -72,6 +72,13 @@ def descendants(rows, roots):
     return seen
 
 
+def owned_daemons(rows, client_pid, known, prefix):
+    """Keep this client's daemons after reparenting, without taking another run's daemon."""
+    children = descendants(rows, [client_pid])
+    return {pid for pid, _, _, command in rows
+            if (pid in children or pid in known) and command.startswith(prefix + "ra-jit daemon")}
+
+
 def footprints_mb(pids, rows):
     """pid -> MB held. macOS: `footprint`, which counts compressed and swapped memory. Else RSS."""
     if not pids:
@@ -109,12 +116,45 @@ def kill(pids, sig=signal.SIGKILL):
             pass
 
 
+def check_runtime_home(home):
+    staging = os.path.join(home, "daemon.sock.new", "s")
+    # Darwin sun_path is 104 bytes including the terminating NUL.
+    if DARWIN and len(os.fsencode(staging)) >= 104:
+        raise ValueError(f"daemon staging socket is too long ({len(os.fsencode(staging))} bytes): "
+                         f"{staging}; use --home with a shorter private directory")
+
+
+def runtime_logs(home):
+    """The daemon and worker logs belonging to this private runtime home."""
+    found = []
+    for pattern in ("workers", "spares"):
+        root = os.path.join(home, pattern)
+        for dirpath, _, files in os.walk(root) if os.path.isdir(root) else []:
+            found += [os.path.join(dirpath, f) for f in files if f == "log"]
+    daemon = os.path.join(home, "daemon.log")
+    return found + ([daemon] if os.path.exists(daemon) else [])
+
+
+def archive_logs(paths, home, destination, client_log=None):
+    """Archive runtime evidence, including stop-time logs. Copy failures are fatal."""
+    os.makedirs(destination, exist_ok=True)
+    for path in paths:
+        if client_log is not None and os.path.abspath(path) == os.path.abspath(client_log):
+            continue  # Already in the artifact directory; unrelated /logs/ paths are not skipped.
+        dest = os.path.join(destination, os.path.relpath(path, home).replace(os.sep, "_"))
+        try:
+            shutil.copyfile(path, dest)
+        except OSError as error:
+            raise RuntimeError(f"could not archive {path} to {dest}: {error}; retain runtime home {home}") from error
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--td", required=True, help="the checkout to build")
     ap.add_argument("--blaze-bin", required=True, help="the directory of blaze, cargo-blaze and ra-jit")
     ap.add_argument("--work", required=True, help="where the home, the store, CARGO_HOME and the results go")
     ap.add_argument("--name", default=time.strftime("%m%d-%H%M%S"))
+    ap.add_argument("--home", help="private runtime home independent of the artifact directory")
     ap.add_argument("--cargo-home-from", help="a CARGO_HOME to clone (copy on write) as --work/cargo-home")
     ap.add_argument("--target-name", default="loadmem.noindex", help="below DIR/target, which .gitignore names")
     ap.add_argument("--watchdog-mb", type=int, default=24 * GB)
@@ -132,6 +172,9 @@ def main():
     ap.add_argument("--memory-max", help="RA_JIT_MEMORY_MAX instead of 16G")
     ap.add_argument("--own-base-memory", help="RA_JIT_OWN_BASE_MEMORY instead of 12G")
     ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the daemon and the client")
+    ap.add_argument("--stop-after", help="a regex: --stop-delay seconds after a log line matches it, record what the "
+                    "biggest process holds (stopped_after in result.json) and stop the run")
+    ap.add_argument("--stop-delay", type=float, default=3.0)
     ap.add_argument("command", nargs="*", help="after --; default: blaze build --locked -p tracedecay-cli")
     a = ap.parse_args()
 
@@ -139,10 +182,13 @@ def main():
     out = os.path.join(work, a.name)
     for sub in ("snap", "mem", "logs"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
-    home, store = os.path.join(work, "home.noindex"), os.path.join(work, "store.noindex")
+    home = os.path.abspath(a.home) if a.home else os.path.join(work, "home.noindex")
+    store = os.path.join(work, "store.noindex")
     cargo_home = os.path.join(work, "cargo-home")
     if not os.path.isdir(cargo_home) and a.cargo_home_from:
-        sh(["cp", "-cR", a.cargo_home_from, cargo_home], check=True)
+        if not DARWIN or sh(["cp", "-cR", a.cargo_home_from, cargo_home]).returncode:
+            shutil.rmtree(cargo_home, ignore_errors=True)
+            shutil.copytree(a.cargo_home_from, cargo_home)
     env = dict(os.environ, RUST_BACKTRACE="0", RA_JIT_HOME=home, RA_JIT_CACHE=store, CARGO_HOME=cargo_home,
                CARGO_TARGET_DIR=os.path.join(td, "target", a.target_name),
                PATH=blaze_bin + os.pathsep + os.environ["PATH"], **GUARD)
@@ -160,6 +206,8 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
+    home = env["RA_JIT_HOME"]
+    check_runtime_home(home)
     command = a.command or ["blaze", "build", "--locked", "-p", "tracedecay-cli"]
     if command and command[0] == "--":
         command = command[1:]
@@ -173,20 +221,17 @@ def main():
     client = subprocess.Popen(command, cwd=td, env=env, stdout=client_log, stderr=subprocess.STDOUT,
                               start_new_session=True)
     result = {"command": command, "td": td, "blaze_bin": blaze_bin, "started": time.strftime("%FT%T"),
+              "client_pid": client.pid, "runtime_home": home,
               "watchdog_mb": a.watchdog_mb, "marks": {}, "tripped": None, "peak_mb": 0, "peak_client_mb": 0,
               "swap_start_mb": round(swap_start), "guard": {k: env[k] for k in GUARD}}
     seen_lines = {}  # log path -> bytes read
+    stop_seen = [0.0]  # when a line matched --stop-after
     last_total = 0.0
     snapped = set()
+    daemons = set()
 
     def logs():
-        found = [os.path.join(out, "logs", "client.log")]
-        for pattern in ("workers", "spares"):
-            root = os.path.join(home, pattern)
-            for dirpath, _, files in os.walk(root) if os.path.isdir(root) else []:
-                found += [os.path.join(dirpath, f) for f in files if f == "log"]
-        daemon = os.path.join(home, "daemon.log")
-        return found + ([daemon] if os.path.exists(daemon) else [])
+        return [os.path.join(out, "logs", "client.log")] + runtime_logs(home)
 
     def tail(total):
         for path in logs():
@@ -198,6 +243,8 @@ def main():
             except OSError:
                 continue
             for line in data.decode("utf-8", "replace").splitlines():
+                if a.stop_after and not stop_seen[0] and re.search(a.stop_after, line):
+                    stop_seen[0] = time.time()
                 if line.strip():
                     phases.write(json.dumps({"t": round(time.time() - t0, 1), "mb": round(total),
                                              "log": os.path.relpath(path, work), "line": line[:400]}) + "\n")
@@ -213,7 +260,7 @@ def main():
             rows = ps_table()
             # The daemon is started by the client and is among its descendants until the client
             # ends, so blaze's own tree is the daemon's, and the client's is the rest of its.
-            daemons = {r[0] for r in rows if r[3].startswith(prefix + "ra-jit daemon")}
+            daemons = owned_daemons(rows, client.pid, daemons, prefix)
             ours = daemons | descendants(rows, daemons)
             client_tree = descendants(rows, [client.pid]) - ours
             if a.count_client:
@@ -269,6 +316,20 @@ def main():
                 time.sleep(2)
                 kill(client_tree & {r[0] for r in ps_table()})
                 break
+            # A readiness marker cannot turn a simultaneous watchdog violation into a pass.
+            if stop_seen[0] and time.time() - stop_seen[0] >= a.stop_delay:
+                top = max((p for p in held if p in ours), key=held.get, default=None)
+                rss = {r[0]: r[2] for r in rows}
+                result["stopped_after"] = {"pattern": a.stop_after, "at_s": round(time.time() - t0, 1),
+                                           "ready_seen_s": round(stop_seen[0] - t0, 1),
+                                           "footprint_mb": round(held[top]) if top else None,
+                                           "rss_mb": round(rss.get(top, 0) / 1024) if top else None,
+                                           "processes_mb": round(total), "pid": top}
+                if top:
+                    snapshot("stopped", top)
+                kill(ours)
+                kill(client_tree, signal.SIGTERM)
+                break
             if client.poll() is not None:
                 top = max((p for p in held if p in ours), key=held.get, default=None)
                 if top:
@@ -279,19 +340,27 @@ def main():
         if client.poll() is None:
             kill(descendants(ps_table(), [client.pid]))
         result["exit"] = client.poll()
-        result["outcome"] = "watchdog-killed" if result["tripped"] else ("ok" if client.returncode == 0 else "failed")
+        result["daemon_pids"] = sorted(daemons)
+        result["outcome"] = ("watchdog-killed" if result["tripped"] else "stopped" if result.get("stopped_after")
+                             else "ok" if client.returncode == 0 else "failed")
         result["wall_s"] = round(time.time() - t0, 1)
         result["last_mb"] = round(last_total)
         tail(last_total)
-        for path in logs():
-            if "/logs/" not in path:
-                dest = os.path.join(out, "logs", os.path.relpath(path, home).replace(os.sep, "_"))
-                try:
-                    shutil.copyfile(path, dest)
-                except OSError:
-                    pass
-        json.dump(result, open(os.path.join(out, "result.json"), "w"), indent=1)
+        collection_error = None
+        try:
+            archive_logs(logs(), home, os.path.join(out, "logs"), os.path.join(out, "logs", "client.log"))
+        except RuntimeError as error:
+            collection_error = str(error)
+        result["collection_ok"] = collection_error is None
+        result["collection_error"] = collection_error
+        with open(os.path.join(out, "result.json"), "w") as file:
+            json.dump(result, file, indent=1)
+        client_log.close()
+        series.close()
+        phases.close()
         print(json.dumps(result), flush=True)
+        if collection_error:
+            raise RuntimeError(collection_error)
 
 
 if __name__ == "__main__":
