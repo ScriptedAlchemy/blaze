@@ -111,6 +111,35 @@ impl Producers {
         serde_json::from_value(metadata).map_err(Into::into)
     }
 
+    /// Libraries compiled with a script use host units. A target-only package remains
+    /// as the script root, but only its build edges enter that compilation.
+    pub(crate) fn script_metadata(&self, target_dir: &Path) -> Result<Metadata> {
+        let mut metadata = serde_json::to_value(&self.metadata)?;
+        let mut selected = BTreeMap::new();
+        for unit in &self.units {
+            if unit.host || !selected.contains_key(&unit.package) {
+                selected.insert(unit.package.clone(), unit);
+            }
+        }
+        let nodes = selected.values().map(|unit| {
+            let deps = unit.dependencies.iter().filter(|dep| unit.host || dep.build)
+                .map(|dep| {
+                    let child = &self.units[dep.unit];
+                    anyhow::ensure!(child.host, "a script compile dependency is not a host unit");
+                    Ok(json!({
+                        "name": dep.name, "pkg": child.package,
+                        "dep_kinds": [{"kind": if dep.build { "build" } else { "normal" }, "target": null}],
+                    }))
+                }).collect::<Result<Vec<_>>>()?;
+            Ok(json!({"id": unit.package, "features": unit.features, "deps": deps,
+                "dependencies": unit.dependencies.iter().filter(|dep| unit.host || dep.build)
+                    .map(|dep| &self.units[dep.unit].package).collect::<Vec<_>>()}))
+        }).collect::<Result<Vec<_>>>()?;
+        metadata["resolve"] = json!({"root": null, "nodes": nodes});
+        metadata["target_directory"] = json!(target_dir);
+        serde_json::from_value(metadata).map_err(Into::into)
+    }
+
     fn run_scripts(
         &mut self,
         selection: &crate::plan::Selection,
@@ -173,6 +202,7 @@ impl Producers {
             target: host,
             explicit_target: selection.target.is_some(),
             packages: Some(&packages),
+            host_cargo: None,
         };
         let mut raw: BTreeMap<_, _> = self.compile_env.vars().collect();
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));

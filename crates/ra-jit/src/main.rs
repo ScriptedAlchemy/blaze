@@ -3351,6 +3351,7 @@ fn workspace_at(
                 packages: ids
                     .filter_map(|id| plan.package(id).map(|it| (id.clone(), it.for_target)))
                     .collect(),
+                host_cargo: plan.host_cargo().cloned(),
                 world: Vec::new(),
             });
         }

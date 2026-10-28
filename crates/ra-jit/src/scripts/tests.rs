@@ -190,6 +190,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         target: "aarch64-unknown-linux-gnu",
         explicit_target: true,
         packages: Some(&packages),
+        host_cargo: None,
     };
     // The installed toolchain's identity selects checked-in cfg answers. No executable is
     // present in this fixture, so obtaining host cfgs cannot rely on a compiler process.
@@ -401,6 +402,7 @@ impl Fixture {
             target: HOST,
             explicit_target: false,
             packages: Some(&packages),
+            host_cargo: None,
         };
         let mut runner =
             Runner::new(leases, &self.cargo, &asked, self.sysroot.clone(), &self.cfg).unwrap();

@@ -402,6 +402,7 @@ impl Flags {
 /// The packages of a build by their id, each as it is built for the target.
 pub(crate) struct Plan {
     packages: FxHashMap<String, Built>,
+    host_cargo: Option<project_model::CargoWorkspace>,
     lto: bool,
     frame_pointers: bool,
     lints_capped: bool,
@@ -587,8 +588,20 @@ impl Plan {
         if lto {
             eprintln!("{LTO_ACCEPTED}");
         }
+        let host_metadata = resolved.script_metadata(cargo.target_directory().as_ref())?;
+        let host_manifest = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
+            host_metadata.workspace_root.join("Cargo.toml").into_std_path_buf(),
+        ))
+        .map_err(|_| anyhow::anyhow!("host script manifest is not absolute"))?;
+        let host_cargo = project_model::CargoWorkspace::new(
+            host_metadata,
+            host_manifest,
+            ide_db::base_db::Env::default(),
+            false,
+        );
         Ok(Plan {
             packages,
+            host_cargo: Some(host_cargo),
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,
@@ -598,6 +611,10 @@ impl Plan {
 
     pub(crate) fn sources(&self) -> &[(PathBuf, Vec<u8>)] {
         &self.sources
+    }
+
+    pub(crate) fn host_cargo(&self) -> Option<&project_model::CargoWorkspace> {
+        self.host_cargo.as_ref()
     }
 
     /// What the build has a debugger told of the packages cargo was asked to build: the
@@ -783,6 +800,7 @@ impl UnitGraph {
             .collect();
         Ok(Plan {
             packages,
+            host_cargo: None,
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,

@@ -214,6 +214,7 @@ pub(crate) struct Asked<'a> {
     /// The packages the build has and whether they are built for the target, rather than
     /// only for the host; `None` for every package, treated as a target package.
     pub(crate) packages: Option<&'a FxHashMap<String, bool>>,
+    pub(crate) host_cargo: Option<&'a CargoWorkspace>,
 }
 
 /// Whether this process runs the build scripts of what it loads: a whole build's worker.
@@ -258,6 +259,7 @@ pub(crate) struct Own {
     pub(crate) target: String,
     pub(crate) explicit_target: bool,
     pub(crate) packages: FxHashMap<String, bool>,
+    pub(crate) host_cargo: Option<CargoWorkspace>,
     /// The scripts the workspace was loaded from, with the token of each run: set when it is.
     pub(crate) world: World,
 }
@@ -274,6 +276,7 @@ impl Own {
             target: &self.target,
             explicit_target: self.explicit_target,
             packages: Some(&self.packages),
+            host_cargo: self.host_cargo.as_ref(),
         }
     }
 }
@@ -1000,6 +1003,24 @@ impl<'a> Runner<'a> {
     /// The script of `package`, compiled by blaze where it is not as it was: its executable,
     /// and the hash of what it was compiled from and when, which its run depends on.
     fn compile(&mut self, package: Package) -> Result<(PathBuf, (u64, SystemTime)), String> {
+        if let Some(host_cargo) = self.asked.host_cargo {
+            let id = &self.cargo[package].id.repr;
+            let package = host_cargo
+                .packages()
+                .find(|&it| host_cargo[it].id.repr == *id)
+                .ok_or_else(|| format!("host script package {id} is absent"))?;
+            let asked = Asked { host_cargo: None, ..*self.asked };
+            let mut runner =
+                Runner::new(self.leases, host_cargo, &asked, self.sysroot.clone(), &[])
+                    .map_err(|it| it.to_string())?;
+            runner.host_flags = self.host_flags.clone();
+            runner.host_cfgs = self.host_cfgs.clone();
+            runner.raw_env = self.raw_env.clone();
+            let compiled = runner.compile(package);
+            self.judged.extend(runner.judged);
+            self.busy = runner.busy;
+            return compiled;
+        }
         let mut crates = Vec::new();
         let mut at: FxHashMap<Package, usize> = FxHashMap::default();
         let cargo = self.cargo;
