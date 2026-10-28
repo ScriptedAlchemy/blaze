@@ -219,6 +219,10 @@ impl ProcMacroClient {
 }
 
 impl ProcMacro {
+    pub fn content_identity(&self) -> Option<[u8; 32]> {
+        self.dylib_content
+    }
+
     /// Returns the name of the procedural macro.
     pub fn name(&self) -> &str {
         &self.name

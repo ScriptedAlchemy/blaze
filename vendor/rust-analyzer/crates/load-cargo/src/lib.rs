@@ -948,6 +948,10 @@ impl ProcMacroExpander for Expander {
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         (other as &dyn Any).downcast_ref::<Self>() == Some(self)
     }
+
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        self.0.content_identity()
+    }
 }
 
 fn resolve_sub_span(

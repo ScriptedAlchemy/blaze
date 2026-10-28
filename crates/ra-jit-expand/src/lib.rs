@@ -510,6 +510,10 @@ impl ProcMacroExpander for Kept {
             .downcast_ref::<Kept>()
             .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
     }
+
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        self.inner.content_identity().or_else(|| self.dylib.hash().copied())
+    }
 }
 
 /// How many, and the time they took on the threads that expanded them.

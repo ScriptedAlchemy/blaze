@@ -230,6 +230,7 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
+            field(&macro_producer_identity(db, on));
             match on.data(db).origin.is_local() {
                 true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
                 false => {
@@ -283,6 +284,7 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
+            field(&macro_producer_identity(db, on));
             match known(on) {
                 Some((None, root)) => {
                     field(&self.library(db, on, &root, checkout, known, process_reads).0)
@@ -369,6 +371,7 @@ fn library_source_hash(contents: &Contents, db: &RootDatabase, krate: Crate) -> 
         }
         let mut hasher = Sha256::new();
         hasher.update(contents.direct_source_hash(db, krate));
+        hasher.update(macro_producer_identity(db, krate));
         let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dep in dependencies {
@@ -379,6 +382,28 @@ fn library_source_hash(contents: &Contents, db: &RootDatabase, krate: Crate) -> 
         hasher.finalize().into()
     }
     closure(contents, db, krate, &mut FxHashSet::default())
+}
+
+fn macro_producer_identity(db: &RootDatabase, krate: Crate) -> Hash {
+    let mut hash = Sha256::new();
+    hash.update(b"ra-jit loaded macro producer 1");
+    if let Some(macros) = hir::ProcMacros::get_for_crate(db, krate)
+        && let Some(macros) = macros.macros()
+    {
+        let mut identities: Vec<_> = macros.iter().map(|item| {
+            (item.name.as_str(), item.expander.content_identity())
+        }).collect();
+        identities.sort_unstable();
+        for (name, identity) in identities {
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update([u8::from(identity.is_some())]);
+            if let Some(identity) = identity {
+                hash.update(identity);
+            }
+        }
+    }
+    hash.finalize().into()
 }
 
 fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
