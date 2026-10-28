@@ -66,9 +66,12 @@ jobs:
         if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
         continue-on-error: true
       - run: python3 nix/unit_graph.py
-      # Fails when a gate is deleted or made conditional (harness/dist/check_nix_workflow.py).
+      # Fails when a gate is deleted or made conditional, and when the checker stops catching
+      # that (harness/dist/check_nix_workflow.py, test_check_nix_workflow.py).
       - name: the cache is optional and every required command is present
-        run: python3 harness/dist/check_nix_workflow.py
+        run: |
+          python3 harness/dist/check_nix_workflow.py
+          python3 -B harness/dist/test_check_nix_workflow.py
       - name: nix/units is what unit_graph.py writes
         run: |
           git diff --stat -- nix/units

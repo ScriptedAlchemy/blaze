@@ -557,6 +557,27 @@ impl Index {
         }
         Ok(blocks)
     }
+
+    /// Checks one block at a time. Receipt validation must not retain a whole pack's
+    /// decompressed contents when the normal store reader needs only one block.
+    fn verify_values(&self, pack: &[u8]) -> Result<(), &'static str> {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_unstable_by_key(|it| it.block);
+        let mut at = 0;
+        for (nth, block) in self.blocks.iter().enumerate() {
+            let bytes = block
+                .unpack(&pack[block.at as usize..][..block.stored as usize])
+                .ok_or("has a block that does not unpack")?;
+            while let Some(entry) = entries.get(at).filter(|it| it.block as usize == nth) {
+                let value = &bytes[entry.at as usize..][..entry.len as usize];
+                if checksum(&entry.key, value) != entry.checksum {
+                    return Err("has a value that is not what was written");
+                }
+                at += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A sealed pack on its way, made of values in the order they are added.
@@ -1304,7 +1325,7 @@ impl Pack {
     /// As [`Self::check`], with every value read and checked.
     fn verify(name: &str, bytes: &[u8]) -> Result<Index, &'static str> {
         let index = Pack::check(name, bytes)?;
-        index.unpack_all(bytes)?;
+        index.verify_values(bytes)?;
         Ok(index)
     }
 }
@@ -1409,6 +1430,64 @@ impl Store {
                 opened.map_err(|e| eprintln!("store: not used: {e}")).ok()
             })
             .as_ref()
+    }
+
+    /// An owned compiler-batch store with the process cache's producer and format.
+    pub fn owned(dir: &Path) -> io::Result<Store> {
+        Self::open(dir, Identity::current()?, Tuning::from_env()?)
+    }
+
+    pub fn producer(&self) -> [u8; KEY] {
+        self.identity.0
+    }
+
+    /// Publication barrier after every compiler writer has joined. Errors remain
+    /// errors, and collection cannot evict what is being prepared for publication.
+    pub fn seal_checked(&self) -> io::Result<Vec<String>> {
+        let thread = self.settling.lock().map_err(|_| io::Error::other("settler poisoned"))?.take();
+        if let Some(thread) = thread {
+            if thread.join().is_err() {
+                self.writer().stop(io::Error::other("store settler panicked"));
+                return Err(io::Error::other("store settler panicked"));
+            }
+        }
+        let mut writer = self.writer();
+        if let Some(why) = &writer.stopped {
+            return Err(io::Error::other(why.clone()));
+        }
+        if let Err(e) = writer.seal_if_large(&self.dir, 1) {
+            let why = e.to_string();
+            writer.stop(e);
+            return Err(io::Error::other(why));
+        }
+        drop(writer);
+        sync_dir(&self.dir.dir)?;
+        self.refresh();
+        let sealed = self.sealed();
+        self.writer().keys.retain(|key| !sealed.index.contains_key(key));
+        drop(sealed);
+        let mut names = self.dir.packs()?;
+        names.sort();
+        for name in &names {
+            self.pack(name)?;
+        }
+        Ok(names)
+    }
+
+    pub fn pack(&self, name: &str) -> io::Result<Vec<u8>> {
+        if !is_pack(name) {
+            return Err(io::Error::other("not a pack name"));
+        }
+        let bytes = self.dir.read(name)?;
+        Pack::verify(name, &bytes).map_err(io::Error::other)?;
+        Ok(bytes)
+    }
+
+    /// Atomic per-pack installation. Multi-pack admission uses a new owned directory
+    /// and exposes its Store only after all compiler-level admission checks pass.
+    pub fn import_pack(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        Pack::verify(name, bytes).map_err(io::Error::other)?;
+        self.dir.write_whole(name, bytes)
     }
 
     fn open(dir: &Path, identity: Identity, tuning: Tuning) -> io::Result<Store> {
@@ -1658,6 +1737,14 @@ impl Store {
         }
         place.pack.used.store(true, Ordering::Relaxed);
         value
+    }
+
+    /// Read only this already-installed generation. An artifact admission check must
+    /// not call the process-global missing-pack fetcher to fill a partial receipt.
+    pub fn get_installed(&self, key: &[u8; KEY]) -> Option<Vec<u8>> {
+        let key = self.identity.key(key);
+        let place = self.sealed().index.get(&key)?.clone();
+        self.value(&place).filter(|value| checksum(&key, value) == place.checksum)
     }
 
     /// The bytes at `place`, read from its block: from disk where the block is as it is,
@@ -1982,6 +2069,51 @@ mod tests {
 
     fn open(dir: &Path, tuning: Tuning) -> Store {
         Store::open(dir, identity("a toolchain"), tuning).unwrap()
+    }
+
+    #[test]
+    fn checked_barrier_seals_and_verifies_an_owned_batch() {
+        let dir = scratch("checked-barrier");
+        let store = open(&dir, Tuning { seal_at: 1 << 30, limit: Limit::Off });
+        store.insert(&[1; KEY], b"one");
+        store.insert(&[2; KEY], b"two");
+        assert!(StoreDir::at(&dir).packs().unwrap().is_empty());
+        let packs = store.seal_checked().unwrap();
+        assert_eq!(packs.len(), 1);
+        let bytes = store.pack(&packs[0]).unwrap();
+        let keys = pack_keys(&packs[0], &bytes).unwrap();
+        assert!(keys.contains(&store.disk_key(&[1; KEY])));
+        assert!(keys.contains(&store.disk_key(&[2; KEY])));
+        assert!(store.writer().keys.is_empty());
+        assert_eq!(store.get(&[1; KEY]).as_deref(), Some(b"one".as_slice()));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checked_barrier_does_not_reset_or_hide_a_write_failure() {
+        let dir = scratch("checked-failure");
+        let store = open(&dir, EAGER);
+        store.writer().stop(io::Error::other("injected disk failure"));
+        store.insert(&[1; KEY], b"one");
+        for _ in 0..2 {
+            assert!(
+                store.seal_checked().unwrap_err().to_string().contains("injected disk failure")
+            );
+        }
+        assert!(StoreDir::at(&dir).packs().unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checked_barrier_reports_a_settler_panic() {
+        let dir = scratch("checked-settler");
+        let store = open(&dir, EAGER);
+        store.settle_with(|| panic!("injected settler failure"));
+        assert!(store.seal_checked().unwrap_err().to_string().contains("panicked"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn files(dir: &Path, kind: Kind) -> Vec<PathBuf> {

@@ -28,6 +28,7 @@ mod collect;
 mod https;
 mod keeper;
 mod s3;
+mod serve;
 mod signed;
 mod transfer;
 
@@ -51,6 +52,7 @@ use url::Url;
 
 pub(crate) use https::{Https, next as https_next};
 use s3::{S3, Written};
+use serve::Serve;
 use signed::{NotRewritten, Trust, Turns, Unremembered};
 use transfer::{Body, Object, TooLong, Version};
 pub(crate) use transfer::{Digest, Fetched, Room, Traffic};
@@ -89,6 +91,8 @@ enum Place {
     S3(Box<S3>),
     /// Files an HTTPS server hands out, such as a release's assets: read-only.
     Https(Box<Https>),
+    /// A cache server `ra-jit serve` runs, at `blaze+http://host:port`.
+    Serve(Box<Serve>),
 }
 
 impl Remote {
@@ -107,6 +111,15 @@ impl Remote {
         let place = if spec.starts_with("s3://") {
             let spec = Url::parse(spec).context("the address of the remote is not a URL")?;
             Place::S3(Box::new(S3::open(&spec, patience, traffic.clone()).await?))
+        } else if spec.starts_with("blaze+") {
+            let spec = Url::parse(spec).context("the address of the server is not a URL")?;
+            if spec.scheme() != "blaze+http" {
+                bail!(
+                    "`{}` is not `blaze+http://host:port`; TLS is not implemented for this place",
+                    spec.scheme()
+                );
+            }
+            Place::Serve(Box::new(Serve::open(&spec, patience, traffic.clone()).await?))
         } else if spec.starts_with("https://") || spec.starts_with("http://") {
             let spec = Url::parse(spec).context("the address of the remote is not a URL")?;
             Place::Https(Box::new(Https::open(&spec, patience, traffic.clone())?))
@@ -172,6 +185,7 @@ impl Remote {
             }
             Place::S3(s3) => Ok(s3.read_from(name, offset).await?.map(Body::S3)),
             Place::Https(https) => Ok(https.read_from(name, offset).await?.map(Body::Http)),
+            Place::Serve(serve) => serve.read_from(name, offset).await,
         }
     }
 
@@ -206,6 +220,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.read_small(name, most).await,
             Place::Https(https) => https.read_small(name, most).await,
+            Place::Serve(serve) => serve.read_small(name, most).await,
         }
     }
 
@@ -231,6 +246,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.found(name).await,
             Place::Https(https) => https.found(name).await,
+            Place::Serve(serve) => serve.found(name).await,
         }
     }
 
@@ -257,6 +273,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.list(prefix).await,
             Place::Https(_) => bail!("a remote over HTTPS cannot be listed"),
+            Place::Serve(serve) => serve.list(prefix).await,
         }
     }
 
@@ -280,6 +297,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.delete(name).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Serve(serve) => serve.delete(name).await,
         }
     }
 
@@ -313,6 +331,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.write_small(name, &bytes, read_at).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Serve(serve) => serve.write_small(name, bytes.as_ref().clone(), read_at).await,
         }
     }
 
@@ -330,6 +349,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.send_file(name, file, len).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Serve(serve) => serve.send_file(name, &file.to_owned(), len).await,
         }
     }
 
@@ -463,6 +483,25 @@ impl Remote {
         Ok(())
     }
 
+    /// The digests of `asked` that the remote does not hold, from its own memory of what it
+    /// has. Only a server keeps such a set: a directory or a bucket answers nothing, and a
+    /// push asks each object as it comes instead.
+    pub(crate) async fn missing(&self, asked: &[Digest]) -> anyhow::Result<BTreeSet<Digest>> {
+        let wire: Vec<blaze_wire::Digest> = asked.iter().map(|it| it.wire()).collect();
+        let absent = match &self.place {
+            Place::Serve(serve) => {
+                let _permit = self.traffic.permit().await?;
+                let mut missing = Vec::new();
+                for batch in wire.chunks(serve.lookup_limit()) {
+                    missing.extend(serve.missing(batch).await?);
+                }
+                missing
+            }
+            _ => return Ok(BTreeSet::new()),
+        };
+        Ok(absent.into_iter().map(Digest::from_wire).collect())
+    }
+
     /// How many requests are made of the remote at a time.
     pub(crate) fn jobs(&self) -> usize {
         self.traffic.jobs()
@@ -481,6 +520,7 @@ impl Place {
             Place::Dir(dir) => dir.display().to_string(),
             Place::S3(s3) => s3.place(),
             Place::Https(https) => https.place(),
+            Place::Serve(serve) => serve.place(),
         }
     }
 }
@@ -688,8 +728,8 @@ impl Manifest {
     /// The packs of the format this build reads that are not in `local`, and how many of
     /// another format were passed over.
     fn missing(&self, local: &BTreeSet<Digest>) -> (Vec<(Digest, Listed)>, usize) {
-        let absent = self.0.iter().filter(|(pack, _)| !local.contains(pack));
-        let (ours, others): (Vec<_>, Vec<_>) = absent
+        let not_here = self.0.iter().filter(|(pack, _)| !local.contains(pack));
+        let (ours, others): (Vec<_>, Vec<_>) = not_here
             .map(|(pack, listed)| (*pack, *listed))
             .partition(|it| it.1.format == STORE_FORMAT);
         (ours, others.len())
@@ -734,7 +774,12 @@ fn keys_of(store: &Path, pack: Digest) -> anyhow::Result<(u64, Vec<u8>)> {
 }
 
 /// Sends a pack and its keys, unless the remote has them, and says how to list it.
-async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Result<(Listed, u64)> {
+async fn send_pack(
+    store: &Path,
+    remote: &Remote,
+    pack: Digest,
+    absent: &BTreeSet<Digest>,
+) -> anyhow::Result<(Listed, u64)> {
     let from = store.to_owned();
     let (size, keys) = tokio::task::spawn_blocking(move || {
         keys_of(&from, pack)
@@ -757,7 +802,7 @@ async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Resul
         return Ok((listed, len));
     }
     let (object, _) = listed.object(&pack);
-    if remote.holds(&object, size).await? {
+    if !absent.contains(&pack) && remote.holds(&object, size).await? {
         return Ok((listed, 0));
     }
     remote.send_file(&object, &store.join(pack_file(&pack)), size).await.with_context(|| {
@@ -801,10 +846,14 @@ pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow
         Err(_) => Manifest::default(),
     };
     let missing: Vec<Digest> = local.into_iter().filter(|it| !listed.0.contains_key(it)).collect();
+    // A server answers for the whole batch from its existence set, so a pack it says it lacks
+    // is not asked about one at a time: one request instead of one `HEAD` per pack.
+    let absent = remote.missing(&missing).await.unwrap_or_default();
     let (mut sent, mut bytes, mut failed) = (Manifest::default(), 0, Vec::new());
-    let mut sending = stream::iter(
-        missing.iter().map(|&pack| async move { (pack, send_pack(store, remote, pack).await) }),
-    )
+    let mut sending = stream::iter(missing.iter().map(|&pack| {
+        let absent = &absent;
+        async move { (pack, send_pack(store, remote, pack, absent).await) }
+    }))
     .buffer_unordered(remote.traffic.jobs());
     while let Some((pack, result)) = sending.next().await {
         match result {
@@ -954,6 +1003,9 @@ const USAGE: &str = "usage: ra-jit cache push|pull REMOTE [PROJECT]\n       \
 /// `ra-jit cache VERB`, on the store of the user's builds.
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
+    if verb == "serve" {
+        return serve(args);
+    }
     if verb == "keygen" {
         return signed::keygen(Path::new(&args.next().context(USAGE)?));
     }
@@ -1788,4 +1840,48 @@ pub(crate) mod tests {
         });
         _ = std::fs::remove_dir_all(&signed.dir);
     }
+}
+
+const SERVE_USAGE: &str = "usage: ra-jit serve --cache DIR --listen ADDR\n\
+                           \n\
+                           ADDR is host:port, and 127.0.0.1:7878 when it is left out. The\n\
+                           directory holds today's remote layout: packs/, keys/, units/ and\n\
+                           manifests/. A machine reaches it with RA_JIT_REMOTE=blaze+http://HOST:PORT.\n\
+                           There is no authentication in this version: it listens on 127.0.0.1 unless\n\
+                           told otherwise.";
+
+/// `ra-jit serve --cache DIR --listen ADDR`: the cache server of unit C3.
+fn serve_command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let mut cache: Option<PathBuf> = None;
+    let mut listen = "127.0.0.1:7878".to_owned();
+    while let Some(flag) = args.next() {
+        let mut value =
+            || args.next().with_context(|| format!("{flag} needs a value\n{SERVE_USAGE}"));
+        match flag.as_str() {
+            "--cache" => cache = Some(PathBuf::from(value()?)),
+            "--listen" => listen = value()?,
+            "--help" | "-h" => {
+                println!("{SERVE_USAGE}");
+                return Ok(());
+            }
+            other => bail!("`{other}` is not an option of `ra-jit serve`\n{SERVE_USAGE}"),
+        }
+    }
+    let Some(cache) = cache else { bail!("`ra-jit serve` needs --cache DIR\n{SERVE_USAGE}") };
+    let listen: std::net::SocketAddr = listen
+        .parse()
+        .with_context(|| format!("`{listen}` is not an address: host:port, as 127.0.0.1:7878"))?;
+    if !listen.ip().is_loopback() {
+        eprintln!(
+            "serve: listening on {listen}, which is not this machine: there is no authentication yet (C6)"
+        );
+    }
+    let mut config = blaze_serve::Config::at(cache, listen.port());
+    config.listen = listen;
+    runtime()?.block_on(blaze_serve::serve(config))
+}
+
+/// `ra-jit serve`: the cache server.
+pub(crate) fn serve(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    serve_command(args)
 }

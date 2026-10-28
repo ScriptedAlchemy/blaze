@@ -220,9 +220,10 @@ These act on the store `cargo ra-jit status` names.
 
 ## The remote
 
-A remote is a directory, `s3://bucket/prefix`, or an `https://` address it is only read from,
+A remote is a directory, `s3://bucket/prefix`, an `https://` address it is only read from,
 whose files are named by their paths with `.` for `/` (a GitHub release's assets: see "The
-standard library" below). It holds sealed packs under the hash of
+standard library" below), or a `blaze+http://host:port` cache server (see "The server" below).
+It holds sealed packs under the hash of
 their bytes, a list of the keys in each pack, and one manifest per project that lists the
 packs that project's builds were served from.
 
@@ -268,6 +269,148 @@ push. A daemon killed with SIGKILL pushes nothing on its way out; the next push 
 
 `RA_JIT_REMOTE` needs the local store (`RA_JIT_CACHE` not `off`): the remote fills and
 reads it.
+
+### The server
+
+`ra-jit serve` shares today's cache layout over HTTP/1.1. It is unit C3 of
+[distributed.md](distributed.md).
+`ra-jit cache serve` is an alias.
+
+    ra-jit serve --cache DIR --listen 127.0.0.1:7878
+
+Without `--listen`, the address is `127.0.0.1:7878`. There is no authentication or TLS in
+this unit. Anyone who can reach the port can read, write and delete cache objects.
+An explicit non-loopback address prints a warning. Deployment access remains the
+operator's Tailscale ACLs. This unit adds no capabilities or sandbox policy.
+
+A client uses the `blaze+http` place. Addresses have a host and port, without credentials,
+a path prefix or a query. `blaze+https` is refused rather than downgraded to plaintext.
+
+    ra-jit cache push blaze+http://HOST:PORT
+    ra-jit cache pull blaze+http://HOST:PORT
+
+Push, pull, lazy fetch, the keeper, dependency units and remote collection use the existing
+transfer code. The server keeps `packs/`, `keys/`, `units/`, `manifests/` and `deps/`.
+A directory remote can read that layout.
+
+The server has these calls.
+
+| Call | Behavior |
+|---|---|
+| `POST /v1/hello` | The current `blaze_wire::VERSION` and server limits, encoded by `blaze-wire` in deterministic CBOR. |
+| `POST /v1/cache/missing` | Up to 4,096 digests, answered from the existence set. The client splits larger requests. |
+| `GET`, `HEAD`, `PUT`, `DELETE /v1/blob/<name>` | Today's blob names, such as `packs/<sha256>.pack`. |
+| `GET`, `HEAD`, `PUT`, `DELETE /v1/list/<name>` | Today's text lists, with content-hash ETags and conditional PUT. |
+| `GET /v1/objects?prefix=<prefix>` | A legacy complete CBOR listing, or the explicitly requested paged extension below. |
+
+A bare `/v1/blob/<sha256>` PUT stores raw content in `units/`. GET and HEAD find the
+existing raw object named by that digest. A compressed-only pack is not returned by a
+bare-digest GET or HEAD. Its named `.pack.zst` route returns compressed bytes without an
+ETag for the uncompressed digest. Compressed packs are named by the uncompressed pack's
+digest. The general encoding-header protocol remains C5 work.
+Digest path names require lowercase hex to prevent case-insensitive filesystem aliases.
+
+A PUT streams to a temporary file. Verification hashes raw content or decompresses and hashes
+a compressed pack without reading the whole upload into memory. Packs must have this store's
+format header. The server then syncs the file, renames it and syncs the directory.
+Interrupted or invalid uploads never appear under the final name. Concurrent publication and
+deletion update the disk and existence set in the same order.
+An explicit reupload replaces the whole object and refreshes its write time for collection.
+Temporary names start with a dot and never appear in listings. Legacy list temporaries with
+the old `.<pid>-<nanos>.tmp` suffix are also excluded before filesystem metadata is read.
+
+GET supports partial, open-ended and suffix byte ranges. Successful ranges return `206`
+with `Content-Range`. Invalid or unsatisfiable ranges return `416`. HEAD returns the same
+length without a body. Lists use `If-Match` or `If-None-Match: *` to avoid lost updates.
+A failed condition returns code 6 with status `409`, and the client reads again.
+When a resumed download gets `416` because the remote object is shorter than the saved
+prefix, the fetch drops that prefix and restarts once from zero. A malformed range response
+is a final refusal and removes the partial instead of disabling other transfers.
+The restarted bytes must still satisfy the listed size, digest and pack-format checks
+before publication. A local upload over the negotiated size limit is not retried.
+
+The existence set is a hint. Files changed directly behind the server are not reflected in
+that set until a rescan or restart. Fetches still read the file, and clients verify its digest.
+Direct filesystem writers do not participate in the server's conditional-write lock.
+Listings are a best-effort snapshot. An object deleted between enumeration and its metadata
+read is omitted. Other filesystem errors remain errors. A real manifest that disappears
+after it was listed still causes collection to fail rather than losing its references.
+
+`hello` returns an Ed25519 public key persisted in `DIR/key`, a placeholder Main epoch of 1,
+and an empty identity set. C3 has no records or identity restrictions. Records, generation
+lookup, root-based collection and coordinator jobs remain separate units.
+On Unix the key seed is created with `0600` permissions. Reopening an older key fixes its mode.
+
+The `/v1` route family is not the CBOR codec version. Both peers advertise
+`blaze_wire::VERSION` and require the selected version to match. This branch has the C1
+codec, currently 1, and has not integrated C2's later schemas or signing domains.
+Hello is itself schema-typed. A request with different fields fails as malformed before
+version negotiation. An unsupported version within the same envelope gets the version error.
+C2 integration must define a stable hello envelope or negotiate in headers before decoding.
+It must update the route banner, docs and codec tests together. No newer or older codec is
+silently ingested here.
+
+The client validates advertised limits against the codec's supported ceiling and uses accepted
+limits for missing batches, request bodies, bounded answers and small-object reads.
+Zero, inconsistent or unsupported larger limits are refused.
+
+The server gives request headers and each body frame a 30-second idle deadline.
+An idle or cancelled upload removes its owned staging file without publishing it.
+Response writes use the same progress-idle deadline. A peer that stops reading releases
+its connection slot; a slow transfer that keeps writing can exceed the idle interval.
+At most 256 connections are accepted concurrently. TCP keepalive detects dead peers.
+Filesystem setup, reads, listing, deletion and publication use the blocking pool, not
+async runtime workers. These are network resource leases, not compile-worker memory caps.
+
+Every minute the server sweeps staging files older than one hour. Live staging files hold
+an exclusive file lock through verification, so a sweep does not remove an active upload.
+Restart sweeps old abandoned files as well. Newer crash leftovers stay hidden until eligible.
+Unopenable or un-lockable janitor files are logged and left untouched. They do not stop
+the service or cause locked uploads to be removed. Transient accept failures, including
+descriptor exhaustion, back off and retry while existing connections can finish.
+Upload publication still requires file locks; filesystems without that facility are
+explicit failures, not an unsafe unlocked fallback.
+The public library's `Config::resources` configures the deadlines and lease counts.
+
+### Paginated listing extension
+
+The C3 listing extension is versioned separately from the C1 CBOR codec.
+`X-Blaze-Listing-Version: 1` requests paging on `/v1/objects`.
+The query accepts `prefix`, `limit` and an optional `cursor`, each once.
+The response body remains the existing `ObjectsAnswer` CBOR map.
+Every page fits the advertised request-byte and batch-item limits.
+`X-Blaze-Listing-Version: 1` and `X-Blaze-Listing-Total` identify a paged response.
+`X-Blaze-Listing-Next` names the next page when more objects remain.
+
+A cursor contains a random snapshot ID and its next row offset. It is not a filesystem path.
+The server validates the prefix and offset against an immutable, sorted metadata snapshot.
+Snapshots expire after ten minutes and their lease count is bounded by the connection limit.
+An unknown or expired cursor returns `409`. An invalid cursor or query returns `400`.
+When leases are occupied, a new snapshot returns `429`; it never truncates a listing.
+
+Each snapshot captures all names once. Later publication does not insert rows between pages.
+Deletion after capture does not shift offsets or skip later objects.
+The client checks the declared total, strict ordering, typed names and cursor progress.
+It follows every page before returning a list to GC. A real manifest deleted after capture
+still fails its subsequent read, so GC does not silently lose references.
+A fresh listing sees subsequent publication and deletion.
+Snapshot construction is proportional to directory size and uses memory for metadata.
+This is not a claim of unlimited cache scale or a root-based GC implementation.
+
+Requests without the extension header retain the complete legacy response.
+An oversized legacy response still fails with `413`, not a partial result.
+The new client accepts a complete legacy small response from an older server.
+Older clients can use the new server's legacy route unchanged.
+No CBOR field, `blaze_wire::VERSION`, C2 BuildSpec or signing domain changed here.
+
+`python3 -I harness/remote.py --server` exercises the server alongside available S3 services.
+`--server --transfers-only` runs its transfer, damage and signing checks without compiler
+round trips. Neither command measures a speedup.
+`--selftest` checks given-S3, cache-server, MinIO and SeaweedFS dispatch without credentials.
+The TLS fixture requires MinIO and openssl. SeaweedFS retains its normal S3 checks but does
+not run the MinIO-specific TLS fixture; the harness reports that omission.
+The focused server CI also runs actual remote-client tests and the dispatch selftest.
+It installs Rust 1.99.0 with rust-src and does not build a release harness binary.
 
 ### The standard library
 
@@ -326,9 +469,10 @@ signer is trusted completely; ra-jit does not compile again to check them. Under
 sits one assumption: two machines with the same ra-jit binary compile the same key to
 equivalent code.
 
-The harness checks, against both servers: a pack truncated, extended, emptied or with one
-byte flipped; a different valid pack under another's name; a listed pack that is missing;
-and manifests that are forged, unsigned, or signed by an unlisted key.
+The harness checks, against both servers and the cache server of "The server" below: a pack
+truncated, extended, emptied or with one byte flipped; a different valid pack under another's
+name; a listed pack that is missing; and manifests that are forged, unsigned, or signed by an
+unlisted key.
 
 There is no `SECURITY.md` in the repository at the commit these docs were written against.
 
@@ -373,6 +517,9 @@ nothing about a real network. The full tables are in [results.md](results.md).
 
 - Real AWS has not been run.
 - Windows and macOS were not run for the remote; the harness is Linux only.
+- The cache server's verification results are reported per run. No server timing is claimed.
+- A cache server holds no records yet: a push still sends every pack its manifest lacks, and
+  there is no batch lookup of a build's crates (C5).
 - When one fetch runs out of retries the remote is taken to be down and that process's
   other transfers stop. The next run resumes them.
 - A merged pack is held twice on the remote until someone runs `cache gc --remote`.

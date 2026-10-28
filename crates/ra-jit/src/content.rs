@@ -141,6 +141,7 @@ impl Contents {
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
+        field(format!("{:?}", data.codegen_flags).as_bytes());
         for attr in &data.crate_attrs {
             field(attr.as_bytes());
         }
@@ -263,7 +264,8 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit library 6");
+        field(b"ra-jit library 7");
+        field(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         field(Self::version(db, krate).as_bytes());
         field(&self.source_hash(db, krate));
         // Where cargo fetched it to is under another directory on another machine, and so is
@@ -312,6 +314,7 @@ impl Contents {
         let named = Self::version(db, krate);
         hasher.update((named.len() as u64).to_le_bytes());
         hasher.update(named.as_bytes());
+        hasher.update(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         match rustc_id {
             Some(id) => hasher.update([&[1][..], &id.to_le_bytes()].concat()),
             None => hasher.update([0]),

@@ -202,3 +202,66 @@ fn when_a_script_runs_again() {
     assert_eq!(Rerun::Package.stale(&dir, ran, &foo, &foo), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `rerun_if_missing` and the like: a file that is not there has cargo run the script again
+/// every build, one that is as old as the run does not, and the files and the variables are
+/// asked apart.
+#[test]
+fn a_file_that_is_not_there_is_stale_every_time() {
+    let dir =
+        std::env::temp_dir().join(format!("blaze-build-script-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("here"), "").unwrap();
+    let rerun =
+        Rerun::Watched { files: vec!["here".into(), "absent".into()], env: vec!["X".into()] };
+    let ran = SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(rerun.stale_files(&dir, ran), Some(Stale::Missing(dir.join("absent"))));
+    // However late the run began.
+    let later = ran + std::time::Duration::from_secs(3600);
+    assert_eq!(rerun.stale_files(&dir, later), Some(Stale::Missing(dir.join("absent"))));
+    std::fs::write(dir.join("absent"), "").unwrap();
+    assert_eq!(rerun.stale_files(&dir, ran), None);
+    // A variable is not a file: its value is what [`Rerun::stale_env`] says of it.
+    let (one, two) = (|_: &str| Some("1".to_owned()), |_: &str| Some("2".to_owned()));
+    assert_eq!(rerun.stale_env(&one, &one), None);
+    assert_eq!(
+        rerun.stale_env(&one, &two),
+        Some(Stale::Env { name: "X".into(), then: Some("1".into()), now: Some("2".into()) })
+    );
+    // Unset and empty are two values.
+    let (unset, empty) = (|_: &str| None, |_: &str| Some(String::new()));
+    assert!(rerun.stale_env(&unset, &empty).is_some());
+    assert!(rerun.stale_env(&empty, &unset).is_some());
+    assert_eq!(rerun.stale_env(&unset, &unset), None);
+    // `stale` is both, files first, and nothing for a script that said nothing.
+    assert_eq!(rerun.stale(&dir, ran, &one, &one), Some(None));
+    assert!(matches!(rerun.stale(&dir, ran, &one, &two), Some(Some(Stale::Env { .. }))));
+    assert_eq!(Rerun::Package.stale_files(&dir, ran), None);
+    assert_eq!(Rerun::Package.stale_env(&one, &two), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a script says it reads, in the order it says it, is what its `Rerun` is: a script that
+/// says other than it did, whatever the files, is another: cargo's fingerprint of the run
+/// before has the old one, and runs the script again for it.
+#[test]
+fn what_a_script_says_it_reads_is_its_rerun() {
+    let dir = Path::new("/p/foo");
+    let said = |files: &[&str], env: &[&str]| {
+        Reads {
+            files: files.iter().map(PathBuf::from).collect(),
+            env: env.iter().map(|it| (*it).to_owned()).collect(),
+        }
+        .rerun(dir)
+    };
+    assert_eq!(said(&[], &[]), Rerun::Package);
+    assert_eq!(said(&["a"], &[]), said(&["a"], &[]));
+    // A path below the package's directory is the package's, one beside it is its own.
+    assert_eq!(said(&["/p/foo/a"], &[]), said(&["a"], &[]));
+    assert_ne!(said(&["/p/a"], &[]), said(&["a"], &[]));
+    assert_ne!(said(&["a"], &[]), Rerun::Package);
+    assert_ne!(said(&["a"], &[]), said(&["a"], &["X"]));
+    assert_ne!(said(&["a", "b"], &[]), said(&["b", "a"], &[]));
+    assert_ne!(said(&[], &["X"]), said(&[], &[]));
+}

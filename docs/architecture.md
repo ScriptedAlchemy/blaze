@@ -336,8 +336,11 @@ and is a patch of the base, as a link once begun has replaced rustc's executable
 it builds that base gives it up for good, logs so, and edits go on patching rustc's
 executable: what the build computed stays in the database, so the bound is on what the
 worker keeps (`RA_JIT_OWN_BASE_MEMORY`, a size such as `40G`, or `off`). The daemon's
-`RA_JIT_MEMORY_MAX` does not stand for it: that stops the worker asked longest ago, never the
-one asked last, which is the one building its base. zed's base outgrows it, on
+`RA_JIT_MEMORY_MAX` does not stand for it: that stops the worker asked longest ago, not the
+one asked last, which is the one building its base, unless that one alone holds more than all
+may. Every build is also held to `RA_JIT_WORKER_MEMORY` (by default what `RA_JIT_MEMORY_MAX`
+says): fewer threads compile ahead as the worker nears it, and a build past it is stopped
+([cargo.md](cargo.md#the-daemon)). zed's base outgrows the first bound, on
 the debuginfo types of [#55](https://github.com/indexable-inc/ra-jit/issues/55).
 
 An edit is never linked in full for want of a base ([#159](https://github.com/indexable-inc/ra-jit/issues/159)).

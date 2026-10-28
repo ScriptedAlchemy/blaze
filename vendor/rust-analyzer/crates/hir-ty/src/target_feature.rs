@@ -1052,4 +1052,49 @@ static TARGET_FEATURE_IMPLICATIONS_RAW: &[&[(&str, Stability, ImpliedFeatures)]]
     M68K_FEATURES,
     AVR_FEATURES,
 ];
+
+/// Rust 1.99's `parse_rust_feature_list` applies each operation, including its forward or
+/// inverse implications, before the next one. Sorting the original flags changes their meaning.
+/// Source: rust-lang/rust, 1.99.0, compiler/rustc_codegen_ssa/src/target_features.rs.
+pub(crate) fn flag_changes(
+    arch: &str,
+    changes: &[(String, bool)],
+) -> std::collections::BTreeMap<String, bool> {
+    let rules = match arch {
+        "aarch64" => AARCH64_FEATURES,
+        "x86_64" | "x86" => X86_FEATURES,
+        _ => &[],
+    };
+    let mut overrides = std::collections::BTreeMap::new();
+    for (name, on) in changes {
+        let mut visited = std::collections::BTreeSet::new();
+        let mut pending = vec![name.as_str()];
+        while let Some(feature) = pending.pop() {
+            if !visited.insert(feature) {
+                continue;
+            }
+            overrides.insert(feature.to_owned(), *on);
+            for &(candidate, _, dependencies) in rules {
+                if *on && candidate == feature {
+                    pending.extend(dependencies.iter().copied());
+                } else if !*on && dependencies.contains(&feature) {
+                    pending.push(candidate);
+                }
+            }
+        }
+    }
+    overrides
+}
+
+/// Architecture-specific implications for effective compiler flags. The CPU's features
+/// come first, then command-line overrides, as rustc's `internal_target_features` does.
+pub(crate) fn flag_features(
+    arch: &str,
+    initial: impl IntoIterator<Item = String>,
+    changes: &[(String, bool)],
+) -> std::collections::BTreeSet<String> {
+    let changes: Vec<_> =
+        initial.into_iter().map(|name| (name, true)).chain(changes.iter().cloned()).collect();
+    flag_changes(arch, &changes).into_iter().filter_map(|(name, on)| on.then_some(name)).collect()
+}
 // spellchecker:on

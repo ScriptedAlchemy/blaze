@@ -47,7 +47,8 @@ pub(crate) fn held_by(pid: u32) -> Option<u64> {
 /// the process to however much the machine has.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn of_the_machine() -> Option<u64> {
-    let total = kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")?;
+    let total =
+        kilobytes(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), "MemTotal:")?;
     let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let allowed = allowed_by(&groups, |file| {
         std::fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok()
@@ -461,9 +462,206 @@ fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Soft footprint target from `RA_JIT_WORKER_MEMORY`: a size, or `off`. The default is
+/// `RA_JIT_MEMORY_MAX`, or half the machine memory when neither is set. Exceeding this
+/// target reduces concurrency; it never fails a build.
+pub(crate) fn build_budget() -> Result<Option<u64>, String> {
+    match std::env::var("RA_JIT_WORKER_MEMORY") {
+        Ok(text) if text == "off" => Ok(None),
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .map(Some)
+            .ok_or_else(|| format!("RA_JIT_WORKER_MEMORY=`{text}` is neither a size nor `off`")),
+        Err(_) => crate::cargo::daemon::memory_max(),
+    }
+}
+
+/// Starts the independent OS-pressure monitor even with the soft budget disabled.
+pub(crate) fn bound_builds() -> anyhow::Result<()> {
+    let most = build_budget().map_err(anyhow::Error::msg)?;
+    // Validate configuration before starting the monitor.
+    let _ = pressure_reserve()?;
+    let grace = pressure_grace()?;
+    let budget = most.map(|most| hir_ty_codegen::budget::Budget {
+        most,
+        held: || held_by(std::process::id()),
+        give_back,
+    });
+    if most.is_none()
+        && std::env::var_os("RA_JIT_WORKER_MEMORY").is_none()
+        && std::env::var_os("RA_JIT_MEMORY_MAX").is_none()
+        && of_the_machine().is_none()
+    {
+        eprintln!("machine memory unavailable: soft budget unknown; host pressure still monitored");
+    }
+    hir_ty_codegen::budget::monitor(budget, host_pressure, give_back, grace)?;
+    Ok(())
+}
+
+pub(crate) fn pressure_grace() -> anyhow::Result<std::time::Duration> {
+    let seconds = match std::env::var("RA_JIT_PRESSURE_GRACE_SECS") {
+        Ok(text) => text.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("RA_JIT_PRESSURE_GRACE_SECS must be a number of seconds")
+        })?,
+        Err(_) => 60,
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn pressure_reserve() -> anyhow::Result<u64> {
+    match std::env::var("RA_JIT_MEMORY_RESERVE") {
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .ok_or_else(|| anyhow::anyhow!("RA_JIT_MEMORY_RESERVE must be a size")),
+        Err(_) => Ok((of_the_machine().unwrap_or(0) / 20).max(2 << 30)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let mut level: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    // SAFETY: the sysctl writes an integer into an integer-sized buffer.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || size != size_of::<libc::c_int>() {
+        return None;
+    }
+    match level {
+        1 => Some(Pressure::Normal),
+        2 => Some(Pressure::Warning),
+        4 => Some(Pressure::Critical),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    read_linux_pressure(|path| std::fs::read_to_string(path), pressure_reserve().ok()?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_linux_pressure(
+    read: impl Fn(&str) -> std::io::Result<String>,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    // Either source can be restricted independently. Read both before classifying, so
+    // an unavailable MemAvailable reading cannot hide critical pressure reported by PSI.
+    linux_pressure(
+        &read("/proc/meminfo").unwrap_or_default(),
+        &read("/proc/pressure/memory").unwrap_or_default(),
+        reserve,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    None
+}
+
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    hir_ty_codegen::budget::testing::pressure().unwrap_or_else(os_pressure)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_pressure(
+    meminfo: &str,
+    psi: &str,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let available = kilobytes(meminfo, "MemAvailable:");
+    let avg = |name: &str| -> Option<f64> {
+        let row = psi.lines().find(|line| line.starts_with(name))?;
+        let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
+        value.parse::<f64>().ok().filter(|it| it.is_finite() && (0.0..=100.0).contains(it))
+    };
+    let (some, full) = (avg("some "), avg("full "));
+    // PSI can be disabled by the kernel or unavailable in a container. An unreadable
+    // signal is unknown, but must not erase pressure observed by another signal.
+    if available.is_some_and(|it| it <= reserve) || full.is_some_and(|it| it >= 10.0) {
+        Some(Pressure::Critical)
+    } else if available.is_some_and(|it| it <= reserve.saturating_mul(2))
+        || some.is_some_and(|it| it >= 10.0)
+    {
+        Some(Pressure::Warning)
+    } else if available.is_some() && some.is_some() && full.is_some() {
+        Some(Pressure::Normal)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_pressure_uses_available_reserve_and_both_psi_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let psi = |some, full| {
+            format!("some avg10={some} avg60=0 total=0\nfull avg10={full} avg60=0 total=0\n")
+        };
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 0), 1 << 20), Some(Normal));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", &psi(0, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", &psi(0, 0), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(10, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 10), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", "unreadable", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_keeps_known_pressure_when_another_signal_is_unavailable() {
+        use hir_ty_codegen::budget::Pressure::*;
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", "", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", "", 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("", "full avg10=10 total=0\n", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("", "some avg10=10 total=0\n", 1 << 20), Some(Warning));
+        assert_eq!(
+            linux_pressure("MemAvailable: 1024 kB", "full avg10=NaN total=0\n", 1 << 20),
+            Some(Critical)
+        );
+        // Incomplete quiet signals do not claim that all pressure sources are normal.
+        assert_eq!(linux_pressure("", "full avg10=0 total=0\n", 1 << 20), None);
+        assert_eq!(linux_pressure("", "", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_reader_keeps_independently_readable_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let read = |meminfo: Option<&str>, psi: Option<&str>| {
+            read_linux_pressure(
+                |path| {
+                    let text = match path {
+                        "/proc/meminfo" => meminfo,
+                        "/proc/pressure/memory" => psi,
+                        _ => panic!("unexpected pressure source: {path}"),
+                    };
+                    text.map(str::to_owned)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                },
+                1 << 20,
+            )
+        };
+        assert_eq!(read(None, Some("full avg10=10 total=0\n")), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=10 total=0\n")), Some(Warning));
+        assert_eq!(read(Some("MemAvailable: 1024 kB"), None), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=0\nfull avg10=0\n")), None);
+        assert_eq!(read(None, None), None);
+    }
+
+    #[test]
+    fn native_pressure_reader_is_not_a_production_noop() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(os_pressure().is_some(), "native OS pressure reader unavailable");
+        }
+    }
 
     #[test]
     fn a_line_of_proc_is_read_as_bytes() {

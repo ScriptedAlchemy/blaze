@@ -251,11 +251,11 @@ impl Sysroot {
         sysroot_source_config: &RustSourceWorkspaceConfig,
         no_deps: bool,
         progress: &dyn Fn(String),
-    ) -> Option<RustLibSrcWorkspace> {
+    ) -> Result<Option<RustLibSrcWorkspace>> {
         assert!(matches!(self.workspace, RustLibSrcWorkspace::Empty), "workspace already loaded");
         let Self { root: _, rust_lib_src_root: Some(src_root), workspace: _, error: _ } = self
         else {
-            return None;
+            return Ok(None);
         };
         if let RustSourceWorkspaceConfig::CargoMetadata(cargo_config) = sysroot_source_config {
             let library_manifest = ManifestPath::try_from(src_root.join("Cargo.toml")).unwrap();
@@ -267,8 +267,11 @@ impl Sysroot {
                     no_deps,
                     progress,
                 ) {
-                    Ok(loaded) => return Some(loaded),
+                    Ok(loaded) => return Ok(Some(loaded)),
                     Err(e) => {
+                        if cargo_config.own_metadata.is_some() {
+                            return Err(e);
+                        }
                         tracing::error!("`cargo metadata` failed on `{library_manifest}` : {e}")
                     }
                 }
@@ -320,12 +323,12 @@ impl Sysroot {
                     }
                 }
             }
-            return Some(RustLibSrcWorkspace::Stitched(stitched));
+            return Ok(Some(RustLibSrcWorkspace::Stitched(stitched)));
         } else if let RustSourceWorkspaceConfig::Json(project_json) = sysroot_source_config {
-            return Some(RustLibSrcWorkspace::Json(project_json.clone()));
+            return Ok(Some(RustLibSrcWorkspace::Json(project_json.clone())));
         }
 
-        None
+        Ok(None)
     }
 
     pub fn set_workspace(&mut self, workspace: RustLibSrcWorkspace) {
@@ -374,9 +377,19 @@ impl Sysroot {
 
         // Make sure we never attempt to write to the sysroot
         let locked = true;
-        let (mut res, err) =
+        let (mut res, err) = if let Some(own) = &cargo_config.own_metadata {
+            let target = cargo_config.targets.first().map(String::as_str);
+            let cfg = crate::toolchain_info::rustc_cfg::get(
+                crate::toolchain_info::QueryConfig::Rustc(self, current_dir.as_ref()),
+                target,
+                &cargo_config.extra_env,
+            );
+            // An owned load cannot silently ask Cargo when resolving std fails.
+            ((own.sysroot)(library_manifest, &cargo_config, &cfg)?, None)
+        } else {
             FetchMetadata::new(library_manifest, current_dir, &cargo_config, self, no_deps)
-                .exec(locked, progress)?;
+                .exec(locked, progress)?
+        };
 
         // Patch out `rustc-std-workspace-*` crates to point to the real crates.
         // This is done prior to `CrateGraph` construction to prevent de-duplication logic from failing.

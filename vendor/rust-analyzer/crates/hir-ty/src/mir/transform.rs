@@ -33,14 +33,17 @@ use crate::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     next_solver::{
-        DbInterner, ErrorGuaranteed, ParamEnv, StoredGenericArgs, Ty, TyKind, TypingMode,
+        DbInterner, ErrorGuaranteed, ParamEnv, StoredGenericArgs, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
-use super::{MirBody, MirLowerError, MirPhase, TerminatorKind, monomorphization::monomorphized};
+use super::{
+    HeldLocals, MirBody, MirLowerError, MirPhase, TerminatorKind,
+    monomorphization::{monomorphized, monomorphized_tys},
+};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -188,6 +191,40 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?)
+}
+
+/// What the future of an instance of a coroutine keeps from one `poll` to the next: the locals
+/// [`MirBody::locals_held_across_yields`] finds in the runtime body, and their types with the
+/// instance's arguments in place of the generic parameters.
+pub struct HeldFrame<'db> {
+    /// The runtime body, generic: monomorphizing a body changes its types and not its blocks,
+    /// which are all the held locals are found from.
+    pub body: &'db MirBody<'db>,
+    pub held: HeldLocals,
+    /// The type of each of `held.locals`, monomorphized.
+    pub types: Vec<StoredTy>,
+}
+
+/// The [`HeldFrame`] of `coroutine` with `subst`, its by-move body's when `by_move`. It is all
+/// that the layout of the future and the debugger's description of it read of the instance's
+/// body, and it is not a monomorphized body, which the database would keep: one copy of every
+/// block for each instance, 1.5 GB of the 30 GB a cold build of tracedecay held
+/// (docs/reports/LOADMEM.md, section 2).
+pub fn held_frame<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    by_move: bool,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<'db, HeldFrame<'db>> {
+    let body = match by_move {
+        true => db.runtime_mir_body_for_coroutine_by_move(coroutine)?,
+        false => db.runtime_mir_body_for_coroutine(coroutine)?,
+    };
+    let held = body.locals_held_across_yields();
+    let tys = held.locals.iter().map(|&local| body.locals[local].ty.clone());
+    let types = monomorphized_tys(db, tys, subst, trait_env)?;
+    Ok(HeldFrame { body, held, types })
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result)]

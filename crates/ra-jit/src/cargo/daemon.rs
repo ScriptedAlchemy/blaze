@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -47,10 +47,10 @@ const CHECKERS: usize = 4;
 /// say: one part in this many.
 const MEMORY_SHARE: u64 = 2;
 
-/// The most the workers may hold together, from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
-/// limit. Half of the machine's memory when it does not say, and no limit where the system
+/// Soft aggregate footprint target from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
+/// target. Half of the machine's memory when it does not say, and no limit where the system
 /// does not tell how much that is.
-fn memory_max() -> Result<Option<u64>, String> {
+pub(crate) fn memory_max() -> Result<Option<u64>, String> {
     match std::env::var("RA_JIT_MEMORY_MAX") {
         Err(_) => Ok(crate::memory::of_the_machine().map(|it| it / MEMORY_SHARE)),
         Ok(text) if text == "off" => Ok(None),
@@ -89,19 +89,22 @@ fn spares() -> Result<Spares, String> {
 /// What a worker holds and how much it is in use.
 struct Held {
     bytes: u64,
+    known: bool,
     asked: Instant,
     /// Answering a request or loading a checkout.
     busy: bool,
 }
 
-/// The workers to stop for the rest to hold no more than `most`: the ones asked longest ago
-/// first. One that is busy is left, and so is the one asked last, which would only be
-/// started again.
-fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
+/// Soft targets never discard an incremental cache. Persistent host critical pressure is
+/// the only memory reason to stop a worker; busy workers own admission and progress.
+fn over(holding: &[(String, Held)], most: u64, critical: bool) -> Vec<String> {
+    if !critical {
+        return Vec::new();
+    }
     let mut all: u64 = holding.iter().map(|it| it.1.bytes).sum();
     let last = holding.iter().map(|it| it.1.asked).max();
     let mut idle: Vec<&(String, Held)> =
-        holding.iter().filter(|it| !it.1.busy && Some(it.1.asked) != last).collect();
+        holding.iter().filter(|it| it.1.known && !it.1.busy && Some(it.1.asked) != last).collect();
     idle.sort_by_key(|it| it.1.asked);
     let mut stopped = Vec::new();
     for (id, held) in idle {
@@ -111,7 +114,28 @@ fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
         all -= held.bytes;
         stopped.push(id.clone());
     }
+    for (id, held) in holding {
+        if held.known && !held.busy && held.bytes > most && !stopped.contains(id) {
+            stopped.push(id.clone());
+        }
+    }
     stopped
+}
+
+/// Critical pressure must persist continuously, including while a live program prevents
+/// eviction. A recovered or unreadable signal starts the grace period over.
+fn pressure_persisted(
+    since: &mut Option<Instant>,
+    pressure: Option<hir_ty_codegen::budget::Pressure>,
+    now: Instant,
+    grace: Duration,
+) -> bool {
+    if pressure == Some(hir_ty_codegen::budget::Pressure::Critical) {
+        now.saturating_duration_since(*since.get_or_insert(now)) >= grace
+    } else {
+        *since = None;
+        false
+    }
 }
 
 /// How often a worker that is loading is looked at.
@@ -127,6 +151,19 @@ const LAST_LINES: usize = 12;
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
 pub(crate) const ENDS_WITH_INPUT: &str = "RA_JIT_ENDS_WITH_INPUT";
+
+/// The variable of a request that says which build of the daemon's it is for: a client's build
+/// is one request to the daemon and several to its worker, which runs a build script that
+/// cargo runs every build once for all of them.
+pub(crate) const BUILD: &str = "RA_JIT_BUILD";
+
+/// The variable that tells a worker which build started it, whose load runs the scripts for it.
+pub(crate) const LOAD_BUILD: &str = "RA_JIT_LOAD_BUILD";
+
+/// The variable that names the file of the variables of the process whose build started a
+/// worker ([`crate::process::encode`]): its load runs the build scripts with them, as cargo
+/// run by that process would, and not with the daemon's, which another process started.
+pub(crate) const LOAD_ENV: &str = "RA_JIT_LOAD_ENV";
 
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
 /// loaded the workspace, in JSON, before it ends.
@@ -224,7 +261,7 @@ impl NotBuilt {
         }
         match reply.strip_prefix("error: ") {
             Some(said) => NotBuilt::Error(crate::errors::Said::of_reply(said)),
-            None => NotBuilt::Failed(reply.to_owned()),
+            None => NotBuilt::Failed(crate::unfailed(reply)),
         }
     }
 }
@@ -234,7 +271,7 @@ pub(crate) struct Status {
     pub(crate) pid: u32,
     pub(crate) version: String,
     pub(crate) idle_secs: Option<u64>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     #[serde(default)]
     pub(crate) memory_max: Option<u64>,
     pub(crate) workers: Vec<WorkerStatus>,
@@ -403,7 +440,19 @@ impl Warmth {
 struct Loaded {
     generation: u128,
     root: PathBuf,
+    request: String,
     warmth: Warmth,
+}
+
+fn request_key(checkout: &Checkout) -> String {
+    // A fresh invocation's clock does not change the load. Including it would let an
+    // unchanged build repeatedly bypass a pressure tombstone without changing its inputs.
+    let mut inputs = checkout.clone();
+    inputs.built_at = 0;
+    Sha256::digest(serde_json::to_vec(&inputs).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A `ra-jit <project> --socket` process and the checkouts it holds.
@@ -421,6 +470,7 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    unknown_held: AtomicBool,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -443,7 +493,12 @@ impl Drop for Answering<'_> {
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     /// `spare` is a process that waits to be told a build, and is told this one.
-    fn start(checkout: &Checkout, dir: PathBuf, spare: Option<Spare>) -> anyhow::Result<Worker> {
+    fn start(
+        checkout: &Checkout,
+        dir: PathBuf,
+        spare: Option<Spare>,
+        build: u64,
+    ) -> anyhow::Result<Worker> {
         let first = checkout.programs.first().context("a checkout without programs")?;
         private_dir(&dir)?;
         let (socket, mut log) = (dir.join("sock"), dir.join("log"));
@@ -508,6 +563,7 @@ impl Worker {
             }
             None => {
                 let mut command = Command::new(std::env::current_exe()?);
+                clear_worker_memory(&mut command);
                 command.args(&args);
                 match store() {
                     Some(store) => command.env("RA_JIT_CACHE", store),
@@ -516,6 +572,17 @@ impl Worker {
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.env(LOAD_BUILD, build.to_string());
+                if !checkout.env.is_empty() {
+                    let asked: ide_db::base_db::Env = checkout.env.clone().into_iter().collect();
+                    let file = dir.join("load-env");
+                    private_file(
+                        OpenOptions::new().write(true).create(true).truncate(true),
+                        &file,
+                    )?
+                    .write_all(crate::process::encode(&asked).as_bytes())?;
+                    command.env(LOAD_ENV, file);
+                }
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -525,6 +592,7 @@ impl Worker {
         let loading = Loaded {
             generation: checkout.generation,
             root: checkout.root.clone(),
+            request: request_key(checkout),
             warmth: Warmth::Loading(Instant::now()),
         };
         Ok(Worker {
@@ -537,6 +605,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            unknown_held: AtomicBool::new(false),
         })
     }
 
@@ -611,9 +680,10 @@ impl Worker {
         }
     }
 
-    /// Waits for the process to listen, then has it build every program of `checkout` once.
-    fn warm(&self, checkout: &Checkout) {
-        let warmth = match self.warmed(checkout) {
+    /// Waits for the process to listen, then has it build every program of `checkout` once,
+    /// for the daemon's `build` that asked.
+    fn warm(&self, checkout: &Checkout, build: u64) {
+        let warmth = match self.warmed(checkout, build) {
             Ok(None) => Warmth::Ready,
             Ok(Some(said)) => Warmth::Broken(said, SystemTime::now()),
             Err(why) => match std::fs::read(errors_beside(&self.socket)) {
@@ -636,14 +706,18 @@ impl Worker {
     }
 
     /// The errors in the source, when the worker found any.
-    fn warmed(&self, checkout: &Checkout) -> anyhow::Result<Option<crate::errors::Said>> {
+    fn warmed(
+        &self,
+        checkout: &Checkout,
+        build: u64,
+    ) -> anyhow::Result<Option<crate::errors::Said>> {
         self.connected()?;
         // A source written since cargo built is the daemon's like any edit: it compiles
         // every function and static of the workspace from what it reads. The program the
         // worker was started on is built already, and is asked for too: what the worker then
         // compiles again by itself, for the first edit to be a patch, is part of warming up.
         for plan in &checkout.programs {
-            match self.ask(checkout, plan)? {
+            match self.ask(checkout, plan, build)? {
                 Ok(_) => {}
                 Err(NotBuilt::Error(said)) => return Ok(Some(said)),
                 Err(why) => anyhow::bail!(why.why()),
@@ -671,9 +745,16 @@ impl Worker {
         }
     }
 
-    /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
-    /// the inner one its answer that it does not build this.
-    fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, NotBuilt>> {
+    /// Asks the process for `plan` of `checkout`, for the daemon's `build`, or `0` for none.
+    /// The outer error is the worker's failing, the inner one its answer that it does not
+    /// build this. The build is the request's own: two clients that ask at once are two
+    /// builds, each of which runs a script cargo runs every build ([`BUILD`]).
+    fn ask(
+        &self,
+        checkout: &Checkout,
+        plan: &Plan,
+        build: u64,
+    ) -> anyhow::Result<Result<String, NotBuilt>> {
         let _answering = Answering::new(&self.answering);
         let failed = || match self.ended_within(EXITING) {
             Some(how) => {
@@ -685,9 +766,18 @@ impl Worker {
             }
         };
         let mut stream = self.connected()?;
-        let mut env = self.env.clone();
+        // A client says all of its variables (`asking`): one it has not is not one the process
+        // asking has, whatever the daemon, started by another, was started with. A request
+        // that says none has the worker's own.
+        let mut env = match checkout.env.is_empty() {
+            true => self.env.clone(),
+            false => ide_db::base_db::Env::default(),
+        };
         for (name, value) in &checkout.env {
             env.set(name, value);
+        }
+        if build != 0 {
+            env.set(BUILD, build.to_string());
         }
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream
@@ -703,9 +793,35 @@ impl Worker {
         }
     }
 
-    /// Brings the programs of `checkout` up to date, all at once: the worker builds the
-    /// requests that wait for it together.
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    /// Tells the process that the daemon's `build` is over: every request of it has been answered
+    /// by the worker, which answers once it has compiled and linked, so nothing of the build
+    /// reads the output of the build scripts any more, and it is free to be written again. It is
+    /// asked until the process hears it or ends: a process that is loading the workspace listens
+    /// only when it has, and one that never heard would hold the build's leases until it ended.
+    fn retire(&self, build: u64) {
+        if build == 0 {
+            return;
+        }
+        loop {
+            if self.ended().is_some() {
+                return;
+            }
+            if let Ok(mut stream) = socket::connect(&self.socket) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.write_all(format!("retire\t{build}\n\n").as_bytes());
+                let mut reply = String::new();
+                let _ = BufReader::new(stream).read_line(&mut reply);
+                if reply.starts_with("ok") {
+                    return;
+                }
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Brings the programs of `checkout` up to date for the daemon's `build`, all at once: the
+    /// worker builds the requests that wait for it together.
+    fn sync(&self, checkout: &Checkout, build: u64) -> Reply {
         let spans = Mutex::new(Vec::new());
         let asked: Vec<anyhow::Result<Result<String, NotBuilt>>> = std::thread::scope(|scope| {
             let asking: Vec<_> = checkout
@@ -714,7 +830,7 @@ impl Worker {
                 .map(|plan| {
                     scope.spawn(|| {
                         let start = Instant::now();
-                        let asked = self.ask(checkout, plan);
+                        let asked = self.ask(checkout, plan, build);
                         let level = Some(crate::trace::ASKED);
                         let span =
                             crate::trace::span("daemon↔worker", level, start, Instant::now());
@@ -746,8 +862,14 @@ impl Worker {
 
     /// What it holds now, and how much it is in use.
     fn held(&self) -> Held {
+        let pid = lock(&self.child).id();
+        let bytes = crate::memory::held_by(pid);
+        if bytes.is_none() && !self.unknown_held.swap(true, Relaxed) {
+            eprintln!("worker {pid} footprint unavailable: aggregate memory usage is unknown");
+        }
         Held {
-            bytes: crate::memory::held_by(lock(&self.child).id()).unwrap_or(0),
+            bytes: bytes.unwrap_or(0),
+            known: bytes.is_some(),
             asked: *lock(&self.asked),
             busy: self.answering.load(Relaxed) != 0 || self.loads(),
         }
@@ -783,6 +905,7 @@ impl Spare {
         private_dir(dir)?;
         let log = dir.join("log");
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.arg("--spare").arg(dir.join("package"));
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -865,6 +988,7 @@ impl Checker {
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.args(&args);
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -936,6 +1060,14 @@ impl Checker {
     }
 }
 
+/// An unset request setting must not inherit the daemon's old budget. Spares are cleared
+/// at spawn and receive the requested policy in Told before starting their monitor.
+fn clear_worker_memory(command: &mut Command) {
+    for name in super::cli::MEMORY_ENV {
+        command.env_remove(name);
+    }
+}
+
 /// Has a worker start in a process group of its own, for `kill` to end what it started with
 /// it: the cargo it asks of a workspace, which would go on in the daemon's home.
 fn own_group(command: &mut Command) {
@@ -966,9 +1098,12 @@ struct Daemon {
     version: String,
     home: PathBuf,
     idle: Option<Duration>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     memory_max: Option<u64>,
     workers: Mutex<FxHashMap<String, Arc<Worker>>>,
+    /// Critical-pressure evictions survive removal of a worker. Source/config/build/budget
+    /// changes retry; an identical request cannot repeatedly reload the same workspace.
+    pressure_stops: Mutex<FxHashMap<(String, String), PressureStop>>,
     /// The worker the next workspace is loaded by, when there is one.
     spare: Mutex<Option<Spare>>,
     spare_when: Spares,
@@ -980,6 +1115,23 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+    /// How many builds clients have asked for: each is one for its worker's requests.
+    builds: AtomicU64,
+}
+
+struct PressureStop {
+    generation: u128,
+    request: String,
+    most: u64,
+    at: SystemTime,
+}
+impl PressureStop {
+    fn blocks(&self, generation: u128, request: &str, most: u64, source_changed: bool) -> bool {
+        self.generation == generation
+            && self.request == request
+            && self.most == most
+            && !source_changed
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1040,6 +1192,7 @@ pub(crate) fn version() -> String {
 /// 3. per worker, the process, and a thread that waits for it to load and has it build
 ///    its programs once.
 pub(crate) fn serve() -> anyhow::Result<()> {
+    crate::memory::bound_builds()?;
     let home = home()?;
     private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let memory_max = memory_max().map_err(anyhow::Error::msg)?;
@@ -1065,12 +1218,14 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         idle,
         memory_max,
         workers: Mutex::default(),
+        pressure_stops: Mutex::default(),
         spare: Mutex::default(),
         spare_when,
         ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
+        builds: AtomicU64::new(0),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1166,8 +1321,8 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
-            Request::Warm(checkout) => match self.warm(checkout) {
+            Request::Sync(checkout) => self.sync(&checkout, 0),
+            Request::Warm(checkout) => match self.warm(checkout, 0) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
@@ -1187,10 +1342,22 @@ impl Daemon {
                 }
                 Reply::Warming
             }
-            Request::Build(checkout) => match self.warm(checkout.clone()) {
-                Ok(()) => self.built(&checkout),
-                Err(why) => Reply::Cold { reason: format!("{why:#}") },
-            },
+            Request::Build(checkout) => {
+                // The number is this request's alone, carried with it to the worker.
+                let build = self.next_build();
+                let reply = match self.warm(checkout.clone(), build) {
+                    Ok(()) => self.built(&checkout, build),
+                    Err(why) => Reply::Cold { reason: format!("{why:#}") },
+                };
+                // The build ends with its answer: what its scripts wrote is no longer read.
+                let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
+                if let Some(worker) = worker {
+                    // From a thread of its own, once every request of the build is answered:
+                    // a worker that is slow to hear it delays no client.
+                    std::thread::spawn(move || worker.retire(build));
+                }
+                reply
+            }
             Request::Check(ahead) => self.check(&ahead),
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
@@ -1207,7 +1374,7 @@ impl Daemon {
         }
     }
 
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    fn sync(&self, checkout: &Checkout, build: u64) -> Reply {
         let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
         let Some(worker) = worker else {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
@@ -1221,7 +1388,7 @@ impl Daemon {
             ),
         };
         match warmth {
-            Warmth::Ready => worker.sync(checkout),
+            Warmth::Ready => worker.sync(checkout, build),
             Warmth::Loading(since) => Reply::Cold {
                 reason: format!(
                     "the daemon is still loading the workspace ({:.0?} so far)",
@@ -1236,10 +1403,11 @@ impl Daemon {
         }
     }
 
-    /// What the worker that loads `checkout` has to say of its programs once it has.
-    fn built(&self, checkout: &Checkout) -> Reply {
+    /// What the worker that loads `checkout` has to say of its programs once it has, for the
+    /// daemon's `build`.
+    fn built(&self, checkout: &Checkout, build: u64) -> Reply {
         loop {
-            match self.sync(checkout) {
+            match self.sync(checkout, build) {
                 Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
                 reply => return reply,
             }
@@ -1256,11 +1424,32 @@ impl Daemon {
         })
     }
 
+    /// The number of a build a client asks for now.
+    fn next_build(&self) -> u64 {
+        self.builds.fetch_add(1, Relaxed) + 1
+    }
+
     /// Has a worker load `checkout`: the one of its configuration when that has not loaded
     /// another build of the same checkout, and a new one otherwise.
-    fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
+    fn warm(&self, checkout: Checkout, build: u64) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
+        let key = (id.clone(), checkout.key.clone());
+        let mut stops = lock(&self.pressure_stops);
+        if stops.get(&key).is_some_and(|stop| {
+            stop.blocks(
+                checkout.generation,
+                &request_key(&checkout),
+                self.memory_max.unwrap_or(u64::MAX),
+                checkout.written_since(stop.at),
+            )
+        }) {
+            anyhow::bail!(
+                "host memory pressure stopped this load; change the source, build configuration or memory budget, or restart the daemon to retry"
+            );
+        }
+        stops.remove(&key);
+        drop(stops);
         // What a worker could not load once it can't load again, until cargo builds anew or
         // a source is written: the failure may be an error in the source.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
@@ -1295,11 +1484,12 @@ impl Daemon {
                     let loading = Loaded {
                         generation: checkout.generation,
                         root: checkout.root.clone(),
+                        request: request_key(&checkout),
                         warmth: Warmth::Loading(Instant::now()),
                     };
                     checkouts.insert(checkout.key.clone(), loading);
                     let worker = worker.clone();
-                    std::thread::spawn(move || worker.warm(&checkout));
+                    std::thread::spawn(move || worker.warm(&checkout, build));
                     return Ok(());
                 }
             }
@@ -1315,20 +1505,22 @@ impl Daemon {
             false => ahead.or_else(|| lock(&self.spare).take()),
         };
         let worker =
-            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
+            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare, build)?);
         eprintln!(
             "worker {id} of pid {} for {}",
             lock(&worker.child).id(),
             worker.project.display()
         );
         workers.insert(id, worker.clone());
-        std::thread::spawn(move || worker.warm(&checkout));
+        std::thread::spawn(move || worker.warm(&checkout, build));
         Ok(())
     }
 
     /// Stops the workers asked longest ago while together they hold more than they may, and
     /// those nobody has asked for the idle time; and the daemon when nobody has asked it.
     fn reap(&self) {
+        let mut critical_since = None;
+        let grace = crate::memory::pressure_grace().unwrap_or(Duration::from_secs(60));
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // A worker that ended by itself is in the daemon's log when it ends, not when a
@@ -1346,8 +1538,14 @@ impl Daemon {
             // A program that takes edits is being edited, however long since the last save:
             // a worker started again would link it again on the next one.
             let live = crate::live::any_running();
-            if let Some(most) = self.memory_max.filter(|_| !live) {
-                self.fit(most);
+            let persisted = pressure_persisted(
+                &mut critical_since,
+                hir_ty_codegen::budget::host_pressure(),
+                Instant::now(),
+                grace,
+            );
+            if !live {
+                self.fit(self.memory_max.unwrap_or(0), persisted);
             }
             let Some(idle) = self.idle else { continue };
             if live {
@@ -1388,18 +1586,40 @@ impl Daemon {
     }
 
     /// Stops the workers asked longest ago until the rest hold no more than `most` bytes. The
-    /// next build of a workspace whose worker was stopped is cargo's while a worker loads it
-    /// again.
-    fn fit(&self, most: u64) {
+    /// active build governs its own pause and failure. Idle caches stopped under critical
+    /// pressure leave tombstones, so the same load is not restarted until it changes.
+    fn fit(&self, most: u64, critical: bool) {
         let mut workers = lock(&self.workers);
         let holding: Vec<(String, Held)> =
             workers.iter().map(|(id, worker)| (id.clone(), worker.held())).collect();
         let all: u64 = holding.iter().map(|it| it.1.bytes).sum();
-        for id in over(&holding, most) {
+        for id in over(&holding, most, critical) {
             let Some(worker) = workers.remove(&id) else { continue };
+            if critical {
+                let mut stops = lock(&self.pressure_stops);
+                for (key, loaded) in lock(&worker.checkouts).iter() {
+                    stops.insert(
+                        (id.clone(), key.clone()),
+                        PressureStop {
+                            generation: loaded.generation,
+                            request: loaded.request.clone(),
+                            most: self.memory_max.unwrap_or(u64::MAX),
+                            at: SystemTime::now(),
+                        },
+                    );
+                }
+            }
+            let alone = holding.iter().find(|it| it.0 == id).map_or(0, |it| it.1.bytes);
+            let why = match alone > most {
+                true => format!(
+                    "host memory pressure stayed critical after the grace period; it alone holds {} MB",
+                    alone >> 20
+                ),
+                false => "it was asked longest ago".to_owned(),
+            };
             eprintln!(
                 "worker {id} of {} stopped: the workers hold {} MB, over the {} MB of \
-                 RA_JIT_MEMORY_MAX, and it was asked longest ago",
+                 RA_JIT_MEMORY_MAX, and {why}",
                 worker.project.display(),
                 all >> 20,
                 most >> 20
@@ -1599,6 +1819,7 @@ mod tests {
         let now = Instant::now();
         let held = |bytes: u64, ago: u64, busy: bool| Held {
             bytes,
+            known: true,
             asked: now - Duration::from_secs(ago),
             busy,
         };
@@ -1608,10 +1829,314 @@ mod tests {
             ("answering".to_owned(), held(4, 40, true)),
             ("last".to_owned(), held(4, 0, false)),
         ];
-        assert_eq!(over(&holding, 16), Vec::<String>::new());
-        assert_eq!(over(&holding, 12), ["oldest"]);
-        assert_eq!(over(&holding, 8), ["oldest", "old"]);
-        // The busy one and the one asked last stay, whatever they hold.
-        assert_eq!(over(&holding, 0), ["oldest", "old"]);
+        assert_eq!(over(&holding, 16, false), Vec::<String>::new());
+        assert_eq!(over(&holding, 3, false), Vec::<String>::new());
+        assert_eq!(over(&holding, 12, true), ["oldest"]);
+        assert_eq!(over(&holding, 8, true), ["oldest", "old"]);
+        // The busy one and the one asked last stay while neither alone holds more than all may.
+        assert_eq!(over(&holding, 4, true), ["oldest", "old"]);
+        assert_eq!(over(&holding, 3, true), ["oldest", "old", "last"]);
+    }
+
+    #[test]
+    fn live_program_recovery_and_unknown_pressure_reset_the_eviction_grace() {
+        use hir_ty_codegen::budget::Pressure::{Critical, Normal, Warning};
+        let start = Instant::now();
+        let grace = Duration::from_secs(60);
+        for recovered in [Some(Normal), Some(Warning), None] {
+            let mut since = None;
+            let mut tick = |seconds, pressure| {
+                pressure_persisted(
+                    &mut since,
+                    pressure,
+                    start + Duration::from_secs(seconds),
+                    grace,
+                )
+            };
+            assert!(!tick(0, Some(Critical)));
+            // The sampler still updates the window while the live program prevents eviction.
+            assert!(!tick(30, recovered));
+            assert!(!tick(120, Some(Critical)));
+            assert!(!tick(179, Some(Critical)));
+            assert!(tick(180, Some(Critical)));
+        }
+    }
+
+    #[test]
+    fn a_lone_worker_keeps_its_cache_past_the_soft_target() {
+        let holding = [(
+            "loading".into(),
+            Held { bytes: 30, known: true, asked: Instant::now(), busy: false },
+        )];
+        assert!(over(&holding, 16, false).is_empty());
+        assert_eq!(over(&holding, 16, true), ["loading"]);
+    }
+
+    #[test]
+    fn workers_clear_inherited_memory_policy_before_applying_the_request() {
+        let mut command = Command::new("unused-worker");
+        command.env("RA_JIT_WORKER_MEMORY", "old-budget");
+        clear_worker_memory(&mut command);
+        for name in super::super::cli::MEMORY_ENV {
+            assert!(command.get_envs().any(|(key, value)| key == *name && value.is_none()));
+        }
+        command.env("RA_JIT_WORKER_MEMORY", "32G");
+        assert!(command.get_envs().any(|(key, value)| key == "RA_JIT_WORKER_MEMORY"
+            && value == Some(std::ffi::OsStr::new("32G"))));
+    }
+
+    #[test]
+    fn pressure_request_identity_ignores_the_invocation_clock_but_keeps_load_inputs() {
+        let mut checkout: Checkout = serde_json::from_value(serde_json::json!({
+            "key": "checkout", "generation": 42, "built_at": 100,
+            "root": "/workspace", "programs": [], "sources": [], "env": {},
+            "config": {
+                "repository": "/repository", "project": "", "cfg_test": false, "env": {},
+                "selection": { "profile": "dev", "features": [], "no_default_features": false,
+                    "all_features": false, "packages": [], "workspace": false,
+                    "target": null, "dev_deps": false }
+            }
+        }))
+        .unwrap();
+        let original = request_key(&checkout);
+        checkout.built_at += 1;
+        assert_eq!(request_key(&checkout), original);
+        checkout.env.insert("INPUT".into(), "changed".into());
+        assert_ne!(request_key(&checkout), original);
+        checkout.env.clear();
+        checkout.config.env.insert("RA_JIT_WORKER_MEMORY".into(), "32G".into());
+        assert_ne!(request_key(&checkout), original);
+    }
+
+    #[test]
+    fn pressure_stop_retries_only_changed_source_build_or_budget() {
+        let stop = PressureStop {
+            generation: 42,
+            request: "request".into(),
+            most: 16,
+            at: SystemTime::now(),
+        };
+        assert!(stop.blocks(42, "request", 16, false));
+        assert!(stop.blocks(42, "request", 16, false));
+        assert!(!stop.blocks(43, "request", 16, false));
+        assert!(!stop.blocks(42, "changed request", 16, false));
+        assert!(!stop.blocks(42, "request", 32, false));
+        assert!(!stop.blocks(42, "request", 16, true));
+    }
+
+    #[test]
+    fn busy_worker_owns_its_pause_and_failure_while_idle_cache_can_be_reclaimed() {
+        let now = Instant::now();
+        let loading = Held { bytes: 30, known: true, asked: now, busy: true };
+        assert!(over(&[("loading".to_owned(), loading)], 16, true).is_empty());
+        let idle = Held { bytes: 30, known: true, asked: now, busy: false };
+        assert_eq!(over(&[("idle".to_owned(), idle)], 16, true), ["idle"]);
+        let under = Held { bytes: 16, known: true, asked: now, busy: true };
+        assert_eq!(over(&[("loading".to_owned(), under)], 16, true), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_eviction_preserves_unknown_workers_and_retries_changed_inputs() {
+        use hir_ty_codegen::budget::Pressure::{Critical, Normal};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn value() -> u32 { 1 }\n").unwrap();
+        let checkout: Checkout = serde_json::from_value(serde_json::json!({
+            "key": "checkout", "generation": 42, "built_at": 100,
+            "root": dir.path(), "programs": [], "sources": [source], "env": {},
+            "config": {
+                "repository": dir.path(), "project": "", "cfg_test": false, "env": {},
+                "selection": { "profile": "dev", "features": [], "no_default_features": false,
+                    "all_features": false, "packages": [], "workspace": false,
+                    "target": null, "dev_deps": false }
+            }
+        }))
+        .unwrap();
+        let worker = Arc::new(Worker {
+            project: checkout.project(),
+            socket: dir.path().join("unused.sock"),
+            log: dir.path().join("log"),
+            env: crate::process::own(),
+            child: Mutex::new(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+            checkouts: Mutex::new(FxHashMap::from_iter([(
+                checkout.key.clone(),
+                Loaded {
+                    generation: checkout.generation,
+                    root: checkout.root.clone(),
+                    request: request_key(&checkout),
+                    warmth: Warmth::Ready,
+                },
+            )])),
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            noted: AtomicBool::new(true),
+            unknown_held: AtomicBool::new(false),
+        });
+        let id = checkout.config.id();
+        let daemon = Daemon {
+            version: "test".into(),
+            home: dir.path().into(),
+            idle: None,
+            memory_max: Some(1),
+            workers: Mutex::new(FxHashMap::from_iter([(id.clone(), worker.clone())])),
+            pressure_stops: Mutex::default(),
+            spare: Mutex::default(),
+            spare_when: Spares::Never,
+            ahead: Mutex::default(),
+            spares: AtomicUsize::new(0),
+            checkers: Mutex::default(),
+            asked: Mutex::new(Instant::now()),
+            builds: AtomicU64::new(0),
+        };
+        let now = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut since = None;
+        assert!(!pressure_persisted(&mut since, Some(Critical), now, grace));
+        assert!(!pressure_persisted(&mut since, None, now + grace, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 2, grace));
+        daemon.fit(1, false);
+        assert!(lock(&daemon.workers).contains_key(&id), "soft target retains the cache");
+        assert!(pressure_persisted(&mut since, Some(Critical), now + grace * 3, grace));
+        daemon.fit(1, true);
+        assert!(!lock(&daemon.workers).contains_key(&id));
+        let stopped = worker.held();
+        assert!(!stopped.known);
+        assert!(worker.unknown_held.load(Relaxed), "unreadable footprint is observable");
+        assert!(over(&[(id.clone(), stopped)], 0, true).is_empty());
+        let retry = daemon.warm(checkout.clone(), 0).unwrap_err().to_string();
+        assert!(retry.contains("host memory pressure stopped this load"), "{retry}");
+        let mut changed = checkout.clone();
+        changed.env.insert("INPUT".into(), "changed".into());
+        let retry = daemon.warm(changed, 0).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty(), "changed request clears tombstone");
+        let stop = PressureStop {
+            generation: 42,
+            request: request_key(&checkout),
+            most: 1,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        assert!(!stop.blocks(42, &request_key(&checkout), 1, checkout.written_since(stop.at)));
+        // Exercise warm's source invalidation, not only the blocks predicate. No real
+        // compiler is launched: this checkout deliberately has no program, so passing
+        // the tombstone reaches the normal request-validation error.
+        lock(&daemon.pressure_stops).insert((id.clone(), checkout.key.clone()), stop);
+        let retry = daemon.warm(checkout.clone(), 0).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty());
+        let mut config = checkout.config.clone();
+        config.env.insert("RA_JIT_WORKER_MEMORY".into(), "off".into());
+        assert_ne!(config.id(), id);
+        lock(&daemon.pressure_stops).insert(
+            (id.clone(), checkout.key.clone()),
+            PressureStop {
+                generation: 42,
+                request: request_key(&checkout),
+                most: 1,
+                at: SystemTime::now(),
+            },
+        );
+        let mut changed = checkout.clone();
+        changed.config = config;
+        let retry = daemon.warm(changed, 0).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert_eq!(lock(&daemon.pressure_stops).len(), 1, "other identity's tombstone stays");
+        assert!(!pressure_persisted(&mut since, Some(Normal), now + grace * 4, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 5, grace));
+        assert!(!pressure_persisted(
+            &mut since,
+            Some(Critical),
+            now + grace * 6 - Duration::from_millis(1),
+            grace
+        ));
+    }
+
+    /// Two clients that ask one worker at once are two builds, and each request says its own
+    /// (p05w-verify, finding 1): a worker that kept the number of the last build asked told
+    /// both requests the second's, and a script cargo runs every build ran once for the two.
+    #[cfg(unix)]
+    #[test]
+    fn requests_that_ask_at_once_each_say_their_own_build() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("ra-jit-daemon-builds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // A worker that answers each request once both have come, with the build it said.
+        let said = std::thread::spawn(move || {
+            let mut streams = Vec::new();
+            let mut builds = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut sync, mut env) = (String::new(), String::new());
+                reader.read_line(&mut sync).unwrap();
+                reader.read_line(&mut env).unwrap();
+                builds.push(crate::process::decode_request(env.trim_end()).1);
+                streams.push(stream);
+            }
+            for mut stream in streams {
+                stream.write_all(b"ok\n").unwrap();
+            }
+            builds.sort_unstable();
+            builds
+        });
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let worker = Worker {
+            project: dir.clone(),
+            socket,
+            log: dir.join("log"),
+            env: ide_db::base_db::Env::default(),
+            child: Mutex::new(child),
+            checkouts: Mutex::new(FxHashMap::default()),
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            noted: AtomicBool::new(false),
+            unknown_held: AtomicBool::new(false),
+        };
+        let plan = Plan {
+            crates: vec![dir.join("src/main.rs")],
+            object: dir.join("probe.o"),
+            patch: dir.join("probe.patch.o"),
+            binary: dir.join("probe"),
+            rustc_binary: None,
+            link_cmd: String::new(),
+            symbol_files: Vec::new(),
+            unit_test: false,
+            linked_as_built: Vec::new(),
+            copies: Vec::new(),
+            package: None,
+            stamp: 0,
+            whole: true,
+        };
+        let checkout = Checkout {
+            key: "probe-whole".to_owned(),
+            generation: 0,
+            built_at: 0,
+            config: WorkerConfig {
+                repository: dir.clone(),
+                project: PathBuf::new(),
+                cfg_test: false,
+                selection: crate::plan::Selection::default(),
+                env: BTreeMap::new(),
+                whole: true,
+            },
+            root: dir.clone(),
+            programs: vec![plan.clone()],
+            sources: Vec::new(),
+            env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
+            scripts: None,
+        };
+        let answers = std::thread::scope(|scope| {
+            let first = scope.spawn(|| worker.ask(&checkout, &plan, 5));
+            let second = scope.spawn(|| worker.ask(&checkout, &plan, 6));
+            [first.join().unwrap().unwrap(), second.join().unwrap().unwrap()]
+        });
+        assert!(answers.iter().all(|it| it.as_ref().is_ok_and(|it| it == "ok")));
+        assert_eq!(said.join().unwrap(), [5, 6]);
+        let _ = lock(&worker.child).kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
