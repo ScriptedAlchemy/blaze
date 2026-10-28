@@ -123,7 +123,75 @@ def main() -> int:
         "cache step allowed to fail a job",
         text.replace("        continue-on-error: true\n", "", 1),
         False,
-        must_mention="the cache step may fail a job",
+        must_mention="not literally true",
+    )
+
+    # The opt-in predicate and the failure policy are effective values, not identifier
+    # spellings: a bare name, an always-true expression and `continue-on-error: false` all
+    # leave the cache ungated or able to fail the job, so all three must fail.
+    case(
+        "cache gate reduced to the identifier as a name",
+        text.replace("        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'", "        name: ENABLE_FLAKEHUB_CACHE", 1),
+        False,
+        must_mention="not gated on ENABLE_FLAKEHUB_CACHE",
+    )
+    case(
+        "cache gate broadened with always()",
+        text.replace(
+            "        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'",
+            "        if: always() || vars.ENABLE_FLAKEHUB_CACHE == 'true'",
+            1,
+        ),
+        False,
+        must_mention="not the supported opt-in predicate",
+    )
+    case(
+        "cache failure policy turned off with false",
+        text.replace("        continue-on-error: true", "        continue-on-error: false", 1),
+        False,
+        must_mention="not literally true",
+    )
+    case(
+        "cache policy as an interpolated expression",
+        text.replace(
+            "        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'",
+            "        if: ${{ vars.ENABLE_FLAKEHUB_CACHE == 'true' }}",
+            1,
+        ),
+        True,
+    )
+
+    # A gate that is only mentioned is not a gate. The argument keeps the command's exact
+    # spelling, so a substring check would pass it.
+    case(
+        "gate echoed with its exact spelling",
+        text.replace(
+            "run: nix flake check --print-build-logs",
+            'run: echo "nix flake check --print-build-logs"',
+            1,
+        ),
+        False,
+        must_mention="only mentioned, not run",
+    )
+    case(
+        "gate spelled in a comment",
+        text.replace(
+            "run: nix flake check --print-build-logs",
+            "run: |\n          # nix flake check --print-build-logs\n          true",
+            1,
+        ),
+        False,
+        must_mention="only mentioned, not run",
+    )
+    case(
+        "gate passed to a different command as an argument",
+        text.replace(
+            "run: nix flake check --print-build-logs",
+            "run: printf '%s\\n' 'nix flake check --print-build-logs'",
+            1,
+        ),
+        False,
+        must_mention="only mentioned, not run",
     )
 
     # A shape the scanner cannot read is refused rather than guessed at. Unknown job keys are
