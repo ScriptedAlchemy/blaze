@@ -198,7 +198,13 @@ impl Inputs {
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
         let scripts = Scripts::of(workspace, config);
         self.checkouts.retain(|it| it.root != root);
-        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts, macro_producers });
+        self.checkouts.push(Checkout {
+            root: root.to_owned(),
+            files,
+            flags,
+            scripts,
+            macro_producers,
+        });
     }
 
     pub(crate) fn macro_generation(&self, root: &Path) -> Option<String> {
@@ -256,7 +262,8 @@ fn fingerprint_producer(root: &Path, path: &Path, hash: &mut sha2::Sha256) -> st
             .collect::<Result<_, _>>()?;
         entries.sort();
         for entry in entries {
-            if entry.ends_with(".git") || entry.join("CACHEDIR.TAG").exists()
+            if entry.ends_with(".git")
+                || entry.join("CACHEDIR.TAG").exists()
                 || entry.join("Cargo.toml").exists()
             {
                 continue;

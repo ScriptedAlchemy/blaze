@@ -547,6 +547,7 @@ def recognized_fallback(text):
 
 def macro_content_report(work, bin_dir, machines, sources):
     from cargo_ra_jit import Side, program_output, wait_warm
+    import norustc
     machine = machines[0]
     ws = os.path.join(machine.checkout("macro-content", sources["macros"]), "macros")
     source = os.path.join(ws, "derive/src/lib.rs")
@@ -556,11 +557,17 @@ def macro_content_report(work, bin_dir, machines, sources):
         output.write(text)
     env = machine.env(bin_dir, os.path.join(machine.top, "macro-store"), daemon_home("pm", "a"),
                       FIXTURES["macros"].get("env"))
+    audit_log = os.path.join(work, "product-tools.log")
+    audit_bin = norustc.stand_ins(os.path.join(work, "product-audit"), audit_log)
+    env["PATH"] = os.path.join(audit_bin, "bin") + os.pathsep + env["PATH"]
+    for variable, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo")):
+        env[variable] = os.path.join(audit_bin, "bin", tool)
     side = Side(ws, env, True)
     rows = []
     previous_pids, previous_builds = None, -1
     try:
         for step in ("initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"):
+            audit_before = len(norustc.runs(audit_log))
             edited_source = producer if step == "dependency-restored-mtime" else source
             before = os.stat(edited_source)
             old_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
@@ -591,6 +598,7 @@ def macro_content_report(work, bin_dir, machines, sources):
                              edited_source=os.path.relpath(edited_source, ws),
                              same_size=os.stat(edited_source).st_size == before.st_size,
                              same_mtime=os.stat(edited_source).st_mtime_ns == before.st_mtime_ns,
+                             product_tool_calls=norustc.runs(audit_log)[audit_before:],
                              dylibs={os.path.relpath(os.path.join(root, name), ws):
                                      hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
                                      for root, _, files in os.walk(os.path.join(ws, "target"))
