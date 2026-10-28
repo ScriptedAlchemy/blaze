@@ -91,6 +91,20 @@ impl Unit {
         Lock::Held(held)
     }
 
+    /// Holds cargo's directory while reading or replacing a run. A missing lock does not
+    /// certify that no cargo is writing: it is an unsupported directory.
+    pub(crate) fn hold(&self) -> Result<Held, String> {
+        match self.lock() {
+            Lock::Held(held) => Ok(held),
+            Lock::Busy => {
+                Err("was not read or run again: a cargo is building in its directory".to_owned())
+            }
+            Lock::Absent => {
+                Err("was not read or run again: its directory has no lock of cargo's".to_owned())
+            }
+        }
+    }
+
     /// The fingerprint cargo wrote when the last run ended, when it is one cargo 1.99 wrote: its
     /// `.json` is what this reads it as, byte for byte, and its hash is what cargo wrote beside
     /// it. Cargo empties the hash before it runs the script again, so an empty one is a run

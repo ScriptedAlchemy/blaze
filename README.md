@@ -87,6 +87,7 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 - [Cargo compatibility](docs/cargo.md): every command, flag and setting
 - [Hot reload](docs/live.md): changing a running program
 - [CI runner](docs/ci-runner.md) and [roadmap](docs/roadmap.md): where blaze is going
+- [Distributed cache, compile and tests](docs/distributed.md): sharing builds and test results across machines
 - [Contributing](docs/contributing.md)
 
 ## Demo: a Game of Life you can edit

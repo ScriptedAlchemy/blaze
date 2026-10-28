@@ -210,13 +210,17 @@ impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
     }
 
     #[inline]
-    pub(crate) fn strong_count(self) -> usize {
-        ThinArc::strong_count(&self.arc())
-    }
-
-    #[inline]
     pub(crate) fn as_raw(self) -> *const c_void {
         self.arc().as_ptr()
+    }
+
+    /// # Safety
+    ///
+    /// The pointer needs to come from [`InternedSliceRef::as_raw`] of a slice that is alive.
+    #[inline]
+    pub(crate) unsafe fn from_raw(ptr: *const c_void) -> Self {
+        // SAFETY: Our precondition: `as_raw` gives a `ThinArc`'s pointer, which is not null.
+        Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) }, _marker: PhantomData }
     }
 
     /// **Available only on GC mode**.
@@ -298,6 +302,16 @@ impl<T: SliceInternable> InternSliceStorage<T> {
                 Default::default(),
             )
         })
+    }
+
+    /// How many slices are interned in it, and 0 when none ever was: reading it does not
+    /// make the table, which a report of what a long-running process holds must not do.
+    pub fn len(&self) -> usize {
+        self.map.get().map_or(0, |it| it.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

@@ -116,6 +116,7 @@ impl Contents {
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
+        field(format!("{:?}", data.codegen_flags).as_bytes());
         for attr in &data.crate_attrs {
             field(attr.as_bytes());
         }
@@ -234,6 +235,7 @@ impl Contents {
             hasher.update(bytes);
         };
         field(b"ra-jit library 4");
+        field(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         field(Self::version(db, krate).as_bytes());
         // Where cargo fetched it to is under another directory on another machine.
         let root = root.to_string_lossy();
@@ -269,6 +271,7 @@ impl Contents {
         let named = Self::version(db, krate);
         hasher.update((named.len() as u64).to_le_bytes());
         hasher.update(named.as_bytes());
+        hasher.update(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         match rustc_id {
             Some(id) => hasher.update([&[1][..], &id.to_le_bytes()].concat()),
             None => hasher.update([0]),
@@ -330,13 +333,14 @@ enum Written {
 
 /// The hash of each file as it was last read, for as long as the daemon runs: a build hashes
 /// only what was edited since the one before.
-struct FileHashes {
+pub(crate) struct FileHashes {
     files: FxHashMap<vfs::FileId, (Arc<str>, Hash)>,
 }
 
+static HASHES: OnceLock<Mutex<FileHashes>> = OnceLock::new();
+
 impl FileHashes {
     fn of(db: &RootDatabase, file: vfs::FileId) -> Hash {
-        static HASHES: OnceLock<Mutex<FileHashes>> = OnceLock::new();
         let hashes = HASHES.get_or_init(|| Mutex::new(FileHashes { files: FxHashMap::default() }));
         let text = db.file_text(file).text(db);
         let mut hashes = hashes.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +353,11 @@ impl FileHashes {
         let hash: Hash = Sha256::digest(text.as_bytes()).into();
         hashes.files.insert(file, (text.clone(), hash));
         hash
+    }
+
+    /// How many files are hashed and kept, for `memory::Own`: none when none was.
+    pub(crate) fn held() -> usize {
+        HASHES.get().map(|it| it.lock().unwrap_or_else(|e| e.into_inner()).files.len()).unwrap_or(0)
     }
 }
 

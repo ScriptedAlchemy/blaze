@@ -4,7 +4,8 @@
 //! each step of warming up, and once warm and after each request it answers writes there what
 //! every ingredient of the database holds, and how much of the heap is live. A build with the
 //! `heap-profile` feature run with `_RJEM_MALLOC_CONF=prof:true` also writes a profile of the
-//! heap next to the ingredients, for `jeprof` to read.
+//! heap next to the ingredients, for `jeprof` to read. `RA_JIT_MEMORY_EVERY` also has a thread
+//! say every few seconds what jemalloc counts, without waiting for a step to end ([`ticks`]).
 
 use std::{
     fmt::Write as _,
@@ -46,7 +47,8 @@ pub(crate) fn held_by(pid: u32) -> Option<u64> {
 /// the process to however much the machine has.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn of_the_machine() -> Option<u64> {
-    let total = kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")?;
+    let total =
+        kilobytes(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default(), "MemTotal:")?;
     let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let allowed = allowed_by(&groups, |file| {
         std::fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok()
@@ -125,6 +127,84 @@ pub(crate) fn live() -> Option<u64> {
     None
 }
 
+/// What jemalloc says of the pages it holds: the bytes allocated and not freed, the bytes in
+/// pages it maps and touches, the bytes it maps, and the bytes of freed pages it keeps to
+/// reuse rather than give back. None where the allocator does not count them.
+pub(crate) fn allocator() -> Option<Allocator> {
+    #[cfg(unix)]
+    {
+        use tikv_jemalloc_ctl::stats;
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        let read = |it: Result<usize, tikv_jemalloc_ctl::Error>| it.ok().map(|it| it as u64);
+        Some(Allocator {
+            allocated: read(stats::allocated::read())?,
+            resident: read(stats::resident::read())?,
+            mapped: read(stats::mapped::read())?,
+            retained: read(stats::retained::read())?,
+        })
+    }
+    #[cfg(windows)]
+    None
+}
+
+/// See [`allocator`].
+#[derive(Clone, Copy)]
+pub(crate) struct Allocator {
+    pub(crate) allocated: u64,
+    pub(crate) resident: u64,
+    pub(crate) mapped: u64,
+    pub(crate) retained: u64,
+}
+
+/// What an idle daemon gives back, from `RA_JIT_RECLAIM`: `0` or `off` for nothing, `1` or
+/// `on` for everything, or any of `gc`, `cache` and `purge`, separated by commas, for those
+/// steps alone. Everything is the default.
+///
+/// The collection of the types is never named without the caches cleared: `gc` clears them,
+/// on every thread, before it collects (a cache entry points at a type the collection frees),
+/// so `gc` alone and `gc,cache` are one step. `cache` alone clears them and collects nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reclaim {
+    /// `hir::collect_ty_garbage()`: the types, arguments and clauses interned for builds
+    /// that are over.
+    pub(crate) types: bool,
+    /// The trait solver's cache on every thread: always when `types` is.
+    pub(crate) solver_caches: bool,
+    /// `give_back()`: the pages of what was freed.
+    pub(crate) pages: bool,
+}
+
+impl Reclaim {
+    /// What `RA_JIT_RECLAIM` says: everything unless it says otherwise, and `0` or `off` for
+    /// nothing. Any of `gc`, `cache` and `purge`, separated by commas, asks for those steps
+    /// alone, which `harness/memgrowth.py`'s M4 runs one at a time to read what each gives back.
+    pub(crate) fn of_env() -> Reclaim {
+        Reclaim::of(std::env::var("RA_JIT_RECLAIM").ok().as_deref())
+    }
+
+    fn of(text: Option<&str>) -> Reclaim {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        let Some(text) = text else { return all };
+        match text.trim() {
+            "" | "1" | "on" | "all" => all,
+            "0" | "off" | "none" => Reclaim { types: false, solver_caches: false, pages: false },
+            steps => {
+                let named = |it: &str| steps.split(',').any(|step| step.trim() == it);
+                let types = named("gc") || named("types");
+                Reclaim {
+                    types,
+                    solver_caches: types || named("cache") || named("caches") || named("solver"),
+                    pages: named("purge") || named("pages"),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.types || self.solver_caches || self.pages
+    }
+}
+
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
 pub(crate) fn give_back() {
@@ -143,6 +223,96 @@ pub(crate) fn give_back() {
     }
 }
 
+/// With `RA_JIT_MEMORY_EVERY` naming a number of seconds, starts a thread that says every that
+/// many seconds, in the log, what the process holds and what jemalloc counts: the live bytes,
+/// the pages they are in, what is mapped and what is kept for reuse. With `RA_JIT_MEMORY`
+/// naming a directory it appends the same to `ticks.tsv` there, and, when the build has the
+/// `heap-profile` feature and the process runs with `_RJEM_MALLOC_CONF=prof:true`, writes
+/// `at-<live MB>.prof` each time the live bytes pass the next `RA_JIT_MEMORY_STEP_MB` (1024) of
+/// the last one. It runs beside the workspace's loading, which the report of [`report`] can't:
+/// that one waits for a step to end, and a load that is stopped for its size never gets there.
+pub(crate) fn ticks() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let every = std::env::var("RA_JIT_MEMORY_EVERY").ok().and_then(|it| it.parse::<f64>().ok());
+    let Some(every) = every.filter(|it| *it > 0.0) else { return };
+    STARTED.call_once(|| {
+        let step = std::env::var("RA_JIT_MEMORY_STEP_MB")
+            .ok()
+            .and_then(|it| it.parse::<u64>().ok())
+            .filter(|it| *it > 0)
+            .unwrap_or(1024);
+        let spawned = std::thread::Builder::new().name("memory-ticks".into()).spawn(move || {
+            let (dir, start) = (report_dir(), std::time::Instant::now());
+            if let Some(dir) = &dir {
+                _ = std::fs::create_dir_all(dir);
+            }
+            let mut next = 0;
+            for tick in 1_u64.. {
+                std::thread::sleep(std::time::Duration::from_secs_f64(every));
+                let mb = |bytes: Option<u64>| bytes.map_or(0, |it| it >> 20);
+                let footprint = mb(held_by(std::process::id()));
+                let [live, active, resident, mapped, retained, metadata] = jemalloc_stats();
+                let compiled = hir_ty_codegen::compiled_functions();
+                let line = format!(
+                    "{tick}\t{:.0}\t{footprint}\t{live}\t{active}\t{resident}\t{mapped}\t{retained}\t{metadata}\t{compiled}",
+                    start.elapsed().as_secs_f64(),
+                );
+                eprintln!(
+                    "memory tick {tick} at {:.0}s: {footprint} MB footprint, {live} MB live, {active} MB active, {resident} MB resident, {mapped} MB mapped, {retained} MB retained, {metadata} MB metadata, {compiled} functions compiled",
+                    start.elapsed().as_secs_f64(),
+                );
+                let Some(dir) = &dir else { continue };
+                let ticks = dir.join("ticks.tsv");
+                let new = !ticks.exists();
+                if let Ok(mut file) =
+                    std::fs::OpenOptions::new().create(true).append(true).open(&ticks)
+                {
+                    use std::io::Write as _;
+                    if new {
+                        _ = writeln!(
+                            file,
+                            "tick\tseconds\tfootprint_mb\tlive_mb\tactive_mb\tresident_mb\tmapped_mb\tretained_mb\tmetadata_mb\tcompiled"
+                        );
+                    }
+                    _ = writeln!(file, "{line}");
+                }
+                if live >= next {
+                    let at = dir.join(format!("at-{live:07}.prof"));
+                    if write_heap_profile(&at).is_ok() && at.exists() {
+                        next = live + step;
+                    }
+                }
+            }
+        });
+        if let Err(why) = spawned {
+            eprintln!("memory: the ticks did not start: {why}");
+        }
+    });
+}
+
+/// Megabytes jemalloc counts as live, active, resident, mapped, kept for reuse and used for its
+/// own metadata, each 0 where it can't say.
+fn jemalloc_stats() -> [u64; 6] {
+    #[cfg(unix)]
+    {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return [0; 6];
+        }
+        let mb = |bytes: Result<usize, _>| bytes.map_or(0, |it| it as u64 >> 20);
+        [
+            mb(stats::allocated::read()),
+            mb(stats::active::read()),
+            mb(stats::resident::read()),
+            mb(stats::mapped::read()),
+            mb(stats::retained::read()),
+            mb(stats::metadata::read()),
+        ]
+    }
+    #[cfg(windows)]
+    [0; 6]
+}
+
 /// Reports what the process holds now that `step` is done.
 pub(crate) fn checkpoint(step: &str) {
     if report_dir().is_none() {
@@ -152,14 +322,83 @@ pub(crate) fn checkpoint(step: &str) {
     eprintln!("memory after {step}: {} MB resident{live}", resident().unwrap_or(0));
 }
 
-/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names.
+/// What the daemon holds that no ingredient of the database counts: the checkouts it has
+/// loaded, the files it has hashed, the symbols of rustc's executables it has read, the maps
+/// a patch keeps, and the addresses of an executable that patches put back. [`set_own`] says
+/// it before each report.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Own {
+    pub(crate) checkouts: usize,
+    pub(crate) files_hashed: usize,
+    /// How many executables rustc linked that the daemon holds the symbols of: an entry of
+    /// `RUSTC_SYMBOLS` each, not a symbol each. The row is still named `rustc symbols`.
+    pub(crate) rustc_symbols: usize,
+    /// The entries of every map a patch keeps of the builds that are over.
+    pub(crate) rejections: usize,
+    /// The addresses of the executable rustc linked that a patch put back.
+    pub(crate) patch_originals: usize,
+}
+
+static OWN: std::sync::Mutex<Own> = std::sync::Mutex::new(Own {
+    checkouts: 0,
+    files_hashed: 0,
+    rustc_symbols: 0,
+    rejections: 0,
+    patch_originals: 0,
+});
+
+/// Says what the daemon holds of its own, for the next [`report`] to write.
+pub(crate) fn set_own(own: Own) {
+    *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = own;
+}
+
+/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names:
+/// a line for every ingredient of the database, then what the daemon holds of its own, the
+/// tables of interned types and arguments, and what the allocator says.
+///
+/// The trait solver's cache is cleared first, here and on every thread of the pool, as
+/// rust-analyzer's `analysis_stats` clears it before it measures: the cache is per revision and
+/// a build's, not a holder of the daemon's, and what it keeps of its goals would be counted as
+/// held.
 pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
+    crate::solving::clear_caller_and_pool();
     std::fs::create_dir_all(&dir)?;
     write_heap_profile(&dir.join(format!("{step}.prof")))?;
-    std::fs::write(dir.join(format!("{step}.tsv")), ingredients(db))?;
+    std::fs::write(dir.join(format!("{step}.tsv")), table(db))?;
     Ok(())
+}
+
+/// Everything [`report`] writes, as one table: the ingredient rows, whose `count` is how many
+/// there are and whose `heap` is the bytes of what they own, then `own` and `interned` rows,
+/// whose `count` is a number of things, and `alloc` rows, whose `count` is bytes.
+fn table(db: &mut RootDatabase) -> String {
+    let mut table = ingredients(db);
+    let own = *OWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, count) in [
+        ("checkouts", own.checkouts),
+        ("files hashed", own.files_hashed),
+        ("rustc symbols", own.rustc_symbols),
+        ("rejections", own.rejections),
+        ("patch originals", own.patch_originals),
+    ] {
+        _ = writeln!(table, "own\t{count}\t\t\t\t{name}");
+    }
+    for (name, count) in hir::interned_counts() {
+        _ = writeln!(table, "interned\t{count}\t\t\t\t{name}");
+    }
+    if let Some(allocator) = allocator() {
+        for (name, bytes) in [
+            ("allocated", allocator.allocated),
+            ("resident", allocator.resident),
+            ("mapped", allocator.mapped),
+            ("retained", allocator.retained),
+        ] {
+            _ = writeln!(table, "alloc\t{bytes}\t\t\t\t{name}");
+        }
+    }
+    table
 }
 
 /// [`report`] once the daemon has answered a request, as `request-N`, N counting from 1.
@@ -223,9 +462,206 @@ fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Soft footprint target from `RA_JIT_WORKER_MEMORY`: a size, or `off`. The default is
+/// `RA_JIT_MEMORY_MAX`, or half the machine memory when neither is set. Exceeding this
+/// target reduces concurrency; it never fails a build.
+pub(crate) fn build_budget() -> Result<Option<u64>, String> {
+    match std::env::var("RA_JIT_WORKER_MEMORY") {
+        Ok(text) if text == "off" => Ok(None),
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .map(Some)
+            .ok_or_else(|| format!("RA_JIT_WORKER_MEMORY=`{text}` is neither a size nor `off`")),
+        Err(_) => crate::cargo::daemon::memory_max(),
+    }
+}
+
+/// Starts the independent OS-pressure monitor even with the soft budget disabled.
+pub(crate) fn bound_builds() -> anyhow::Result<()> {
+    let most = build_budget().map_err(anyhow::Error::msg)?;
+    // Validate configuration before starting the monitor.
+    let _ = pressure_reserve()?;
+    let grace = pressure_grace()?;
+    let budget = most.map(|most| hir_ty_codegen::budget::Budget {
+        most,
+        held: || held_by(std::process::id()),
+        give_back,
+    });
+    if most.is_none()
+        && std::env::var_os("RA_JIT_WORKER_MEMORY").is_none()
+        && std::env::var_os("RA_JIT_MEMORY_MAX").is_none()
+        && of_the_machine().is_none()
+    {
+        eprintln!("machine memory unavailable: soft budget unknown; host pressure still monitored");
+    }
+    hir_ty_codegen::budget::monitor(budget, host_pressure, give_back, grace)?;
+    Ok(())
+}
+
+pub(crate) fn pressure_grace() -> anyhow::Result<std::time::Duration> {
+    let seconds = match std::env::var("RA_JIT_PRESSURE_GRACE_SECS") {
+        Ok(text) => text.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("RA_JIT_PRESSURE_GRACE_SECS must be a number of seconds")
+        })?,
+        Err(_) => 60,
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn pressure_reserve() -> anyhow::Result<u64> {
+    match std::env::var("RA_JIT_MEMORY_RESERVE") {
+        Ok(text) => ra_jit_store::parse_size(&text)
+            .ok_or_else(|| anyhow::anyhow!("RA_JIT_MEMORY_RESERVE must be a size")),
+        Err(_) => Ok((of_the_machine().unwrap_or(0) / 20).max(2 << 30)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let mut level: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    // SAFETY: the sysctl writes an integer into an integer-sized buffer.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || size != size_of::<libc::c_int>() {
+        return None;
+    }
+    match level {
+        1 => Some(Pressure::Normal),
+        2 => Some(Pressure::Warning),
+        4 => Some(Pressure::Critical),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    read_linux_pressure(|path| std::fs::read_to_string(path), pressure_reserve().ok()?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_linux_pressure(
+    read: impl Fn(&str) -> std::io::Result<String>,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    // Either source can be restricted independently. Read both before classifying, so
+    // an unavailable MemAvailable reading cannot hide critical pressure reported by PSI.
+    linux_pressure(
+        &read("/proc/meminfo").unwrap_or_default(),
+        &read("/proc/pressure/memory").unwrap_or_default(),
+        reserve,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    None
+}
+
+pub(crate) fn host_pressure() -> Option<hir_ty_codegen::budget::Pressure> {
+    hir_ty_codegen::budget::testing::pressure().unwrap_or_else(os_pressure)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_pressure(
+    meminfo: &str,
+    psi: &str,
+    reserve: u64,
+) -> Option<hir_ty_codegen::budget::Pressure> {
+    use hir_ty_codegen::budget::Pressure;
+    let available = kilobytes(meminfo, "MemAvailable:");
+    let avg = |name: &str| -> Option<f64> {
+        let row = psi.lines().find(|line| line.starts_with(name))?;
+        let value = row.split_whitespace().find_map(|part| part.strip_prefix("avg10="))?;
+        value.parse::<f64>().ok().filter(|it| it.is_finite() && (0.0..=100.0).contains(it))
+    };
+    let (some, full) = (avg("some "), avg("full "));
+    // PSI can be disabled by the kernel or unavailable in a container. An unreadable
+    // signal is unknown, but must not erase pressure observed by another signal.
+    if available.is_some_and(|it| it <= reserve) || full.is_some_and(|it| it >= 10.0) {
+        Some(Pressure::Critical)
+    } else if available.is_some_and(|it| it <= reserve.saturating_mul(2))
+        || some.is_some_and(|it| it >= 10.0)
+    {
+        Some(Pressure::Warning)
+    } else if available.is_some() && some.is_some() && full.is_some() {
+        Some(Pressure::Normal)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_pressure_uses_available_reserve_and_both_psi_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let psi = |some, full| {
+            format!("some avg10={some} avg60=0 total=0\nfull avg10={full} avg60=0 total=0\n")
+        };
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 0), 1 << 20), Some(Normal));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", &psi(0, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", &psi(0, 0), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(10, 0), 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", &psi(0, 10), 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 4096 kB", "unreadable", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_keeps_known_pressure_when_another_signal_is_unavailable() {
+        use hir_ty_codegen::budget::Pressure::*;
+        assert_eq!(linux_pressure("MemAvailable: 1024 kB", "", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("MemAvailable: 2048 kB", "", 1 << 20), Some(Warning));
+        assert_eq!(linux_pressure("", "full avg10=10 total=0\n", 1 << 20), Some(Critical));
+        assert_eq!(linux_pressure("", "some avg10=10 total=0\n", 1 << 20), Some(Warning));
+        assert_eq!(
+            linux_pressure("MemAvailable: 1024 kB", "full avg10=NaN total=0\n", 1 << 20),
+            Some(Critical)
+        );
+        // Incomplete quiet signals do not claim that all pressure sources are normal.
+        assert_eq!(linux_pressure("", "full avg10=0 total=0\n", 1 << 20), None);
+        assert_eq!(linux_pressure("", "", 1 << 20), None);
+    }
+
+    #[test]
+    fn linux_pressure_reader_keeps_independently_readable_signals() {
+        use hir_ty_codegen::budget::Pressure::*;
+        let read = |meminfo: Option<&str>, psi: Option<&str>| {
+            read_linux_pressure(
+                |path| {
+                    let text = match path {
+                        "/proc/meminfo" => meminfo,
+                        "/proc/pressure/memory" => psi,
+                        _ => panic!("unexpected pressure source: {path}"),
+                    };
+                    text.map(str::to_owned)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                },
+                1 << 20,
+            )
+        };
+        assert_eq!(read(None, Some("full avg10=10 total=0\n")), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=10 total=0\n")), Some(Warning));
+        assert_eq!(read(Some("MemAvailable: 1024 kB"), None), Some(Critical));
+        assert_eq!(read(None, Some("some avg10=0\nfull avg10=0\n")), None);
+        assert_eq!(read(None, None), None);
+    }
+
+    #[test]
+    fn native_pressure_reader_is_not_a_production_noop() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(os_pressure().is_some(), "native OS pressure reader unavailable");
+        }
+    }
 
     #[test]
     fn a_line_of_proc_is_read_as_bytes() {
@@ -267,6 +703,39 @@ mod tests {
         let machine = of_the_machine();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(held.is_some_and(|it| it > 0) && machine.is_some_and(|it| it > held.unwrap()));
+        }
+    }
+
+    #[test]
+    fn reclaim_never_collects_without_clearing() {
+        let steps = ["gc", "types", "gc,purge", "gc, cache", "cache", "purge", "pages,solver", "1"];
+        for text in steps {
+            let reclaim = Reclaim::of(Some(text));
+            assert!(!reclaim.types || reclaim.solver_caches, "{text}: {reclaim:?}");
+        }
+        assert!(Reclaim::of(Some("gc")).solver_caches, "gc alone clears the caches too");
+        assert_eq!(
+            Reclaim::of(Some("gc")),
+            Reclaim { types: true, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("cache")),
+            Reclaim { types: false, solver_caches: true, pages: false }
+        );
+        assert_eq!(
+            Reclaim::of(Some("purge")),
+            Reclaim { types: false, solver_caches: false, pages: true }
+        );
+    }
+
+    #[test]
+    fn reclaim_says_everything_by_default_and_nothing_for_off() {
+        let all = Reclaim { types: true, solver_caches: true, pages: true };
+        for text in [None, Some(""), Some("1"), Some("on"), Some("all")] {
+            assert_eq!(Reclaim::of(text), all);
+        }
+        for text in ["0", "off", "none"] {
+            assert!(!Reclaim::of(Some(text)).any());
         }
     }
 }

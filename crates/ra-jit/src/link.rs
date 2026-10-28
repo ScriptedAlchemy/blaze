@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, ffi::OsString};
 
 use anyhow::{Context, bail};
 use hir::Crate;
@@ -16,6 +17,54 @@ use ide_db::base_db::{self, CrateOrigin, LangCrateOrigin};
 use rustc_hash::FxHashSet;
 
 pub(crate) mod split;
+
+/// The request's linker environment, captured once per operation. Clearing the command's
+/// environment also honors variables absent in a request; process-global mutation would
+/// race detached links and scripts.
+#[derive(Clone, Debug)]
+pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+
+impl Environment {
+    pub(crate) fn of(db: &RootDatabase) -> Self {
+        let vars = match base_db::ProcessEnv::try_get(db) {
+            Some(env) => env.vars(db).iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            None => std::env::vars_os().collect(),
+        };
+        Self(vars)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&std::ffi::OsStr> {
+        self.0.get(std::ffi::OsStr::new(name)).map(OsString::as_os_str)
+    }
+
+    pub(crate) fn apply(&self, command: &mut Command) {
+        command.env_clear().envs(&self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_command_retains_its_request_and_unsets_worker_variables() {
+        let mut db = RootDatabase::default();
+        let request =
+            |value: &str| [("LIBRARY_PATH".to_owned(), value.to_owned())].into_iter().collect();
+        base_db::set_process_env(&mut db, request("a"));
+        let first = Environment::of(&db);
+        base_db::set_process_env(&mut db, request("b"));
+        let second = Environment::of(&db);
+        for (env, want) in [(first, "a"), (second, "b")] {
+            let mut command = Command::new("/usr/bin/printenv");
+            command.env("BLAZE_LINK_LEAK", "worker");
+            env.apply(&mut command);
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("LIBRARY_PATH={want}\n"));
+        }
+    }
+}
 
 /// Links `objects` into the executable `exe`, with the native libraries of the crates `program`
 /// links. A shared library instead when `exports` names what it exports: the rest of it is
@@ -52,7 +101,12 @@ pub(crate) fn executable(
 }
 
 /// The command that links `objects` into the executable `exe` as [`executable`] does, for a
-/// shell: the daemon's line, which its edits are spliced after.
+/// shell: the daemon's line, which its edits are spliced after. The first of `objects` is the
+/// patch of the object after it: a definition of the patch is the one that stays. On Apple
+/// that is the object's weak definitions giving way; on ELF the daemon makes the object's
+/// definitions of what the patch defines weak before the line runs
+/// ([`crate::weaken::replaced`]), and the line asks the linker for nothing of duplicates, so
+/// that two definitions of any other name are its error.
 pub(crate) fn command(
     db: &RootDatabase,
     program: &[Crate],
@@ -61,6 +115,34 @@ pub(crate) fn command(
     exe: &Path,
 ) -> anyhow::Result<String> {
     let line = Line::of(db, program, sysroot, false)?;
+    command_of(&line, objects, exe, CommandPurpose::WholeLink)
+}
+
+/// The native command and its request environment, before compiling the Rust objects. A
+/// native identity includes every user link argument, but not the Rust outputs or the
+/// daemon's mutable output-layout options: its headerpad file may grow during a link.
+pub(crate) fn native_command(
+    db: &RootDatabase,
+    program: &[Crate],
+    sysroot: Option<&Path>,
+    exe: &Path,
+) -> anyhow::Result<(String, Environment)> {
+    let line = Line::of(db, program, sysroot, false)?;
+    let command = command_of(&line, &[], exe, CommandPurpose::NativeInputs)?;
+    Ok((command, line.env))
+}
+
+enum CommandPurpose {
+    WholeLink,
+    NativeInputs,
+}
+
+fn command_of(
+    line: &Line,
+    objects: &[&Path],
+    exe: &Path,
+    purpose: CommandPurpose,
+) -> anyhow::Result<String> {
     let mut args = vec!["cc".to_owned()];
     args.extend(line.before.iter().cloned());
     for &object in objects {
@@ -77,6 +159,11 @@ pub(crate) fn command(
         }
     }
     args.extend(line.after.iter().cloned());
+    if let CommandPurpose::WholeLink = purpose {
+        let splices = crate::cargo::plan::whole_link_args(line.apple, exe)
+            .with_context(|| format!("writing what the link of {} asks for", exe.display()))?;
+        args.extend(splices);
+    }
     args.extend(["-o".to_owned(), exe.display().to_string()]);
     shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
 }
@@ -86,6 +173,7 @@ pub(crate) struct Line {
     before: Vec<String>,
     after: Vec<String>,
     apple: bool,
+    env: Environment,
 }
 
 impl Line {
@@ -111,12 +199,13 @@ impl Line {
         }
         after.extend(native.args);
         after.extend(target.trailing());
-        Ok(Line { before, after, apple: target.apple })
+        Ok(Line { before, after, apple: target.apple, env: Environment::of(db) })
     }
 
     /// Links `objects` into the executable `exe`. How long `cc` took.
     pub(crate) fn link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
         let mut cmd = Command::new("cc");
+        self.env.apply(&mut cmd);
         cmd.args(&self.before);
         for &object in objects {
             if split::is_archive(&leading_bytes(object)?) {
@@ -126,6 +215,7 @@ impl Line {
             }
         }
         cmd.args(&self.after).arg("-o").arg(exe);
+        eprintln!("link line: {cmd:?}");
         let start = Instant::now();
         let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
         if !ran.status.success() {
@@ -169,7 +259,7 @@ pub(crate) fn stand_ins(exe: &Path) -> anyhow::Result<Vec<String>> {
 
 /// The toolchain's directory with lld as `ld.lld`, for `cc -B`: the `gcc-ld` of the host's
 /// `lib/rustlib/<host>/bin`.
-fn lld_dir(sysroot: &Path) -> Option<PathBuf> {
+pub(crate) fn lld_dir(sysroot: &Path) -> Option<PathBuf> {
     std::fs::read_dir(sysroot.join("lib/rustlib"))
         .ok()?
         .filter_map(|it| Some(it.ok()?.path().join("bin/gcc-ld")))

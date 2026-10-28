@@ -101,6 +101,14 @@ const WORKER_ENV: &[&str] = &[
     "RA_JIT_SPLICE",
 ];
 
+/// Memory policy is part of worker identity: changing a budget explicitly retries a load.
+pub(crate) const MEMORY_ENV: &[&str] = &[
+    "RA_JIT_WORKER_MEMORY",
+    "RA_JIT_MEMORY_MAX",
+    "RA_JIT_MEMORY_RESERVE",
+    "RA_JIT_PRESSURE_GRACE_SECS",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Subcommand {
     Build,
@@ -444,7 +452,9 @@ pub(crate) fn build_env() -> BTreeMap<String, String> {
 
 /// The variables of this process that a worker for its builds runs with.
 pub(crate) fn worker_env() -> BTreeMap<String, String> {
-    env_named(WORKER_ENV)
+    let mut env = env_named(WORKER_ENV);
+    env.extend(env_named(MEMORY_ENV));
+    env
 }
 
 fn env_named(names: &[&str]) -> BTreeMap<String, String> {

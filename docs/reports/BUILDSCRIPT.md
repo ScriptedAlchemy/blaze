@@ -1,5 +1,37 @@
 # Why every edit of tracedecay's CLI went to cargo: its build script printed something else
 
+## Review update, 2026-10-28: baseline capture is locked; the lane stays parked
+
+The latest review found that `current` held Cargo's locks but `Run::of`, which captures
+the baseline, did not. It could combine the previous run's printed output with a directory
+being changed by Cargo, or accept the partial directory of an interrupted run. `Run::of`
+now takes the same nonblocking locks, verifies the completed fingerprint, and holds the
+locks until both the printed output and directory digest have been read. A busy directory,
+a missing lock, and an unfinished fingerprint all refuse baseline capture.
+
+Three focused regressions failed on the previous implementation and pass with the fix.
+On Linux with Rust 1.99.0, a small test crate compiling the actual `script.rs`, `records.rs`
+and `dep_info.rs` with the real `blaze-build-script` dependency passed 50 tests; the existing
+measurement test stayed ignored. This is component validation, not a full `ra-jit` build.
+The comparison harness self-test, 32 release-policy cases, 20 Nix workflow checker cases,
+138 harness imports, formatting, the compiler-site audit (15 existing sites, none new),
+and `git diff --check` passed. The merged Nix graph was regenerated using Cargo 1.99.0
+metadata on Linux and its input hashes match the manifests and lockfile.
+
+The branch now includes `dist/main` at `a5207402`. Conflict resolution preserves the
+owned-script scheduler and leases, and the removal of cached script-run replay. An
+independent source review caught a missing test-fixture initializer during that integration;
+both new fields are initialized. The shared release checker also rejects parent traversal
+in a supposedly store-bound Nix loader path.
+
+**PR #5 remains parked and is not ready to merge.** A failed or rejected hybrid script run
+can still be executed again when control returns to Cargo. This repair does not establish
+the full compiler-to-baseline lifetime invariant or supersede the earlier live-Cargo
+acceptance failures. The active owned-script implementation from #12 remains the direction
+for execution. No full compiler, LLVM, macOS, Windows, Nix derivation or end-to-end hybrid
+acceptance was run in this review. The measurements below are historical evidence from
+the original work, not measurements of this update.
+
 Unit u8-buildscript of the distributed compile, cache and tests program. The question:
 [TRACEDECAY.md](TRACEDECAY.md) (items 4 and 7) found that 18 of 18 builds after an edit went to cargo
 because "the build script of `tracedecay-cli` printed something else" the second time blaze ran

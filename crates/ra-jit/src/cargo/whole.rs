@@ -68,8 +68,14 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     if programs.is_empty() {
         return Ok(None);
     }
-    let dir = metadata.target_directory.as_std_path().join("ra-jit/whole");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let root = metadata.workspace_root.as_std_path();
+    let project = programs.first().map(|it| super::state::package_dir(&it.package));
+    let project = project.as_deref().unwrap_or(root);
+    let config = config_of(asked, &cwd, root, project);
+    // One directory per build of the checkout, as the daemon names it: the features, the
+    // profile, the target and the variables that change what is compiled are all in that
+    // name, so the program one build links is never the one another places.
+    let dir = prepare_dir(&config, metadata.target_directory.as_std_path())?;
     for program in &programs {
         let package = &program.package;
         let at = super::state::package_dir(package);
@@ -79,7 +85,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
             &format!("{} v{} ({})", package.name, package.version, at.display()),
         );
     }
-    if let Err(why) = whole(asked, &cwd, &metadata, &programs, &dir) {
+    if let Err(why) = whole(asked, &cwd, &metadata, &config, &programs, &dir) {
         say::error(&why);
         return Ok(Some(FAILED));
     }
@@ -100,10 +106,11 @@ fn whole(
     asked: &Invocation,
     cwd: &Path,
     metadata: &Metadata,
+    config: &WorkerConfig,
     programs: &[Program],
     dir: &Path,
 ) -> Result<(), String> {
-    let checkout = checkout(asked, cwd, metadata, programs, dir);
+    let checkout = checkout(asked, cwd, metadata, config, programs, dir);
     let reply = client::ask(Request::Build(super::asking(&checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
     let built = match reply {
@@ -144,26 +151,33 @@ fn whole(
     Ok(())
 }
 
-/// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
-fn checkout(
-    asked: &Invocation,
-    cwd: &Path,
-    metadata: &Metadata,
-    programs: &[Program],
-    dir: &Path,
-) -> Checkout {
-    let root = metadata.workspace_root.as_std_path();
-    let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.to_owned(), |it| cwd.join(it));
-    let project = programs.first().map(|it| super::state::package_dir(&it.package));
-    let project = project.as_deref().unwrap_or(root);
-    let config = WorkerConfig {
+/// The worker configuration of a whole build asked in `cwd`, of the workspace at `root` whose
+/// program is in `project`. The invocation directory selects the members and resolves a
+/// relative manifest path; the workspace root names the repository and project separately.
+fn config_of(asked: &Invocation, cwd: &Path, root: &Path, project: &Path) -> WorkerConfig {
+    let asked_in =
+        asked.flags.manifest_path.as_ref().map_or_else(|| cwd.to_owned(), |it| cwd.join(it));
+    WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
         cfg_test: false,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
         whole: true,
-    };
+    }
+}
+
+/// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
+fn checkout(
+    asked: &Invocation,
+    cwd: &Path,
+    metadata: &Metadata,
+    config: &WorkerConfig,
+    programs: &[Program],
+    dir: &Path,
+) -> Checkout {
+    let root = metadata.workspace_root.as_std_path();
+    let config = config.clone();
     let plans = programs.iter().map(|program| Linked {
         crates: vec![program.root.clone()],
         object: dir.join(format!("{}.o", program.name)),
@@ -332,6 +346,23 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
     Ok(run::exit_code(status))
 }
 
+/// The directory a whole build of `config`, under `target`, links its programs in: one per
+/// build of the checkout, named as the daemon names the worker of it. Two builds of one
+/// program with different features, profile, target or variables put it where cargo does,
+/// which is one path, so they must not share the file that is linked before it is placed
+/// there.
+fn dir_of(config: &WorkerConfig, target: &Path) -> PathBuf {
+    target.join("ra-jit").join("whole").join(config.id())
+}
+
+/// Creates only this build's directory. Another configuration may still be reading or
+/// placing its linked output after a worker reply, regardless of its directory's age.
+fn prepare_dir(config: &WorkerConfig, target: &Path) -> anyhow::Result<PathBuf> {
+    let dir = dir_of(config, target);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// The programs `asked` builds, each executable root of the build, as blaze plans it with its
 /// own resolution, or as cargo's unit graph has them where blaze cannot.
 fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Result<Vec<Program>> {
@@ -399,4 +430,182 @@ fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Resul
         });
     }
     Ok(programs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cargo::cli::Asked;
+
+    /// A whole build of one program, as `cargo ra-jit build` of `args` is it, with the
+    /// configuration the daemon would load for it.
+    fn config(args: &str) -> WorkerConfig {
+        config_in(args, Path::new("/ws"), Path::new("/ws"), Path::new("/ws"))
+    }
+
+    fn config_in(args: &str, cwd: &Path, root: &Path, project: &Path) -> WorkerConfig {
+        config_with_args(args.split_whitespace().map(str::to_owned).collect(), cwd, root, project)
+    }
+
+    fn config_with_args(
+        args: Vec<String>,
+        cwd: &Path,
+        root: &Path,
+        project: &Path,
+    ) -> WorkerConfig {
+        let words = std::iter::once("build".to_owned()).chain(args);
+        let asked = match Asked::parse(words.collect()) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        config_of(&asked, cwd, root, project)
+    }
+
+    /// The file a whole build of `args` links its program into, before it places it where
+    /// cargo has it. Two builds whose program differs in what it compiles must not share it:
+    /// the one of the second would be placed from a file the first linked.
+    #[test]
+    fn a_build_links_into_a_directory_of_its_own() {
+        let target = Path::new("/ws/target");
+        let linked = |args: &str| dir_of(&config(args), target).join("app");
+        assert_ne!(linked("--features x"), linked(""));
+        assert_ne!(linked("--release"), linked(""));
+        assert_ne!(linked("--target aarch64-unknown-linux-gnu"), linked(""));
+        assert_ne!(linked("--no-default-features"), linked(""));
+        assert_ne!(linked("--all-features"), linked(""));
+        assert_ne!(linked("--config profile.dev.opt-level=2"), linked(""));
+        // A build of the same flags again is the same directory, and places the same file,
+        // whatever the spelling of the flags that asked for it.
+        assert_eq!(linked("--features x"), linked("--features x"));
+        assert_eq!(linked("--features x"), linked("-F x"));
+        assert_eq!(linked("--release"), linked("-r"));
+        assert_eq!(linked(""), linked(""));
+        // Under the target directory, beside the daemon's other files.
+        assert!(linked("--features x").starts_with(target.join("ra-jit/whole")));
+    }
+
+    #[test]
+    fn worker_resolution_keeps_the_invocation_directory() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        for (file, source) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['default', 'member', 'parts']\n\
+                 default-members = ['default']\nresolver = '2'\n",
+            ),
+            (
+                "Cargo.lock",
+                "# This file is automatically @generated by Cargo.\n\
+                 # It is not intended for manual editing.\n\
+                 version = 4\n\n\
+                 [[package]]\nname = \"kdefault\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"kparts\",\n]\n\n\
+                 [[package]]\nname = \"kmember\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"kparts\",\n]\n\n\
+                 [[package]]\nname = \"kparts\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "default/Cargo.toml",
+                "[package]\nname = 'kdefault'\nversion = '0.1.0'\nedition = '2021'\n\
+                 [dependencies]\nkparts = { path = '../parts', features = ['default-member'] }\n",
+            ),
+            ("default/src/main.rs", "fn main() {}"),
+            (
+                "member/Cargo.toml",
+                "[package]\nname = 'kmember'\nversion = '0.1.0'\nedition = '2021'\n\
+                 [dependencies]\nkparts = { path = '../parts', features = ['selected-member'] }\n",
+            ),
+            ("member/src/main.rs", "fn main() {}"),
+            (
+                "parts/Cargo.toml",
+                "[package]\nname = 'kparts'\nversion = '0.1.0'\nedition = '2021'\n\
+                 [features]\ndefault-member = []\nselected-member = []\n",
+            ),
+            ("parts/src/lib.rs", ""),
+        ] {
+            let file = root.join(file);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, source).unwrap();
+        }
+        let member = root.join("member");
+        let loaded = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
+            member.join("Cargo.toml"),
+        ))
+        .unwrap();
+        for (cwd, manifest, expected) in [
+            (root.to_owned(), None, "default-member"),
+            (member.clone(), None, "selected-member"),
+            (member.join("src"), None, "selected-member"),
+            (member.join("src"), Some(PathBuf::from("../Cargo.toml")), "selected-member"),
+            (root.to_owned(), Some(member.join("Cargo.toml")), "selected-member"),
+        ] {
+            let args = manifest.as_ref().map_or_else(Vec::new, |it| {
+                vec!["--manifest-path".to_owned(), it.to_str().unwrap().to_owned()]
+            });
+            let config = config_with_args(args, &cwd, root, &member);
+            let asked_in = manifest.as_ref().map_or_else(|| cwd.clone(), |it| cwd.join(it));
+            assert_eq!(config.selection.asked_in.as_deref(), Some(asked_in.as_path()));
+            assert_eq!(config.repository, repository(root));
+            assert_eq!(config.project, Path::new("member"));
+            // Exercise the worker's actual resolver callback, not just the identity hash.
+            // Loading the member must still resolve root defaults when asked from the root.
+            let own = super::super::metadata::own(&config.selection).unwrap();
+            let (metadata, _) =
+                (own.metadata)(&loaded, Some("x86_64-unknown-linux-gnu"), &[], &Default::default())
+                    .unwrap();
+            let parts = metadata.packages.iter().find(|it| it.name == "kparts").unwrap();
+            let node = metadata
+                .resolve
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|it| it.id == parts.id)
+                .unwrap();
+            assert_eq!(node.features, [expected], "asked in {} with {manifest:?}", cwd.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_configuration_preserves_aged_active_output() {
+        use std::{
+            fs::{File, FileTimes},
+            sync::mpsc,
+            time::{Duration, SystemTime},
+        };
+
+        let target = tempfile::tempdir().unwrap();
+        let active = prepare_dir(&config(""), target.path()).unwrap();
+        let binary = active.join("app");
+        std::fs::write(&binary, b"configuration A").unwrap();
+        let aged = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        File::open(&active).unwrap().set_times(FileTimes::new().set_modified(aged)).unwrap();
+        assert!(std::fs::metadata(&active).unwrap().modified().unwrap() <= aged);
+        // A no-op reuse neither removes the output nor refreshes the directory's age.
+        assert_eq!(prepare_dir(&config(""), target.path()).unwrap(), active);
+        assert_eq!(std::fs::read(&binary).unwrap(), b"configuration A");
+        assert!(std::fs::metadata(&active).unwrap().modified().unwrap() <= aged);
+
+        let placed = target.path().join("installed");
+        let (ready, replied) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            // A's worker has replied; its client has not yet read or placed the binary.
+            ready.send(()).unwrap();
+            paused.recv().unwrap();
+            assert_eq!(std::fs::read(&binary).unwrap(), b"configuration A");
+            place(&binary, &placed).unwrap();
+            assert_eq!(std::fs::read(&placed).unwrap(), b"configuration A");
+        });
+        replied.recv().unwrap();
+        let other = prepare_dir(&config("--features x"), target.path()).unwrap();
+        assert_ne!(active, other);
+        std::fs::write(other.join("app"), b"configuration B").unwrap();
+        // B uses the production preparation path while A is paused, with no age refresh.
+        assert!(std::fs::metadata(&active).unwrap().modified().unwrap() <= aged);
+        resume.send(()).unwrap();
+        client.join().unwrap();
+    }
 }

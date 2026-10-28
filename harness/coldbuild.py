@@ -21,7 +21,7 @@ a remote `ra-jit std` made once, as a release's does.
 
 RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py.
 """
-import os, re, shutil, subprocess, sys, tempfile, time
+import glob, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -62,6 +62,40 @@ pub fn counted(words: &str) -> BTreeMap<&str, usize> {
     "app/examples/kex.rs": """fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     println!("kex {:?} {}", args, kparts::counted(&args.join(" ")).len());
+}
+""",
+}
+# A program whose source is the same under two feature sets, so that only the features decide
+# what it prints: the whole build must build it again for each, as cargo does, at one path.
+FEATURES = {
+    "Cargo.toml": '[package]\nname = "kfeat"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                  '[features]\nx = []\n',
+    "src/main.rs": """fn main() {
+    if cfg!(feature = "x") { println!("with x") } else { println!("without x") }
+}
+""",
+}
+# Root defaults and a selected member enable different features of the same dependency.
+# Client planning and worker loading must select the same graph from the invocation cwd.
+MEMBERS = {
+    "Cargo.toml": '[workspace]\nmembers = ["default", "member", "parts"]\n'
+                  'default-members = ["default"]\nresolver = "2"\n',
+    "default/Cargo.toml": '[package]\nname = "kdefault"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                          '[dependencies]\nkselected = { path = "../parts", features = ["root"] }\n',
+    "default/src/main.rs": 'fn main() { println!("default {}", kselected::said()); }\n',
+    "member/Cargo.toml": '[package]\nname = "kmember"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                         '[dependencies]\nkselected = { path = "../parts", features = ["member"] }\n',
+    "member/src/main.rs": 'fn main() { println!("member {}", kselected::said()); }\n',
+    "parts/Cargo.toml": '[package]\nname = "kselected"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                        '[features]\nroot = []\nmember = []\n',
+    "parts/src/lib.rs": """pub fn said() -> &'static str {
+    if cfg!(feature = "member") && !cfg!(feature = "root") {
+        "selected"
+    } else if cfg!(feature = "root") && !cfg!(feature = "member") {
+        "root"
+    } else {
+        "wrong feature graph"
+    }
 }
 """,
 }
@@ -134,6 +168,67 @@ def cargo_built(target):
                if at != own and not at.startswith(own + os.sep))
 
 
+def c_main_allocation():
+    """A cold no_main executable owns allocation independently of Rust's start shim."""
+    root = tempfile.mkdtemp(prefix="ra-jit-cmain-", dir="/tmp")
+    wrong = []
+    source = """#![no_main]
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let words = vec![String::from("c-main original")];
+    println!("{}", words[0]);
+    0
+}
+"""
+    try:
+        for splice in ("1", "0"):
+            ws = os.path.join(root, "ws-" + splice)
+            write(ws, {
+                "Cargo.toml": '[package]\nname="cold_c_main"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
+                "src/main.rs": source,
+            })
+            env = env_for(os.path.join(root, "home-" + splice))
+            env["RA_JIT_SPLICE"] = splice
+            try:
+                for label, text in (("cold", source),
+                                    ("body", source.replace("original", "edited")),
+                                    ("declined", source.replace("original", "new function")
+                                     .replace("    0\n", "    newly_added()\n")
+                                     + '\n#[inline(never)]\nfn newly_added() -> i32 { println!("added"); 0 }\n')):
+                    write(ws, {"src/main.rs": text})
+                    refdir = os.path.join(root, "ref-" + splice)
+                    reference, _ = cargo(ws, env, refdir, "build")
+                    assert reference.returncode == 0, reference.stderr[-3000:]
+                    program = os.path.join(ws, "target", "debug", "cold_c_main")
+                    if label == "declined" and os.path.exists(program):
+                        # The daemon splices its whole image, not the installed copy.
+                        # Replacing it with a non-executable must decline the splice.
+                        image = os.path.join(ws, "target", "ra-jit", "whole", "cold_c_main")
+                        with open(image, "wb") as executable:
+                            executable.write(b"not an executable\n")
+                    ran, _ = blaze(ws, env, "build")
+                    ok = (ran.returncode == 0 and os.path.exists(program)
+                          and not cargo_built(os.path.join(ws, "target"))
+                          and printed(program) == printed(os.path.join(refdir, "debug", "cold_c_main")))
+                    print(f"no_main allocation splice={splice} {label:8} {'ok' if ok else 'WRONG'}", flush=True)
+                    if not ok:
+                        wrong.append(f"splice={splice} {label}")
+                        print(ran.stdout + ran.stderr, flush=True)
+                for log in glob.glob(os.path.join(env["RA_JIT_HOME"], "workers", "*", "log")):
+                    with open(log, errors="replace") as worker:
+                        for line in worker:
+                            if line.startswith("link:"):
+                                print(line.rstrip(), flush=True)
+            finally:
+                subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env,
+                               capture_output=True, timeout=120)
+        if wrong:
+            sys.exit(f"coldbuild.py: no_main allocation wrong: {wrong}; under {root}")
+    finally:
+        if not wrong:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 def fixtures():
     root = tempfile.mkdtemp(prefix="ra-jit-coldbuild-", dir="/tmp")
     ws, bad = os.path.join(root, "ws"), os.path.join(root, "bad")
@@ -184,6 +279,52 @@ def fixtures():
           f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}\ncargo's: {reference.stdout!r}")
     check("  ... and it is in target/debug/examples", os.path.exists(os.path.join(ws, "target", "debug", "examples", "kex")))
 
+    # The features are part of which build it is: each set is the program cargo builds, also
+    # when the other set's program is already at the one path cargo has.
+    feat = os.path.join(root, "feat")
+    write(feat, FEATURES)
+    steps = [("--features x", "with x"), ("", "without x"),
+             ("--features x", "with x"), ("", "without x")]
+    for at, (flags, expected) in enumerate(steps):
+        args = flags.split()
+        reference, _ = cargo(feat, env, os.path.join(root, "feat-ref"), "build", *args)
+        assert reference.returncode == 0, reference.stderr[-3000:]
+        ran, _ = blaze(feat, env, "build", *args)
+        said = ran.stdout + ran.stderr
+        what = " ".join(["`cargo blaze build", *args, "`"])
+        check(f"{what}: builds", ran.returncode == 0, said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(feat, "target")), said)
+        program = os.path.join(feat, "target", "debug", "kfeat")
+        ours = printed(program) if os.path.exists(program) else None
+        theirs = printed(os.path.join(root, "feat-ref", "debug", "kfeat"))
+        check(f"  ... and prints what cargo's does ({expected})", ours == theirs and ours is not None and ours[1].strip() == expected,
+              f"step {at}: blaze's printed {ours!r}, cargo's {theirs!r}")
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=feat, env=env, capture_output=True, timeout=120)
+
+    members = os.path.join(root, "members")
+    write(members, MEMBERS)
+    for where, args, name, expected in [
+        ("", [], "kdefault", "default root"),
+        ("member", [], "kmember", "member selected"),
+        ("member/src", [], "kmember", "member selected"),
+        ("member/src", ["--manifest-path", "../Cargo.toml"], "kmember", "member selected"),
+        ("", ["--manifest-path", os.path.join(members, "member", "Cargo.toml")], "kmember", "member selected"),
+        ("", [], "kdefault", "default root"),
+    ]:
+        cwd = os.path.join(members, where)
+        reference, _ = cargo(cwd, env, os.path.join(root, "member-ref"), "build", *args)
+        assert reference.returncode == 0, reference.stderr[-3000:]
+        ran, _ = blaze(cwd, env, "build", *args)
+        said = ran.stdout + ran.stderr
+        check(f"member selection from {where or 'root'} {' '.join(args)}: builds", ran.returncode == 0, said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(members, "target")), said)
+        program = os.path.join(members, "target", "debug", name)
+        ours = printed(program) if os.path.exists(program) else None
+        theirs = printed(os.path.join(root, "member-ref", "debug", name))
+        check(f"  ... and uses the selected graph ({expected})", ours == theirs and ours is not None and ours[1].strip() == expected,
+              f"blaze's printed {ours!r}, cargo's {theirs!r}")
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=members, env=env, capture_output=True, timeout=120)
+
     for package, whose in (("kbad", "its own"), ("kuses", "a library's")):
         ran, _ = blaze(bad, env, "build", "-p", package)
         said = ran.stdout + ran.stderr
@@ -196,6 +337,7 @@ def fixtures():
         sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
     print("coldbuild.py: all right")
     shutil.rmtree(root, ignore_errors=True)
+    c_main_allocation()
 
 
 # The edits of bench.py's projects a whole build is measured on, after its cold build: the

@@ -1,0 +1,33 @@
+{
+ "command": [
+  "/Users/bytedance/.rustup/toolchains/nightly-2026-10-18-aarch64-apple-darwin/bin/rust-analyzer",
+  "analysis-stats",
+  "/Users/bytedance/dev/td-u5",
+  "-v"
+ ],
+ "td": "/Users/bytedance/dev/td-u5",
+ "blaze_bin": "/Users/bytedance/dev/blaze-targets/u5/release",
+ "started": "2026-10-26T00:49:03",
+ "watchdog_mb": 24576,
+ "marks": {
+  "2": 40.1,
+  "4": 254.4,
+  "8": 281.5,
+  "12": 308.9,
+  "16": 486.1
+ },
+ "tripped": null,
+ "peak_mb": 18458,
+ "peak_client_mb": 0,
+ "swap_start_mb": 4770,
+ "guard": {
+  "RA_JIT_MEMORY_MAX": "16G",
+  "RA_JIT_OWN_BASE_MEMORY": "12G",
+  "RA_JIT_SPARE": "0"
+ },
+ "peak_swap_growth_mb": 0,
+ "exit": 0,
+ "outcome": "ok",
+ "wall_s": 524.0,
+ "last_mb": 0
+}

@@ -27,7 +27,7 @@ use anyhow::Context as _;
 use ide_db::{RootDatabase, base_db::SourceDatabase};
 use syntax::Edition;
 
-use crate::plan::Selection;
+use crate::{plan::Selection, solving};
 use extract::{Example, Marks};
 use program::{Frame, Program};
 
@@ -1260,6 +1260,7 @@ fn add_crates(
             origin: CrateOrigin::Local { repo: None, name: None },
             crate_attrs: Box::default(),
             target_kind: TargetKind::Bin,
+            codegen_flags: data.codegen_flags.clone(),
             proc_macro_cwd: data.proc_macro_cwd.clone(),
         };
         let extra = ExtraCrateData {
@@ -1465,23 +1466,25 @@ fn run(
         }
         let compilers: Vec<_> = (0..compilers)
             .map(|_| {
-                let (db, ready, ours) = (db.clone(), ready.clone(), &ours);
+                let (db, ready, ours) = (solving::Handle::of(&db), ready.clone(), &ours);
                 let unit = unit.as_deref();
                 let (tests, counted) = (&tests, &counted);
                 scope.spawn(move || {
-                    let Some(unit) = unit else { return };
-                    loop {
-                        let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
-                        let Some((at, name)) = job else { break };
-                        let compiled = compile(&db, building, asked, &tests[at], name, unit);
-                        let compiled = compiled.inspect_err(|why| {
-                            eprintln!("ra-jit: {} is rustc's: {why:#}", tests[at].name);
-                        });
-                        if let Ok(Ours::Linked(_)) = &compiled {
-                            counted.remembered.fetch_add(1, Ordering::Relaxed);
+                    db.solve(|db| {
+                        let Some(unit) = unit else { return };
+                        loop {
+                            let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
+                            let Some((at, name)) = job else { break };
+                            let compiled = compile(db, building, asked, &tests[at], name, unit);
+                            let compiled = compiled.inspect_err(|why| {
+                                eprintln!("ra-jit: {} is rustc's: {why:#}", tests[at].name);
+                            });
+                            if let Ok(Ours::Linked(_)) = &compiled {
+                                counted.remembered.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ = ready.send((at, compiled.ok()));
                         }
-                        _ = ready.send((at, compiled.ok()));
-                    }
+                    })
                 })
             })
             .collect();
