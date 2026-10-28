@@ -352,7 +352,7 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
 
 /// A crate of a build script's description that blaze's runner of build scripts makes from
 /// blaze's own reading of the workspace (`crate::scripts`), not from what cargo told rustc.
-#[derive(serde_derive::Deserialize)]
+#[derive(Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Planned {
     pub(crate) name: String,

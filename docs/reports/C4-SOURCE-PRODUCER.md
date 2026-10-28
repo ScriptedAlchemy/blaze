@@ -17,28 +17,55 @@ std artifact. The output directory is exclusively owned by the caller until
 the child ends. Publication leases and before/after validation are not added
 by this boundary.
 
-## Where the real host plan must come from
+## The application-derived host plan
 
-The next planner unit belongs in `crates/ra-jit`, over `blaze-metadata` and
-`plan.rs`. It must expose resolved compile units rather than metadata's folded
-package nodes. `blaze-metadata/src/graph.rs::of_build` currently unions host and
-target features into a package node. Those nodes cannot produce this host
-graph: `scripts.rs::Runner::described` also reads that union today.
+`ra-jit proc-macro-plan <application-manifest> <selection.json> <host> <target>`
+renders the source units derived by blaze's own resolver and profile planner.
+`proc-macro-build` takes the same arguments followed by an exclusive output
+directory and builds the reached source producers. It does not consume the
+rendering, a wrapper record or an oracle artifact.
 
-Preserve `(PackageId, FeaturesFor, CompileKind)` while walking the owned
-`ResolvedFeatures`. A proc-macro edge selects `HostDep` and the host triple;
-normal dependencies of that unit retain the host feature domain, including
-optional dependency activation. Evaluate target predicates for that domain.
-Use the resolver's extern-name mapping for renamed dependencies. Use the host
-profile and effective host rustflags from the owned plan, not target flags.
-Add the implicit source `proc_macro` dependency. Execute dependency build
-scripts topologically through the owned script compiler/runner before filling
-each unit's cfg, environment and native-link inputs. Nested proc macros need
-the same host scheduling. Never recover this graph from rustc records.
+`blaze-metadata::build_units` walks the application's `ResolvedFeatures`
+before metadata folds host and target features into package nodes.
+`ResolvedUnit::host` identifies `FeaturesFor::HostDep`, not whether a triple
+happens to equal the native host. The one target compile kind comes from the
+application selection; proc-macro and build-dependency edges select Host.
+Normal dependencies retain their parent's feature domain. Optional activation
+is read in that domain, target predicates use its platform facts, and extern
+names come from the owned resolver. Host-only packages omitted by the folded
+target metadata are retained from the same resolution, not resolved again.
+Resolver 1's intentional feature union is preserved.
 
-Test that graph independently against Cargo's unit graph, emitted by the
-Python harness only, especially a shared dependency with disjoint host/target
-features. Then feed the verified graph to this compiler boundary.
+`cargo::producer_plan` uses owned target cfg answers, owned profiles and
+`Config::extra_args`. Explicit `--target`, even when it names the native
+triple, keeps target rustflags away from host producers. Feature cfgs,
+debug assertions, overflow checks, panic, additional cfgs, package environment
+and config environment are per unit. Host profiles use build overrides.
+Source closure reindexing marks only the producer root; the compiler adds
+the implicit source `proc_macro` dependency.
+
+The diagnostic renders library or selected package roots, not all target
+kinds of a complete Cargo unit graph. The first executable witness selects
+one binary application and library producers without scripts. Build-script
+units are identified but not executed. `proc-macro-build` fails before any
+compiler child if a producer closure needs a script or nested proc macro.
+This is an unfinished scheduler boundary, not a restriction on the intended
+product. No cold path calls it yet.
+
+`harness/dist/producer_plan.py` compares native, explicit-native and cross
+plans with an independent Cargo unit graph. It checks disjoint features,
+optional renamed edges, host predicates, profile overrides, cfg and config
+environment. It compiles the producer from the application's manifests
+through `proc-macro-build`, expands with the matching owned server, and
+compares with a separate Cargo-built reference. Cargo receives the manifests,
+not the product's serialized graph. The product tool audit retains queries
+as well as compile calls. A Rust regression compares unit features directly
+with the owned resolver's result under resolver 1, 2 and 3.
+
+Next: execute scripts through the owned runner and compiler, preserving unit
+domains, attach generated cfg/env/native inputs, and schedule nested producers
+topologically with leases. Then switch both cold paths. Never derive a plan
+from rustc artifacts.
 
 ## Separate compiler witnesses
 

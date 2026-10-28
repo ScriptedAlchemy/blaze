@@ -14,6 +14,7 @@ pub(crate) mod own_macro;
 pub(crate) mod own_script;
 mod package;
 pub(crate) mod plan;
+pub(crate) mod producer_plan;
 pub(crate) mod run;
 mod sandboxed;
 pub(crate) mod say;

@@ -13,6 +13,9 @@
 
 mod graph;
 mod summary;
+mod units;
+
+pub use units::{ResolvedUnit, UnitDependency};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -120,14 +123,26 @@ pub struct Targets<'a> {
 
 /// The JSON `cargo metadata --format-version 1` prints for `asked`.
 pub fn metadata(asked: &Asked<'_>) -> Result<String> {
-    Ok(made(asked)?.0)
+    Ok(made(asked, None, None)?.0)
 }
 
 /// Metadata with the structural source bytes that produced it. A daemon must not certify
 /// this graph with manifest bytes read after a build script has run.
 pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
-    let (json, _, sources) = made(asked)?;
+    let (json, _, sources) = made(asked, None, None)?;
     Ok((json, sources))
+}
+
+/// Resolve an application's build without folding host and target feature domains.
+/// Target facts are supplied by the owned planner, never queried from a toolchain.
+pub fn build_units(
+    asked: &Asked<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<ResolvedUnit>, Vec<(PathBuf, Vec<u8>)>)> {
+    anyhow::ensure!(asked.build.is_some(), "compile units require a build selection");
+    let mut units = Vec::new();
+    let (json, _, sources) = made(asked, Some(host), Some(&mut units))?;
+    Ok((json, units, sources))
 }
 
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
@@ -135,7 +150,7 @@ pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf,
 /// it is built with, or the one target named.
 pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
     anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
-    let (json, roots, _) = made(asked)?;
+    let (json, roots, _) = made(asked, None, None)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
     let features: FxHashMap<&str, Vec<&str>> = nodes
@@ -196,7 +211,11 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
 }
 
 /// The metadata of `asked`, and the ids of the members its build selects.
-fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
+fn made(
+    asked: &Asked<'_>,
+    host: Option<&TargetPlatform<'_>>,
+    units: Option<&mut Vec<ResolvedUnit>>,
+) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start("metadata", asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
@@ -303,8 +322,9 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
         None => vec![CompileKind::Host],
     };
-    let packages = Packages { reads: &reads, platform: asked.platform.as_ref() };
+    let packages = Packages { reads: &reads, platform: asked.platform.as_ref(), host };
     let mut roots = Vec::new();
+    let mut resolved_units = Vec::new();
     let resolve = match &asked.build {
         None => resolve_graph(&targeted, member_ids, current, &packages, &kinds)?,
         Some(build) => {
@@ -313,6 +333,17 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
             let features =
                 FeatureResolver::resolve(&packages, &targeted, &member_features, &kinds, opts)?;
             roots = member_features.iter().map(|(it, _)| it.package_id()).collect();
+            if units.is_some() {
+                resolved_units = units::of_build(
+                    &targeted,
+                    &features,
+                    &roots,
+                    build.dev_units,
+                    &reads,
+                    &packages,
+                    kinds[0],
+                )?;
+            }
             let activated = |platform: &Platform| packages.activates(platform);
             graph::of_build(
                 &targeted,
@@ -335,11 +366,23 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
         let id = id.with_context(|| format!("no package {} was read", node.id))?;
         listed.push((id, reached[&id]));
     }
+    // Target-folded metadata may omit a dependency selected only by a host predicate.
+    // Its manifest was already read by this resolution; retain its source package too.
+    for unit in &resolved_units {
+        let id = ids.iter().find(|id| id.to_spec().to_string() == unit.package).copied();
+        let id = id.with_context(|| format!("no unit package {} was read", unit.package))?;
+        if !listed.iter().any(|(listed, _)| *listed == id) {
+            listed.push((id, reached[&id]));
+        }
+    }
     listed.sort();
     let mut slots: Vec<Option<SerializedPackage<'_>>> = serialized.into_iter().map(Some).collect();
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
     let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
+    if let Some(units) = units {
+        *units = resolved_units;
+    }
     Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), ctx.sources()))
 }
 
@@ -347,11 +390,19 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
 struct Packages<'a> {
     reads: &'a FxHashMap<PackageId, Read>,
     platform: Option<&'a TargetPlatform<'a>>,
+    host: Option<&'a TargetPlatform<'a>>,
 }
 
 impl Packages<'_> {
     fn activates(&self, platform: &Platform) -> bool {
         self.platform.is_none_or(|it| it.activates(platform))
+    }
+
+    fn activates_for(&self, platform: &Platform, kind: CompileKind) -> bool {
+        match (kind, self.host) {
+            (CompileKind::Host, Some(host)) => host.activates(platform),
+            _ => self.activates(platform),
+        }
     }
 }
 
@@ -364,8 +415,8 @@ impl MetadataPackages for Packages<'_> {
         self.reads.get(&id).and_then(|it| it.lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 
@@ -378,8 +429,8 @@ impl PackageTargets for Packages<'_> {
         self.reads.get(&package_id).is_some_and(|it| it.proc_macro_lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 
