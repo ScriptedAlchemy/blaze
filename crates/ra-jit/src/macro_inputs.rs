@@ -70,6 +70,12 @@ impl ArtifactInputs {
         project: &Path,
         selection: &crate::plan::Selection,
     ) -> anyhow::Result<Option<Self>> {
+        // Cargo may ask through a directory symlink while its compiler and daemon
+        // work in the physical checkout. Resolve before metadata, config ancestry
+        // and package paths enter this identity, on every capture path.
+        let project = dunce::canonicalize(project)
+            .with_context(|| format!("resolving macro producer project {}", project.display()))?;
+        let project = project.as_path();
         let manifest = project.join("Cargo.toml");
         let asked = blaze_metadata::Asked {
             cwd: project,

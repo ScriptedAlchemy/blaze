@@ -28,7 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--blaze-bin", type=Path, required=True)
-    parser.add_argument("--scenario", choices=["B", "D", "E", "F", "H", "all"], default="all")
+    parser.add_argument("--scenario", choices=["B", "D", "E", "F", "H", "I", "J", "all"], default="all")
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -47,9 +47,9 @@ def main():
         env = machine.env(binary, os.path.join(machine.top, "store"),
                           crossmachine.daemon_home("f2" + name, "a"),
                           crossmachine.FIXTURES["macros"].get("env"))
-        if name in ("D", "E"):
+        if name in ("D", "E", "I"):
             env = cargo_ra_jit.enabled_home(str(work / ("enabled-" + name)), env)
-        side = Side(ws, env, "plain" if name in ("D", "E") else True)
+        side = Side(ws, env, "plain" if name in ("D", "E", "I") else True)
         rows = []
 
         def step(label):
@@ -66,6 +66,39 @@ def main():
             return row
 
         try:
+            if name in ("I", "J"):
+                link = Path(ws).parent / "link"
+                link.symlink_to(Path(ws), target_is_directory=True)
+                argv = side.argv("build", "--manifest-path", "link/Cargo.toml", "-p", "app")
+                built = subprocess.run(argv, cwd=str(link.parent), env=env,
+                                       capture_output=True, text=True)
+                _, states = wait_warm(side, ws)
+                ran = subprocess.run(side.argv("run", "--manifest-path", "link/Cargo.toml", "-p", "app"),
+                                     cwd=str(link.parent), env=env, capture_output=True, text=True)
+                row = dict(label=name + "1 symlink directory", build_rc=built.returncode,
+                           stdout=built.stdout, stderr=built.stderr, states=states,
+                           output=program_output(ran), worker=crossmachine.workers_log(side))
+                rows.append(row)
+                print(row["label"], built.returncode, states, flush=True)
+                assert built.returncode == 0 and states and all(s == "ready" for s in states), row
+                assert ran.returncode == 0, row
+                # Fresh plain Cargo invokes no wrapper at all, so it cannot restart
+                # a stopped daemon. Restart is exercised by scenario B instead.
+                if name == "I":
+                    return
+                side.cargo("stop")
+                built = subprocess.run(argv, cwd=str(link.parent), env=env,
+                                       capture_output=True, text=True)
+                _, states = wait_warm(side, ws)
+                ran = subprocess.run(side.argv("run", "--manifest-path", "link/Cargo.toml", "-p", "app"),
+                                     cwd=str(link.parent), env=env, capture_output=True, text=True)
+                restart = dict(label=name + "2 restart", build_rc=built.returncode, states=states,
+                               stdout=built.stdout, stderr=built.stderr, output=program_output(ran))
+                rows.append(restart)
+                print(restart["label"], built.returncode, states, flush=True)
+                assert built.returncode == 0 and states and all(s == "ready" for s in states), restart
+                assert restart["output"] == row["output"], restart
+                return
             if name in ("E", "F"):
                 # The P4 review's real-wrapper repro: Cargo runs outside the workspace,
                 # but invokes rustc in the workspace root.
@@ -125,7 +158,7 @@ def main():
             report[name] = rows
 
     try:
-        for name in ["B", "D", "E", "F", "H"] if args.scenario == "all" else [args.scenario]:
+        for name in ["B", "D", "E", "F", "H", "I", "J"] if args.scenario == "all" else [args.scenario]:
             run_scenario(name)
         print("F2/F3: warmth, relative manifest and nonfatal capture errors pass", flush=True)
     finally:
