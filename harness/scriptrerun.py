@@ -214,6 +214,16 @@ fn main() {
     "src/main.rs": COUNTER["src/main.rs"],
 }
 
+QUIET = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "quiet").replace(
+        'build = "build.rs"\n', 'build = "build.rs"\nexclude = ["target-ref"]\n',
+    ),
+    "build.rs": LOGGER["build.rs"].replace(
+        '    println!("cargo::rerun-if-changed=src/main.rs");\n',
+        '    println!("cargo::rustc-cfg=quiet_cfg");\n',
+    ),
+    "src/main.rs": COUNTER["src/main.rs"],
+}
 
 NEWENV = {
     "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "newenv"),
@@ -414,7 +424,7 @@ def main():
         print(f"under {root}{tails(home)}")
     else:
         shutil.rmtree(root, ignore_errors=True)
-    for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True)]:
+    for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True), ("quiet", QUIET, True)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
     for why in wrong:

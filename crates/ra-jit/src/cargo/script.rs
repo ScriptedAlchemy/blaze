@@ -280,7 +280,7 @@ pub(crate) struct Cargo<'a> {
 /// run made now.
 ///
 /// A run made now is cargo's next, and is recorded as cargo's: it is made in `out_dir` itself, with
-/// the environment and directory cargo ran the script with, under cargo's locks on the build
+/// current user variables and cargo's recorded script variables and directory, under its locks,
 /// directory, and cargo's hash of the run is emptied before it and written after it with what the
 /// run printed, as cargo does (`build_work`, `write_fingerprint`). Cargo's next build finds the
 /// script run, as after a run of its own, and does not run it again, whether that build is the one
@@ -290,9 +290,7 @@ pub(crate) struct Cargo<'a> {
 /// (docs/reports/BUILDSCRIPT.md, "Round 3" and "Round 4").
 ///
 /// It is `Err`, the build cargo's, and nothing is run: when cargo's records are not ones cargo
-/// 1.99 wrote, or of a run that did not end; when they do not hold what cargo would reckon now (a
-/// variable the script reads has another value, and cargo runs it again with that one); when the
-/// script says nothing of what it reads, and cargo reckons from every file of its package; when a
+/// 1.99 wrote, or of a run that did not end; when a watched variable has another value; when a
 /// cargo holds the lock, so its run cannot be read consistently; and when there is no
 /// lock to take. A run that fails, or that printed what cargo does not take, is `Err` too, and
 /// cargo, which finds its records of a run that did not end, runs the script again.
@@ -325,17 +323,21 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     let generated = std::fs::read(unit.output().with_file_name("root-output")).ok();
     let generated = generated.and_then(|it| String::from_utf8(it).ok()).map(PathBuf::from);
     let last = said(&printed, generated.as_deref().unwrap_or(out_dir))?;
-    let nothing = "says nothing of what it reads, and cargo reckons from every file of its package";
-    if last.rerun_if_changed.is_empty() && last.rerun_if_env_changed.is_empty() {
-        return Err(nothing.to_owned());
-    }
-    let named = unit.output_named(&recorded)?;
-    let reckoned = |said: &blaze_build_script::Output| {
-        let (files, variables) = (&said.rerun_if_changed, &said.rerun_if_env_changed);
-        records::local(files, variables, &named, package, cargo.env)
+    let named = if last.rerun_if_changed.is_empty() {
+        PathBuf::new()
+    } else {
+        unit.output_named(&recorded)?
     };
-    let now = reckoned(&last).ok_or(nothing)?;
-    if now != recorded.local {
+    let reckoned = |said: &blaze_build_script::Output, named: &Path| {
+        let (files, variables) = (&said.rerun_if_changed, &said.rerun_if_env_changed);
+        records::local(files, variables, named, package, cargo.env)
+    };
+    let now = reckoned(&last, &named).unwrap_or_else(|| match &recorded.local[..] {
+        [records::Local::Precalculated(value)] if !value.ends_with(')') => recorded.local.clone(),
+        _ => vec![records::Local::Precalculated(crate::scripts::path_package_fingerprint(package))],
+    });
+    let local_changed = now != recorded.local;
+    if local_changed && !matches!(&now[..], [records::Local::Precalculated(_)]) {
         return Err(changed(&now, &recorded.local));
     }
     let compiled = ran.real.to_str().and_then(|it| it.strip_suffix(".real")).map(PathBuf::from);
@@ -343,7 +345,7 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     let home = (cargo.env)("CARGO_HOME")
         .map(|it| ran.cwd.join(it))
         .or_else(|| (cargo.env)("HOME").map(|it| Path::new(&it).join(".cargo")));
-    if unit.stale(&now, package, &compiled, home).is_none() {
+    if !local_changed && unit.stale(&now, package, &compiled, home).is_none() {
         return Run::left(&printed, out_dir);
     }
     let began = unit.begin()?;
@@ -357,33 +359,8 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
             env.insert(name.clone(), value);
         }
     }
-    // Cargo supplies these to the script, rather than inheriting them from its caller.
-    // Keep their recorded values while replacing or removing inherited user variables.
     for (name, value) in &ran.env {
-        if name.starts_with("CARGO_PKG_")
-            || name.starts_with("CARGO_FEATURE_")
-            || name.starts_with("CARGO_CFG_")
-            || name.starts_with("DEP_")
-            || matches!(
-                name.as_str(),
-                "CARGO"
-                    | "CARGO_MANIFEST_DIR"
-                    | "CARGO_MANIFEST_PATH"
-                    | "CARGO_MANIFEST_LINKS"
-                    | "CARGO_ENCODED_RUSTFLAGS"
-                    | "CARGO_MAKEFLAGS"
-                    | "OUT_DIR"
-                    | "NUM_JOBS"
-                    | "TARGET"
-                    | "DEBUG"
-                    | "OPT_LEVEL"
-                    | "PROFILE"
-                    | "HOST"
-                    | "RUSTC"
-                    | "RUSTDOC"
-                    | "RUSTC_LINKER"
-            )
-        {
+        if cargo_sets(name) {
             env.insert(name.clone(), value.clone());
         }
     }
@@ -401,9 +378,44 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     }
     unit.ran(began, &again.stdout, &again.stderr)?;
     let said = said(&again.stdout, out_dir)?;
+    let named = if !said.rerun_if_changed.is_empty() && named.as_os_str().is_empty() {
+        unit.output_named(&recorded)?
+    } else {
+        named
+    };
     // A run that says nothing of what it reads leaves what cargo reckoned before it.
-    unit.record(&recorded.with_local(reckoned(&said).unwrap_or(now)))?;
+    unit.record(&recorded.with_local(reckoned(&said, &named).unwrap_or(now)))?;
     Run::left(&again.stdout, out_dir)
+}
+
+fn cargo_sets(name: &str) -> bool {
+    name.starts_with("CARGO_PKG_")
+        || name.starts_with("CARGO_FEATURE_")
+        || name.starts_with("CARGO_CFG_")
+        || name.starts_with("DEP_")
+        || matches!(
+            name,
+            "CARGO"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_MANIFEST_LINKS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "CARGO_MAKEFLAGS"
+                | "OUT_DIR"
+                | "NUM_JOBS"
+                | "TARGET"
+                | "DEBUG"
+                | "OPT_LEVEL"
+                | "PROFILE"
+                | "HOST"
+                | "RUSTC"
+                | "RUSTDOC"
+                | "RUSTC_LINKER"
+                | "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "DYLD_FALLBACK_LIBRARY_PATH"
+                | "LD_LIBRARY_PATH"
+        )
 }
 
 /// Why cargo's record of a run, `recorded`, is not what cargo reckons of it now, `now`.
@@ -1537,11 +1549,96 @@ printf %s "${VP5_VAR+x}" > "$OUT_DIR/present"
     }
 
     #[test]
-    fn a_script_that_says_nothing_of_what_it_reads_is_cargos() {
-        let out_dir = ran_script("says-nothing", "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\n", "");
+    fn a_script_with_no_rerun_lines_runs_once_per_package_edit() {
+        let lines = r#"#!/bin/sh
+echo run >> "$OUT_DIR/../runs"
+echo cargo:rustc-cfg=quiet_cfg
+printf 'pub const RUNS: u32 = 1;\n' > "$OUT_DIR/generated.rs"
+"#;
+        let out_dir = ran_script("quiet", lines, "");
+        let run_dir = out_dir.parent().unwrap();
+        // The usual fixture puts the manifest in the run directory. Its records would
+        // then be package inputs, so a quiet script needs a separate source directory.
+        let package = run_dir.ancestors().nth(4).unwrap().join("package");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        let manifest = package.join("Cargo.toml");
+        let source = package.join("src/main.rs");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"quiet\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "fn main() { println!(\"7\"); }\n").unwrap();
+        let before = SystemTime::now() - Duration::from_secs(3600);
+        set_written(&manifest, before);
+        set_written(&source, before);
+        let mut ran = ran_of(&out_dir);
+        ran.real = ran.real.with_extension("inner");
+        ran.cwd = package.clone();
+        for (name, value) in &mut ran.env {
+            if name == "CARGO_MANIFEST_DIR" {
+                *value = package.to_str().unwrap().to_owned();
+            }
+        }
+        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+        let unit = records::Unit::of(&out_dir).unwrap();
+        let began = unit.begin().unwrap();
+        let initial = Command::new(&ran.real)
+            .env_clear()
+            .envs(ran.env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&ran.cwd)
+            .output()
+            .unwrap();
+        assert!(initial.status.success());
+        unit.ran(began, &initial.stdout, &initial.stderr).unwrap();
+        records::tests::recorded_as_cargo_would(&out_dir, &package, &initial.stdout);
+        let built = Run::of(&out_dir).unwrap();
+        assert_eq!(runs(&out_dir), 1);
+        assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
+        assert_eq!(runs(&out_dir), 1);
+        for number in 8..10 {
+            std::fs::write(&source, format!("fn main() {{ println!(\"{number}\"); }}\n")).unwrap();
+            set_written(&source, before + Duration::from_secs(number as u64));
+            assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
+            assert_eq!(runs(&out_dir), number - 6);
+            assert_eq!(current(&out_dir, &CARGO), Ok(built.clone()));
+            assert_eq!(runs(&out_dir), number - 6);
+        }
+    }
+
+    #[test]
+    fn an_immutable_quiet_packages_version_is_not_replaced_by_file_times() {
+        let out_dir = ran_script("quiet-registry", COUNTS, "");
         recorded(&out_dir, format!("cargo:in={}\n", out_dir.display()).as_bytes());
-        let result = rerun_is_same(&out_dir);
-        assert!(result.as_ref().is_err_and(|it| it.contains("says nothing")), "{result:?}");
+        let unit = records::Unit::of(&out_dir).unwrap();
+        let version = vec![records::Local::Precalculated("1.2.3".to_owned())];
+        unit.record(&unit.recorded().unwrap().with_local(version.clone())).unwrap();
+        let before = Run::of(&out_dir).unwrap();
+        assert_eq!(current(&out_dir, &CARGO), Ok(before));
+        assert_eq!(runs(&out_dir), 0);
+        assert_eq!(unit.recorded().unwrap().local, version);
+    }
+
+    #[test]
+    fn a_quiet_run_that_starts_watching_files_records_cargos_output_path() {
+        let out_dir = ran_script("quiet-add-watch", COUNTS, "");
+        let unit = records::Unit::of(&out_dir).unwrap();
+        let recorded = unit.recorded().unwrap();
+        let named = unit.output_named(&recorded).unwrap();
+        std::fs::write(unit.output(), format!("cargo:in={}\n", out_dir.display())).unwrap();
+        changed(&out_dir);
+        assert!(current(&out_dir, &CARGO).is_ok());
+        let after = unit.recorded().unwrap();
+        assert_eq!(
+            after.local,
+            vec![records::Local::RerunIfChanged {
+                output: named,
+                paths: vec![PathBuf::from("watched")],
+            }]
+        );
+        assert_eq!(runs(&out_dir), 1);
+        assert!(current(&out_dir, &CARGO).is_ok());
+        assert_eq!(runs(&out_dir), 1);
     }
 
     #[test]

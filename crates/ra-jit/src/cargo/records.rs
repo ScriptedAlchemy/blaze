@@ -571,12 +571,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let env = |name: &str| std::env::var(name).ok();
-        // A run that says nothing of what it read: cargo's record has when a file of its
-        // package was last written, which no test reckons.
-        let package_written = vec![Local::Precalculated("1.000000000s (build.rs)".to_owned())];
         fingerprint.local =
             local(&said.rerun_if_changed, &said.rerun_if_env_changed, &output, package, &env)
-                .unwrap_or(package_written);
+                .unwrap_or_else(|| {
+                    vec![Local::Precalculated(crate::scripts::path_package_fingerprint(package))]
+                });
         let unit = Unit {
             out_dir: out_dir.to_owned(),
             run_dir: run_dir.to_owned(),
