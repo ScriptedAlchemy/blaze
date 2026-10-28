@@ -232,7 +232,18 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         Output { status, stdout, stderr }
     };
     if args.windows(2).any(|args| args == ["config", "get"]) {
-        let (code, said) = blaze_manifest::config::get::main(&cwd, env, &args);
+        let mut normalized = Vec::new();
+        let mut at = 0;
+        while at < args.len() {
+            if args[at] == "-Z" && args.get(at + 1).is_some_and(|it| it == "unstable-options") {
+                normalized.push("-Zunstable-options".to_owned());
+                at += 2;
+            } else {
+                normalized.push(args[at].clone());
+                at += 1;
+            }
+        }
+        let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
         return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
     }
     let rustc = toolchain_rustc(command.get_program(), &var)?;
