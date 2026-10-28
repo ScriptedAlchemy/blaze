@@ -345,9 +345,26 @@ pub(crate) struct Planned {
 /// The `rust-project.json` of the script that is the first of `crates`, over the standard
 /// library of `sysroot`.
 pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> String {
+    planned_source_description(sysroot, crates, false)
+}
+
+/// The source graph of an owned proc-macro producer. No rustc artifact or unit record
+/// is needed to identify its root. Scheduling/linking this graph is separate work.
+pub(crate) fn planned_macro_description(
+    sysroot: &Path,
+    crates: Vec<Planned>,
+) -> Result<String, String> {
+    if crates.is_empty() {
+        return Err("a proc-macro producer needs a root crate".to_owned());
+    }
+    Ok(planned_source_description(sysroot, crates, true))
+}
+
+fn planned_source_description(sysroot: &Path, crates: Vec<Planned>, macro_root: bool) -> String {
     let crates: Vec<Described> = crates
         .into_iter()
-        .map(|it| Described {
+        .enumerate()
+        .map(|(at, it)| Described {
             name: it.name,
             root: it.root,
             edition: it.edition,
@@ -356,7 +373,7 @@ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> Strin
             env: it.env,
             deps: it.deps,
             proc_macro: None,
-            compiled_macro: false,
+            compiled_macro: macro_root && at == 0,
             inputs: None,
         })
         .collect();
@@ -470,6 +487,48 @@ fn described(krate: &Described, member: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_macro_root_is_source_only_and_preserves_host_graph() {
+        let crates = || {
+            vec![
+                Planned {
+                    name: "derive".into(),
+                    root: "/sources/derive/src/lib.rs".into(),
+                    edition: "2021".into(),
+                    cfg: vec!["feature=\"host-feature\"".into()],
+                    codegen_flags: vec!["-Copt-level=1".into()],
+                    env: [("PRODUCER".into(), "host".into())].into_iter().collect(),
+                    deps: vec![("renamed_dependency".into(), 1)],
+                },
+                Planned {
+                    name: "dependency".into(),
+                    root: "/sources/dependency/src/lib.rs".into(),
+                    edition: "2021".into(),
+                    cfg: vec![],
+                    codegen_flags: vec![],
+                    env: BTreeMap::new(),
+                    deps: vec![],
+                },
+            ]
+        };
+        let sysroot = Path::new("/owned/sysroot");
+        let plain: Value = serde_json::from_str(&planned_description(sysroot, crates())).unwrap();
+        let mut producer: Value =
+            serde_json::from_str(&planned_macro_description(sysroot, crates()).unwrap()).unwrap();
+        assert_eq!(producer["crates"][0]["is_proc_macro"], true);
+        assert_eq!(producer["crates"][1]["is_proc_macro"], false);
+        assert!(
+            producer["crates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|krate| krate["proc_macro_dylib_path"].is_null())
+        );
+        producer["crates"][0]["is_proc_macro"] = json!(false);
+        assert_eq!(plain, producer, "only the root's producer kind may change");
+        assert!(planned_macro_description(sysroot, vec![]).is_err());
+    }
 
     #[test]
     fn a_variable_read_as_rustc_would_read_it() {
