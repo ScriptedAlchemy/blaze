@@ -104,3 +104,32 @@ that choice; product code does not erase the user's SDK. Closing the SDK query
 gap is still required, rather than waiving the audit.
 
 No cold path was switched. The strict initial seven-row witness remains FAIL.
+
+## Owned producer scripts
+
+`proc-macro-build` projects the application's resolved host units into the
+existing `scripts.rs` runner. The adapter replaces folded metadata features
+and edges with host-domain features and renamed normal/build edges. It gives
+the runner the owned host flags and cfg answers. The runner compiles and runs
+the scripts itself, with its existing freshness records, admission and output
+generation leases. The command keeps those leases and pins through producer
+compilation. Generated cfg, env and OUT_DIR reach each host library; the link
+reads native inputs from the script output beside OUT_DIR as before.
+
+Scripts name an owned probe launcher. Version and print questions go straight
+to `answers.rs`'s owned answers, never its rustc fallback. Compile probes remain
+unfinished: they record a failure which the runner checks before publishing
+successful script output. A script cannot swallow that failure and silently
+select incomplete cfgs. This is not default-feature registry probe support.
+
+`harness/dist/producer_scripts.py` uses the vendored token producer with a
+default feature and build script. It compares expansion with an independent
+Cargo/rustc oracle. The producer uses a renamed build dependency, host-only
+metadata from a dependency script with `links`, generated include source,
+cfg and env, and an owned version query. A repeat checks that script executables
+and outputs stay unchanged. A swallowed compile probe is a negative control.
+Every product tool call, including queries and expansion, remains audited.
+
+Registry compile probes, nested producer scheduling and image generation
+reuse still need implementation. Both cold paths and the native server
+bootstrap retain their old handoff. The PR stays draft and strict gate FAIL.
