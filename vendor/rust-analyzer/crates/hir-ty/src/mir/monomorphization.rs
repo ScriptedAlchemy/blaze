@@ -377,6 +377,23 @@ pub fn monomorphized<'db>(
     Ok(body)
 }
 
+/// `tys` with `subst` in place of their generic parameters, each as [`monomorphized`] has it in
+/// a body.
+pub(super) fn monomorphized_tys<'db>(
+    db: &'db dyn HirDatabase,
+    tys: impl IntoIterator<Item = StoredTy>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<Vec<StoredTy>, MirLowerError<'db>> {
+    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    tys.into_iter()
+        .map(|mut ty| {
+            filler.fill_ty(&mut ty)?;
+            Ok(ty)
+        })
+        .collect()
+}
+
 /// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
 /// is with `args`, once they name the impl: `None` for one of another function, or while they
 /// don't.

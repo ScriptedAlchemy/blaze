@@ -39,6 +39,15 @@ pub(crate) fn decode(line: &str) -> Env {
         .collect()
 }
 
+/// What [`decode`] makes of the line of a request, without the variable that says which build
+/// of the daemon's it is for, and that build: `0` when it says none.
+pub(crate) fn decode_request(line: &str) -> (Env, u64) {
+    let all = decode(line);
+    let build = all.get(crate::cargo::daemon::BUILD).and_then(|it| it.parse().ok());
+    let rest = all.iter().filter(|(name, _)| *name != crate::cargo::daemon::BUILD);
+    (rest.map(|(name, value)| (name.to_owned(), value.to_owned())).collect(), build.unwrap_or(0))
+}
+
 fn escape(text: &str, line: &mut String) {
     for c in text.chars() {
         match c {
@@ -104,5 +113,17 @@ mod tests {
         let line = encode(&env);
         assert!(!line.contains(['\t', '\n']));
         assert_eq!(decode(&line), env);
+    }
+
+    /// The build a request is for is the daemon's to say, not a variable of the process.
+    #[test]
+    fn the_build_of_a_request_is_not_a_variable() {
+        let mut env: Env = [("A".to_owned(), "1".to_owned())].into_iter().collect();
+        assert_eq!(decode_request(&encode(&env)), (env.clone(), 0));
+        env.set(crate::cargo::daemon::BUILD, "7");
+        let (rest, build) = decode_request(&encode(&env));
+        assert_eq!(build, 7);
+        assert_eq!(rest, [("A".to_owned(), "1".to_owned())].into_iter().collect());
+        assert_eq!(decode_request("").1, 0);
     }
 }

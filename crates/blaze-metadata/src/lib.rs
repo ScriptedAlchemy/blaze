@@ -126,12 +126,19 @@ pub fn metadata(asked: &Asked<'_>) -> Result<String> {
     Ok(made(asked)?.0)
 }
 
+/// Metadata with the structural source bytes that produced it. A daemon must not certify
+/// this graph with manifest bytes read after a build script has run.
+pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
+    let (json, _, sources) = made(asked)?;
+    Ok((json, sources))
+}
+
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
 /// graph has them: of each member the build selects, the binaries whose `required-features`
 /// it is built with, or the one target named.
 pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
     anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
-    let (json, roots) = made(asked)?;
+    let (json, roots, _) = made(asked)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
     let features: FxHashMap<&str, Vec<&str>> = nodes
@@ -192,7 +199,7 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
 }
 
 /// The metadata of `asked`, and the ids of the members its build selects.
-fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
+fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
     let (ctx, offline) = open(asked, "metadata")?;
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let locked = Locked::read(&ws, &ctx, offline, asked.store.clone())?;
@@ -212,7 +219,7 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let targeted = world.resolve(&ws, &specs, &cli_features, has_dev_units)?.targeted;
+    let targeted = world.resolve(&ws, &ctx, &specs, &cli_features, has_dev_units)?.targeted;
 
     let kinds = match &asked.platform {
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
@@ -258,7 +265,7 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
     let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
-    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect()))
+    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), ctx.sources()))
 }
 
 /// The configuration `asked` is read with, for the command cargo would be run as, and whether
@@ -291,11 +298,11 @@ impl Locked {
         store: Option<Arc<dyn blaze_registry::Blobs>>,
     ) -> Result<Locked> {
         let root = ws.root().to_owned();
-        if summary::has_replace(&root)? {
+        if summary::has_replace(&root, ctx)? {
             bail!("`[replace]` is not read by blaze yet");
         }
         let lock_path = root.join("Cargo.lock");
-        let lock_text = std::fs::read_to_string(&lock_path)
+        let lock_text = String::from_utf8(ctx.read_source(&lock_path)?)
             .with_context(|| format!("no lock file at {}", lock_path.display()))?;
 
         let path_packages = path_packages(ws, &root, ctx)?;
@@ -409,6 +416,7 @@ impl<'a> World<'a> {
     fn resolve(
         &self,
         ws: &Workspace<'_>,
+        ctx: &Context,
         specs: &[PackageIdSpec],
         cli_features: &CliFeatures,
         has_dev_units: HasDevUnits,
@@ -417,7 +425,7 @@ impl<'a> World<'a> {
         for read in self.reads.values() {
             registry.add(IndexSummary::Candidate(read.summary.clone()));
         }
-        let patch = summary::patch_tables(ws.root(), &registry)?;
+        let patch = summary::patch_tables(ws.root(), &registry, ctx)?;
         let by_path: FxHashMap<SourceId, Summary> = self
             .reads
             .values()
@@ -530,7 +538,7 @@ fn selected(
 fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<Package>> {
     let members: Vec<PathBuf> =
         ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
-    let mut queue = summary::patch_paths(root)?;
+    let mut queue = summary::patch_paths(root, ctx)?;
     for (_, m) in ws.members() {
         queue.extend(native_path_dependencies(m));
     }

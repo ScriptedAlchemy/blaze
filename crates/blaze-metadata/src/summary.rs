@@ -295,25 +295,30 @@ fn patch_dependency(root: &Path, name: &str, entry: &toml::Value) -> Result<Opti
 }
 
 /// The directories of the path packages the root manifest's `[patch]` names.
-pub(crate) fn patch_paths(root: &Path) -> Result<Vec<PathBuf>> {
-    let manifest = root_table(root)?;
+pub(crate) fn patch_paths(root: &Path, ctx: &blaze_manifest::Context) -> Result<Vec<PathBuf>> {
+    let manifest = root_table(root, ctx)?;
     let tables = manifest.get("patch").and_then(|p| p.as_table()).into_iter().flatten();
     let entries = tables.flat_map(|(_, table)| table.as_table().into_iter().flatten());
     let paths = entries.filter_map(|(_, entry)| entry.get("path")?.as_str());
     Ok(paths.map(|path| normalize(&root.join(path))).collect())
 }
 
-fn root_table(root: &Path) -> Result<toml::Table> {
+fn root_table(root: &Path, ctx: &blaze_manifest::Context) -> Result<toml::Table> {
     let path = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    let text =
+        String::from_utf8(ctx.read_source(&path)?).with_context(|| path.display().to_string())?;
     Ok(toml::from_str(&text)?)
 }
 
 /// The root manifest's `[patch]`, without entries that name an alternative registry or whose
 /// package `registry` does not have (a patch the graph does not use).
-pub(crate) fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(Url, Vec<Patch>)>> {
+pub(crate) fn patch_tables(
+    root: &Path,
+    registry: &MemRegistry,
+    ctx: &blaze_manifest::Context,
+) -> Result<Vec<(Url, Vec<Patch>)>> {
     let manifest_path = root.join("Cargo.toml");
-    let manifest = root_table(root)?;
+    let manifest = root_table(root, ctx)?;
     let mut tables = Vec::new();
     for (key, table) in manifest.get("patch").and_then(|p| p.as_table()).into_iter().flatten() {
         let url = if key == "crates-io" {
@@ -339,8 +344,8 @@ pub(crate) fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(U
 }
 
 /// Whether the root manifest has a `[replace]` table, which blaze does not read yet.
-pub(crate) fn has_replace(root: &Path) -> Result<bool> {
-    Ok(root_table(root)?.contains_key("replace"))
+pub(crate) fn has_replace(root: &Path, ctx: &blaze_manifest::Context) -> Result<bool> {
+    Ok(root_table(root, ctx)?.contains_key("replace"))
 }
 
 /// The output of a future that is ready at once, as [`MemRegistry`]'s are.

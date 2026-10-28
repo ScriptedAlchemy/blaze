@@ -20,7 +20,8 @@ settles it, each line tagged with the finding's id. [Appendix A](#appendix-a-rev
 every finding of both re-reviews its status. It also takes in two reports written since revision
 2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
 edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
-under verification).
+parked after four failed verifications; P0.5 does its job in the whole build,
+[reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)).
 
 **Revision 3.2** (this one) applies the owner's scope ruling of 2026-10-26: the program gives
 tracedecay what Bazel with NativeLink gives it for Rust today, and nothing beyond. It adds the
@@ -152,7 +153,7 @@ access model above: only the owner's own same-repository runs and the fleet's no
 - **Phase 0 comes first: blaze builds tracedecay.** G0 measured a no-go on macOS arm64: the
   whole build (no cargo) fails on a writable static of the standard library (#255); 18 of 18
   edits went to cargo because blaze reran the CLI's build script in an empty `OUT_DIR` and compared
-  every byte it printed (BUILDSCRIPT.md, fix in PR #5); a loaded tracedecay worker reached 58.3 GB
+  every byte it printed (BUILDSCRIPT.md, fixed by P0.5); a loaded tracedecay worker reached 58.3 GB
   on a 48 GiB Mac, which LOADMEM.md traces to the worker compiling the whole program at load in one
   salsa revision with every memo kept; `RA_JIT_MEMORY_MAX` does not bound a busy or last-asked
   worker (`daemon.rs:96-104`). Linux is unmeasured. Eight units fix and re-measure that before any
@@ -321,12 +322,14 @@ true and measures them.
   per-worker ceiling (LOADMEM section 6, fixes 2 and 3). Section 4 makes that batch the unit of
   distribution.
 - **Edits went to cargo because of blaze, not the script** (BUILDSCRIPT.md, PR #5, `dist/u8-buildscript`,
-  **reported** here: one run per case): blaze reran the script into an empty `OUT_DIR`, where
+  **reported** there: one run per case): blaze reran the script into an empty `OUT_DIR`, where
   cargo reruns it in the one it left, and compared every byte of its output, where cargo reads
-  only `cargo:` lines. The fix reruns in a copy of cargo's `OUT_DIR` and compares what cargo reads.
-  Its verification (u8-verify, in progress) has found two blocking bugs in the copy (directory
-  times not kept, symlinks written through) and an invalid-UTF-8 comparison; P0-D stays open until
-  PR #5 lands with those fixed.
+  only `cargo:` lines. PR #5 reran in a copy of cargo's `OUT_DIR`, then in cargo's own, and
+  failed four verifications on ever new interactions with the state cargo keeps in
+  `target/debug`; the coordinator parked it. A worker of this design runs the whole build, which
+  has no such state to agree with, so P0.5 moved there: the daemon asks for a script's run by
+  cargo's own rule, and `harness/scriptedits.py` holds that to cargo 1.99.0
+  ([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)).
 
 ### The store, the keys and the remote
 
@@ -913,11 +916,16 @@ What is decided here, and why:
   refused it if any byte of its output differed (`cargo/script.rs:670-688`); cargo reruns in the
   `OUT_DIR` it left and reads only `cargo:` lines. BUILDSCRIPT.md found that the CLI's script runs
   `pnpm` in an empty `OUT_DIR` and prints 61 lines of its own there, so every edit went to cargo; it
-  is blaze's bug, and tracedecay needs no change. PR #5 reruns in a copy and compares what cargo
-  reads. A script whose cargo-read output differs between two runs on the same inputs is still
-  marked impure, run once per build, its latest output used (recording its reads where blaze's
-  existing sandbox does, #147), and its run never shared across machines (section 1). Unit P0.5 lands PR #5 with its verifier's
-  findings fixed.
+  is blaze's bug, and tracedecay needs no change. PR #5 (parked, above) tried it beside cargo's
+  builds. P0.5 now compiles and runs scripts in blaze's own whole-build runner
+  (`crates/ra-jit/src/scripts.rs`, units p05w and p05r), with cargo's freshness rules
+  (`blaze_build_script::fresh`) and the variables of the process that asks. A run uses the
+  `OUT_DIR` it left and is not replayed from the store. Graphs with proc macros still use the
+  load's `cargo check`, which also runs their scripts; removing that remaining check is
+  no-rustc step J ([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)). A script whose cargo-read
+  output differs between two runs on the same inputs is impure: run once per build, its latest
+  output used (recording its reads where blaze's existing sandbox does, #147), and its run never
+  shared across machines (section 1). Unit P0.5.
 - **The standard library's writable statics are blaze's on macOS** (#255): `CLEANUP`,
   `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE` have no rustc symbol in the toolchain's
   `libstd` dylib on macOS (`nm -m`: non-external, #255, **reported**). The whole-program path
@@ -1195,7 +1203,7 @@ that fixes it, before the unit that needs it:
 |---|---|---|---|
 | crate ids from absolute paths outside `CARGO_HOME` (`main.rs:938-951`, `:1676-1689`) | yes | C4 | C5 (cross-machine hits) |
 | registry paths in stored code: panic locations, `file!()`, debug info (`$CARGO_HOME/registry/src/...`) | **unverified** whether a stored function carries machine A's path into B's program | C4 checks, and if so rebinds them symbolically in the stored value (a relocation the linker fills from the machine's paths) rather than normalising the key | C5 |
-| build-script run keys (`cargo/script.rs` `run_key`) | hash the script's executable | C4: hash the package's content, its dependencies' ids, the environment cargo gives and, on Linux, the digests of what the sandbox recorded it reading. Impure scripts (P0.5) are never shared | D2 (a helper not running every script) |
+| build-script run keys (`cargo/script.rs` `run_key`) | hash the script's executable, its directory, arguments and variables, and what `OUT_DIR` held before the run (P0.5) | C4: hash the package's content, its dependencies' ids, the environment cargo gives and, on Linux, the digests of what the sandbox recorded it reading. Impure scripts are never shared | D2 (a helper not running every script) |
 | proc-macro expansion keys (`ra-jit-expand`) | hold cwd and environment | C4: checkout-relative cwd, the environment cargo gives, recorded reads | D2 |
 | per-target-dir test records (`tests-reach`, `tests-passed`, `CARGO_BIN_EXE_*` by size and mtime, `affected.rs:213-228`) | yes | T2 | T2 |
 
@@ -1677,6 +1685,156 @@ a sans-IO state machine in `crates/blaze-dist`.
     lead that finds no helper free compiles alone, and two leads never hold helpers waiting for each
     other.
 
+### The protocol in `crates/blaze-dist`
+
+The work set, an executor's side of it, executions and admission are sans-IO state machines in
+`crates/blaze-dist` (unit dsm). Each call takes `now` and a `blaze-wire` request, answers with a
+`blaze-wire` answer or a refusal, and appends what it did to a log; nothing in the crate does IO,
+starts a thread or reads a clock. D0 drives them in the lead's process, D1 over HTTP, E3 and E4 in
+`ra-jit serve`. Where each rule of this section and section 5 lives:
+
+| Rule | Where |
+|---|---|
+| Join: the lead's `RootSet` authoritative, a first helper's provisional, a differing one fenced and refused, the work set restarted on the lead's list (step 1, c3-B2.3) | `work::WorkSet::join`, `join_lead`, `reset` |
+| Grant: names before roots, the first finder first; a holder's live lease asked for again is the same grant (step 2) | `WorkSet::lease`, `grant` |
+| Commit in one transition: outcomes, found names with their finder, conflicts, `Edge`s, packs, returned work back in the pool before the next generation, a replay answered as before (step 5, c3-B2.1) | `WorkSet::result`, `commit_name`, `register`, `shape` |
+| Done once the lead's root set is fixed, every root, name and edge terminal and no lease live (step 6) | `WorkSet::check_done` |
+| The fencing table: heartbeats, the progress timeout, a lost helper, a dead generation, the lead lost, the deadline (step 9, rb-M3) | `WorkSet::heartbeat`, `tick`, `lose`, `fence`, `new_attempt`, `end` |
+| Finder retention and `Lost` answers (c3-B2.2); an unknown name a conflict and `Local` (c3-B2 pre-index) | `holder::Holder::plan`, `committed`; `WorkSet::commit_name` |
+| A lead that misses three heartbeats, one reassignment, a dead attempt's calls refused, a second loss `Lost` ("Warm remote jobs") | `jobs::Execution::tick`, `assign`, `worker_events` |
+| One execution per `JobContent`, subscribers' own deadlines and policies, cancellation when the last leaves, a pull request's new push (E3, a-M6) | `jobs::Jobs::submit`, `Execution::unsubscribe`, `tick`, `jobs::local_action` |
+| Capacity and reservations, `Main` first, `Q`, platform matching, rebuild by drain (section 5, E4) | `admission::Admission` |
+
+What the crate fixes that this section leaves open, one line each:
+
+- A batch's items are its processed roots' in ascending index order, then its processed names'
+  in the grant's set order, one each. A result of another shape is refused `malformed` and its
+  lease revoked.
+- A holder's lease ends with the holder: 60 s with nothing heard from it (a heartbeat or any
+  work call) drops it and its findings, and it joins again as new. A lease revoked by the progress
+  timeout drops its holder the same way.
+- `Lost { lost-finding }` sends the name to another finder; `Lost { unknown-name }`, and a `Lost`
+  with any other reason, makes it terminal `Local` and counts a conflict.
+- An item reported `Exported` or `FromStore` with an `unnamed` request is committed `Local`.
+- A join with the same root set, and a lease asked for while one is live, are answered as before,
+  so a repeated message changes nothing.
+- Before the lead has joined, a helper whose root set differs from the provisional one is refused
+  `not-yet` with a retry time; after, `front-end-differs` for the attempt. A new lead whose root
+  set differs from the fixed one, after a reassignment, is authoritative too.
+- A lead that is loading its front end heartbeats; only a lead that stops heartbeating is lost.
+- A stop effect and its acknowledgment carry the execution and attempt that occupied the
+  executor slot. Only a matching pending stop releases that slot; a delayed duplicate cannot
+  release a newer assignment or finish its drain.
+- Worker events expire subscribers against their own deadlines before accepting a terminal
+  result, just as a timer does. Each subscriber receives its outcome once.
+- Worker ingress validates a whole batch before changing the stream, refusal or liveness.
+  Queued, Admitted, Assigned, Compiled and Done stages and `Assigned` events are coordinator-only.
+  A lead may report forward Fetched/Loaded/Published/Linked/Tested/Reported progress; stage
+  timestamps use coordinator time and duplicate latest stages do not append again. Post-compile
+  progress requires current authoritative completion, or explicit `NoCompileWork` admission.
+  A lead may also report `Published`, `Program`, `Verdict` and one final `Done` (Passed, Failed
+  or Refused), last in its batch. Both lead and helper may report `Output` and `Refused`;
+  helper stages and job verdicts, backwards progress, reserved stages and duplicate Done are
+  refused. Accepted stage updates always go through the coordinator's stage bookkeeping.
+- `ExecutionConfig::completion` defaults to `WorkProtocol`: Passed requires completed work,
+  the current lead's agreement, and the current attempt/root-epoch completion notification.
+  Retained work does not bypass a replacement lead's agreement. Admission may explicitly
+  choose `NoCompileWork` for verified cache-only artifacts or an already-built test shard;
+  that mode rejects work calls. Empty BuildSpec or a worker Stage is not that decision.
+- Refusals keep section 8's codes, and each message starts with a stable token (`dead-lease`,
+  `attempt-moved`, `not-joined`, `not-yet`, ...) that an executor reads back.
+- Admission is strict per platform: the head of `Main`'s queue first, a pull request's job only
+  while no `Main` job waits, and a head that cannot run blocks its class. An idle executor takes a
+  job only if its reservation covers the job's measured need.
+
+The permanent-stall regression keeps a promoted lead heartbeating without completing its
+batch. It checks deadline cancellation, no false coverage, fenced late results and stop effects.
+It does not establish successful recovery from a heartbeating stuck lead. These state machines
+and synthetic simulations do not certify compiler, transport, publication or process cleanup
+integration; their effects still need drivers.
+
+**The simulation.** `blaze_dist::sim` runs the machines on one thread over a seeded scheduler and a
+virtual clock, as roadmap.md's simulation backend describes. The work simulation puts the
+coordinator (inside an `Execution`) and two to four executors over a network that, until a fault
+horizon, loses up to 25% of messages, duplicates up to 15%, delays them up to 3 s (and so reorders
+them) and partitions executors; executors die before or after any effect, clocks run at 0.8 to
+1.25 times (one at 0.05 to 0.2), one helper may have another front end (a swapped tie, another
+root, impure inputs), one may stall past the progress timeout but eventually finishes, findings
+are dropped and call sites disagree on tuples. One
+executor never dies. The checker holds, from the coordinator's log and the calls it sees: no root
+or name in two live leases; no result committed for a fenced or expired lease (expiry by the
+checker's own clock), of another attempt, or after Done; at Done every root, found name and edge
+terminal, from exactly one accepted result whose item is the lead's front end's, or in the lead's
+tail; an unknown name a conflict or `Local`; Done reached unless the lead was lost twice or no
+lead was left; a correct holder never told it is malformed. The jobs simulation checks capacity,
+`Main` first and first in first out, `Q`, platform and namespace matching, assignment identity,
+attempts, subscriber deadlines, typed terminal delivery, public-stream stage order and that every
+execution ends. It injects forged worker stages and checks that rejected batches leave no prefix
+in the public stream. These jobs explicitly model `NoCompileWork`; compile coverage remains the
+work simulator's responsibility. Direct ingress tests cover both completion modes.
+`cargo test -p blaze-dist` runs 10,000 seeds of each and prints the seed of a failure with the
+command that replays it. The [review report](reports/DSM-REVIEW.md) records the regressions,
+validation commands, timings, mutation checks and the original integration limits.
+
+### Additive subscriber-terminal contract, version 2
+
+`blaze-wire::job_terminal_v2` adds a separate typed terminal response. It does not add a field or
+variant to `JobEvent` or edit `BuildSpec`. A v1 Done stream is retained for display and replay,
+but is **not** enough to preserve the termination reason: Lost can be NoLead or LeadLostTwice.
+NoLead is canonical Lost in both the v1 stream and subscriber delivery, whereas a reported
+build/test failure is Failed.
+The driver must return `Jobs::terminal(execution, subscriber)` verbatim, rather than synthesizing
+a reason from Done. `Effect::SubscriberEnded` carries this same immutable response.
+
+Proposed terminal route: `GET /v2/jobs/<execution>/subscribers/<subscriber>/terminal`.
+The HTTP body (or one existing length-delimited Unix response body) is exactly one deterministic
+CBOR map, content type `application/cbor`; no concatenated frames or JSON identities. A pending
+subscription has no terminal yet. Retries return the same record. The route's terminal-contract
+version is explicit in field 3's nested field 0, which must be 2.
+
+```
+SubscriberTerminalV2 = { 0: ExecutionId, 1: Attempt, 2: subscriber u64,
+                        3: { 0: version u32, 1: Outcome, 2: TerminationReasonV2 } }
+TerminationReasonV2 = [ discriminant, null ]
+  0 Reported          -> Passed | Failed | Refused
+  1 NoLead            -> Lost
+  2 LeadLostTwice      -> Lost
+  3 Cancelled          -> Cancelled
+  4 Deadline           -> Cancelled
+  5 SubscriberDeadline -> TimedOut
+```
+
+`decode_terminal` enforces negotiated `Limits.event` (1 MiB by default), normal schema depth
+(32), string/collection limits and canonical CBOR, including no trailing frame, unknown field
+or variant. Unsupported terminal versions and inconsistent pairs are rejected before policy.
+`local_action` now requires `TerminationV2` and returns a typed refusal for invalid contracts.
+Reported outcomes are verdicts under Never/Fallback/Race, including failed tests and refusals.
+Infrastructure, cancellation and timeout fail under Never and choose local work under
+Fallback/Race (Race's local arm is already running). A subscriber's own timeout remains distinct
+from the execution deadline. Old clients must fail incompatibility, not guess a fallback policy
+from a v1 outcome. The unpublished local 187e2a39 draft used Failed+NoLead; this is not an
+accepted alias. A consumer of that draft needs its pinned codec and an explicit checked
+conversion to canonical Lost+NoLead, not implicit dual decoding.
+
+This terminal version is **separate** from the general wire schema and digest-domain version.
+This lane inherits schema 1; C2's independent schema-2 branch adds required workspace/config
+fields and changes typed digest/signature domains to `/v2`. Combining the branches must preserve
+C2's global version/domains (including its schema-3 path work), merge the isolated module export, and update BuildSpec fixture
+literals. New terminal type names and explicit terminal version remain; this addition makes no
+promise that general schema-1 identities survive C2's change. Existing HTTP `/v1` routes and
+request-auth framing have their own versions. A general schema-1 peer requires its pinned codec,
+not a schema-2 decoder accepting old shapes.
+
+The codec, effect-to-response model and client-policy function are implemented and tested.
+The local Unix driver in [blaze-dist-local](../crates/blaze-dist-local/README.md) now implements
+length-framed deterministic CBOR, explicit transport/global-codec/terminal negotiation,
+daemon-issued session labels with deliberate release, actual registry routing and immutable
+typed terminal/pending lookup. It retains exact request replies over reconnect, enforces
+bounds and forwards real effects to the backend.
+Its CLI and socket tests do not supply a compiler holder or execute a fallback/race build.
+HTTP/fleet transport, source/store/compiler execution and production client-race behavior
+remain D1/E3 integration work.
+
 ### Export and ingestion (re-review B, B3)
 
 **What a batch end lacks today.** A batch ends holding `CompiledFunction`s, which are salsa memos
@@ -2064,14 +2222,34 @@ not in it, as in Bazel (**unverified**, inferred from what an action holds).
    there).
 4. **Flaky retries as Bazel's.** A test runs once, or up to three times when the manifest marks it
    `flaky`, as `--flaky_test_attempts=default` runs it (research/bazel-nativelink.md, citing
-   `ExecutionOptions.java:240-252`; **reported** here, read there); one that needed more than one attempt is reported FLAKY, and its pass is not cached
-   (whether Bazel caches such a result is **unverified**; not caching it costs only a rerun). What
-   a FLAKY test does to the job is the owner's `flake-policy` gate below.
+   `ExecutionOptions.java:240-252`; **reported** here, read there). One that passes on a later
+   attempt is reported FLAKY and its successful result is cached: Bazel retains `testPassed=true`
+   and `cachable=true` when changing PASSED to FLAKY (`StandaloneTestStrategy.java:228-239,678`),
+   and auto caching accepts it (`TestRunnerAction.java:576-588`; **read** in the T1 review).
+   What a FLAKY test does to the tracedecay job stays the owner's `flake-policy` gate below.
 
 How many of tracedecay's tests the contract caches is measured (gate GT), not assumed. Time is not
 virtualised and `HashMap`'s seed is not fixed: a test that reads either and passes is cached like any
 other passing test, as under Bazel, and the owner's `no-cache` marker is the remedy for a test that
 should not be.
+
+### Local affected-test implementation (T1)
+
+`RA_JIT_TESTS=affected` retains its existing per-test reach identities. In `blaze-tests.toml` at
+its workspace root, `data` declares files and directories and `env` names variables; the names
+in `RA_JIT_TEST_ENV` count too. Their contents, the effective configured environment,
+`--test-threads` and `RUST_TEST_THREADS` are digested into each pass. Changing them reruns the
+tests. `no_cache` and `external` name tests that always run, by libtest name, `package/name` or a
+pattern with `*` at an end. An unreadable manifest or declared input prevents reuse.
+Directory boundaries are part of the typed tree digest. Declared inherited environment
+values are forwarded to Linux sandboxed tests, with configured command overrides preserved.
+
+The manifest's `flaky` list gives a test three attempts, or `RA_JIT_FLAKY_TEST_ATTEMPTS` sets the
+number for all tests; otherwise a local test gets one attempt. Only failed tests retry, and an
+exhausted failure does not block another test's retry. A later pass is reported `Flaky` and
+cached. The existing Linux read-recording sandbox and the existing conservative behavior when
+no `data` is declared are unchanged by T1; no new effect classifier or audit mode is added.
+The remote `TestKey` and runtime bundle below belong to T2 and T3.
 
 ### Out of scope (owner, 2026-10-26): the stricter contract
 
@@ -2101,8 +2279,9 @@ manifest has to be matched against recordings:
 4. A manifest that holds in full is the pass's. The test is skipped and the report says so:
    "skipped: passed under the same inputs at abc1234". If none holds, or the test is marked
    `external` or `no-cache`, it runs.
-5. A passing run publishes its manifest and the verdict together; a failing run, or a run that
-   needed a retry, publishes nothing.
+5. A passing terminal result publishes its manifest and verdict together, including a success
+   after retries, which retains the `Flaky` verdict. A terminal failure publishes nothing.
+   Any job-level policy that rejects flaky results is separate from cache eligibility.
 
 ### Runtime bundles and shards
 
@@ -2716,27 +2895,38 @@ harness/tracedecay.py --predicate P0-C --runs 3`.
 Where: Mac. If 16 GB is not reached, the unit lands what it reached and the owner decides between
 the Linux host and a higher bar (open questions).
 
-**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D: the build-script runner of unit
-p05r, which takes `cargo check` out of the whole build and stays in scope. Lands PR #5 (unit u8,
-`dist/u8-buildscript`): the rerun in a copy of cargo's `OUT_DIR`, comparing the lines cargo reads,
-with its verifier's findings fixed (directory times kept in the copy, symlinks into the original
-not written through, the baseline digest taken before the rerun, invalid UTF-8 lines ignored as
-cargo ignores them). Then a script whose cargo-read output differs between two runs on the same
-inputs is marked impure instead of refused: run once per build (recording its reads where blaze's
-existing sandbox does, #147), its latest output used, as cargo does; never shared across
-machines. Files:
-`crates/ra-jit/src/cargo/script.rs` (`rerun_into`, `run_key`), `crates/blaze-build-script`,
-`harness/scriptrerun.py`. Depends: P0.1. Acceptance: a fixture script that prints a list of files git
-tracks and runs a tool that prints its own lines into an empty `OUT_DIR`: an edit is the daemon's,
-the list updated; the verifier's regressions pass. From the reviews:
+**P0.5 Build scripts rerun as cargo reruns them.** Goal: P0-D. Parks PR #5 (unit u8,
+`dist/u8-buildscript`), which failed four verifications on its interactions with the state cargo
+keeps in `target/debug`, and does its job in the whole build. The build-script runner of units
+p05w and p05r stays in scope: blaze compiles and runs scripts with its own records in
+`target/ra-jit/build-scripts`, without `cargo check` when the graph has no proc macros. A graph
+with proc macros still uses the load's check; that remaining path is no-rustc step J.
+
+The runner decides when to compile or run a script by cargo 1.99's rules
+(`blaze_build_script::fresh`): a file named by `rerun-if-changed` that is newer than the run or
+not there, a variable whose value changed (unset, empty and set are three), the package's files
+when the script named nothing, the script's own modules and the packages it is built with, and
+a run owed for having said other than the run before. It judges a script once for each build
+(a build is several requests to a worker, which cargo's every-build scripts must not follow).
+The scripts run with the variables of the process that asks; a variable the daemon was started
+with that the client lacks is unset for them. A run uses the `OUT_DIR` it left and is not
+replayed from the store. An impure script runs once per build, its latest output used
+(recording its reads where blaze's existing sandbox does, #147), and is never shared across
+machines. Files: `crates/ra-jit/src/scripts.rs`, `crates/ra-jit/src/inputs.rs`,
+`crates/blaze-build-script`, `crates/ra-jit/src/cargo/own_script.rs`,
+`crates/ra-jit/src/cargo/daemon.rs` (the build a request is for), `harness/scriptedits.py`.
+Depends: P0.1. Acceptance: `scriptedits.py`'s 42 probes, each blaze's whole build against cargo
+1.99.0 on the same project and edits, equal at every step in the build's status, how many times
+each script ran, and the program's exit status, standard output and standard error; each fix
+has a unit test; the tracedecay fixture is P0-D's. From the reviews:
 - [rb-N2] "Specify the number of measured edit and revert builds per run, one consistent
   denominator (for example 30/30), and whether the cold/warm preparation builds are excluded."
   Checked by: `--predicate P0-D --runs 5` counts 30 builds (5 runs × 3 edit kinds × an edit and its
   revert), excludes the one cold and one warm build before them, and passes only at 30 of 30 the
   daemon's, 0 `building with cargo`.
 
-Verify: `python3 -I harness/scriptrerun.py && python3 -I harness/scripts.py --impure && python3 -I
-harness/tracedecay.py --predicate P0-D --runs 5`. Where: Mac.
+Verify: `python3 -I harness/scriptedits.py && python3 -I harness/tracedecay.py --predicate P0-D
+--runs 5`. Where: Linux (Docker on the Mac until P0.6); the P0-D run on the Mac once P0.6 lands.
 
 **P0.6 The whole build on macOS arm64 (#255).** Goal: P0-E. The standard library's writable statics
 without a rustc symbol (`CLEANUP`, `GLOBAL_PANIC_COUNT`, `OUTPUT_CAPTURE_USED`, `INSTANCE`) are
@@ -3253,22 +3443,33 @@ Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and Docker 
 
 ### Phase 4: tests
 
-**T1 The cacheability contract (Bazel's).** Goal: section 6's rules 1 to 4: results cached as
-`cache_test_results=auto` caches them. Reduced by the scope ruling: **out of scope (owner,
-2026-10-26)** are the reach classifier that marks time, randomness, threads, sockets, unlisted
-spawns, foreign code and unlisted environment as always-run reasons, audit mode
-(`RA_JIT_TESTS=audit`) and 5% sampling. What remains: the key is the declared inputs; an
-`external` or `no-cache` marker from the owner's manifest makes a test always run; failures are
-never cached; flaky attempts as `flaky_test_attempts`. Files: `crates/ra-jit/src/cargo/affected.rs`,
-`harness/dist/fixtures/tests`. Depends: none. Acceptance: a fixture of tests, run twice: a pure
-test and a test that reads the clock and passes are each skipped the second time (as under Bazel);
-a change to a declared input (an argument, a declared environment variable, a bundle file's
-content or mode) runs the test; a test marked `external` and one marked `no-cache` run both
-times; a failing test runs again and is never served from the cache, and a later pass of it is
-cached; a test marked `flaky` that fails once and passes is run at most three times, reported
-FLAKY and not cached, and an unmarked one is run once; `--runs_per_test 2` is not cached.
+**T1 The cacheability contract.** Goal: section 6's contract, which is Bazel's
+`cache_test_results=auto` and no more (the owner's parity rule, 2026-10-26, which narrowed this
+unit from revision 3's classifier, audit mode and sampling). A pass is reused while the test, its
+declared inputs (`data` files and `env` variables of `blaze-tests.toml`) and the run configuration
+(`--test-threads`) are unchanged; `no_cache` and `external` opt a test out; a failed run keeps
+nothing; a test that fails is retried up to its attempts (`flaky` in the manifest,
+`RA_JIT_FLAKY_TEST_ATTEMPTS`) and reported `Flaky`. Files: `crates/ra-jit/src/cargo/affected.rs`,
+`crates/ra-jit/src/cargo/run.rs`, `harness/dist/fixtures/tests`, `harness/dist/tests.py`. Depends:
+none. The no-rustc audit (P0-A) remains pending: the fixtures have not run under it, and the
+harness says so. Acceptance: a fixture workspace in which an unchanged test is skipped
+on a second run; a changed test, a changed declared data file, a changed declared variable and a
+changed `--test-threads` or declared executable mode each rerun; a test opted out with
+`no_cache` and with `external` runs every time; a test that fails is not skipped at the next run,
+nor after its code goes back to what
+passed; a test that fails once is retried, reported `Flaky`, and cached, and with one attempt it
+fails the run. The complete parity gate also includes Bazel repeated-run requests
+(`--runs_per_test` above one) bypassing the cache; the current local harness has not measured
+that part. From the reviews:
+- [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
+  unknown effects instead of assuming libc is closed." Closed by the owner's decision, not by
+  code: Bazel's key has the same blind spots (research 7.10) and blaze holds to Bazel's. What
+  the unit checks instead is what Bazel gives the owner against them: the opt-out marker (a test
+  that reads the clock, `getpid` or a default map's seed and fails now and then is marked
+  `no_cache` or `flaky`) and the rerun of every failure.
+
 Verify: `python3 -I harness/testselect.py && python3 -I harness/dist/tests.py --contract`. Where:
-Mac. From the reviews: [b-B2] is accepted at parity (appendix A).
+Mac; the sandbox steps on Linux (Docker), **not run** for this unit.
 
 **T2 Passes across machines.** Goal: `TestKey` and `InputManifest` of declared files (the bundle's
 digests, modes and lengths; nothing recorded by running), logical paths, the server's results

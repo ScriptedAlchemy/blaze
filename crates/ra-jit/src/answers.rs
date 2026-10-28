@@ -26,6 +26,8 @@ pub(crate) fn own_answer(rustc: &Path, args: &[OsString]) -> Option<Vec<u8>> {
     own::answer(rustc, args, &[], &|_| None)
 }
 
+pub(crate) use own::target_cfg;
+
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
     "all-target-specs-json",
@@ -191,6 +193,9 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
     let program = Path::new(command.get_program()).file_stem()?.to_str()?.to_owned();
     match program.as_str() {
         "cargo" => {
+            if let Some(answer) = cargo_question(command) {
+                return Some(answer);
+            }
             ready_cargo(command);
             None
         }
@@ -200,6 +205,140 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
         }
         _ => None,
     }
+}
+
+/// Cargo's query-only front door. Answer with the owned configuration reader and
+/// toolchain records; never start Cargo merely to have it ask our rustc stand-in.
+fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
+    let args: Vec<String> =
+        command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
+    let var = |name: &str| var_of(command, name);
+    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (name, value) in command.get_envs() {
+        let name = name.to_str()?.to_owned();
+        match value {
+            Some(value) => env.insert(name, value.to_str()?.to_owned()),
+            None => env.remove(&name),
+        };
+    }
+    let cwd =
+        command.get_current_dir().map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
+    let output = |stdout: Vec<u8>, stderr: Vec<u8>, code: u8| {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(i32::from(code) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(u32::from(code))
+        };
+        Output { status, stdout, stderr }
+    };
+    if args.windows(2).any(|args| args == ["config", "get"]) {
+        let mut normalized = Vec::new();
+        let mut at = 0;
+        while at < args.len() {
+            if args[at] == "-Z" && args.get(at + 1).is_some_and(|it| it == "unstable-options") {
+                normalized.push("-Zunstable-options".to_owned());
+                at += 2;
+            } else {
+                normalized.push(args[at].clone());
+                at += 1;
+            }
+        }
+        let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
+        return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
+    }
+    let rustc = toolchain_rustc(command.get_program(), &var)?;
+    // A resolved Cargo path points into the same installation, but it is not rustc.
+    let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    if args == ["--version"] {
+        return own::cargo_version(&rustc).map(|stdout| Ok(output(stdout, Vec::new(), 0)));
+    }
+    if args.first().is_some_and(|it| it == "rustc")
+        && args.iter().any(|it| it == "--print" || it.starts_with("--print="))
+    {
+        let mut rustc_args = Vec::new();
+        let mut at = 1;
+        while at < args.len() {
+            let arg = &args[at];
+            at += 1;
+            if arg == "--" {
+                rustc_args.extend(args[at..].iter().map(OsString::from));
+                break;
+            }
+            if arg == "-Z" && args.get(at).is_some_and(|it| it == "unstable-options") {
+                at += 1;
+                continue;
+            }
+            if matches!(arg.as_str(), "--print" | "--target") {
+                rustc_args.push(OsString::from(arg));
+                rustc_args.push(OsString::from(args.get(at)?));
+                at += 1;
+            } else if arg.starts_with("--print=") || arg.starts_with("--target=") {
+                rustc_args.push(OsString::from(arg));
+            } else {
+                return None;
+            }
+        }
+        if !is_question(&rustc_args) {
+            return None;
+        }
+        // Cargo appends its effective flags before the rustc-only tail. In particular,
+        // --cfg participates in both program parsing and platform dependency resolution.
+        let explicit_target = rustc_args
+            .windows(2)
+            .find(|args| args[0] == "--target")
+            .and_then(|args| args[1].to_str())
+            .or_else(|| rustc_args.iter().find_map(|arg| arg.to_str()?.strip_prefix("--target=")));
+        // Past this point the query is ours: a missing model is a named gap, never Cargo's run.
+        let gap = |what: &str| {
+            Some(Err(io::Error::other(format!(
+                "owned toolchain query has no model for {what}: {rustc_args:?}; Cargo was not executed"
+            ))))
+        };
+        let Some(target) = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))
+        else {
+            return gap("the host target");
+        };
+        let Some(sysroot) = rustc.parent().and_then(Path::parent) else {
+            return gap("the toolchain's sysroot");
+        };
+        let Some(builtin) = own::target_cfg(sysroot, &target, &env) else {
+            return gap(&format!("target {target}'s built-in cfg"));
+        };
+        let cfg = builtin
+            .iter()
+            .map(|cfg| match cfg.split_once('=') {
+                Some((key, value)) => cfg::CfgAtom::KeyValue {
+                    key: intern::Symbol::intern(key),
+                    value: intern::Symbol::intern(value.trim_matches('"')),
+                },
+                None => cfg::CfgAtom::Flag(intern::Symbol::intern(cfg)),
+            })
+            .collect::<Vec<_>>();
+        let configured = || -> anyhow::Result<Vec<String>> {
+            let mut config = blaze_manifest::Config::load(&cwd, env.clone(), &[])?;
+            config.start("rustc", &[])?;
+            crate::scripts::rustflags(&config, &target, &cfg)
+        };
+        let flags = match configured() {
+            Ok(flags) => flags,
+            Err(error) => return Some(Err(io::Error::other(format!("{error:#}")))),
+        };
+        let mut effective = flags.into_iter().map(OsString::from).collect::<Vec<_>>();
+        effective.extend(rustc_args);
+        return Some(match own::answer(&rustc, &effective, &[], &var) {
+            Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
+            None => Err(io::Error::other(format!(
+                "owned toolchain query has no model for its effective flags: {effective:?}; \
+                 Cargo was not executed (docs/no-rustc.md#unmodeled-cpu-cfg-queries)"
+            ))),
+        });
+    }
+    None
 }
 
 /// Has a cargo ask rustc through ra-jit, unless the user named a wrapper of their own: one
@@ -384,5 +523,122 @@ mod tests {
         assert!(!question("--print cfg --target my-target.json"));
         assert!(!question("@args.txt"));
         assert!(!question(""));
+    }
+
+    #[test]
+    fn cargo_config_queries_are_answered_from_the_request_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".cargo")).unwrap();
+        std::fs::write(
+            dir.path().join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"from_file\"]\n",
+        )
+        .unwrap();
+        // A deliberately nonexistent executable: this query must be answered in-process.
+        let executable = dir.path().join("absent-query-tool");
+        let mut command = Command::new(&executable);
+        command.current_dir(dir.path()).args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "--format",
+            "json-value",
+            "build.rustflags",
+        ]);
+        let result = cargo_question(&mut command).expect("owned config query").unwrap();
+        assert!(result.status.success());
+        let got: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(got, serde_json::json!(["--cfg", "from_file"]));
+        command.env("CARGO_BUILD_RUSTFLAGS", "--cfg request");
+        let result = cargo_question(&mut command).unwrap().unwrap();
+        assert!(result.status.success());
+        assert_ne!(result.stdout, b"");
+    }
+
+    #[test]
+    fn independent_cargo_prints_stay_owned_with_unmodeled_codegen_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = dir.path();
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        let rustlib = toolchain.join("lib/rustlib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(toolchain.join("lib/librustc_driver-test.so"), "").unwrap();
+        std::fs::write(rustlib.join("manifest-rustc-aarch64-unknown-linux-gnu"), "").unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        std::fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            format!("\n[pkg.rustc]\nversion = {:?}\n", release["version"].as_str().unwrap()),
+        )
+        .unwrap();
+        let executable = toolchain.join("bin/cargo");
+        std::fs::write(&executable, "this tool must not be executed").unwrap();
+        exercise_independent_prints(&executable, toolchain);
+        // The targeted ownership harness supplies an armed norustc stand-in tree.
+        // The synthetic non-executable control above always runs as well.
+        if let Some(path) = std::env::var_os("RA_JIT_TEST_QUERY_TOOLCHAIN") {
+            let path = PathBuf::from(path);
+            exercise_independent_prints(&path.join("bin/cargo"), &path);
+        }
+    }
+
+    fn exercise_independent_prints(executable: &Path, toolchain: &Path) {
+        for kind in ["target-libdir", "sysroot", "target-spec-json", "file-names"] {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args([
+                "rustc",
+                "-Z",
+                "unstable-options",
+                "--print",
+                kind,
+            ]);
+            if kind == "file-names" {
+                command.args(["--", "-", "--crate-name", "___", "--crate-type", "rlib"]);
+            } else if kind == "target-spec-json" {
+                command.args(["--", "-Z", "unstable-options"]);
+            }
+            command.env("RUSTFLAGS", "-Ctarget-cpu=native -Crelocation-model=pic");
+            command.env("RUSTC_BOOTSTRAP", "1");
+            for key in [
+                "SDKROOT",
+                "MACOSX_DEPLOYMENT_TARGET",
+                "RUST_TARGET_PATH",
+                "RUSTC_OVERRIDE_VERSION_STRING",
+            ] {
+                command.env_remove(key);
+            }
+            let answer = ask(&mut command).expect("must not hand the query to Cargo").unwrap();
+            assert!(answer.status.success() && !answer.stdout.is_empty(), "{kind}");
+        }
+        for kind in ["sysroot", "target-libdir"] {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", kind]);
+            command.env("RUSTFLAGS", "--sysroot /elsewhere -Ctarget-cpu=native");
+            let answer = ask(&mut command).expect("sysroot flags stay owned").unwrap();
+            let text = String::from_utf8(answer.stdout).unwrap();
+            assert!(text.starts_with("/elsewhere"), "{kind}: {text}");
+        }
+        let mut command = Command::new(executable);
+        command.current_dir(toolchain).args(["rustc", "--print", "cfg", "--", "-O"]);
+        command.env("RUSTFLAGS", "-Ctarget-cpu=native");
+        command.env("RUSTC_BOOTSTRAP", "1");
+        let error = ask(&mut command).expect("cfg gap must not hand off to Cargo").unwrap_err();
+        assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+        // A target or bootstrap setting the answers do not model is a named gap, not Cargo's run.
+        for (target, bootstrap) in
+            [(Some("bogus-unknown-none"), "1"), (None, "somecrate"), (None, "-1")]
+        {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", "sysroot"]);
+            if let Some(target) = target {
+                command.args(["--target", target]);
+            }
+            command.env("RUSTC_BOOTSTRAP", bootstrap);
+            let answer = ask(&mut command).expect("an unmodeled print must not hand off to Cargo");
+            if let Err(error) = answer {
+                assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+            }
+        }
     }
 }

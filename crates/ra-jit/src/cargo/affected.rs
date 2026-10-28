@@ -7,9 +7,26 @@
 //! every test, as cargo does. A test that reaches the world outside its code runs in a
 //! sandbox that records what it touched, and runs again only when that changed too
 //! ([`sandboxed`]); where there is no sandbox, it runs every time.
+//!
+//! This is Bazel's `cache_test_results=auto` (docs/distributed.md, section 6): a pass is reused
+//! while the test, the inputs its owner declared and the way it is run are the same. The owner
+//! declares them, and opts tests out, in [`MANIFEST`]:
+//!
+//! - `no_cache` (or `external`, which Bazel gives the same effect) names tests that run every
+//!   time, and a pass is never kept of a test that failed;
+//! - `data` and `env` are what every test is given, as Bazel's `data` and `--test_env` are:
+//!   they are part of what a pass was under, and a test that reaches files runs without a
+//!   sandbox when `data` is declared, trusting that declaration as Bazel does;
+//! - `flaky` names tests that get several attempts, and [`ATTEMPTS`] says how many a test gets
+//!   in all, as Bazel's `flaky = True` and `--flaky_test_attempts` do.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -19,6 +36,23 @@ use super::{
 };
 
 pub(crate) const VAR: &str = "RA_JIT_TESTS";
+
+/// The file in the root of the workspace where its owner opts tests out of the cache and
+/// declares what they are given ([`Manifest`]).
+pub(crate) const MANIFEST: &str = "blaze-tests.toml";
+
+/// How many times a test that fails is run in all, before it fails the run: a number, or
+/// `default` (Bazel's `--flaky_test_attempts` default) for [`FLAKY_ATTEMPTS`] of a test the
+/// manifest marks `flaky` and one for the others.
+pub(crate) const ATTEMPTS: &str = "RA_JIT_FLAKY_TEST_ATTEMPTS";
+
+/// Additional inherited variables the owner declares for the sandboxed test environment.
+pub(crate) fn declared_env(state: &State) -> Vec<String> {
+    Manifest::read(&state.root).0.map(|it| it.env).unwrap_or_default()
+}
+
+/// The attempts of a test marked `flaky`, as Bazel gives it.
+const FLAKY_ATTEMPTS: usize = 3;
 
 /// The file beside a program of tests with the tests that passed, one a line: what
 /// [`plan::REACH`] said of the test then, a tab and its name.
@@ -134,6 +168,7 @@ pub(crate) fn pick(
     state: &State,
     test: &Program,
     sandbox: Option<&str>,
+    command: &Command,
 ) -> Pick {
     if !on() || !asked.positional.is_empty() || !plain(&asked.trailing) {
         return Pick::Asked;
@@ -147,7 +182,9 @@ pub(crate) fn pick(
         .filter_map(|it| it.split_once('\t'))
         .map(|(identity, name)| (name, identity))
         .collect();
-    let programs = programs_run_by(state, test);
+    let manifest = Manifest::read(&state.root);
+    let given = manifest.given(&state.root, &asked.trailing, command);
+    let programs = format!("{}{}", programs_run_by(state, test), given.as_deref().unwrap_or(""));
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -158,8 +195,17 @@ pub(crate) fn pick(
             return Pick::Asked;
         }
         total += 1;
+        let why = manifest.opts_out(&test.package, name).or_else(|| given.as_ref().err().cloned());
+        if let Some(why) = why {
+            names.push(name.to_owned());
+            always.push(Always { name: name.to_owned(), why, path: None });
+            continue;
+        }
         let outside = hash.strip_prefix('~');
-        if hash == "-" || outside.is_some() && sandbox.is_none() {
+        // Without a sandbox to record what a test reads, the files it was declared to be given
+        // are all there is to go by.
+        let unrecorded = sandbox.is_none() && !manifest.declares_data();
+        if hash == "-" || outside.is_some() && unrecorded {
             names.push(name.to_owned());
             let why = parts.next().unwrap_or_default().to_owned();
             let path = parts.next().map(str::to_owned);
@@ -199,11 +245,33 @@ pub(crate) fn pick(
 /// them, runs as asked.
 fn plain(trailing: &[String]) -> bool {
     let mut args = trailing.iter();
+    let mut seen = BTreeSet::new();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-q" | "--quiet" | "--nocapture" | "--no-capture" | "--show-output" => {}
-            "--test-threads" | "--color" if args.next().is_some() => {}
-            _ if arg.starts_with("--test-threads=") || arg.starts_with("--color=") => {}
+        let (name, value) =
+            arg.split_once('=').map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        let name = match name {
+            "-q" => "--quiet",
+            name => name,
+        };
+        // A cache hit must not turn an invalid libtest invocation into success.
+        // These options are single-use, including -q/--quiet's shared spelling.
+        if !seen.insert(name) {
+            return false;
+        }
+        match name {
+            "--quiet" | "--nocapture" | "--no-capture" | "--show-output" if value.is_none() => {}
+            "--test-threads" | "--color" => {
+                let value = value.or_else(|| args.next().map(String::as_str));
+                let valid = match name {
+                    "--test-threads" => value
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .is_some_and(|threads| threads > 0),
+                    _ => matches!(value, Some("auto" | "always" | "never")),
+                };
+                if !valid {
+                    return false;
+                }
+            }
             _ => return false,
         }
     }
@@ -231,9 +299,262 @@ fn programs_run_by(state: &State, test: &Program) -> String {
     format!("-{hex}")
 }
 
+/// What the owner wrote in [`MANIFEST`], or why it can't be read.
+struct Manifest(Result<Declared, String>);
+
+/// The keys of [`MANIFEST`]. Each is a list; a test is named by its name as libtest shows it
+/// or `package/name`, and a `*` at either end stands for any text.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct Declared {
+    /// Tests that run every time: Bazel's `no-cache` tag.
+    no_cache: Vec<String>,
+    /// Tests that run every time: Bazel's `external` tag, which has the same effect here.
+    external: Vec<String>,
+    /// Files and directories every test is given, relative to the manifest: Bazel's `data`.
+    data: Vec<String>,
+    /// Variables of the environment every test is given: Bazel's `--test_env`.
+    env: Vec<String>,
+    /// Tests that get [`FLAKY_ATTEMPTS`]: Bazel's `flaky = True`.
+    flaky: Vec<String>,
+}
+
+impl Manifest {
+    fn read(root: &Path) -> Manifest {
+        let file = root.join(MANIFEST);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Manifest(Ok(Declared::default()));
+            }
+            Err(error) => return Manifest(Err(format!("{}: {error}", file.display()))),
+        };
+        // A key it does not have is refused rather than ignored: a typo would leave a test
+        // cached that its owner opted out.
+        Manifest(toml::from_str(&text).map_err(|error| format!("{}: {error}", file.display())))
+    }
+
+    /// Why the owner has the test `name` of `package` run every time, if it does. A manifest
+    /// that can't be read opts every test out: nothing is known of which it marks.
+    fn opts_out(&self, package: &str, name: &str) -> Option<String> {
+        let declared = match &self.0 {
+            Ok(declared) => declared,
+            Err(why) => return Some(format!("`{MANIFEST}` can't be read ({why})")),
+        };
+        let tags = [("no_cache", &declared.no_cache), ("external", &declared.external)];
+        tags.into_iter().find_map(|(tag, names)| {
+            let named = names.iter().find(|it| names_test(it, package, name))?;
+            Some(format!("`{MANIFEST}` opts it out of the cache (`{tag}`: `{named}`)"))
+        })
+    }
+
+    /// Whether the owner declared files the tests are given.
+    fn declares_data(&self) -> bool {
+        self.0.as_ref().is_ok_and(|it| !it.data.is_empty())
+    }
+
+    /// What stands for how the tests are run and what they are given: `--test-threads`, the
+    /// contents of the files of `data` (and which are not there), and the value of each
+    /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
+    /// pass was under another runs.
+    fn given(&self, root: &Path, trailing: &[String], command: &Command) -> Result<String, String> {
+        let declared = self.0.as_ref().map_err(Clone::clone)?;
+        let mut hash = Sha256::new();
+        hash.update(b"test inputs 2\0threads\0");
+        match test_threads(trailing) {
+            Some(value) => {
+                hash.update(b"set\0");
+                hash.update(value.as_bytes());
+            }
+            None => hash.update(b"unset"),
+        }
+        hash.update([0]);
+        match environment(command, "RUST_TEST_THREADS") {
+            Some(value) => {
+                hash.update(b"set\0");
+                hash.update(value.as_encoded_bytes());
+            }
+            None => hash.update(b"unset"),
+        }
+        hash.update(b"\0data\0");
+        for path in &declared.data {
+            hash.update(path.as_bytes());
+            hash.update([0]);
+            let input = root.join(path);
+            let digest = data_hash(&input, &mut BTreeSet::new()).map_err(|error| {
+                format!("declared data `{}` can't be read ({error})", input.display())
+            })?;
+            hash.update(digest);
+        }
+        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+        let mut names: Vec<&str> =
+            declared.env.iter().map(String::as_str).chain(passed.split(',')).collect();
+        names.retain(|it| !it.trim().is_empty());
+        names.sort_unstable();
+        names.dedup();
+        hash.update(b"env\0");
+        for name in names {
+            hash.update(name.as_bytes());
+            hash.update([0]);
+            match environment(command, name) {
+                Some(value) => {
+                    hash.update(b"set\0");
+                    hash.update(value.as_encoded_bytes());
+                }
+                None => hash.update(b"unset"),
+            }
+            hash.update([0]);
+        }
+        let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
+        Ok(format!("+{hex}"))
+    }
+
+    fn marks_flaky(&self, package: &str, name: &str) -> bool {
+        let flaky = self.0.as_ref().map(|it| &it.flaky[..]).unwrap_or_default();
+        flaky.iter().any(|it| names_test(it, package, name))
+    }
+}
+
+/// Whether `pattern`, a name as libtest shows it or `package/name`, names the test.
+fn names_test(pattern: &str, package: &str, name: &str) -> bool {
+    glob(pattern, name) || glob(pattern, &format!("{package}/{name}"))
+}
+
+/// Whether `text` is `pattern`, which may have a `*` at its start or at its end for any text.
+fn glob(pattern: &str, text: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        _ if pattern == "*" => true,
+        (Some(tail), _) if !tail.contains('*') => text.ends_with(tail),
+        (_, Some(head)) if !head.contains('*') => text.starts_with(head),
+        _ => pattern == text,
+    }
+}
+
+/// The value after `--test-threads` in what follows `--`, which is how the tests are run that
+/// can change how they end.
+fn test_threads(trailing: &[String]) -> Option<&str> {
+    let mut args = trailing.iter();
+    while let Some(arg) = args.next() {
+        match arg.strip_prefix("--test-threads=") {
+            Some(value) => return Some(value),
+            None if arg == "--test-threads" => return args.next().map(String::as_str),
+            None => {}
+        }
+    }
+    None
+}
+
+/// The value the test receives, including Cargo's configured overrides and removals.
+fn environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == name)
+        .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()))
+}
+
+/// Each child has its own digest: file bytes cannot impersonate the next directory entry.
+/// A path we cannot finish reading is not evidence for reusing a pass. Following symlinks
+/// keeps their target's contents in the key, with cycles rejected instead of recursing forever.
+fn data_hash(path: &Path, visiting: &mut BTreeSet<PathBuf>) -> std::io::Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Sha256::digest(b"absent").into());
+        }
+        Err(error) => return Err(error),
+    };
+    if meta.is_symlink() {
+        hash.update(b"link\0");
+        let target = std::fs::read_link(path)?;
+        let bytes = target.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+        let here =
+            path.parent().unwrap_or(Path::new(".")).canonicalize()?.join(path.file_name().unwrap());
+        if !visiting.insert(here.clone()) {
+            return Err(std::io::Error::other("symlink cycle"));
+        }
+        let target = path.parent().unwrap_or(Path::new(".")).join(target);
+        let result = data_hash(&target, visiting);
+        visiting.remove(&here);
+        hash.update(result?);
+    } else if meta.is_dir() {
+        hash.update(b"dir");
+        let here = path.canonicalize()?;
+        if !visiting.insert(here.clone()) {
+            return Err(std::io::Error::other("directory cycle"));
+        }
+        let mut names = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|it| it.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        hash.update((names.len() as u64).to_le_bytes());
+        for name in names {
+            hash.update((name.as_encoded_bytes().len() as u64).to_le_bytes());
+            hash.update(name.as_encoded_bytes());
+            hash.update(data_hash(&path.join(name), visiting)?);
+        }
+        visiting.remove(&here);
+    } else if meta.is_file() {
+        hash.update(b"file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            hash.update((meta.permissions().mode() & 0o111).to_le_bytes());
+        }
+        let mut file = std::fs::File::open(path)?;
+        std::io::copy(&mut file, &mut hash)?;
+    } else {
+        return Err(std::io::Error::other("not a regular file or directory"));
+    }
+    Ok(hash.finalize().into())
+}
+
+/// How many attempts each test gets before it fails the run.
+pub(crate) struct Attempts {
+    /// What [`ATTEMPTS`] says, when it says a number.
+    all: Option<usize>,
+    manifest: Manifest,
+}
+
+pub(crate) fn attempts(state: &State) -> Attempts {
+    let all = std::env::var(ATTEMPTS).ok().and_then(|it| it.trim().parse().ok());
+    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(&state.root) }
+}
+
+impl Attempts {
+    #[cfg(test)]
+    pub(super) fn with_flaky(names: &[&str]) -> Self {
+        Self {
+            all: None,
+            manifest: Manifest(Ok(Declared {
+                flaky: names.iter().map(|it| (*it).to_owned()).collect(),
+                ..Declared::default()
+            })),
+        }
+    }
+
+    /// The attempts of the test `name` of `package`: the number asked for, or, as Bazel's
+    /// `default` has it, three for a test the manifest marks `flaky` and one for the others.
+    pub(crate) fn of(&self, package: &str, name: &str) -> usize {
+        match self.all {
+            Some(all) => all,
+            None if self.manifest.marks_flaky(package, name) => FLAKY_ATTEMPTS,
+            None => 1,
+        }
+    }
+
+    /// Whether some test may get more than one, so that failures have to be listed.
+    pub(crate) fn any(&self) -> bool {
+        self.all.is_some_and(|it| it > 1)
+            || self.all.is_none() && self.manifest.0.as_ref().is_ok_and(|it| !it.flaky.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::plain;
+    use super::*;
 
     fn of(args: &[&str]) -> bool {
         plain(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())
@@ -248,5 +569,210 @@ mod tests {
         assert!(!of(&["--list"]));
         assert!(!of(&["--test-threads"]));
         assert!(!of(&["some_test"]));
+    }
+
+    #[test]
+    fn invalid_libtest_options_cannot_reuse_a_cached_pass() {
+        for args in [
+            vec!["--color=bogus"],
+            vec!["--color", ""],
+            vec!["--color=never", "--color=always"],
+            vec!["--test-threads=0"],
+            vec!["--test-threads=invalid"],
+            vec!["--test-threads=1", "--test-threads=0"],
+            vec!["--test-threads", "1", "--test-threads=2"],
+            vec!["-q", "--quiet"],
+            vec!["--nocapture", "--nocapture"],
+            vec!["--show-output", "--show-output"],
+        ] {
+            assert!(!of(&args), "libtest must diagnose {args:?}, even after a cached pass");
+        }
+        // Libtest registers these two spellings as separate flags.
+        assert!(of(&["--nocapture", "--no-capture"]));
+        assert!(of(&["--test-threads=+1", "--color=auto"]));
+    }
+
+    fn manifest(text: &str) -> Manifest {
+        Manifest(toml::from_str(text).map_err(|error| error.to_string()))
+    }
+
+    #[test]
+    fn a_name_opts_a_test_out_the_way_bazels_tags_do() {
+        let manifest = manifest(
+            "no_cache = [\"tests::clock\", \"slow::*\"]\nexternal = [\"tsel/it_net\", \"*::net\"]\n",
+        );
+        let why = |package, name| manifest.opts_out(package, name);
+        assert!(why("tsel", "tests::clock").unwrap().contains("`no_cache`"));
+        assert!(why("other", "slow::sort").is_some());
+        assert!(why("tsel", "it_net").unwrap().contains("`external`"));
+        assert!(why("other", "it_net").is_none());
+        assert!(why("other", "a::net").is_some());
+        assert!(why("tsel", "tests::plain").is_none());
+        // What can't be read opts every test out.
+        let broken = Manifest(Err("expected `=`".to_owned()));
+        assert!(broken.opts_out("tsel", "tests::plain").unwrap().contains("can't be read"));
+    }
+
+    #[test]
+    fn the_manifest_is_read_from_the_root_and_refuses_what_it_does_not_have() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Manifest::read(&dir).0.is_ok_and(|it| it.no_cache.is_empty()));
+        std::fs::write(dir.join(MANIFEST), "no_cache = [\"a\"]\ndata = [\"d\"]\nflaky = [\"f\"]\n")
+            .unwrap();
+        let read = Manifest::read(&dir);
+        assert!(read.declares_data() && read.marks_flaky("p", "f") && !read.marks_flaky("p", "g"));
+        std::fs::write(dir.join(MANIFEST), "no_cash = [\"a\"]\n").unwrap();
+        assert!(Manifest::read(&dir).0.is_err());
+        std::fs::write(dir.join(MANIFEST), "no_cache = [\"a\"\n").unwrap();
+        assert!(Manifest::read(&dir).0.is_err());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pass_is_under_the_inputs_the_owner_declared_and_how_the_tests_are_run() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-given-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/a.txt"), "a").unwrap();
+        let declared = manifest("data = [\"data\", \"missing.txt\"]\nenv = [\"T1_GIVEN\"]\n");
+        let given = |it: &Manifest, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+            it.given(&dir, &args, &Command::new("test"))
+        };
+        let before = given(&declared, &[]);
+        assert_eq!(before, given(&declared, &["--nocapture"]), "display options are not it");
+        assert_ne!(before, given(&declared, &["--test-threads=1"]));
+        assert_eq!(
+            given(&declared, &["--test-threads=1"]),
+            given(&declared, &["--test-threads", "1"])
+        );
+        std::fs::write(dir.join("data/a.txt"), "b").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a declared file changed");
+        std::fs::write(dir.join("data/a.txt"), "a").unwrap();
+        assert_eq!(before, given(&declared, &[]));
+        std::fs::write(dir.join("data/new.txt"), "").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a file was added to a declared directory");
+        std::fs::remove_file(dir.join("data/new.txt")).unwrap();
+        std::fs::write(dir.join("missing.txt"), "").unwrap();
+        assert_ne!(before, given(&declared, &[]), "a declared path that was absent exists");
+        std::fs::remove_file(dir.join("missing.txt")).unwrap();
+        assert_eq!(before, given(&declared, &[]));
+        assert_ne!(before, given(&manifest(""), &[]));
+        let mut command = Command::new("test");
+        command.env("T1_GIVEN", "configured");
+        assert_ne!(
+            before,
+            declared.given(&dir, &[], &command),
+            "the effective test environment is keyed"
+        );
+        let mut threads = Command::new("test");
+        threads.env("RUST_TEST_THREADS", "1");
+        let one = declared.given(&dir, &[], &threads);
+        threads.env("RUST_TEST_THREADS", "2");
+        assert_ne!(one, declared.given(&dir, &[], &threads), "configured test threads are keyed");
+        threads.env_remove("RUST_TEST_THREADS");
+        let absent = declared.given(&dir, &[], &threads);
+        threads.env("RUST_TEST_THREADS", "");
+        assert_ne!(absent, declared.given(&dir, &[], &threads), "empty is not unset");
+        assert_ne!(before, given(&declared, &["--test-threads="]), "empty is not the default");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_file_out_of_a_directory_changes_the_declared_key() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-tree-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("d/a")).unwrap();
+        std::fs::write(dir.join("d/a/b"), "hello").unwrap();
+        let declared = manifest("data = [\"d\"]");
+        let before = declared.given(&dir, &[], &Command::new("test")).unwrap();
+        std::fs::rename(dir.join("d/a/b"), dir.join("d/b")).unwrap();
+        assert_ne!(before, declared.given(&dir, &[], &Command::new("test")).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn data_file_bytes_cannot_impersonate_another_directory_entry() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-framing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"xb\0filey").unwrap();
+        let one = data_hash(&dir, &mut BTreeSet::new()).unwrap();
+        // The previous encoding of these two distinct trees was identical:
+        // `dir` + `a\0file` + `xb\0filey`.
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        std::fs::write(dir.join("b"), b"y").unwrap();
+        let two = data_hash(&dir, &mut BTreeSet::new()).unwrap();
+        assert_ne!(one, two);
+        assert_eq!(two, data_hash(&dir, &mut BTreeSet::new()).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_data_links_track_targets_and_cycles_disable_reuse() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"one").unwrap();
+        symlink("target", dir.join("link")).unwrap();
+        let declared = manifest("data = [\"link\"]\n");
+        let command = Command::new("test");
+        let one = declared.given(&dir, &[], &command).unwrap();
+        std::fs::write(dir.join("target"), b"two").unwrap();
+        assert_ne!(one, declared.given(&dir, &[], &command).unwrap());
+        std::fs::remove_file(dir.join("link")).unwrap();
+        symlink(".", dir.join("link")).unwrap();
+        assert!(declared.given(&dir, &[], &command).unwrap_err().contains("cycle"));
+        std::fs::remove_file(dir.join("link")).unwrap();
+        symlink("other", dir.join("link")).unwrap();
+        symlink("link", dir.join("other")).unwrap();
+        assert!(declared.given(&dir, &[], &command).unwrap_err().contains("cycle"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_tools_executable_mode_is_part_of_its_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("ra-jit-data-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = data_hash(&file, &mut BTreeSet::new()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(before, data_hash(&file, &mut BTreeSet::new()).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_file_data_cannot_be_cached_as_empty_or_opened_as_a_stream() {
+        let declared = manifest("data = [\"/dev/null\"]\n");
+        assert!(declared.given(Path::new("."), &[], &Command::new("test")).is_err());
+    }
+
+    #[test]
+    fn a_test_gets_the_attempts_asked_for_or_bazels_default() {
+        let flaky = manifest("flaky = [\"tests::net\"]\n");
+        let by_default = Attempts { all: None, manifest: flaky };
+        assert_eq!(by_default.of("p", "tests::net"), FLAKY_ATTEMPTS);
+        assert_eq!(by_default.of("p", "tests::plain"), 1);
+        assert!(by_default.any());
+        let asked = Attempts { all: Some(2), manifest: manifest("flaky = [\"tests::net\"]\n") };
+        assert_eq!((asked.of("p", "tests::net"), asked.of("p", "tests::plain")), (2, 2));
+        let once = Attempts { all: Some(1), manifest: manifest("flaky = [\"tests::net\"]\n") };
+        assert_eq!(once.of("p", "tests::net"), 1);
+        assert!(!once.any() && !Attempts { all: None, manifest: manifest("") }.any());
+    }
+
+    #[test]
+    fn successful_results_are_kept_and_failures_are_removed() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-retried-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tests = [("a", "1"), ("b", "2")].map(|(n, i)| (n.to_owned(), i.to_owned())).into();
+        let passed = Passed { file: dir.join(PASSED), tests, kept: None };
+        passed.failed(None, Some(&["a".to_owned()]));
+        assert_eq!(std::fs::read_to_string(dir.join(PASSED)).unwrap(), "2\tb\n");
+        _ = std::fs::remove_dir_all(&dir);
     }
 }

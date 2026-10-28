@@ -365,6 +365,8 @@ pub(super) struct Recorder<'db> {
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
     pub(super) isa: &'static dyn TargetIsa,
+    /// Captured from the crate input for this compile; detached tiers retain it too.
+    pub(super) machine: hir_ty::mir::codegen_options::TargetMachine,
     pub(super) requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -379,6 +381,7 @@ impl Wants {
     pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
         Wants {
             isa,
+            machine: Default::default(),
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -389,6 +392,11 @@ impl Wants {
 
     pub(super) fn into_requests(self) -> Requests {
         self.requests
+    }
+
+    #[cfg(test)]
+    fn moved_machine(self) -> hir_ty::mir::codegen_options::TargetMachine {
+        self.machine
     }
 
     /// The bytes of each data object asked for so far that is read-only and points nowhere,
@@ -646,6 +654,100 @@ impl Wants {
     }
 }
 
+#[cfg(test)]
+mod machine_transport_tests {
+    use super::*;
+
+    #[salsa::db]
+    #[derive(Default)]
+    struct Database {
+        storage: salsa::Storage<Self>,
+    }
+
+    impl std::fmt::Debug for Database {
+        fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fmt.write_str("machine transport test database")
+        }
+    }
+
+    #[salsa::db]
+    impl salsa::Database for Database {}
+
+    #[salsa::db]
+    impl base_db::SourceDatabase for Database {
+        fn file_text(&self, _: FileId) -> base_db::FileText {
+            unreachable!()
+        }
+        fn set_file_text(&mut self, _: FileId, _: &str) {
+            unreachable!()
+        }
+        fn set_file_text_with_durability(&mut self, _: FileId, _: &str, _: salsa::Durability) {
+            unreachable!()
+        }
+        fn source_root(&self, _: base_db::SourceRootId) -> base_db::SourceRootInput {
+            unreachable!()
+        }
+        fn file_source_root(&self, _: FileId) -> base_db::FileSourceRootInput {
+            unreachable!()
+        }
+        fn set_file_source_root_with_durability(
+            &mut self,
+            _: FileId,
+            _: base_db::SourceRootId,
+            _: salsa::Durability,
+        ) {
+            unreachable!()
+        }
+        fn set_source_root_with_durability(
+            &mut self,
+            _: base_db::SourceRootId,
+            _: triomphe::Arc<base_db::SourceRoot>,
+            _: salsa::Durability,
+        ) {
+            unreachable!()
+        }
+        fn crates_map(&self) -> triomphe::Arc<base_db::CratesMap> {
+            unreachable!()
+        }
+        fn nonce_and_revision(&self) -> (base_db::Nonce, salsa::Revision) {
+            unreachable!()
+        }
+        fn line_column(
+            &self,
+            _: FileId,
+            _: syntax::TextSize,
+        ) -> std::result::Result<(u32, u32), ()> {
+            unreachable!()
+        }
+    }
+
+    #[salsa::db]
+    impl HirDatabase for Database {
+        fn as_dyn(&self) -> &dyn HirDatabase {
+            self
+        }
+        fn type_name<'db>(&'db self, _: Ty<'db>, _: hir_def::ModuleId) -> String {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn wants_owns_the_machine_retained_when_the_recorder_is_detached() {
+        let isa = super::super::target().unwrap();
+        let db = Database::default();
+        let mut recorder =
+            Recorder::new(&db, &**isa, super::super::selected_target().unwrap(), false);
+        let machine = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-feature=+lse".to_owned(),
+            "-Ctarget-cpu=generic".to_owned(),
+            "-Copt-level=3".to_owned(),
+        ]);
+        recorder.set_machine(machine.clone());
+        let (wants, _) = recorder.detach();
+        assert_eq!(wants.moved_machine(), machine);
+    }
+}
+
 impl<'db> std::ops::Deref for Recorder<'db> {
     type Target = Wants;
 
@@ -661,6 +763,12 @@ impl<'db> std::ops::DerefMut for Recorder<'db> {
 }
 
 impl<'db> Recorder<'db> {
+    /// Recorder dereferences to Wants, so the machine is already carried by detach.
+    /// Set it explicitly to make that producer/tier transport unambiguous.
+    pub(super) fn set_machine(&mut self, machine: hir_ty::mir::codegen_options::TargetMachine) {
+        self.wants.machine = machine;
+    }
+
     /// The stack slots that hold a local written with a name.
     pub(super) fn named_slots(&self) -> impl Iterator<Item = ir::StackSlot> + '_ {
         self.named.iter().map(|it| it.slot)

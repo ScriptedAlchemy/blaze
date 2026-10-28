@@ -131,9 +131,10 @@ pub fn native_overrides(
 ) -> Result<(), Refusal> {
     for (name, value) in &mut resolved.config_env {
         let Some(raw) = native.get(name).filter(|v| v.to_str().is_none()) else { continue };
-        let entry = config
-            .get_cv(&ConfigKey::parse(&format!("env.{name}")))
-            .map_err(|e| rejected(name, e))?;
+        // A quoted environment name may contain dots; it is one literal key component.
+        let mut key = ConfigKey::parse("env");
+        key.push(name);
+        let entry = config.get_cv(&key).map_err(|e| rejected(name, e))?;
         let forced = matches!(entry,Some(ConfigValue::Table(ref fields,_))
             if matches!(fields.get("force"),Some(ConfigValue::Boolean(true,_))));
         if !forced {

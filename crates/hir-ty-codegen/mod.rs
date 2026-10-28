@@ -96,11 +96,13 @@ use hir_ty::mir::{
 
 mod asm;
 mod backend;
+pub mod budget;
 use backend::Step;
 pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
 mod debuginfo;
 pub use debuginfo::Sidecar;
+pub mod export;
 mod float_pair;
 mod fncache;
 pub use fncache::{AlwaysRun, Reach, tests_reach};
@@ -158,7 +160,12 @@ pub enum CodegenError {
     /// rustc built the function under a symbol private to its object, so its copy stays the
     /// one that code of that object calls, and goes on using rustc's statics.
     Private,
+    /// Not of a function: admission failed after persistent critical host memory pressure
+    /// without compile progress ([`budget`]). Soft footprint targets never cause this.
+    OverBudget(String),
 }
+
+impl std::error::Error for CodegenError {}
 
 impl CodegenError {
     /// Whether rustc has no symbol of the function that ours could take the place of.
@@ -176,6 +183,7 @@ impl fmt::Display for CodegenError {
             CodegenError::NoSymbol | CodegenError::Private => {
                 write!(f, "unsupported: no rustc symbol for function")
             }
+            CodegenError::OverBudget(it) => write!(f, "cannot admit compile work: {it}"),
         }
     }
 }
@@ -613,6 +621,9 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
+    /// The crate whose independently linked executable needs allocator shims, even when
+    /// `#![no_main]` supplies the C entry point instead of Rust's start function.
+    pub allocator: Option<Crate>,
     /// The object is linked into a shared library of its own, which has the allocator shim
     /// a program's `start` otherwise brings.
     pub shared: bool,
@@ -711,6 +722,13 @@ impl CodegenUnit {
                 let why = match patch {
                     Ok(Ok(patch)) => break Some(patch),
                     Ok(Err(why)) => Some(why),
+                    Err(error @ CodegenError::OverBudget(_)) => {
+                        // No new object exists. Keep the warm base and revalidate the same
+                        // edit after recovery, rather than retrying it as a full build.
+                        known.put_base(base);
+                        known.stale = stale;
+                        return Err(error);
+                    }
                     Err(_) => None,
                 };
                 // Code compiled at a higher level that a patch can't hold goes, not the
@@ -839,11 +857,13 @@ impl CodegenUnit {
             let mut next = 0;
             if let Some(main) = start {
                 cg.define_start(main)?;
-                cg.define_allocator_shim(main.krate(db))?;
-            } else if roots.shared
-                && let Some(first) = roots.entries.first()
-            {
-                cg.define_allocator_shim(first.krate(db))?;
+            }
+            let allocator =
+                roots.allocator.or_else(|| start.map(|main| main.krate(db))).or_else(|| {
+                    roots.shared.then(|| roots.entries.first().map(|it| it.krate(db))).flatten()
+                });
+            if let Some(krate) = allocator {
+                cg.define_allocator_shim(krate)?;
             }
             for &id in roots.kept {
                 cg.static_data(id)?;
@@ -869,8 +889,17 @@ impl CodegenUnit {
                     #[cfg(feature = "llvm")]
                     cg.compile_units(&ours, Vec::new());
                 } else {
+                    // Only ahead of the object: near the memory the process may hold, a root is
+                    // left to the threads that compile ahead, which fewer of then do.
+                    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+                    let governor = budget::Governor::new(budget::budget(), threads);
                     symbols.in_parallel(ours.len(), &|db, symbols, at| {
-                        if symbols.function(ours[at]).is_none() {
+                        if governor.look() {
+                            return;
+                        }
+                        let Ok(_permit) = budget::enter() else { return };
+                        if governor.allowed() < threads {
+                        } else if symbols.function(ours[at]).is_none() {
                             _ = db.mir_body(ours[at].into());
                         } else if stored.get(&ours[at]).is_some_and(Option::is_some) {
                         } else if let (Ok(compiled), Some(told)) =
@@ -887,6 +916,9 @@ impl CodegenUnit {
                     // A root still being compiled waits for those compiled after it.
                     let mut held = std::collections::VecDeque::new();
                     loop {
+                        if cg.shed.is_some() || ahead.as_ref().is_some_and(|it| it.shed()) {
+                            break;
+                        }
                         let root = match (queue.get(next), &ahead) {
                             (Some(&root), Some(ahead))
                                 if !denied.contains(&root)
@@ -918,6 +950,9 @@ impl CodegenUnit {
                         match result {
                             Ok(symbol) => compiled.push((root, symbol)),
                             Err(e) => {
+                                if matches!(e, CodegenError::OverBudget(_)) {
+                                    break;
+                                }
                                 // rustc's copy calls what ours would have, when it has one.
                                 if !on_demand.is_empty()
                                     && !e.no_symbol()
@@ -941,6 +976,9 @@ impl CodegenUnit {
                     }
                     failed.extend(cg.define_waves(ahead));
                 });
+                if let Some(why) = cg.shed.take() {
+                    return Err(CodegenError::OverBudget(why));
+                }
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
                 if next == queue.len() {
                     break;
@@ -1367,8 +1405,10 @@ impl Rejections {
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
-    ) -> Option<Stale> {
-        Some(self.patched()?.stale(db, symbols, part, parts))
+    ) -> Result<Option<Stale>> {
+        let Some(base) = self.patched() else { return Ok(None) };
+        let _permit = budget::enter()?;
+        Ok(Some(base.stale(db, symbols, part, parts)))
     }
 
     /// What the next build is a patch of, if it is one.
@@ -2074,7 +2114,7 @@ struct ObjectCodegen<'a, 'db> {
     /// What those types are told as, and the ones the threads that compile told of.
     told: ToldTypes,
     /// Writes what is kept to the store, once there is something to keep.
-    writer: Option<cached::Writer>,
+    writer: Option<cached::Writer<'static>>,
     imports: FxHashMap<String, FuncId>,
     /// The functions of `asm!` blocks, by their assembly.
     assemblies: FxHashMap<String, FuncId>,
@@ -2157,6 +2197,8 @@ struct ObjectCodegen<'a, 'db> {
     type_ids: FxHashMap<FuncId, u128>,
     /// An entry did not fit the object, which now lacks a function it declares.
     misfit: bool,
+    /// Why the threads that compile ahead were stopped for the memory the process held.
+    shed: Option<String>,
     /// The functions of a patch that are at a level above 1, whose code it has at that level.
     tiers: Option<&'a tier::Tiers>,
     /// What each function built from an entry of the store is an instance of.
@@ -2227,6 +2269,9 @@ impl Kept {
     }
 
     fn written(&mut self, written: cached::Written) {
+        for error in &written.errors {
+            eprintln!("store: {error}");
+        }
         self.added += written.added;
         if written.of_cargo != 0 {
             *self.unkept.entry(OF_CARGO).or_default() += written.of_cargo;
@@ -2568,6 +2613,7 @@ pub fn copied_by_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// one after another, so that threads share that work. One rustc copies into its callers,
 /// which `home` passes over, is not compiled.
 pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
+    let Ok(_permit) = budget::enter() else { return };
     if !patch::copied_by_rustc(db, func) {
         let compile = || compiled_root(db, func).is_ok();
         // One that panics does again as `home` compiles it, which says so.
@@ -2583,6 +2629,7 @@ pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
 pub fn compile_unnamed(db: &dyn HirDatabase, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
     let mut homes = home::Homes::default();
     loop {
+        let Ok(_permit) = budget::enter() else { return };
         let job = {
             let mut state = unnamed.state.lock().unwrap_or_else(|e| e.into_inner());
             let job = match state.roots.pop() {
@@ -2735,6 +2782,25 @@ fn callee_name(db: &dyn HirDatabase, def: InstanceDef) -> &str {
         InstanceDef::FnPointerShim => "{closure}::fn_pointer",
         InstanceDef::ReifyShim { .. } => "{reify}",
     }
+}
+
+/// The requested type of the compiler's TypeId intrinsic. Shared by object and batch
+/// lowering; the hash comes from the type, never an object FuncId.
+fn type_id_of<'db>(
+    db: &'db dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+) -> Option<Ty<'db>> {
+    if FunctionSignature::of(db, func).name.as_str() != "of" {
+        return None;
+    }
+    let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
+    let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).skip_binder().kind() else { return None };
+    if symbols.item(adt.def_id().into())? != "core::any::TypeId" {
+        return None;
+    }
+    args.as_slice().first()?.ty()
 }
 
 /// Writes into `blob` the `TypeId`s it has the places of.
@@ -3785,6 +3851,7 @@ struct Ahead {
 struct Ready<'a> {
     ahead: &'a std::sync::Mutex<Ahead>,
     idle: &'a std::sync::Condvar,
+    governor: &'a budget::Governor,
     /// The instances to put in the object that a thread is still to compile.
     waiting: FxHashMap<(Instance, StoredParamEnvAndCrate), Vec<FuncId>>,
 }
@@ -3796,6 +3863,9 @@ impl Ready<'_> {
         &mut self,
         pending: &mut Vec<(Instance, StoredParamEnvAndCrate, FuncId)>,
     ) -> Vec<(Instance, StoredParamEnvAndCrate, FuncId)> {
+        if self.governor.look() {
+            return Vec::new();
+        }
         let mut ready = Vec::new();
         let mut state = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
         let mut queued = false;
@@ -3860,6 +3930,12 @@ impl Ready<'_> {
 
     fn through(state: &Ahead, root: FunctionId) -> bool {
         state.stopped || !state.rooted.contains(&root) || state.rooted_done.contains(&root)
+    }
+
+    /// Whether the build was stopped for the memory the process holds: nothing more is to be
+    /// put in the object.
+    fn shed(&self) -> bool {
+        self.governor.look()
     }
 
     /// Has the threads compile `roots` too, which putting the others in the object found.
@@ -4360,6 +4436,19 @@ fn compile_as<'db>(
 ) -> Result<Produced> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
+    let mut machine =
+        hir_ty::mir::codegen_options::TargetMachine::from_flags(&env.krate.data(db).codegen_flags);
+    if let Some(function) = body.and_then(|body| body.owner.as_function()) {
+        // Function attributes enable features after crate flags. Their set has no order;
+        // sort it so the machine identity is independent of symbol interning order.
+        let mut features: Vec<_> = AttrFlags::target_features(db, function)
+            .iter()
+            .map(|feature| feature.as_str().to_owned())
+            .collect();
+        features.sort_unstable();
+        machine.features.extend(features.into_iter().map(|feature| (feature, true)));
+    }
+    cg.set_machine(machine);
     let tally = backend::Tally::global();
     /// `RA_JIT_PROMOTE=0` leaves every local in its slot of the frame.
     static PROMOTE: LazyLock<bool> =
@@ -4592,24 +4681,32 @@ fn inlinable(
     tier::plain(|| small_body(db, instance, env))
 }
 
+/// Whether the body of `func` is small enough to be inlined, as its MIR is before any instance of
+/// it is built. Asked before [`inlinable`], so that a body too large leaves no memo of it and of
+/// what it read: `inlinable`'s values and edges were 1.3 GB of the 30 GB a cold build of
+/// tracedecay held (docs/reports/LOADMEM.md, section 2).
+fn small_mir(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    /// The most blocks and statements the body of a function that is inlined has.
+    const BLOCKS: usize = 4;
+    const STATEMENTS: usize = 12;
+    let Ok(generic) = db.mir_body(func.into()) else { return false };
+    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
+    generic.basic_blocks.len() <= BLOCKS
+        && statements <= STATEMENTS
+        && generic.closures.is_empty()
+        && generic.coroutine.is_none()
+}
+
 fn small_body(
     db: &dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
-    /// The most blocks and statements the body of a function that is inlined has, and
-    /// the most instructions it is built to with what it calls inlined into it.
-    const BLOCKS: usize = 4;
-    const STATEMENTS: usize = 12;
+    /// The most instructions the body of a function that is inlined is built to, with what it
+    /// calls inlined into it.
     const INSTRUCTIONS: usize = 64;
     let InstanceDef::Fn(func) = instance.def else { return None };
-    let generic = db.mir_body(func.into()).ok()?;
-    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
-    if generic.basic_blocks.len() > BLOCKS
-        || statements > STATEMENTS
-        || !generic.closures.is_empty()
-        || generic.coroutine.is_some()
-    {
+    if !small_mir(db, func) {
         return None;
     }
     let body = instance_body(db, &instance, env.clone()).ok()?;
@@ -4751,11 +4848,23 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
 /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
 /// (i128 corners, for one); that must cost us one function, not the process.
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    emit_for(ctx, &Default::default())
+}
+
+fn emit_for(
+    ctx: &mut cranelift_codegen::Context,
+    options: &hir_ty::mir::codegen_options::TargetMachine,
+) -> Result<Code> {
     if Target::current().is_wasm() {
         return emit_wasm(&ctx.func, Target::current().calls());
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
-    let mut isa = &**if large { target_for_large()? } else { target()? };
+    let mut owned = if *options == Default::default() {
+        if large { target_for_large()?.clone() } else { target()?.clone() }
+    } else {
+        configured_target(options, large, false)?
+    };
+    let mut isa = &*owned;
     let func = &ctx.func;
     if !isa.flags().preserve_frame_pointers()
         && (backend::frame_pointers()
@@ -4765,7 +4874,12 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                     .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetFramePointer)
             }))
     {
-        isa = &**target_with_frame_pointer()?;
+        owned = if *options == Default::default() {
+            target_with_frame_pointer()?.clone()
+        } else {
+            configured_target(options, large, true)?
+        };
+        isa = &*owned;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store::Store::global() {
@@ -4810,6 +4924,28 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .or_else(|| panic.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown");
             Err(CodegenError::Backend(format!("backend panic: {message}")))
+        }
+    }
+}
+
+fn configured_target(
+    options: &hir_ty::mir::codegen_options::TargetMachine,
+    large: bool,
+    frame_pointers: bool,
+) -> Result<isa::OwnedTargetIsa> {
+    type Options = hir_ty::mir::codegen_options::TargetMachine;
+    static MACHINES: LazyLock<
+        std::sync::Mutex<FxHashMap<(Options, bool, bool), isa::OwnedTargetIsa>>,
+    > = LazyLock::new(Default::default);
+    let mut machines = MACHINES.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (options.clone(), large, frame_pointers);
+    match machines.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let isa = selected_target()?
+                .isa_for(if large { "single_pass" } else { regalloc() }, frame_pointers, options)
+                .map_err(CodegenError::Backend)?;
+            Ok(entry.insert(isa).clone())
         }
     }
 }
@@ -5010,6 +5146,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             type_id_shims: FxHashMap::default(),
             type_ids: FxHashMap::default(),
             misfit: false,
+            shed: None,
             own_statics,
             mixed,
             elf_relocs: Vec::new(),
@@ -5025,7 +5162,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// The object, and the files of what a debugger reads that is kept apart from it.
     fn finish(mut self) -> Result<(Vec<u8>, Vec<Sidecar>)> {
+        if let Some(why) = self.shed.take() {
+            return Err(CodegenError::OverBudget(why));
+        }
+        budget::admit()?;
         self.make_later();
+        budget::admit()?;
         if Target::current().writes_wasm_objects() {
             return Ok((self.finish_wasm()?, Vec::new()));
         }
@@ -5136,6 +5278,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Puts a non-generic function in the object, exported under its rustc symbol name.
     fn define_function(&mut self, func: FunctionId) -> Result<String> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
+        budget::testing::checkpoint("define_function");
         let db = self.db;
         let stored = match self.stored_roots.get(&func) {
             Some(name) => name.clone(),
@@ -5291,6 +5437,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Puts the `main` the C runtime calls in the object.
     fn define_start(&mut self, main: FunctionId) -> Result<()> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
         let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
         self.stitch(id, compiled)?;
@@ -5418,10 +5567,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Puts the instances requested by calls in the object. Returns the ones that failed.
-    fn define_instances(&mut self) -> Vec<(Instance, Rejected)> {
+    fn define_instances(&mut self) -> Result<Vec<(Instance, Rejected)>> {
         let mut failed = Vec::new();
         self.compile_ahead(Vec::new(), &mut |cg, ahead| failed.extend(cg.define_waves(ahead)));
-        failed
+        if let Some(why) = self.shed.take() {
+            return Err(CodegenError::OverBudget(why));
+        }
+        Ok(failed)
     }
 
     /// Puts what is pending in the object, and what that calls. With `ahead`, the other
@@ -5430,6 +5582,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_waves(&mut self, mut ahead: Option<&mut Ready<'_>>) -> Vec<(Instance, Rejected)> {
         let mut failed = Vec::new();
         loop {
+            if let Err(why) = budget::admit() {
+                self.shed = Some(why.to_string());
+                break;
+            }
+            // What the threads did not compile is not compiled here either.
+            if self.shed.is_some() || ahead.as_ref().is_some_and(|it| it.shed()) {
+                break;
+            }
             let wave = match &mut ahead {
                 Some(ahead) => ahead.take(&mut self.pending),
                 None if self.pending.is_empty() => Vec::new(),
@@ -5447,6 +5607,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let start = stdx::time::Instant::now();
                     let told = self.tells_variables().then_some(&self.told);
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
+                        let Ok(_permit) = budget::enter() else { return };
                         let (instance, env, _) = &wave[at];
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
@@ -5458,12 +5619,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     wave
                 }
             };
-            if wave.is_empty() && self.found_pending.is_empty() {
+            if (wave.is_empty() && self.found_pending.is_empty())
+                || ahead.as_ref().is_some_and(|it| it.shed())
+            {
                 break;
             }
             for (instance, env, id) in wave {
                 let defined = self.define_instance(&instance, &env, id);
                 if let Err(e) = defined {
+                    if matches!(e, CodegenError::OverBudget(_)) {
+                        break;
+                    }
                     if self.forward_to_rustc(&instance, id).is_some() {
                         self.forwarded.insert(instance);
                     } else {
@@ -5489,6 +5655,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// compiled, where the waves of [`Self::define_instances`] each wait for their slowest
     /// function. What this compiles that the object has no use for is only wasted. `beside`
     /// runs on this thread meanwhile, and is told whether anything is compiled ahead of it.
+    ///
+    /// The soft footprint target reduces concurrency ([`budget`]). Critical host pressure
+    /// pauses admission; only persistent pressure without progress sheds the build.
     fn compile_ahead(
         &mut self,
         roots: Vec<FunctionId>,
@@ -5532,6 +5701,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let idle = std::sync::Condvar::new();
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let governor = budget::Governor::new(budget::budget(), threads);
         let (entries, owned) = (self.entries.clone(), &self.own_statics.crates.clone());
         let entries = entries.as_deref();
         let told = self.tells_variables().then(|| self.told.clone());
@@ -5562,6 +5732,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 if state.stopped {
                     return;
                 }
+                // The process-wide FIFO admission gate owns the concurrency limit.
+                // Idle threads hold no permit and do not wait for pressure to recover.
                 let job = match state.roots.pop_front() {
                     Some(root) => either::Either::Left(root),
                     None => match state.queue.pop() {
@@ -5578,6 +5750,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 state.working += 1;
                 drop(state);
+                let _permit = match budget::enter() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        governor.stop();
+                        let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                        state.working -= 1;
+                        state.stopped = true;
+                        idle.notify_all();
+                        return;
+                    }
+                };
                 let working = Working(&ahead, &idle);
                 let (mut found, mut called) = (Vec::new(), Vec::new());
                 let compiled = match &job {
@@ -5624,8 +5807,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     }
                 }
                 drop(working);
+                drop(_permit);
                 state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                 state.working -= 1;
+                if governor.shed() {
+                    state.stopped = true;
+                }
                 if let either::Either::Left(root) = job {
                     state.rooted_done.insert(root);
                 }
@@ -5659,13 +5846,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let _leaving = Leaving(&ahead, &idle);
             run(db, symbols);
         };
-        let mut ready = Ready { ahead: &ahead, idle: &idle, waiting: FxHashMap::default() };
+        let mut ready = Ready {
+            ahead: &ahead,
+            idle: &idle,
+            governor: &governor,
+            waiting: FxHashMap::default(),
+        };
         self.symbols.in_parallel_beside(threads, &work, &mut || {
             beside(self, Some(&mut ready));
             ahead.lock().unwrap_or_else(|e| e.into_inner()).open = false;
             idle.notify_all();
         });
         self.ahead = ahead.into_inner().unwrap_or_else(|e| e.into_inner()).seen;
+        if governor.shed() {
+            self.shed = Some(governor.why());
+        }
     }
 
     fn define_instance(
@@ -5674,6 +5869,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         env: &StoredParamEnvAndCrate,
         id: FuncId,
     ) -> Result<()> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let start = stdx::time::Instant::now();
         let tiers = self.tiers;
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
@@ -5751,8 +5949,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             stable_names: &mut self.stable_names,
             source_paths: &mut self.source_paths,
             kept: &mut self.kept,
-            declarations: self.module.declarations(),
-            type_ids: &self.type_ids,
             root_names: &self.root_names,
             own_crates: &self.own_statics.crates,
             told: &self.told,
@@ -5775,7 +5971,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             });
             settled.collect()
         });
-        let made = self.keeper(settled).make(later);
+        let bindings =
+            export::ObjectBindings::new(self.module.declarations(), &self.type_ids, later);
+        let made = self.keeper(settled).make(later, &bindings);
         self.apply(later, made);
     }
 
@@ -5825,8 +6023,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     stable_names: &mut stable_names,
                     source_paths: &mut source_paths,
                     kept: &mut kept,
-                    declarations,
-                    type_ids,
                     root_names,
                     own_crates: owned,
                     told,
@@ -5840,7 +6036,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 loop {
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(part) = parts.get(at) else { break };
-                    let part = part.iter().map(|it| keeper.make(it)).collect();
+                    let part = part
+                        .iter()
+                        .map(|it| {
+                            let bindings = export::ObjectBindings::new(declarations, type_ids, it);
+                            keeper.make(it, &bindings)
+                        })
+                        .collect();
                     let kept = std::mem::take(&mut *keeper.kept);
                     let misses = names.misses.take();
                     *made[at].lock().unwrap_or_else(|e| e.into_inner()) =
@@ -5855,8 +6057,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // A resolver without threads leaves the work to whoever asks for it.
             let Some((part_made, kept, misses)) = made else {
                 for it in part.iter() {
-                    let made = self.keeper(None).make(it);
-                    self.apply(it, made);
+                    self.make_now(it);
                 }
                 continue;
             };
@@ -5871,7 +6072,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
-    fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer {
+    fn writer(&mut self, store: &'static store::Store) -> &mut cached::Writer<'static> {
         let symbols = self.symbols;
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
@@ -6089,6 +6290,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
                 CachedData::Location(at) => self.define_location(at.clone())?,
                 CachedData::FilePath(path) => self.define_file_path(path.clone())?,
+                CachedData::Text(parts) => {
+                    let text = parts
+                        .iter()
+                        .map(|it| match it {
+                            cached::CachedTextPart::Text(text)
+                            | cached::CachedTextPart::FilePath(text) => text.as_str(),
+                        })
+                        .collect::<String>();
+                    self.define_file_path(text)?
+                }
             };
             ids.datas.push(id);
         }
@@ -6398,6 +6609,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
+        let _permit = budget::enter().inspect_err(|why| {
+            self.shed = Some(why.to_string());
+        })?;
         let db = self.db;
         let known = [&self.imported_statics, &self.statics, &self.frozen_statics];
         if let Some(&data) = known.into_iter().find_map(|it| it.get(&id)) {
@@ -6961,16 +7175,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// The `T` of `TypeId::of::<T>`, when `func` is that function.
     fn type_id_of(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<Ty<'db>> {
-        let db = self.db;
-        if FunctionSignature::of(db, func).name.as_str() != "of" {
-            return None;
-        }
-        let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
-        let TyKind::Adt(adt, _) = db.impl_self_ty(impl_).skip_binder().kind() else { return None };
-        if self.symbols.item(adt.def_id().into())? != "core::any::TypeId" {
-            return None;
-        }
-        args.as_slice().first()?.ty()
+        type_id_of(self.db, self.symbols, func, args)
     }
 
     fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
@@ -10361,8 +10566,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let arch = self.cg.target.arch;
         let features = self.body.and_then(|it| it.owner.as_function());
         let features = features.map(|func| AttrFlags::target_features(self.cg.db, func));
-        let extensions =
-            asm::extensions(arch, features.into_iter().flatten().map(|it| it.as_str()));
+        let extensions = asm::machine_extensions(
+            arch,
+            &self.cg.machine,
+            features.into_iter().flatten().map(|it| it.as_str()),
+        );
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;
@@ -13023,6 +13231,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // compiled it, and calling that one is less work than building it again.
         let flags = AttrFlags::query(db, func.into());
         if !flags.contains(AttrFlags::IS_INLINE) && args.iter().all(|it| it.region().is_some()) {
+            return None;
+        }
+        if !small_mir(db, func) {
             return None;
         }
         let body = inlinable(db, instance, self.env.store()).as_ref()?;

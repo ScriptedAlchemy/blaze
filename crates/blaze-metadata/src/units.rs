@@ -380,7 +380,7 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
         if filter.need_dev_deps(intent) { HasDevUnits::Yes } else { HasDevUnits::No };
     let cli_features =
         CliFeatures::from_command_line(a.features, a.all_features, !a.no_default_features)?;
-    let resolved = world.resolve(&ws, &specs, &cli_features, has_dev_units)?;
+    let resolved = world.resolve(&ws, &ctx, &specs, &cli_features, has_dev_units)?;
 
     let summaries = world.member_summaries();
     let member_features = members_with_features(&world.members(&summaries), &specs, &cli_features)?;

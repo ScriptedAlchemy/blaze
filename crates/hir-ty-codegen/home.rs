@@ -282,6 +282,9 @@ impl Homes {
             return asked.clone();
         }
         let home = mentions.crates.iter().copied().find(|&krate| {
+            if krate.data(db).codegen_flags != asked.krate.data(db).codegen_flags {
+                return false;
+            }
             let sees = self
                 .sees
                 .entry(krate)

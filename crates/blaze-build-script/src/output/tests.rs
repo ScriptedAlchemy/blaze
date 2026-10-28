@@ -366,3 +366,52 @@ fn link_lib_specs() {
     assert_eq!((plain.kind, plain.name, plain.rename), (None, "z", None));
     assert_eq!(LinkLib::parse("framework=Security").kind, Some("framework"));
 }
+
+/// What a script reads is read as `parse` reads it: the same lines, in the same order, whatever
+/// else is in the output.
+#[test]
+fn what_a_script_reads_is_what_parse_reads() {
+    let package = foo("0.5.0", None, lib());
+    let printed: &[&[u8]] = &[
+        b"",
+        b"cargo:rerun-if-changed=a.txt\ncargo::rerun-if-changed=b.txt\ncargo:rerun-if-env-changed=X\n",
+        // Trimmed on both sides, and a line's end as cargo splits it.
+        b"  \tcargo:rerun-if-changed=lead\r\ncargo::rerun-if-env-changed=Y  \r\n",
+        // Noise and what is not one of the two, between them; a line that is not UTF-8 is
+        // left out whole, one that names a path with a byte that is not text too.
+        b"hello\ncargo:rustc-cfg=a\ncargo:rerun-if-changed=\xff\ncargo:warning=w\ncargo:rerun-if-changed=kept\n",
+        // Order and duplicates are kept, an empty value too.
+        b"cargo:rerun-if-env-changed=B\ncargo:rerun-if-env-changed=A\ncargo:rerun-if-env-changed=B\ncargo:rerun-if-changed=\n",
+        // A key of the old syntax that is not one cargo reserves is metadata.
+        b"cargo:rerun-if-changed-not=1\ncargo:key=rerun-if-changed=2\n",
+    ];
+    for printed in printed {
+        let reads = reads(printed).unwrap();
+        // The lines that are not UTF-8 are out of both: `parse` gets the bytes too.
+        let output = parse(
+            printed,
+            &Context {
+                package: &package,
+                out_dir_when_generated: Path::new(OUT),
+                out_dir: Path::new(OUT),
+                nightly_features_allowed: false,
+                rustc_bootstrap: None,
+            },
+        );
+        let output = output.unwrap_or_else(|it| panic!("{printed:?}: {it}"));
+        assert_eq!(reads.files, output.rerun_if_changed, "{printed:?}");
+        assert_eq!(reads.env, output.rerun_if_env_changed, "{printed:?}");
+    }
+    let said = reads(
+        b"cargo:rerun-if-env-changed=B\ncargo:rerun-if-env-changed=A\ncargo:rerun-if-changed=\n",
+    );
+    assert_eq!(
+        said,
+        Ok(Reads { files: vec![PathBuf::from("")], env: vec!["B".to_owned(), "A".to_owned()] })
+    );
+    // cargo fails the build for a line of the new syntax with no `=`, as `parse` does.
+    let package = foo("0.5.0", None, lib());
+    let line = "cargo::rerun-if-changed";
+    assert!(reads(line.as_bytes()).is_err());
+    assert!(read(&package, line).is_err());
+}

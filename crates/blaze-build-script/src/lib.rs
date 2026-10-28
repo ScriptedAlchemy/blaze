@@ -12,6 +12,8 @@
 
 pub mod apply;
 pub mod env;
+pub mod files;
+pub mod fresh;
 pub mod output;
 pub mod run;
 pub mod unit;
