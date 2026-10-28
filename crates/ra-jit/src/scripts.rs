@@ -1107,15 +1107,21 @@ impl<'a> Runner<'a> {
         let mut cfg: Vec<String> =
             data.active_features.iter().map(|it| format!("feature={it:?}")).collect();
         cfg.sort();
-        // The flags the host's units are compiled with: `--cfg` and `-C debug-assertions` change what
-        // the crate is; the others are noted.
+        // Host flags follow the profile's arguments, just as they do on rustc's command
+        // line. Overflow and panic settings must reach MIR/codegen, not only fingerprints.
         let applied = apply_flags(&self.host_flags);
         for note in &applied.ignored {
             eprintln!("build scripts: not applied to blaze's compile of {name}: {note}");
         }
-        if applied.debug_assertions.unwrap_or(profile.debug_assertions) {
+        let effective = crate::plan::Profile::for_script(profile, &self.host_flags)
+            .map_err(|error| format!("the profile of {name}: {error:#}"))?;
+        if effective.debug_assertions {
             cfg.push("debug_assertions".to_owned());
         }
+        if effective.overflow_checks {
+            cfg.push("overflow_checks".to_owned());
+        }
+        cfg.push(format!("panic={:?}", effective.panic.name()));
         for extra in applied.cfgs {
             if !cfg.contains(&extra) {
                 cfg.push(extra);
@@ -1177,6 +1183,8 @@ struct Applied {
     cfgs: Vec<String>,
     /// `-C debug-assertions`, when it is said.
     debug_assertions: Option<bool>,
+    overflow_checks: Option<bool>,
+    panic: Option<String>,
     /// What is said and not applied: codegen options, lints, search paths, anything else. A line each.
     ignored: Vec<String>,
 }
@@ -1219,11 +1227,20 @@ fn apply_flags(flags: &[String]) -> Applied {
                 Some((name, setting)) => (name, Some(setting)),
                 None => (option.as_str(), None),
             };
-            if name == "debug-assertions" {
-                applied.debug_assertions =
-                    Some(!matches!(setting, Some("no" | "n" | "off" | "false")));
-            } else {
-                applied.ignored.push(format!("-C {option}"));
+            let on = match setting {
+                None | Some("" | "yes" | "y" | "on" | "true") => Some(true),
+                Some("no" | "n" | "off" | "false") => Some(false),
+                _ => None,
+            };
+            match name.replace('_', "-").as_str() {
+                "debug-assertions" => applied.debug_assertions = on,
+                "overflow-checks" => applied.overflow_checks = on,
+                // Applied by the effective profile, including implicit assertion settings.
+                "opt-level" => {}
+                "panic" if matches!(setting, Some("abort" | "unwind")) => {
+                    applied.panic = setting.map(str::to_owned);
+                }
+                _ => applied.ignored.push(format!("-C {option}")),
             }
         } else if flag == "--check-cfg" {
             at += 1;

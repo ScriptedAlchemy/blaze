@@ -2167,7 +2167,7 @@ HOSTFLAGS_PROGRAM = r"""fn main() {
 """
 
 
-def hostflags(sc, source_sha):
+def hostflags(sc, source_sha, codegen=False):
     """The flags for rustc cargo gives a build script's compile. With RUSTFLAGS and no `--target`, the scripts are
     compiled with them (`cfg!(hostflag)` is true in the script); with `--target`, even the host's triple, they are
     not, and the script still runs with the target's flags in `CARGO_ENCODED_RUSTFLAGS`; the program's crate has them
@@ -2175,11 +2175,21 @@ def hostflags(sc, source_sha):
     host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout, re.M)[1]
     sc.notes["host"] = host
     flags = "--cfg hostflag"
+    build_rs, program_rs = HOSTFLAGS_BUILD_RS, HOSTFLAGS_PROGRAM
+    if codegen:
+        flags = "-C overflow-checks=yes -C panic=unwind"
+        build_rs = r'''fn main() {
+    let value: u8 = std::env::var("VALUE").unwrap_or_else(|_| "255".into()).parse().unwrap();
+    let checked = std::panic::catch_unwind(|| value + 1).is_err();
+    println!("cargo:rustc-env=CHECKED={}", if checked { "yes" } else { "no" });
+    println!("cargo:rustc-env=PANIC={}", if cfg!(panic = "abort") { "abort" } else { "unwind" });
+}'''
+        program_rs = r'''fn main() { println!("overflow={} panic={}", env!("CHECKED"), env!("PANIC")); }'''
 
     def project(ws):
         sc.project(ws)
-        for name, text in (("build.rs", HOSTFLAGS_BUILD_RS), ("src/one.rs", HOSTFLAGS_PROGRAM),
-                           ("src/two.rs", HOSTFLAGS_PROGRAM)):
+        for name, text in (("build.rs", build_rs), ("src/one.rs", program_rs),
+                           ("src/two.rs", program_rs)):
             with open(os.path.join(ws, name), "w") as f:
                 f.write(text)
 
@@ -2216,11 +2226,20 @@ def hostflags(sc, source_sha):
         if p.returncode != 0:
             sc.fail(f"{mode}: the build exited {p.returncode}: {err[-500:]}")
             continue
+        if "[ra-jit]" not in err:
+            sc.fail(f"{mode}: the host flags witness was not daemon-owned")
+            continue
         exe = os.path.join(ws, sub, "gen-one")
         got = subprocess.run([exe], capture_output=True, text=True).stdout if os.path.exists(exe) else None
         sc.notes.setdefault("programs", {})[mode] = {"got": got, "want": want}
         if got != want:
             sc.fail(f"{mode}: the program printed {got!r}, cargo's {want!r}")
+
+
+def host_codegen(sc, source_sha):
+    """Overflow checks affect executed arithmetic in the build script, with flags
+    applied for an implicit host and omitted for an explicit host target as Cargo does."""
+    hostflags(sc, source_sha, codegen=True)
 
 
 def unrelated(sc, source_sha):
@@ -2325,12 +2344,21 @@ def native_only(sc, source_sha, proxy=None):
                 "input": 'format!("INPUT({})\\n", out.join("libgen.a").display())',
                 "group": 'format!("GROUP(AS_NEEDED({}))\\n", out.join("libgen.a").display())',
                 "include": 'format!("INCLUDE {}\\n", out.join("included").display())',
+                "nested": 'format!("INPUT({})\\n", out.join("included").display())',
+                "symlink": 'format!("INPUT({})\\n", out.join("libgen.a").display())',
             }[proxy]
             extra_script = ('fs::write(out.join("included"), format!("INPUT({})\\n", out.join("libgen.a").display())).unwrap();'
-                            if proxy == "include" else "")
+                            if proxy in ("include", "nested") else "")
             text = text.replace('println!("cargo:rustc-link-lib=static={lib}");',
                                 f'{extra_script}\n    fs::write(out.join("libproxy.so"), {proxy_script}).unwrap();\n'
                                 '    println!("cargo:rustc-link-lib=proxy");')
+            if proxy == "symlink":
+                text = text.replace('fs::write(out.join("libproxy.so"),',
+                                    'fs::write(out.join("included"),')
+                text = text.replace('    println!("cargo:rustc-link-lib=proxy");',
+                                    '    if !out.join("libproxy.so").exists() {\n'
+                                    '        std::os::unix::fs::symlink("included", out.join("libproxy.so")).unwrap();\n'
+                                    '    }\n    println!("cargo:rustc-link-lib=proxy");')
         with open(script, "w") as f:
             f.write(text)
         with open(os.path.join(ws, "native-value.txt"), "w") as f:
@@ -2460,6 +2488,7 @@ SCENARIOS = {
     "selector-moves": selector_moves,
     "feature-capture": feature_capture,
     "hostflags": hostflags,
+    "host-codegen": host_codegen,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,
@@ -2471,6 +2500,8 @@ SCENARIOS = {
     "native-script-input": lambda sc, sha: native_only(sc, sha, "input"),
     "native-script-group": lambda sc, sha: native_only(sc, sha, "group"),
     "native-script-include": lambda sc, sha: native_only(sc, sha, "include"),
+    "native-script-nested": lambda sc, sha: native_only(sc, sha, "nested"),
+    "native-script-symlink": lambda sc, sha: native_only(sc, sha, "symlink"),
     "native-request-env": native_request_env,
     "link-control": link_control,
     "same-worker": lambda sc, sha: same_or_cross(sc, False, sha),

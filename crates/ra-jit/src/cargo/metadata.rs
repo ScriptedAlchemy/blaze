@@ -99,7 +99,49 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),
         metadata: std::sync::Arc::new(metadata),
+        sysroot: std::sync::Arc::new(sysroot_metadata),
     })
+}
+
+/// Resolve the actual installed std workspace with its own lockfile/features. It is
+/// not the user's package selection or configuration, and is never a stitched subset.
+fn sysroot_metadata(
+    manifest: &project_model::ManifestPath,
+    config: &project_model::CargoMetadataConfig,
+    cfg: &[cfg::CfgAtom],
+) -> anyhow::Result<Metadata> {
+    let manifest: &Path = manifest.as_ref();
+    let cwd = manifest.parent().context("std manifest has no directory")?;
+    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (name, value) in &config.extra_env {
+        match value {
+            Some(value) => vars.insert(name.clone(), value.clone()),
+            None => vars.remove(name),
+        };
+    }
+    let (features, all, no_default) = match &config.features {
+        project_model::CargoFeatures::All => (Vec::new(), true, false),
+        project_model::CargoFeatures::Selected { features, no_default_features } => {
+            (features.clone(), false, *no_default_features)
+        }
+    };
+    let cfg = cfg.iter().filter_map(platform_cfg).collect::<Vec<_>>();
+    let target = config.targets.first().context("std has no target")?;
+    let asked = blaze_metadata::Asked {
+        cwd,
+        env: vars.into_iter().collect(),
+        manifest_path: Some(manifest),
+        config: &[],
+        features: &features,
+        all_features: all,
+        no_default_features: no_default,
+        build: None,
+        platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
+        offline: false,
+        store: None,
+    };
+    let json = blaze_metadata::metadata(&asked)?;
+    serde_json::from_str(&json).context("blaze's std metadata is not cargo's form")
 }
 
 /// The programs a build of `selection` links of `targets`, asked for in `cwd` (of the package

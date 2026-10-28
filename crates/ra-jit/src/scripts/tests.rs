@@ -799,7 +799,25 @@ fn the_flags_for_rustc_a_crate_is_compiled_with_are_applied_where_they_change_th
         "kept",
     ]));
     assert_eq!(applied.cfgs, ["kept"]);
-    assert_eq!(applied.ignored, ["-C opt-level=3", "-Wunused"]);
+    assert_eq!(applied.ignored, ["-Wunused"]);
     // A flag with no value says so.
     assert_eq!(apply_flags(&flags(&["--cfg"])).ignored, ["--cfg has no value"]);
+}
+
+#[test]
+fn host_overflow_and_panic_flags_change_the_effective_script_profile() {
+    let profile = blaze_manifest::profiles::Profile::default();
+    let flags = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+    let asked = flags(&["-C", "overflow_checks=yes", "-Cpanic=abort"]);
+    let effective = crate::plan::Profile::for_script(&profile, &asked).unwrap();
+    assert!(effective.overflow_checks);
+    assert_eq!(effective.panic.name(), "abort");
+    let applied = apply_flags(&asked);
+    assert_eq!(applied.overflow_checks, Some(true));
+    assert_eq!(applied.panic.as_deref(), Some("abort"));
+    assert!(applied.ignored.is_empty());
+    let asked = flags(&["-Coverflow-checks=off", "-C", "panic=unwind"]);
+    let effective = crate::plan::Profile::for_script(&profile, &asked).unwrap();
+    assert!(!effective.overflow_checks);
+    assert_eq!(effective.panic.name(), "unwind");
 }

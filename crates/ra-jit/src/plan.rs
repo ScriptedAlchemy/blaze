@@ -263,7 +263,7 @@ pub(crate) enum PanicStrategy {
 }
 
 impl PanicStrategy {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             PanicStrategy::Unwind => "unwind",
             PanicStrategy::Abort | PanicStrategy::ImmediateAbort => "abort",
@@ -272,6 +272,15 @@ impl PanicStrategy {
 }
 
 impl Profile {
+    /// Host script units use the same profile/flag precedence as ordinary owned units.
+    pub(crate) fn for_script(
+        profile: &blaze_manifest::profiles::Profile,
+        flags: &[String],
+    ) -> anyhow::Result<Profile> {
+        let profile: Profile = serde_json::from_value(serde_json::to_value(profile)?)?;
+        Ok(profile.with(&Flags::parse(flags.iter().map(String::as_str))))
+    }
+
     /// The profile as rustc ends up with it once `flags` follow what cargo passes for it.
     fn with(&self, flags: &Flags) -> Profile {
         // cargo names a check only where it is not what rustc has for the level by itself, so
@@ -535,8 +544,22 @@ impl Plan {
             }
             None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
         };
+        // Cargo reads external --config files internally. Retain the owned reading of
+        // that configuration before asking for the graph, including its include closure.
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (name, value) in asked.env {
+            match value {
+                Some(value) => env.insert(name.clone(), value.clone()),
+                None => env.remove(name),
+            };
+        }
+        let mut config = blaze_manifest::Config::load(dir, env, &[])?;
+        config.start("build", &selection.config)?;
+        let sources = config.sources();
         let graph = UnitGraph::of(dir, manifest, selection, &[], asked.env)?;
-        graph.plan(&Flags::of(dir, asked)?)
+        let mut plan = graph.plan(&Flags::of(dir, asked)?)?;
+        plan.sources = sources;
+        Ok(plan)
     }
 
     /// [`Plan::of`] made by blaze with no cargo, for the whole build: the packages of `cargo`,

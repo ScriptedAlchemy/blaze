@@ -179,12 +179,22 @@ type Metadata = dyn Fn(
 pub struct OwnMetadata {
     pub root: std::sync::Arc<Root>,
     pub metadata: std::sync::Arc<Metadata>,
+    pub sysroot: std::sync::Arc<
+        dyn Fn(
+                &ManifestPath,
+                &CargoMetadataConfig,
+                &[cfg::CfgAtom],
+            ) -> anyhow::Result<cargo_metadata::Metadata>
+            + Send
+            + Sync,
+    >,
 }
 
 impl PartialEq for OwnMetadata {
     fn eq(&self, other: &OwnMetadata) -> bool {
         std::sync::Arc::ptr_eq(&self.root, &other.root)
             && std::sync::Arc::ptr_eq(&self.metadata, &other.metadata)
+            && std::sync::Arc::ptr_eq(&self.sysroot, &other.sysroot)
     }
 }
 
@@ -352,6 +362,8 @@ pub struct CargoMetadataConfig {
     /// The toolchain version, if known.
     /// Used to conditionally enable unstable cargo features.
     pub toolchain_version: Option<semver::Version>,
+    /// The embedder's resolver also owns the standard library workspace.
+    pub own_metadata: Option<OwnMetadata>,
 }
 
 // Deserialize helper for the cargo metadata

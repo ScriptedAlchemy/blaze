@@ -239,6 +239,22 @@ pub(crate) fn target_cfg(
     cfgs(target, &given, nightly)
 }
 
+/// Cargo's release version from the installed channel manifest, not from executing it.
+pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
+    let toolchain = Toolchain::of(rustc)?;
+    let manifest = std::fs::read_to_string(
+        toolchain.sysroot.join("lib/rustlib/multirust-channel-manifest.toml"),
+    )
+    .ok()?;
+    let (_, rest) = manifest.split_once("\n[pkg.cargo]\nversion = \"")?;
+    let (version, _) = rest.split_once('"')?;
+    // Cargo's package version (0.100.0) differs from its release version (1.99.0).
+    // The channel's rustc release supplies that prefix; Cargo supplies its own commit/date.
+    let release = toolchain.release.version.split_whitespace().next()?;
+    let (_, commit) = version.split_once(' ')?;
+    Some(format!("cargo {release} {commit}\n").into_bytes())
+}
+
 fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {
     let mut cfgs = target.cfg.clone();
     if nightly {

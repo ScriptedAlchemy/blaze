@@ -188,6 +188,9 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
     let program = Path::new(command.get_program()).file_stem()?.to_str()?.to_owned();
     match program.as_str() {
         "cargo" => {
+            if let Some(answer) = cargo_question(command) {
+                return Some(answer);
+            }
             ready_cargo(command);
             None
         }
@@ -197,6 +200,80 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
         }
         _ => None,
     }
+}
+
+/// Cargo's query-only front door. Answer with the owned configuration reader and
+/// toolchain records; never start Cargo merely to have it ask our rustc stand-in.
+fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
+    let args: Vec<String> =
+        command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
+    let var = |name: &str| var_of(command, name);
+    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (name, value) in command.get_envs() {
+        let name = name.to_str()?.to_owned();
+        match value {
+            Some(value) => env.insert(name, value.to_str()?.to_owned()),
+            None => env.remove(&name),
+        };
+    }
+    let cwd =
+        command.get_current_dir().map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
+    let output = |stdout: Vec<u8>, stderr: Vec<u8>, code: u8| {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(i32::from(code) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(u32::from(code))
+        };
+        Output { status, stdout, stderr }
+    };
+    if args.windows(2).any(|args| args == ["config", "get"]) {
+        let (code, said) = blaze_manifest::config::get::main(&cwd, env, &args);
+        return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
+    }
+    let rustc = toolchain_rustc(command.get_program(), &var)?;
+    // A resolved Cargo path points into the same installation, but it is not rustc.
+    let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    if args == ["--version"] {
+        return own::cargo_version(&rustc).map(|stdout| Ok(output(stdout, Vec::new(), 0)));
+    }
+    if args.first().is_some_and(|it| it == "rustc")
+        && args.iter().any(|it| it == "--print" || it.starts_with("--print="))
+    {
+        let mut rustc_args = Vec::new();
+        let mut at = 1;
+        while at < args.len() {
+            let arg = &args[at];
+            at += 1;
+            if arg == "--" {
+                rustc_args.extend(args[at..].iter().map(OsString::from));
+                break;
+            }
+            if arg == "-Z" && args.get(at).is_some_and(|it| it == "unstable-options") {
+                at += 1;
+                continue;
+            }
+            if matches!(arg.as_str(), "--print" | "--target") {
+                rustc_args.push(OsString::from(arg));
+                rustc_args.push(OsString::from(args.get(at)?));
+                at += 1;
+            } else if arg.starts_with("--print=") || arg.starts_with("--target=") {
+                rustc_args.push(OsString::from(arg));
+            } else {
+                return None;
+            }
+        }
+        if !is_question(&rustc_args) {
+            return None;
+        }
+        return own::answer(&rustc, &rustc_args, &[], &var)
+            .map(|stdout| Ok(output(stdout, Vec::new(), 0)));
+    }
+    None
 }
 
 /// Has a cargo ask rustc through ra-jit, unless the user named a wrapper of their own: one
@@ -381,5 +458,34 @@ mod tests {
         assert!(!question("--print cfg --target my-target.json"));
         assert!(!question("@args.txt"));
         assert!(!question(""));
+    }
+
+    #[test]
+    fn cargo_config_queries_are_answered_from_the_request_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".cargo")).unwrap();
+        std::fs::write(
+            dir.path().join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"from_file\"]\n",
+        )
+        .unwrap();
+        let mut command = Command::new("/nonexistent/toolchain/bin/cargo");
+        command.current_dir(dir.path()).args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "--format",
+            "json-value",
+            "build.rustflags",
+        ]);
+        let result = cargo_question(&mut command).expect("owned config query").unwrap();
+        assert!(result.status.success());
+        let got: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(got, serde_json::json!(["--cfg", "from_file"]));
+        command.env("CARGO_BUILD_RUSTFLAGS", "--cfg request");
+        let result = cargo_question(&mut command).unwrap().unwrap();
+        assert!(result.status.success());
+        assert_ne!(result.stdout, b"");
     }
 }
