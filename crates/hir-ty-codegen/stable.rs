@@ -465,12 +465,6 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     fn spell_crate(&self, out: &mut String, krate: Crate) -> Option<()> {
-        let flags = &krate.data(self.db).codegen_flags;
-        if !flags.is_empty() {
-            // Library symbols can be supplied by a toolchain with the same crate id but
-            // another effective target machine. Keep their code entries distinct too.
-            write!(out, "codegen{flags:?}:").ok()?;
-        }
         // The source of a crate of the workspace changes too, built by the daemon or not.
         if self.of_the_checkout(krate) {
             if !self.by_content {
@@ -482,7 +476,19 @@ impl<'a, 'db> StableNames<'a, 'db> {
             write!(out, "{OF_CHECKOUT}{id}:").ok()?;
         } else {
             match self.symbols.stable_crate_id(krate) {
-                Some(id) => write!(out, "{id:x}:").ok()?,
+                Some(id) => {
+                    use std::hash::{Hash as _, Hasher as _};
+                    let flags = &krate.data(self.db).codegen_flags;
+                    let id = if flags.is_empty() {
+                        id
+                    } else {
+                        let mut hash = rustc_hash::FxHasher::default();
+                        id.hash(&mut hash);
+                        flags.hash(&mut hash);
+                        hash.finish()
+                    };
+                    write!(out, "{id:x}:").ok()?;
+                }
                 None => match self.symbols.content_id(krate) {
                     Some(id) => write!(out, "{OF_LIBRARY}{id}:").ok()?,
                     None => return self.miss("no crate id"),

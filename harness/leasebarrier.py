@@ -2250,7 +2250,7 @@ def program_flag_cfg(sc, source_sha):
     build-script cfg. Both implicit and explicit target loads must retain it."""
     hostflags(sc, source_sha, program_cfg=True)
 
-def machine_lse(sc, source_sha):
+def machine_lse(sc, source_sha, isolated=False):
     """AArch64 target-feature=lse must select actual atomic instructions, not just cfgs.
     The same daemon/store sees +lse, -lse, +lse; each program must execute like Cargo."""
     if not sys.platform.startswith("linux"):
@@ -2286,6 +2286,9 @@ fn main() {
                 for sign in ("+", "-")}
     sc.project()
     for index, sign in enumerate(("+", "-", "+")):
+        if isolated:
+            sc.ws = os.path.join(sc.dir, f"ws-machine-{index}")
+            sc.project()
         p = sc.client("a", RUSTFLAGS="-Ctarget-feature=" + sign + "lse", RUSTC_BOOTSTRAP="1")
         sc.finish(p, f"machine-{index}")
         if p.returncode != 0 or "[ra-jit]" not in p.err:
@@ -2555,6 +2558,7 @@ SCENARIOS = {
     "host-codegen": host_codegen,
     "program-flag-cfg": program_flag_cfg,
     "machine-lse": machine_lse,
+    "machine-lse-isolated": lambda sc, sha: machine_lse(sc, sha, isolated=True),
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,
