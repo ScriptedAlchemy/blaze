@@ -2,9 +2,8 @@
 //! `--print cfg`, `sysroot`, `target-libdir`, `target-spec-json`, the names of the files of
 //! each kind of crate, and the rest of what a release of rustc says the same way every time
 //! it is asked. ra-jit answers from what it knows of the release and its targets ([`own`]),
-//! running no rustc. A question it does not know the answer of is asked of rustc once per
-//! toolchain and the answer is kept, byte for byte; every later asker, the daemon's workers
-//! and spares among them, is given that.
+//! running no rustc. An unmodelled question fails with a named gap. It never executes the
+//! compiler or reads a cached answer produced by it.
 //!
 //! cargo asks through its wrapper, which is ra-jit's in the builds of `cargo ra-jit` and in
 //! the cargos ra-jit runs only to ask; rust-analyzer asks through [`ask`], which ra-jit hands
@@ -14,10 +13,8 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{Command, ExitStatus, Output},
 };
-
-use sha2::{Digest as _, Sha256};
 
 mod own;
 mod probe;
@@ -119,29 +116,12 @@ const ALSO_VALUED: [&str; 9] = [
 /// is part of the question.
 const ABOUT_INPUT: [&str; 2] = ["file-names", "crate-name"];
 
-/// The variables that change what rustc answers.
-const READ_BY_RUSTC: [&str; 9] = [
-    "RUSTC_BOOTSTRAP",
-    "RUSTC_OVERRIDE_VERSION_STRING",
-    "RUST_TARGET_PATH",
-    "SDKROOT",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "IPHONEOS_DEPLOYMENT_TARGET",
-    "TVOS_DEPLOYMENT_TARGET",
-    "WATCHOS_DEPLOYMENT_TARGET",
-    "XROS_DEPLOYMENT_TARGET",
-];
-
 /// The variable that names the wrapper cargo runs every rustc through.
 const WRAPPER: &str = "RUSTC_WRAPPER";
 
 /// The variable that tells ra-jit as cargo's wrapper only to answer questions, and to leave
 /// what cargo compiles as it would be without ra-jit.
 pub(crate) const ONLY_ASKS: &str = "RA_JIT_ONLY_ASKS";
-
-/// The variable that says which answers are given: `0` none, so rustc is asked every time;
-/// `own` only ra-jit's own, so a question it has no answer of fails.
-const OFF: &str = "RA_JIT_ANSWERS";
 
 /// Whether rustc run with `args` compiles nothing and says only what its release, the
 /// arguments and standard input decide.
@@ -193,47 +173,21 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
         && (kinds.iter().all(about_rustc) || (from_stdin && inputs == 0))
 }
 
-/// rustc's answer to what `command` asks it, given `stdin`: ra-jit's own, the kept answer, or
-/// rustc's now, kept when it is one. `command` runs rustc and asks a question ([`is_question`]).
+/// Answer from owned release and target facts, without executing `command`. There is no
+/// environment switch or cached compiler answer that can turn this into a subprocess.
 pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> {
-    let given = std::env::var_os(OFF);
-    if given.as_ref().is_none_or(|it| it != "0") {
-        let var = |name: &str| var_of(command, name);
-        let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-        let rustc = toolchain_rustc(command.get_program(), &var);
-        if let Some(stdout) = rustc.and_then(|rustc| own::answer(&rustc, &args, stdin, &var)) {
-            return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-        }
+    let var = |name: &str| var_of(command, name);
+    let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+    let rustc = toolchain_rustc(command.get_program(), &var);
+    let stdout = rustc.as_ref().and_then(|rustc| own::answer(rustc, &args, stdin, &var));
+    match stdout {
+        Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
+        None => Err(io::Error::other(format!(
+            "owned compiler query has no model: {:?} {args:?} (toolchain {rustc:?}); \
+             rustc was not executed; Cargo was not executed",
+            command.get_program()
+        ))),
     }
-    if given.is_some_and(|it| it == "own") {
-        return Err(io::Error::other("ra-jit has no answer of its own to this question"));
-    }
-    let key = key(command, stdin);
-    let file = key.as_ref().and_then(|key| Some(dir()?.join(key)));
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    // The workers and spares of one load ask the same questions at once: one asks rustc, and
-    // the others wait for its answer.
-    let _held = file.as_deref().and_then(hold);
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    let mut child =
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    if let Some(mut input) = child.stdin.take() {
-        // rustc may answer without reading what it was given.
-        _ = input.write_all(stdin);
-    }
-    let output = child.wait_with_output()?;
-    // A question rustc did not answer is asked again, and what it warns of is said each time.
-    if let Some(file) = file
-        && output.status.success()
-        && output.stderr.is_empty()
-    {
-        keep(&file, &output.stdout);
-    }
-    Ok(output)
 }
 
 /// What rust-analyzer runs to learn of the toolchain, answered here when it asks rustc.
@@ -301,7 +255,11 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
         return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
     }
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
+    let Some(rustc) = toolchain_rustc(command.get_program(), &var) else {
+        return Some(Err(io::Error::other(format!(
+            "owned Cargo query has no toolchain model: {args:?}; Cargo was not executed"
+        ))));
+    };
     // A resolved Cargo path points into the same installation, but it is not rustc.
     let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     if args == ["--version"] {
@@ -353,8 +311,21 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
             .find(|args| args[0] == "--target")
             .and_then(|args| args[1].to_str())
             .or_else(|| rustc_args.iter().find_map(|arg| arg.to_str()?.strip_prefix("--target=")));
-        let target = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))?;
-        let builtin = own::target_cfg(rustc.parent()?.parent()?, &target, &env)?;
+        let gap = |what: &str| {
+            Some(Err(io::Error::other(format!(
+                "owned toolchain query has no model for {what}: {rustc_args:?}; Cargo was not executed"
+            ))))
+        };
+        let Some(target) = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))
+        else {
+            return gap("the host target");
+        };
+        let Some(sysroot) = rustc.parent().and_then(Path::parent) else {
+            return gap("the toolchain's sysroot");
+        };
+        let Some(builtin) = own::target_cfg(sysroot, &target, &env) else {
+            return gap(&format!("target {target}'s built-in cfg"));
+        };
         let cfg = builtin
             .iter()
             .map(|cfg| match cfg.split_once('=') {
@@ -425,52 +396,6 @@ pub(crate) fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>>
     }))
 }
 
-/// Where the answers are kept: in `RA_JIT_HOME` when it is set, else in the user's cache
-/// directory, which outlives the session.
-fn dir() -> Option<PathBuf> {
-    if std::env::var_os(OFF).is_some_and(|it| it == "0") {
-        return None;
-    }
-    if let Some(home) = std::env::var_os("RA_JIT_HOME").filter(|it| !it.is_empty()) {
-        return Some(Path::new(&home).join("answers"));
-    }
-    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
-    Some(caches.join("ra-jit/answers"))
-}
-
-/// The name of the question: the rustc that is asked, its arguments, what it reads of its
-/// environment and of standard input. `None` when which rustc runs is not known.
-fn key(command: &Command, stdin: &[u8]) -> Option<String> {
-    let var = |name: &str| var_of(command, name);
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
-    let is = std::fs::metadata(&rustc).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"ra-jit answer 1\0");
-    hasher.update(rustc.as_os_str().as_encoded_bytes());
-    hasher.update([0]);
-    hasher.update(is.len().to_le_bytes());
-    let modified = is.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    hasher.update(modified.as_nanos().to_le_bytes());
-    for arg in command.get_args() {
-        hasher.update(arg.as_encoded_bytes());
-        hasher.update([0]);
-    }
-    for name in READ_BY_RUSTC {
-        hasher.update(name);
-        match var(name) {
-            Some(value) => {
-                hasher.update([1]);
-                hasher.update(value.as_encoded_bytes());
-            }
-            None => hasher.update([0]),
-        }
-    }
-    hasher.update(stdin);
-    Some(hasher.finalize().iter().map(|it| format!("{it:02x}")).collect())
-}
-
 /// The variable `name` as `command` will have it.
 fn var_of(command: &Command, name: &str) -> Option<OsString> {
     match command.get_envs().find(|(it, _)| *it == name) {
@@ -509,29 +434,86 @@ fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> O
     std::fs::canonicalize(rustc).ok()
 }
 
-fn kept(file: &Path) -> Option<Vec<u8>> {
-    std::fs::read(file).ok()
-}
-
-/// The lock of the question whose answer is `file`, held until it is dropped.
-fn hold(file: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(file.parent()?).ok()?;
-    let lock = std::fs::File::create(file.with_extension("lock")).ok()?;
-    lock.lock().ok()?;
-    Some(lock)
-}
-
-fn keep(file: &Path, stdout: &[u8]) {
-    let Some(dir) = file.parent() else { return };
-    if std::fs::create_dir_all(dir).is_ok() {
-        // An answer not kept is asked again.
-        _ = ra_jit_store::write_file_whole(file, stdout);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_toolchain(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let rustlib = dir.join("lib/rustlib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(dir.join("lib/librustc_driver-test.so"), "").unwrap();
+        std::fs::write(rustlib.join("manifest-rustc-aarch64-apple-darwin"), "").unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        std::fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            format!("\n[pkg.rustc]\nversion = {:?}\n", release["version"].as_str().unwrap()),
+        )
+        .unwrap();
+        let rustc = dir.join("bin/rustc");
+        std::fs::write(&rustc, "this compiler must not execute").unwrap();
+        rustc
+    }
+
+    #[test]
+    fn compiler_queries_never_execute_or_use_cached_external_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = synthetic_toolchain(dir.path());
+        let armed = std::env::var_os("RA_JIT_TEST_QUERY_TOOLCHAIN")
+            .map(PathBuf::from)
+            .map(|path| path.join("bin/rustc"));
+        for compiler in std::iter::once(compiler).chain(armed) {
+            for args in [
+                vec!["--version"],
+                vec!["--print=sysroot"],
+                vec!["--print=target-libdir"],
+                vec!["-vV"],
+                vec!["--print", "cfg", "-O", "--target", "aarch64-apple-darwin"],
+                vec!["-Z", "unstable-options", "--print", "target-spec-json"],
+                vec![
+                    "-",
+                    "--crate-name",
+                    "___",
+                    "--print=file-names",
+                    "--crate-type",
+                    "rlib",
+                    "--print=sysroot",
+                    "--print=split-debuginfo",
+                    "--print=crate-name",
+                    "--print=cfg",
+                ],
+            ] {
+                let mut command = Command::new(&compiler);
+                command.args(&args).env("RUSTC_BOOTSTRAP", "1");
+                command.env("RA_JIT_ANSWERS", "0");
+                for name in [
+                    "SDKROOT",
+                    "MACOSX_DEPLOYMENT_TARGET",
+                    "IPHONEOS_DEPLOYMENT_TARGET",
+                    "TVOS_DEPLOYMENT_TARGET",
+                    "WATCHOS_DEPLOYMENT_TARGET",
+                    "XROS_DEPLOYMENT_TARGET",
+                    "RUST_TARGET_PATH",
+                    "RUSTC_OVERRIDE_VERSION_STRING",
+                ] {
+                    command.env_remove(name);
+                }
+                command.env("SDKROOT", "/deliberately/nonexistent/sdk");
+                let output = answer(&mut command, &[])
+                    .unwrap_or_else(|error| panic!("{compiler:?} {args:?}: {error}"));
+                assert!(output.status.success() && !output.stdout.is_empty());
+                command.args(["-Ctarget-cpu=native", "--print=cfg"]);
+                let error = answer(&mut command, &[]).unwrap_err();
+                assert!(error.to_string().contains("Cargo was not executed"));
+            }
+        }
+        let mut command = Command::new(dir.path().join("nonexistent-rustc"));
+        command.arg("--version");
+        assert!(
+            answer(&mut command, &[]).unwrap_err().to_string().contains("Cargo was not executed")
+        );
+    }
 
     fn question(args: &str) -> bool {
         let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();

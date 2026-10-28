@@ -2,7 +2,7 @@
 //! the targets that release has: no rustc runs. The data of each release is what that rustc
 //! printed for every target ra-jit has (`harness/answers.py --write`), and the cfgs that follow
 //! from the arguments are added here, as rustc adds them. A question this does not understand
-//! whole is answered `None`, and rustc is asked.
+//! whole is answered `None`, and the caller reports a named gap without running rustc.
 
 use std::{
     collections::BTreeMap,
@@ -333,11 +333,11 @@ fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>
     Some(cfgs)
 }
 
-/// The variables rustc reads for a question that ra-jit answers only when unset.
-const UNSET: [&str; 8] = [
+/// Overrides not yet modelled by the owned query answers. SDKROOT is a linker
+/// input, not an input to these release, cfg, filename or target-spec prints.
+const UNSET: [&str; 7] = [
     "RUSTC_OVERRIDE_VERSION_STRING",
     "RUST_TARGET_PATH",
-    "SDKROOT",
     "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
     "TVOS_DEPLOYMENT_TARGET",
