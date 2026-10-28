@@ -100,7 +100,11 @@
           auditable = false;
           buildPhase = ''
             runHook preBuild
-            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped
+            # A package in a derivation runs only against this store's glibc, so it is not held
+            # to the portable tarball's RHEL 9 floor; build_release.py still checks that every
+            # binary is bound to the store. The release's tarball is built elsewhere on Ubuntu
+            # 22.04 with --artifact-mode portable, which keeps the floor.
+            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped --artifact-mode nix-native
             runHook postBuild
           '';
           installPhase = ''
