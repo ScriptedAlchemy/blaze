@@ -545,6 +545,16 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
+def valid_macro_mutation(step, same_size, same_mtime, before, after,
+                         old_dylibs, dylibs, old_reloads, reloads):
+    mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
+    if mutation:
+        return (same_size and same_mtime and before != after and old_dylibs != dylibs
+                and reloads > old_reloads)
+    if step == "unchanged-content":
+        return before == after and old_dylibs == dylibs and reloads == old_reloads
+    return reloads == old_reloads
+
 def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     from cargo_ra_jit import Side, program_output, wait_warm
     import norustc
@@ -609,15 +619,14 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
             same_size = os.stat(edited_source).st_size == before.st_size
             same_mtime = os.stat(edited_source).st_mtime_ns == before.st_mtime_ns
             mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
-            mutation_valid = (not mutation or (same_size and same_mtime and old_digest != new_digest
-                                               and dylibs != previous_dylibs))
-            if step == "unchanged-content":
-                mutation_valid &= old_digest == new_digest and dylibs == previous_dylibs
-            previous_dylibs = dylibs
             worker = workers_log(side)
             reload_count = len(re.findall(r"(?m)^reload:", worker))
             reload_valid = (reload_count > previous_reload_count if mutation
                             else reload_count == previous_reload_count)
+            mutation_valid = valid_macro_mutation(step, same_size, same_mtime, old_digest, new_digest,
+                                                  previous_dylibs, dylibs,
+                                                  previous_reload_count, reload_count)
+            previous_dylibs = dylibs
             previous_reload_count = reload_count
             retention = {}
             if reloads:
@@ -1229,6 +1238,13 @@ def self_test():
     ready_status = "daemon: pid 1\nworker: pid 2\n/ws: ready\n3 builds by the daemon, 0 by cargo"
     check("unchanged ready workers pass", valid_worker_generation(ready_status, ["ready"], ["1", "2"], ["1", "2"], 3, 2))
     check("PID replacement fails", not valid_worker_generation(ready_status, ["ready"], ["1", "3"], ["1", "2"], 3, 2))
+    check("real PM edit advances bytes image and reload", valid_macro_mutation("same-size-restored-mtime", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1))
+    check("a no-op PM edit fails", not valid_macro_mutation("same-size-restored-mtime", True, True, "a", "a", {"a": "image"}, {"b": "image"}, 0, 1))
+    check("PM changed mtime fails the restored-mtime control", not valid_macro_mutation("same-size-restored-mtime", True, False, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1))
+    check("PM changed size fails the same-size control", not valid_macro_mutation("same-size-restored-mtime", False, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1))
+    check("PM stale image fails", not valid_macro_mutation("dependency-restored-mtime", True, True, "a", "b", {"a": "image"}, {"a": "image"}, 0, 1))
+    check("PM missing reload fails", not valid_macro_mutation("reload-00", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
+    check("PM unchanged control cannot hide a reload", not valid_macro_mutation("unchanged-content", True, True, "a", "a", {"a": "image"}, {"a": "image"}, 1, 2))
     check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))
     check("cargo build count fails", not valid_worker_generation(ready_status.replace("0 by cargo", "1 by cargo"), ["ready"], ["1", "2"], ["1", "2"], 3, 2))
     check("unnamed compute fails coverage", bool(fed_coverage("t", zero.replace("0 instances", "1 instances"), {}, True)))
