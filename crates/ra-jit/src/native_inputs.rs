@@ -458,19 +458,23 @@ fn hash_path(
         }
         Err(error) => return Err(error),
     };
-    if meta.file_type().is_symlink() {
+    let meta = if meta.file_type().is_symlink() {
         frame(hash, b"symlink");
         let target = fs::read_link(path)?;
         frame(hash, target.as_os_str().as_encoded_bytes());
-        match path.canonicalize() {
-            Ok(target) => return hash_path(&target, hash, active, cwd, search, script, inspect),
+        // Keep the path passed to the linker. A thin archive's relative members are
+        // resolved beside that path, including when the archive itself is a symlink.
+        match fs::metadata(path) {
+            Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 frame(hash, b"missing-target");
                 return Ok(());
             }
             Err(error) => return Err(error),
         }
-    }
+    } else {
+        meta
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -487,6 +491,7 @@ fn hash_path(
         let mut buffer = [0; 64 * 1024];
         let mut first = true;
         let mut text = None;
+        let mut thin = None;
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
@@ -496,9 +501,12 @@ fn hash_path(
                 first = false;
                 let bytes = &buffer[..read];
                 // Follow the content, not the basename: INPUT may name an extensionless
-                // script, or a .so symlink may resolve to one. Binary archives/objects
-                // keep the single streaming pass and never allocate a whole-file buffer.
+                // script, or a .so symlink may resolve to one. Ordinary binary archives and
+                // objects stream; thin archives retain their table of external members.
                 let binary = native_binary(bytes);
+                if inspect && bytes.starts_with(b"!<thin>\n") {
+                    thin = Some(Vec::new());
+                }
                 let textual = inspect
                     && !binary
                     && (script
@@ -515,9 +523,34 @@ fn hash_path(
             if let Some(text) = &mut text {
                 text.extend_from_slice(&buffer[..read]);
             }
+            if let Some(thin) = &mut thin {
+                thin.extend_from_slice(&buffer[..read]);
+            }
             file_hash.update(&buffer[..read]);
         }
         frame(hash, &file_hash.finalize());
+        if let Some(bytes) = thin {
+            let archive = object::read::archive::ArchiveFile::parse(bytes.as_slice())
+                .map_err(io::Error::other)?;
+            let dir = path.parent().unwrap_or(cwd);
+            for member in archive.members() {
+                let member = member.map_err(io::Error::other)?;
+                let name = member.name();
+                if !member.is_thin() || name.is_empty() {
+                    return Err(io::Error::other("native thin archive member is opaque"));
+                }
+                #[cfg(unix)]
+                let name = {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    Path::new(std::ffi::OsStr::from_bytes(name))
+                };
+                #[cfg(not(unix))]
+                let name = Path::new(std::str::from_utf8(name).map_err(io::Error::other)?);
+                frame(hash, b"thin-member");
+                frame(hash, name.as_os_str().as_encoded_bytes());
+                hash_path(&dir.join(name), hash, active, cwd, search, false, true)?;
+            }
+        }
         if let Some(bytes) = text {
             let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
             let dependencies = script_inputs(text)?;
@@ -701,6 +734,98 @@ mod tests {
             opaque: false,
             ..Inputs::default()
         }
+    }
+
+    fn thin_archive(member: &[u8]) -> Vec<u8> {
+        let mut names = member.to_vec();
+        names.extend_from_slice(b"/\n");
+        if names.len() % 2 != 0 {
+            names.push(b'\n');
+        }
+        let mut archive = format!(
+            "!<thin>\n{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "//",
+            "",
+            "",
+            "",
+            "",
+            names.len()
+        )
+        .into_bytes();
+        archive.extend_from_slice(&names);
+        archive.extend_from_slice(b"/0              0           0     0     644     8         `\n");
+        archive
+    }
+
+    #[test]
+    fn thin_archive_members_are_native_inputs_even_when_the_archive_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("objects")).unwrap();
+        let archive = dir.path().join("libgenerated.a");
+        let member = dir.path().join("objects/generated.o");
+        let bytes = thin_archive(b"objects/generated.o");
+        fs::write(&archive, &bytes).unwrap();
+        fs::write(&member, b"\x7fELFAAAA").unwrap();
+        let stamp = fs::metadata(&member).unwrap().modified().unwrap();
+        let before = inputs(&archive).digest().unwrap();
+        fs::write(&member, b"\x7fELFBBBB").unwrap();
+        fs::File::options().write(true).open(&member).unwrap().set_modified(stamp).unwrap();
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        assert_ne!(inputs(&archive).digest().unwrap(), before);
+        fs::write(&member, b"\x7fELFAAAA").unwrap();
+        assert_eq!(inputs(&archive).digest().unwrap(), before);
+        fs::remove_file(&member).unwrap();
+        assert_ne!(inputs(&archive).digest().unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thin_archive_members_resolve_beside_the_linked_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let actual = dir.path().join("actual");
+        let alias = dir.path().join("alias");
+        fs::create_dir(&actual).unwrap();
+        fs::create_dir(&alias).unwrap();
+        fs::write(actual.join("libgenerated.a"), thin_archive(b"generated.o")).unwrap();
+        fs::write(actual.join("generated.o"), b"\x7fELFAAAA").unwrap();
+        fs::write(alias.join("generated.o"), b"\x7fELFBBBB").unwrap();
+        let archive = alias.join("libgenerated.a");
+        symlink("../actual/libgenerated.a", &archive).unwrap();
+        let before = inputs(&archive).digest().unwrap();
+        fs::write(alias.join("generated.o"), b"\x7fELFCCCC").unwrap();
+        assert_ne!(inputs(&archive).digest().unwrap(), before);
+        fs::write(alias.join("generated.o"), b"\x7fELFBBBB").unwrap();
+        fs::write(actual.join("generated.o"), b"\x7fELFDDDD").unwrap();
+        assert_eq!(inputs(&archive).digest().unwrap(), before);
+    }
+
+    #[test]
+    fn malformed_or_cyclic_thin_archives_do_not_certify_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("libgenerated.a");
+        fs::write(&archive, b"!<thin>\nbroken header").unwrap();
+        assert!(inputs(&archive).digest().is_err());
+        fs::write(&archive, thin_archive(b"other.a")).unwrap();
+        fs::write(dir.path().join("other.a"), thin_archive(b"libgenerated.a")).unwrap();
+        assert!(inputs(&archive).digest().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thin_archive_member_paths_preserve_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = b"generated-\xff.o";
+        let member = dir.path().join(std::ffi::OsStr::from_bytes(name));
+        let archive = dir.path().join("libgenerated.a");
+        fs::write(&archive, thin_archive(name)).unwrap();
+        fs::write(&member, b"\x7fELFAAAA").unwrap();
+        let before = inputs(&archive).digest().unwrap();
+        fs::write(&member, b"\x7fELFBBBB").unwrap();
+        assert_ne!(inputs(&archive).digest().unwrap(), before);
     }
 
     #[test]

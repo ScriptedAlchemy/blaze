@@ -56,6 +56,29 @@ pub(super) fn crc32(instruction: &str) -> String {
     format!(".arch_extension crc\n.globl {SYMBOL}\n{SYMBOL}:\n{instruction} w0, w0, {data}\nret\n")
 }
 
+/// Assembly observes the final machine features, including disables and their inverse
+/// implications. Function attributes enable their features after the crate's flags.
+pub(super) fn machine_extensions<'a>(
+    arch: Arch,
+    machine: &hir_ty::mir::codegen_options::TargetMachine,
+    attributes: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let architecture = match arch {
+        Arch::X86_64 => "x86_64",
+        Arch::Aarch64 => "aarch64",
+        Arch::Wasm32 => "wasm32",
+    };
+    let overrides = machine.feature_overrides(architecture);
+    let mut enabled = overrides
+        .iter()
+        .filter_map(|(feature, enabled)| enabled.then_some(feature.as_str()))
+        .collect::<Vec<_>>();
+    for feature in attributes {
+        enabled.push(feature);
+    }
+    extensions(arch, enabled)
+}
+
 /// The directives that have the assembler take the instructions of `features`, those a
 /// function's `#[target_feature]` enables, for assembly of its `asm!`: rustc gives LLVM the
 /// features with the function the `asm!` is in, and this assembly is assembled apart from
@@ -1171,7 +1194,29 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arch, extensions};
+    use super::{Arch, extensions, machine_extensions};
+
+    #[test]
+    fn ordered_machine_features_determine_assembly_extensions() {
+        use hir_ty::mir::codegen_options::TargetMachine;
+
+        for (flags, expected) in [
+            ("+lse,-lse", ""),
+            ("-lse,+lse", ".arch_extension lse\n"),
+            ("+fp16,-neon", ""),
+            ("-neon,+fp16", ".arch_extension fp16\n.arch_extension simd\n"),
+        ] {
+            let machine = TargetMachine::from_flags(&[format!("-Ctarget-feature={flags}")]);
+            assert_eq!(machine_extensions(Arch::Aarch64, &machine, []), expected, "{flags}");
+        }
+        let machine = TargetMachine::from_flags(&["-Ctarget-feature=+lse,-lse".to_owned()]);
+        assert_eq!(
+            machine_extensions(Arch::Aarch64, &machine, ["lse"]),
+            ".arch_extension lse\n",
+            "a function attribute enables its feature after the crate flags"
+        );
+        assert_eq!(machine_extensions(Arch::X86_64, &machine, ["lse"]), "");
+    }
 
     /// constant_time_eq's `#[target_feature(enable = "dit")]` reads DIT, which LLVM's
     /// assembler has no extension of: the architecture that has it comes before the

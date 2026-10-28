@@ -4363,9 +4363,14 @@ fn compile_as<'db>(
     let mut machine =
         hir_ty::mir::codegen_options::TargetMachine::from_flags(&env.krate.data(db).codegen_flags);
     if let Some(function) = body.and_then(|body| body.owner.as_function()) {
-        for feature in AttrFlags::target_features(db, function) {
-            machine.features.insert(feature.as_str().to_owned(), true);
-        }
+        // Function attributes enable features after crate flags. Their set has no order;
+        // sort it so the machine identity is independent of symbol interning order.
+        let mut features: Vec<_> = AttrFlags::target_features(db, function)
+            .iter()
+            .map(|feature| feature.as_str().to_owned())
+            .collect();
+        features.sort_unstable();
+        machine.features.extend(features.into_iter().map(|feature| (feature, true)));
     }
     cg.set_machine(machine);
     let tally = backend::Tally::global();
@@ -10408,16 +10413,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let arch = self.cg.target.arch;
         let features = self.body.and_then(|it| it.owner.as_function());
         let features = features.map(|func| AttrFlags::target_features(self.cg.db, func));
-        let mut enabled = self
-            .cg
-            .machine
-            .features
-            .iter()
-            .filter(|(_, enabled)| **enabled)
-            .map(|(feature, _)| feature.as_str())
-            .collect::<Vec<_>>();
-        enabled.extend(features.into_iter().flatten().map(|it| it.as_str()));
-        let extensions = asm::extensions(arch, enabled);
+        let extensions = asm::machine_extensions(
+            arch,
+            &self.cg.machine,
+            features.into_iter().flatten().map(|it| it.as_str()),
+        );
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;

@@ -337,7 +337,12 @@ impl Target {
                 eprintln!("codegen: target-cpu={cpu} tuning is not applied by Cranelift");
             }
         }
-        for (feature, enabled) in &options.features {
+        let arch = match self.arch {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+            Arch::Wasm32 => "wasm32",
+        };
+        for (feature, enabled) in options.feature_overrides(arch) {
             let setting = match (self.arch, feature.as_str()) {
                 (Arch::Aarch64, "lse") => Some("has_lse"),
                 (Arch::Aarch64, "fp16") => Some("has_fp16"),
@@ -360,12 +365,15 @@ impl Target {
             };
             match setting {
                 Some(setting) => isa
-                    .set(setting, if *enabled { "true" } else { "false" })
+                    .set(setting, if enabled { "true" } else { "false" })
                     .map_err(|error| error.to_string())?,
-                None => eprintln!(
-                    "codegen: target-feature={}{feature} is not applied by Cranelift",
-                    if *enabled { '+' } else { '-' }
-                ),
+                None if options.features.iter().any(|(name, _)| name == &feature) => {
+                    eprintln!(
+                        "codegen: target-feature={}{feature} is not applied by Cranelift",
+                        if enabled { '+' } else { '-' }
+                    );
+                }
+                None => {}
             }
         }
         isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
@@ -407,6 +415,22 @@ mod machine_tests {
         let baseline = target.isa("backtracking", false).unwrap();
         let avx2 = baseline.isa_flags().into_iter().find(|flag| flag.name == "has_avx2").unwrap();
         assert_eq!(avx2.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn feature_overrides_update_isa_dependencies_in_command_line_order() {
+        let target = Target::parse("x86_64-unknown-linux-gnu").unwrap();
+        for (features, enabled) in [("-avx,+avx2", true), ("+avx2,-avx", false)] {
+            let options = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+                "-Ctarget-cpu=haswell".to_owned(),
+                format!("-Ctarget-feature={features}"),
+            ]);
+            let isa = target.isa_for("backtracking", false, &options).unwrap();
+            for name in ["has_avx", "has_avx2"] {
+                let setting = isa.isa_flags().into_iter().find(|flag| flag.name == name).unwrap();
+                assert_eq!(setting.as_bool(), Some(enabled), "{features}: {name}");
+            }
+        }
     }
 
     #[test]

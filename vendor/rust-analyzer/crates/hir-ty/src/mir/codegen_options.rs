@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 pub struct TargetMachine {
     pub cpu: Option<String>,
     pub opt_level: Option<String>,
-    /// Last setting wins for each feature; different feature names accumulate.
-    pub features: BTreeMap<String, bool>,
+    /// Ordered operations: a later feature can enable a prerequisite disabled earlier.
+    pub features: Vec<(String, bool)>,
 }
 
 impl TargetMachine {
@@ -28,9 +28,9 @@ impl TargetMachine {
                 "target-feature" => {
                     for feature in value.split(',') {
                         if let Some(name) = feature.strip_prefix('+') {
-                            options.features.insert(name.to_owned(), true);
+                            options.features.push((name.to_owned(), true));
                         } else if let Some(name) = feature.strip_prefix('-') {
-                            options.features.insert(name.to_owned(), false);
+                            options.features.push((name.to_owned(), false));
                         }
                     }
                 }
@@ -46,6 +46,12 @@ impl TargetMachine {
             .map(|(name, enabled)| format!("{}{name}", if *enabled { '+' } else { '-' }))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// Final overrides, including forward implications when enabling and inverse ones
+    /// when disabling, applied in the order the flags were written.
+    pub fn feature_overrides(&self, arch: &str) -> BTreeMap<String, bool> {
+        crate::target_feature::flag_changes(arch, &self.features)
     }
 
     pub fn effective_features(
@@ -74,7 +80,7 @@ mod tests {
         .map(str::to_owned);
         let options = TargetMachine::from_flags(&flags);
         assert_eq!(options.cpu.as_deref(), Some("apple-m1"));
-        assert_eq!(options.llvm_features(), "+dotprod,+fp16,-lse");
+        assert_eq!(options.llvm_features(), "+lse,+fp16,-lse,+dotprod");
     }
 
     #[test]
@@ -88,5 +94,32 @@ mod tests {
         let options = TargetMachine::from_flags(&["-Ctarget-feature=+fp16".to_owned()]);
         let arm = options.effective_features("aarch64", []);
         assert!(arm.contains("fp16") && arm.contains("neon"));
+    }
+
+    #[test]
+    fn feature_implications_follow_command_line_order() {
+        for (changes, enabled) in [
+            ("-sse2,+avx2", true),
+            ("+avx2,-sse2", false),
+            ("-avx,+avx2", true),
+            ("+avx2,-avx", false),
+            ("+avx2,-sse4.2,+avx2", true),
+        ] {
+            let options = TargetMachine::from_flags(&[format!("-Ctarget-feature={changes}")]);
+            let features = options.effective_features("x86_64", ["sse2".to_owned()]);
+            assert_eq!(features.contains("avx2"), enabled, "{changes}");
+            assert_eq!(features.contains("avx"), enabled, "{changes}");
+        }
+        let first = TargetMachine::from_flags(&["-Ctarget-feature=-avx,+avx2".to_owned()]);
+        let second = TargetMachine::from_flags(&["-Ctarget-feature=+avx2,-avx".to_owned()]);
+        assert_ne!(first, second, "different effective machines cannot share a cache key");
+        assert_eq!(first.llvm_features(), "-avx,+avx2");
+        assert_eq!(second.llvm_features(), "+avx2,-avx");
+        for (changes, enabled) in [("-neon,+fp16", true), ("+fp16,-neon", false)] {
+            let options = TargetMachine::from_flags(&[format!("-Ctarget-feature={changes}")]);
+            let features = options.effective_features("aarch64", ["neon".to_owned()]);
+            assert_eq!(features.contains("fp16"), enabled, "{changes}");
+            assert_eq!(features.contains("neon"), enabled, "{changes}");
+        }
     }
 }
