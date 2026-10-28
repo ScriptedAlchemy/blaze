@@ -11758,17 +11758,11 @@ fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
     let original = std::fs::read(&source).unwrap();
     let time = std::fs::metadata(&source).unwrap().modified().unwrap();
     let inputs = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
-    // These cargo invocations are the test oracle, not a product rebuild/refusal path.
+    // Only the Python harness invokes the reference compiler. No Rust source starts cargo.
     let cargo_build = || {
-        let out = std::process::Command::new("cargo")
-            .current_dir(&root)
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_INCREMENTAL")
-            .env("RUSTUP_TOOLCHAIN", "1.99.0")
-            .args(["build", "-p", "app", "--message-format=json"])
-            .output()
-            .unwrap();
+        let oracle = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/dist/supplied_macro_oracle.py");
+        let out = std::process::Command::new("python3").arg(oracle).arg(&root).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let messages: Vec<cargo_metadata::Message> =
             cargo_metadata::Message::parse_stream(std::io::Cursor::new(out.stdout))
