@@ -41,6 +41,196 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+/// Provenance of cargo's supplied libraries. Resolution here is blaze's, not a workspace
+/// load or a compiler query. Keep all platforms/dependency kinds conservatively: cargo
+/// can compile host producers outside the program's target graph.
+pub(crate) struct ArtifactInputs {
+    paths: Vec<PathBuf>,
+    context: Vec<u8>,
+    configuration: Vec<(PathBuf, Option<Vec<u8>>)>,
+    root: PathBuf,
+    identity: String,
+    _lease: std::fs::File,
+}
+
+fn artifact_digest(paths: &[PathBuf], context: &[u8]) -> anyhow::Result<String> {
+    let mut hash = Sha256::new();
+    field(&mut hash, b"blaze supplied macro producer inputs 1");
+    field(&mut hash, context);
+    for path in paths {
+        field(&mut hash, path.as_os_str().as_encoded_bytes());
+        hash_tree(path, path, &mut BTreeSet::new(), &mut hash)
+            .with_context(|| format!("reading macro producer inputs {}", path.display()))?;
+    }
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+impl ArtifactInputs {
+    pub(crate) fn capture(
+        project: &Path,
+        selection: &crate::plan::Selection,
+    ) -> anyhow::Result<Option<Self>> {
+        let manifest = project.join("Cargo.toml");
+        let asked = blaze_metadata::Asked {
+            cwd: project,
+            env: std::env::vars().collect(),
+            manifest_path: Some(&manifest),
+            config: &selection.config,
+            features: &selection.features,
+            all_features: selection.all_features,
+            no_default_features: selection.no_default_features,
+            build: None,
+            platform: None,
+            offline: false,
+            store: None,
+        };
+        let mut metadata: cargo_metadata::Metadata =
+            serde_json::from_str(&blaze_metadata::metadata(&asked)?)?;
+        let mut selected = BTreeSet::new();
+        let mut pending: Vec<_> = metadata
+            .packages
+            .iter()
+            .filter(|package| package.targets.iter().any(|target| target.is_proc_macro()))
+            .map(|package| package.id.clone())
+            .collect();
+        let resolve =
+            metadata.resolve.as_ref().context("macro provenance needs a resolve graph")?;
+        while let Some(id) = pending.pop() {
+            if selected.insert(id.clone()) {
+                let node = resolve
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .context("macro producer absent from resolve graph")?;
+                pending.extend(node.dependencies.iter().cloned());
+            }
+        }
+        let mut paths: Vec<_> = metadata
+            .packages
+            .iter()
+            .filter(|package| selected.contains(&package.id))
+            .map(|package| package.manifest_path.parent().unwrap().as_std_path().to_owned())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        // Selection includes profile, target, features and config. The worker's build
+        // environment is stable across client and worker; output/safety env is not input.
+        metadata.target_directory = Default::default();
+        let context = serde_json::to_vec(&(selection, crate::cargo::producer_env(), &metadata))?;
+        let mut configuration = Vec::new();
+        let workspace_root = metadata.workspace_root.as_std_path();
+        for path in [workspace_root.join("Cargo.toml"), workspace_root.join("Cargo.lock")] {
+            configuration.push((path.clone(), Some(std::fs::read(path)?)));
+        }
+        for ancestor in project.ancestors() {
+            for name in [".cargo/config", ".cargo/config.toml"] {
+                let path = ancestor.join(name);
+                match std::fs::read(&path) {
+                    Ok(bytes) => configuration.push((path, Some(bytes))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        configuration.push((path, None));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        let context = serde_json::to_vec(&(context, &configuration))?;
+        let identity = artifact_digest(&paths, &context)?;
+        let root = metadata
+            .workspace_root
+            .as_std_path()
+            .join("target/rust-analyzer/producer-inputs")
+            .join(&identity);
+        let lease = load_cargo::proc_macro_producer_lifetime::lease(&root)?;
+        Ok(Some(Self { paths, context, configuration, root, identity, _lease: lease }))
+    }
+
+    fn current(&self) -> anyhow::Result<bool> {
+        for (path, before) in &self.configuration {
+            let now = match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if &now != before {
+                return Ok(false);
+            }
+        }
+        Ok(artifact_digest(&self.paths, &self.context)? == self.identity)
+    }
+
+    /// This is evidence of a completed existing build, never permission to start one.
+    pub(crate) fn record(&self, artifact: &cargo_metadata::Artifact) -> anyhow::Result<()> {
+        if artifact.fresh || !artifact.target.is_proc_macro() || !self.current()? {
+            return Ok(());
+        }
+        for library in artifact.filenames.iter().filter(|path| is_dylib(path.as_std_path())) {
+            let bytes = std::fs::read(library)?;
+            // Do not publish a record when hashing the artifact straddled an input edit.
+            if !self.current()? {
+                return Ok(());
+            }
+            let hash = Sha256::digest(&bytes);
+            let name: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+            // Complete contents are visible atomically. An interrupted write is not proof.
+            let path = self.root.join(format!("artifact-{name}"));
+            crate::replace(&path, self.identity.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn accepts(&self, artifact: &cargo_metadata::Artifact) -> anyhow::Result<()> {
+        anyhow::ensure!(self.current()?, "macro producer changed during warm load");
+        for library in artifact.filenames.iter().filter(|path| is_dylib(path.as_std_path())) {
+            let hash = Sha256::digest(std::fs::read(library)?);
+            let name: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+            let record = self.root.join(format!("artifact-{name}"));
+            anyhow::ensure!(
+                std::fs::read(record).ok().as_deref() == Some(self.identity.as_bytes()),
+                "refusing warm load: proc-macro artifact {} has no matching producer record; \
+                 cargo's result stands, no rebuild was requested",
+                library
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_dylib(path: &Path) -> bool {
+    matches!(path.extension().and_then(|it| it.to_str()), Some("dylib" | "so" | "dll"))
+}
+
+/// Every message consumer, including the streaming loader, uses the same gate.
+pub(crate) fn validate_artifacts(
+    project: &Path,
+    selection: &crate::plan::Selection,
+    lines: &[String],
+) -> anyhow::Result<Option<ArtifactInputs>> {
+    let artifacts: Vec<cargo_metadata::Artifact> = lines
+        .iter()
+        .filter_map(|line| match serde_json::from_str::<cargo_metadata::Message>(line) {
+            Ok(cargo_metadata::Message::CompilerArtifact(artifact))
+                if artifact.target.is_proc_macro() =>
+            {
+                Some(artifact)
+            }
+            _ => None,
+        })
+        .collect();
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+    let inputs = ArtifactInputs::capture(project, selection)?
+        .context("refusing warm load: proc-macro artifact outside the producer closure")?;
+    for artifact in artifacts {
+        inputs.accepts(&artifact)?;
+    }
+    Ok(Some(inputs))
+}
+
 /// Error is distinct from no producer. Never turn an unreadable closure into an mtime target.
 pub(crate) fn generation(
     workspace: &ProjectWorkspace,
@@ -72,6 +262,7 @@ pub(crate) fn generation(
 pub(crate) struct Generation {
     path: PathBuf,
     _lease: std::fs::File,
+    pub(crate) artifacts: Option<ArtifactInputs>,
 }
 
 impl Generation {
@@ -94,7 +285,7 @@ impl Generation {
         config.target_dir_config = project_model::TargetDirectoryConfig::Directory(
             paths::AbsPathBuf::assert_utf8(path.clone()).into(),
         );
-        Ok(Some(Self { path, _lease: lease }))
+        Ok(Some(Self { path, _lease: lease, artifacts: None }))
     }
 
     pub(crate) fn collect(&self) -> std::io::Result<Vec<PathBuf>> {

@@ -3276,7 +3276,7 @@ fn workspace_at(
     let mut workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
     // Discover the actual producer closure on both cold and reload paths before
     // choosing the existing compile-time producer operation's output directory.
-    let generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
+    let mut generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
     if generation.is_some() {
         workspace = ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?;
     }
@@ -3369,6 +3369,10 @@ fn workspace_at(
             // is what the crates that need no more are read with.
             let (lines, _) = beside.said.so_far();
             beside.applied = lines.len();
+            let artifacts = macro_inputs::validate_artifacts(project, selection, &lines)?;
+            if let Some(generation) = &mut generation {
+                generation.artifacts = artifacts;
+            }
             scripts =
                 Some(WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str)));
         }
@@ -3397,6 +3401,10 @@ fn workspace_at(
             // Cargo's build that is over said it all: the scripts it ran said what they did,
             // and it built the proc macros where they are.
             (None, ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
+                let artifacts = macro_inputs::validate_artifacts(project, selection, &said)?;
+                if let Some(generation) = &mut generation {
+                    generation.artifacts = artifacts;
+                }
                 WorkspaceBuildScripts::of_messages(cargo, said.iter().map(String::as_str))
             }
             // The whole build's scripts are blaze's to compile and run, with no cargo.
@@ -8499,6 +8507,16 @@ fn follow_cargo(
         let (now, all) = beside.ready(cargo, &lines);
         let all = all || ended;
         if lines.len() > beside.applied && (now != ready || all && !all_applied) {
+            let artifacts = macro_inputs::validate_artifacts(
+                &checkouts.roots[beside.at].0,
+                &checkouts.selection,
+                &lines,
+            )?;
+            if let Some(generation) =
+                checkouts.macro_generations.get_mut(&checkouts.roots[beside.at].1)
+            {
+                generation.artifacts = artifacts;
+            }
             let scripts =
                 WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
             let mut workspace = workspace.clone();
@@ -11718,4 +11736,126 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     }
     std::fs::write(&source, original).unwrap();
     drop(second);
+}
+
+#[test]
+#[ignore = "cargo oracle reproduction on a copied proc-macro fixture"]
+fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
+    let root = PathBuf::from(std::env::var_os("C4_SAID_MACRO_FIXTURE").unwrap());
+    let project = root.join("app");
+    let config = CargoConfig {
+        sysroot: Some(project_model::RustLibSource::Discover),
+        only_manifest_package: true,
+        ..Default::default()
+    };
+    let selection = plan::Selection { packages: vec!["app".into()], ..Default::default() };
+    let source = root.join("derive/src/lib.rs");
+    let original = std::fs::read(&source).unwrap();
+    let time = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let inputs = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
+    // These cargo invocations are the test oracle, not a product rebuild/refusal path.
+    let cargo_build = || {
+        let out = std::process::Command::new("cargo")
+            .current_dir(&root)
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_INCREMENTAL")
+            .env("RUSTUP_TOOLCHAIN", "1.99.0")
+            .args(["build", "-p", "app", "--message-format=json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let messages: Vec<cargo_metadata::Message> =
+            cargo_metadata::Message::parse_stream(std::io::Cursor::new(out.stdout))
+                .map(Result::unwrap)
+                .collect();
+        let artifacts: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                cargo_metadata::Message::CompilerArtifact(artifact)
+                    if artifact.target.is_proc_macro() =>
+                {
+                    Some(artifact.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let lines = messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    cargo_metadata::Message::BuildScriptExecuted(_)
+                        | cargo_metadata::Message::CompilerArtifact(_)
+                )
+            })
+            .map(|message| serde_json::to_string(message).unwrap())
+            .collect::<Vec<_>>();
+        (lines, artifacts)
+    };
+    let load_said = |lines| {
+        workspace_at(&project, &config, &load_config(), &selection, None, Some(lines), None, None)
+    };
+    let (first, artifacts) = cargo_build();
+    assert!(!artifacts.is_empty() && artifacts.iter().all(|artifact| !artifact.fresh));
+    assert!(load_said(first.clone()).is_err(), "pre-record targets must refuse warmth");
+    for artifact in &artifacts {
+        inputs.record(artifact).unwrap();
+    }
+    assert!(load_said(first).is_ok(), "stable fresh:false artifacts must be accepted");
+    let replacement =
+        String::from_utf8(original.clone()).unwrap().replace("was described", "got described");
+    assert_eq!(original.len(), replacement.len());
+    assert_ne!(original, replacement.as_bytes());
+    std::fs::write(&source, &replacement).unwrap();
+    std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
+    let (stale, artifacts) = cargo_build();
+    assert!(artifacts.iter().all(|artifact| artifact.fresh), "cargo must reproduce the mtime gap");
+    for artifact in &artifacts {
+        let path = artifact
+            .filenames
+            .iter()
+            .find(|path| matches!(path.extension(), Some("so" | "dylib" | "dll")))
+            .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(memchr::memmem::find(&bytes, b"was described").is_some());
+        assert!(memchr::memmem::find(&bytes, b"got described").is_none());
+        inputs.record(artifact).unwrap();
+    }
+    let error = load_said(stale.clone()).err().expect("stale supplied artifact must fail closed");
+    assert!(format!("{error:#}").contains("no matching producer record"));
+    let said = Arc::new(Said::default());
+    said.lines.lock().unwrap().said = stale;
+    let mut beside = Beside {
+        said,
+        at: 0,
+        awaited: FxHashSet::default(),
+        built: FxHashSet::default(),
+        applied: 0,
+    };
+    let error = workspace_at(
+        &project,
+        &config,
+        &load_config(),
+        &selection,
+        Some(&mut beside),
+        None,
+        None,
+        None,
+    )
+    .err()
+    .expect("streamed artifact must also fail closed");
+    assert!(format!("{error:#}").contains("no matching producer record"));
+    // A build straddling an edit must not publish even a fresh:false message for the new id.
+    let edited = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
+    std::fs::write(&source, &original).unwrap();
+    for mut artifact in artifacts {
+        artifact.fresh = false;
+        edited.record(&artifact).unwrap();
+    }
+    std::fs::write(&source, replacement).unwrap();
+    assert!(
+        macro_inputs::validate_artifacts(&project, &selection, &beside.said.so_far().0).is_err()
+    );
+    std::fs::write(&source, original).unwrap();
 }

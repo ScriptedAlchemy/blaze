@@ -34,6 +34,14 @@ use daemon::{Checkout, NotBuilt, Reply, Request};
 use state::{Built, Counts, Held, Staged, State};
 pub(crate) use units::Record;
 
+pub(crate) fn producer_env() -> BTreeMap<String, String> {
+    let mut env = cli::worker_env();
+    for name in cli::MEMORY_ENV {
+        env.remove(*name);
+    }
+    env
+}
+
 /// `ra-jit cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();

@@ -489,6 +489,20 @@ impl Built {
         ahead: Option<&daemon::Ahead>,
     ) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
+        // Take producer bytes before the existing cargo build starts, not when a worker
+        // happens to load. Failure loses warmth, never adds a compiling cargo invocation.
+        let producer_inputs = ahead.and_then(|ahead| {
+            match crate::macro_inputs::ArtifactInputs::capture(
+                &ahead.root.join(&ahead.config.project),
+                &ahead.config.selection,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    eprintln!("macro provenance: warm load unavailable: {error:#}");
+                    None
+                }
+            }
+        });
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
             Subcommand::Build | Subcommand::Run | Subcommand::Check => cargo.arg("build"),
@@ -515,6 +529,12 @@ impl Built {
         });
         for message in Message::parse_stream(BufReader::new(said)) {
             let message = message?;
+            if let Message::CompilerArtifact(artifact) = &message
+                && let Some(inputs) = &producer_inputs
+                && let Err(error) = inputs.record(artifact)
+            {
+                eprintln!("macro provenance: artifact not recorded: {error:#}");
+            }
             // The worker that loads the workspace meanwhile reads what the scripts said and
             // where the proc macros are from cargo's one build of them, and the symbols of
             // each library as it is built.
