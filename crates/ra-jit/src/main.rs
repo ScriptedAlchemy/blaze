@@ -1278,6 +1278,15 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
     names.filter(|it| named(it)).map(|it| dir.join(it)).collect()
 }
 
+/// Dependent helper callbacks use their parent's admission slot. Keep this around the work
+/// itself, independently of the database handle that owns the helper's solver-cache lifetime.
+fn admitted_parallel_work<'a>(
+    work: &'a ParallelWork<'a>,
+) -> impl Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a {
+    let job = hir_ty_codegen::budget::job_context();
+    move |db, resolver, at| job.run(|| work(db, resolver, at))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -1286,23 +1295,21 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let job = hir_ty_codegen::budget::job_context();
+        let work = admitted_parallel_work(work);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
-                let job = job.clone();
+                let work = &work;
                 scope.spawn(move || {
                     let resolver = parts.over(&db);
-                    job.run(|| {
-                        hir::attach_db(&db, || {
-                            loop {
-                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if at >= count {
-                                    break;
-                                }
-                                work(&db, &resolver, at);
+                    hir::attach_db(&db, || {
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if at >= count {
+                                break;
                             }
-                        })
+                            work(&db, &resolver, at);
+                        }
                     })
                 });
             }
