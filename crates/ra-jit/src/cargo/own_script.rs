@@ -255,7 +255,28 @@ fn build(
     std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
     let project = dir.join("rust-project.json");
     std::fs::write(&project, described).map_err(|it| it.to_string())?;
-    let mut ra_jit = Command::new(std::env::current_exe().map_err(|it| it.to_string())?);
+    let executable = std::env::current_exe().map_err(|it| it.to_string())?;
+    let mut ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
+    let built = ra_jit.output().map_err(|it| format!("ra-jit did not run: {it}"))?;
+    let said = String::from_utf8_lossy(&built.stderr).into_owned();
+    std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
+    if !built.status.success() {
+        let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
+        return Err(format!("ra-jit did not build it ({}): {last}", built.status));
+    }
+    Ok(said)
+}
+
+fn build_command(
+    executable: &Path,
+    project: &Path,
+    dir: &Path,
+    made: &Made<'_>,
+    store: Option<PathBuf>,
+    shipped: bool,
+    asked: Option<(&[(String, String)], &Path)>,
+) -> Command {
+    let mut ra_jit = Command::new(executable);
     ra_jit.arg(&project).args(["--crate", made.name]).arg("--out").arg(dir.join("built.o"));
     ra_jit.arg("--exe").arg(&made.exe).arg("--dep-info").arg(&made.dep_info);
     if made.proc_macro {
@@ -277,7 +298,7 @@ fn build(
             ra_jit.env_remove(&name);
         }
     }
-    for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE"] {
+    for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE", "RA_JIT_RUN_ID"] {
         if let Some(value) = std::env::var_os(kept).filter(|_| asked.is_some()) {
             ra_jit.env(kept, value);
         }
@@ -293,15 +314,15 @@ fn build(
     if !shipped {
         ra_jit.env("RA_JIT_STD_FROM", "off");
     }
-    ra_jit.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
-    let built = ra_jit.output().map_err(|it| format!("ra-jit did not run: {it}"))?;
-    let said = String::from_utf8_lossy(&built.stderr).into_owned();
-    std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
-    if !built.status.success() {
-        let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
-        return Err(format!("ra-jit did not build it ({}): {last}", built.status));
+    // A source-only producer cannot reach the remaining rustc query fallback.
+    if made.proc_macro && asked.is_some() {
+        ra_jit.env("RA_JIT_ANSWERS", "own");
+        ra_jit.env("BLAZE_ANSWERS", "own");
+        ra_jit.env("RA_JIT_OWN_RESOLVE", "1");
+        ra_jit.env("BLAZE_OWN_RESOLVE", "1");
     }
-    Ok(said)
+    ra_jit.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
+    ra_jit
 }
 
 /// Builds a script that does nothing over the standard library of `sysroot` in `dir`, into
@@ -331,6 +352,8 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
 
 /// A crate of a build script's description that blaze's runner of build scripts makes from
 /// blaze's own reading of the workspace (`crate::scripts`), not from what cargo told rustc.
+#[derive(serde_derive::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Planned {
     pub(crate) name: String,
     pub(crate) root: PathBuf,
@@ -349,7 +372,7 @@ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> Strin
 }
 
 /// The source graph of an owned proc-macro producer. No rustc artifact or unit record
-/// is needed to identify its root. Scheduling/linking this graph is separate work.
+/// is needed to identify its root.
 pub(crate) fn planned_macro_description(
     sysroot: &Path,
     crates: Vec<Planned>,
@@ -357,7 +380,66 @@ pub(crate) fn planned_macro_description(
     if crates.is_empty() {
         return Err("a proc-macro producer needs a root crate".to_owned());
     }
+    for krate in &crates {
+        if !krate.root.is_absolute() {
+            return Err(format!("the source root of `{}` is not absolute", krate.name));
+        }
+        if krate.deps.iter().any(|(_, at)| *at >= crates.len()) {
+            return Err(format!("a dependency of `{}` is outside the source graph", krate.name));
+        }
+    }
+    fn visit(at: usize, crates: &[Planned], state: &mut [u8]) -> Result<(), String> {
+        match state[at] {
+            1 => return Err(format!("a cycle in the source graph reaches `{}`", crates[at].name)),
+            2 => return Ok(()),
+            _ => {}
+        }
+        state[at] = 1;
+        for (_, dep) in &crates[at].deps {
+            visit(*dep, crates, state)?;
+        }
+        state[at] = 2;
+        Ok(())
+    }
+    let mut state = vec![0; crates.len()];
+    for at in 0..crates.len() {
+        visit(at, &crates, &mut state)?;
+    }
     Ok(planned_source_description(sysroot, crates, true))
+}
+
+/// Compiles an owned host source graph into a proc-macro image and its complete dep-info.
+/// The caller supplies resolved host cfgs, profiles and script outputs, and owns `dir`
+/// exclusively until the build ends. This does not read wrapper records, restore supplied
+/// libraries or route a cold workspace load. Publication and scheduling belong to the caller.
+pub(crate) fn link_macro_planned(
+    sysroot: &Path,
+    crates: Vec<Planned>,
+    dir: &Path,
+    env: &[(String, String)],
+) -> Result<PathBuf, String> {
+    let name = crates.first().ok_or("a proc-macro producer needs a root crate")?.name.clone();
+    let described = planned_macro_description(sysroot, crates)?;
+    let exe =
+        dir.join(format!("{}{name}{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX));
+    let made = Made {
+        name: &name,
+        proc_macro: true,
+        dep_info: dir.join(format!("{name}.d")),
+        exe: exe.clone(),
+    };
+    let inputs = dir.join("producer.inputs");
+    let said = build(&described, dir, &made, super::daemon::store(), false, Some((env, &inputs)))?;
+    if let Some(line) =
+        said.lines().find(|it| it.contains(" functions in it ra-jit could not compile"))
+        && !line.ends_with(", 0 functions in it ra-jit could not compile")
+    {
+        return Err(format!("it calls functions blaze could not compile ({line})"));
+    }
+    if !exe.is_file() || !made.dep_info.is_file() || !inputs.is_file() {
+        return Err("the producer build did not write its library and complete dep-info".to_owned());
+    }
+    Ok(exe)
 }
 
 fn planned_source_description(sysroot: &Path, crates: Vec<Planned>, macro_root: bool) -> String {
@@ -528,6 +610,85 @@ mod tests {
         producer["crates"][0]["is_proc_macro"] = json!(false);
         assert_eq!(plain, producer, "only the root's producer kind may change");
         assert!(planned_macro_description(sysroot, vec![]).is_err());
+    }
+
+    fn source_crate(name: &str, deps: Vec<(String, usize)>) -> Planned {
+        Planned {
+            name: name.into(),
+            root: format!("/sources/{name}/src/lib.rs").into(),
+            edition: "2021".into(),
+            cfg: vec![],
+            codegen_flags: vec![],
+            env: BTreeMap::new(),
+            deps,
+        }
+    }
+
+    #[test]
+    fn planned_macro_rejects_artifacts_and_invalid_edges_before_building() {
+        let sysroot = Path::new("/owned/sysroot");
+        let invalid = vec![source_crate("derive", vec![("missing".into(), 1)])];
+        assert!(planned_macro_description(sysroot, invalid).unwrap_err().contains("outside"));
+        let cycle = vec![
+            source_crate("derive", vec![("dep".into(), 1)]),
+            source_crate("dep", vec![("root".into(), 0)]),
+        ];
+        assert!(planned_macro_description(sysroot, cycle).unwrap_err().contains("cycle"));
+        let mut relative = source_crate("derive", vec![]);
+        relative.root = "src/lib.rs".into();
+        assert!(planned_macro_description(sysroot, vec![relative]).is_err());
+        let mut supplied = json!({
+            "name": "derive", "root": "/sources/derive/src/lib.rs", "edition": "2021",
+            "cfg": [], "codegen_flags": [], "env": {}, "deps": [],
+            "proc_macro_dylib_path": "/cargo/libderive.dylib",
+        });
+        assert!(serde_json::from_value::<Planned>(supplied.clone()).is_err());
+        supplied.as_object_mut().unwrap().remove("proc_macro_dylib_path");
+        assert!(serde_json::from_value::<Planned>(supplied).is_ok());
+    }
+
+    #[test]
+    fn planned_macro_build_uses_owned_compiler_shared_link_and_host_environment() {
+        let dir = Path::new("/producer");
+        let made = Made {
+            name: "derive",
+            proc_macro: true,
+            exe: dir.join("libderive.dylib"),
+            dep_info: dir.join("derive.d"),
+        };
+        let env = vec![
+            ("PATH".into(), "/tools".into()),
+            ("CARGO_BUILD_TARGET".into(), "wasm32-unknown-unknown".into()),
+            ("RUSTC_WRAPPER".into(), "/forbidden".into()),
+        ];
+        let command = build_command(
+            Path::new("/blaze/ra-jit"),
+            &dir.join("rust-project.json"),
+            dir,
+            &made,
+            None,
+            false,
+            Some((&env, &dir.join("producer.inputs"))),
+        );
+        assert_eq!(command.get_program(), "/blaze/ra-jit");
+        let args = command.get_args().map(|it| it.to_str().unwrap()).collect::<Vec<_>>();
+        assert!(args.windows(3).any(|it| it == ["--crate", "proc_macro", "--shared"]));
+        assert!(args.windows(2).any(|it| it == ["--inputs", "/producer/producer.inputs"]));
+        assert!(args.windows(2).any(|it| it == ["--exe", "/producer/libderive.dylib"]));
+        let env = command.get_envs().collect::<BTreeMap<_, _>>();
+        assert_ne!(
+            env.get(OsStr::new("CARGO_BUILD_TARGET")).copied().flatten(),
+            Some(OsStr::new("wasm32-unknown-unknown"))
+        );
+        assert_ne!(
+            env.get(OsStr::new("RUSTC_WRAPPER")).copied().flatten(),
+            Some(OsStr::new("/forbidden"))
+        );
+        assert_eq!(env.get(OsStr::new("RA_JIT_STD_FROM")), Some(&Some(OsStr::new("off"))));
+        assert_eq!(env.get(OsStr::new("RA_JIT_ANSWERS")), Some(&Some(OsStr::new("own"))));
+        assert_eq!(env.get(OsStr::new("BLAZE_ANSWERS")), Some(&Some(OsStr::new("own"))));
+        assert_eq!(env.get(OsStr::new("RA_JIT_OWN_RESOLVE")), Some(&Some(OsStr::new("1"))));
+        assert_eq!(env.get(OsStr::new("BLAZE_OWN_RESOLVE")), Some(&Some(OsStr::new("1"))));
     }
 
     #[test]

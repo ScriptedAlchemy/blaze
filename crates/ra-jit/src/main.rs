@@ -7936,6 +7936,9 @@ fn main() -> anyhow::Result<()> {
         Some(cargo::own_macro::COMMAND) => {
             return cargo::own_macro::command(std::env::args_os().skip(2));
         }
+        Some(cargo::own_macro::SOURCE_COMMAND) => {
+            return cargo::own_macro::source_command(std::env::args_os().skip(2));
+        }
         Some("cargo") => return cargo::command(std::env::args().skip(2)),
         Some("enable" | "disable" | "status" | "stop") => {
             return cargo::command(std::env::args().skip(1));
