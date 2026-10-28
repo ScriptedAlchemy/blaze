@@ -427,28 +427,32 @@ fn pending(binary: PathBuf, inputs: Inputs) -> Pending {
 pub(crate) fn output_digest(path: &Path) -> io::Result<Digest> {
     #[cfg(unix)]
     {
-        let stamp = OutputStamp::of(&fs::metadata(path)?);
-        if let Some((cached, digest)) = crate::lock(&OUTPUT_DIGESTS).get(path)
-            && *cached == stamp
-        {
-            return Ok(*digest);
+        // A successful link can overlap the client's rename/chmod publication. Retry
+        // that bounded transition; never cache a digest observed during a write.
+        for _ in 0..8 {
+            let stamp = OutputStamp::of(&fs::metadata(path)?);
+            if let Some((cached, digest)) = crate::lock(&OUTPUT_DIGESTS).get(path)
+                && *cached == stamp
+            {
+                return Ok(*digest);
+            }
+            let mut file = fs::File::open(path)?;
+            if OutputStamp::of(&file.metadata()?) == stamp {
+                let digest = hash_output(&mut file)?;
+                if OutputStamp::of(&file.metadata()?) == stamp
+                    && OutputStamp::of(&fs::metadata(path)?) == stamp
+                {
+                    let mut cache = crate::lock(&OUTPUT_DIGESTS);
+                    if cache.len() >= 1024 && !cache.contains_key(path) {
+                        cache.pop_first();
+                    }
+                    cache.insert(path.to_owned(), (stamp, digest));
+                    return Ok(digest);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let mut file = fs::File::open(path)?;
-        if OutputStamp::of(&file.metadata()?) != stamp {
-            return Err(io::Error::other("publication changed while opening its artifact"));
-        }
-        let digest = hash_output(&mut file)?;
-        if OutputStamp::of(&file.metadata()?) != stamp
-            || OutputStamp::of(&fs::metadata(path)?) != stamp
-        {
-            return Err(io::Error::other("publication changed while hashing its artifact"));
-        }
-        let mut cache = crate::lock(&OUTPUT_DIGESTS);
-        if cache.len() >= 1024 && !cache.contains_key(path) {
-            cache.pop_first();
-        }
-        cache.insert(path.to_owned(), (stamp, digest));
-        Ok(digest)
+        Err(io::Error::other("publication did not settle while hashing its artifact"))
     }
     #[cfg(not(unix))]
     {
@@ -1279,6 +1283,27 @@ fn main() {{}}
         let stamp = OutputStamp::of(&fs::metadata(&binary).unwrap());
         assert_eq!(crate::lock(&OUTPUT_DIGESTS).get(&binary).unwrap().0, stamp);
         assert!(new_ms.iter().sum::<f64>() < old_ms.iter().sum::<f64>());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_cache_rehashes_renamed_and_same_timestamp_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        fs::write(&path, b"one").unwrap();
+        let first = output_digest(&path).unwrap();
+        let old = OutputStamp::of(&fs::metadata(&path).unwrap());
+        let time = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"two").unwrap();
+        fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        assert_ne!(OutputStamp::of(&fs::metadata(&path).unwrap()), old);
+        assert_ne!(output_digest(&path).unwrap(), first);
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"one").unwrap();
+        fs::File::options().write(true).open(&replacement).unwrap().set_modified(time).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert_ne!(OutputStamp::of(&fs::metadata(&path).unwrap()).inode, old.inode);
+        assert_eq!(output_digest(&path).unwrap(), first);
     }
 
     #[cfg(unix)]
