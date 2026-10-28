@@ -1150,7 +1150,85 @@ impl Jobs {
                 && let Some(jobs) = self.pr_jobs.get_mut(&pr.n)
             {
                 jobs.executions.remove(&id);
+                // Supersession only needs the source while a PR still has live work.
+                // Retaining empty entries makes bounded execution retention leak one
+                // source record for every PR ever served.
+                if jobs.executions.is_empty() {
+                    self.pr_jobs.remove(&pr.n);
+                }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::admission::AdmissionConfig;
+    use blaze_wire::{BuildSpec, Command, PrNamespace, ProfileSpec, RootRef, Set, StoreIdentity};
+
+    fn request(pr: u64, source: u8) -> JobRequest {
+        JobRequest {
+            spec: BuildSpec {
+                source: SourceRef::Root(RootRef { root: [source; 32] }),
+                lock: [1; 32],
+                units: Vec::new(),
+                asked: Set::new(Vec::new()),
+                profile: ProfileSpec {
+                    name: "dev".to_owned(),
+                    opt_level: 0,
+                    debug: 1,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: 0,
+                    strip: 0,
+                    split_debuginfo: 0,
+                    backend: 0,
+                    mir_opt: 0,
+                },
+                platform: [1; 32],
+                rustflags: Vec::new(),
+                config_env: Set::new(Vec::new()),
+                script_env: Set::new(Vec::new()),
+                cwd: String::new(),
+                command: Command::Build,
+                toolchain: StoreIdentity([2; 32]),
+            },
+            namespace: Namespace::Pr(PrNamespace { n: pr }),
+            deadline_ms: 100_000,
+            local: LocalPolicy::Never,
+            test_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn ending_pr_executions_releases_the_source_index_and_preserves_live_siblings() {
+        let mut jobs =
+            Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
+        let need = Reservation { memory: 4, cpus: 4, disk: 4 };
+        for pr in 1..=128 {
+            let mut effects = Vec::new();
+            let first = jobs.submit(0, &request(pr, 1), need.clone(), &mut effects).unwrap();
+            let mut other_platform = request(pr, 1);
+            other_platform.spec.platform = [3; 32];
+            let sibling = jobs.submit(0, &other_platform, need.clone(), &mut effects).unwrap();
+            jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
+            assert_eq!(jobs.pr_jobs[&pr].executions.len(), 1);
+            assert!(jobs.pr_jobs[&pr].executions.contains_key(&sibling.execution));
+
+            let next = jobs.submit(2, &request(pr, 2), need.clone(), &mut effects).unwrap();
+            assert_eq!(
+                jobs.execution(sibling.execution).unwrap().state(),
+                ExecState::Ended(Outcome::Cancelled)
+            );
+            assert_eq!(jobs.pr_jobs[&pr].executions.len(), 1);
+            assert!(jobs.pr_jobs[&pr].executions.contains_key(&next.execution));
+            jobs.unsubscribe(3, next.execution, next.subscriber, &mut effects).unwrap();
+            for execution in [first.execution, sibling.execution, next.execution] {
+                assert!(jobs.forget_terminal(execution));
+            }
+            assert_eq!(jobs.executions().count(), 0);
+            assert!(jobs.pr_jobs.is_empty(), "finished PR {pr} retained its source index");
         }
     }
 }

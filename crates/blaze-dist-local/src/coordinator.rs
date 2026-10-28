@@ -381,12 +381,17 @@ impl Coordinator {
                 if submission(&req, s.need.clone()).content != s.content {
                     return Err(error(ErrorCode::Conflict, "content-mismatch"));
                 }
-                if self.jobs.executions().count() >= self.config.max_executions {
+                let running = self
+                    .jobs
+                    .executions()
+                    .find(|e| e.content == s.content && !matches!(e.state(), ExecState::Ended(_)));
+                // An equal live job adds an interest to the existing execution. A retained
+                // terminal instead creates a new execution with its own subscriber budget.
+                if running.is_none() && self.jobs.executions().count() >= self.config.max_executions
+                {
                     return Err(error(ErrorCode::Busy, "execution-retention-capacity"));
                 }
-                if self.jobs.executions().any(|e| {
-                    e.content == s.content && e.subscribers().count() >= self.config.max_subscribers
-                }) {
+                if running.is_some_and(|e| e.subscribers().count() >= self.config.max_subscribers) {
                     return Err(error(ErrorCode::Busy, "subscriber-retention-capacity"));
                 }
                 let a = self
