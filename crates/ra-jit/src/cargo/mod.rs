@@ -594,12 +594,66 @@ fn asking(checkout: &Checkout) -> Checkout {
             || name == "RA_JIT_STATS"
             || name == "RA_JIT_TRACE"
     };
-    let mut env: BTreeMap<String, String> =
-        crate::process::vars().filter(|(name, _)| !wraps(name)).collect();
-    env.extend(checkout.env.clone());
-    let native_env =
-        Some(crate::process::native().over(env.iter().map(|(k, v)| (k.into(), v.into()))));
-    Checkout { env, native_env, ..checkout.clone() }
+    let native_env = crate::process::Native::of(
+        crate::process::native()
+            .vars()
+            .filter(|(name, _)| name.to_str().is_none_or(|name| !wraps(name))),
+    )
+    .over(checkout.env.iter().map(|(k, v)| (k.into(), v.into())));
+    let env = crate::process::unicode(native_env.vars()).collect();
+    Checkout { env, native_env: Some(native_env), ..checkout.clone() }
+}
+
+#[cfg(all(test, unix))]
+mod request_tests {
+    use super::*;
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    #[test]
+    fn native_requests_do_not_restore_filtered_wrapper_variables() {
+        let control = [wrapper::DRIVEN, switch::VARIABLE, "RA_JIT_STATS", "RA_JIT_TRACE"];
+        let byte_value = OsString::from_vec(vec![0xff, b'v']);
+        let byte_name = OsString::from_vec(vec![0xff, b'k']);
+        let _scope = crate::process::enter_native(crate::process::Native::of(
+            control.iter().map(|name| ((*name).into(), "control".into())).chain([
+                ("PLAIN".into(), "caller".into()),
+                ("EMPTY".into(), OsString::new()),
+                ("BYTE_VALUE".into(), byte_value.clone()),
+                (byte_name.clone(), "native-key".into()),
+            ]),
+        ));
+        let checkout = Checkout {
+            key: String::new(),
+            generation: 0,
+            built_at: 0,
+            config: daemon::WorkerConfig {
+                repository: Default::default(),
+                project: Default::default(),
+                cfg_test: false,
+                selection: Default::default(),
+                env: BTreeMap::new(),
+                whole: false,
+            },
+            root: Default::default(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            env: BTreeMap::from([("PLAIN".into(), "checkout".into())]),
+            native_env: None,
+            scripts: None,
+        };
+        let request = asking(&checkout);
+        let native: BTreeMap<_, _> = request.native_env.unwrap().vars().collect();
+        for name in control {
+            assert!(!request.env.contains_key(name));
+            assert!(!native.contains_key(std::ffi::OsStr::new(name)), "restored {name}");
+        }
+        assert_eq!(request.env["PLAIN"], "checkout");
+        assert_eq!(native[std::ffi::OsStr::new("PLAIN")], "checkout");
+        assert_eq!(native[std::ffi::OsStr::new("EMPTY")], "");
+        assert_eq!(native[std::ffi::OsStr::new("BYTE_VALUE")], byte_value);
+        assert_eq!(native[&byte_name], "native-key");
+        assert!(!request.env.contains_key("BYTE_VALUE"));
+    }
 }
 
 /// Tells the daemon to load `checkout` as cargo just built it, starting one when there is

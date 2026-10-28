@@ -16,9 +16,17 @@ use super::own_script::{self, Planned};
 
 type Files = BTreeMap<PathBuf, [u8; 32]>;
 
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Snapshot {
+    files: Files,
+    /// Keep the route by which source was read, even when both possible targets
+    /// of a symlink already occur elsewhere in the input closure.
+    bindings: BTreeMap<PathBuf, PathBuf>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Record {
-    files: Files,
+    files: Snapshot,
     outputs: Files,
     library: PathBuf,
 }
@@ -31,12 +39,13 @@ fn digest(path: &Path) -> Result<[u8; 32]> {
     .into())
 }
 
-fn walk(path: &Path, files: &mut Files, active: &mut BTreeSet<PathBuf>) -> Result<()> {
+fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> Result<()> {
     let metadata = std::fs::metadata(path)?;
+    let canonical = std::fs::canonicalize(path)?;
+    inputs.bindings.insert(path.to_owned(), canonical.clone());
     if metadata.is_file() {
-        files.insert(std::fs::canonicalize(path)?, digest(path)?);
+        inputs.files.insert(canonical, digest(path)?);
     } else if metadata.is_dir() {
-        let canonical = std::fs::canonicalize(path)?;
         anyhow::ensure!(active.insert(canonical.clone()), "producer source directory cycle");
         let mut entries = std::fs::read_dir(path)?
             .map(|it| it.map(|it| it.path()))
@@ -49,7 +58,7 @@ fn walk(path: &Path, files: &mut Files, active: &mut BTreeSet<PathBuf>) -> Resul
             {
                 continue;
             }
-            walk(&entry, files, active)?;
+            walk(&entry, inputs, active)?;
         }
         active.remove(&canonical);
     } else {
@@ -58,12 +67,12 @@ fn walk(path: &Path, files: &mut Files, active: &mut BTreeSet<PathBuf>) -> Resul
     Ok(())
 }
 
-fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Files> {
-    let mut files = Files::new();
+fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
+    let mut inputs = Snapshot::default();
     let mut roots = BTreeSet::new();
     for krate in crates {
         if let Some(image) = &krate.proc_macro {
-            files.insert(std::fs::canonicalize(image)?, digest(image)?);
+            walk(image, &mut inputs, &mut BTreeSet::new())?;
         }
         let package = krate
             .root
@@ -80,12 +89,12 @@ fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Files> {
     // Source std is part of an owned image, including local toolchain source edits.
     roots.insert(sysroot.join("lib/rustlib/src/rust/library"));
     for root in roots {
-        walk(&root, &mut files, &mut BTreeSet::new())?;
+        walk(&root, &mut inputs, &mut BTreeSet::new())?;
     }
     // A changed compiler cannot reuse an earlier producer even under the same version.
     let compiler = std::env::current_exe()?;
-    files.insert(std::fs::canonicalize(&compiler)?, digest(&compiler)?);
-    Ok(files)
+    walk(&compiler, &mut inputs, &mut BTreeSet::new())?;
+    Ok(inputs)
 }
 
 fn unchanged(files: &Files) -> bool {
@@ -106,7 +115,7 @@ pub(crate) fn link(
     let context =
         serde_json::to_vec(&(description, crate::process::Native::of(env.iter().cloned())))?;
     let mut hash = Sha256::new();
-    hash.update(b"blaze owned producer image 1\0");
+    hash.update(b"blaze owned producer image 2\0");
     hash.update((context.len() as u64).to_le_bytes());
     hash.update(context);
     hash.update(serde_json::to_vec(&before)?);
@@ -168,7 +177,9 @@ pub(crate) fn link(
     // Unknown external include inputs were not read before compilation. Build succeeds,
     // but do not certify an image for reuse from a post-build-only observation.
     if read.files.iter().any(|it| {
-        std::fs::canonicalize(attempt.join(it)).ok().is_none_or(|path| !before.contains_key(&path))
+        std::fs::canonicalize(attempt.join(it))
+            .ok()
+            .is_none_or(|path| !before.files.contains_key(&path))
     }) {
         return Ok(library);
     }
@@ -193,22 +204,56 @@ pub(crate) fn link(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_detect_retargeted_source_aliases() {
+        use std::os::unix::fs::symlink;
+
+        for directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("first");
+            let second = dir.path().join("second");
+            let alias = dir.path().join("selected");
+            if directory {
+                std::fs::create_dir(&first).unwrap();
+                std::fs::create_dir(&second).unwrap();
+            }
+            let file = |path: &Path| {
+                if directory { path.join("lib.rs") } else { path.to_owned() }
+            };
+            std::fs::write(file(&first), b"FIRST").unwrap();
+            std::fs::write(file(&second), b"SECOND").unwrap();
+            symlink(&first, &alias).unwrap();
+            let read = || {
+                let mut files = Snapshot::default();
+                walk(dir.path(), &mut files, &mut BTreeSet::new()).unwrap();
+                files
+            };
+            let before = read();
+            assert_eq!(read(), before);
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&second, &alias).unwrap();
+            assert_eq!(std::fs::read(file(&alias)).unwrap(), b"SECOND");
+            assert_ne!(read(), before, "source alias retargeting must change the image key");
+        }
+    }
+
     #[test]
     fn snapshots_detect_restored_mtime_changes_and_directory_cycles() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("lib.rs");
         std::fs::write(&file, b"ONE").unwrap();
         let time = std::fs::metadata(&file).unwrap().modified().unwrap();
-        let mut files = Files::new();
+        let mut files = Snapshot::default();
         walk(dir.path(), &mut files, &mut BTreeSet::new()).unwrap();
-        assert!(unchanged(&files));
+        assert!(unchanged(&files.files));
         std::fs::write(&file, b"TWO").unwrap();
         File::options().write(true).open(&file).unwrap().set_modified(time).unwrap();
-        assert!(!unchanged(&files));
+        assert!(!unchanged(&files.files));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(dir.path(), dir.path().join("cycle")).unwrap();
-            assert!(walk(dir.path(), &mut Files::new(), &mut BTreeSet::new()).is_err());
+            assert!(walk(dir.path(), &mut Snapshot::default(), &mut BTreeSet::new()).is_err());
         }
     }
 
