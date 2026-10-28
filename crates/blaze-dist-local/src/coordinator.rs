@@ -547,3 +547,74 @@ impl Coordinator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_dist::admission::{Admission, AdmissionConfig};
+    use blaze_dist::jobs::ExecutionConfig;
+
+    fn coordinator(config: Config) -> Coordinator {
+        let jobs =
+            Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
+        Coordinator::new(jobs, config, [7; 32])
+    }
+
+    /// A label is never issued twice. Running the counter out is a typed capacity refusal,
+    /// not a wrap that would hand back an old identity, and the daemon keeps serving.
+    #[test]
+    fn label_counter_exhaustion_is_a_typed_refusal_not_a_reissued_identity() {
+        let mut c = coordinator(Config::default());
+        c.issued = u64::MAX;
+        let refused = c.hello(0, &hello([1; 32])).unwrap_err();
+        assert_eq!(refused.code(), Some(ErrorCode::Busy));
+        assert!(refused.message.contains("session-label-exhausted"));
+        // Nothing was issued, so capacity was not spent and no label came back around.
+        assert!(c.sessions.is_empty());
+        assert_eq!(c.issued, u64::MAX);
+    }
+
+    /// A creation is idempotent for its nonce only while that lifetime is live, and the two
+    /// outcomes are distinguishable so a client never mistakes a revival for a creation.
+    #[test]
+    fn creation_is_idempotent_while_live_and_distinct_after_expiry() {
+        let mut c = coordinator(Config { session_ms: 10, ..Config::default() });
+        let first = c.hello(0, &hello([2; 32])).unwrap();
+        assert!(first.created);
+        let retried = c.hello(5, &hello([2; 32])).unwrap();
+        assert_eq!(retried.session, first.session);
+        assert!(!retried.created);
+        let expired = c.hello(11, &hello([2; 32])).unwrap();
+        assert!(expired.created);
+        assert_ne!(expired.session, first.session);
+        // The old label is dead, not resumable, and not a live session any more.
+        assert!(c.hello(11, &resume(first.session, c.epoch)).is_err());
+    }
+
+    /// A release frees capacity and journal memory at once, and no tombstone remains, so the
+    /// map cannot grow with the number of clients served.
+    #[test]
+    fn release_returns_capacity_without_retaining_a_tombstone() {
+        let mut c = coordinator(Config { max_sessions: 2, ..Config::default() });
+        let a = c.hello(0, &hello([3; 32])).unwrap();
+        let b = c.hello(0, &hello([4; 32])).unwrap();
+        assert_ne!(a.session, b.session);
+        let third = c.hello(0, &hello([5; 32])).unwrap_err();
+        assert_eq!(third.code(), Some(ErrorCode::Busy));
+        // Release `a`: its journal goes with it and one slot comes back.
+        let request = Request {
+            epoch: c.epoch,
+            session: a.session,
+            sequence: 1,
+            command: Command::Release(Release {}),
+        };
+        let (_, effects) = c.request(0, &request).unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(c.sessions.len(), 1);
+        assert!(!c.sessions.contains_key(&a.session));
+        let c2 = c.hello(0, &hello([6; 32])).unwrap();
+        assert!(c2.created);
+        // The released label cannot be resumed or replayed.
+        assert!(c.hello(0, &resume(a.session, c.epoch)).is_err());
+    }
+}
