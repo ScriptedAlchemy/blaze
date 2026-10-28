@@ -51,6 +51,9 @@ pub struct LoadCargoConfig {
     pub proc_macro_processes: usize,
 }
 
+/// Worker snapshot allocation and post-wait cleanup use the same API-owned layout.
+pub use proc_macro_api::snapshot_dir as proc_macro_snapshot_dir;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcMacroServerChoice {
     Sysroot,

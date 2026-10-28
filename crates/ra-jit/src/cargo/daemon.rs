@@ -957,7 +957,7 @@ fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
     if let Ok(home) = home() {
-        let _ = proc_macro_api::snapshot_dir::remove_after_worker_exit(&home, pid);
+        let _ = load_cargo::proc_macro_snapshot_dir::remove_after_worker_exit(&home, pid);
     }
 }
 
