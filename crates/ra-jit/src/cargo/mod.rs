@@ -255,6 +255,10 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             eprintln!("{written}");
             return Ok(FAILED);
         }
+        Ok(Err(NotServed::Script(why))) => {
+            eprintln!("error: {why}");
+            return Ok(FAILED);
+        }
         Ok(Err(NotServed::Cargo(ToCargo(state, reason)))) => {
             say::cargo_builds(&reason, "building with cargo", say::EDIT);
             let mut counts = state.counts;
@@ -297,6 +301,10 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                         }
                         Err(NotServed::Error(_, written)) => {
                             eprintln!("{written}");
+                            return Ok(FAILED);
+                        }
+                        Err(NotServed::Script(why)) => {
+                            eprintln!("error: {why}");
                             return Ok(FAILED);
                         }
                         Err(NotServed::Cargo(ToCargo(state, reason))) => {
@@ -364,6 +372,10 @@ fn check(asked: &Invocation) -> anyhow::Result<i32> {
                 return Ok(0);
             }
             Err(NotServed::Error(said, _)) => return turned_down(&[said]),
+            Err(NotServed::Script(why)) => {
+                eprintln!("error: {why}");
+                return Ok(FAILED);
+            }
             Err(NotServed::Cargo(_)) => {}
         }
     }
@@ -506,6 +518,8 @@ struct ToCargo(Box<State>, String);
 /// Why the daemon's programs are not the build.
 enum NotServed {
     Cargo(ToCargo),
+    /// A build script executed for this request and failed. Do not retry it.
+    Script(String),
     /// The source has errors: them, and them as rustc and cargo write them.
     Error(crate::errors::Said, String),
 }
@@ -517,7 +531,10 @@ fn by_daemon(mut state: State) -> Result<(State, Held), NotServed> {
     use crate::trace::{CLIENT, note};
     let to_cargo = |state, why| NotServed::Cargo(ToCargo(Box::new(state), why));
     let checking = Instant::now();
-    let cargos = state.refusal.clone().or_else(|| state.broken_guard());
+    let cargos = match &state.refusal {
+        Some(why) => Some(why.clone()),
+        None => state.broken_guard().map_err(NotServed::Script)?,
+    };
     if let Some(reason) = cargos.or_else(|| state.stale_cargos()) {
         return Err(to_cargo(state, reason));
     }

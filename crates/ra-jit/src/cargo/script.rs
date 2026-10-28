@@ -292,9 +292,39 @@ pub(crate) struct Cargo<'a> {
 /// It is `Err`, the build cargo's, and nothing is run: when cargo's records are not ones cargo
 /// 1.99 wrote, or of a run that did not end; when a watched variable has another value; when a
 /// cargo holds the lock, so its run cannot be read consistently; and when there is no
-/// lock to take. A run that fails, or that printed what cargo does not take, is `Err` too, and
-/// cargo, which finds its records of a run that did not end, runs the script again.
+/// lock to take. An executed failure is the result of this build, not permission to retry
+/// it through cargo. Its empty fingerprint permits the next requested build to retry.
 pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> {
+    judge(out_dir, cargo).map_err(|it| it.to_string())
+}
+
+/// Failure to inspect a run is different from a run that failed this build.
+#[derive(Debug)]
+pub(crate) enum JudgementError {
+    Unavailable(String),
+    Failed(String),
+}
+
+impl From<String> for JudgementError {
+    fn from(value: String) -> Self {
+        Self::Unavailable(value)
+    }
+}
+
+impl From<&str> for JudgementError {
+    fn from(value: &str) -> Self {
+        Self::Unavailable(value.to_owned())
+    }
+}
+
+impl std::fmt::Display for JudgementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Unavailable(what) | Self::Failed(what)) = self;
+        f.write_str(what)
+    }
+}
+
+pub(crate) fn judge(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, JudgementError> {
     let unit = records::Unit::of(out_dir)?;
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
@@ -338,7 +368,7 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     });
     let local_changed = now != recorded.local;
     if local_changed && !matches!(&now[..], [records::Local::Precalculated(_)]) {
-        return Err(changed(&now, &recorded.local));
+        return Err(changed(&now, &recorded.local).into());
     }
     let compiled = ran.real.to_str().and_then(|it| it.strip_suffix(".real")).map(PathBuf::from);
     let compiled = compiled.unwrap_or_else(|| ran.real.clone());
@@ -346,7 +376,7 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
         .map(|it| ran.cwd.join(it))
         .or_else(|| (cargo.env)("HOME").map(|it| Path::new(&it).join(".cargo")));
     if !local_changed && unit.stale(&now, package, &compiled, home).is_none() {
-        return Run::left(&printed, out_dir);
+        return Ok(Run::left(&printed, out_dir)?);
     }
     let began = unit.begin()?;
     let mut env: std::collections::BTreeMap<String, String> = ran
@@ -367,17 +397,24 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     let mut script = Command::new(&ran.real);
     script.env_clear().envs(&env);
     script.current_dir(&ran.cwd).stdin(Stdio::null());
-    let again = script.output().map_err(|it| it.to_string())?;
+    let again = script.output().map_err(|it| JudgementError::Failed(it.to_string()))?;
     if !again.status.success() {
-        return Err(format!("failed ({})", again.status));
+        return Err(JudgementError::Failed(format!(
+            "failed ({})\n{}",
+            again.status,
+            String::from_utf8_lossy(&again.stderr).trim_end()
+        )));
     }
     // Cargo reads each line as the script prints it, and a run that logged an error is a failed
     // one, of which it writes nothing.
     if String::from_utf8_lossy(&again.stdout).lines().any(|it| it.starts_with("cargo::error=")) {
-        return Err("logged an error".to_owned());
+        return Err(JudgementError::Failed(format!(
+            "logged an error\n{}",
+            String::from_utf8_lossy(&again.stdout).trim_end()
+        )));
     }
     unit.ran(began, &again.stdout, &again.stderr)?;
-    let said = said(&again.stdout, out_dir)?;
+    let said = said(&again.stdout, out_dir).map_err(JudgementError::Failed)?;
     let named = if !said.rerun_if_changed.is_empty() && named.as_os_str().is_empty() {
         unit.output_named(&recorded)?
     } else {
@@ -385,7 +422,7 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
     };
     // A run that says nothing of what it reads leaves what cargo reckoned before it.
     unit.record(&recorded.with_local(reckoned(&said, &named).unwrap_or(now)))?;
-    Run::left(&again.stdout, out_dir)
+    Ok(Run::left(&again.stdout, out_dir)?)
 }
 
 fn cargo_sets(name: &str) -> bool {
@@ -1461,11 +1498,27 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     }
 
     #[test]
+    fn an_executed_failure_is_not_permission_to_retry_this_build() {
+        let out_dir = ran_script(
+            "fail-on-second",
+            "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nif [ \"$(wc -l < \"$OUT_DIR/../runs\")\" -eq 2 ]; then echo 'second run fails' >&2; exit 3; fi\n",
+            "",
+        );
+        run_as_cargo_does(&out_dir, 1);
+        changed(&out_dir);
+        let failure = judge(&out_dir, &CARGO).unwrap_err();
+        assert!(matches!(failure, JudgementError::Failed(_)), "{failure:?}");
+        assert!(failure.to_string().contains("second run fails"));
+        assert_eq!(runs(&out_dir), 2);
+        assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
+    }
+
+    #[test]
     fn a_script_that_logs_an_error_or_prints_what_cargo_does_not_take_has_no_record_of_a_run() {
         let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::error=broken\n";
         let out_dir = ran_script("logs-error", lines, "");
         let output = std::fs::read(out_dir.parent().unwrap().join("output")).unwrap();
-        assert_eq!(rerun_is_same(&out_dir), Err("logged an error".to_owned()));
+        assert!(rerun_is_same(&out_dir).unwrap_err().starts_with("logged an error"));
         assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
         assert_eq!(std::fs::read(out_dir.parent().unwrap().join("output")).unwrap(), output);
         // A key cargo does not know: cargo writes what it printed, and no fingerprint.

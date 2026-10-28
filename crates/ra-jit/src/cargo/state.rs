@@ -193,11 +193,24 @@ enum Guard {
 
 impl Guard {
     /// What changed, when something did. `configured` is the `[env]` of cargo's configuration.
-    fn broken(&mut self, built_at: u128, configured: &[Configured]) -> Option<String> {
-        match self {
+    fn broken(
+        &mut self,
+        built_at: u128,
+        configured: &[Configured],
+    ) -> Result<Option<String>, String> {
+        Ok(match self {
             Guard::Script { package, out_dir, reruns_for, checked_at, built, targets } => {
                 let since = built_at.max(*checked_at);
-                reruns_for.iter_mut().find_map(|it| it.broken(since, configured))?;
+                let mut changed = false;
+                for guard in reruns_for {
+                    if guard.broken(since, configured)?.is_some() {
+                        changed = true;
+                        break;
+                    }
+                }
+                if !changed {
+                    return Ok(None);
+                }
                 let now = stamp_now();
                 let env = |name: &str| as_cargo_has(name, configured);
                 let env_names: Vec<String> = std::env::vars_os()
@@ -205,7 +218,14 @@ impl Guard {
                     .chain(configured.iter().map(|it| it.name.clone()))
                     .collect();
                 let cargo = script::Cargo { env: &env, env_names: &env_names, targets };
-                match script::current(out_dir, &cargo).and_then(|it| it.same_as(built)) {
+                let run = match script::judge(out_dir, &cargo) {
+                    Ok(run) => Ok(run),
+                    Err(script::JudgementError::Unavailable(what)) => Err(what),
+                    Err(script::JudgementError::Failed(what)) => {
+                        return Err(format!("the build script of `{package}` {what}"));
+                    }
+                };
+                match run.and_then(|it| it.same_as(built)) {
                     Ok(()) => {
                         *checked_at = now;
                         None
@@ -219,7 +239,8 @@ impl Guard {
                         Ok(written) => !was_there || stamp_of(written) > built_at,
                         Err(_) => *was_there,
                     }
-                })?;
+                });
+                let Some(changed) = changed else { return Ok(None) };
                 Some(format!("{what} {} changed", changed.0.display()))
             }
             Guard::Read { what, files } => {
@@ -227,7 +248,8 @@ impl Guard {
                     files.iter().find(|(file, was_there, read_at)| match written_at(file) {
                         Some(written) => !was_there || written > read_at.unwrap_or(built_at),
                         None => *was_there,
-                    })?;
+                    });
+                let Some(changed) = changed else { return Ok(None) };
                 Some(format!("{what} {} changed", changed.0.display()))
             }
             Guard::BesideTests { files, cargo } => {
@@ -237,12 +259,12 @@ impl Guard {
                         (Some(now), Some((then, print))) if *then <= built_at && now > built_at => {
                             match without_tests(file).as_ref() == Some(print) {
                                 true => tests_only = tests_only.max(Some(now)),
-                                false => return None,
+                                false => return Ok(None),
                             }
                         }
                         (None, None) => {}
                         (Some(now), Some(_)) if now <= built_at => {}
-                        _ => return None,
+                        _ => return Ok(None),
                     }
                 }
                 for file in cargo.iter().filter(|it| written_at(it) < tests_only) {
@@ -252,7 +274,7 @@ impl Guard {
                 None
             }
             Guard::Tree { what, dir } => {
-                let changed = newer_in(dir, built_at)?;
+                let Some(changed) = newer_in(dir, built_at) else { return Ok(None) };
                 Some(format!("{what} and {} changed", changed.display()))
             }
             Guard::AsLeft { file, written } => {
@@ -260,7 +282,7 @@ impl Guard {
             }
             Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
                 .then(|| format!("the environment variable {name} changed")),
-        }
+        })
     }
 
     fn files(what: &str, files: impl IntoIterator<Item = PathBuf>) -> Guard {
@@ -664,13 +686,18 @@ impl State {
     }
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
-    pub(crate) fn broken_guard(&mut self) -> Option<String> {
+    pub(crate) fn broken_guard(&mut self) -> Result<Option<String>, String> {
         let (built_at, configured) = (self.built_at, &self.configured);
         // A build script is run last, when nothing else sends the build to cargo: a run is
         // recorded as cargo's, and cargo's build would make it then.
         let (scripts, others): (Vec<_>, Vec<_>) =
             self.guards.iter_mut().partition(|it| matches!(it, Guard::Script { .. }));
-        others.into_iter().chain(scripts).find_map(|it| it.broken(built_at, configured))
+        for guard in others.into_iter().chain(scripts) {
+            if let Some(why) = guard.broken(built_at, configured)? {
+                return Ok(Some(why));
+            }
+        }
+        Ok(None)
     }
 
     /// Why the next build is cargo's: a program the daemon is never asked for has new

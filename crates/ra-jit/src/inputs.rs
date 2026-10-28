@@ -401,22 +401,31 @@ impl Script {
     /// load: what cargo would find when it ran it, without asking cargo. Not when the script
     /// itself is older than its source, or was compiled reading a variable cargo does not
     /// set; cargo compiles it again. `env` is a variable as the cargo that builds next has it.
-    fn reruns_the_same(&self, env: &dyn Fn(&str) -> Option<String>, env_names: &[String]) -> bool {
+    fn reruns_the_same(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+        env_names: &[String],
+    ) -> anyhow::Result<bool> {
         use crate::cargo::script;
-        let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return false };
+        let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return Ok(false) };
         if !script::compiled_from_what_is_there(&out_dir, &self.workspace) {
-            return false;
+            return Ok(false);
         }
         // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
         // it asked for this build, is the one cargo has, by cargo's records: it is not made
         // twice.
-        let run = script::current(
+        let run = script::judge(
             &out_dir,
             &script::Cargo { env, env_names, targets: &self.output_targets },
         );
-        run.and_then(|it| it.named(&out_dir, &self.out_dir))
-            .and_then(|it| it.same_as(loaded))
-            .is_ok()
+        let run = match run {
+            Ok(run) => run,
+            Err(script::JudgementError::Unavailable(_)) => return Ok(false),
+            Err(script::JudgementError::Failed(why)) => {
+                anyhow::bail!("the build script of `{}` {why}", self.package);
+            }
+        };
+        Ok(run.named(&out_dir, &self.out_dir).and_then(|it| it.same_as(loaded)).is_ok())
     }
 
     /// Where a run of the script that can be run again wrote: the load's, or else the last
@@ -807,9 +816,16 @@ impl Scripts {
                 .chain(self.config.extra_env.keys().cloned())
                 .collect(),
         };
-        if !variables
-            && changed.iter().all(|&at| self.scripts[at].reruns_the_same(&cargo_has, &env_names))
-        {
+        let mut same = !variables;
+        if same {
+            for &at in &changed {
+                if !self.scripts[at].reruns_the_same(&cargo_has, &env_names)? {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if same {
             for at in changed {
                 self.scripts[at].files = self.scripts[at].watched(&[]);
                 self.scripts[at].package_stamp = self.scripts[at].package_now();

@@ -243,6 +243,61 @@ fn main() {
     "src/main.rs": COUNTER["src/main.rs"],
 }
 
+FAILING = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "failing"),
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+fn main() {
+    println!("cargo::rerun-if-changed=src/main.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let log = out.join("../runs");
+    let runs = fs::read_to_string(&log).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&log, runs.to_string()).unwrap();
+    if runs == 2 { eprintln!("second run fails"); std::process::exit(3); }
+    fs::write(out.join("generated.rs"), "pub const RUNS: u32 = 0;\n").unwrap();
+}
+""",
+    "src/main.rs": COUNTER["src/main.rs"],
+}
+
+
+def failing_script(bin_dir):
+    """A failed second run ends that build. A later explicit request may retry."""
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-sf-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in FAILING.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env["RA_JIT_CACHE"] = "off"
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+    try:
+        build(side, "failing: cold", home)
+        _, cold = reference.cargo("build", "-q")
+        if cold.returncode:
+            raise SystemExit(cold.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"failing: not ready: {states}{tails(home)}")
+        cargo_ra_jit.rewrite(os.path.join(ws, "src/main.rs"), "    7\n", "    8\n")
+        for step, expected_status, expected_runs in [("an edit", 101, 2), ("explicit retry", 0, 3)]:
+            _, ours = side.cargo("build")
+            _, theirs = reference.cargo("build", "-q")
+            counts = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
+            if (ours.returncode, theirs.returncode) != (expected_status, expected_status):
+                wrong.append(f"failing: {step}: status {ours.returncode}/{theirs.returncode}, expected {expected_status}")
+            if counts != (expected_runs, expected_runs):
+                wrong.append(f"failing: {step}: runs {counts}, expected {expected_runs}")
+            if expected_status and "second run fails" not in ours.stderr:
+                wrong.append("failing: lost the script's stderr")
+            print(f"failing: {step}: status {ours.returncode}/{theirs.returncode}, runs {counts}")
+    finally:
+        side.cargo("stop")
+        shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
 
 def newly_watched_env(bin_dir):
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-se-", dir="/tmp"))
@@ -427,6 +482,7 @@ def main():
     for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True), ("quiet", QUIET, True)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
+    wrong += failing_script(bin_dir)
     for why in wrong:
         print(f"  {why}")
     if wrong:
