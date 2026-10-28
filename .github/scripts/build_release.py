@@ -51,6 +51,25 @@ On Linux every binary in DIR, the server's included, is refused when it asks for
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
 oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
 (GitHub issue #351). install.sh says the same floor to a system below it.
+
+`--artifact-mode` names which contract DIR has to meet, because two artifacts of the same
+recipe are not the same thing:
+
+  portable    (the default, and what `--out` means everywhere else) ships a tarball to unknown
+              systems, so every binary must start on RHEL 9: it is refused when it asks for a
+              glibc newer than `GLIBC`. Do not relax this to make a build pass.
+  nix-native  the package in a Nix derivation, which is bound to the store it was built in and
+              runs only against that store's glibc. Its contract is that binding, not RHEL 9, so
+              it is refused when a binary's loader is not the store's (`PT_INTERP` outside
+              `/nix/store`), and it is accepted only inside a Nix build. The asked-for glibc is
+              reported, not capped. That is a store-binding check, not a closure certificate: it
+              does not read `DT_NEEDED` or the run path, so it does not prove every library the
+              binary needs resolves in the store. An ELF it cannot read is a named failure, never
+              "static" -- not having an interpreter is what would otherwise waive the check.
+
+A Nix build that wants a portable tarball must still ask for `--artifact-mode portable` and
+build on the release's Ubuntu; the mode is a declaration of the artifact, never a way to skip
+a check.
 """
 
 import argparse
@@ -61,6 +80,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -91,9 +111,14 @@ STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # (the crates that did not change below, none of the workspace's), and says nothing.
 CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6ra_jit")
 # The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and
-# how a binary names the versions it asks for (in its dynamic string table).
+# how a binary names the versions it asks for (in its dynamic string table). This is the
+# portable artifact's floor and must not be raised: a tarball has to start on RHEL 9.
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
+# The artifact contracts `--artifact-mode` chooses between (see the module docstring).
+ARTIFACT_MODES = ("portable", "nix-native")
+# Where a Nix build puts the store it linked against; a nix-native artifact must name it.
+NIX_STORE = "/nix/store/"
 
 
 def run(argv, **kwargs):
@@ -290,19 +315,142 @@ def glibc_asked(binary):
     return max(found, default=None)
 
 
+class BadElf(Exception):
+    """A file that starts like ELF but cannot be read as one: never treated as static."""
+
+
+def elf_kind(data: bytes) -> str:
+    """`"elf32"`, `"elf64"` or `"other"` for a file's first bytes."""
+    if data[:4] != b"\x7fELF" or len(data) < 6:
+        return "other"
+    return {1: "elf32", 2: "elf64"}.get(data[4], "other")
+
+
+def interpreter(binary):
+    """The `PT_INTERP` path a Linux ELF names, or None when it is static.
+
+    Raises BadElf rather than returning None when the header is truncated, uses a class or
+    byte order this does not read (little-endian ELF32/ELF64 are the targets here), or names a
+    `PT_INTERP` that is empty, unterminated or outside the file. A malformed file must not pass
+    as static, because "static" is what waives the store-binding check -- so the class decides
+    the minimum header length (52 for ELF32, 64 for ELF64) before any class-specific field is
+    read, and every read is bounds-checked.
+    """
+    data = binary.read_bytes()
+    if data[:4] != b"\x7fELF":
+        return None
+    if len(data) < 0x06:
+        raise BadElf(f"{binary.name}: truncated ELF identification ({len(data)} bytes)")
+    if data[4] == 2:
+        wide, header = True, 0x40
+    elif data[4] == 1:
+        wide, header = False, 0x34
+    else:
+        raise BadElf(f"{binary.name}: ELF class {data[4]} is neither 32 nor 64 bit")
+    if data[5] != 1:
+        raise BadElf(f"{binary.name}: ELF data encoding {data[5]} is not little-endian")
+    if len(data) < header:
+        raise BadElf(f"{binary.name}: truncated ELF header ({len(data)} bytes, ELF{'64' if wide else '32'} "
+                     f"needs {header})")
+    if wide:
+        phoff, = struct.unpack_from("<Q", data, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+        wide_fmt, wide_off, size_off, need = "<Q", 0x08, 0x20, 0x38
+    else:
+        phoff, = struct.unpack_from("<I", data, 0x1C)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x2A)
+        wide_fmt, wide_off, size_off, need = "<I", 0x04, 0x10, 0x20
+    if phnum == 0:
+        return None
+    if phentsize < need:
+        raise BadElf(f"{binary.name}: program header entry is {phentsize} bytes, under {need}")
+    if phoff + phnum * phentsize > len(data):
+        raise BadElf(f"{binary.name}: {phnum} program headers at {phoff} run past the file "
+                     f"({len(data)} bytes)")
+    for i in range(phnum):
+        at = phoff + i * phentsize
+        kind, = struct.unpack_from("<I", data, at)
+        if kind != 3:  # PT_INTERP
+            continue
+        offset, = struct.unpack_from(wide_fmt, data, at + wide_off)
+        size, = struct.unpack_from(wide_fmt, data, at + size_off)
+        if offset + size > len(data):
+            raise BadElf(f"{binary.name}: PT_INTERP at {offset}+{size} runs past the file "
+                         f"({len(data)} bytes)")
+        if size == 0:
+            raise BadElf(f"{binary.name}: PT_INTERP is empty")
+        raw = data[offset:offset + size]
+        # The loader path must be a terminated string inside the record: a prefix match on an
+        # unterminated slice would accept a record no loader could read.
+        end = raw.find(b"\0")
+        if end < 0:
+            raise BadElf(f"{binary.name}: PT_INTERP is not NUL-terminated in its {size} bytes")
+        if end == 0:
+            raise BadElf(f"{binary.name}: PT_INTERP names no loader (it is empty)")
+        return raw[:end].decode(errors="replace")
+    return None
+
+
+def elf_binaries(out):
+    """The ELF files in `out`, sorted."""
+    return [p for p in sorted(out.iterdir()) if p.is_file() and p.read_bytes()[:4] == b"\x7fELF"]
+
+
 def check_glibc(out):
-    """Refuses the build when a binary in `out` asks for a glibc newer than `GLIBC`."""
+    """The portable contract: refuses the build when a binary asks for a glibc newer than `GLIBC`."""
     shown = ".".join(map(str, GLIBC))
     newer = []
-    for binary in sorted(out.iterdir()):
-        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
-            asked = glibc_asked(binary)
-            if asked and asked > GLIBC:
-                newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
+    for binary in elf_binaries(out):
+        asked = glibc_asked(binary)
+        if asked and asked > GLIBC:
+            newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
     if newer:
         sys.exit(f"error: build_release: {'; '.join(newer)}, newer than RHEL 9's {shown}, so it does not start "
                  "there: build on Ubuntu 22.04, as the release does")
     print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
+
+
+def check_nix_native(out):
+    """The Nix contract: every binary in `out` is bound to the store it was built in.
+
+    A package in a derivation runs only against its own store, so its glibc need not be RHEL
+    9's. What it must be is store-bound: a binary whose interpreter is not under `/nix/store`
+    would be a portable build claiming to be this one. The asked-for glibc is reported so a
+    surprising value is visible, but it is not capped here -- `portable` is that check.
+
+    This is a store-binding check, not a closure certificate. `PT_INTERP` says which loader a
+    binary starts with; it does not prove that every library it needs (`DT_NEEDED`) and every
+    run-path entry resolves inside the store, which would take reading the dynamic section.
+    The derivation's own build is what puts the binaries in that store, so the log's job is to
+    catch a portable build wearing this mode, which is what the loader test does.
+    """
+    stray, asked = [], []
+    for binary in elf_binaries(out):
+        try:
+            interp = interpreter(binary)
+        except BadElf as e:
+            # Not static: an ELF header we cannot read is a failure, never a waiver.
+            sys.exit(f"error: build_release: {e}: a nix-native artifact must be a readable ELF; "
+                     "build the portable tarball with --artifact-mode portable")
+        if interp is not None and not interp.startswith(NIX_STORE):
+            stray.append(f"{binary.name} is loaded by {interp}")
+        version = glibc_asked(binary)
+        if version:
+            asked.append(f"{binary.name} glibc {'.'.join(map(str, version))}")
+    if stray:
+        sys.exit(f"error: build_release: {'; '.join(stray)}, outside {NIX_STORE}: a nix-native artifact must be "
+                 "bound to its store; build the portable tarball with --artifact-mode portable")
+    said = f"build_release: the binaries in {out} are bound to {NIX_STORE}"
+    print(f"{said} ({'; '.join(asked)})" if asked else said, flush=True)
+
+
+def check_artifact(out, mode):
+    """Applies the contract `mode` names; anything but a known mode is a caller's error."""
+    if mode == "portable":
+        return check_glibc(out)
+    if mode == "nix-native":
+        return check_nix_native(out)
+    raise SystemExit(f"error: build_release: unknown --artifact-mode {mode!r}; one of {', '.join(ARTIFACT_MODES)}")
 
 
 def main():
@@ -315,8 +463,21 @@ def main():
     parser.add_argument("--features", help="cargo features of ra-jit (`llvm`); a release has none")
     parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
+    parser.add_argument("--artifact-mode", choices=ARTIFACT_MODES, default="portable",
+                        help="the contract --out must meet: portable keeps RHEL 9's glibc floor "
+                             "(the default); nix-native is a store-bound Nix package")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     args = parser.parse_args()
+    # `nix-native` is a claim about the artifact, so it is only honoured inside a Nix build. A
+    # release job that passed it would otherwise skip the portable floor it exists to enforce.
+    if args.artifact_mode == "nix-native" and not os.environ.get("NIX_BUILD_TOP"):
+        parser.error("--artifact-mode nix-native is for a Nix build (NIX_BUILD_TOP is unset): a release's "
+                     "tarball must pass --artifact-mode portable and keep RHEL 9's glibc floor")
+    if args.artifact_mode == "portable" and os.environ.get("NIX_BUILD_TOP") and args.out:
+        # Not an error: a Nix build may legitimately produce a portable tarball, but say so, so
+        # that a store package silently asking for the portable contract is visible in the log.
+        print("build_release: --artifact-mode portable inside a Nix build: this artifact promises RHEL 9's "
+              f"glibc {'.'.join(map(str, GLIBC))} floor", flush=True)
     if args.pin:
         return pin(args.pin)
     if not args.target:
@@ -351,7 +512,7 @@ def main():
         if args.server:
             proc_macro_server(args.out / "ra-jit", args.out)
         if "linux" in args.target:
-            check_glibc(args.out)
+            check_artifact(args.out, args.artifact_mode)
     shown = args.out or binaries[0].parent
     print(f"build_release: {', '.join(b.name for b in binaries)} in {shown}, with the profile trained at "
           f"{chosen['commit'][:10]}; {stale} functions changed since and are not optimized by it", flush=True)

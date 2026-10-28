@@ -21,7 +21,7 @@ use syntax::{
 };
 use vfs::FileId;
 
-use crate::Listed;
+use crate::{Listed, solving};
 
 /// Attributes that leave the item they are on as it is written.
 const INERT: &[&str] = &[
@@ -383,26 +383,28 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads.min(files.len()))
             .map(|part| {
-                let (db, functions) = (db.clone(), &functions);
+                let (db, functions) = (solving::Handle::of(&db), &functions);
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
-                        let files = files.iter().zip(functions).enumerate();
-                        files
-                            .skip(part)
-                            .step_by(threads)
-                            .map(|(at, (&file, functions))| {
-                                let Some(functions) = functions else {
-                                    if stats {
-                                        eprintln!(
-                                            "outline: {file:?} has functions that are not listed"
-                                        );
-                                    }
-                                    return (at, None);
-                                };
-                                (at, outline(&db, file, functions))
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    db.solve(|db| {
+                        hir::attach_db(db, || {
+                            let files = files.iter().zip(functions).enumerate();
+                            files
+                                .skip(part)
+                                .step_by(threads)
+                                .map(|(at, (&file, functions))| {
+                                    let Some(functions) = functions else {
+                                        if stats {
+                                            eprintln!(
+                                                "outline: {file:?} has functions that are not listed"
+                                            );
+                                        }
+                                        return (at, None);
+                                    };
+                                    (at, outline(db, file, functions))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                                    })
                 })
             })
             .collect();

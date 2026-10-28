@@ -2595,6 +2595,7 @@ impl Base {
         cg.replaced = unchanged;
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
+            let _permit = super::budget::enter()?;
             let was = &self.instances[instance];
             let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
             else {
@@ -2610,6 +2611,7 @@ impl Base {
         }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
+            let _permit = super::budget::enter()?;
             let was = &self.hydrated[i as usize];
             let Ok(compiled) = compiled_instance(db, instance.clone(), env.clone()).as_ref() else {
                 return Ok(Err("code of the checkout from the store no longer compiles"));
@@ -2626,8 +2628,10 @@ impl Base {
             cg.pending.push((instance, env, id));
         }
         for &id in &changed_statics {
-            if cg.static_data(id).is_err() {
-                return Ok(Err("a static of the base no longer has a value"));
+            match cg.static_data(id) {
+                Ok(_) => {}
+                Err(error @ CodegenError::OverBudget(_)) => return Err(error),
+                Err(_) => return Ok(Err("a static of the base no longer has a value")),
             }
         }
         // rustc's callers of one that hands out a value of a type only its body names go on
@@ -2648,6 +2652,9 @@ impl Base {
                 }
                 match cg.define_function(root) {
                     Ok(_) => {}
+                    // Pressure stopped this build, not the function's support for patching.
+                    // Preserve the error instead of asking for a full rebuild to retry it.
+                    Err(e @ CodegenError::OverBudget(_)) => return Err(e),
                     // As in a full build, a function added to a crate whose symbols are
                     // rustc's has none to be put in the object under: what calls it has a
                     // copy of its own.
@@ -2656,7 +2663,7 @@ impl Base {
                 }
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
             }
-            if !cg.define_instances().is_empty() {
+            if !cg.define_instances()?.is_empty() {
                 return Ok(Err("an instance can't be compiled"));
             }
             queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));

@@ -315,7 +315,8 @@ timings and memory come from separate runs (lean-frontend.md).
    `allocated` after reclaim should plateau. Fit a least-squares line to `allocated` after
    reclaim against pair number (`soak.py`'s `slope`); call it a leak if the line adds more
    than 5% of the ready size over 1,000 pairs with r² above 0.8, and name the holder whose
-   count or bytes grows with it.
+   count or bytes grows with it. A run whose first sample has no `allocated` has no ready size
+   to measure the line against: its verdict is unknown, never no leak.
 6. Projects: ripgrep (fast, 1.6 GB), nushell (a mid-size reference with a recorded heap), and
    tracedecay once u1's build exists. Linux and macOS, each against its own baseline.
 
@@ -341,10 +342,13 @@ with one worktree moved through `K` heads by file edits is the policy to compare
 
 ### M4. Idle reclaim A/B
 
-On the same worker after M1's last pair: type GC alone, solver caches alone, purge alone,
+On the same worker after M1's last pair: solver caches alone, the type GC (which clears the
+solver caches first on every thread and runs only when no thread solves: the collection is not
+run without them, so the GC's own share is the difference from the caches alone), purge alone,
 `background_thread:true` and one second of decay, each as its own run from the same state;
-record the figure and the next edit's time (the page faults the purge costs). Settles items 1
-and 6's order.
+record the figure and the next edit's time (the page faults the purge costs), and how long
+each collection of the types took (the `reclaim-types-us:` lines of `RA_JIT_STATS`). Settles
+items 1 and 6's order.
 
 ### M5. Fleet shape: cores and allocator
 

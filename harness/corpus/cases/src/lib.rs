@@ -2217,6 +2217,26 @@ pub mod async_frames {
     pub fn run() -> (u64, u64, u64) {
         (block_on(leaf(3)), block_on(borrows(5)), block_on(nested(1)))
     }
+
+    /// A generic `async fn` keeps a value of its type parameter across an `.await`, so each
+    /// instance's future is laid out with the instance's type.
+    async fn holds<T: Clone>(value: T) -> (T, T) {
+        let kept = value.clone();
+        Twice(false).await;
+        (kept, value)
+    }
+
+    pub fn generic() -> (u8, [u64; 3], (u16, String), [usize; 3]) {
+        let sizes = [
+            std::mem::size_of_val(&holds(1u8)),
+            std::mem::size_of_val(&holds([7u64; 3])),
+            std::mem::size_of_val(&holds((3u16, String::from("s")))),
+        ];
+        let small = block_on(holds(1u8)).0;
+        let array = block_on(holds([7u64; 3])).1;
+        let pair = block_on(holds((3u16, String::from("s")))).0;
+        (small, array, pair, sizes)
+    }
 }
 
 /// `Box<dyn FnMut>` forwards its arguments to the closure as the tuple it was called with.

@@ -8,6 +8,14 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `RA_JIT_WORKER_MEMORY`: a soft target for a worker or `ra-jit` run, defaulting to
+  `RA_JIT_MEMORY_MAX`. Past three quarters it purges freed pages and admits fewer compile jobs,
+  never none. Exceeding it never fails a build. A process-wide OS memory-pressure monitor
+  pauses new jobs only under critical host pressure; jobs in flight finish. Persistent critical
+  pressure without progress after `RA_JIT_PRESSURE_GRACE_SECS` (60 by default) can fail
+  admission. Linux uses PSI and available memory against `RA_JIT_MEMORY_RESERVE`;
+  macOS uses memorystatus. Unknown signals are logged once. Historical hard-cap results
+  are labelled in [docs/reports/LOADMEM.md](docs/reports/LOADMEM.md), section 8.
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
@@ -444,6 +452,17 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- `RA_JIT_MEMORY_MAX` is soft: passing it does not discard incremental caches. Persistent
+  critical host pressure can reclaim idle workers; tombstones suppress identical load retries.
+  Busy workers own their compile pause and progress grace.
+- A cold build holds less: the layout of a future and the debugger's description of it read the
+  coroutine's generic body and monomorphize only the types of what it keeps across yields
+  (`hir_ty::mir::held_frame`), where the database kept a copy of the whole body for every
+  instance (1.5 GB of a cold tracedecay build at 30 GB); `inlinable` is asked only of a body small
+  enough to inline, so the others leave no memo; and a worker gives back the pages name
+  resolution freed before its first build. At the same number of functions compiled, 208,371, a
+  cold tracedecay worker's footprint was 15.1 GB where it was 17.0 GB (n=1 each, LOADMEM.md
+  section 8).
 - The first edit after a daemon starts on the store no longer compiles every function from
   the store in the edited file to tell what changed. Each entry names the items of the
   checkout its code comes from, by a hash of their text: the body it is written in, the

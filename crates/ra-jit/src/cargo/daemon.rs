@@ -47,10 +47,10 @@ const CHECKERS: usize = 4;
 /// say: one part in this many.
 const MEMORY_SHARE: u64 = 2;
 
-/// The most the workers may hold together, from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
-/// limit. Half of the machine's memory when it does not say, and no limit where the system
+/// Soft aggregate footprint target from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
+/// target. Half of the machine's memory when it does not say, and no limit where the system
 /// does not tell how much that is.
-fn memory_max() -> Result<Option<u64>, String> {
+pub(crate) fn memory_max() -> Result<Option<u64>, String> {
     match std::env::var("RA_JIT_MEMORY_MAX") {
         Err(_) => Ok(crate::memory::of_the_machine().map(|it| it / MEMORY_SHARE)),
         Ok(text) if text == "off" => Ok(None),
@@ -89,19 +89,22 @@ fn spares() -> Result<Spares, String> {
 /// What a worker holds and how much it is in use.
 struct Held {
     bytes: u64,
+    known: bool,
     asked: Instant,
     /// Answering a request or loading a checkout.
     busy: bool,
 }
 
-/// The workers to stop for the rest to hold no more than `most`: the ones asked longest ago
-/// first. One that is busy is left, and so is the one asked last, which would only be
-/// started again.
-fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
+/// Soft targets never discard an incremental cache. Persistent host critical pressure is
+/// the only memory reason to stop a worker; busy workers own admission and progress.
+fn over(holding: &[(String, Held)], most: u64, critical: bool) -> Vec<String> {
+    if !critical {
+        return Vec::new();
+    }
     let mut all: u64 = holding.iter().map(|it| it.1.bytes).sum();
     let last = holding.iter().map(|it| it.1.asked).max();
     let mut idle: Vec<&(String, Held)> =
-        holding.iter().filter(|it| !it.1.busy && Some(it.1.asked) != last).collect();
+        holding.iter().filter(|it| it.1.known && !it.1.busy && Some(it.1.asked) != last).collect();
     idle.sort_by_key(|it| it.1.asked);
     let mut stopped = Vec::new();
     for (id, held) in idle {
@@ -111,7 +114,28 @@ fn over(holding: &[(String, Held)], most: u64) -> Vec<String> {
         all -= held.bytes;
         stopped.push(id.clone());
     }
+    for (id, held) in holding {
+        if held.known && !held.busy && held.bytes > most && !stopped.contains(id) {
+            stopped.push(id.clone());
+        }
+    }
     stopped
+}
+
+/// Critical pressure must persist continuously, including while a live program prevents
+/// eviction. A recovered or unreadable signal starts the grace period over.
+fn pressure_persisted(
+    since: &mut Option<Instant>,
+    pressure: Option<hir_ty_codegen::budget::Pressure>,
+    now: Instant,
+    grace: Duration,
+) -> bool {
+    if pressure == Some(hir_ty_codegen::budget::Pressure::Critical) {
+        now.saturating_duration_since(*since.get_or_insert(now)) >= grace
+    } else {
+        *since = None;
+        false
+    }
 }
 
 /// How often a worker that is loading is looked at.
@@ -234,7 +258,7 @@ pub(crate) struct Status {
     pub(crate) pid: u32,
     pub(crate) version: String,
     pub(crate) idle_secs: Option<u64>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     #[serde(default)]
     pub(crate) memory_max: Option<u64>,
     pub(crate) workers: Vec<WorkerStatus>,
@@ -403,7 +427,19 @@ impl Warmth {
 struct Loaded {
     generation: u128,
     root: PathBuf,
+    request: String,
     warmth: Warmth,
+}
+
+fn request_key(checkout: &Checkout) -> String {
+    // A fresh invocation's clock does not change the load. Including it would let an
+    // unchanged build repeatedly bypass a pressure tombstone without changing its inputs.
+    let mut inputs = checkout.clone();
+    inputs.built_at = 0;
+    Sha256::digest(serde_json::to_vec(&inputs).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A `ra-jit <project> --socket` process and the checkouts it holds.
@@ -421,6 +457,7 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    unknown_held: AtomicBool,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -508,6 +545,7 @@ impl Worker {
             }
             None => {
                 let mut command = Command::new(std::env::current_exe()?);
+                clear_worker_memory(&mut command);
                 command.args(&args);
                 match store() {
                     Some(store) => command.env("RA_JIT_CACHE", store),
@@ -525,6 +563,7 @@ impl Worker {
         let loading = Loaded {
             generation: checkout.generation,
             root: checkout.root.clone(),
+            request: request_key(checkout),
             warmth: Warmth::Loading(Instant::now()),
         };
         Ok(Worker {
@@ -537,6 +576,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            unknown_held: AtomicBool::new(false),
         })
     }
 
@@ -746,8 +786,14 @@ impl Worker {
 
     /// What it holds now, and how much it is in use.
     fn held(&self) -> Held {
+        let pid = lock(&self.child).id();
+        let bytes = crate::memory::held_by(pid);
+        if bytes.is_none() && !self.unknown_held.swap(true, Relaxed) {
+            eprintln!("worker {pid} footprint unavailable: aggregate memory usage is unknown");
+        }
         Held {
-            bytes: crate::memory::held_by(lock(&self.child).id()).unwrap_or(0),
+            bytes: bytes.unwrap_or(0),
+            known: bytes.is_some(),
             asked: *lock(&self.asked),
             busy: self.answering.load(Relaxed) != 0 || self.loads(),
         }
@@ -783,6 +829,7 @@ impl Spare {
         private_dir(dir)?;
         let log = dir.join("log");
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.arg("--spare").arg(dir.join("package"));
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -865,6 +912,7 @@ impl Checker {
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
         let mut command = Command::new(std::env::current_exe()?);
+        clear_worker_memory(&mut command);
         command.args(&args);
         match store() {
             Some(store) => command.env("RA_JIT_CACHE", store),
@@ -936,6 +984,14 @@ impl Checker {
     }
 }
 
+/// An unset request setting must not inherit the daemon's old budget. Spares are cleared
+/// at spawn and receive the requested policy in Told before starting their monitor.
+fn clear_worker_memory(command: &mut Command) {
+    for name in super::cli::MEMORY_ENV {
+        command.env_remove(name);
+    }
+}
+
 /// Has a worker start in a process group of its own, for `kill` to end what it started with
 /// it: the cargo it asks of a workspace, which would go on in the daemon's home.
 fn own_group(command: &mut Command) {
@@ -962,9 +1018,12 @@ struct Daemon {
     version: String,
     home: PathBuf,
     idle: Option<Duration>,
-    /// The most the workers may hold together, in bytes.
+    /// Soft aggregate footprint target, in bytes.
     memory_max: Option<u64>,
     workers: Mutex<FxHashMap<String, Arc<Worker>>>,
+    /// Critical-pressure evictions survive removal of a worker. Source/config/build/budget
+    /// changes retry; an identical request cannot repeatedly reload the same workspace.
+    pressure_stops: Mutex<FxHashMap<(String, String), PressureStop>>,
     /// The worker the next workspace is loaded by, when there is one.
     spare: Mutex<Option<Spare>>,
     spare_when: Spares,
@@ -976,6 +1035,21 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+}
+
+struct PressureStop {
+    generation: u128,
+    request: String,
+    most: u64,
+    at: SystemTime,
+}
+impl PressureStop {
+    fn blocks(&self, generation: u128, request: &str, most: u64, source_changed: bool) -> bool {
+        self.generation == generation
+            && self.request == request
+            && self.most == most
+            && !source_changed
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1036,6 +1110,7 @@ pub(crate) fn version() -> String {
 /// 3. per worker, the process, and a thread that waits for it to load and has it build
 ///    its programs once.
 pub(crate) fn serve() -> anyhow::Result<()> {
+    crate::memory::bound_builds()?;
     let home = home()?;
     private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let memory_max = memory_max().map_err(anyhow::Error::msg)?;
@@ -1061,6 +1136,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         idle,
         memory_max,
         workers: Mutex::default(),
+        pressure_stops: Mutex::default(),
         spare: Mutex::default(),
         spare_when,
         ahead: Mutex::default(),
@@ -1257,6 +1333,22 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
+        let key = (id.clone(), checkout.key.clone());
+        let mut stops = lock(&self.pressure_stops);
+        if stops.get(&key).is_some_and(|stop| {
+            stop.blocks(
+                checkout.generation,
+                &request_key(&checkout),
+                self.memory_max.unwrap_or(u64::MAX),
+                checkout.written_since(stop.at),
+            )
+        }) {
+            anyhow::bail!(
+                "host memory pressure stopped this load; change the source, build configuration or memory budget, or restart the daemon to retry"
+            );
+        }
+        stops.remove(&key);
+        drop(stops);
         // What a worker could not load once it can't load again, until cargo builds anew or
         // a source is written: the failure may be an error in the source.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
@@ -1291,6 +1383,7 @@ impl Daemon {
                     let loading = Loaded {
                         generation: checkout.generation,
                         root: checkout.root.clone(),
+                        request: request_key(&checkout),
                         warmth: Warmth::Loading(Instant::now()),
                     };
                     checkouts.insert(checkout.key.clone(), loading);
@@ -1325,6 +1418,8 @@ impl Daemon {
     /// Stops the workers asked longest ago while together they hold more than they may, and
     /// those nobody has asked for the idle time; and the daemon when nobody has asked it.
     fn reap(&self) {
+        let mut critical_since = None;
+        let grace = crate::memory::pressure_grace().unwrap_or(Duration::from_secs(60));
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // A worker that ended by itself is in the daemon's log when it ends, not when a
@@ -1342,8 +1437,14 @@ impl Daemon {
             // A program that takes edits is being edited, however long since the last save:
             // a worker started again would link it again on the next one.
             let live = crate::live::any_running();
-            if let Some(most) = self.memory_max.filter(|_| !live) {
-                self.fit(most);
+            let persisted = pressure_persisted(
+                &mut critical_since,
+                hir_ty_codegen::budget::host_pressure(),
+                Instant::now(),
+                grace,
+            );
+            if !live {
+                self.fit(self.memory_max.unwrap_or(0), persisted);
             }
             let Some(idle) = self.idle else { continue };
             if live {
@@ -1384,18 +1485,40 @@ impl Daemon {
     }
 
     /// Stops the workers asked longest ago until the rest hold no more than `most` bytes. The
-    /// next build of a workspace whose worker was stopped is cargo's while a worker loads it
-    /// again.
-    fn fit(&self, most: u64) {
+    /// active build governs its own pause and failure. Idle caches stopped under critical
+    /// pressure leave tombstones, so the same load is not restarted until it changes.
+    fn fit(&self, most: u64, critical: bool) {
         let mut workers = lock(&self.workers);
         let holding: Vec<(String, Held)> =
             workers.iter().map(|(id, worker)| (id.clone(), worker.held())).collect();
         let all: u64 = holding.iter().map(|it| it.1.bytes).sum();
-        for id in over(&holding, most) {
+        for id in over(&holding, most, critical) {
             let Some(worker) = workers.remove(&id) else { continue };
+            if critical {
+                let mut stops = lock(&self.pressure_stops);
+                for (key, loaded) in lock(&worker.checkouts).iter() {
+                    stops.insert(
+                        (id.clone(), key.clone()),
+                        PressureStop {
+                            generation: loaded.generation,
+                            request: loaded.request.clone(),
+                            most: self.memory_max.unwrap_or(u64::MAX),
+                            at: SystemTime::now(),
+                        },
+                    );
+                }
+            }
+            let alone = holding.iter().find(|it| it.0 == id).map_or(0, |it| it.1.bytes);
+            let why = match alone > most {
+                true => format!(
+                    "host memory pressure stayed critical after the grace period; it alone holds {} MB",
+                    alone >> 20
+                ),
+                false => "it was asked longest ago".to_owned(),
+            };
             eprintln!(
                 "worker {id} of {} stopped: the workers hold {} MB, over the {} MB of \
-                 RA_JIT_MEMORY_MAX, and it was asked longest ago",
+                 RA_JIT_MEMORY_MAX, and {why}",
                 worker.project.display(),
                 all >> 20,
                 most >> 20
@@ -1595,6 +1718,7 @@ mod tests {
         let now = Instant::now();
         let held = |bytes: u64, ago: u64, busy: bool| Held {
             bytes,
+            known: true,
             asked: now - Duration::from_secs(ago),
             busy,
         };
@@ -1604,10 +1728,225 @@ mod tests {
             ("answering".to_owned(), held(4, 40, true)),
             ("last".to_owned(), held(4, 0, false)),
         ];
-        assert_eq!(over(&holding, 16), Vec::<String>::new());
-        assert_eq!(over(&holding, 12), ["oldest"]);
-        assert_eq!(over(&holding, 8), ["oldest", "old"]);
-        // The busy one and the one asked last stay, whatever they hold.
-        assert_eq!(over(&holding, 0), ["oldest", "old"]);
+        assert_eq!(over(&holding, 16, false), Vec::<String>::new());
+        assert_eq!(over(&holding, 3, false), Vec::<String>::new());
+        assert_eq!(over(&holding, 12, true), ["oldest"]);
+        assert_eq!(over(&holding, 8, true), ["oldest", "old"]);
+        // The busy one and the one asked last stay while neither alone holds more than all may.
+        assert_eq!(over(&holding, 4, true), ["oldest", "old"]);
+        assert_eq!(over(&holding, 3, true), ["oldest", "old", "last"]);
+    }
+
+    #[test]
+    fn live_program_recovery_and_unknown_pressure_reset_the_eviction_grace() {
+        use hir_ty_codegen::budget::Pressure::{Critical, Normal, Warning};
+        let start = Instant::now();
+        let grace = Duration::from_secs(60);
+        for recovered in [Some(Normal), Some(Warning), None] {
+            let mut since = None;
+            let mut tick = |seconds, pressure| {
+                pressure_persisted(
+                    &mut since,
+                    pressure,
+                    start + Duration::from_secs(seconds),
+                    grace,
+                )
+            };
+            assert!(!tick(0, Some(Critical)));
+            // The sampler still updates the window while the live program prevents eviction.
+            assert!(!tick(30, recovered));
+            assert!(!tick(120, Some(Critical)));
+            assert!(!tick(179, Some(Critical)));
+            assert!(tick(180, Some(Critical)));
+        }
+    }
+
+    #[test]
+    fn a_lone_worker_keeps_its_cache_past_the_soft_target() {
+        let holding = [(
+            "loading".into(),
+            Held { bytes: 30, known: true, asked: Instant::now(), busy: false },
+        )];
+        assert!(over(&holding, 16, false).is_empty());
+        assert_eq!(over(&holding, 16, true), ["loading"]);
+    }
+
+    #[test]
+    fn workers_clear_inherited_memory_policy_before_applying_the_request() {
+        let mut command = Command::new("unused-worker");
+        command.env("RA_JIT_WORKER_MEMORY", "old-budget");
+        clear_worker_memory(&mut command);
+        for name in super::super::cli::MEMORY_ENV {
+            assert!(command.get_envs().any(|(key, value)| key == *name && value.is_none()));
+        }
+        command.env("RA_JIT_WORKER_MEMORY", "32G");
+        assert!(command.get_envs().any(|(key, value)| key == "RA_JIT_WORKER_MEMORY"
+            && value == Some(std::ffi::OsStr::new("32G"))));
+    }
+
+    #[test]
+    fn pressure_request_identity_ignores_the_invocation_clock_but_keeps_load_inputs() {
+        let mut checkout: Checkout = serde_json::from_value(serde_json::json!({
+            "key": "checkout", "generation": 42, "built_at": 100,
+            "root": "/workspace", "programs": [], "sources": [], "env": {},
+            "config": {
+                "repository": "/repository", "project": "", "cfg_test": false, "env": {},
+                "selection": { "profile": "dev", "features": [], "no_default_features": false,
+                    "all_features": false, "packages": [], "workspace": false,
+                    "target": null, "dev_deps": false }
+            }
+        }))
+        .unwrap();
+        let original = request_key(&checkout);
+        checkout.built_at += 1;
+        assert_eq!(request_key(&checkout), original);
+        checkout.env.insert("INPUT".into(), "changed".into());
+        assert_ne!(request_key(&checkout), original);
+        checkout.env.clear();
+        checkout.config.env.insert("RA_JIT_WORKER_MEMORY".into(), "32G".into());
+        assert_ne!(request_key(&checkout), original);
+    }
+
+    #[test]
+    fn pressure_stop_retries_only_changed_source_build_or_budget() {
+        let stop = PressureStop {
+            generation: 42,
+            request: "request".into(),
+            most: 16,
+            at: SystemTime::now(),
+        };
+        assert!(stop.blocks(42, "request", 16, false));
+        assert!(stop.blocks(42, "request", 16, false));
+        assert!(!stop.blocks(43, "request", 16, false));
+        assert!(!stop.blocks(42, "changed request", 16, false));
+        assert!(!stop.blocks(42, "request", 32, false));
+        assert!(!stop.blocks(42, "request", 16, true));
+    }
+
+    #[test]
+    fn busy_worker_owns_its_pause_and_failure_while_idle_cache_can_be_reclaimed() {
+        let now = Instant::now();
+        let loading = Held { bytes: 30, known: true, asked: now, busy: true };
+        assert!(over(&[("loading".to_owned(), loading)], 16, true).is_empty());
+        let idle = Held { bytes: 30, known: true, asked: now, busy: false };
+        assert_eq!(over(&[("idle".to_owned(), idle)], 16, true), ["idle"]);
+        let under = Held { bytes: 16, known: true, asked: now, busy: true };
+        assert_eq!(over(&[("loading".to_owned(), under)], 16, true), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_eviction_preserves_unknown_workers_and_retries_changed_inputs() {
+        use hir_ty_codegen::budget::Pressure::{Critical, Normal};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn value() -> u32 { 1 }\n").unwrap();
+        let checkout: Checkout = serde_json::from_value(serde_json::json!({
+            "key": "checkout", "generation": 42, "built_at": 100,
+            "root": dir.path(), "programs": [], "sources": [source], "env": {},
+            "config": {
+                "repository": dir.path(), "project": "", "cfg_test": false, "env": {},
+                "selection": { "profile": "dev", "features": [], "no_default_features": false,
+                    "all_features": false, "packages": [], "workspace": false,
+                    "target": null, "dev_deps": false }
+            }
+        }))
+        .unwrap();
+        let worker = Arc::new(Worker {
+            project: checkout.project(),
+            socket: dir.path().join("unused.sock"),
+            log: dir.path().join("log"),
+            env: crate::process::own(),
+            child: Mutex::new(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+            checkouts: Mutex::new(FxHashMap::from_iter([(
+                checkout.key.clone(),
+                Loaded {
+                    generation: checkout.generation,
+                    root: checkout.root.clone(),
+                    request: request_key(&checkout),
+                    warmth: Warmth::Ready,
+                },
+            )])),
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            noted: AtomicBool::new(true),
+            unknown_held: AtomicBool::new(false),
+        });
+        let id = checkout.config.id();
+        let daemon = Daemon {
+            version: "test".into(),
+            home: dir.path().into(),
+            idle: None,
+            memory_max: Some(1),
+            workers: Mutex::new(FxHashMap::from_iter([(id.clone(), worker.clone())])),
+            pressure_stops: Mutex::default(),
+            spare: Mutex::default(),
+            spare_when: Spares::Never,
+            ahead: Mutex::default(),
+            spares: AtomicUsize::new(0),
+            checkers: Mutex::default(),
+            asked: Mutex::new(Instant::now()),
+        };
+        let now = Instant::now();
+        let grace = Duration::from_secs(60);
+        let mut since = None;
+        assert!(!pressure_persisted(&mut since, Some(Critical), now, grace));
+        assert!(!pressure_persisted(&mut since, None, now + grace, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 2, grace));
+        daemon.fit(1, false);
+        assert!(lock(&daemon.workers).contains_key(&id), "soft target retains the cache");
+        assert!(pressure_persisted(&mut since, Some(Critical), now + grace * 3, grace));
+        daemon.fit(1, true);
+        assert!(!lock(&daemon.workers).contains_key(&id));
+        let stopped = worker.held();
+        assert!(!stopped.known);
+        assert!(worker.unknown_held.load(Relaxed), "unreadable footprint is observable");
+        assert!(over(&[(id.clone(), stopped)], 0, true).is_empty());
+        let retry = daemon.warm(checkout.clone()).unwrap_err().to_string();
+        assert!(retry.contains("host memory pressure stopped this load"), "{retry}");
+        let mut changed = checkout.clone();
+        changed.env.insert("INPUT".into(), "changed".into());
+        let retry = daemon.warm(changed).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty(), "changed request clears tombstone");
+        let stop = PressureStop {
+            generation: 42,
+            request: request_key(&checkout),
+            most: 1,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        assert!(!stop.blocks(42, &request_key(&checkout), 1, checkout.written_since(stop.at)));
+        // Exercise warm's source invalidation, not only the blocks predicate. No real
+        // compiler is launched: this checkout deliberately has no program, so passing
+        // the tombstone reaches the normal request-validation error.
+        lock(&daemon.pressure_stops).insert((id.clone(), checkout.key.clone()), stop);
+        let retry = daemon.warm(checkout.clone()).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert!(lock(&daemon.pressure_stops).is_empty());
+        let mut config = checkout.config.clone();
+        config.env.insert("RA_JIT_WORKER_MEMORY".into(), "off".into());
+        assert_ne!(config.id(), id);
+        lock(&daemon.pressure_stops).insert(
+            (id.clone(), checkout.key.clone()),
+            PressureStop {
+                generation: 42,
+                request: request_key(&checkout),
+                most: 1,
+                at: SystemTime::now(),
+            },
+        );
+        let mut changed = checkout.clone();
+        changed.config = config;
+        let retry = daemon.warm(changed).unwrap_err().to_string();
+        assert!(!retry.contains("host memory pressure stopped this load"), "{retry}");
+        assert_eq!(lock(&daemon.pressure_stops).len(), 1, "other identity's tombstone stays");
+        assert!(!pressure_persisted(&mut since, Some(Normal), now + grace * 4, grace));
+        assert!(!pressure_persisted(&mut since, Some(Critical), now + grace * 5, grace));
+        assert!(!pressure_persisted(
+            &mut since,
+            Some(Critical),
+            now + grace * 6 - Duration::from_millis(1),
+            grace
+        ));
     }
 }

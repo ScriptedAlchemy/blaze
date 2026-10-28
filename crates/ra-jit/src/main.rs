@@ -26,6 +26,7 @@ mod remote;
 mod sandbox;
 mod shipped;
 mod socket;
+mod solving;
 mod splice;
 mod splicer;
 mod stub;
@@ -1292,6 +1293,15 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
     names.filter(|it| named(it)).map(|it| dir.join(it)).collect()
 }
 
+/// Dependent helper callbacks use their parent's admission slot. Keep this around the work
+/// itself, independently of the database handle that owns the helper's solver-cache lifetime.
+fn admitted_parallel_work<'a>(
+    work: &'a ParallelWork<'a>,
+) -> impl Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a {
+    let job = hir_ty_codegen::budget::job_context();
+    move |db, resolver, at| job.run(|| work(db, resolver, at))
+}
+
 impl SymbolResolver for Resolver<'_> {
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
@@ -1300,19 +1310,23 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = admitted_parallel_work(work);
+        let work = &work;
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                let (db, next, parts) = (solving::Handle::of(&self.db), &next, self.parts());
                 scope.spawn(move || {
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
+                    db.solve(|db| {
+                        let resolver = parts.over(db);
+                        hir::attach_db(db, || {
+                            loop {
+                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if at >= count {
+                                    break;
+                                }
+                                work(db, &resolver, at);
                             }
-                            work(&db, &resolver, at);
-                        }
+                        })
                     })
                 });
             }
@@ -3129,13 +3143,15 @@ fn resolve_names(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads.min(crates.len()) {
-            let (db, next) = (db.clone(), &next);
+            let (db, next) = (solving::Handle::of(&db), &next);
             scope.spawn(move || {
-                while let Some(&krate) =
-                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    hir::attach_db(&db, || _ = hir::crate_def_map(&db, krate));
-                }
+                db.solve(|db| {
+                    while let Some(&krate) =
+                        crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        hir::attach_db(db, || _ = hir::crate_def_map(db, krate));
+                    }
+                })
             });
         }
     });
@@ -3149,50 +3165,52 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: us
     let helping = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let db = db.clone();
+            let db = solving::Handle::of(&db);
             let (next, helping) = (&next, &helping);
             scope.spawn(move || {
-                while let Some(&krate) =
-                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    let start = Instant::now();
-                    let before = memory::live();
-                    hir::attach_db(&db, || {
-                        _ = hir::crate_def_map(&db, krate);
-                        let names = start.elapsed();
-                        let frozen = hir_ty::method_resolution::frozen::served(&db, krate);
-                        if !frozen {
-                            warm_impls(&db, krate, helping, threads);
-                        }
-                        _ = hir::TraitImpls::for_crate(&db, krate);
-                        // Which of its dependencies the crate names is read off its files,
-                        // and the first body inferred would wait for that of every crate.
-                        _ = hir::TraitImpls::for_crate_and_deps(&db, krate);
-                        if frozen {
-                            warm_files(&db, krate, helping, threads);
-                        } else if krate.data(&db).origin.is_lang() {
-                            // A build asks which functions written in the bodies of the
-                            // standard library share a path, which every body of the crate is
-                            // lowered for: threads are idle here, waiting for the crates that
-                            // come next.
-                            _ = declared_in(&db, krate.into());
-                        }
-                        if std::env::var_os("RA_JIT_STATS").is_some() {
-                            let name = krate.extra_data(&db).display_name.as_ref();
-                            let name = name.map(|it| it.to_string()).unwrap_or_default();
-                            // What the heap grew by is this crate's when one thread resolves.
-                            let grew = memory::live().zip(before).map(|(now, before)| {
-                                let origin = &krate.data(&db).origin;
-                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
-                            });
-                            eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
-                                start.elapsed() - names,
-                                grew.unwrap_or_default()
-                            );
-                        }
-                    });
-                }
+                db.solve(|db| {
+                    while let Some(&krate) =
+                        crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        let start = Instant::now();
+                        let before = memory::live();
+                        hir::attach_db(db, || {
+                            _ = hir::crate_def_map(db, krate);
+                            let names = start.elapsed();
+                            let frozen = hir_ty::method_resolution::frozen::served(db, krate);
+                            if !frozen {
+                                warm_impls(db, krate, helping, threads);
+                            }
+                            _ = hir::TraitImpls::for_crate(db, krate);
+                            // Which of its dependencies the crate names is read off its files,
+                            // and the first body inferred would wait for that of every crate.
+                            _ = hir::TraitImpls::for_crate_and_deps(db, krate);
+                            if frozen {
+                                warm_files(db, krate, helping, threads);
+                            } else if krate.data(db).origin.is_lang() {
+                                // A build asks which functions written in the bodies of the
+                                // standard library share a path, which every body of the crate is
+                                // lowered for: threads are idle here, waiting for the crates that
+                                // come next.
+                                _ = declared_in(db, krate.into());
+                            }
+                            if std::env::var_os("RA_JIT_STATS").is_some() {
+                                let name = krate.extra_data(db).display_name.as_ref();
+                                let name = name.map(|it| it.to_string()).unwrap_or_default();
+                                // What the heap grew by is this crate's when one thread resolves.
+                                let grew = memory::live().zip(before).map(|(now, before)| {
+                                    let origin = &krate.data(db).origin;
+                                    format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+                                });
+                                eprintln!(
+                                    "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+                                    start.elapsed() - names,
+                                    grew.unwrap_or_default()
+                                );
+                            }
+                        });
+                    }
+                })
             });
         }
     });
@@ -3225,18 +3243,20 @@ fn verify_impls<'scope>(
     let next = Arc::new(AtomicUsize::new(0));
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     for _ in 0..threads.min(crates.len()) {
-        let (db, crates, next) = (db.clone(), crates.clone(), next.clone());
+        let (db, crates, next) = (solving::Handle::of(&db), crates.clone(), next.clone());
         scope.spawn(move || {
-            // A query that is cancelled unwinds, and those that wait for it see that.
-            _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hir::attach_db(&db, || {
-                    let at = || next.fetch_add(1, Ordering::Relaxed);
-                    while let Some(&krate) = crates.get(at()) {
-                        _ = TraitImpls::for_crate(&db, krate);
-                        _ = InherentImpls::for_crate(&db, krate);
-                    }
-                })
-            }));
+            db.solve(|db| {
+                // A query that is cancelled unwinds, and those that wait for it see that.
+                _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hir::attach_db(db, || {
+                        let at = || next.fetch_add(1, Ordering::Relaxed);
+                        while let Some(&krate) = crates.get(at()) {
+                            _ = TraitImpls::for_crate(db, krate);
+                            _ = InherentImpls::for_crate(db, krate);
+                        }
+                    })
+                }));
+            })
         });
     }
 }
@@ -3290,9 +3310,9 @@ fn on_idle_threads<T: Sync>(
     };
     std::thread::scope(|scope| {
         for _ in 0..helpers {
-            let db = db.clone();
+            let db = solving::Handle::of(&db);
             let each = &each;
-            scope.spawn(move || hir::attach_db(&db, || each(&db)));
+            scope.spawn(move || db.solve(|db| hir::attach_db(db, || each(db))));
         }
         each(db);
     });
@@ -3555,8 +3575,8 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
         let parts: Vec<_> = functions
             .chunks(each)
             .map(|part| {
-                let db = db.clone();
-                scope.spawn(move || hir::attach_db(&db, || exported(&db, part)))
+                let db = solving::Handle::of(&db);
+                scope.spawn(move || db.solve(|db| hir::attach_db(db, || exported(db, part))))
             })
             .collect();
         // A query that is cancelled unwinds, and goes on unwinding here as what it is.
@@ -3610,13 +3630,15 @@ impl Listed {
         std::thread::scope(|scope| {
             let parts: Vec<_> = (0..threads.min(crates.len()))
                 .map(|_| {
-                    let (db, next) = (db.clone(), &next);
+                    let (db, next) = (solving::Handle::of(&db), &next);
                     scope.spawn(move || {
-                        hir::attach_db(&db, || {
-                            let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            while let Some(&krate) = crates.get(at()) {
-                                self.of(&db, krate);
-                            }
+                        db.solve(|db| {
+                            hir::attach_db(db, || {
+                                let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                while let Some(&krate) = crates.get(at()) {
+                                    self.of(db, krate);
+                                }
+                            })
                         })
                     })
                 })
@@ -3836,12 +3858,16 @@ fn home_in_rustcs(
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..cores().min(written.len()) {
-                let (db, written, next) = (db.clone(), &written, &next);
+                let (db, written, next) = (solving::Handle::of(&db), &written, &next);
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
-                        while let Some(&func) = written.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            hir_ty_codegen::compile_written(&db, func);
-                        }
+                    db.solve(|db| {
+                        hir::attach_db(db, || {
+                            while let Some(&func) =
+                                written.get(next.fetch_add(1, Ordering::Relaxed))
+                            {
+                                hir_ty_codegen::compile_written(db, func);
+                            }
+                        })
                     })
                 });
             }
@@ -4045,13 +4071,15 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
         // ones: each thread takes every nth, so that they are spread over all of them.
         let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
-            let (db, bodies) = (db.clone(), &bodies);
+            let (db, bodies) = (solving::Handle::of(&db), &bodies);
             scope.spawn(move || {
-                PROBING.set(probing);
-                hir::attach_db(&db, || {
-                    for &body in bodies.iter().skip(part).step_by(threads) {
-                        Body::of(&db, body);
-                    }
+                db.solve(|db| {
+                    PROBING.set(probing);
+                    hir::attach_db(db, || {
+                        for &body in bodies.iter().skip(part).step_by(threads) {
+                            Body::of(db, body);
+                        }
+                    })
                 })
             });
         }
@@ -4537,28 +4565,38 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
+    let stale: Result<Option<Vec<_>>, CodegenError> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
+                let (db, known, local, next) = (solving::Handle::of(&db), &*known, &local, &next);
                 let parts = resolver.parts();
                 scope.spawn(move || {
-                    PROBING.set(true);
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
+                    db.solve(|db| {
+                        PROBING.set(true);
+                        let resolver = parts.over(db);
+                        hir::attach_db(db, || {
+                            while let Some(&krate) =
+                                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                hir_ty::method_resolution::TraitImpls::for_crate(db, krate.into());
+                                hir_ty::method_resolution::InherentImpls::for_crate(
+                                    db,
+                                    krate.into(),
+                                );
+                            }
+                            known.stale(db, Some(&resolver), part, threads)
+                        })
                     })
                 })
             })
             .collect();
-        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
+        let parts: Result<Vec<_>, CodegenError> = parts
+            .into_iter()
+            .map(|it| it.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        parts.map(|parts| parts.into_iter().collect())
     });
+    let stale = stale.map_err(anyhow::Error::new)?;
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
@@ -4568,7 +4606,7 @@ fn build(
     let unit = hir::attach_db(db, || {
         CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
     })
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::new)?;
     let Some(mut unit) = unit else { return Ok(None) };
     known.stats.onto_rustcs = unit.object.is_some() && resolver.onto_rustcs();
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
@@ -4625,8 +4663,10 @@ fn build(
         unset: unset_in(db, &local),
         unwritten,
     };
-    // A patch is of the last full build and replaces nothing the next edit is built from.
-    if !undoable || known.stats.patched.is_some() {
+    // An edit may need another build after checking tiered code. Keep even a complete
+    // patch unpublished until that decision finishes: a failed retry must leave the
+    // last published object, patch and executable together.
+    if !undoable {
         build.keep(known)?;
     }
     if let Some(path) = &args.report {
@@ -4692,7 +4732,10 @@ fn with_failed_macro(
     let frontend = match &error {
         CodegenError::Frontend(_) => true,
         CodegenError::Unsupported(why) => why.contains("frontend:"),
-        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+        CodegenError::Backend(_)
+        | CodegenError::NoSymbol
+        | CodegenError::Private
+        | CodegenError::OverBudget(_) => false,
     };
     if !frontend {
         return error;
@@ -5278,12 +5321,12 @@ fn can_call(binary: &Path, name: &str) -> bool {
     }
 }
 
-/// A symbol the patch at `patch` refers to that the executable at `binary` does not give it;
+/// A symbol the uncommitted patch refers to that the executable does not give it;
 /// none while the executable is being read, which a splice then says.
-fn missing_in(binary: &Path, patch: &Path) -> Option<String> {
+fn missing_in(binary: &Path, patch: &[u8]) -> Option<String> {
     let linked = lock(&LINKED);
     let Some(Executable::Read(baseline)) = linked.get(binary) else { return None };
-    baseline.missing_in(&std::fs::read(patch).ok()?)
+    baseline.missing_in(patch)
 }
 
 /// The executable of the last full link, for splicing edits into.
@@ -5499,6 +5542,8 @@ enum Refused {
     Error(errors::Said),
     /// The source is one ra-jit does not build as it is, or ra-jit failed to: cargo builds it.
     Cargos(String),
+    /// A transient host-pressure failure leaves the worker and last published build intact.
+    Pressure(String),
 }
 
 impl Refused {
@@ -5507,6 +5552,7 @@ impl Refused {
         match self {
             Refused::Error(said) => said.reply(),
             Refused::Cargos(why) => format!("cargo: {}", why.replace('\n', " ")),
+            Refused::Pressure(why) => format!("error: {}", why.replace('\n', " ")),
         }
     }
 }
@@ -5516,7 +5562,28 @@ impl std::fmt::Display for Refused {
         match self {
             Refused::Error(said) => said.fmt(f),
             Refused::Cargos(why) => f.write_str(why),
+            Refused::Pressure(why) => f.write_str(why),
         }
+    }
+}
+
+/// Every build attempt in an edit, including retries for tiered code, has this boundary.
+/// Preserve typed host-pressure failures without terminating the worker or asking Cargo.
+/// This preserves published files; retaining an in-memory base is the patch path's rule,
+/// not a guarantee for a full rebuild that has already discarded its old base.
+fn recover_pressure<T>(
+    built: anyhow::Result<T>,
+    unbuilt: &mut Unbuilt,
+) -> anyhow::Result<Result<T, Refused>> {
+    match built {
+        Err(why)
+            if matches!(why.downcast_ref::<CodegenError>(), Some(CodegenError::OverBudget(_))) =>
+        {
+            eprintln!("pressure: edit not published; last published files retained: {why:#}");
+            unbuilt.stale = true;
+            Ok(Err(Refused::Pressure(format!("{why:#}"))))
+        }
+        other => other.map(Ok),
     }
 }
 
@@ -5721,55 +5788,57 @@ fn broken_in(
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let (db, config, within) = (db.clone(), &config, &within);
+                let (db, config, within) = (solving::Handle::of(&db), &config, &within);
                 scope.spawn(move || {
-                    let files = edited.iter().skip(part).step_by(threads);
-                    hir::attach_db(&db, || {
-                        files
-                            .flat_map(|&file| {
-                                // A library's files are its unit tests' too, with what is
-                                // under `cfg(test)`: each crate built of them says what it
-                                // finds, where rust-analyzer would ask the first.
-                                let crates: Vec<_> = ide_db::base_db::relevant_crates(&db, file)
-                                    .iter()
-                                    .copied()
-                                    .filter(|it| within.as_ref().is_none_or(|w| w.contains(it)))
-                                    .collect();
-                                let each: Vec<_> = match crates.len() {
-                                    0 | 1 => vec![within.clone()],
-                                    _ => crates
-                                        .into_iter()
-                                        .map(|it| Some(Arc::new(FxHashSet::from_iter([it]))))
-                                        .collect(),
-                                };
-                                let db = &db;
-                                let each = each.into_iter().flat_map(move |within| {
-                                    ide_diagnostics::semantic_diagnostics_within(
-                                        db,
-                                        config,
-                                        &ide_db::assists::AssistResolveStrategy::None,
-                                        file,
-                                        within,
-                                    )
-                                });
-                                each.collect::<Vec<_>>()
-                            })
-                            .filter(|it| {
-                                let code = it.code.as_str();
-                                // rustc says nothing of most lints in what another crate's
-                                // macro expands to.
-                                let expanded = it.main_node.is_some_and(|it| it.file_id.is_macro());
-                                it.severity == ide_db::Severity::Error
-                                    && (SURE.contains(&code)
-                                        || refuse_borrowck && BORROWCK.contains(&code)
-                                        || lints
-                                            && !expanded
-                                            && (DENIED.contains(&code)
-                                                || refuse_borrowck
-                                                    && DENIED_BORROWCK.contains(&code)))
-                            })
-                            .map(|it| (it.range, it.code.as_str(), it.message))
-                            .collect::<Vec<_>>()
+                    db.solve(|db| {
+                        let files = edited.iter().skip(part).step_by(threads);
+                        hir::attach_db(db, || {
+                            files
+                                .flat_map(|&file| {
+                                    // A library's files are its unit tests' too, with what is
+                                    // under `cfg(test)`: each crate built of them says what it
+                                    // finds, where rust-analyzer would ask the first.
+                                    let crates: Vec<_> = ide_db::base_db::relevant_crates(db, file)
+                                        .iter()
+                                        .copied()
+                                        .filter(|it| within.as_ref().is_none_or(|w| w.contains(it)))
+                                        .collect();
+                                    let each: Vec<_> = match crates.len() {
+                                        0 | 1 => vec![within.clone()],
+                                        _ => crates
+                                            .into_iter()
+                                            .map(|it| Some(Arc::new(FxHashSet::from_iter([it]))))
+                                            .collect(),
+                                    };
+                                    let each = each.into_iter().flat_map(move |within| {
+                                        ide_diagnostics::semantic_diagnostics_within(
+                                            db,
+                                            config,
+                                            &ide_db::assists::AssistResolveStrategy::None,
+                                            file,
+                                            within,
+                                        )
+                                    });
+                                    each.collect::<Vec<_>>()
+                                })
+                                .filter(|it| {
+                                    let code = it.code.as_str();
+                                    // rustc says nothing of most lints in what another crate's
+                                    // macro expands to.
+                                    let expanded =
+                                        it.main_node.is_some_and(|it| it.file_id.is_macro());
+                                    it.severity == ide_db::Severity::Error
+                                        && (SURE.contains(&code)
+                                            || refuse_borrowck && BORROWCK.contains(&code)
+                                            || lints
+                                                && !expanded
+                                                && (DENIED.contains(&code)
+                                                    || refuse_borrowck
+                                                        && DENIED_BORROWCK.contains(&code)))
+                                })
+                                .map(|it| (it.range, it.code.as_str(), it.message))
+                                .collect::<Vec<_>>()
+                        })
                     })
                 })
             })
@@ -6382,7 +6451,7 @@ fn compile_tiered(
         tier::done(&binary, Vec::new(), counters);
         return;
     }
-    let (db, tiering) = (db.clone(), Tiering::start());
+    let db = solving::Handle::of(&db);
     let asked_of = binary.clone();
     // Each body built in or shown is built inside the one that calls it, up to ten deep, with
     // the frames of a whole function's build each; a thread's default 2 MiB does not hold that.
@@ -6390,19 +6459,21 @@ fn compile_tiered(
     let spawned = thread.spawn(move || {
         // The IR of every function is built with the database, which is let go of before
         // LLVM runs: a change to the source waits for the database to be let go of, and
-        // so for nothing LLVM does.
-        let prepared: Vec<_> = asked
-            .into_iter()
-            .map(|(symbol, asked)| {
-                let start = Instant::now();
-                let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hir::attach_db(&db, || codegen_tier::prepare(&db, &asked))
-                }))
-                .unwrap_or_else(|_| Err("an edit came first".to_owned()));
-                (symbol, asked.node, asked.level, prepared, start.elapsed())
-            })
-            .collect();
-        drop((db, tiering));
+        // so for nothing LLVM does. This thread goes on into LLVM, and its solver cache
+        // with it unless it is cleared before the database is dropped: `solve` does that.
+        let prepared: Vec<_> = db.solve(|db| {
+            asked
+                .into_iter()
+                .map(|(symbol, asked)| {
+                    let start = Instant::now();
+                    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        hir::attach_db(db, || codegen_tier::prepare(db, &asked))
+                    }))
+                    .unwrap_or_else(|_| Err("an edit came first".to_owned()));
+                    (symbol, asked.node, asked.level, prepared, start.elapsed())
+                })
+                .collect()
+        });
         let (mut code, mut done) = (Vec::new(), Vec::new());
         for (symbol, node, level, prepared, with_db) in prepared {
             let room = ra_jit_live::format::COUNTERS as u32;
@@ -6452,31 +6523,65 @@ fn compile_tiered(
     }
 }
 
-/// A compile at a higher level that holds the database, which [`let_go`] waits to have none.
-struct Tiering;
-
-static TIERING: AtomicUsize = AtomicUsize::new(0);
-
-impl Tiering {
-    fn start() -> Self {
-        TIERING.fetch_add(1, Ordering::Relaxed);
-        Tiering
-    }
-}
-
-impl Drop for Tiering {
-    fn drop(&mut self) {
-        TIERING.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
+///
+/// Then, once nothing runs, it reclaims what nothing will read again (see [`reclaim`]): the
+/// types, arguments and clauses interned for the builds that are over, the trait solver's
+/// cache on every thread, and the pages of what was freed.
 fn let_go(db: &mut RootDatabase, builds: &Builds) {
     use ide_db::base_db::salsa::Database;
-    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 {
+    // A build that has sent its answer has dropped its handle, which a count says; one that
+    // has not sent it is in `running`. A tier compile holds a handle until its IR is built.
+    if builds.running.is_empty() && solving::SCOPES.held() == 0 {
         db.trigger_lru_eviction();
+        reclaim(db);
+    }
+}
+
+/// Gives an idle worker back what a build made and nothing will read again, as
+/// `docs/research/memory.md`'s item 1 says: the types interned for it, the trait solver's
+/// cache, and the pages the allocator kept. `RA_JIT_RECLAIM` turns it off, or names the steps.
+fn reclaim(db: &mut RootDatabase) {
+    let reclaim = memory::Reclaim::of_env();
+    if !reclaim.any() {
+        return;
+    }
+    if reclaim.types {
+        // Clears the solver caches first, on every thread, and collects only when no thread
+        // solves: see `solving::collect_types`, which is the one way to collect.
+        if let Err(busy) = solving::collect_types(db) {
+            eprintln!("reclaim: the interned types are not collected this time: {busy}");
+        }
+    } else if reclaim.solver_caches {
+        solving::clear_caller_and_pool();
+    }
+    if reclaim.pages {
+        memory::give_back();
+    }
+}
+
+/// Says what the daemon holds of its own for the next `memory::report`: what no ingredient of
+/// the database counts, and where it is held.
+fn held_of_own(checkouts: &Checkouts, programs: &[Program]) -> memory::Own {
+    let rejections = programs.iter().map(|it| {
+        let (rejected, theirs, unknown, left, futures) = it.known.held();
+        rejected + theirs + unknown + left + futures
+    });
+    let patch_originals = lock(&LINKED)
+        .values()
+        .filter_map(|it| match it {
+            Executable::Read(baseline) => Some(baseline.held_originals()),
+            Executable::Linked(_) => None,
+        })
+        .sum();
+    memory::Own {
+        checkouts: checkouts.roots.len(),
+        files_hashed: content::FileHashes::held(),
+        rustc_symbols: lock(&RUSTC_SYMBOLS).len(),
+        rejections: rejections.sum(),
+        patch_originals,
     }
 }
 
@@ -7001,6 +7106,8 @@ usage: ra-jit <command>
   cargo <command>   what `cargo blaze <command>` runs: build, run, test, check
   cache <verb>      the disk store: stats, gc, verify, push, pull, keygen
                     (`cargo blaze cache clear` forgets what `#[ra_jit::cache]` kept)
+  serve --cache DIR --listen ADDR
+                    a cache server other machines reach at blaze+http://ADDR
   mir <dir> --crate <name> [--level 0|1|2] [--time]
                     a crate's MIR as blaze compiles it, written as rustc's -Zunpretty=mir
   --help, --version
@@ -7071,6 +7178,7 @@ fn main() -> anyhow::Result<()> {
             end_with_reader();
             return remote::command(std::env::args().skip(2));
         }
+        Some("serve") => return remote::serve(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         _ => {}
     }
@@ -7172,11 +7280,13 @@ fn lower_until(
     std::thread::scope(|scope| {
         let compiling: Vec<_> = (0..threads)
             .map(|_| {
-                let (db, unnamed) = (db.clone(), &unnamed);
+                let (db, unnamed) = (solving::Handle::of(&db), &unnamed);
                 scope.spawn(move || {
-                    let compile = || hir_ty_codegen::compile_unnamed(&db, unnamed, done);
-                    let compile = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, compile));
-                    let _ = std::panic::catch_unwind(compile);
+                    db.solve(|db| {
+                        let compile = || hir_ty_codegen::compile_unnamed(db, unnamed, done);
+                        let compile = std::panic::AssertUnwindSafe(|| hir::attach_db(db, compile));
+                        let _ = std::panic::catch_unwind(compile);
+                    })
                 })
             })
             .collect();
@@ -7198,14 +7308,16 @@ fn lower_until(
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let (db, next) = (db.clone(), &next);
+                let (db, next) = (solving::Handle::of(&db), &next);
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
-                        while let Some(&body) = bodies.get(next.fetch_add(1, Ordering::Relaxed))
-                            && !done()
-                        {
-                            hir_def::expr_store::Body::of(&db, body);
-                        }
+                    db.solve(|db| {
+                        hir::attach_db(db, || {
+                            while let Some(&body) = bodies.get(next.fetch_add(1, Ordering::Relaxed))
+                                && !done()
+                            {
+                                hir_def::expr_store::Body::of(db, body);
+                            }
+                        })
                     })
                 });
             }
@@ -7782,6 +7894,7 @@ fn run_holding(
     }
     process_wide();
     memory::ticks();
+    memory::bound_builds()?;
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -7938,6 +8051,10 @@ fn run_holding(
     if let Some(said) = ra_jit_expand::report() {
         eprintln!("{said}");
     }
+    // Resolution lets go of a third of what it held at its peak, and the allocator keeps the
+    // pages: 4 GB of tracedecay's (docs/reports/LOADMEM.md). The build that comes next is bounded
+    // by what the process holds.
+    memory::give_back();
     memory::checkpoint("resolve");
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
@@ -8089,6 +8206,7 @@ fn run_holding(
             if let Some(said) = ra_jit_expand::report() {
                 eprintln!("{said}");
             }
+            memory::set_own(held_of_own(&checkouts, &[]));
             memory::report(&mut db, "build")?;
             report_stats(&known.stats);
             link(
@@ -8304,6 +8422,7 @@ fn run_holding(
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
                                 let_go(&mut db, &builds);
+                                memory::set_own(held_of_own(&checkouts, &programs));
                                 memory::served(&mut db)?;
                             }
                         }
@@ -8316,6 +8435,7 @@ fn run_holding(
                         let event = builds.events.recv()?;
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds);
+                            memory::set_own(held_of_own(&checkouts, &programs));
                             memory::served(&mut db)?;
                         }
                     }
@@ -8330,6 +8450,7 @@ fn run_holding(
                     while let Ok(event) = builds.events.try_recv() {
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds);
+                            memory::set_own(held_of_own(&checkouts, &programs));
                             memory::served(&mut db)?;
                         }
                     }
@@ -9103,7 +9224,7 @@ fn run_holding(
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
-                    (db.clone(), listed.clone(), paths.clone(), sender.clone());
+                    (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
                 let done = Arc::new(AtomicBool::new(false));
                 if own_base && let Some(budget) = own_base_budget() {
@@ -9129,12 +9250,16 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
-                    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer)
-                    }));
+                    // The write that interrupts waits for the clone to be dropped, and the
+                    // collection of types asks that the solver cache of this thread, which
+                    // outlives the clone until the thread ends, is cleared first: `solve`
+                    // does both as it returns.
+                    let answer = db.solve(|db| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            program.sync(db, &listed, &paths, &edit, wanted.as_ref(), link, defer)
+                        }))
+                    });
                     done.store(true, Ordering::SeqCst);
-                    // The write that interrupts waits for this.
-                    drop(db);
                     let answer = match answer {
                         _ if INTERRUPTING.load(Ordering::SeqCst) => None,
                         Ok(answer) => Some(answer),
@@ -9162,15 +9287,18 @@ fn run_holding(
                         let mut theirs = clients.iter().filter(|it| it.0 == at).peekable();
                         let defer =
                             theirs.peek().is_some() && theirs.all(|it| it.1.0 == Request::Edit);
-                        let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
+                        let (db, listed, paths, edit) =
+                            (solving::Handle::of(&db), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
                         let build = scope.spawn(move || {
-                            let answer =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    program.sync(&db, listed, paths, edit, wanted, link, defer)
-                                }));
-                            end_link();
-                            answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                            db.solve(|db| {
+                                let answer =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        program.sync(db, listed, paths, edit, wanted, link, defer)
+                                    }));
+                                end_link();
+                                answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                            })
                         });
                         (at, build)
                     })
@@ -9298,6 +9426,7 @@ fn run_holding(
             links.insert(out, linked);
         }
         let_go(&mut db, &builds);
+        memory::set_own(held_of_own(&checkouts, &programs));
         memory::served(&mut db)?;
     }
 }
@@ -9682,15 +9811,17 @@ impl Program {
                 verify_impls(scope, db, crates);
             }
             let check = {
-                let (db, edited, root) = (db.clone(), &edited, &args.checkout);
+                let (db, edited, root) = (solving::Handle::of(&db), &edited, &args.checkout);
                 let lints = !args.lints_capped;
                 scope.spawn(move || {
-                    let start = Instant::now();
-                    let broken = broken_in(&db, edited, paths, root, within, lints);
-                    if std::env::var_os("RA_JIT_STATS").is_some() {
-                        eprintln!("check-us: {}", start.elapsed().as_micros());
-                    }
-                    broken
+                    db.solve(|db| {
+                        let start = Instant::now();
+                        let broken = broken_in(db, edited, paths, root, within, lints);
+                        if std::env::var_os("RA_JIT_STATS").is_some() {
+                            eprintln!("check-us: {}", start.elapsed().as_micros());
+                        }
+                        broken
+                    })
                 })
             };
             let (check, checked) = (std::sync::Mutex::new(Some(check)), std::sync::OnceLock::new());
@@ -9719,30 +9850,40 @@ impl Program {
             eprintln!("edit-to-binary: {:.1?}", start.elapsed());
             why
         };
-        let Some(mut warm) = warm? else { return Ok(Err(held(known))) };
+        let warm = match recover_pressure(warm, unbuilt)? {
+            Ok(warm) => warm,
+            Err(pressure) => return Ok(Err(pressure)),
+        };
+        let Some(mut warm) = warm else { return Ok(Err(held(known))) };
         // Code compiled at a higher level can call what rustc built into its callers and left
         // no symbol of. The executable can't take a patch with it, and a full link would start
         // the program over, so the code goes instead; of several functions installed
         // together, the others are installed again one by one, a build each.
         loop {
             let missing = match (&args.splice, &args.patch) {
-                (Some(binary), Some(patch)) if known.stats.patched.is_some() => {
-                    missing_in(binary, patch)
-                }
+                (Some(binary), Some(patch)) if known.stats.patched.is_some() => warm
+                    .unwritten
+                    .iter()
+                    .find(|(path, _)| path == patch)
+                    .and_then(|(_, bytes)| missing_in(binary, bytes)),
                 _ => None,
             };
             let again = match missing {
                 Some(missing) => known.tiers.refuse(&format!(
                     "no patch can hold its code: {missing} is not in the executable"
                 )),
-                None => known.tiers.held(),
+                None => known.tiers.held() || hir_ty_codegen::budget::testing::tier_retry(),
             };
             if !again {
                 break;
             }
-            match build(db, table, args, known, listed, Some(&hold))? {
-                Some(again) => warm = again,
-                None => return Ok(Err(held(known))),
+            hir_ty_codegen::budget::testing::checkpoint("tier_rebuild");
+            let retry =
+                recover_pressure(build(db, table, args, known, listed, Some(&hold)), unbuilt)?;
+            match retry {
+                Err(pressure) => return Ok(Err(pressure)),
+                Ok(Some(again)) => warm = again,
+                Ok(None) => return Ok(Err(held(known))),
             }
         }
         let full = known.stats.patched.is_none();
@@ -9976,6 +10117,65 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("patch.o");
+        std::fs::write(&patch, b"last published patch").unwrap();
+        let candidate = || Build {
+            compiled: 1,
+            skipped: Vec::new(),
+            instances: 0,
+            codegen: Duration::ZERO,
+            emit: Duration::ZERO,
+            steps: [Duration::ZERO; 3],
+            looked: Default::default(),
+            unset: None,
+            unwritten: vec![(patch.clone(), b"new complete patch".to_vec())],
+        };
+        let mut unbuilt = Unbuilt::default();
+        let first = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("first attempt failed"))
+            .unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let error = anyhow::Error::new(CodegenError::OverBudget("host memory pressure".into()))
+            .context("second tier build");
+        let second: Result<Option<Build>, Refused> =
+            recover_pressure(Err(error), &mut unbuilt).unwrap();
+        let reply = match second {
+            Err(why) => why.reply(),
+            Ok(_) => panic!("second build did not fail"),
+        };
+        assert!(reply.starts_with("error: second tier build: "));
+        assert!(reply.contains("host memory pressure"));
+        assert!(unbuilt.stale);
+        drop(first);
+        assert_eq!(std::fs::read(&patch).unwrap(), b"last published patch");
+        let mut retry = recover_pressure(Ok(Some(candidate())), &mut unbuilt)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("recovery failed"))
+            .unwrap();
+        retry.keep(&mut Rejections::default()).unwrap();
+        assert_eq!(std::fs::read(&patch).unwrap(), b"new complete patch");
+        let unrelated =
+            recover_pressure::<()>(Err(anyhow::anyhow!("ordinary error")), &mut unbuilt);
+        assert_eq!(unrelated.err().unwrap().to_string(), "ordinary error");
+    }
+
+    #[test]
+    fn pressure_reply_is_a_transient_error_not_a_cargo_request() {
+        let reply = super::Refused::Pressure("host memory pressure".into()).reply();
+        assert_eq!(reply, "error: host memory pressure");
+        let error = anyhow::Error::new(hir_ty_codegen::CodegenError::OverBudget(
+            "host memory pressure".into(),
+        ));
+        assert!(matches!(
+            error.downcast_ref::<hir_ty_codegen::CodegenError>(),
+            Some(hir_ty_codegen::CodegenError::OverBudget(_))
+        ));
+    }
+
     use super::*;
 
     #[test]
