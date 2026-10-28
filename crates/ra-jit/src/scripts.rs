@@ -316,6 +316,9 @@ pub(crate) fn run_producers(
             runner.raw_env = raw_env.clone();
             let mut outputs = BTreeMap::new();
             for package in cargo.packages() {
+                if asked.packages.is_some_and(|it| !it.contains_key(&cargo[package].id.repr)) {
+                    continue;
+                }
                 if cargo[package].targets.iter().any(|&target| {
                     matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
                 }) {
@@ -448,7 +451,64 @@ fn pass(
         "blaze runs build scripts with the standard library's source, and has no toolchain",
     )?;
     let mut runner = Runner::new(leases, cargo, asked, sysroot, &workspace.rustc_cfg)?;
+    if let Some(failure) = asked.env.get("BLAZE_PRODUCER_PROBE_FAILURE") {
+        match std::fs::remove_file(failure) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        }
+    }
     let mut lines = Vec::new();
+    if let Some(host_cargo) = asked.host_cargo {
+        let host_ask = Asked { host_cargo: None, target: asked.host, ..*asked };
+        let (outputs, images, world) = run_producers(
+            host_cargo,
+            &host_ask,
+            runner.sysroot.clone(),
+            runner.host_flags.clone(),
+            runner.host_cfgs.clone().context("no host cfg for owned producers")?,
+            &runner.child_env(),
+        )?;
+        runner.judged.extend(world);
+        for (package, (out_dir, output)) in outputs {
+            // Host-only packages, including proc macros, use these host outputs.
+            if asked.packages.is_some_and(|it| it.get(&package) == Some(&false)) {
+                lines.push(json!({
+                    "reason": "build-script-executed", "package_id": package,
+                    "linked_libs": output.library_links,
+                    "linked_paths": output.library_paths.iter().map(|it| it.path().display().to_string()).collect::<Vec<_>>(),
+                    "cfgs": output.cfgs, "env": output.env, "out_dir": out_dir,
+                }).to_string());
+            }
+        }
+        for (id, image) in images {
+            let package = cargo
+                .packages()
+                .find(|&it| cargo[it].id.repr == id)
+                .context("owned producer missing from loaded workspace")?;
+            let target = cargo[package]
+                .targets
+                .iter()
+                .map(|&it| &cargo[it])
+                .find(|it| matches!(it.kind, TargetKind::Lib { is_proc_macro: true }))
+                .context("owned producer has no macro target")?;
+            lines.push(
+                json!({
+                    "reason": "compiler-artifact", "package_id": id,
+                    "manifest_path": cargo[package].manifest.to_string(),
+                    "target": { "name": target.name, "kind": ["proc-macro"],
+                        "crate_types": ["proc-macro"], "src_path": target.root.to_string(),
+                        "edition": cargo[package].edition.to_string(),
+                        "doc": false, "doctest": false, "test": false },
+                    "profile": { "opt_level": "0", "debuginfo": 0,
+                        "debug_assertions": false, "overflow_checks": false, "test": false },
+                    "features": cargo[package].active_features,
+                    "filenames": [image], "executable": null, "fresh": false,
+                })
+                .to_string(),
+            );
+        }
+    }
     for package in cargo.packages() {
         if !runner.runs(package) {
             continue;

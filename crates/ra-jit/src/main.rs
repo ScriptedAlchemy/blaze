@@ -3314,26 +3314,20 @@ fn workspace_at(
         sources.extend_from_slice(plan.sources());
         cargo.set_sources(sources);
         let packages: Vec<_> = cargo.packages().collect();
-        // A proc macro of the build is still built by cargo's check of the load (step J), which
-        // then runs the scripts too: blaze runs them where the build has none.
-        let built = |it: &&project_model::Package| plan.package(&cargo[**it].id.repr).is_some();
-        let is_macro = |it: &&project_model::Package| {
-            cargo[**it].targets.iter().any(|&target| {
-                matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
-            })
-        };
-        let proc_macro = packages.iter().filter(built).find(is_macro);
-        if whole && let Some(found) = proc_macro {
-            eprintln!(
-                "build scripts: the build has the proc macro `{}`, which blaze does not build \
-                 without cargo's check yet (no-rustc step J): the check runs the scripts",
-                cargo[*found].name
+        if whole || (beside.is_none() && said.is_none()) {
+            let mut env = asked.map(|it| it.0.clone()).unwrap_or_else(|| process::vars().collect());
+            let producer_dir = cargo.target_directory().join("blaze-owned-producers");
+            std::fs::create_dir_all(&producer_dir)?;
+            let probe = producer_dir.join("producer-rustc");
+            crate::answers::producer_launcher(probe.as_ref())?;
+            env.insert("RUSTC".into(), probe.to_string());
+            env.insert("RUSTDOC".into(), probe.to_string());
+            env.remove("RUSTC_WRAPPER");
+            env.remove("RUSTC_WORKSPACE_WRAPPER");
+            env.insert(
+                "BLAZE_PRODUCER_PROBE_FAILURE".into(),
+                producer_dir.join("unsupported-probe").to_string(),
             );
-        }
-        if whole
-            && proc_macro.is_none()
-            && let Some((env, _)) = asked
-        {
             let host = project_model::toolchain_info::target_tuple::get(
                 project_model::toolchain_info::QueryConfig::Rustc(&workspace.sysroot, dir.as_ref()),
                 None,
@@ -3341,7 +3335,7 @@ fn workspace_at(
             )?;
             let ids = packages.iter().map(|&it| &cargo[it].id.repr);
             own = Some(scripts::Own {
-                env: env.clone(),
+                env,
                 native_env: process::native(),
                 profile: selection.profile.clone(),
                 config: selection.config.clone(),
@@ -3410,23 +3404,10 @@ fn workspace_at(
                 }
                 said
             }
-            (None, kind, _) => {
-                if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
-                    && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
-                {
-                    seed_own_target(cargo.target_directory().as_ref());
-                }
-                if let Some(generation) = &generation {
-                    generation.verify(&workspace, cargo_config)?;
-                }
-                let built = workspace.run_build_scripts(cargo_config, &|_| {});
-                // Validate even an unsuccessful build: partial cargo outputs cannot certify
-                // a generation after the source it was keyed by changed.
-                if let Some(generation) = &generation {
-                    generation.verify(&workspace, cargo_config)?;
-                }
-                built?
+            (None, ProjectWorkspaceKind::Cargo { .. }, _) => {
+                anyhow::bail!("owned producer scheduling was not established for this load")
             }
+            (None, _, _) => WorkspaceBuildScripts::default(),
         };
         // A crate whose script did not run is read without what it writes: thiserror's
         // `include!` of its `OUT_DIR` then leaves every derived `Error` unimplemented, and a
