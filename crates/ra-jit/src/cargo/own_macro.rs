@@ -89,7 +89,7 @@ pub(crate) fn source_command(
     let dir = std::path::absolute(args.next().context("then an exclusive build directory")?)?;
     anyhow::ensure!(args.next().is_none(), "unexpected producer build argument");
     let crates = serde_json::from_slice(&std::fs::read(plan)?)?;
-    let env = crate::process::vars().collect::<Vec<_>>();
+    let env = std::env::vars_os().collect::<Vec<_>>();
     let library =
         own_script::link_macro_planned(&sysroot, crates, &dir, &env).map_err(anyhow::Error::msg)?;
     println!("{}", library.display());

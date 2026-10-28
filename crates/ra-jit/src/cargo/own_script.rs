@@ -11,7 +11,7 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -250,7 +250,7 @@ fn build(
     made: &Made<'_>,
     store: Option<PathBuf>,
     shipped: bool,
-    asked: Option<(&[(String, String)], &Path)>,
+    asked: Option<(&[(OsString, OsString)], &Path)>,
 ) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
     let project = dir.join("rust-project.json");
@@ -274,7 +274,7 @@ fn build_command(
     made: &Made<'_>,
     store: Option<PathBuf>,
     shipped: bool,
-    asked: Option<(&[(String, String)], &Path)>,
+    asked: Option<(&[(OsString, OsString)], &Path)>,
 ) -> Command {
     let mut ra_jit = Command::new(executable);
     ra_jit.arg(&project).args(["--crate", made.name]).arg("--out").arg(dir.join("built.o"));
@@ -290,7 +290,11 @@ fn build_command(
     };
     if let Some((env, inputs)) = asked {
         ra_jit.env_clear();
-        ra_jit.envs(env.iter().filter(|(name, _)| !not_the_builds(name)).map(|(k, v)| (k, v)));
+        ra_jit.envs(
+            env.iter()
+                .filter(|(name, _)| !not_the_builds(&name.to_string_lossy()))
+                .map(|(k, v)| (k, v)),
+        );
         ra_jit.arg("--inputs").arg(inputs);
     }
     for (name, _) in std::env::vars_os() {
@@ -417,7 +421,7 @@ pub(crate) fn link_macro_planned(
     sysroot: &Path,
     crates: Vec<Planned>,
     dir: &Path,
-    env: &[(String, String)],
+    env: &[(OsString, OsString)],
 ) -> Result<PathBuf, String> {
     let name = crates.first().ok_or("a proc-macro producer needs a root crate")?.name.clone();
     let described = planned_macro_description(sysroot, crates)?;
@@ -473,7 +477,7 @@ pub(crate) fn link_planned(
     dir: &Path,
     exe: &Path,
     inputs: &Path,
-    env: &[(String, String)],
+    env: &[(OsString, OsString)],
 ) -> Result<String, String> {
     let made = Made {
         name: SCRIPT,

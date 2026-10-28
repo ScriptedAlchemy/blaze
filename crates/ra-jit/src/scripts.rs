@@ -295,12 +295,14 @@ pub(crate) fn run_producers(
     sysroot: PathBuf,
     flags: Vec<String>,
     cfgs: Vec<String>,
+    raw_env: &BTreeMap<OsString, OsString>,
 ) -> anyhow::Result<(BTreeMap<String, (PathBuf, blaze_build_script::Output)>, World)> {
     retrying(asked.build, false, || {
         let result = (|| {
             let mut runner = Runner::new(&LEASES, cargo, asked, sysroot.clone(), &[])?;
             runner.host_flags = flags.clone();
             runner.host_cfgs = Some(cfgs.clone());
+            runner.raw_env = raw_env.clone();
             let mut outputs = BTreeMap::new();
             for package in cargo.packages() {
                 if runner.runs(package) {
@@ -489,6 +491,9 @@ struct Runner<'a> {
     cross: bool,
     /// `[env]`, as it applies.
     config_env: BTreeMap<String, String>,
+    /// Byte-valued environment supplied by the source-producer caller. Unicode
+    /// projection is for source/configuration only, never a child process boundary.
+    raw_env: BTreeMap<OsString, OsString>,
     target_cfgs: Vec<String>,
     host_cfgs: Option<Vec<String>>,
     /// What `rustc -vV` says, which every fingerprint has.
@@ -571,6 +576,7 @@ impl<'a> Runner<'a> {
             host_flags,
             cross,
             config_env,
+            raw_env: BTreeMap::new(),
             profiles,
             rustc,
             done: FxHashMap::default(),
@@ -592,6 +598,13 @@ impl<'a> Runner<'a> {
     /// process's.
     fn value(&self, name: &str) -> Option<String> {
         self.config_env.get(name).or_else(|| self.asked.env.get(name)).cloned()
+    }
+
+    fn child_env(&self) -> BTreeMap<OsString, OsString> {
+        let mut env = self.raw_env.clone();
+        env.extend(self.asked.env.iter().map(|(key, value)| (key.into(), value.into())));
+        env.extend(self.config_env.iter().map(|(key, value)| (key.into(), value.into())));
+        env
     }
 
     fn profile(&self, package: Package, unit_for: UnitFor, kind: &CompileKind) -> Profile {
@@ -739,8 +752,7 @@ impl<'a> Runner<'a> {
                 .chain(deps.iter().map(|(name, _, made)| (name.clone(), *made)))
                 .collect();
         let stale = fresh::stale(was.as_ref(), &now, &output_file, &made, &package_dir);
-        let cargo_env: Vec<(OsString, OsString)> =
-            self.asked.env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let cargo_env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         let cx = output::Context::of(&unit, &cargo_env);
         let mut writer = None;
         let mut generation = 0;
@@ -1025,9 +1037,7 @@ impl<'a> Runner<'a> {
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         let began = SystemTime::now();
-        let mut env: Vec<(String, String)> =
-            self.asked.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        env.extend(self.config_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         crate::cargo::own_script::link_planned(&described, &dir, &exe, &inputs, &env)?;
         if let Some(line) = std::fs::read_to_string(dir.join("ra-jit.log"))
             .unwrap_or_default()

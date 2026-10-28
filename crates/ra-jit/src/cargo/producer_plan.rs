@@ -169,8 +169,12 @@ impl Producers {
             explicit_target: selection.target.is_some(),
             packages: Some(&packages),
         };
+        let mut raw: BTreeMap<_, _> = std::env::vars_os().collect();
+        raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));
+        raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
+        raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
         let (outputs, world) =
-            crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs)?;
+            crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs, &raw)?;
         anyhow::ensure!(
             !failure.exists(),
             "blaze could not compile a producer's compiler probe: {}",
@@ -416,7 +420,7 @@ pub(crate) fn command(
         let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
             .map(std::path::PathBuf::from)
             .context("the source toolchain is not named")?;
-        let env = crate::process::vars().collect::<Vec<_>>();
+        let env = std::env::vars_os().collect::<Vec<_>>();
         // Reject nested producer graphs before any script or compiler child. This
         // boundary is removed only when the nested scheduler supplies their images.
         let mut preflight = Producers {
