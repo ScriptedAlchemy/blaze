@@ -111,6 +111,37 @@ def main() -> int:
         code, said = run_check(d, "nix-native")
         note("nix-native accepts a binary with no interpreter (static)", code == 0, said[:60])
 
+        # A malformed ELF must never be read as static: "static" is what waives the check.
+        malformed = {
+            "truncated header": b"\x7fELF" + bytes([2, 1, 1]) + bytes(8),
+            "bad data encoding": b"\x7fELF" + bytes([2, 2, 1]) + bytes(9) + bytes(64),
+            "bad class": b"\x7fELF" + bytes([7, 1, 1]) + bytes(9) + bytes(64),
+        }
+        for why, blob in malformed.items():
+            d = tmp / f"bad-{why.replace(' ', '-')}"
+            d.mkdir()
+            (d / "ra-jit").write_bytes(blob)
+            code, said = run_check(d, "nix-native")
+            note(f"nix-native refuses a malformed ELF ({why})", code == 1 and "must be a readable ELF" in said,
+                 said[:80])
+
+        # Program headers that run past the file, and a PT_INTERP that does.
+        ident = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+        past = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0, 64, 56, 40, 0, 0, 0)
+        d = tmp / "phnum-past-eof"
+        d.mkdir()
+        (d / "ra-jit").write_bytes(past)
+        code, said = run_check(d, "nix-native")
+        note("nix-native refuses program headers past EOF", code == 1 and "past the file" in said, said[:80])
+
+        interp_past = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0) \
+            + struct.pack("<IIQQQQQQ", 3, 4, 4096, 0, 0, 512, 512, 1)
+        d = tmp / "interp-past-eof"
+        d.mkdir()
+        (d / "ra-jit").write_bytes(interp_past)
+        code, said = run_check(d, "nix-native")
+        note("nix-native refuses a PT_INTERP past EOF", code == 1 and "past the file" in said, said[:80])
+
         # --- the mode is a declaration, not a way to skip a check -------------------------
         d = tmp / "unknown-mode"
         d.mkdir()

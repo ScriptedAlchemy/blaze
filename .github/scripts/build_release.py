@@ -62,7 +62,10 @@ recipe are not the same thing:
               runs only against that store's glibc. Its contract is that binding, not RHEL 9, so
               it is refused when a binary's loader is not the store's (`PT_INTERP` outside
               `/nix/store`), and it is accepted only inside a Nix build. The asked-for glibc is
-              reported, not capped.
+              reported, not capped. That is a store-binding check, not a closure certificate: it
+              does not read `DT_NEEDED` or the run path, so it does not prove every library the
+              binary needs resolves in the store. An ELF it cannot read is a named failure, never
+              "static" -- not having an interpreter is what would otherwise waive the check.
 
 A Nix build that wants a portable tarball must still ask for `--artifact-mode portable` and
 build on the release's Ubuntu; the mode is a declaration of the artifact, never a way to skip
@@ -312,22 +315,50 @@ def glibc_asked(binary):
     return max(found, default=None)
 
 
+class BadElf(Exception):
+    """A file that starts like ELF but cannot be read as one: never treated as static."""
+
+
+def elf_kind(data: bytes) -> str:
+    """`"elf32"`, `"elf64"` or `"other"` for a file's first bytes."""
+    if data[:4] != b"\x7fELF" or len(data) < 6:
+        return "other"
+    return {1: "elf32", 2: "elf64"}.get(data[4], "other")
+
+
 def interpreter(binary):
-    """The `PT_INTERP` path a Linux ELF names, or None when it names none (static or not ELF)."""
+    """The `PT_INTERP` path a Linux ELF names, or None when it is static.
+
+    Raises BadElf rather than returning None when the header is truncated, uses a class or
+    byte order this does not read (little-endian ELF32/ELF64 are the targets here), or names a
+    `PT_INTERP` outside the file. A malformed file must not pass as static, because "static"
+    is what waives the store-binding check.
+    """
     data = binary.read_bytes()
     if data[:4] != b"\x7fELF":
         return None
-    wide = data[4] == 2  # ELFCLASS64
+    if len(data) < 0x34:
+        raise BadElf(f"{binary.name}: truncated ELF header ({len(data)} bytes)")
+    if data[5] != 1:
+        raise BadElf(f"{binary.name}: ELF data encoding {data[5]} is not little-endian")
+    wide = data[4] == 2
+    if not wide and data[4] != 1:
+        raise BadElf(f"{binary.name}: ELF class {data[4]} is neither 32 nor 64 bit")
     if wide:
         phoff, = struct.unpack_from("<Q", data, 0x20)
         phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
-        # p_offset and p_filesz in an Elf64_Phdr.
-        wide_fmt, wide_off, size_off = "<Q", 0x08, 0x20
+        wide_fmt, wide_off, size_off, need = "<Q", 0x08, 0x20, 0x38
     else:
         phoff, = struct.unpack_from("<I", data, 0x1C)
         phentsize, phnum = struct.unpack_from("<HH", data, 0x2A)
-        # p_offset and p_filesz in an Elf32_Phdr.
-        wide_fmt, wide_off, size_off = "<I", 0x04, 0x10
+        wide_fmt, wide_off, size_off, need = "<I", 0x04, 0x10, 0x20
+    if phnum == 0:
+        return None
+    if phentsize < need:
+        raise BadElf(f"{binary.name}: program header entry is {phentsize} bytes, under {need}")
+    if phoff + phnum * phentsize > len(data):
+        raise BadElf(f"{binary.name}: {phnum} program headers at {phoff} run past the file "
+                     f"({len(data)} bytes)")
     for i in range(phnum):
         at = phoff + i * phentsize
         kind, = struct.unpack_from("<I", data, at)
@@ -335,6 +366,11 @@ def interpreter(binary):
             continue
         offset, = struct.unpack_from(wide_fmt, data, at + wide_off)
         size, = struct.unpack_from(wide_fmt, data, at + size_off)
+        if offset + size > len(data):
+            raise BadElf(f"{binary.name}: PT_INTERP at {offset}+{size} runs past the file "
+                         f"({len(data)} bytes)")
+        if size == 0:
+            raise BadElf(f"{binary.name}: PT_INTERP is empty")
         return data[offset:offset + size].split(b"\0", 1)[0].decode(errors="replace")
     return None
 
@@ -359,16 +395,27 @@ def check_glibc(out):
 
 
 def check_nix_native(out):
-    """The Nix contract: every binary is bound to the store it was built in.
+    """The Nix contract: every binary in `out` is bound to the store it was built in.
 
     A package in a derivation runs only against its own store, so its glibc need not be RHEL
     9's. What it must be is store-bound: a binary whose interpreter is not under `/nix/store`
     would be a portable build claiming to be this one. The asked-for glibc is reported so a
     surprising value is visible, but it is not capped here -- `portable` is that check.
+
+    This is a store-binding check, not a closure certificate. `PT_INTERP` says which loader a
+    binary starts with; it does not prove that every library it needs (`DT_NEEDED`) and every
+    run-path entry resolves inside the store, which would take reading the dynamic section.
+    The derivation's own build is what puts the binaries in that store, so the log's job is to
+    catch a portable build wearing this mode, which is what the loader test does.
     """
     stray, asked = [], []
     for binary in elf_binaries(out):
-        interp = interpreter(binary)
+        try:
+            interp = interpreter(binary)
+        except BadElf as e:
+            # Not static: an ELF header we cannot read is a failure, never a waiver.
+            sys.exit(f"error: build_release: {e}: a nix-native artifact must be a readable ELF; "
+                     "build the portable tarball with --artifact-mode portable")
         if interp is not None and not interp.startswith(NIX_STORE):
             stray.append(f"{binary.name} is loaded by {interp}")
         version = glibc_asked(binary)
