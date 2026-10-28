@@ -798,25 +798,17 @@ int main(void) { printf("%d %d\n", case_root(), case_vtable_root()); }
             std::process::Command::new(staging.join("imported-program")).output().unwrap();
         assert!(program.status.success());
         assert_eq!(program.stdout, b"12 9\n");
-        // Differential oracle only: product compiler work above was entirely blaze.
+        // The same source rustc builds, for `harness/d0export.py` to compile and run as the
+        // differential oracle. This crate starts no rustc (docs/no-rustc.md): the reference
+        // build is the harness's, and it compares the two programs' output, error and status.
         let source = SOURCE.replace("#[rustc_builtin_macro]\nmacro_rules! file {}\n", "");
         std::fs::write(
             staging.join("oracle.rs"),
             format!("{source}\nfn main() {{ println!(\"{{}} {{}}\", root(), vtable_root()); }}\n"),
         )
         .unwrap();
-        let oracle = std::process::Command::new("rustc")
-            .args(["+1.99.0", "--edition=2024"])
-            .arg(staging.join("oracle.rs"))
-            .arg("-o")
-            .arg(staging.join("oracle"))
-            .output()
+        std::fs::write(staging.join("program.status"), program.status.code().unwrap().to_string())
             .unwrap();
-        assert!(oracle.status.success(), "oracle: {}", String::from_utf8_lossy(&oracle.stderr));
-        let reference = std::process::Command::new(staging.join("oracle")).output().unwrap();
-        assert_eq!(program.status.code(), reference.status.code());
-        assert_eq!(program.stdout, reference.stdout);
-        assert_eq!(program.stderr, reference.stderr);
         if let Some(evidence) = std::env::var_os("BLAZE_D0_EVIDENCE") {
             let evidence = std::path::PathBuf::from(evidence);
             std::fs::create_dir_all(&evidence).unwrap();
@@ -835,13 +827,11 @@ int main(void) { printf("%d %d\n", case_root(), case_vtable_root()); }
                 }
                 std::fs::write(destination.join("receipt.txt"), format!("{receipt:#?}")).unwrap();
             }
-            for name in ["imported.o", "main.c", "oracle.rs"] {
+            for name in ["imported.o", "main.c", "oracle.rs", "program.status"] {
                 std::fs::copy(staging.join(name), evidence.join(name)).unwrap();
             }
             std::fs::write(evidence.join("program.stdout"), &program.stdout).unwrap();
             std::fs::write(evidence.join("program.stderr"), &program.stderr).unwrap();
-            std::fs::write(evidence.join("oracle.stdout"), &reference.stdout).unwrap();
-            std::fs::write(evidence.join("oracle.stderr"), &reference.stderr).unwrap();
         }
         drop(imported);
         std::fs::remove_dir_all(staging).unwrap();

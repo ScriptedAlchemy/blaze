@@ -103,6 +103,9 @@ HARNESSES = [
     ("store", ["storeguards.py"], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
+    # The D0 export round trip's oracle: rustc builds the exported fixture's source, and the
+    # program assembled from the imported entries has to agree with it (crates/hir-ty-codegen).
+    ("store", ["d0export.py"], {}, on("linux", "macos"), 2),
     ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
     # MinIO as one program in ~/s3tools, which CI puts there on Linux.

@@ -1,8 +1,8 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "a217d789f06995d7f242444c60d01430cbafd11593928c5770799317a0134b5b",
-  "Cargo.toml": "b223b758fd1433d368ef3378e9ebb45b57e7eb8571a6ff3085e4d5bb032b4255"
+  "Cargo.lock": "37971189beaaad71a2651315b6c364f98760671947b5f6b57b0beb08a596a957",
+  "Cargo.toml": "6e4dabf764dd4c822b9183baf1c9eddef2e6a5d32fc011b99ff4c6a455320bc7"
  },
  "packages": {
   "adler2@2.0.1": {
@@ -851,6 +851,23 @@
    "rust_version": "1.99",
    "source": {
     "dir": "crates/blaze-resolve",
+    "kind": "path"
+   },
+   "version": "0.1.0"
+  },
+  "blaze-wire@0.1.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's wire schema: every type of docs/distributed.md in deterministic CBOR, its validator, digests, signatures and a JSON rendering",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-wire",
+   "readme": "README.md",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.99",
+   "source": {
+    "dir": "crates/blaze-wire",
     "kind": "path"
    },
    "version": "0.1.0"
@@ -20601,6 +20618,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 330,
+       "name": "rayon"
+      },
+      {
        "i": 340,
        "name": "rustc_demangle"
       },
@@ -20884,6 +20905,10 @@
       {
        "i": 327,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 330,
+       "name": "rayon"
       },
       {
        "i": 340,
@@ -21171,6 +21196,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 330,
+       "name": "rayon"
+      },
+      {
        "i": 340,
        "name": "rustc_demangle"
       },
@@ -21454,6 +21483,10 @@
       {
        "i": 327,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 330,
+       "name": "rayon"
       },
       {
        "i": 340,
@@ -21741,6 +21774,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 330,
+       "name": "rayon"
+      },
+      {
        "i": 340,
        "name": "rustc_demangle"
       },
@@ -22024,6 +22061,10 @@
       {
        "i": 327,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 330,
+       "name": "rayon"
       },
       {
        "i": 340,
@@ -39703,6 +39744,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 333,
+       "name": "rayon"
+      },
+      {
        "i": 343,
        "name": "rustc_demangle"
       },
@@ -39986,6 +40031,10 @@
       {
        "i": 330,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 333,
+       "name": "rayon"
       },
       {
        "i": 343,
@@ -40273,6 +40322,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 333,
+       "name": "rayon"
+      },
+      {
        "i": 343,
        "name": "rustc_demangle"
       },
@@ -40556,6 +40609,10 @@
       {
        "i": 330,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 333,
+       "name": "rayon"
       },
       {
        "i": 343,
@@ -40843,6 +40900,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 333,
+       "name": "rayon"
+      },
+      {
        "i": 343,
        "name": "rustc_demangle"
       },
@@ -41126,6 +41187,10 @@
       {
        "i": 330,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 333,
+       "name": "rayon"
       },
       {
        "i": 343,
@@ -58665,6 +58730,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 331,
+       "name": "rayon"
+      },
+      {
        "i": 341,
        "name": "rustc_demangle"
       },
@@ -58948,6 +59017,10 @@
       {
        "i": 328,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 331,
+       "name": "rayon"
       },
       {
        "i": 341,
@@ -59235,6 +59308,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 331,
+       "name": "rayon"
+      },
+      {
        "i": 341,
        "name": "rustc_demangle"
       },
@@ -59518,6 +59595,10 @@
       {
        "i": 328,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 331,
+       "name": "rayon"
       },
       {
        "i": 341,
@@ -59805,6 +59886,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 331,
+       "name": "rayon"
+      },
+      {
        "i": 341,
        "name": "rustc_demangle"
       },
@@ -60088,6 +60173,10 @@
       {
        "i": 328,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 331,
+       "name": "rayon"
       },
       {
        "i": 341,
@@ -77794,6 +77883,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 334,
+       "name": "rayon"
+      },
+      {
        "i": 344,
        "name": "rustc_demangle"
       },
@@ -78077,6 +78170,10 @@
       {
        "i": 331,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 334,
+       "name": "rayon"
       },
       {
        "i": 344,
@@ -78364,6 +78461,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 334,
+       "name": "rayon"
+      },
+      {
        "i": 344,
        "name": "rustc_demangle"
       },
@@ -78647,6 +78748,10 @@
       {
        "i": 331,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 334,
+       "name": "rayon"
       },
       {
        "i": 344,
@@ -78934,6 +79039,10 @@
        "name": "ra_jit_store"
       },
       {
+       "i": 334,
+       "name": "rayon"
+      },
+      {
        "i": 344,
        "name": "rustc_demangle"
       },
@@ -79217,6 +79326,10 @@
       {
        "i": 331,
        "name": "ra_jit_store"
+      },
+      {
+       "i": 334,
+       "name": "rayon"
       },
       {
        "i": 344,
