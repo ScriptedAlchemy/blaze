@@ -936,6 +936,8 @@ impl UnitGraph {
             .map(|(id, (index, unit))| {
                 let features = unit.features.iter().cloned().collect();
                 let for_target = for_target.contains(&index);
+                // Cargo's unstable host.rustflags/target-applies-to-host overrides are
+                // not modeled here yet; this is the ordinary explicit-target rule.
                 let applies = for_target || !explicit_target;
                 let profile = if applies { unit.profile.with(flags) } else { unit.profile.clone() };
                 let primary = roots.contains(id);

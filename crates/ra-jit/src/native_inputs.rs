@@ -33,6 +33,34 @@ struct Linked {
 static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Linked>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutputStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl OutputStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+static OUTPUT_DIGESTS: LazyLock<Mutex<BTreeMap<PathBuf, (OutputStamp, Digest)>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 #[derive(Default)]
 struct Inputs {
     directives: Vec<Vec<u8>>,
@@ -105,9 +133,23 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
         }
     }
     let mut inputs = Inputs::default();
+    let mut linked_crates = std::collections::HashSet::new();
     for root in &roots {
         let root: ide_db::base_db::Crate = (*root).into();
-        inputs.directives.push(format!("{:?}", root.data(db).codegen_flags).into_bytes());
+        for krate in root.transitive_deps(db) {
+            if !linked_crates.insert(krate) {
+                continue;
+            }
+            // Ordered, length-framed argv is a format, unlike a Debug rendering.
+            let flags = &krate.data(db).codegen_flags;
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&(flags.len() as u64).to_le_bytes());
+            for flag in flags {
+                encoded.extend_from_slice(&(flag.len() as u64).to_le_bytes());
+                encoded.extend_from_slice(flag.as_bytes());
+            }
+            inputs.directives.push(encoded);
+        }
     }
     for out in &out_dirs {
         if let Some(printed) = crate::cargo::script::printed(out) {
@@ -346,11 +388,7 @@ pub(crate) fn invalidate(db: &RootDatabase, programs: &mut [Program]) {
             }
             // Another worker may have published a different machine's executable to this
             // path. Retain compiled queries and objects: only publication/link reuse is lost.
-            forget_binary(&binary);
-            program.known.forget_base();
-            program.whole = None;
-            program.unbuilt.stale = true;
-            program.unbuilt.unlinked = true;
+            program.forget_link_baseline(Some(&binary));
             continue;
         }
         if program.wrote.is_none() {
@@ -358,12 +396,8 @@ pub(crate) fn invalidate(db: &RootDatabase, programs: &mut [Program]) {
         }
         // The old identity must not become reusable after a failed A -> B -> A relink.
         crate::lock(&LINKED_INPUTS).remove(&binary);
-        forget_binary(&binary);
-        program.known.forget_base();
-        program.whole = None;
+        program.forget_link_baseline(Some(&binary));
         program.moved = true;
-        program.unbuilt.stale = true;
-        program.unbuilt.unlinked = true;
         program.args.link_cmd = None;
     }
 }
@@ -391,7 +425,39 @@ fn pending(binary: PathBuf, inputs: Inputs) -> Pending {
 }
 
 pub(crate) fn output_digest(path: &Path) -> io::Result<Digest> {
-    let mut file = fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        let stamp = OutputStamp::of(&fs::metadata(path)?);
+        if let Some((cached, digest)) = crate::lock(&OUTPUT_DIGESTS).get(path)
+            && *cached == stamp
+        {
+            return Ok(*digest);
+        }
+        let mut file = fs::File::open(path)?;
+        if OutputStamp::of(&file.metadata()?) != stamp {
+            return Err(io::Error::other("publication changed while opening its artifact"));
+        }
+        let digest = hash_output(&mut file)?;
+        if OutputStamp::of(&file.metadata()?) != stamp
+            || OutputStamp::of(&fs::metadata(path)?) != stamp
+        {
+            return Err(io::Error::other("publication changed while hashing its artifact"));
+        }
+        let mut cache = crate::lock(&OUTPUT_DIGESTS);
+        if cache.len() >= 1024 && !cache.contains_key(path) {
+            cache.pop_first();
+        }
+        cache.insert(path.to_owned(), (stamp, digest));
+        Ok(digest)
+    }
+    #[cfg(not(unix))]
+    {
+        // Timestamps alone cannot certify unchanged content; retain full checking here.
+        hash_output(&mut fs::File::open(path)?)
+    }
+}
+
+fn hash_output(file: &mut fs::File) -> io::Result<Digest> {
     let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -1178,6 +1244,41 @@ fn main() {{}}
         fs::write(&binary, b"+machine").unwrap();
         link.commit().unwrap();
         assert_eq!(crate::lock(&LINKED_INPUTS).remove(&binary), Some(registered));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_large_publications_reuse_the_digest_without_reading_the_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("large-program");
+        let mut file = fs::File::create(&binary).unwrap();
+        let chunk = vec![0x5a; 1024 * 1024];
+        for _ in 0..201 {
+            file.write_all(&chunk).unwrap();
+        }
+        drop(file);
+        let mut old_ms = Vec::new();
+        let mut new_ms = Vec::new();
+        let expected = output_digest(&binary).unwrap();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                assert_eq!(hash_output(&mut fs::File::open(&binary).unwrap()).unwrap(), expected);
+            }
+            old_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                assert_eq!(output_digest(&binary).unwrap(), expected);
+            }
+            new_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        eprintln!(
+            "publication no-op 201MiB, 3 identity checks, n=5: uncached_ms={old_ms:?}; cached_ms={new_ms:?}"
+        );
+        let stamp = OutputStamp::of(&fs::metadata(&binary).unwrap());
+        assert_eq!(crate::lock(&OUTPUT_DIGESTS).get(&binary).unwrap().0, stamp);
+        assert!(new_ms.iter().sum::<f64>() < old_ms.iter().sum::<f64>());
     }
 
     #[cfg(unix)]

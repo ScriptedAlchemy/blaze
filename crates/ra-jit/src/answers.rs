@@ -281,16 +281,6 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         if !is_question(&rustc_args) {
             return None;
         }
-        if !own::flag_sensitive(&rustc_args) {
-            // These answers do not depend on Cargo's CPU, features or relocation
-            // choices. Query-tail arguments that do affect a name remain in argv.
-            return Some(match own::answer(&rustc, &rustc_args, &[], &var) {
-                Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
-                None => Err(io::Error::other(format!(
-                    "owned toolchain print is not modeled: {rustc_args:?}; Cargo was not executed"
-                ))),
-            });
-        }
         // Cargo appends its effective flags before the rustc-only tail. In particular,
         // --cfg participates in both program parsing and platform dependency resolution.
         let explicit_target = rustc_args
@@ -325,7 +315,7 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
             Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
             None => Err(io::Error::other(format!(
                 "owned toolchain query has no model for its effective flags: {effective:?}; \
-                 Cargo was not executed"
+                 Cargo was not executed (docs/no-rustc.md#unmodeled-cpu-cfg-queries)"
             ))),
         });
     }
@@ -601,6 +591,14 @@ mod tests {
             }
             let answer = ask(&mut command).expect("must not hand the query to Cargo").unwrap();
             assert!(answer.status.success() && !answer.stdout.is_empty(), "{kind}");
+        }
+        for kind in ["sysroot", "target-libdir"] {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", kind]);
+            command.env("RUSTFLAGS", "--sysroot /elsewhere -Ctarget-cpu=native");
+            let answer = ask(&mut command).expect("sysroot flags stay owned").unwrap();
+            let text = String::from_utf8(answer.stdout).unwrap();
+            assert!(text.starts_with("/elsewhere"), "{kind}: {text}");
         }
         let mut command = Command::new(executable);
         command.current_dir(toolchain).args(["rustc", "--print", "cfg", "--", "-O"]);

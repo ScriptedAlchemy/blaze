@@ -534,6 +534,16 @@ fixture's P0-A bar, not every target/query or full Rust parity. Target-feature, 
 deployment overrides and other unmodeled options remain open; no broader acceptance or
 performance claim follows.
 
+#### Unmodeled CPU cfg queries
+
+A `cfg` print with an unmodeled `-C target-cpu` (for example, `native`) is a
+named ownership gap. A build that needs it fails at the query: blaze does not
+run Cargo or rustc to answer it, and it does not silently use baseline target
+features. Owning it needs host CPU detection, rustc 1.99's per-CPU feature
+tables, and the architecture's implied features, applied in effective flag
+order. Both the cfg answer and generated instructions need differential
+tests. This is unfinished Rust support, not an allowed subset or a waiver.
+
 **C. `asm!` assembled in process.** ([#83](https://github.com/indexable-inc/ra-jit/issues/83)) The assembly text ra-jit already produces goes to LLVM's
 assembler (the LLVM backend links LLVM already) or to an assembler crate, in process. Risk is
 low: the cache key and the output are the same, and `harness/asmedits.py` compares.
