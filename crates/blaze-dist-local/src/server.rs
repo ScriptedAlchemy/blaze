@@ -234,10 +234,14 @@ impl Server {
                 }
             }
             Ok(ClientFrame::Request(request)) if c.session == Some(request.session) => {
+                // A release ends the lifetime in the coordinator, which journals this answer
+                // before it is written. The connection is closed after that answer, because
+                // the session it named no longer exists.
+                let releases = matches!(request.command, Command::Release(_));
                 match self.coordinator.request(now, &request) {
                     Ok((reply, effects)) => {
                         self.effects.deliver(effects);
-                        (reply, false)
+                        (reply, releases)
                     }
                     Err(e) => (encode(&ServerFrame::Error(e)), true),
                 }

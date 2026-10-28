@@ -13,13 +13,15 @@ use crate::Error;
 use crate::protocol::*;
 use crate::server::frame;
 
-/// Local client with immutable retry state. Session IDs are lifetime identities, not capabilities.
+/// Local client with immutable retry state. Session labels are lifetime identities, not capabilities.
 pub struct Client {
     stream: UnixStream,
     /// Negotiated clock, versions, epoch and frame bounds.
     pub welcome: LocalWelcome,
     next: u64,
     pending: Option<Request>,
+    /// Creation nonce, kept so a retried creation returns this same lifetime.
+    nonce: Digest,
 }
 
 fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome), Error> {
@@ -31,13 +33,16 @@ fn connect(path: &Path, hello: LocalHello) -> Result<(UnixStream, LocalWelcome),
     let ServerFrame::Welcome(welcome) = response else {
         return Err(Error::Protocol(format!("hello refused: {response:?}")));
     };
-    if welcome.session != hello.session
-        || welcome.transport != hello.transport
+    let resumes = hello.resume.is_some();
+    if welcome.transport != hello.transport
         || welcome.codec != hello.codec
         || welcome.terminal != hello.terminal
-        || hello.epoch.is_some_and(|epoch| epoch != welcome.epoch)
         || welcome.max_frame == 0
         || welcome.max_frame > Limits::DOCUMENTED.request
+        // A creation must not answer as a resume of some other lifetime, and a resume must
+        // answer with exactly the label it named.
+        || (resumes && (welcome.created || Some(welcome.session) != hello.resume))
+        || hello.epoch.is_some_and(|epoch| epoch != welcome.epoch)
     {
         return Err(Error::Protocol("welcome-binding/version".to_owned()));
     }
@@ -58,16 +63,18 @@ fn read(stream: &mut UnixStream, max_frame: u32) -> Result<ServerFrame, Error> {
 }
 
 impl Client {
-    /// New daemon-relative session. A restarted process uses a new random ID.
-    pub fn connect(path: &Path, session: Digest) -> Result<Self, Error> {
-        let (stream, welcome) = connect(path, hello(session, None))?;
-        Ok(Self { next: welcome.next_request, welcome, stream, pending: None })
+    /// Create a new daemon-issued lifetime. `nonce` only makes a retried creation
+    /// idempotent while that lifetime is live; it is not a capability or an authority.
+    pub fn connect(path: &Path, nonce: Digest) -> Result<Self, Error> {
+        let (stream, welcome) = connect(path, hello(nonce))?;
+        Ok(Self { next: welcome.next_request, welcome, stream, pending: None, nonce })
     }
 
-    /// Resume this same session and epoch; a pending request is not changed or silently skipped.
+    /// Resume this same lifetime and epoch. A pending request is never changed, skipped or
+    /// carried into a new lifetime: an expired lifetime refuses this and the caller decides
+    /// explicitly whether to create a fresh one and re-issue its work.
     pub fn reconnect(&mut self, path: &Path) -> Result<(), Error> {
-        let (stream, welcome) =
-            connect(path, hello(self.welcome.session, Some(self.welcome.epoch)))?;
+        let (stream, welcome) = connect(path, resume(self.welcome.session, self.welcome.epoch))?;
         if let Some(pending) = &self.pending {
             if welcome.next_request != pending.sequence
                 && welcome.next_request != pending.sequence + 1
@@ -79,6 +86,47 @@ impl Client {
         }
         self.stream = stream;
         self.welcome = welcome;
+        Ok(())
+    }
+
+    /// Explicitly create a fresh lifetime after expiry. Nothing of the old lifetime carries
+    /// over: it is refused while a request is pending, because an unresolved request is
+    /// never migrated into a new session, and its exact bytes stay available for inspection.
+    pub fn renew(&mut self, path: &Path, nonce: Digest) -> Result<(), Error> {
+        if self.pending.is_some() {
+            return Err(Error::Protocol(
+                "pending-request: abandon it explicitly, never migrate it".to_owned(),
+            ));
+        }
+        let (stream, welcome) = connect(path, hello(nonce))?;
+        self.next = welcome.next_request;
+        self.stream = stream;
+        self.welcome = welcome;
+        self.nonce = nonce;
+        Ok(())
+    }
+
+    /// Give up the pending request deliberately, returning it so the caller can decide
+    /// whether to re-issue the work as a new request in a new lifetime.
+    pub fn abandon_pending(&mut self) -> Option<Request> {
+        self.pending.take()
+    }
+
+    /// The creation nonce this client was opened with.
+    pub fn nonce(&self) -> Digest {
+        self.nonce
+    }
+
+    /// End this lifetime deliberately. The daemon journals the answer first, then removes the
+    /// session, so capacity returns at once instead of at the fixed lifetime. Nothing of it
+    /// can be resumed afterwards; a pending request is refused rather than migrated.
+    pub fn release(&mut self) -> Result<(), Error> {
+        if self.pending.is_some() {
+            return Err(Error::Protocol(
+                "pending-request: abandon it explicitly, never migrate it".to_owned(),
+            ));
+        }
+        self.call(Command::Release(Release {}))?;
         Ok(())
     }
 
@@ -127,6 +175,7 @@ impl Client {
 fn validate_answer(command: &Command, answer: &Answer) -> Result<(), Error> {
     let matched = match (command, answer) {
         (_, Answer::Error(_)) => true,
+        (Command::Release(_), Answer::Ack(_)) => true,
         (Command::Submit(s), Answer::Binding(b)) => b.subscription.content == s.content,
         (Command::Subscribe(s), Answer::Binding(b)) => {
             b.subscription.content == s.content && b.subscription.execution == s.execution

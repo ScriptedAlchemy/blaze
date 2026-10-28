@@ -19,23 +19,51 @@ frame is `ClientFrame::Hello(LocalHello)`:
 
 ```
 LocalHello = {0: transport u32, 1: global_codec u32, 2: terminal u32,
-              3: session bytes32, 4: daemon_epoch bytes32|null}
+              3: nonce bytes32, 4: daemon_epoch bytes32|null,
+              5: resume bytes32|null}
 LocalWelcome = {0: transport, 1: global_codec, 2: terminal, 3: session,
                 4: daemon_epoch, 5: now_ms, 6: expires_ms,
-                7: max_frame u32, 8: next_request u64}
+                7: max_frame u32, 8: next_request u64, 9: created bool}
 Request = {0: daemon_epoch, 1: session, 2: sequence, 3: Command}
 Response = {0: daemon_epoch, 1: session, 2: sequence, 3: Answer}
 ClientFrame = [0, LocalHello] | [1, Request]
 ServerFrame = [0, LocalWelcome] | [1, Response] | [2, WireError]
 ```
 
-Carrier version is **1**, terminal contract is **2**, and global codec is the
+Carrier version is **2**, terminal contract is **2**, and global codec is the
 actual pinned `blaze_wire::VERSION`. All three must match; no older/newer BuildSpec
 decoder or cargo/compiler fallback is attempted. This lane inherits global
 schema1. C2's independent schema3 branch changes global codec/types/digest domains;
 it is not merged here. Combining must select that reviewed codec and update the
 fixtures. A terminal version of2 does not assert global schema2 or a `/v2` digest
 domain. Typed digests use the selected codec's actual domain.
+
+### Transport 2: the daemon issues session labels
+
+Version 1 echoed a client-chosen session ID, so refusing to revive an expired ID
+meant remembering every ID for the life of the process. Ordinary CLI use minted one
+ID per call, and the fixed 32-session cap was therefore a lifetime quota that
+exhausted permanently. Version 2 changes who names a session:
+
+- A **creation** Hello sends `nonce` with neither `epoch` nor `resume`. The daemon
+  issues a monotonic label and returns `created: true`. Retrying the same nonce
+  while that lifetime is live returns the same label with `created: false`; after
+  it expires, the same nonce creates a *new* label, and the old label is never
+  issued again.
+- A **resume** Hello sends both `epoch` and `resume`; naming only one is malformed.
+  A resume never creates: an unknown, expired or released label is refused, and a
+  different daemon epoch is refused as `daemon-moved`.
+- `Release` (Command 11) ends a lifetime deliberately after its answer is journaled.
+  The session and its journal are removed, so capacity and memory return at once
+  rather than at the fixed lifetime. A release performs no core transition, so a
+  client that never saw the answer and retries meets `session-expired` having lost
+  only a lifetime, not an effect.
+
+The live-session cap therefore bounds *concurrent* sessions only. Labels are not
+capabilities and carry no authority; the epoch check and the existing core rules
+do. An older transport-1 peer is refused by the version mismatch, never
+reinterpreted as transport 2.
+
 
 `Submission.request` is an opaque CBOR byte string containing exactly a JobRequest.
 The server decodes it only in the negotiated global codec, recomputes
@@ -47,7 +75,7 @@ a dependency.
 ## Actual commands and bindings
 
 Command discriminants: Submit0, Subscribe1, Resume2, Events3, Cancel4, Join5,
-Lease6, Result7, WorkerEvents8, KillAck9, Terminal10. All payloads and their
+Lease6, Result7, WorkerEvents8, KillAck9, Terminal10, Release11. All payloads and their
 integer field numbers are in `src/protocol.rs`. All responses are in `Answer`.
 
 - Submit calls `Jobs::submit`, then real admission. Subscribe adds an interest to
@@ -78,15 +106,17 @@ retained terminal attempt even if other subscribers continue on a new attempt.
 
 ## Retry, retention and limits
 
-Session IDs and daemon epochs are OS-random32-byte lifetime identities, **not**
-application capabilities. The socket is owner-only; deployment access remains
-the existing Unix/Tailscale access model. No PR/Main trust/sandbox layer is added.
+Session labels and daemon epochs are lifetime identities, **not** application
+capabilities. The socket is owner-only; deployment access remains the existing
+Unix/Tailscale access model. No PR/Main trust/sandbox layer is added.
 
-Hello creation is idempotent for its random session ID; retrying a lost Hello
-response returns the existing lifetime. A resume includes the epoch; an unknown,
-expired or different-daemon session is refused. Session lifetime is fixed, not
-renewed by reconnect. Expired IDs remain tombstones until daemon shutdown.
-The finite session count includes tombstones, so exhaustion is explicit Busy.
+Creation is idempotent for its nonce while the lifetime is live; after expiry the
+same nonce creates a new label and the old one stays dead. A resume names the
+issued label and the epoch together; an unknown, expired or released label is
+refused, and a different daemon is `daemon-moved`. Session lifetime is fixed, not
+renewed by reconnect, and expiry or `Release` returns capacity immediately. The
+live-session cap therefore bounds concurrent sessions, never a lifetime quota of
+identities, and no tombstone set grows with the number of clients served.
 
 Requests have contiguous sequence numbers starting at1. Before executing, the
 coordinator reserves replay space for a maximum-size response. It journals the
@@ -100,9 +130,11 @@ claimed durable across process crashes.
 This covers a multi-stage report retried after later stages were already
 accepted: it is answered from the journal, not re-fed as backwards progress.
 Clients must retain the pending request on IO failure and reconnect/retry it
-unchanged. A new session means **new** requests, not the old idempotency lifetime.
+unchanged. A new session means **new** requests, not the old idempotency lifetime: a
+client with an unresolved request must abandon it explicitly rather than replay it
+into a fresh lifetime.
 
-Defaults: frame1MiB, connections32, sessions32, fixed session300s,1024requests
+Defaults: frame1MiB, connections32, live sessions32, fixed session300s,1024requests
 and8MiB journal per session;128retained executions,256subscribers each,
 4096events/8MiB public event bytes and8MiB accepted work-result bytes each.
 Event pages request1–256whole events and fit the negotiated frame. Root/grant

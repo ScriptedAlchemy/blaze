@@ -70,17 +70,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             server.run(stop)?;
         }
         Some("hello") => {
-            let client = Client::connect(path, random_id()?)?;
+            let mut client = Client::connect(path, random_id()?)?;
             println!("{}", hex(&encode(&client.welcome)));
+            // The daemon issued this lifetime; give it back so repeated `hello` runs do not
+            // consume the fixed lifetime of the daemon and exhaust live capacity.
+            client.release()?;
         }
         Some("client") => {
             let mut client = Client::connect(path, random_id()?)?;
             println!("welcome {}", hex(&encode(&client.welcome)));
+            let mut failed = None;
             for line in io::stdin().lock().lines() {
                 let bytes = unhex(line?.trim())?;
                 let command: Command = decode(&bytes, &Limits::DOCUMENTED)?;
-                let answer = client.call(command)?;
-                println!("{}", hex(&encode(&answer)));
+                match client.call(command) {
+                    Ok(answer) => println!("{}", hex(&encode(&answer))),
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            // Release only a clean lifetime: a pending request stays pending so its exact
+            // bytes are never migrated into a new session, and the error is reported.
+            match failed {
+                Some(error) => return Err(error.into()),
+                None => client.release()?,
             }
         }
         _ => return Err("unknown local transport mode".into()),

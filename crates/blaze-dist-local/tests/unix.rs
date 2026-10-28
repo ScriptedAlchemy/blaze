@@ -16,8 +16,8 @@ use blaze_dist_local::coordinator::Config;
 use blaze_dist_local::protocol::*;
 use blaze_dist_local::server::{Clock, Server, frame, random_id};
 use blaze_wire::{
-    Attempt, BatchResult, DoneEvent, ExecutionId, ItemOutcome, ItemResult, JobEvent, JobRequest,
-    Limits, LocalPolicy, Outcome, Reservation, RootSet, Set, Stage, StageEvent, Why,
+    Attempt, BatchResult, DoneEvent, ErrorCode, ExecutionId, ItemOutcome, ItemResult, JobEvent,
+    JobRequest, Limits, LocalPolicy, Outcome, Reservation, RootSet, Set, Stage, StageEvent, Why,
     WorkJoinRequest, WorkLeaseRequest, WorkName, WorkersEventsRequest, decode, encode,
 };
 
@@ -142,24 +142,30 @@ fn raw(f: &Fixture) -> UnixStream {
     stream
 }
 
-fn hello_raw(
-    _f: &Fixture,
-    stream: &mut UnixStream,
-    session: blaze_wire::Digest,
-    epoch: Option<blaze_wire::Digest>,
-) -> LocalWelcome {
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello(session, epoch))))).unwrap();
+fn hello_raw(stream: &mut UnixStream, value: LocalHello) -> LocalWelcome {
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(value)))).unwrap();
     let ServerFrame::Welcome(w) = read(stream) else {
         panic!("hello");
     };
     w
 }
 
+/// Create a lifetime with a client-chosen nonce and return its welcome.
+fn create_raw(f: &Fixture, stream: &mut UnixStream, nonce: blaze_wire::Digest) -> LocalWelcome {
+    let _ = f;
+    hello_raw(stream, hello(nonce))
+}
+
+/// Resume the lifetime a previous welcome named.
+fn resume_raw(stream: &mut UnixStream, welcome: &LocalWelcome) -> LocalWelcome {
+    hello_raw(stream, resume(welcome.session, welcome.epoch))
+}
+
 #[test]
 fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
     let f = Fixture::new(false, Config::default());
     let mut stream = raw(&f);
-    let bytes = frame(&encode(&ClientFrame::Hello(hello([1; 32], None))));
+    let bytes = frame(&encode(&ClientFrame::Hello(hello([1; 32]))));
     for byte in bytes {
         stream.write_all(&[byte]).unwrap();
     }
@@ -174,7 +180,7 @@ fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
     bad.write_all(&[0, 0, 0, 0]).unwrap();
     assert!(matches!(read(&mut bad), ServerFrame::Error(_)));
     let mut coalesced = raw(&f);
-    let h = hello([2; 32], None);
+    let h = hello([2; 32]);
     let mut bytes = frame(&encode(&ClientFrame::Hello(h.clone())));
     bytes.extend(frame(&encode(&ClientFrame::Hello(h))));
     coalesced.write_all(&bytes).unwrap();
@@ -186,7 +192,7 @@ fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
 fn versions_content_session_and_terminal_bindings_fail_closed() {
     let f = Fixture::new(true, Config::default());
     let mut stream = raw(&f);
-    let mut h = hello([3; 32], None);
+    let mut h = hello([3; 32]);
     h.codec += 1;
     stream.write_all(&frame(&encode(&ClientFrame::Hello(h)))).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
@@ -206,7 +212,7 @@ fn versions_content_session_and_terminal_bindings_fail_closed() {
 fn disconnect_retry_has_identical_response_and_no_duplicate_submit_or_multistage_events() {
     let f = Fixture::new(true, Config::default());
     let mut stream = raw(&f);
-    let w = hello_raw(&f, &mut stream, [4; 32], None);
+    let w = create_raw(&f, &mut stream, [4; 32]);
     let req = Request {
         epoch: w.epoch,
         session: w.session,
@@ -218,7 +224,7 @@ fn disconnect_retry_has_identical_response_and_no_duplicate_submit_or_multistage
     drop(stream);
     std::thread::sleep(Duration::from_millis(20));
     let mut stream = raw(&f);
-    hello_raw(&f, &mut stream, [4; 32], Some(w.epoch));
+    resume_raw(&mut stream, &w);
     let bytes = frame(&encode(&ClientFrame::Request(req.clone())));
     stream.write_all(&bytes).unwrap();
     let first = read(&mut stream);
@@ -443,6 +449,142 @@ fn no_worker_never_passes_and_old_attempt_is_fenced_after_reconnect() {
 }
 
 #[test]
+fn ordinary_cli_hellos_exceed_the_live_cap_without_restart_or_capacity_loss() {
+    // The reported defect: a CLI that mints a lifetime per call consumed the default
+    // 32-session cap forever. Forty-five real `hello` processes against one daemon, each
+    // releasing its lifetime, must all succeed, and the daemon must stay bounded.
+    let f = Fixture::new(false, Config::default());
+    let executable = env!("CARGO_BIN_EXE_blaze-dist-local");
+    let mut sessions = Vec::new();
+    for _ in 0..45 {
+        let output =
+            std::process::Command::new(executable).arg("hello").arg(&f.path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "hello failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hex = String::from_utf8(output.stdout).unwrap();
+        let bytes: Vec<u8> = hex
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        let welcome: LocalWelcome = decode(&bytes, &Limits::DOCUMENTED).unwrap();
+        assert!(welcome.created);
+        assert_eq!(welcome.transport, TRANSPORT_VERSION);
+        sessions.push(welcome.session);
+    }
+    // Issued labels are distinct: no call was answered with another lifetime's identity.
+    let mut unique = sessions.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), sessions.len());
+    // The cap is still enforced for genuinely concurrent live sessions. A small dedicated
+    // daemon keeps this assertion independent of connection slots the CLI runs used.
+    let cap = Fixture::new(false, Config { max_sessions: 4, ..Config::default() });
+    let mut held: Vec<Client> =
+        (0..4u8).map(|nonce| Client::connect(&cap.path, [nonce; 32]).unwrap()).collect();
+    let mut overflow = raw(&cap);
+    overflow.write_all(&frame(&encode(&ClientFrame::Hello(hello([99; 32]))))).unwrap();
+    let ServerFrame::Error(refused) = read(&mut overflow) else { panic!("cap not enforced") };
+    assert_eq!(refused.code(), Some(ErrorCode::Busy));
+    // Releasing one live lifetime returns exactly one slot, without a restart.
+    held.pop().unwrap().release().unwrap();
+    let mut stream = raw(&cap);
+    let w = create_raw(&cap, &mut stream, [98; 32]);
+    assert!(w.created);
+    drop(held);
+}
+
+#[test]
+fn released_and_expired_lifetimes_never_revive_an_old_sequence() {
+    let f = Fixture::new(true, Config::default());
+    let mut c = f.client();
+    let first = c.welcome.clone();
+    let b = submit(&mut c, 100_000);
+    // A deliberate release ends the lifetime; its label is not resumable afterwards.
+    c.release().unwrap();
+    let mut stream = raw(&f);
+    stream
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)))))
+        .unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    // The old session's exact request bytes are refused, not replayed into a new lifetime.
+    let mut stream = raw(&f);
+    let fresh = create_raw(&f, &mut stream, [123; 32]);
+    assert_ne!(fresh.session, first.session);
+    let stale = Request {
+        epoch: first.epoch,
+        session: first.session,
+        sequence: 1,
+        command: Command::Submit(submission(&job(1000), need())),
+    };
+    stream.write_all(&frame(&encode(&ClientFrame::Request(stale)))).unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    // No second Submit happened: exactly one Assigned event was ever delivered. The count
+    // is taken out of the guard so a failed assertion cannot poison the fixture's mutex.
+    let assigned = f
+        .effects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| matches!(e, Effect::Event(i) if matches!(i.event, JobEvent::Assigned(_))))
+        .count();
+    assert_eq!(assigned, 1);
+    let _ = b;
+}
+
+#[test]
+fn transport_two_hello_shape_is_strict_and_legacy_peers_are_refused() {
+    let f = Fixture::new(false, Config::default());
+    // Creation names neither epoch nor resume; resume names both. Half a resume is refused.
+    let mut stream = raw(&f);
+    let mut half = hello([5; 32]);
+    half.epoch = Some([1; 32]);
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(half)))).unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    let mut stream = raw(&f);
+    let mut half = hello([5; 32]);
+    half.resume = Some([1; 32]);
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(half)))).unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    // An older transport-1 peer is refused by version, not reinterpreted as transport 2.
+    let mut stream = raw(&f);
+    let mut legacy = hello([5; 32]);
+    legacy.transport = 1;
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(legacy)))).unwrap();
+    let ServerFrame::Error(error) = read(&mut stream) else { panic!() };
+    assert!(error.message.contains("version-mismatch"));
+}
+
+#[test]
+fn expired_lifetime_creation_retry_is_not_mistaken_for_the_old_one() {
+    let f = Fixture::new(false, Config { session_ms: 10, ..Config::default() });
+    let mut stream = raw(&f);
+    let first = create_raw(&f, &mut stream, [42; 32]);
+    assert!(first.created);
+    drop(stream);
+    // Retrying the same nonce while live is idempotent and creates nothing.
+    let mut stream = raw(&f);
+    let again = create_raw(&f, &mut stream, [42; 32]);
+    assert_eq!(again.session, first.session);
+    assert!(!again.created);
+    f.at(11);
+    // After expiry the same nonce is a new lifetime, and the old label is not revived.
+    let mut stream = raw(&f);
+    let fresh = create_raw(&f, &mut stream, [42; 32]);
+    assert!(fresh.created);
+    assert_ne!(fresh.session, first.session);
+    let mut stream = raw(&f);
+    stream
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(first.session, first.epoch)))))
+        .unwrap();
+    assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+}
+
+#[test]
 fn real_cli_hello_and_lifetime_retention_are_bounded() {
     let f = Fixture::new(false, Config { session_ms: 10, ..Config::default() });
     // The executable is the transport CLI Cargo built for this integration test,
@@ -453,11 +595,20 @@ fn real_cli_hello_and_lifetime_retention_are_bounded() {
     let hex = String::from_utf8(output.stdout).unwrap();
     assert!(!hex.trim().is_empty());
     let mut c = f.client();
+    let expired = c.welcome.clone();
     f.at(11);
+    // An expired lifetime is refused, and the label it named is never issued again.
     assert!(c.reconnect(&f.path).is_err());
     let mut stream = raw(&f);
-    stream.write_all(&frame(&encode(&ClientFrame::Hello(hello(c.welcome.session, None))))).unwrap();
+    stream
+        .write_all(&frame(&encode(&ClientFrame::Hello(resume(expired.session, expired.epoch)))))
+        .unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
+    // A fresh creation after expiry is ordinary use, not capacity exhaustion.
+    let mut fresh = raw(&f);
+    let created = create_raw(&f, &mut fresh, [77; 32]);
+    assert!(created.created);
+    assert_ne!(created.session, expired.session);
 }
 
 #[test]
@@ -544,7 +695,7 @@ fn bounded_retention_and_replay_identity_fail_closed() {
     let b = submit(&mut c, 1000);
     assert!(c.call(Command::Resume(b.subscription)).is_err());
     let mut stream = raw(&f);
-    let w = hello_raw(&f, &mut stream, [7; 32], None);
+    let w = create_raw(&f, &mut stream, [7; 32]);
     let mut r = Request {
         epoch: w.epoch,
         session: w.session,
@@ -643,7 +794,7 @@ fn production_cli_client_transmits_cbor_submit_over_the_socket() {
 fn coalesced_requests_and_partial_disconnect_do_not_duplicate_effects() {
     let f = Fixture::new(true, Config::default());
     let mut stream = raw(&f);
-    let w = hello_raw(&f, &mut stream, [8; 32], None);
+    let w = create_raw(&f, &mut stream, [8; 32]);
     let r = Request {
         epoch: w.epoch,
         session: w.session,
@@ -675,7 +826,7 @@ fn coalesced_requests_and_partial_disconnect_do_not_duplicate_effects() {
     stream.write_all(&bytes[..bytes.len() / 2]).unwrap();
     drop(stream);
     let mut stream = raw(&f);
-    let resumed = hello_raw(&f, &mut stream, w.session, Some(w.epoch));
+    let resumed = resume_raw(&mut stream, &w);
     assert_eq!(resumed.next_request, 2);
     stream.write_all(&bytes).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Response(_)));
@@ -685,7 +836,7 @@ fn coalesced_requests_and_partial_disconnect_do_not_duplicate_effects() {
 fn daemon_epoch_and_out_of_order_ids_cannot_create_a_new_transition() {
     let f = Fixture::new(false, Config::default());
     let mut stream = raw(&f);
-    let w = hello_raw(&f, &mut stream, [9; 32], None);
+    let w = create_raw(&f, &mut stream, [9; 32]);
     let r = Request {
         epoch: w.epoch,
         session: w.session,
@@ -696,9 +847,7 @@ fn daemon_epoch_and_out_of_order_ids_cannot_create_a_new_transition() {
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
     let g = Fixture::new(false, Config::default());
     let mut stream = raw(&g);
-    stream
-        .write_all(&frame(&encode(&ClientFrame::Hello(hello(w.session, Some(w.epoch))))))
-        .unwrap();
+    stream.write_all(&frame(&encode(&ClientFrame::Hello(resume(w.session, w.epoch))))).unwrap();
     assert!(matches!(read(&mut stream), ServerFrame::Error(_)));
 }
 
@@ -706,17 +855,17 @@ fn daemon_epoch_and_out_of_order_ids_cannot_create_a_new_transition() {
 fn hello_retry_is_idempotent_and_clock_rollback_does_not_extend_lifetime() {
     let f = Fixture::new(false, Config::default());
     let mut stream = raw(&f);
-    let first = hello_raw(&f, &mut stream, [10; 32], None);
+    let first = create_raw(&f, &mut stream, [10; 32]);
     drop(stream);
     let mut stream = raw(&f);
-    let second = hello_raw(&f, &mut stream, [10; 32], None);
+    let second = create_raw(&f, &mut stream, [10; 32]);
     assert_eq!(first.epoch, second.epoch);
     assert_eq!(first.expires_ms, second.expires_ms);
     f.at(100);
     f.at(1);
     drop(stream);
     let mut stream = raw(&f);
-    let resumed = hello_raw(&f, &mut stream, [10; 32], Some(first.epoch));
+    let resumed = resume_raw(&mut stream, &first);
     assert!(resumed.now_ms >= 100);
     assert_eq!(resumed.expires_ms, first.expires_ms);
 }
