@@ -261,6 +261,9 @@ fn build(
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
+        if let Some(at) = said.find("error:") {
+            return Err(format!("ra-jit did not build it ({}):\n{}", built.status, &said[at..]));
+        }
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
         return Err(format!("ra-jit did not build it ({}): {last}", built.status));
     }

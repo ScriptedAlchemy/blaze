@@ -8815,6 +8815,11 @@ fn run_holding(
         listed.touch(&db, None);
         resolved = resolve_crates(&db, &args, cores())?;
     }
+    if nothing_of_rustc && let Some(error) = check::syntax(&db, &args, &files)? {
+        let said = errors::Said::one(error);
+        errors_for_the_daemon(&args, &said)?;
+        anyhow::bail!("{said}");
+    }
     // A tests' program starts in ra-jit's harness, which what rustc linked does not have.
     let texts = harnesses(&db, [&args], None);
     let harnessed = !texts.is_empty();

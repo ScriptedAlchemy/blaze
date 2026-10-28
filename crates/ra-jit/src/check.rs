@@ -19,6 +19,39 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+/// Syntax failures in source-only builds must be reported before codegen/linking.
+/// Walk semantic modules rather than all loaded source-root files.
+pub(crate) fn syntax(
+    db: &RootDatabase,
+    args: &Args,
+    files: &[WatchedFile],
+) -> anyhow::Result<Option<crate::errors::Diagnostic>> {
+    let mut checked = Vec::new();
+    for name in args.crates() {
+        for krate in crate::crates_named(db, name, args)? {
+            for id in ide_db::base_db::Crate::from(krate).transitive_deps(db) {
+                if id.data(db).origin.is_lang() {
+                    continue;
+                }
+                let krate = hir::Crate::from(id);
+                checked.extend(krate.modules(db).into_iter().map(|module| {
+                    module.definition_source_file_id(db).original_file(db).file_id(db)
+                }));
+            }
+        }
+    }
+    checked.sort_unstable();
+    checked.dedup();
+    let paths = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, it.path.clone())),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    Ok(crate::unparsed(db, &checked, &Sources { paths }, &args.checkout))
+}
+
 /// A metadata-only compiler probe checks all source bodies, including unreachable
 /// ones. It loads an owned source description, not a Cargo workspace or rmeta.
 pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
