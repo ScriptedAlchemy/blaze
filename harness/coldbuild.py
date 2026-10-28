@@ -65,6 +65,40 @@ pub fn counted(words: &str) -> BTreeMap<&str, usize> {
 }
 """,
 }
+# A program whose source is the same under two feature sets, so that only the features decide
+# what it prints: the whole build must build it again for each, as cargo does, at one path.
+FEATURES = {
+    "Cargo.toml": '[package]\nname = "kfeat"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                  '[features]\nx = []\n',
+    "src/main.rs": """fn main() {
+    if cfg!(feature = "x") { println!("with x") } else { println!("without x") }
+}
+""",
+}
+# Root defaults and a selected member enable different features of the same dependency.
+# Client planning and worker loading must select the same graph from the invocation cwd.
+MEMBERS = {
+    "Cargo.toml": '[workspace]\nmembers = ["default", "member", "parts"]\n'
+                  'default-members = ["default"]\nresolver = "2"\n',
+    "default/Cargo.toml": '[package]\nname = "kdefault"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                          '[dependencies]\nkselected = { path = "../parts", features = ["root"] }\n',
+    "default/src/main.rs": 'fn main() { println!("default {}", kselected::said()); }\n',
+    "member/Cargo.toml": '[package]\nname = "kmember"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                         '[dependencies]\nkselected = { path = "../parts", features = ["member"] }\n',
+    "member/src/main.rs": 'fn main() { println!("member {}", kselected::said()); }\n',
+    "parts/Cargo.toml": '[package]\nname = "kselected"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                        '[features]\nroot = []\nmember = []\n',
+    "parts/src/lib.rs": """pub fn said() -> &'static str {
+    if cfg!(feature = "member") && !cfg!(feature = "root") {
+        "selected"
+    } else if cfg!(feature = "root") && !cfg!(feature = "member") {
+        "root"
+    } else {
+        "wrong feature graph"
+    }
+}
+""",
+}
 # What blaze cannot compile yet: `f128` (docs/no-rustc.md, step G). `kbad`'s own `main` has
 # one; `kuses` reaches a library's function that has one, whose stand-in would be left in the
 # executable.
@@ -183,6 +217,52 @@ def fixtures():
     check("`cargo blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (reference.returncode, reference.stdout),
           f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}\ncargo's: {reference.stdout!r}")
     check("  ... and it is in target/debug/examples", os.path.exists(os.path.join(ws, "target", "debug", "examples", "kex")))
+
+    # The features are part of which build it is: each set is the program cargo builds, also
+    # when the other set's program is already at the one path cargo has.
+    feat = os.path.join(root, "feat")
+    write(feat, FEATURES)
+    steps = [("--features x", "with x"), ("", "without x"),
+             ("--features x", "with x"), ("", "without x")]
+    for at, (flags, expected) in enumerate(steps):
+        args = flags.split()
+        reference, _ = cargo(feat, env, os.path.join(root, "feat-ref"), "build", *args)
+        assert reference.returncode == 0, reference.stderr[-3000:]
+        ran, _ = blaze(feat, env, "build", *args)
+        said = ran.stdout + ran.stderr
+        what = " ".join(["`cargo blaze build", *args, "`"])
+        check(f"{what}: builds", ran.returncode == 0, said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(feat, "target")), said)
+        program = os.path.join(feat, "target", "debug", "kfeat")
+        ours = printed(program) if os.path.exists(program) else None
+        theirs = printed(os.path.join(root, "feat-ref", "debug", "kfeat"))
+        check(f"  ... and prints what cargo's does ({expected})", ours == theirs and ours is not None and ours[1].strip() == expected,
+              f"step {at}: blaze's printed {ours!r}, cargo's {theirs!r}")
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=feat, env=env, capture_output=True, timeout=120)
+
+    members = os.path.join(root, "members")
+    write(members, MEMBERS)
+    for where, args, name, expected in [
+        ("", [], "kdefault", "default root"),
+        ("member", [], "kmember", "member selected"),
+        ("member/src", [], "kmember", "member selected"),
+        ("member/src", ["--manifest-path", "../Cargo.toml"], "kmember", "member selected"),
+        ("", ["--manifest-path", os.path.join(members, "member", "Cargo.toml")], "kmember", "member selected"),
+        ("", [], "kdefault", "default root"),
+    ]:
+        cwd = os.path.join(members, where)
+        reference, _ = cargo(cwd, env, os.path.join(root, "member-ref"), "build", *args)
+        assert reference.returncode == 0, reference.stderr[-3000:]
+        ran, _ = blaze(cwd, env, "build", *args)
+        said = ran.stdout + ran.stderr
+        check(f"member selection from {where or 'root'} {' '.join(args)}: builds", ran.returncode == 0, said)
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(members, "target")), said)
+        program = os.path.join(members, "target", "debug", name)
+        ours = printed(program) if os.path.exists(program) else None
+        theirs = printed(os.path.join(root, "member-ref", "debug", name))
+        check(f"  ... and uses the selected graph ({expected})", ours == theirs and ours is not None and ours[1].strip() == expected,
+              f"blaze's printed {ours!r}, cargo's {theirs!r}")
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=members, env=env, capture_output=True, timeout=120)
 
     for package, whose in (("kbad", "its own"), ("kuses", "a library's")):
         ran, _ = blaze(bad, env, "build", "-p", package)

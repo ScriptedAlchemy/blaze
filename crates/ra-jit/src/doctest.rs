@@ -1260,6 +1260,7 @@ fn add_crates(
             origin: CrateOrigin::Local { repo: None, name: None },
             crate_attrs: Box::default(),
             target_kind: TargetKind::Bin,
+            codegen_flags: data.codegen_flags.clone(),
             proc_macro_cwd: data.proc_macro_cwd.clone(),
         };
         let extra = ExtraCrateData {

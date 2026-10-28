@@ -340,12 +340,11 @@ impl GlobalState {
                             )
                         }
                         LinkedProject::InlineProjectJson(it) => {
-                            let workspace = project_model::ProjectWorkspace::load_inline(
+                            project_model::ProjectWorkspace::load_inline(
                                 it.clone(),
                                 &cargo_config,
                                 &progress,
-                            );
-                            Ok(workspace)
+                            )
                         }
                     })
                     .collect();

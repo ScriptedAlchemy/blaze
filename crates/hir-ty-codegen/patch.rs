@@ -64,12 +64,27 @@ pub(super) fn stable_mark(
     let place = |at: Option<(FileId, u32, u32)>| {
         at.map(|(file, line, column)| (names.file_path(file), line, column))
     };
+    // Const evaluation's TypeId bytes and StoredTy hashes are local table ids.
+    // Patch tracking crosses the store boundary too: hash the actual type identity
+    // and the bytes outside its placeholder, not either table's insertion order.
+    let portable_blob = |blob: &super::ConstBlob| {
+        let mut portable = blob.clone();
+        let mut types = Vec::new();
+        for (offset, ty) in std::mem::take(&mut portable.type_ids) {
+            let at = offset as usize;
+            portable.bytes.get_mut(at..at.checked_add(16)?)?.fill(0);
+            types.push((offset, names.type_name(ty.as_ref())?));
+        }
+        Some((portable, types))
+    };
     for request in &compiled.requests.datas {
         match request {
-            DataRequest::Blob { blob, identity } => (0u8, blob, identity).hash(&mut hasher),
+            DataRequest::Blob { blob, identity } => {
+                (0u8, portable_blob(blob)?, identity).hash(&mut hasher)
+            }
             DataRequest::Vtable { ty, trait_ref, blob } => {
                 let trait_ref = trait_ref.as_ref().map(|(id, args)| (*id, args.as_ref()));
-                (1u8, names.vtable(ty.as_ref(), trait_ref)?, blob).hash(&mut hasher)
+                (1u8, names.vtable(ty.as_ref(), trait_ref)?, portable_blob(blob)?).hash(&mut hasher)
             }
             DataRequest::Static(id) => (2u8, names.static_name(*id)?).hash(&mut hasher),
             DataRequest::Location(at) => {

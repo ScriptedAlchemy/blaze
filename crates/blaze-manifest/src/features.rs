@@ -198,6 +198,7 @@ const SEE_CHANNELS: &str = "See https://doc.rust-lang.org/book/appendix-07-night
 #[derive(Clone, Debug, Default)]
 pub struct Features {
     is_local: bool,
+    enabled: Vec<String>,
 }
 
 impl Features {
@@ -206,7 +207,19 @@ impl Features {
         warnings: &mut Vec<String>,
         is_local: bool,
     ) -> anyhow::Result<Features> {
+        Self::for_channel(features, warnings, is_local, "stable")
+    }
+
+    /// Cargo checks manifest feature gates against this invocation's channel. Bootstrap
+    /// resolves the installed std workspace on a nightly channel even in a stable release.
+    pub fn for_channel(
+        features: &[String],
+        warnings: &mut Vec<String>,
+        is_local: bool,
+        channel: &str,
+    ) -> anyhow::Result<Features> {
         let mut seen = Vec::new();
+        let nightly = matches!(channel, "nightly" | "dev");
         for name in features {
             let Some(feature) = FEATURES.iter().find(|f| f.name.replace('_', "-") == *name) else {
                 let mut msg = format!("unknown Cargo.toml feature `{name}`\n\n");
@@ -233,6 +246,7 @@ impl Features {
                      longer necessary to be listed in the manifest\n  {see_docs}",
                     feature.version
                 )),
+                Status::Unstable if nightly => {}
                 Status::Unstable => bail!(
                     "the cargo feature `{name}` requires a nightly version of Cargo, but this is \
                      the `stable` channel\n{SEE_CHANNELS}\n{see_docs}"
@@ -256,7 +270,7 @@ impl Features {
                 }
             }
         }
-        Ok(Features { is_local })
+        Ok(Features { is_local, enabled: if nightly { features.to_vec() } else { Vec::new() } })
     }
 
     /// Fails as cargo does for a manifest that uses an unstable feature: none is enabled.
@@ -265,7 +279,9 @@ impl Features {
     }
 
     pub fn require_with_hint(&self, feature: &Feature, hint: Option<&str>) -> anyhow::Result<()> {
-        if feature.status == Status::Stable {
+        if feature.status == Status::Stable
+            || self.enabled.iter().any(|it| *it == feature.name.replace('_', "-"))
+        {
             return Ok(());
         }
         let _ = self.is_local;
@@ -292,4 +308,23 @@ impl Features {
 
 fn cargo_docs_link(path: &str) -> String {
     format!("https://doc.rust-lang.org/cargo/{path}")
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn unstable_manifest_gates_follow_the_invocations_channel() {
+        let names = vec!["profile-rustflags".to_owned(), "public-dependency".to_owned()];
+        assert!(Features::for_channel(&names, &mut Vec::new(), true, "stable").is_err());
+        let enabled = Features::for_channel(&names, &mut Vec::new(), true, "nightly").unwrap();
+        assert!(enabled.require(Feature::profile_rustflags).is_ok());
+        assert!(enabled.require(Feature::public_dependency).is_ok());
+        assert!(enabled.require(Feature::metabuild).is_err());
+        assert!(
+            Features::for_channel(&["not-a-feature".to_owned()], &mut Vec::new(), true, "nightly")
+                .is_err()
+        );
+    }
 }

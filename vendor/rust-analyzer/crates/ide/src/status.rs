@@ -42,6 +42,7 @@ pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
                 origin,
                 crate_attrs,
                 target_kind,
+                codegen_flags: _,
                 proc_macro_cwd,
             } = crate_id.data(db);
             let ExtraCrateData { version, display_name, potential_cfg_options } =

@@ -120,6 +120,14 @@ pub(super) enum CachedData {
     /// The file, line and column of a `core::panic::Location`.
     Location(Option<(String, u32, u32)>),
     FilePath(String),
+    /// Literal parts are not paths. Only FilePath parts are rebound on another host.
+    Text(Vec<CachedTextPart>),
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(super) enum CachedTextPart {
+    Text(String),
+    FilePath(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,6 +248,7 @@ impl StoredCode {
     /// which requests the IR's names stand for, which LLVM's code has in it.
     pub(super) fn key<'a>(
         optimization: super::backend::Optimization,
+        machine: &hir_ty::mir::codegen_options::TargetMachine,
         func: &cranelift_codegen::ir::Function,
         named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
         constants: impl Iterator<Item = (u32, &'a [u8])>,
@@ -249,6 +258,7 @@ impl StoredCode {
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
         hasher.update(b"ra-jit llvm 7");
+        hasher.update(format!("{machine:?}"));
         // Nor what the types of the parameters say of the memory they point to.
         for (at, pointee) in pointees {
             let super::fragment::Pointee { unique, frozen, size, align } = *pointee;
@@ -423,7 +433,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 11");
+        field(b"ra-jit entry 12");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -468,7 +478,8 @@ impl Entry {
             CachedData::Static { .. }
             | CachedData::OwnStatic(_)
             | CachedData::Location(_)
-            | CachedData::FilePath(_) => true,
+            | CachedData::FilePath(_)
+            | CachedData::Text(_) => true,
         });
         datas && self.code.sound(|namespace| if namespace == 0 { funcs } else { self.datas.len() })
     }
@@ -511,11 +522,22 @@ impl Entry {
     /// The names of the files the entry tells of: in its panic locations, in what `file!()`
     /// is, and in what a debugger is told.
     fn files(&mut self) -> impl Iterator<Item = &mut String> {
-        let named = self.datas.iter_mut().filter_map(|it| match it {
-            CachedData::Location(Some((file, ..))) | CachedData::FilePath(file) => Some(file),
-            _ => None,
-        });
-        named.chain(self.debug.iter_mut().flat_map(|it| &mut it.files))
+        let mut named = Vec::new();
+        for data in &mut self.datas {
+            match data {
+                CachedData::Location(Some((file, ..))) | CachedData::FilePath(file) => {
+                    named.push(file);
+                }
+                CachedData::Text(parts) => {
+                    named.extend(parts.iter_mut().filter_map(|it| match it {
+                        CachedTextPart::FilePath(file) => Some(file),
+                        CachedTextPart::Text(_) => None,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        named.into_iter().chain(self.debug.iter_mut().flat_map(|it| &mut it.files))
     }
 
     fn of_cargo(&mut self) -> bool {
@@ -578,7 +600,8 @@ impl Entry {
 
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
-    store: &'static Store,
+    store: EntryStore,
+    accepted: Option<FxHashMap<String, [u8; KEY]>>,
     /// What a debugger is told by the entries asked for.
     debug: Told,
     /// The one program the entries are of, when they are not of any: see [`Entry::key`].
@@ -587,6 +610,20 @@ pub(super) struct Entries {
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
     known: Mutex<Known>,
+}
+
+enum EntryStore {
+    Global(&'static Store),
+    Owned(Arc<Store>),
+}
+
+impl EntryStore {
+    fn get(&self, key: &[u8; KEY]) -> Option<Vec<u8>> {
+        match self {
+            EntryStore::Global(store) => store.get(key),
+            EntryStore::Owned(store) => store.get_installed(key),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -609,19 +646,19 @@ pub(super) struct KeptTypes {
 
 impl KeptTypes {
     /// The key the set is in the store under, which is of nothing but what the set tells.
-    pub(super) fn keep(&mut self, store: &Store, types: &TypeSet) -> [u8; KEY] {
+    pub(super) fn keep(&mut self, store: &Store, types: &TypeSet) -> Option<[u8; KEY]> {
         let at = types.at();
         if let Some((_, key)) = self.keys.get(&at) {
-            return *key;
+            return Some(*key);
         }
-        let bytes = postcard::to_allocvec(&types.to_vec()).unwrap_or_default();
+        let bytes = postcard::to_allocvec(&types.to_vec()).ok()?;
         let mut hasher = Sha256::new();
         hasher.update(b"ra-jit types 1");
         hasher.update(&bytes);
         let key = hasher.finalize().into();
         store.insert(&key, &bytes);
         self.keys.insert(at, (types.clone(), key));
-        key
+        Some(key)
     }
 }
 
@@ -641,22 +678,25 @@ pub(super) enum Kept {
 pub(super) struct Written {
     pub(super) added: usize,
     pub(super) of_cargo: usize,
+    pub(super) errors: Vec<String>,
 }
 
 /// Gives the store what is compiled on threads of its own, so that the thread that
 /// compiles does not wait for an entry to be written before it stitches the next.
-pub(super) struct Writer {
-    store: &'static Store,
+pub(super) struct Writer<'s> {
+    store: &'s Store,
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
     types: KeptTypes,
     written: Written,
-    threads: Option<(std::sync::mpsc::Sender<Kept>, Vec<std::thread::JoinHandle<Written>>)>,
+    threads: Option<(std::sync::mpsc::SyncSender<Kept>, Vec<std::thread::JoinHandle<Written>>)>,
     /// Whether there is no thread to be had, and the entries are written where they are kept.
     alone: bool,
+    /// A checked batch cannot turn a failed finish into success by asking again.
+    failed: Option<String>,
 }
 
-impl Writer {
+impl Writer<'static> {
     pub(super) fn new(
         store: &'static Store,
         cargo_home: Option<String>,
@@ -667,19 +707,10 @@ impl Writer {
         writer
     }
 
-    /// A writer that writes where it is asked to.
-    pub(super) fn alone(
-        store: &'static Store,
-        cargo_home: Option<String>,
-        library: Option<super::LibrarySources>,
-    ) -> Self {
-        let (types, written) = Default::default();
-        Writer { store, cargo_home, library, types, written, threads: None, alone: true }
-    }
-
     pub(super) fn keep(&mut self, kept: Kept) {
         if self.threads.is_none() && !self.alone {
-            let (jobs, queued) = std::sync::mpsc::channel::<Kept>();
+            // Backpressure bounds queued entries, not incremental cache retention.
+            let (jobs, queued) = std::sync::mpsc::sync_channel::<Kept>(16);
             let queued = Arc::new(Mutex::new(queued));
             // A whole build hands over most of its entries at once, when its last wave is
             // compiled: one thread would write them after the link.
@@ -707,8 +738,33 @@ impl Writer {
             }
         }
         match &self.threads {
-            Some((jobs, _)) => _ = jobs.send(kept),
+            Some((jobs, _)) => {
+                if jobs.send(kept).is_err() {
+                    self.written.errors.push("compiler store writer disconnected".to_owned());
+                }
+            }
             None => self.write(kept),
+        }
+    }
+}
+
+impl<'s> Writer<'s> {
+    /// Writes each finished entry before compiling the next. No global store or queue.
+    pub(super) fn alone(
+        store: &'s Store,
+        cargo_home: Option<String>,
+        library: Option<super::LibrarySources>,
+    ) -> Self {
+        let (types, written) = Default::default();
+        Writer {
+            store,
+            cargo_home,
+            library,
+            types,
+            written,
+            threads: None,
+            alone: true,
+            failed: None,
         }
     }
 
@@ -716,7 +772,9 @@ impl Writer {
         let (key, mut entry) = match kept {
             Kept::Entry { key, entry } => (key, entry),
             Kept::Types(types) => {
-                types.iter().for_each(|it| _ = self.types.keep(self.store, it));
+                if types.iter().any(|it| self.types.keep(self.store, it).is_none()) {
+                    self.written.errors.push("debug type encoding failed".to_owned());
+                }
                 return;
             }
         };
@@ -734,7 +792,7 @@ impl Writer {
     pub(super) fn encoded(&mut self, entry: &mut Entry) -> Option<Vec<u8>> {
         if let Some(debug) = &mut entry.debug {
             let keys = debug.types.iter().map(|it| self.types.keep(self.store, it));
-            debug.stored_types = keys.collect();
+            debug.stored_types = keys.collect::<Option<_>>()?;
         }
         entry.leave(self.cargo_home.as_deref(), self.library.as_ref()).then(|| entry.encode())?
     }
@@ -745,16 +803,46 @@ impl Writer {
         let mut written = std::mem::take(&mut self.written);
         if let Some((jobs, threads)) = self.threads.take() {
             drop(jobs);
-            for theirs in threads.into_iter().filter_map(|it| it.join().ok()) {
-                written.added += theirs.added;
-                written.of_cargo += theirs.of_cargo;
+            for thread in threads {
+                match thread.join() {
+                    Ok(theirs) => {
+                        written.added += theirs.added;
+                        written.of_cargo += theirs.of_cargo;
+                        written.errors.extend(theirs.errors);
+                    }
+                    Err(_) => written.errors.push("compiler store writer panicked".to_owned()),
+                }
             }
         }
         written
     }
+
+    pub(super) fn finish_checked(&mut self) -> std::io::Result<Written> {
+        if let Some(why) = &self.failed {
+            return Err(std::io::Error::other(why.clone()));
+        }
+        let written = self.finish();
+        if !written.errors.is_empty() {
+            let why = written.errors.join("; ");
+            self.failed = Some(why.clone());
+            return Err(std::io::Error::other(why));
+        }
+        if written.of_cargo != 0 {
+            let why = "an entry could not be made portable".to_owned();
+            self.failed = Some(why.clone());
+            return Err(std::io::Error::other(why));
+        }
+        Ok(written)
+    }
+
+    /// An owned batch has finished describing this request. Keep serialized type blobs
+    /// in the store, not their in-memory graphs for the lifetime of the whole batch.
+    pub(super) fn release_types(&mut self) {
+        self.types.keys.clear();
+    }
 }
 
-impl Drop for Writer {
+impl Drop for Writer<'_> {
     fn drop(&mut self) {
         self.finish();
     }
@@ -781,7 +869,36 @@ impl Entries {
         cargo_home: Option<String>,
         library: Option<super::LibrarySources>,
     ) -> Entries {
-        Entries { store, debug, program, cargo_home, library, known: Mutex::default() }
+        Entries {
+            store: EntryStore::Global(store),
+            accepted: None,
+            debug,
+            program,
+            cargo_home,
+            library,
+            known: Mutex::default(),
+        }
+    }
+
+    /// A fresh cache-generation view of an admitted closed receipt. Pack keys outside
+    /// the accepted set cannot be read through a side door.
+    pub(super) fn owned(
+        store: Arc<Store>,
+        accepted: FxHashMap<String, [u8; KEY]>,
+        debug: Told,
+        program: Option<[u8; 32]>,
+        cargo_home: Option<String>,
+        library: Option<super::LibrarySources>,
+    ) -> Entries {
+        Entries {
+            store: EntryStore::Owned(store),
+            accepted: Some(accepted),
+            debug,
+            program,
+            cargo_home,
+            library,
+            known: Mutex::default(),
+        }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -799,6 +916,13 @@ impl Entries {
     }
 
     pub(super) fn get(&self, name: &str) -> Option<Arc<Entry>> {
+        // A receipt admits an exact key, not every variant of its function name.
+        // Packs may contain other settings' entries, and process-wide compiler policy
+        // can change between builds. Only the ordinary global cache recomputes a key.
+        let admitted_key = match &self.accepted {
+            Some(accepted) => Some(*accepted.get(name)?),
+            None => None,
+        };
         let cell = {
             let mut known = self.known();
             match known.entries.get(name) {
@@ -807,7 +931,8 @@ impl Entries {
             }
         };
         let read = || {
-            let key = Entry::key(name, self.debug, self.program.as_ref())?;
+            let key =
+                admitted_key.or_else(|| Entry::key(name, self.debug, self.program.as_ref()))?;
             let mut entry = Entry::decode(&self.store.get(&key)?)?;
             if let Some(debug) = &mut entry.debug {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
@@ -926,6 +1051,64 @@ mod tests {
         },
         *,
     };
+
+    #[test]
+    fn checked_finish_reports_every_panicked_writer() {
+        use std::sync::mpsc::sync_channel;
+        super::super::store::compiles_against("1.99.0");
+        let directory =
+            std::env::temp_dir().join(format!("blaze-d0-writer-{}", std::process::id()));
+        let store = super::super::store::Store::owned(&directory).unwrap();
+        let mut writer = Writer::alone(&store, None, None);
+        let (sender, _) = sync_channel(1);
+        writer.threads = Some((
+            sender,
+            vec![
+                std::thread::spawn(|| panic!("injected writer failure one")),
+                std::thread::spawn(|| panic!("injected writer failure two")),
+            ],
+        ));
+        let why = writer.finish_checked().err().unwrap().to_string();
+        assert_eq!(why.matches("writer panicked").count(), 2);
+        assert!(writer.finish_checked().is_err());
+        drop(writer);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn owned_entries_read_only_the_key_admitted_for_a_name() {
+        super::super::store::compiles_against("1.99.0");
+        let directory =
+            std::env::temp_dir().join(format!("blaze-d0-admitted-key-{}", std::process::id()));
+        let store = Arc::new(Store::owned(&directory).unwrap());
+        let name = "receipt-selected-function";
+        let admitted_key = Entry::key(name, Told::Nothing, None).unwrap();
+        let other_key = Entry::key(name, Told::Lines, None).unwrap();
+        assert_ne!(admitted_key, other_key);
+        let mut admitted = entry();
+        admitted.debug = None;
+        admitted.label = "admitted".into();
+        store.insert(&admitted_key, &admitted.encode().unwrap());
+        let mut other = entry();
+        other.debug = None;
+        other.label = "not in the receipt".into();
+        store.insert(&other_key, &other.encode().unwrap());
+        store.seal_checked().unwrap();
+        let entries = Entries::owned(
+            store.clone(),
+            FxHashMap::from_iter([(name.to_owned(), admitted_key)]),
+            Told::Lines,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(entries.get(name).unwrap().label, "admitted");
+        assert!(entries.get("another-function").is_none());
+        drop(entries);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn signature() -> Signature {
         let mut signature = Signature::new(CallConv::SystemV);
@@ -1069,6 +1252,26 @@ mod tests {
         assert!(stored.files().any(|it| it == "src/lib.rs"));
         let here = Entry::decode(&bytes).unwrap().arrived(Some(other), None).unwrap();
         assert_eq!(here.encode().unwrap(), fetched_to(other).encode().unwrap());
+    }
+
+    #[test]
+    fn text_rebinds_only_path_parts_not_literals_around_them() {
+        let mut written = entry();
+        written.datas.push(CachedData::Text(vec![
+            CachedTextPart::Text("/home/one/.cargo-is-a-literal:".to_owned()),
+            CachedTextPart::FilePath("/home/one/.cargo/registry/src/dep/lib.rs".to_owned()),
+            CachedTextPart::Text(":tail".to_owned()),
+        ]));
+        assert!(written.leave(Some("/home/one/.cargo"), None));
+        let read = Entry::decode(&written.encode().unwrap())
+            .unwrap()
+            .arrived(Some("/srv/cargo"), None)
+            .unwrap();
+        assert!(matches!(read.datas.last(), Some(CachedData::Text(parts)) if parts == &[
+            CachedTextPart::Text("/home/one/.cargo-is-a-literal:".to_owned()),
+            CachedTextPart::FilePath("/srv/cargo/registry/src/dep/lib.rs".to_owned()),
+            CachedTextPart::Text(":tail".to_owned()),
+        ]));
     }
 
     #[test]

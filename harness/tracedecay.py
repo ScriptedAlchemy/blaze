@@ -565,7 +565,8 @@ def timed(ctx, tool, scenario, args, run, extra=None, cwd=None, check=False, rec
     audit; returns the record."""
     env = ctx.env(tool)
     log = os.path.join(ctx.logs, f"{tool}-{scenario}-{run}.log")
-    cmd = ["/usr/bin/time", "-l", ctx.exe(tool)] + args
+    # BSD time's `-l`, GNU time's `-v`: both say the largest resident set.
+    cmd = ["/usr/bin/time", "-l" if platform.system() == "Darwin" else "-v", ctx.exe(tool)] + args
     blaze_prefix = os.path.join(ctx.blaze_bin, "ra-jit") if tool.startswith("blaze") else None
     load = os.getloadavg()
     holder = {}
@@ -592,6 +593,8 @@ def timed(ctx, tool, scenario, args, run, extra=None, cwd=None, check=False, rec
     text = open(log, errors="replace").read()
     fin = [l.strip() for l in text.splitlines() if re.search(r"^\s*Finished|test result:|error(\[|:)", l)]
     mrss = re.search(r"(\d+)\s+maximum resident set size", text)
+    if not mrss and (gnu := re.search(r"Maximum resident set size \(kbytes\): (\d+)", text)):
+        mrss = re.match(r"(\d+)", str(int(gnu.group(1)) * 1024))
     rec = {
         "tool": tool, "scenario": scenario, "run": run, "wall_s": round(wall, 2), "exit": code,
         "finished": fin[-1] if fin else None,
@@ -920,6 +923,30 @@ def only_asks(argv):
     return bool(printing or {"-vV", "-V", "--version"} & set(words))
 
 
+def cargo_only_asks(argv):
+    """Whether a cargo run only asked a question (`--version`, `config get`, `metadata`, a stand-in `rustc`
+    `--print`), as opposed to building, checking, testing or running something."""
+    words = argv.split()
+    if {"--version", "-V", "-vV"} & set(words[:2]):
+        return True
+    # `-Z unstable-options` is a flag and its value, not the subcommand.
+    rest = [w for w in words if not w.startswith("-") and w != "unstable-options"]
+    first = rest[0] if rest else ""
+    if first in ("metadata", "locate-project", "pkgid", "tree", "read-manifest", "verify-project"):
+        return True
+    if first == "config" and "get" in rest[:2]:
+        return True
+    if first == "rustc" and any(w.startswith("--print") or w == "--print" for w in words):
+        return True
+    return False
+
+
+def cargo_summary(runs):
+    """`N cargo runs, M of them only asking`: what tells a query of cargo from a build by cargo."""
+    asking = sum(1 for run in runs if cargo_only_asks(run["argv"]))
+    return f"{len(runs)} cargo runs, {asking} of them only asking, {len(runs) - asking} compiling or otherwise running things"
+
+
 def compiler_summary(runs):
     """`N compiler runs, M of them only asking`, which is what tells a probe from a compile."""
     asking = sum(1 for run in runs if only_asks(run["argv"]))
@@ -978,7 +1005,11 @@ def compiler_count(rec):
 
 def predicate_a(ctx, a):
     """P0-A, no rustc: the build, the program, the test binary and the doctests with 0 compiler
-    execs in the tree. Section 0's positive fixture; the negative ones are P0.2's."""
+    execs in the tree. Section 0's positive fixture; the negative ones are P0.2's. With
+    `--whole`, the whole build's (`BLAZE_WHOLE_BUILD=1`), which builds and runs programs only:
+    the build and the program, with 0 compiler execs and 0 cargo execs."""
+    if a.whole:
+        return predicate_a_whole(ctx, a)
     r = Report("P0-A", "the build, the program, the test binary and a doctest succeed with 0 compiler execs in the tree")
     clean(ctx, "blaze")
     build = timed(ctx, "blaze", "p0a-build", build_args("blaze", a.package), 1, cwd=ctx.td)
@@ -1016,6 +1047,52 @@ def predicate_a(ctx, a):
         r.fail(f"{runs} compiler execs in the tree ({asking} of them only asking, {runs - asking} compiling); "
                "P0-A's bar is 0")
     stop_daemon(ctx, "blaze")
+    return r
+
+
+def predicate_a_whole(ctx, a):
+    """P0-A of the whole build: a cold build, the program, an edit of each crate the build
+    compiles a build script with, and a build with nothing changed, each with no rustc, rustdoc
+    or cargo started by blaze: the stand-ins log every one."""
+    tool = "blaze-whole"
+    r = Report("P0-A", "the whole build and its program succeed with 0 compiler execs and 0 cargo execs in the tree")
+    clean(ctx, tool)
+    records = [timed(ctx, tool, "p0a-whole-build", build_args(tool, a.package), 1, cwd=ctx.td)]
+    for i, (path, old, new) in enumerate(a.whole_edit or []):
+        file = os.path.join(ctx.td, path)
+        text = open(file).read()
+        if old not in text:
+            r.fail(f"{path} has no {old!r} to edit")
+            continue
+        with open(file, "w") as f:
+            f.write(text.replace(old, new, 1))
+        records.append(timed(ctx, tool, f"p0a-whole-edit-{i + 1}", build_args(tool, a.package), 1, cwd=ctx.td))
+    records.append(timed(ctx, tool, "p0a-whole-noop", build_args(tool, a.package), 1, cwd=ctx.td))
+    for rec in records:
+        compilers, cargos = rec["audit"]["compiler"], rec["audit"]["cargo"]
+        r.facts.append(f"{rec['scenario']}: exit {rec['exit']}, {rec['finished']!r}, {compiler_summary(compilers)}, "
+                       f"{cargo_summary(cargos)}")
+        if rec["exit"] != 0:
+            r.fail(f"{rec['scenario']} failed ({rec['exit']}): {rec['finished']}")
+        if not rec.get("rajit_finished"):
+            r.fail(f"{rec['scenario']} was not blaze's build ([ra-jit])")
+        audit_names(r, rec)
+        for run in cargos:
+            r.fail(f"{rec['scenario']}: cargo ran: {shorten(run['argv'], 200)} (parent {shorten(run['parent'], 120)})")
+    program = os.path.join(ctx.target(tool), "debug", a.program)
+    if os.path.exists(program):
+        ran = sh([program] + a.program_args, env=ctx.env(tool), cwd=ctx.td)
+        r.facts.append(f"program: exit {ran.returncode}, {ran.stdout.strip()!r}")
+        if ran.returncode != 0:
+            r.fail(f"the program exited {ran.returncode}")
+    else:
+        r.fail(f"no program at {program}")
+    compilers = sum(compiler_count(rec) for rec in records)
+    cargos = sum(len(rec["audit"]["cargo"]) for rec in records)
+    if compilers or cargos:
+        every = [run for rec in records for run in rec["audit"]["cargo"]]
+        r.fail(f"{compilers} compiler execs and {cargo_summary(every)} in the tree; the whole build's bar is 0 and 0")
+    stop_daemon(ctx, tool)
     return r
 
 
@@ -1556,6 +1633,10 @@ def parse_args(argv):
     p.add_argument("--doc", action=argparse.BooleanOptionalAction, default=True,
                    help="P0-A builds and runs the doctests too (the default; --no-doc leaves them out "
                         "for a package that has no library)")
+    p.add_argument("--whole", action="store_true",
+                   help="P0-A of the whole build (BLAZE_WHOLE_BUILD=1): the build and the program, 0 compiler and 0 cargo execs")
+    p.add_argument("--whole-edit", nargs=3, action="append", metavar=("FILE", "OLD", "NEW"),
+                   help="with --whole: an edit built after the cold build (FILE relative to --td); may be repeated")
     p.add_argument("--pairs", type=int, default=20, help="P0-C's edit/undo pairs (20)")
     p.add_argument("--runs", type=int, default=None,
                    help="how many runs per arm a predicate does (P0-D 5, P0-H 3); with a command, the runs of a scenario")
