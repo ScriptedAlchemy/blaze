@@ -579,22 +579,11 @@ mod tests {
     }
 
     fn exercise_independent_prints(executable: &Path, toolchain: &Path) {
-        for kind in ["target-libdir", "sysroot", "target-spec-json", "file-names"] {
+        // `cargo test` hands its children the toolchain's environment (SDKROOT on macOS),
+        // which the owned answers decline to guess for a stand-in toolchain.
+        let query = || {
             let mut command = Command::new(executable);
-            command.current_dir(toolchain).args([
-                "rustc",
-                "-Z",
-                "unstable-options",
-                "--print",
-                kind,
-            ]);
-            if kind == "file-names" {
-                command.args(["--", "-", "--crate-name", "___", "--crate-type", "rlib"]);
-            } else if kind == "target-spec-json" {
-                command.args(["--", "-Z", "unstable-options"]);
-            }
-            command.env("RUSTFLAGS", "-Ctarget-cpu=native -Crelocation-model=pic");
-            command.env("RUSTC_BOOTSTRAP", "1");
+            command.current_dir(toolchain);
             for key in [
                 "SDKROOT",
                 "MACOSX_DEPLOYMENT_TARGET",
@@ -603,19 +592,31 @@ mod tests {
             ] {
                 command.env_remove(key);
             }
+            command
+        };
+        for kind in ["target-libdir", "sysroot", "target-spec-json", "file-names"] {
+            let mut command = query();
+            command.args(["rustc", "-Z", "unstable-options", "--print", kind]);
+            if kind == "file-names" {
+                command.args(["--", "-", "--crate-name", "___", "--crate-type", "rlib"]);
+            } else if kind == "target-spec-json" {
+                command.args(["--", "-Z", "unstable-options"]);
+            }
+            command.env("RUSTFLAGS", "-Ctarget-cpu=native -Crelocation-model=pic");
+            command.env("RUSTC_BOOTSTRAP", "1");
             let answer = ask(&mut command).expect("must not hand the query to Cargo").unwrap();
             assert!(answer.status.success() && !answer.stdout.is_empty(), "{kind}");
         }
         for kind in ["sysroot", "target-libdir"] {
-            let mut command = Command::new(executable);
-            command.current_dir(toolchain).args(["rustc", "--print", kind]);
+            let mut command = query();
+            command.args(["rustc", "--print", kind]);
             command.env("RUSTFLAGS", "--sysroot /elsewhere -Ctarget-cpu=native");
             let answer = ask(&mut command).expect("sysroot flags stay owned").unwrap();
             let text = String::from_utf8(answer.stdout).unwrap();
             assert!(text.starts_with("/elsewhere"), "{kind}: {text}");
         }
-        let mut command = Command::new(executable);
-        command.current_dir(toolchain).args(["rustc", "--print", "cfg", "--", "-O"]);
+        let mut command = query();
+        command.args(["rustc", "--print", "cfg", "--", "-O"]);
         command.env("RUSTFLAGS", "-Ctarget-cpu=native");
         command.env("RUSTC_BOOTSTRAP", "1");
         let error = ask(&mut command).expect("cfg gap must not hand off to Cargo").unwrap_err();
@@ -624,8 +625,8 @@ mod tests {
         for (target, bootstrap) in
             [(Some("bogus-unknown-none"), "1"), (None, "somecrate"), (None, "-1")]
         {
-            let mut command = Command::new(executable);
-            command.current_dir(toolchain).args(["rustc", "--print", "sysroot"]);
+            let mut command = query();
+            command.args(["rustc", "--print", "sysroot"]);
             if let Some(target) = target {
                 command.args(["--target", target]);
             }
