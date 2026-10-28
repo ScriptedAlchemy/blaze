@@ -2318,6 +2318,9 @@ fn load(
         beside,
         scripts_said,
     };
+    if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
+        checkouts.loaded.set_proc_macro_snapshot_root(Some(cargo::daemon::home()?));
+    }
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs)?;

@@ -144,9 +144,15 @@ pub struct Loaded {
     /// The server of the libraries that list their macros ([`serve_listed_with`]), started
     /// when the first of them is loaded.
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    snapshot_root: Option<std::path::PathBuf>,
 }
 
 impl Loaded {
+    /// Explicit worker ownership for snapshots, set before starting either server.
+    pub fn set_proc_macro_snapshot_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.snapshot_root = root;
+    }
+
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
         &self.workspaces
     }
@@ -158,6 +164,11 @@ impl Loaded {
 
     /// Puts `workspace` where the one at `index` is. It is loaded by the next [`Self::add`].
     pub fn replace(&mut self, index: usize, workspace: ProjectWorkspace) {
+        for server in [&self.proc_macro_server, &self.listed_server] {
+            if let Some(Ok(server)) = server {
+                server.begin_load_epoch();
+            }
+        }
         self.workspaces[index] = workspace;
     }
 
@@ -237,16 +248,23 @@ impl Loaded {
             Err(_) => false,
         });
         if self.proc_macro_server.is_none() && unlisted {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
+            self.proc_macro_server =
+                spawn_proc_macro_server(ws, extra_env, load_config).map(|server| {
+                    server.map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                });
         }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {
             let spawned =
                 ProcMacroClient::spawn(server, extra_env, None, load_config.proc_macro_processes);
-            self.listed_server = Some(spawned.map_err(|e| {
-                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
-            }));
+            self.listed_server = Some(
+                spawned
+                    .map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                    .map_err(|e| {
+                        ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
+                    }),
+            );
         }
         let proc_macros = {
             fn running(

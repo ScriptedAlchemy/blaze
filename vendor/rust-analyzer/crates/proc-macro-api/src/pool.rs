@@ -1,5 +1,8 @@
 //! A pool of proc-macro server processes
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -9,21 +12,41 @@ use crate::{LibrarySnapshot, MacroDylib, ProcMacro, ServerError, process::ProcMa
 pub(crate) struct ProcMacroServerPool {
     workers: Arc<[ProcMacroServerProcess]>,
     version: u32,
+    loaded: Arc<Mutex<HashMap<paths::AbsPathBuf, PreparedLibrary>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedLibrary {
+    snapshot: Arc<LibrarySnapshot>,
+    pub(crate) content: [u8; 32],
+}
+
+impl PreparedLibrary {
+    pub(crate) fn copy(
+        dylib: &MacroDylib,
+        root: Option<&std::path::Path>,
+    ) -> Result<Self, ServerError> {
+        let (snapshot, content) = LibrarySnapshot::copy(&dylib.path, root).map_err(|error| {
+            ServerError { message: "copying macro library".into(), io: Some(Arc::new(error)) }
+        })?;
+        Ok(Self { snapshot: Arc::new(snapshot), content })
+    }
 }
 
 impl ProcMacroServerPool {
     pub(crate) fn new(workers: Vec<ProcMacroServerProcess>) -> Self {
         let version = workers[0].version();
-        Self { workers: workers.into(), version }
+        Self { workers: workers.into(), version, loaded: Default::default() }
+    }
+
+    pub(crate) fn replaces(&self, path: &paths::AbsPathBuf, content: [u8; 32]) -> bool {
+        self.loaded.lock().unwrap().get(path).is_some_and(|old| old.content != content)
     }
 }
 
 impl ProcMacroServerPool {
     pub(crate) fn exited(&self) -> Option<&ServerError> {
-        for worker in &*self.workers {
-            worker.exited()?;
-        }
-        self.workers[0].exited()
+        self.workers.iter().find_map(|worker| worker.exited())
     }
 
     pub(crate) fn pick_process(&self) -> Result<&ProcMacroServerProcess, ServerError> {
@@ -49,20 +72,29 @@ impl ProcMacroServerPool {
         })
     }
 
-    pub(crate) fn load_dylib(&self, dylib: &MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
+    pub(crate) fn load_dylib(
+        self: &Arc<Self>,
+        dylib: &MacroDylib,
+        prepared: PreparedLibrary,
+    ) -> Result<Vec<ProcMacro>, ServerError> {
         let _span = tracing::info_span!("ProcMacroServer::load_dylib").entered();
 
         let original_dylib_path = Arc::new(dylib.path.clone());
-        // The server may cache native loaded libraries by pathname/mtime. Give
-        // this immutable loaded generation its own file, retained by its handles.
-        let snapshot = LibrarySnapshot::copy(&dylib.path)
-            .map_err(|error| ServerError { message: error.to_string(), io: None })?;
-        let dylib_path = Arc::new(paths::AbsPathBuf::assert_utf8(snapshot.snapshot_path()));
-        let snapshot = Arc::new(snapshot);
-        use sha2::{Digest as _, Sha256};
-        let bytes = std::fs::read(dylib_path.as_path())
-            .map_err(|error| ServerError { message: error.to_string(), io: None })?;
-        let dylib_content = Some(Sha256::digest(bytes).into());
+        // Reuse the immutable pathname for unchanged bytes. Native loaders cannot
+        // unload individual images; duplicates must not accumulate within an epoch.
+        let prepared = {
+            let mut loaded = self.loaded.lock().unwrap();
+            let entry = loaded.entry(dylib.path.clone()).or_insert_with(|| prepared.clone());
+            if entry.content != prepared.content {
+                // The non-replayable test transport cannot rotate pools, but still
+                // must use a new immutable pathname for changed bytes.
+                *entry = prepared;
+            }
+            entry.clone()
+        };
+        let dylib_path =
+            Arc::new(paths::AbsPathBuf::assert_utf8(prepared.snapshot.snapshot_path()));
+        let dylib_content = Some(prepared.content);
 
         let (first, rest) = self.workers.split_first().expect("worker pool must not be empty");
 
@@ -88,7 +120,7 @@ impl ProcMacroServerPool {
                 dylib_path: dylib_path.clone(),
                 dylib_content,
                 original_dylib_path: original_dylib_path.clone(),
-                _snapshot: snapshot.clone(),
+                _snapshot: prepared.snapshot.clone(),
             })
             .collect())
     }

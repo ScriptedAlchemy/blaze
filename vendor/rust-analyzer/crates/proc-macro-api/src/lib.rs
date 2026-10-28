@@ -21,12 +21,16 @@ mod generation_tests;
 pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
+pub mod snapshot_dir;
 pub mod transport;
 
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
 use span::{ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
-use std::{fmt, io, sync::Arc};
+use std::{
+    fmt, io,
+    sync::{Arc, Mutex, Weak},
+};
 
 use crate::{
     bidirectional_protocol::SubCallback, pool::ProcMacroServerPool, process::ProcMacroServerProcess,
@@ -88,12 +92,31 @@ pub struct ProcMacroClient {
     ///
     /// That means that concurrent salsa requests may block each other when expanding proc macros,
     /// which is unfortunate, but simple and good enough for the time being.
-    pool: Arc<ProcMacroServerPool>,
+    epochs: Arc<Mutex<Epochs>>,
     /// New library generations get a pool whose lifetime follows their handles.
     /// This releases native server images without changing either wire protocol.
     spawn_generation: Option<Arc<dyn Fn() -> io::Result<ProcMacroServerPool> + Send + Sync>>,
+    snapshot_root: Option<std::path::PathBuf>,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
+}
+
+/// Only the unused first pool is held strongly. Serving pools belong to consumers.
+struct Epochs {
+    initial: Option<Arc<ProcMacroServerPool>>,
+    current: Weak<ProcMacroServerPool>,
+    live: Vec<Weak<ProcMacroServerPool>>,
+}
+
+impl Epochs {
+    fn new(pool: ProcMacroServerPool) -> Self {
+        let pool = Arc::new(pool);
+        Self {
+            current: Arc::downgrade(&pool),
+            live: vec![Arc::downgrade(&pool)],
+            initial: Some(pool),
+        }
+    }
 }
 
 impl fmt::Debug for ProcMacroClient {
@@ -120,7 +143,7 @@ impl MacroDylib {
 /// we share a single expander process for all macros within a workspace.
 #[derive(Debug, Clone)]
 pub struct ProcMacro {
-    pool: ProcMacroServerPool,
+    pool: Arc<ProcMacroServerPool>,
     dylib_path: Arc<AbsPathBuf>,
     name: Box<str>,
     kind: ProcMacroKind,
@@ -135,53 +158,45 @@ enum LibrarySnapshot {
 }
 
 impl LibrarySnapshot {
-    fn copy(source: &AbsPath) -> io::Result<Self> {
+    fn copy(source: &AbsPath, root: Option<&std::path::Path>) -> io::Result<(Self, [u8; 32])> {
         // Open first: a missing producer must not leave an empty generation.
         let mut input = std::fs::File::open(source)?;
         // The daemon knows this private worker home and removes it only after
         // killing/waiting for that worker group. This covers stop without Drop.
-        if std::env::var_os("RA_JIT_ENDS_WITH_INPUT").is_some()
-            && let Some(home) = std::env::var_os("RA_JIT_HOME")
-        {
+        if let Some(root) = root {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let pid = std::process::id();
-            let dir = std::path::PathBuf::from(home).join("macro-snapshots").join(pid.to_string());
-            for ancestor in dir.ancestors().take(2) {
-                if std::fs::symlink_metadata(ancestor)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                {
-                    return Err(io::Error::other("symlink in owned macro snapshot directory"));
-                }
-            }
-            std::fs::create_dir_all(&dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-            let marker = dir.join("owner");
-            if std::fs::symlink_metadata(&marker)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err(io::Error::other("symlink macro snapshot owner marker"));
-            }
-            if marker.exists() && std::fs::read_to_string(&marker)? != pid.to_string() {
-                return Err(io::Error::other("macro snapshot owner mismatch"));
-            }
-            std::fs::write(marker, pid.to_string())?;
+            let dir = snapshot_dir::prepare(root, std::process::id())?;
             let path = dir.join(format!(
                 "generation-{}",
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
             let snapshot = Self::WorkerOwned(path);
-            io::copy(&mut input, &mut file)?;
-            return Ok(snapshot);
+            let digest = Self::copy_and_hash(&mut input, &mut file)?;
+            return Ok((snapshot, digest));
         }
         let dir = stdx::tempfile::NamedTempDir::new("proc-macro-content")?;
         let mut file = std::fs::File::create(dir.path().join("library"))?;
-        io::copy(&mut input, &mut file)?;
-        Ok(Self::Temporary(dir))
+        let digest = Self::copy_and_hash(&mut input, &mut file)?;
+        Ok((Self::Temporary(dir), digest))
+    }
+
+    fn copy_and_hash(
+        input: &mut impl io::Read,
+        output: &mut impl io::Write,
+    ) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+        }
+        Ok(hash.finalize().into())
     }
 
     fn snapshot_path(&self) -> std::path::PathBuf {
@@ -265,15 +280,17 @@ impl ProcMacroClient {
         };
         let pool = factory()?;
         Ok(ProcMacroClient {
-            pool: Arc::new(pool),
+            epochs: Arc::new(Mutex::new(Epochs::new(pool))),
             path: process_path.to_owned(),
             spawn_generation: Some(Arc::new(factory)),
+            snapshot_root: None,
         })
     }
 
     /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
     ///
     /// The `process_path` is used for `Self::server_path`. This function is mainly used for testing.
+    /// This non-replayable transport cannot rotate a native pool; use `spawn` in production.
     pub fn with_io_channels(
         process_path: &AbsPath,
         spawn: impl Fn(
@@ -293,13 +310,15 @@ impl ProcMacroClient {
             })?);
         }
         Ok(ProcMacroClient {
-            pool: Arc::new(ProcMacroServerPool::new(workers)),
+            epochs: Arc::new(Mutex::new(Epochs::new(ProcMacroServerPool::new(workers)))),
             path: process_path.to_owned(),
             spawn_generation: None,
+            snapshot_root: None,
         })
     }
 
-    /// Test transport with replayable streams for each owned generation.
+    /// Replayable test transport for exercising epoch lifetime without a native server.
+    #[cfg(test)]
     pub fn with_generation_io_channels(
         process_path: &AbsPath,
         spawn: impl Fn(
@@ -326,10 +345,30 @@ impl ProcMacroClient {
             Ok(ProcMacroServerPool::new(workers))
         };
         Ok(ProcMacroClient {
-            pool: Arc::new(factory()?),
+            epochs: Arc::new(Mutex::new(Epochs::new(factory()?))),
             path: process_path.to_owned(),
             spawn_generation: Some(Arc::new(factory)),
+            snapshot_root: None,
         })
+    }
+
+    /// Use a private worker root whose owner performs post-wait cleanup after abrupt exit.
+    /// Other clients use self-cleaning temporary snapshots and never read daemon environment.
+    pub fn with_snapshot_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.snapshot_root = root;
+        self
+    }
+
+    /// A workspace reload can replace content-addressed producer *paths*, not
+    /// just bytes at an existing path. Retire its native epoch at the next load.
+    /// Existing consumers still own the previous epoch; an unused cold pool is reused.
+    pub fn begin_load_epoch(&self) {
+        if self.spawn_generation.is_some() {
+            let mut epochs = self.epochs.lock().unwrap();
+            if epochs.initial.is_none() {
+                epochs.current = Weak::new();
+            }
+        }
     }
 
     /// Returns the absolute path to the proc-macro server.
@@ -339,17 +378,39 @@ impl ProcMacroClient {
 
     /// Loads a proc-macro dylib into the server process returning a list of `ProcMacro`s loaded.
     pub fn load_dylib(&self, dylib: MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
-        let Some(factory) = &self.spawn_generation else {
-            return self.pool.load_dylib(&dylib);
-        };
-        let pool =
-            factory().map_err(|error| ServerError { message: error.to_string(), io: None })?;
-        pool.load_dylib(&dylib)
+        let prepared = pool::PreparedLibrary::copy(&dylib, self.snapshot_root.as_deref())?;
+        // Serialize registration and rotation: concurrent loads must agree on an epoch.
+        let mut epochs = self.epochs.lock().unwrap();
+        let mut pool = epochs.current.upgrade();
+        if let Some(factory) = &self.spawn_generation {
+            if pool.as_ref().is_none_or(|pool| pool.replaces(&dylib.path, prepared.content)) {
+                let next = Arc::new(factory().map_err(|error| ServerError {
+                    message: "spawning proc-macro epoch".into(),
+                    io: Some(Arc::new(error)),
+                })?);
+                epochs.current = Arc::downgrade(&next);
+                epochs.live.retain(|pool| pool.strong_count() != 0);
+                epochs.live.push(Arc::downgrade(&next));
+                pool = Some(next);
+            }
+        }
+        let pool = pool.expect("non-replayable transport retains its initial pool");
+        let handles = pool.load_dylib(&dylib, prepared)?;
+        if self.spawn_generation.is_some() {
+            epochs.initial = None;
+        }
+        Ok(handles)
     }
 
     /// Checks if the proc-macro server has exited.
-    pub fn exited(&self) -> Option<&ServerError> {
-        self.pool.exited()
+    pub fn exited(&self) -> Option<ServerError> {
+        self.epochs
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|pool| pool.exited().cloned())
     }
 }
 

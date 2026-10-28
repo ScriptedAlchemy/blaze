@@ -432,6 +432,9 @@ impl GlobalState {
             let mut builder = ProcMacrosBuilder::default();
             let proc_macro_clients = proc_macro_clients.iter().chain(iter::repeat(&None));
             for (client, paths) in proc_macro_clients.zip(paths) {
+                if let Some(Ok(client)) = client {
+                    client.begin_load_epoch();
+                }
                 for (crate_id, res) in paths.iter() {
                     let expansion_res = match client {
                         Some(Ok(client)) => match res {

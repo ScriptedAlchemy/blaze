@@ -957,18 +957,7 @@ fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
     if let Ok(home) = home() {
-        let dir = home.join("macro-snapshots").join(pid.to_string());
-        // Only the PID-marked directory allocated by this child is ours.
-        if std::fs::symlink_metadata(home.join("macro-snapshots"))
-            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-            && std::fs::symlink_metadata(&dir)
-                .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-            && std::fs::symlink_metadata(dir.join("owner"))
-                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            && std::fs::read_to_string(dir.join("owner")).ok().as_deref() == Some(&pid.to_string())
-        {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let _ = proc_macro_api::snapshot_dir::remove_after_worker_exit(&home, pid);
     }
 }
 
