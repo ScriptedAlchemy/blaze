@@ -61,22 +61,6 @@ pub(crate) fn name(name: &std::ffi::OsStr) -> String {
     })
 }
 
-pub(crate) fn matches(value: Option<&str>, was: Option<&str>) -> bool {
-    match was {
-        Some(was) if was.starts_with("hmac-sha256-v1:") => {
-            self::value(value).ok().flatten().as_deref() == Some(was)
-        }
-        _ => value == was,
-    }
-}
-
-pub(crate) fn captured(value: Option<&str>) -> anyhow::Result<Option<String>> {
-    match value {
-        Some(value) if value.starts_with("hmac-sha256-v1:") => Ok(Some(value.to_owned())),
-        _ => self::value(value),
-    }
-}
-
 /// Persistent compiler records retain environment field names only. Values
 /// are delivered to daemon memory over the existing socket and restored only
 /// while that daemon lives; a lost snapshot makes the record unreadable.
@@ -185,9 +169,8 @@ mod tests {
         let first = super::value(Some(secret)).unwrap();
         assert!(!first.as_ref().unwrap().contains(secret));
         assert_eq!(first, super::value(Some(secret)).unwrap());
-        assert!(super::matches(Some(secret), first.as_deref()));
-        assert!(!super::matches(Some("changed"), first.as_deref()));
-        assert_eq!(super::captured(first.as_deref()).unwrap(), first);
+        let prefix_value = "hmac-sha256-v1:source-value";
+        assert_ne!(super::value(Some(prefix_value)).unwrap().as_deref(), Some(prefix_value));
         assert_ne!(first, super::value(Some("another")).unwrap());
         assert_ne!(super::value(None).unwrap(), super::value(Some("")).unwrap());
     }

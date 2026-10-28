@@ -4924,7 +4924,7 @@ fn write_dep_info(
     path: &Path,
 ) -> anyhow::Result<()> {
     let krates = crates_named(db, &args.krate, args)?;
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, false)
 }
 
 /// Writes to `path` the dep-info of every crate `exe` links but those of the standard library:
@@ -4949,7 +4949,7 @@ fn write_inputs(
             krates.push(krate);
         }
     }
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, true)
 }
 
 /// The dep-info of `krates`, the files of their modules and what `include!` and its kin read,
@@ -4961,6 +4961,7 @@ fn write_dep_info_of(
     vfs: &vfs::Vfs,
     exe: &Path,
     path: &Path,
+    private: bool,
 ) -> anyhow::Result<()> {
     let mut files = Vec::new();
     for &krate in krates {
@@ -4986,8 +4987,8 @@ fn write_dep_info_of(
     for file in &escaped {
         text += &format!("{file}:\n");
     }
-    // Keyed identities, not values. Freshness readers can compare what source
-    // read without retaining credentials in dep-info.
+    // Cargo reads ordinary dep-info literally. Private owned inputs use keyed
+    // identities; Cargo's file contains only values source actually read.
     let mut env: Vec<(String, Option<String>)> = db
         .env_read()
         .into_iter()
@@ -5005,8 +5006,11 @@ fn write_dep_info_of(
     }
     for (key, value) in env {
         let key = dep_info::escaped_variable(&key);
-        match env_identity::value(value.as_deref())? {
-            Some(identity) => text += &format!("# env-dep:{key}={identity}\n"),
+        let value = if private { env_identity::value(value.as_deref())? } else { value };
+        match value {
+            Some(value) => {
+                text += &format!("# env-dep:{key}={}\n", dep_info::escaped_variable(&value))
+            }
             None => text += &format!("# env-dep:{key}\n"),
         }
     }
@@ -7971,6 +7975,8 @@ fn main() -> anyhow::Result<()> {
         std::io::stdin().read_line(&mut line)?;
         let (env, _) = process::decode_native(line.trim_end()).map_err(anyhow::Error::msg)?;
         scripts::set_load_env(env);
+        // SAFETY: the worker has not started any thread yet.
+        unsafe { std::env::remove_var(cargo::daemon::LOAD_ENV) };
     }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);

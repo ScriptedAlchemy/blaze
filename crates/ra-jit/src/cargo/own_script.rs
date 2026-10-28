@@ -518,9 +518,7 @@ fn read_otherwise(
     info: &crate::dep_info::DepInfo,
     rustc_has: impl Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
-    match info.env.iter().find(|(name, value)| {
-        !crate::env_identity::matches(rustc_has(name).as_deref(), value.as_deref())
-    }) {
+    match info.env.iter().find(|(name, value)| rustc_has(name) != *value) {
         Some((name, _)) => Err(format!("it reads `{name}`, which ra-jit's build is not given")),
         None => Ok(()),
     }

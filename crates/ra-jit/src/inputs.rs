@@ -772,10 +772,18 @@ impl Scripts {
             // blaze judges each script itself, as cargo does at every build: a script whose
             // last run stands is not run, and the workspace is another only when what one
             // said is.
-            let asked: std::collections::BTreeMap<String, String> = match env {
+            let mut asked: std::collections::BTreeMap<String, String> = match env {
                 Some(env) => env.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
                 None => own.env.clone(),
             };
+            // These are this workspace's owned probes, not caller tool overrides.
+            for name in ["RUSTC", "RUSTDOC", "BLAZE_PRODUCER_PROBE_FAILURE"] {
+                if let Some(value) = own.env.get(name) {
+                    asked.insert(name.to_owned(), value.clone());
+                }
+            }
+            asked.remove("RUSTC_WRAPPER");
+            asked.remove("RUSTC_WORKSPACE_WRAPPER");
             let (said, world) = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
             let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind
             else {

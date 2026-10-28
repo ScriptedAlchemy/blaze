@@ -1469,13 +1469,11 @@ fn guards(
     };
     for unit in used {
         let env = unit.inputs().env.into_iter().filter(|(name, _)| !set_for_rustc(name));
-        guards.extend(
-            env.map(|(name, value)| Guard::Env {
-                name,
-                value: crate::env_identity::captured(value.as_deref())
-                    .expect("environment guard identity"),
-            }),
-        );
+        guards.extend(env.map(|(name, value)| Guard::Env {
+            name,
+            value:
+                crate::env_identity::value(value.as_deref()).expect("environment guard identity"),
+        }));
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {

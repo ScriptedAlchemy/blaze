@@ -35,8 +35,9 @@ do not echo request bytes. No environment value is written to a diagnostic.
 No load-environment file is written. Legacy build-script run records keep
 names only; replay snapshots live in daemon memory and are lost on restart.
 Owned script freshness records store HMAC-SHA256 identities of values actually
-read, using a random private key in the daemon home. Dep-info stores keyed
-identities, never values.
+read, using a random private key in the daemon home. Private owned input files
+store keyed identities. Cargo-facing dep-info follows Cargo's literal format
+and records only variables source actually read, not the caller snapshot.
 The key is not an environment value and is never part of a shared store.
 Legacy compiler-unit, wrapper-state and doctest replay records also retain
 environment field names only. Their values travel over the daemon socket and

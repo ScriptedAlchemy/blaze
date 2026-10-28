@@ -137,10 +137,10 @@ pub(crate) fn run_as_cargo_does(
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
         // This request is memory-only. A daemon restart loses replay eligibility;
         // it never reconstructs a caller snapshot from disk or its own environment.
-        super::client::ask(
+        let _ = super::client::ask(
             super::daemon::Request::RememberScript { dir: run_dir.to_owned(), env: env.clone() },
             super::client::Start::Never,
-        )?;
+        );
         let ran = Ran {
             real: real.clone(),
             cwd: cwd.clone(),
@@ -229,10 +229,7 @@ pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> b
     let Some(env) = environment(run_dir) else { return false };
     let env = env.unicode();
     let set = |name: &str| env.get(name);
-    if read.env.iter().any(|(name, value)| {
-        !name.starts_with("CARGO_")
-            || !crate::env_identity::matches(set(name).as_deref(), value.as_deref())
-    }) {
+    if read.env.iter().any(|(name, value)| !name.starts_with("CARGO_") || set(name) != *value) {
         return false;
     }
     !read.files.is_empty()

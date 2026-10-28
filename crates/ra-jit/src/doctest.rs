@@ -435,7 +435,7 @@ impl Remembered {
                 .map(|(name, value)| {
                     (
                         name,
-                        crate::env_identity::captured(value.as_deref())
+                        crate::env_identity::value(value.as_deref())
                             .expect("doctest freshness identity"),
                     )
                 })
@@ -533,15 +533,37 @@ impl Recorded {
 
     /// Writes the run down in `dir`, under a name that sorts after those of the runs before.
     fn write(&self, dir: &Path) -> anyhow::Result<()> {
+        self.write_with(dir, crate::cargo::client::ask)
+    }
+
+    fn write_with(
+        &self,
+        dir: &Path,
+        ask: impl FnOnce(
+            crate::cargo::daemon::Request,
+            crate::cargo::client::Start,
+        ) -> anyhow::Result<Option<crate::cargo::daemon::Reply>>,
+    ) -> anyhow::Result<()> {
+        use crate::cargo::{
+            client::Start,
+            daemon::{Reply, Request},
+        };
+
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
         let file = dir.join(format!("{:039}-{}.json", since.as_nanos(), std::process::id()));
-        crate::cargo::client::ask(
-            crate::cargo::daemon::Request::RememberScript {
+        // Recording can be the first daemon request of a doctest-only run. Publish the
+        // names-only file only after the daemon has acknowledged keeping its snapshot.
+        let reply = ask(
+            Request::RememberScript {
                 dir: file.clone(),
                 env: crate::process::Native::of(self.env.clone()),
             },
-            crate::cargo::client::Start::Never,
+            Start::IfMissing,
         )?;
+        anyhow::ensure!(
+            matches!(reply, Some(Reply::Warming)),
+            "the daemon did not acknowledge the doctest environment"
+        );
         let kept = Recorded {
             args: self.args.clone(),
             cwd: self.cwd.clone(),
@@ -554,6 +576,13 @@ impl Recorded {
 
     /// The runs written down in `dir`, in the order cargo asked for them.
     fn all_in(dir: &Path) -> anyhow::Result<Vec<Recorded>> {
+        Self::all_in_with(dir, crate::cargo::script::environment)
+    }
+
+    fn all_in_with(
+        dir: &Path,
+        mut environment: impl FnMut(&Path) -> Option<crate::process::Native>,
+    ) -> anyhow::Result<Vec<Recorded>> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             files.push(entry?.path());
@@ -562,13 +591,136 @@ impl Recorded {
         files.sort();
         let read = |file: &PathBuf| {
             let mut kept: Recorded = serde_json::from_slice(&std::fs::read(file)?)?;
-            kept.env = crate::cargo::script::environment(file)
+            // Command setup and replay both read these snapshots. Keep their file keys
+            // under Replay::dir so the caller can release that scope after replay ends.
+            kept.env = environment(file)
                 .context("doctest environment is no longer in daemon memory")?
                 .vars()
                 .collect();
             Ok(kept)
         };
         files.iter().map(read).collect()
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::{
+        cargo::{
+            client::Start,
+            daemon::{Reply, Request},
+        },
+        process::Native,
+    };
+
+    #[cfg(unix)]
+    fn non_unicode() -> OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+        OsString::from_vec(b"native-\xff".to_vec())
+    }
+
+    #[cfg(windows)]
+    fn non_unicode() -> OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+        OsString::from_wide(&[b'n' as u16, 0xd800])
+    }
+
+    fn recorded(cwd: &Path) -> Recorded {
+        Recorded {
+            args: vec!["--test".into(), "--crate-name=fixture".into(), "src/lib.rs".into()],
+            cwd: cwd.to_owned(),
+            env: vec![
+                ("TOKEN".into(), "synthetic-doctest-secret".into()),
+                ("EMPTY".into(), "".into()),
+                (non_unicode(), non_unicode()),
+            ],
+            env_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recorded_serialization_keeps_names_only_after_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = recorded(dir.path());
+        recorded
+            .write_with(dir.path(), |request, start| {
+                assert!(matches!(start, Start::IfMissing));
+                let Request::RememberScript { dir: file, env } = request else {
+                    panic!("expected a snapshot request");
+                };
+                assert_eq!(file.parent(), Some(dir.path()));
+                assert!(!file.exists());
+                assert_eq!(env, Native::of(recorded.env.clone()));
+                Ok(Some(Reply::Warming))
+            })
+            .unwrap();
+
+        let file = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+        let bytes = std::fs::read(file).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 3);
+        assert!(json.get("env").is_none());
+        assert_eq!(
+            json["env_names"],
+            serde_json::json!(["TOKEN", "EMPTY", crate::env_identity::name(&non_unicode()),])
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-doctest-secret"));
+        let kept: Recorded = serde_json::from_slice(&bytes).unwrap();
+        assert!(kept.env.is_empty());
+        assert_eq!(kept.args, recorded.args);
+        assert_eq!(kept.cwd, recorded.cwd);
+    }
+
+    #[test]
+    fn recording_without_acknowledgement_writes_no_file() {
+        for reply in [
+            Ok(None),
+            Ok(Some(Reply::Restart { version: "another-version".into() })),
+            Ok(Some(Reply::ScriptEnvironment(None))),
+            Err(anyhow::anyhow!("snapshot transport failed")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let result = recorded(dir.path()).write_with(dir.path(), |_, start| {
+                assert!(matches!(start, Start::IfMissing));
+                reply
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn replay_restores_native_snapshot_and_requires_it_on_each_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = recorded(dir.path());
+        let expected = Native::of(recorded.env.clone());
+        let mut snapshots = std::collections::BTreeMap::new();
+        recorded
+            .write_with(dir.path(), |request, _| {
+                // Exercise the same native snapshot encoding as the daemon socket.
+                let request = serde_json::to_vec(&request)?;
+                let Request::RememberScript { dir, env } = serde_json::from_slice(&request)? else {
+                    panic!("expected a snapshot request");
+                };
+                snapshots.insert(dir, env);
+                Ok(Some(Reply::Warming))
+            })
+            .unwrap();
+
+        // Command setup must leave the snapshot available for the replay process.
+        for _ in 0..2 {
+            let runs =
+                Recorded::all_in_with(dir.path(), |file| snapshots.get(file).cloned()).unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].env, expected.vars().collect::<Vec<_>>());
+            assert_eq!(runs[0].args, recorded.args);
+            assert_eq!(runs[0].cwd, recorded.cwd);
+        }
+        snapshots.clear();
+        let error =
+            Recorded::all_in_with(dir.path(), |file| snapshots.get(file).cloned()).err().unwrap();
+        assert!(error.to_string().contains("doctest environment is no longer in daemon memory"));
     }
 }
 
