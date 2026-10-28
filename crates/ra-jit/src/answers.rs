@@ -288,8 +288,22 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
             .find(|args| args[0] == "--target")
             .and_then(|args| args[1].to_str())
             .or_else(|| rustc_args.iter().find_map(|arg| arg.to_str()?.strip_prefix("--target=")));
-        let target = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))?;
-        let builtin = own::target_cfg(rustc.parent()?.parent()?, &target, &env)?;
+        // Past this point the query is ours: a missing model is a named gap, never Cargo's run.
+        let gap = |what: &str| {
+            Some(Err(io::Error::other(format!(
+                "owned toolchain query has no model for {what}: {rustc_args:?}; Cargo was not executed"
+            ))))
+        };
+        let Some(target) = explicit_target.map(str::to_owned).or_else(|| own::host_tuple(&rustc))
+        else {
+            return gap("the host target");
+        };
+        let Some(sysroot) = rustc.parent().and_then(Path::parent) else {
+            return gap("the toolchain's sysroot");
+        };
+        let Some(builtin) = own::target_cfg(sysroot, &target, &env) else {
+            return gap(&format!("target {target}'s built-in cfg"));
+        };
         let cfg = builtin
             .iter()
             .map(|cfg| match cfg.split_once('=') {
@@ -606,5 +620,20 @@ mod tests {
         command.env("RUSTC_BOOTSTRAP", "1");
         let error = ask(&mut command).expect("cfg gap must not hand off to Cargo").unwrap_err();
         assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+        // A target or bootstrap setting the answers do not model is a named gap, not Cargo's run.
+        for (target, bootstrap) in
+            [(Some("bogus-unknown-none"), "1"), (None, "somecrate"), (None, "-1")]
+        {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", "sysroot"]);
+            if let Some(target) = target {
+                command.args(["--target", target]);
+            }
+            command.env("RUSTC_BOOTSTRAP", bootstrap);
+            let answer = ask(&mut command).expect("an unmodeled print must not hand off to Cargo");
+            if let Err(error) = answer {
+                assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+            }
+        }
     }
 }
