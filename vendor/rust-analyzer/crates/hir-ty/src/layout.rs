@@ -355,33 +355,22 @@ pub fn layout_of_ty_query(
             // set over another, from the runtime body as rustc's coroutine transform has it.
             // `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
-            let parent_args = GenericArgs::new_from_slice(args.parent_args());
-            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
-                db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
-            } else {
-                db.monomorphized_runtime_mir_body_for_coroutine(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
-            }
-            .map_err(|_| LayoutError::Unknown)?;
-            let held = body.locals_held_across_yields();
+            let parent_args = GenericArgs::new_from_slice(args.parent_args()).store();
+            let by_move = crate::mir::is_by_move_coroutine(db, id.0, args);
+            let frame = crate::mir::held_frame(db, id.0, by_move, &parent_args, &trait_env)
+                .map_err(|_| LayoutError::Unknown)?;
+            let held = &frame.held;
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
                 .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
             // niche.
-            let locals = held
-                .locals
+            let locals = frame
+                .types
                 .iter()
-                .map(|&local| {
-                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                .map(|ty| {
+                    let of = db.layout_of_ty(ty.clone(), trait_env.clone())?;
                     let mut layout = LayoutData::unit(dl, true);
                     layout.size = of.size;
                     layout.align = of.align;

@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+pub mod codegen_options;
 mod eval;
 mod held;
 pub mod location;
@@ -68,7 +69,7 @@ pub use optimize::{
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
 pub use transform::{
-    monomorphized_runtime_mir_body_for_closure_query,
+    HeldFrame, held_frame, monomorphized_runtime_mir_body_for_closure_query,
     monomorphized_runtime_mir_body_for_coroutine_by_move_query,
     monomorphized_runtime_mir_body_for_coroutine_query, monomorphized_runtime_mir_body_query,
     runtime_mir_body_for_closure_query, runtime_mir_body_for_coroutine_by_move_query,

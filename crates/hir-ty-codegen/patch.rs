@@ -64,12 +64,27 @@ pub(super) fn stable_mark(
     let place = |at: Option<(FileId, u32, u32)>| {
         at.map(|(file, line, column)| (names.file_path(file), line, column))
     };
+    // Const evaluation's TypeId bytes and StoredTy hashes are local table ids.
+    // Patch tracking crosses the store boundary too: hash the actual type identity
+    // and the bytes outside its placeholder, not either table's insertion order.
+    let portable_blob = |blob: &super::ConstBlob| {
+        let mut portable = blob.clone();
+        let mut types = Vec::new();
+        for (offset, ty) in std::mem::take(&mut portable.type_ids) {
+            let at = offset as usize;
+            portable.bytes.get_mut(at..at.checked_add(16)?)?.fill(0);
+            types.push((offset, names.type_name(ty.as_ref())?));
+        }
+        Some((portable, types))
+    };
     for request in &compiled.requests.datas {
         match request {
-            DataRequest::Blob { blob, identity } => (0u8, blob, identity).hash(&mut hasher),
+            DataRequest::Blob { blob, identity } => {
+                (0u8, portable_blob(blob)?, identity).hash(&mut hasher)
+            }
             DataRequest::Vtable { ty, trait_ref, blob } => {
                 let trait_ref = trait_ref.as_ref().map(|(id, args)| (*id, args.as_ref()));
-                (1u8, names.vtable(ty.as_ref(), trait_ref)?, blob).hash(&mut hasher)
+                (1u8, names.vtable(ty.as_ref(), trait_ref)?, portable_blob(blob)?).hash(&mut hasher)
             }
             DataRequest::Static(id) => (2u8, names.static_name(*id)?).hash(&mut hasher),
             DataRequest::Location(at) => {
@@ -2595,6 +2610,7 @@ impl Base {
         cg.replaced = unchanged;
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
+            let _permit = super::budget::enter()?;
             let was = &self.instances[instance];
             let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
             else {
@@ -2610,6 +2626,7 @@ impl Base {
         }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
+            let _permit = super::budget::enter()?;
             let was = &self.hydrated[i as usize];
             let Ok(compiled) = compiled_instance(db, instance.clone(), env.clone()).as_ref() else {
                 return Ok(Err("code of the checkout from the store no longer compiles"));
@@ -2626,8 +2643,10 @@ impl Base {
             cg.pending.push((instance, env, id));
         }
         for &id in &changed_statics {
-            if cg.static_data(id).is_err() {
-                return Ok(Err("a static of the base no longer has a value"));
+            match cg.static_data(id) {
+                Ok(_) => {}
+                Err(error @ CodegenError::OverBudget(_)) => return Err(error),
+                Err(_) => return Ok(Err("a static of the base no longer has a value")),
             }
         }
         // rustc's callers of one that hands out a value of a type only its body names go on
@@ -2648,6 +2667,9 @@ impl Base {
                 }
                 match cg.define_function(root) {
                     Ok(_) => {}
+                    // Pressure stopped this build, not the function's support for patching.
+                    // Preserve the error instead of asking for a full rebuild to retry it.
+                    Err(e @ CodegenError::OverBudget(_)) => return Err(e),
                     // As in a full build, a function added to a crate whose symbols are
                     // rustc's has none to be put in the object under: what calls it has a
                     // copy of its own.
@@ -2656,7 +2678,7 @@ impl Base {
                 }
                 queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
             }
-            if !cg.define_instances().is_empty() {
+            if !cg.define_instances()?.is_empty() {
                 return Ok(Err("an instance can't be compiled"));
             }
             queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));

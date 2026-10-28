@@ -169,6 +169,7 @@ impl ProjectJson {
                         deps: crate_data.deps,
                         cfg,
                         target: crate_data.target,
+                        codegen_flags: crate_data.codegen_flags,
                         env: crate_data.env,
                         crate_attrs: crate_data.crate_attrs,
                         proc_macro_dylib_path: crate_data
@@ -263,6 +264,7 @@ pub struct Crate {
     pub(crate) deps: Vec<Dep>,
     pub(crate) cfg: Vec<CfgAtom>,
     pub(crate) target: Option<String>,
+    pub(crate) codegen_flags: Vec<String>,
     pub(crate) env: FxHashMap<String, String>,
     // Extra crate-level attributes, without the surrounding `#![]`.
     pub(crate) crate_attrs: Vec<String>,
@@ -418,6 +420,8 @@ struct CrateData {
     #[serde(default)]
     cfg: CfgList,
     target: Option<String>,
+    #[serde(default)]
+    codegen_flags: Vec<String>,
     #[serde(default)]
     env: FxHashMap<String, String>,
     #[serde(default)]

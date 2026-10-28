@@ -142,12 +142,30 @@ nothing is handed to cargo:
     error: `kuses` can reach functions blaze could not compile, so it is not built:
       `khalf::halved`: unsupported: f16 and f128
 
-Build scripts and proc macros are still built and run as the daemon's load does
-(`target/rust-analyzer`). A build of libraries alone and `test` are as without the setting.
+Build scripts are compiled and run by blaze itself (`crates/ra-jit/src/scripts.rs`), with
+no cargo and no rustc: each script and its build dependencies are compiled by blaze from source,
+and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the environment cargo
+1.99 gives it. A build whose graph has a proc macro still has the daemon's load build it with
+cargo's check (`target/rust-analyzer`), which then runs the scripts too (no-rustc step J). A script runs again when cargo 1.99 would run it: for a file it named
+with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
+every build), for a variable it named whose value is another (unset, empty and set are three), for
+any file of its package when it named nothing, for a change to the script, its modules or a
+package it is built with (a file, or a variable `env!` or `option_env!` read there), for the
+output of its last run being gone, and once more for having said other than it did the run before.
+It is run once for a build, with the variables of the process that asks; two builds at once are two. `harness/scriptedits.py` holds
+that to cargo ([harness.md](harness.md)). A build of libraries alone and `test` are as without the
+setting.
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which builds what was
 edited since on what it loaded and links the programs again; a changed manifest or lock file
-has a new worker load the workspace.
+has a new worker load the workspace. Each build links its programs into a directory of its own
+under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
+checkout of it, so a build with other features, another profile, another target or other
+flags is the program cargo would have built, not the one another build linked before.
+The worker resolves the build from the original invocation directory, including relative
+`--manifest-path` arguments, not from the workspace root. These linked directories stay until
+the target directory is cleaned while no build uses it; a directory's age does not say whether
+another client is still reading or placing its output.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
@@ -381,12 +399,28 @@ two workers, because unit tests are built with `cfg(test)` and integration tests
 
 A worker for a large workspace holds a lot of memory: 1.3 GB for ripgrep and 9.4 GB for
 dioxus-cli at the end of the agent-style edit runs in [results.md](results.md). The workers
-together hold at most half of the machine's memory, or what `RA_JIT_MEMORY_MAX` says. On
+together have a soft target of half the machine's memory, or what `RA_JIT_MEMORY_MAX` says. On
 Linux the machine's memory is the least of what it has and what the control group the daemon
-was started in allows (a container's, a CI job's, a systemd unit's). Once a
-second, over that, the daemon stops the worker asked longest ago, and the next build of its
-workspace is cargo's while a worker loads it again. A worker that is answering or loading is
-never stopped, nor is the one asked last, nor any while a program takes live edits.
+was started in allows (a container's, a CI job's, a systemd unit's). Exceeding a target does not
+stop a worker or discard its incremental cache. Only persistent critical host memory pressure
+permits memory eviction of idle workers. A busy worker owns its compile pause and progress;
+the daemon cannot bypass its grace. Eviction leaves a tombstone: identical loads are not
+restarted until the source, request, configuration or budget changes, or the daemon is
+explicitly restarted. The ordinary inactivity timeout remains.
+
+`RA_JIT_WORKER_MEMORY` is also soft. Past three quarters of it, the process purges allocator
+free pages at most once a second and admits fewer compile jobs, never fewer than one. Past
+all of it the build keeps going. Disabling a target with `off` does not disable host monitoring.
+One process-wide sampler reads macOS memorystatus, or Linux memory PSI and `MemAvailable`,
+independently of compilation. Warning reduces threads and purges. Critical pressure pauses
+new work; in-flight jobs finish. Only a critical pause with no in-flight work and no compile
+progress for `RA_JIT_PRESSURE_GRACE_SECS` (60 seconds by default) fails admission, naming host
+memory pressure. Recovery resumes compilation. The 100 ms sampling interval is not an
+allocation ceiling: one function can allocate before the next safe admission point.
+Unreadable footprint and pressure signals are logged once and treated as unknown.
+[reports/LOADMEM.md](reports/LOADMEM.md), section 8, separates this policy from the earlier
+hard-budget experiment. No new work is handed to rustc or cargo on failure; the existing
+client outcome for a failed load remains no-rustc step K.
 
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
@@ -447,7 +481,10 @@ started it. To change one, run `cargo ra-jit stop` first.
 |---|---|---|
 | `RA_JIT_HOME` | the daemon's directory (also read by every client) | see above |
 | `RA_JIT_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
-| `RA_JIT_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
+| `RA_JIT_MEMORY_MAX` | soft aggregate target, a size such as `6G`, or `off`; exceeding it alone does not evict workers | half the machine's memory (on Linux, or of what its control group allows) |
+| `RA_JIT_WORKER_MEMORY` | soft process target, a size such as `16G`, or `off`; fewer threads compile past three quarters, never failure at the target | what `RA_JIT_MEMORY_MAX` says |
+| `RA_JIT_MEMORY_RESERVE` | Linux available-memory reserve; at or below it pressure is critical, within twice it warning | larger of 2 GiB and 5% of machine/container RAM |
+| `RA_JIT_PRESSURE_GRACE_SECS` | seconds to pause before failing for persistent host critical pressure without compile progress; in-flight jobs finish | 60 |
 | `RA_JIT_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `RA_JIT_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `RA_JIT_CACHE` | directory of the disk store, or `off` for none | `ra-jit/store` in the user's cache directory ([cache.md](cache.md)) |

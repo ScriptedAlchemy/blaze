@@ -123,12 +123,19 @@ pub fn metadata(asked: &Asked<'_>) -> Result<String> {
     Ok(made(asked)?.0)
 }
 
+/// Metadata with the structural source bytes that produced it. A daemon must not certify
+/// this graph with manifest bytes read after a build script has run.
+pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
+    let (json, _, sources) = made(asked)?;
+    Ok((json, sources))
+}
+
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
 /// graph has them: of each member the build selects, the binaries whose `required-features`
 /// it is built with, or the one target named.
 pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
     anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
-    let (json, roots) = made(asked)?;
+    let (json, roots, _) = made(asked)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
     let features: FxHashMap<&str, Vec<&str>> = nodes
@@ -189,18 +196,18 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
 }
 
 /// The metadata of `asked`, and the ids of the members its build selects.
-fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
+fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start("metadata", asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
     let ctx = Context::new(config);
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let root = ws.root().to_owned();
-    if summary::has_replace(&root)? {
+    if summary::has_replace(&root, &ctx)? {
         bail!("`[replace]` is not read by blaze yet");
     }
     let lock_path = root.join("Cargo.lock");
-    let lock_text = std::fs::read_to_string(&lock_path)
+    let lock_text = String::from_utf8(ctx.read_source(&lock_path)?)
         .with_context(|| format!("no lock file at {}", lock_path.display()))?;
 
     let path_packages = path_packages(&ws, &root, &ctx)?;
@@ -240,7 +247,7 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
     for read in reads.values() {
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
-    let patch = summary::patch_tables(&root, &registry)?;
+    let patch = summary::patch_tables(&root, &registry, &ctx)?;
     let by_path: FxHashMap<SourceId, Summary> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
@@ -333,7 +340,7 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
     let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
-    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect()))
+    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), ctx.sources()))
 }
 
 /// What the resolve graph and the feature resolver read of the packages.
@@ -404,7 +411,7 @@ fn selected(
 fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<Package>> {
     let members: Vec<PathBuf> =
         ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
-    let mut queue = summary::patch_paths(root)?;
+    let mut queue = summary::patch_paths(root, ctx)?;
     for (path, m) in ws.members() {
         queue.extend(path_dependencies(&serde_json::to_value(export_package(path, m))?));
     }

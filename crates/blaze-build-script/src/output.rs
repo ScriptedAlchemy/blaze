@@ -379,6 +379,47 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
     Ok(out)
 }
 
+/// What a script's output says it reads: the files and variables it has cargo run it again
+/// for, in the order it printed them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// `rerun-if-changed`, as written: relative to the package's directory, or absolute.
+    pub files: Vec<PathBuf>,
+    /// `rerun-if-env-changed`.
+    pub env: Vec<String>,
+}
+
+/// The two lines of `input` that say what a script reads, read as [`parse`] reads them, which
+/// is as cargo's `BuildOutput::parse` does: split at each `\n`, a line that is not UTF-8 left
+/// out whole, the rest trimmed; `cargo:` and `cargo::` alike, `cargo:` for those it reserves
+/// alone. Nothing of the package's targets or version is needed, which is why it is not
+/// [`parse`]: for a daemon that asks whether a script is to run again. `Err` for a line cargo
+/// fails the build for, one with no `=`; whatever else is wrong with the output is not looked
+/// for.
+pub fn reads(input: &[u8]) -> Result<Reads, Error> {
+    let mut reads = Reads::default();
+    for line in input.split(|b| *b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else { continue };
+        let line = line.trim();
+        let (data, syntax) = if let Some(data) = line.strip_prefix("cargo::") {
+            (data, "cargo::")
+        } else if let Some(data) = line.strip_prefix("cargo:") {
+            if !has_reserved_prefix(data) {
+                continue;
+            }
+            (data, "cargo:")
+        } else {
+            continue;
+        };
+        match key_value("the build script", line, data, syntax)? {
+            ("rerun-if-changed", value) => reads.files.push(PathBuf::from(value)),
+            ("rerun-if-env-changed", value) => reads.env.push(value.to_owned()),
+            _ => {}
+        }
+    }
+    Ok(reads)
+}
+
 /// `rustc-flags`: only `-l` and `-L`, with or without a space before the value.
 pub fn parse_rustc_flags(value: &str, whence: &str) -> Result<(Vec<PathBuf>, Vec<String>), Error> {
     let mut flags = value.trim().split(char::is_whitespace).filter(|it| !it.trim().is_empty());
