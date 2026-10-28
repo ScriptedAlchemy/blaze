@@ -76,13 +76,18 @@ def main():
             assert (work / "unsupported").exists(), ours.stderr
             assert "owned release feature catalog" in ours.stderr, ours.stderr
             (work / "unsupported").unlink()
+        elif (work / "unsupported").exists():
+            assert ours.returncode != 0
+            assert "owned compiler probe acceptance is not proven" in ours.stderr, ours.stderr
+            rows[-1]["verdict"] = "undecided-refused"
+            (work / "unsupported").unlink()
         else:
             assert (ours.returncode == 0) == (oracle.returncode == 0), rows[-1]
             assert not (work / "unsupported").exists(), ours.stderr
     calls = norustc.runs(str(audit_log))
     (work / "product-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
     assert not calls, calls
-    print(f"{len(rows) - 1} owned source probe statuses equal rustc; bootstrap feature probe refuses; zero product compilers")
+    print(f"{len(rows)} source probes: oracle parity or loud undecided refusal; zero product compilers")
 
 
 if __name__ == "__main__":

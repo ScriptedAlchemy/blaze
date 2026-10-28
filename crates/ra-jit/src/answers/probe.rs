@@ -1,7 +1,9 @@
-//! Metadata-only build-script probes through the owned source checker.
+//! Metadata-only build-script probes through the partial owned source checker.
 //!
 //! Unknown flags and artifact consumers are not negative feature results. They
 //! remain unsupported operations and must fail the surrounding producer build.
+//! Apparent success is also undecided until the checker owns every acceptance
+//! pass. It must never be reported as successful compilation.
 
 use std::{collections::BTreeMap, ffi::OsString, io::Read as _, path::Path};
 

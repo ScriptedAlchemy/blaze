@@ -124,7 +124,15 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         eprintln!("{refused}");
         return Ok(false);
     }
-    Ok(true)
+    // IDE diagnostics and MIR refusals are not a compiler acceptance proof.
+    // Stability, privacy, const validity, dyn compatibility and unresolved
+    // signatures are not all checked here. A script may swallow a negative
+    // status, so an undecided probe must mark the *producer build* unsupported
+    // rather than silently select an implementation from a wrong feature cfg.
+    anyhow::bail!(
+        "owned compiler probe acceptance is not proven: stability, privacy, \
+         const validity, dyn compatibility and name/type resolution need complete compiler checks"
+    )
 }
 
 /// What a checker answers when the workspace changed in a way only loading it again takes
