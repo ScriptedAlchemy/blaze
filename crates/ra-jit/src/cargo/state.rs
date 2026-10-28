@@ -200,7 +200,11 @@ impl Guard {
                 reruns_for.iter_mut().find_map(|it| it.broken(since, configured))?;
                 let now = stamp_now();
                 let env = |name: &str| as_cargo_has(name, configured);
-                let cargo = script::Cargo { env: &env, targets };
+                let env_names: Vec<String> = std::env::vars_os()
+                    .filter_map(|(name, _)| name.into_string().ok())
+                    .chain(configured.iter().map(|it| it.name.clone()))
+                    .collect();
+                let cargo = script::Cargo { env: &env, env_names: &env_names, targets };
                 match script::current(out_dir, &cargo).and_then(|it| it.same_as(built)) {
                     Ok(()) => {
                         *checked_at = now;
@@ -1364,7 +1368,7 @@ fn as_cargo_has(name: &str, configured: &[Configured]) -> Option<String> {
 /// directory of each directory up from it, the nearest first, then from cargo's home. Of two
 /// files in one directory cargo reads `config`, not `config.toml`. A `relative` value is a
 /// path from the directory its `.cargo` is in.
-pub(super) fn configured_env(cwd: &Path) -> Vec<Configured> {
+pub(crate) fn configured_env(cwd: &Path) -> Vec<Configured> {
     let in_dir = |dir: &Path| {
         ["config", "config.toml"].map(|it| dir.join(it)).into_iter().find(|it| it.is_file())
     };

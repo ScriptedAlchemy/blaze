@@ -215,6 +215,61 @@ fn main() {
 }
 
 
+NEWENV = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "newenv"),
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+fn main() {
+    println!("cargo::rerun-if-changed=src/main.rs");
+    let main = fs::read_to_string("src/main.rs").unwrap();
+    let mut n = 0;
+    if main.contains("    8") {
+        println!("cargo::rerun-if-env-changed=VP5_VAR");
+        n = env::var("VP5_VAR").map(|v| v.len()).unwrap_or(0);
+    }
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(out.join("generated.rs"), format!("pub const RUNS: u32 = {n};\n")).unwrap();
+}
+""",
+    "src/main.rs": COUNTER["src/main.rs"],
+}
+
+
+def newly_watched_env(bin_dir):
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-se-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in NEWENV.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env.pop("VP5_VAR", None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+    try:
+        build(side, "newenv: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode != 0:
+            raise SystemExit(built.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"newenv: the daemon did not get ready: {states}{tails(home)}")
+        side.env["VP5_VAR"] = reference.env["VP5_VAR"] = "new"
+        cargo_ra_jit.rewrite(os.path.join(ws, "src/main.rs"), "    7\n", "    8\n")
+        how = how_built(build(side, "newenv: an edit", home))
+        _, built = reference.cargo("build", "-q")
+        ran = subprocess.run([os.path.join(ws, "target", "debug", "newenv")], capture_output=True)
+        theirs = subprocess.run([os.path.join(ws, "target-ref", "debug", "newenv")], capture_output=True)
+        wrong = differences(ran, theirs, built)
+        if ran.stdout != b"3 8\n":
+            wrong.append(f"newenv printed {ran.stdout!r}, expected b'3 8\\n'")
+        print(f"{'newenv: an edit':36} {'WRONG' if wrong else 'ok':8} {ran.stdout.strip()!r}, {how}")
+    finally:
+        side.cargo("stop")
+        shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
+
 def ran_a_script(out):
     """Whether `cargo build -v` said it ran a build script."""
     return re.search(r"Running `[^`]*build-script-build", out) is not None
@@ -361,6 +416,7 @@ def main():
         shutil.rmtree(root, ignore_errors=True)
     for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
+    wrong += newly_watched_env(bin_dir)
     for why in wrong:
         print(f"  {why}")
     if wrong:

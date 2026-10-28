@@ -268,6 +268,8 @@ pub(crate) struct Cargo<'a> {
     /// environment. Cargo's record of a run keeps the value of each variable the script said it
     /// reads, and runs the script again when one is another.
     pub(crate) env: &'a dyn Fn(&str) -> Option<String>,
+    /// All variable names in that request, including ones the last script run did not have.
+    pub(crate) env_names: &'a [String],
     /// The targets of the script's package, as `cargo metadata` lists them: cargo takes a
     /// `rustc-link-arg-bins` line and its like only from the script of a package that has one.
     pub(crate) targets: &'a [blaze_build_script::unit::Target],
@@ -345,8 +347,48 @@ pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> 
         return Run::left(&printed, out_dir);
     }
     let began = unit.begin()?;
+    let mut env: std::collections::BTreeMap<String, String> = ran
+        .env
+        .iter()
+        .filter_map(|(name, _)| (cargo.env)(name).map(|value| (name.clone(), value)))
+        .collect();
+    for name in cargo.env_names {
+        if let Some(value) = (cargo.env)(name) {
+            env.insert(name.clone(), value);
+        }
+    }
+    // Cargo supplies these to the script, rather than inheriting them from its caller.
+    // Keep their recorded values while replacing or removing inherited user variables.
+    for (name, value) in &ran.env {
+        if name.starts_with("CARGO_PKG_")
+            || name.starts_with("CARGO_FEATURE_")
+            || name.starts_with("CARGO_CFG_")
+            || name.starts_with("DEP_")
+            || matches!(
+                name.as_str(),
+                "CARGO"
+                    | "CARGO_MANIFEST_DIR"
+                    | "CARGO_MANIFEST_PATH"
+                    | "CARGO_MANIFEST_LINKS"
+                    | "CARGO_ENCODED_RUSTFLAGS"
+                    | "CARGO_MAKEFLAGS"
+                    | "OUT_DIR"
+                    | "NUM_JOBS"
+                    | "TARGET"
+                    | "DEBUG"
+                    | "OPT_LEVEL"
+                    | "PROFILE"
+                    | "HOST"
+                    | "RUSTC"
+                    | "RUSTDOC"
+                    | "RUSTC_LINKER"
+            )
+        {
+            env.insert(name.clone(), value.clone());
+        }
+    }
     let mut script = Command::new(&ran.real);
-    script.env_clear().envs(ran.env.iter().map(|(name, value)| (name, value)));
+    script.env_clear().envs(&env);
     script.current_dir(&ran.cwd).stdin(Stdio::null());
     let again = script.output().map_err(|it| it.to_string())?;
     if !again.status.success() {
@@ -525,8 +567,7 @@ mod tests {
     /// A run directory as cargo and `ra-jit build-script` leave one, for a script that
     /// writes `wrote` and prints where.
     fn ran(name: &str, wrote: &str) -> PathBuf {
-        let lines =
-            "#!/bin/sh\nprintf %s \"$WROTE\" > \"$OUT_DIR/made.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
+        let lines = "#!/bin/sh\nprintf %s \"$CARGO_PKG_DESCRIPTION\" > \"$OUT_DIR/made.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
         ran_script(name, lines, wrote)
     }
 
@@ -537,13 +578,13 @@ mod tests {
 
     /// What the cargo that builds next has, for a test: its variables, and a package with no
     /// targets.
-    const CARGO: Cargo<'static> = Cargo { env: &cargo_env, targets: &[] };
+    const CARGO: Cargo<'static> = Cargo { env: &cargo_env, env_names: &[], targets: &[] };
 
     /// The lines of shell a test's script is run through: the script, then what it reads.
     const WATCHES: &str =
         "#!/bin/sh\n\"$0.inner\" \"$@\" || exit $?\necho cargo:rerun-if-changed=watched\n";
 
-    /// A run of the script `lines`, which is given `wrote` as `WROTE`, as cargo and `ra-jit
+    /// A run of the script `lines`, given `wrote` as `CARGO_PKG_DESCRIPTION`, as cargo and `ra-jit
     /// build-script` leave one: in cargo's build directory, `target/debug/build/<name>-0123`,
     /// which is the package's directory too and the one the script ran in, with cargo's records
     /// of a run that printed where it ran and that it reads `watched` beside it, made after
@@ -576,7 +617,7 @@ mod tests {
         let env = vec![
             ("OUT_DIR".to_owned(), text(&out_dir)),
             ("CARGO_MANIFEST_DIR".to_owned(), text(&run_dir)),
-            ("WROTE".to_owned(), wrote.to_owned()),
+            ("CARGO_PKG_DESCRIPTION".to_owned(), wrote.to_owned()),
             ("PATH".to_owned(), std::env::var("PATH").unwrap()),
         ];
         let ran = Ran { real, cwd: run_dir.clone(), env };
@@ -1332,10 +1373,11 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
 
     #[test]
     fn a_write_into_the_directory_by_another_path_is_a_difference() {
-        let lines = "#!/bin/sh\nprintf %s new > \"$LEAK\"\necho \"cargo:in=$OUT_DIR\"\n";
+        let lines =
+            "#!/bin/sh\nprintf %s new > \"$CARGO_MANIFEST_PATH\"\necho \"cargo:in=$OUT_DIR\"\n";
         let out_dir = ran_script("by-path", lines, "");
         std::fs::write(out_dir.join("data"), "old").unwrap();
-        with_variable(&out_dir, "LEAK", &out_dir.join("data"));
+        with_variable(&out_dir, "CARGO_MANIFEST_PATH", &out_dir.join("data"));
         assert_eq!(check_as_cargos_run(&out_dir).0, Err("wrote something else".to_owned()));
     }
 
@@ -1432,7 +1474,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert_eq!(rerun_is_same(&out_dir), Ok(()));
         // The cargo that builds next has another value than the one cargo's record has.
         let set = |name: &str| (name == "RA_JIT_TEST_UNSET_VARIABLE").then(|| "1".to_owned());
-        let cargo = Cargo { env: &set, targets: &[] };
+        let cargo = Cargo { env: &set, env_names: &[], targets: &[] };
         changed(&out_dir);
         let result = current(&out_dir, &cargo);
         assert!(
@@ -1440,6 +1482,58 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             "{result:?}"
         );
         assert!(cargo_would_run(&out_dir), "nothing was run, and cargo runs it");
+    }
+
+    #[test]
+    fn a_newly_watched_variable_has_the_current_requests_value() {
+        let lines = r#"#!/bin/sh
+echo run >> "$OUT_DIR/../runs"
+n=0
+if [ "$(cat watched)" = 8 ]; then
+    echo cargo:rerun-if-env-changed=VP5_VAR
+    n=${#VP5_VAR}
+fi
+printf 'pub const RUNS: u32 = %s;\n' "$n" > "$OUT_DIR/generated.rs"
+printf %s "${VP5_VAR+x}" > "$OUT_DIR/present"
+"#;
+        for (case, before, value, expected) in [
+            ("added", None, Some("new"), 3),
+            ("changed", Some("old-value"), Some("new"), 3),
+            ("removed", Some("old-value"), None, 0),
+            ("empty", Some("old-value"), Some(""), 0),
+        ] {
+            let out_dir = ran_script(&format!("newenv-{case}"), lines, "");
+            let run_dir = out_dir.parent().unwrap();
+            if let Some(before) = before {
+                with_variable(&out_dir, "VP5_VAR", Path::new(before));
+            }
+            std::fs::write(run_dir.join("watched"), "7").unwrap();
+            run_as_cargo_does(&out_dir, 1);
+            let built = Run::of(&out_dir).unwrap();
+            std::fs::write(run_dir.join("watched"), "8").unwrap();
+            changed(&out_dir);
+            let env = |name: &str| match name {
+                "VP5_VAR" => value.map(str::to_owned),
+                _ => cargo_env(name),
+            };
+            let names = vec!["VP5_VAR".to_owned()];
+            let cargo = Cargo { env: &env, env_names: &names, targets: &[] };
+            let rerun = current(&out_dir, &cargo).unwrap();
+            assert_ne!(rerun, built, "{case}: the edited source changes the run");
+            assert_eq!(
+                std::fs::read_to_string(out_dir.join("generated.rs")).unwrap(),
+                format!("pub const RUNS: u32 = {expected};\n"),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(out_dir.join("present")).unwrap(),
+                if value.is_some() { "x" } else { "" },
+                "{case}"
+            );
+            assert_eq!(runs(&out_dir), 2, "{case}: one initial run and one edit run");
+            assert_eq!(current(&out_dir, &cargo), Ok(rerun), "{case}");
+            assert_eq!(runs(&out_dir), 2, "{case}: the recorded run stays fresh");
+        }
     }
 
     #[test]

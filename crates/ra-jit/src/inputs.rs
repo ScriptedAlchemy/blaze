@@ -401,7 +401,7 @@ impl Script {
     /// load: what cargo would find when it ran it, without asking cargo. Not when the script
     /// itself is older than its source, or was compiled reading a variable cargo does not
     /// set; cargo compiles it again. `env` is a variable as the cargo that builds next has it.
-    fn reruns_the_same(&self, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    fn reruns_the_same(&self, env: &dyn Fn(&str) -> Option<String>, env_names: &[String]) -> bool {
         use crate::cargo::script;
         let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return false };
         if !script::compiled_from_what_is_there(&out_dir, &self.workspace) {
@@ -410,7 +410,10 @@ impl Script {
         // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
         // it asked for this build, is the one cargo has, by cargo's records: it is not made
         // twice.
-        let run = script::current(&out_dir, &script::Cargo { env, targets: &self.output_targets });
+        let run = script::current(
+            &out_dir,
+            &script::Cargo { env, env_names, targets: &self.output_targets },
+        );
         run.and_then(|it| it.named(&out_dir, &self.out_dir))
             .and_then(|it| it.same_as(loaded))
             .is_ok()
@@ -784,11 +787,29 @@ impl Scripts {
         }
         // Cargo would run only the scripts whose files changed: each is run again here as
         // cargo ran it, which costs the script and not a cargo that resolves the workspace.
+        let configured = crate::cargo::configured_env(self.workspace.workspace_root().as_ref());
         let cargo_has = |name: &str| match env {
-            Some(env) => env.get(name),
+            Some(env) => match configured.iter().find(|it| it.name == name) {
+                Some(it) if it.force || env.get(name).is_none() => Some(it.value.clone()),
+                _ => self.config.extra_env.get(name).cloned().unwrap_or_else(|| env.get(name)),
+            },
             None => run_with(&self.config, name),
         };
-        if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same(&cargo_has)) {
+        let env_names: Vec<String> = match env {
+            Some(env) => env
+                .iter()
+                .map(|(name, _)| name.to_owned())
+                .chain(self.config.extra_env.keys().cloned())
+                .chain(configured.iter().map(|it| it.name.clone()))
+                .collect(),
+            None => std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .chain(self.config.extra_env.keys().cloned())
+                .collect(),
+        };
+        if !variables
+            && changed.iter().all(|&at| self.scripts[at].reruns_the_same(&cargo_has, &env_names))
+        {
             for at in changed {
                 self.scripts[at].files = self.scripts[at].watched(&[]);
                 self.scripts[at].package_stamp = self.scripts[at].package_now();

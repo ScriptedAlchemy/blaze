@@ -32,6 +32,7 @@ use anyhow::Context as _;
 use cli::{Asked, Invocation, Subcommand};
 use client::Start;
 use daemon::{Checkout, NotBuilt, Reply, Request};
+pub(crate) use state::configured_env;
 use state::{Built, Counts, Held, Staged, State};
 pub(crate) use units::Record;
 
