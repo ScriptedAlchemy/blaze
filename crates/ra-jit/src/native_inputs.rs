@@ -31,6 +31,7 @@ static LINKED_INPUTS: LazyLock<Mutex<BTreeMap<PathBuf, Digest>>> =
 struct Inputs {
     directives: Vec<Vec<u8>>,
     paths: BTreeSet<PathBuf>,
+    native: BTreeSet<PathBuf>,
     search: BTreeSet<PathBuf>,
     cwd: PathBuf,
     opaque: bool,
@@ -143,6 +144,7 @@ impl Inputs {
         env: &crate::link::Environment,
     ) {
         self.cwd = cwd.to_owned();
+        let already = self.paths.clone();
         self.directives.push(command.as_bytes().to_vec());
         let Some(words) = shlex::split(command) else {
             self.opaque = true;
@@ -275,6 +277,7 @@ impl Inputs {
                 self.paths.insert(framework.join(format!("{name}.tbd")));
             }
         }
+        self.native.extend(self.paths.difference(&already).cloned());
     }
 }
 
@@ -346,7 +349,14 @@ impl Inputs {
         frame(&mut hash, &(self.paths.len() as u64).to_le_bytes());
         for path in &self.paths {
             frame(&mut hash, path.as_os_str().as_encoded_bytes());
-            hash_path(path, &mut hash, &mut BTreeSet::new(), &self.cwd, &self.search, false)?;
+            hash_path(
+                path,
+                &mut hash,
+                &mut BTreeSet::new(),
+                &self.cwd,
+                &self.search,
+                self.native.contains(path),
+            )?;
         }
         Ok(hash.finalize().into())
     }
@@ -400,54 +410,71 @@ fn hash_path(
         let mut file_hash = Sha256::new();
         let mut file = fs::File::open(path)?;
         let mut buffer = [0; 64 * 1024];
+        let mut first = true;
+        let mut text = None;
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
+            if first {
+                first = false;
+                let bytes = &buffer[..read];
+                // Follow the content, not the basename: INPUT may name an extensionless
+                // script, or a .so symlink may resolve to one. Binary archives/objects
+                // keep the single streaming pass and never allocate a whole-file buffer.
+                let binary = native_binary(bytes);
+                let textual = !binary
+                    && (script
+                        || path
+                            .extension()
+                            .is_some_and(|ext| matches!(ext.to_str(), Some("so" | "ld")))
+                        || ["INPUT", "GROUP", "INCLUDE"].iter().any(|word| {
+                            bytes.windows(word.len()).any(|bytes| bytes == word.as_bytes())
+                        }));
+                if textual {
+                    text = Some(Vec::new());
+                }
+            }
+            if let Some(text) = &mut text {
+                text.extend_from_slice(&buffer[..read]);
+            }
             file_hash.update(&buffer[..read]);
         }
         frame(hash, &file_hash.finalize());
-        // A library named .so can be a GNU ld script rather than an ELF object.
-        // Discover its dependency closure at each digest, including commit-time rehash.
-        // Unknown textual link rules are opaque: legal full links remain available.
-        if script
-            || path.file_name().is_some_and(|name| name.to_string_lossy().contains(".so"))
-            || path.extension().is_some_and(|ext| ext == "ld")
-        {
-            let bytes = fs::read(path)?;
-            if !bytes.starts_with(b"\x7fELF") {
-                let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-                let dependencies = script_inputs(text)?;
-                let mut dirs = search.clone();
-                dirs.insert(cwd.to_owned());
-                if let Some(parent) = path.parent() {
-                    dirs.insert(parent.to_owned());
+        if let Some(bytes) = text {
+            let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+            let dependencies = script_inputs(text)?;
+            let mut dirs = search.clone();
+            dirs.insert(cwd.to_owned());
+            if let Some(parent) = path.parent() {
+                dirs.insert(parent.to_owned());
+            }
+            for (dependency, _) in dependencies {
+                let mut candidates = BTreeSet::new();
+                if dependency.starts_with('=') || dependency.starts_with("$SYSROOT") {
+                    return Err(io::Error::other("native linker script sysroot is opaque"));
                 }
-                for (dependency, included_script) in dependencies {
-                    let mut candidates = BTreeSet::new();
-                    if dependency.starts_with('=') || dependency.starts_with("$SYSROOT") {
-                        return Err(io::Error::other("native linker script sysroot is opaque"));
-                    }
-                    if let Some(name) = dependency.strip_prefix("-l") {
-                        for dir in &dirs {
-                            if let Some(exact) = name.strip_prefix(':') {
-                                candidates.insert(dir.join(exact));
-                            } else {
-                                candidates.insert(dir.join(format!("lib{name}.so")));
-                                candidates.insert(dir.join(format!("lib{name}.a")));
+                if let Some(name) = dependency.strip_prefix("-l") {
+                    for dir in &dirs {
+                        if let Some(exact) = name.strip_prefix(':') {
+                            candidates.insert(dir.join(exact));
+                        } else {
+                            for suffix in ["so", "a", "dylib", "tbd"] {
+                                candidates.insert(dir.join(format!("lib{name}.{suffix}")));
                             }
+                            candidates.insert(dir.join(format!("{name}.lib")));
                         }
-                    } else if Path::new(&dependency).is_absolute() {
-                        candidates.insert(PathBuf::from(&dependency));
-                    } else {
-                        candidates.extend(dirs.iter().map(|dir| dir.join(&dependency)));
                     }
-                    frame(hash, dependency.as_bytes());
-                    for candidate in candidates {
-                        frame(hash, candidate.as_os_str().as_encoded_bytes());
-                        hash_path(&candidate, hash, active, cwd, &dirs, included_script)?;
-                    }
+                } else if Path::new(&dependency).is_absolute() {
+                    candidates.insert(PathBuf::from(&dependency));
+                } else {
+                    candidates.extend(dirs.iter().map(|dir| dir.join(&dependency)));
+                }
+                frame(hash, dependency.as_bytes());
+                for candidate in candidates {
+                    frame(hash, candidate.as_os_str().as_encoded_bytes());
+                    hash_path(&candidate, hash, active, cwd, &dirs, true)?;
                 }
             }
         }
@@ -474,6 +501,27 @@ fn hash_path(
     }
     active.remove(&real);
     Ok(())
+}
+
+fn native_binary(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"!<arch>\n")
+        || bytes.starts_with(b"!<thin>\n")
+        || bytes.get(..4).is_some_and(|magic| {
+            matches!(
+                magic,
+                b"\xfe\xed\xfa\xce"
+                    | b"\xce\xfa\xed\xfe"
+                    | b"\xfe\xed\xfa\xcf"
+                    | b"\xcf\xfa\xed\xfe"
+                    | b"\xca\xfe\xba\xbe"
+                    | b"\xbe\xba\xfe\xca"
+            )
+        })
+        || bytes.starts_with(b"MZ")
+        || bytes.get(..2).is_some_and(|machine| {
+            matches!(machine, b"\x64\x86" | b"\x4c\x01" | b"\x64\xaa" | b"\0\0")
+        })
 }
 
 /// The dependency-only GNU ld script grammar. Other commands can change linker search
@@ -582,7 +630,7 @@ mod tests {
     #[test]
     fn a_search_directory_does_not_hash_the_link_outputs() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("libgenerated.a"), b"native").unwrap();
+        fs::write(dir.path().join("libgenerated.a"), b"!<arch>\nnative").unwrap();
         let mut inputs = Inputs::default();
         inputs.link_inputs("cc -L. -lgenerated -o program", dir.path(), &BTreeSet::new());
         let before = inputs.digest().unwrap();
@@ -597,11 +645,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("first")).unwrap();
         fs::create_dir(dir.path().join("second")).unwrap();
-        fs::write(dir.path().join("second/libvalue.a"), b"B").unwrap();
+        fs::write(dir.path().join("second/libvalue.a"), b"!<arch>\nB").unwrap();
         let mut inputs = Inputs::default();
         inputs.link_inputs("cc -Lfirst -Lsecond -lvalue -o program", dir.path(), &BTreeSet::new());
         let before = inputs.digest().unwrap();
-        fs::write(dir.path().join("first/libvalue.a"), b"A").unwrap();
+        fs::write(dir.path().join("first/libvalue.a"), b"!<arch>\nA").unwrap();
         assert_ne!(inputs.digest().unwrap(), before);
     }
 
@@ -611,7 +659,7 @@ mod tests {
         let proxy = dir.path().join("libproxy.so");
         let archive = dir.path().join("impl.a");
         let include = dir.path().join("inner");
-        fs::write(&archive, b"A").unwrap();
+        fs::write(&archive, b"!<arch>\nA").unwrap();
         for script in
             ["INPUT(impl.a)", "/* GNU ld script */ GROUP( AS_NEEDED(impl.a) )", "INCLUDE inner"]
         {
@@ -619,15 +667,15 @@ mod tests {
             fs::write(&include, "INPUT(impl.a)").unwrap();
             let tracked = inputs(&proxy);
             let before = tracked.digest().unwrap();
-            fs::write(&archive, b"B").unwrap();
+            fs::write(&archive, b"!<arch>\nB").unwrap();
             assert_ne!(tracked.digest().unwrap(), before, "{script}");
-            fs::write(&archive, b"A").unwrap();
+            fs::write(&archive, b"!<arch>\nA").unwrap();
             assert_eq!(tracked.digest().unwrap(), before, "{script}");
         }
         fs::write(&include, "INPUT(other.a)").unwrap();
         let tracked = inputs(&proxy);
         let before = tracked.digest().unwrap();
-        fs::write(dir.path().join("other.a"), b"C").unwrap();
+        fs::write(dir.path().join("other.a"), b"!<arch>\nC").unwrap();
         assert_ne!(tracked.digest().unwrap(), before);
         fs::write(&include, "INCLUDE libproxy.so").unwrap();
         assert!(tracked.digest().is_err(), "an included script cycle cannot be reused");
@@ -642,8 +690,8 @@ mod tests {
         let b = dir.path().join("b");
         fs::create_dir(&a).unwrap();
         fs::create_dir(&b).unwrap();
-        fs::write(a.join("libchoice.a"), b"A").unwrap();
-        fs::write(b.join("libchoice.a"), b"B").unwrap();
+        fs::write(a.join("libchoice.a"), b"!<arch>\nA").unwrap();
+        fs::write(b.join("libchoice.a"), b"!<arch>\nB").unwrap();
         let mut db = RootDatabase::default();
         let request = |path: &Path| {
             [("LIBRARY_PATH".to_owned(), path.display().to_string())].into_iter().collect()
@@ -661,6 +709,32 @@ mod tests {
         assert!(input_b.paths.contains(&b.join("libchoice.a")));
         assert!(!input_b.paths.contains(&a.join("libchoice.a")));
         assert_ne!(input_a.digest().unwrap(), input_b.digest().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extensionless_input_scripts_and_symlink_targets_have_transitive_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dir.path().join("libproxy.so");
+        let inner = dir.path().join("inner");
+        let archive = dir.path().join("impl.a");
+        fs::write(&inner, "INPUT(impl.a)").unwrap();
+        fs::write(&archive, b"!<arch>\nA").unwrap();
+        for linked in [false, true] {
+            if linked {
+                fs::remove_file(&proxy).unwrap();
+                symlink("inner", &proxy).unwrap();
+            } else {
+                fs::write(&proxy, "GROUP(inner)").unwrap();
+            }
+            let before = inputs(&proxy).digest().unwrap();
+            fs::write(&archive, b"!<arch>\nB").unwrap();
+            assert_ne!(inputs(&proxy).digest().unwrap(), before);
+            fs::write(&archive, b"!<arch>\nA").unwrap();
+            assert_eq!(inputs(&proxy).digest().unwrap(), before);
+        }
     }
 
     #[test]
