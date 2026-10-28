@@ -1189,6 +1189,7 @@ fn project_json_to_crate_graph(
                     version,
                     cfg,
                     target,
+                    codegen_flags,
                     env,
                     crate_attrs,
                     proc_macro_dylib_path,
@@ -1271,6 +1272,7 @@ fn project_json_to_crate_graph(
                     },
                     crate_ws_data.clone(),
                 );
+                crate_graph.set_codegen_flags(crate_graph_crate_id, codegen_flags.clone());
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),
@@ -1429,6 +1431,7 @@ fn cargo_to_crate_graph(
                     },
                     &cargo_path,
                 );
+                crate_graph.set_codegen_flags(crate_id, pkg_data.codegen_flags.clone());
                 // Even crates that don't set proc-macro = true are allowed to depend on proc_macro
                 // (just none of the APIs work when called outside of a proc macro).
                 if let Some(proc_macro) = libproc_macro {

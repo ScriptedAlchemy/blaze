@@ -113,6 +113,7 @@ impl Selection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Built {
     pub(crate) features: BTreeSet<String>,
+    pub(crate) codegen_flags: Vec<String>,
     pub(crate) profile: Profile,
     /// Whether the package is one cargo was asked to build, not one those depend on.
     pub(crate) primary: bool,
@@ -375,6 +376,7 @@ impl Profile {
 /// after the profile's own on the command line and so win.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Flags {
+    codegen_flags: Vec<String>,
     opt_level: Option<String>,
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
@@ -425,7 +427,10 @@ impl Flags {
     }
 
     fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Flags {
+        let all: Vec<&str> = words.by_ref().collect();
+        let mut words = all.iter().copied();
         let mut flags = Flags::default();
+        flags.codegen_flags = all.iter().map(|it| (*it).to_owned()).collect();
         while let Some(word) = words.next() {
             if ["--cap-lints", "--force-warn"].iter().any(|it| {
                 word.strip_prefix(it).is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
@@ -685,6 +690,15 @@ impl Plan {
             lto |= for_target && profile.links_from_bitcode();
             let built = Built {
                 features: data.active_features.iter().cloned().collect(),
+                codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
+                    .chain(
+                        flags
+                            .codegen_flags
+                            .iter()
+                            .filter(|_| for_target || selection.target.is_none())
+                            .cloned(),
+                    )
+                    .collect(),
                 profile: profile.with(&flags),
                 primary: roots.contains(package),
                 for_target,
@@ -923,7 +937,21 @@ impl UnitGraph {
                 let features = unit.features.iter().cloned().collect();
                 let (profile, primary) = (unit.profile.with(flags), roots.contains(id));
                 let for_target = for_target.contains(&index);
-                (package_named(id), Built { features, profile, primary, for_target })
+                (
+                    package_named(id),
+                    Built {
+                        features,
+                        profile,
+                        primary,
+                        for_target,
+                        codegen_flags: std::iter::once(format!(
+                            "-Copt-level={}",
+                            unit.profile.opt_level
+                        ))
+                        .chain(flags.codegen_flags.iter().cloned())
+                        .collect(),
+                    },
+                )
             })
             .collect();
         Ok(Plan {

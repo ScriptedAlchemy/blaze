@@ -188,6 +188,7 @@ fn calls_after_imports(db: &dyn HirDatabase, pending: &Pending) -> Vec<FuncReque
         return pending.wants.requests.funcs.clone();
     };
     let mut recorder = Recorder::new(db, &**isa, target, false);
+    recorder.machine = pending.wants.machine.clone();
     let (funcs, datas) = recorder.moved_requests(&pending.wants.requests);
     let chosen = imports::chosen_for(&mut recorder, &|_| false, imports::BUDGET);
     let imported: FxHashMap<u32, &imports::Import> = chosen.iter().map(|it| (it.id, it)).collect();
@@ -720,6 +721,11 @@ fn unit(db: &dyn HirDatabase, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
         return alone(members, "no LLVM");
     };
     let mut recorder = Recorder::new(db, &**isa, target, false);
+    let machine = members[0].pending.wants.machine.clone();
+    if members.iter().any(|member| member.pending.wants.machine != machine) {
+        return alone(members, "different target machines");
+    }
+    recorder.machine = machine;
     // Each function in the unit's names, and the request the others call it by.
     let mut funcs = Vec::with_capacity(members.len());
     let mut defined: FxHashSet<Instance> = FxHashSet::default();

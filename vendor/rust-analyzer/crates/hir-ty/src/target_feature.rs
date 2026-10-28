@@ -1052,4 +1052,55 @@ static TARGET_FEATURE_IMPLICATIONS_RAW: &[&[(&str, Stability, ImpliedFeatures)]]
     M68K_FEATURES,
     AVR_FEATURES,
 ];
+
+/// Architecture-specific implications for effective compiler flags, including disabling
+/// a prerequisite's dependents. Do not merge ARM and x86 features of the same name.
+pub(crate) fn flag_features(
+    arch: &str,
+    initial: impl IntoIterator<Item = String>,
+    changes: &std::collections::BTreeMap<String, bool>,
+) -> std::collections::BTreeSet<String> {
+    let rules = match arch {
+        "aarch64" => AARCH64_FEATURES,
+        "x86_64" | "x86" => X86_FEATURES,
+        _ => &[],
+    };
+    let mut enabled = initial.into_iter().collect::<std::collections::BTreeSet<_>>();
+    for (name, on) in changes {
+        if *on {
+            enabled.insert(name.clone());
+        } else {
+            enabled.remove(name);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &(name, _, dependencies) in rules {
+            if enabled.contains(name) {
+                for dependency in dependencies {
+                    changed |= enabled.insert((*dependency).to_owned());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (name, on) in changes {
+        if !*on {
+            enabled.remove(name);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &(name, _, dependencies) in rules {
+            if enabled.contains(name) && dependencies.iter().any(|dep| !enabled.contains(*dep)) {
+                changed |= enabled.remove(name);
+            }
+        }
+        if !changed {
+            return enabled;
+        }
+    }
+}
 // spellchecker:on

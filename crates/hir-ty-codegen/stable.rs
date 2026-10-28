@@ -465,6 +465,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     fn spell_crate(&self, out: &mut String, krate: Crate) -> Option<()> {
+        let flags = &krate.data(self.db).codegen_flags;
+        if !flags.is_empty() {
+            // Library symbols can be supplied by a toolchain with the same crate id but
+            // another effective target machine. Keep their code entries distinct too.
+            write!(out, "codegen{flags:?}:").ok()?;
+        }
         // The source of a crate of the workspace changes too, built by the daemon or not.
         if self.of_the_checkout(krate) {
             if !self.by_content {

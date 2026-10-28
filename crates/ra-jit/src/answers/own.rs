@@ -98,6 +98,7 @@ struct Given<'a> {
     unstable_options: bool,
     from_stdin: bool,
     extra_filename: bool,
+    target_features: Vec<&'a str>,
 }
 
 /// The flags that take a value and change no answer.
@@ -194,6 +195,7 @@ impl<'a> Given<'a> {
                         "debug-assertions" => given.debug_assertions = Some(yes(value)?),
                         "overflow-checks" => given.overflow_checks = Some(yes(value)?),
                         "panic" => given.panic = Some(value?),
+                        "target-feature" => given.target_features.push(value?),
                         "extra-filename" => given.extra_filename = true,
                         name if IGNORED_CODEGEN.contains(&name) => {}
                         _ => return None,
@@ -261,6 +263,24 @@ pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
 
 fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {
     let mut cfgs = target.cfg.clone();
+    if !given.target_features.is_empty() {
+        let arch = cfgs.iter().find_map(|cfg| cfg.strip_prefix("target_arch=\""))?;
+        let arch = arch.trim_end_matches('"').to_owned();
+        let initial = cfgs
+            .iter()
+            .filter_map(|cfg| cfg.strip_prefix("target_feature=\""))
+            .map(|name| name.trim_end_matches('"').to_owned())
+            .collect::<Vec<_>>();
+        let flags = given
+            .target_features
+            .iter()
+            .map(|flags| format!("-Ctarget-feature={flags}"))
+            .collect::<Vec<_>>();
+        let features = hir_ty::mir::codegen_options::TargetMachine::from_flags(&flags)
+            .effective_features(&arch, initial);
+        cfgs.retain(|cfg| !cfg.starts_with("target_feature="));
+        cfgs.extend(features.into_iter().map(|feature| format!("target_feature={feature:?}")));
+    }
     if nightly {
         cfgs.extend(target.nightly_cfg.iter().cloned());
     }
@@ -460,7 +480,7 @@ mod tests {
         assert!(Given::of(&["-C", "opt-level=0"]).is_some_and(|it| it.debug_assertions()));
         // What may change the target's features is rustc's to answer.
         assert!(Given::of(&["-C", "target-cpu=native", "--print", "cfg"]).is_none());
-        assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_none());
+        assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_some());
         assert!(Given::of(&["-Z", "ub-checks", "--print", "cfg"]).is_none());
     }
 }

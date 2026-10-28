@@ -238,6 +238,7 @@ pub struct PackageData {
     /// What the profile cargo builds the package with changes of the toolchain's cfg, when the
     /// build is known.
     pub profile_cfg: Option<cfg::CfgDiff>,
+    pub codegen_flags: Vec<String>,
     /// Whether the package is one the build was asked for, which cargo tells its crates with
     /// `CARGO_PRIMARY_PACKAGE`.
     pub primary: bool,
@@ -458,6 +459,7 @@ impl CargoWorkspace {
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
                 profile_cfg: None,
+                codegen_flags: Vec::new(),
                 primary: false,
                 metadata: meta.rust_analyzer.unwrap_or_default(),
                 all_member_deps: None,
@@ -579,6 +581,10 @@ impl CargoWorkspace {
     /// Sets what the profile the package is built with changes of the toolchain's cfg.
     pub fn set_profile_cfg(&mut self, package: Package, cfg: cfg::CfgDiff) {
         self.packages[package].profile_cfg = Some(cfg);
+    }
+
+    pub fn set_codegen_flags(&mut self, package: Package, flags: Vec<String>) {
+        self.packages[package].codegen_flags = flags;
     }
 
     /// Sets whether the package is one the build was asked for.

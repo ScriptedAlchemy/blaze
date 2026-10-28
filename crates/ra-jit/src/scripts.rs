@@ -1170,6 +1170,9 @@ impl<'a> Runner<'a> {
             root: root.to_owned(),
             edition: data.edition.to_string(),
             cfg,
+            codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
+                .chain(self.host_flags.iter().cloned())
+                .collect(),
             env,
             deps: Vec::new(),
         })
@@ -1235,8 +1238,8 @@ fn apply_flags(flags: &[String]) -> Applied {
             match name.replace('_', "-").as_str() {
                 "debug-assertions" => applied.debug_assertions = on,
                 "overflow-checks" => applied.overflow_checks = on,
-                // Applied by the effective profile, including implicit assertion settings.
-                "opt-level" => {}
+                // Carried as typed target-machine inputs, not simulated cfg values.
+                "opt-level" | "target-feature" | "target-cpu" => {}
                 "panic" if matches!(setting, Some("abort" | "unwind")) => {
                     applied.panic = setting.map(str::to_owned);
                 }

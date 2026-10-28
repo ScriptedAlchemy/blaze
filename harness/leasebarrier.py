@@ -2250,6 +2250,61 @@ def program_flag_cfg(sc, source_sha):
     build-script cfg. Both implicit and explicit target loads must retain it."""
     hostflags(sc, source_sha, program_cfg=True)
 
+def machine_lse(sc, source_sha):
+    """AArch64 target-feature=lse must select actual atomic instructions, not just cfgs.
+    The same daemon/store sees +lse, -lse, +lse; each program must execute like Cargo."""
+    if not sys.platform.startswith("linux"):
+        sc.fail("the LSE machine-code witness requires Linux AArch64 objdump")
+        return
+    host = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+    if "host: aarch64-" not in host:
+        sc.fail("the LSE runtime witness requires an AArch64 host")
+        return
+    original = sc.project
+    source = r'''#![feature(core_intrinsics)]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn machine_add(ptr: *mut u64) -> u64 {
+    unsafe { core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::SeqCst }>(ptr, 1) }
+}
+fn main() {
+    let mut value = 41u64;
+    let old = unsafe { machine_add(&mut value) };
+    println!("atomic={old}/{value} lse={}", cfg!(target_feature = "lse"));
+}'''
+    def project(ws=None, config=None, pkg="gen"):
+        original(ws, config, pkg)
+        ws = ws or sc.ws
+        manifest = open(os.path.join(ws, "Cargo.toml")).read().replace('build = "build.rs"', "build = false")
+        with open(os.path.join(ws, "Cargo.toml"), "w") as f:
+            f.write(manifest)
+        for name in ("one", "two"):
+            with open(os.path.join(ws, "src", name + ".rs"), "w") as f:
+                f.write(source)
+    sc.project = project
+    expected = {sign: sc.oracle("a", {"RUSTFLAGS": "-Ctarget-feature=" + sign + "lse", "RUSTC_BOOTSTRAP": "1"})
+                for sign in ("+", "-")}
+    sc.project()
+    for index, sign in enumerate(("+", "-", "+")):
+        p = sc.client("a", RUSTFLAGS="-Ctarget-feature=" + sign + "lse", RUSTC_BOOTSTRAP="1")
+        sc.finish(p, f"machine-{index}")
+        if p.returncode != 0 or "[ra-jit]" not in p.err:
+            sc.fail(f"machine {sign}: not a successful daemon build: {p.err[-700:]}")
+            return
+        got = sc.program("gen-one")
+        want = (expected[sign] or {}).get("gen-one")
+        exe = os.path.join(sc.ws, "target", "debug", "gen-one")
+        dis = subprocess.run(["objdump", "-d", "--disassemble=machine_add", exe],
+                             capture_output=True, text=True)
+        with open(os.path.join(sc.dir, f"machine-{index}.asm"), "w") as f:
+            f.write(dis.stdout + dis.stderr)
+        lse = bool(re.search(r"\bldaddal\b", dis.stdout))
+        sc.notes.setdefault("programs", {})[str(index)] = {"got": got, "want": want, "ldaddal": lse}
+        if got != want:
+            sc.fail(f"machine {sign}: {got!r}, cargo's {want!r}")
+        if dis.returncode != 0 or lse != (sign == "+"):
+            sc.fail(f"machine {sign}: expected {'ldaddal' if sign == '+' else 'non-LSE loop'}, got {dis.stdout[-900:]}")
+
 
 def unrelated(sc, source_sha):
     """A worker has R and S loaded, and another worker runs S's script again. An edit to R,
@@ -2499,6 +2554,7 @@ SCENARIOS = {
     "hostflags": hostflags,
     "host-codegen": host_codegen,
     "program-flag-cfg": program_flag_cfg,
+    "machine-lse": machine_lse,
     "choice-stable": choice_stable,
     "overlay": overlay,
     "worlds": worlds,

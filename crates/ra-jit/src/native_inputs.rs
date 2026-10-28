@@ -145,6 +145,7 @@ impl Inputs {
     ) {
         self.cwd = cwd.to_owned();
         let already = self.paths.clone();
+        let mut bytes_only = BTreeSet::new();
         self.directives.push(command.as_bytes().to_vec());
         let Some(words) = shlex::split(command) else {
             self.opaque = true;
@@ -209,7 +210,11 @@ impl Inputs {
                 | "-unexported_symbols_list"
                 | "-order_file" => match next() {
                     Some(path) => {
-                        self.paths.insert(cwd.join(path));
+                        let path = cwd.join(path);
+                        if !matches!(word.as_str(), "-T" | "--script") {
+                            bytes_only.insert(path.clone());
+                        }
+                        self.paths.insert(path);
                         // A full linker script can change the linker's implicit search,
                         // sysroot and output rules. Until those rules are interpreted in
                         // full, it links legally but does not advertise a reusable key.
@@ -240,7 +245,11 @@ impl Inputs {
                         })
                         .map(|(_, path)| path);
                     if let Some(file) = file {
-                        self.paths.insert(cwd.join(file));
+                        let path = cwd.join(file);
+                        if !word.starts_with("--script=") {
+                            bytes_only.insert(path.clone());
+                        }
+                        self.paths.insert(path);
                         self.opaque |= word.starts_with("--script=");
                     } else if !word.starts_with('-') {
                         let path = cwd.join(word);
@@ -277,7 +286,14 @@ impl Inputs {
                 self.paths.insert(framework.join(format!("{name}.tbd")));
             }
         }
-        self.native.extend(self.paths.difference(&already).cloned());
+        self.native.extend(
+            self.paths
+                .difference(&already)
+                .filter(|path| {
+                    !bytes_only.contains(*path) && path.extension().is_none_or(|ext| ext != "tbd")
+                })
+                .cloned(),
+        );
     }
 }
 
@@ -735,6 +751,22 @@ mod tests {
             fs::write(&archive, b"!<arch>\nA").unwrap();
             assert_eq!(inputs(&proxy).digest().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn linker_maps_and_text_stubs_are_byte_inputs_not_dependency_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("exports.map"), "{ global: entry; local: *; };").unwrap();
+        fs::write(dir.path().join("libchoice.tbd"), "--- !tapi-tbd\nexports: []\n").unwrap();
+        let mut inputs = Inputs::default();
+        inputs.link_inputs(
+            "cc -L. -lchoice -Wl,--version-script=exports.map -o program",
+            dir.path(),
+            &BTreeSet::new(),
+        );
+        let before = inputs.digest().unwrap();
+        fs::write(dir.path().join("exports.map"), "{ global: other; local: *; };").unwrap();
+        assert_ne!(inputs.digest().unwrap(), before);
     }
 
     #[test]

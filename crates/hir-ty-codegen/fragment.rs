@@ -365,6 +365,8 @@ pub(super) struct Recorder<'db> {
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
     pub(super) isa: &'static dyn TargetIsa,
+    /// Captured from the crate input for this compile; detached tiers retain it too.
+    pub(super) machine: hir_ty::mir::codegen_options::TargetMachine,
     pub(super) requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -379,6 +381,7 @@ impl Wants {
     pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
         Wants {
             isa,
+            machine: Default::default(),
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),

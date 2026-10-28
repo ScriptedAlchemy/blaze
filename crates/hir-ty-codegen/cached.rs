@@ -240,6 +240,7 @@ impl StoredCode {
     /// which requests the IR's names stand for, which LLVM's code has in it.
     pub(super) fn key<'a>(
         optimization: super::backend::Optimization,
+        machine: &hir_ty::mir::codegen_options::TargetMachine,
         func: &cranelift_codegen::ir::Function,
         named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
         constants: impl Iterator<Item = (u32, &'a [u8])>,
@@ -249,6 +250,7 @@ impl StoredCode {
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
         hasher.update(b"ra-jit llvm 7");
+        hasher.update(format!("{machine:?}"));
         // Nor what the types of the parameters say of the memory they point to.
         for (at, pointee) in pointees {
             let super::fragment::Pointee { unique, frozen, size, align } = *pointee;

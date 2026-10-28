@@ -201,7 +201,19 @@ impl Backend {
                 tally.fell_back(Duration::ZERO, "a handler LLVM lowers only for a tier");
             }
             #[cfg(feature = "llvm")]
-            Backend::Llvm(optimization) => {
+            Backend::Llvm(mut optimization) => {
+                if let Some(level) = recorder.machine.opt_level.as_deref() {
+                    optimization.passes = match level {
+                        "0" => Passes::None,
+                        "1" => Passes::Less,
+                        "2" => Passes::Default,
+                        "3" | "s" | "z" => Passes::Aggressive,
+                        _ => optimization.passes,
+                    };
+                    if optimization.passes == Passes::None {
+                        optimization.selection = Selection::Fast;
+                    }
+                }
                 let start = Instant::now();
                 match Self::emit_with_llvm(recorder, &context.func, optimization) {
                     Ok(code) => {
@@ -217,7 +229,7 @@ impl Backend {
         let _span = tracing::info_span!(target: "ra_jit", "cranelift").entered();
         let start = Instant::now();
         let pairs = super::float_pair::lower(recorder, &mut context.func);
-        let mut code = super::emit(context)?;
+        let mut code = super::emit_for(context, &recorder.machine)?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots = SlotPlaces::of_frame(recorder.isa, frame, recorder.named_slots());
         }
@@ -274,6 +286,7 @@ impl Backend {
         let store = Store::global().filter(|_| recorder.seen.is_empty());
         let Some((store, key)) = store.zip(StoredCode::key(
             optimization,
+            &recorder.machine,
             func,
             named.iter().copied(),
             recorder.constants(),

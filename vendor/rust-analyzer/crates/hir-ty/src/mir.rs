@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+pub mod codegen_options;
 mod eval;
 mod held;
 pub mod location;

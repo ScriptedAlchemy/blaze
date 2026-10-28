@@ -4360,6 +4360,13 @@ fn compile_as<'db>(
 ) -> Result<Produced> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
+    cg.machine =
+        hir_ty::mir::codegen_options::TargetMachine::from_flags(&env.krate.data(db).codegen_flags);
+    if let Some(function) = body.and_then(|body| body.owner.as_function()) {
+        for feature in AttrFlags::target_features(db, function) {
+            cg.machine.features.insert(feature.as_str().to_owned(), true);
+        }
+    }
     let tally = backend::Tally::global();
     /// `RA_JIT_PROMOTE=0` leaves every local in its slot of the frame.
     static PROMOTE: LazyLock<bool> =
@@ -4751,11 +4758,23 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
 /// Runs Cranelift on a finished function. Cranelift panics on IR it has no lowering for
 /// (i128 corners, for one); that must cost us one function, not the process.
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+    emit_for(ctx, &Default::default())
+}
+
+fn emit_for(
+    ctx: &mut cranelift_codegen::Context,
+    options: &hir_ty::mir::codegen_options::TargetMachine,
+) -> Result<Code> {
     if Target::current().is_wasm() {
         return emit_wasm(&ctx.func, Target::current().calls());
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
-    let mut isa = &**if large { target_for_large()? } else { target()? };
+    let mut owned = if *options == Default::default() {
+        if large { target_for_large()?.clone() } else { target()?.clone() }
+    } else {
+        configured_target(options, large, false)?
+    };
+    let mut isa = &*owned;
     let func = &ctx.func;
     if !isa.flags().preserve_frame_pointers()
         && (backend::frame_pointers()
@@ -4765,7 +4784,12 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                     .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetFramePointer)
             }))
     {
-        isa = &**target_with_frame_pointer()?;
+        owned = if *options == Default::default() {
+            target_with_frame_pointer()?.clone()
+        } else {
+            configured_target(options, large, true)?
+        };
+        isa = &*owned;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store::Store::global() {
@@ -4810,6 +4834,28 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
                 .or_else(|| panic.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown");
             Err(CodegenError::Backend(format!("backend panic: {message}")))
+        }
+    }
+}
+
+fn configured_target(
+    options: &hir_ty::mir::codegen_options::TargetMachine,
+    large: bool,
+    frame_pointers: bool,
+) -> Result<isa::OwnedTargetIsa> {
+    type Options = hir_ty::mir::codegen_options::TargetMachine;
+    static MACHINES: LazyLock<
+        std::sync::Mutex<FxHashMap<(Options, bool, bool), isa::OwnedTargetIsa>>,
+    > = LazyLock::new(Default::default);
+    let mut machines = MACHINES.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (options.clone(), large, frame_pointers);
+    match machines.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let isa = selected_target()?
+                .isa_for(if large { "single_pass" } else { regalloc() }, frame_pointers, options)
+                .map_err(CodegenError::Backend)?;
+            Ok(entry.insert(isa).clone())
         }
     }
 }
@@ -10361,8 +10407,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let arch = self.cg.target.arch;
         let features = self.body.and_then(|it| it.owner.as_function());
         let features = features.map(|func| AttrFlags::target_features(self.cg.db, func));
-        let extensions =
-            asm::extensions(arch, features.into_iter().flatten().map(|it| it.as_str()));
+        let mut enabled = self
+            .cg
+            .machine
+            .features
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .map(|(feature, _)| feature.as_str())
+            .collect::<Vec<_>>();
+        enabled.extend(features.into_iter().flatten().map(|it| it.as_str()));
+        let extensions = asm::extensions(arch, enabled);
         if block.naked {
             let text = asm::naked(arch, &block.template, block.options, &operands)
                 .map_err(CodegenError::Unsupported)?;

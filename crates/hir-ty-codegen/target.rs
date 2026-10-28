@@ -272,6 +272,15 @@ impl Target {
         regalloc: &str,
         frame_pointers: bool,
     ) -> Result<OwnedTargetIsa, String> {
+        self.isa_for(regalloc, frame_pointers, &Default::default())
+    }
+
+    pub(super) fn isa_for(
+        &self,
+        regalloc: &str,
+        frame_pointers: bool,
+        options: &hir_ty::mir::codegen_options::TargetMachine,
+    ) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
         // An image of PE reaches all of itself relative to the instruction, and what it
         // imports through the stubs the linker adds: there is no table of addresses to go
@@ -294,7 +303,12 @@ impl Target {
             // Cranelift gives a function its frame pointer only when all of them keep one.
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
-        flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+        let optimization = match options.opt_level.as_deref() {
+            Some("s" | "z") => "speed_and_size",
+            Some("1" | "2" | "3") => "speed",
+            _ => "none",
+        };
+        flags.set("opt_level", optimization).map_err(|e| e.to_string())?;
         // Cranelift checks the IR of every function it is given unless told not to.
         let verify = if cfg!(debug_assertions) { "true" } else { "false" };
         flags.set("enable_verifier", verify).map_err(|e| e.to_string())?;
@@ -312,6 +326,72 @@ impl Target {
             // swaps 128 bits, as `core::arch::x86_64::cmpxchg16b` does.
             isa.enable("has_cmpxchg16b").map_err(|e| e.to_string())?;
         }
+        if let Some(cpu) = options.cpu.as_deref() {
+            // x86 Cranelift CPU presets are real instruction-set presets. AArch64 has
+            // no CPU presets; its CPU tuning remains an LLVM setting, not guessed here.
+            if self.arch == Arch::X86_64 && cpu != "generic" && cpu != "x86-64" {
+                if let Err(error) = isa.enable(cpu) {
+                    eprintln!("codegen: Cranelift has no target-cpu preset for {cpu}: {error}");
+                }
+            } else if self.arch == Arch::Aarch64 && cpu != "generic" {
+                eprintln!("codegen: target-cpu={cpu} tuning is not applied by Cranelift");
+            }
+        }
+        for (feature, enabled) in &options.features {
+            let setting = match (self.arch, feature.as_str()) {
+                (Arch::Aarch64, "lse") => Some("has_lse"),
+                (Arch::Aarch64, "fp16") => Some("has_fp16"),
+                (Arch::Aarch64, "dotprod") => Some("has_dotprod"),
+                (Arch::Aarch64, "i8mm") => Some("has_i8mm"),
+                (Arch::Aarch64, "paca" | "pacg") => Some("has_pauth"),
+                (Arch::X86_64, "sse3") => Some("has_sse3"),
+                (Arch::X86_64, "ssse3") => Some("has_ssse3"),
+                (Arch::X86_64, "sse4.1") => Some("has_sse41"),
+                (Arch::X86_64, "sse4.2") => Some("has_sse42"),
+                (Arch::X86_64, "avx") => Some("has_avx"),
+                (Arch::X86_64, "avx2") => Some("has_avx2"),
+                (Arch::X86_64, "fma") => Some("has_fma"),
+                (Arch::X86_64, "bmi1") => Some("has_bmi1"),
+                (Arch::X86_64, "bmi2") => Some("has_bmi2"),
+                (Arch::X86_64, "lzcnt") => Some("has_lzcnt"),
+                (Arch::X86_64, "popcnt") => Some("has_popcnt"),
+                (Arch::X86_64, "cmpxchg16b") => Some("has_cmpxchg16b"),
+                _ => None,
+            };
+            match setting {
+                Some(setting) => isa
+                    .set(setting, if *enabled { "true" } else { "false" })
+                    .map_err(|error| error.to_string())?,
+                None => eprintln!(
+                    "codegen: target-feature={}{feature} is not applied by Cranelift",
+                    if *enabled { '+' } else { '-' }
+                ),
+            }
+        }
         isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    #[test]
+    fn lse_flags_change_the_actual_cranelift_target_without_mutating_the_baseline() {
+        let target = Target::parse("aarch64-unknown-linux-gnu").unwrap();
+        let enabled = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-feature=+lse".to_owned(),
+        ]);
+        let disabled = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-feature=-lse".to_owned(),
+        ]);
+        let yes = target.isa_for("backtracking", false, &enabled).unwrap();
+        let no = target.isa_for("backtracking", false, &disabled).unwrap();
+        let setting = |isa: &OwnedTargetIsa| {
+            isa.isa_flags().into_iter().find(|flag| flag.name == "has_lse").unwrap().as_bool()
+        };
+        assert_eq!(setting(&yes), Some(true));
+        assert_eq!(setting(&no), Some(false));
+        assert_eq!(setting(&target.isa("backtracking", false).unwrap()), Some(false));
     }
 }

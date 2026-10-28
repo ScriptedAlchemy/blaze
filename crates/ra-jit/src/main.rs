@@ -3299,6 +3299,7 @@ fn workspace_at(
                 cargo.set_profile_cfg(package, profile.cfg());
             }
             let Some(built) = built else { continue };
+            cargo.set_codegen_flags(package, built.codegen_flags.clone());
             cargo.set_active_features(package, built.features.iter().cloned().collect());
             cargo.set_primary(package, built.primary);
         }
