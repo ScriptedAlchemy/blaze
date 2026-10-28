@@ -2353,6 +2353,9 @@ def native_only(sc, source_sha, proxy=None):
         if p.returncode != 0:
             sc.fail(f"native-only {value}: rc={p.returncode}: {p.err[-600:]}")
             return
+        if "[ra-jit]" not in p.err:
+            sc.fail("the native witness was not built by the daemon")
+            return
         sc.check_programs(f"native-{index}", sc.keep(f"native-{index}"), expected[value], "a")
         if proxy:
             hashes.append({name: sha256(os.path.join(sc.run_dir(), name))
@@ -2419,6 +2422,9 @@ def native_request_env(sc, source_sha):
         sc.finish(p, "library-path-" + name)
         if p.returncode != 0:
             sc.fail(f"LIBRARY_PATH={name}: rc={p.returncode}: {p.err[-600:]}")
+            return
+        if "[ra-jit]" not in p.err:
+            sc.fail("the native environment witness was not built by the daemon")
             return
         for program in PROGRAMS:
             got = sc.program(program)
