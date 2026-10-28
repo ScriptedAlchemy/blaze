@@ -2167,7 +2167,7 @@ HOSTFLAGS_PROGRAM = r"""fn main() {
 """
 
 
-def hostflags(sc, source_sha, codegen=False, program_cfg=False):
+def hostflags(sc, source_sha, codegen=False, program_cfg=False, audit=False):
     """The flags for rustc cargo gives a build script's compile. With RUSTFLAGS and no `--target`, the scripts are
     compiled with them (`cfg!(hostflag)` is true in the script); with `--target`, even the host's triple, they are
     not, and the script still runs with the target's flags in `CARGO_ENCODED_RUSTFLAGS`; the program's crate has them
@@ -2213,7 +2213,20 @@ fn main() { println!("program-cfg={}", selected()); }'''
         shutil.rmtree(ws, ignore_errors=True)
         project(ws)
         client_env = dict(sc.env(mode), RUSTFLAGS=flags)
-        p = subprocess.Popen(["cargo", "ra-jit", "build", "--bin", "gen-one", *args], cwd=ws, env=client_env,
+        if audit:
+            import norustc
+            log = os.path.join(sc.dir, f"audit-{mode}.log")
+            toolchain = norustc.stand_ins(os.path.join(sc.dir, f"standins-{mode}"), log)
+            client_env.update(RUSTUP_TOOLCHAIN=toolchain,
+                              RUSTUP_HOME=os.path.join(sc.dir, "unused-rustup"),
+                              PATH=os.path.join(toolchain, "bin") + os.pathsep + client_env["PATH"])
+            for name in ("RUSTC", "RUSTDOC", "CARGO"):
+                client_env[name] = os.path.join(toolchain, "bin", name.lower())
+            # The user-facing Cargo launcher is not a query performed by blaze.
+            argv = [RA_JIT, "cargo", "build", "--bin", "gen-one", *args]
+        else:
+            argv = ["cargo", "ra-jit", "build", "--bin", "gen-one", *args]
+        p = subprocess.Popen(argv, cwd=ws, env=client_env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
                              stdin=subprocess.DEVNULL)
         if mode not in sc.daemons:
@@ -2237,6 +2250,20 @@ fn main() { println!("program-cfg={}", selected()); }'''
         sc.notes.setdefault("programs", {})[mode] = {"got": got, "want": want}
         if got != want:
             sc.fail(f"{mode}: the program printed {got!r}, cargo's {want!r}")
+        if audit:
+            first = norustc.runs(log)
+            retry = subprocess.run(argv, cwd=ws, env=client_env, capture_output=True, text=True,
+                                   timeout=WAIT)
+            with open(os.path.join(sc.dir, f"client-{mode}-noop.err"), "w") as f:
+                f.write(retry.stderr)
+            all_runs = norustc.runs(log)
+            sc.notes.setdefault("audit", {})[mode] = {"cold": first, "noop": all_runs[len(first):]}
+            if first or all_runs[len(first):]:
+                sc.fail(f"{mode}: expected 0 compiler/0 Cargo queries in cold/noop: {all_runs}")
+            if retry.returncode != 0 or "[ra-jit]" not in retry.stderr:
+                sc.fail(f"{mode}: audited no-op was not a successful blaze build")
+            if subprocess.run([exe], capture_output=True, text=True).stdout != want:
+                sc.fail(f"{mode}: audited no-op program differs from Cargo")
 
 
 def host_codegen(sc, source_sha):
@@ -2249,6 +2276,12 @@ def program_flag_cfg(sc, source_sha):
     """An item needed by the program exists only under RUSTFLAGS --cfg, not a
     build-script cfg. Both implicit and explicit target loads must retain it."""
     hostflags(sc, source_sha, program_cfg=True)
+
+
+def program_flag_cfg_owned(sc, source_sha):
+    """The program's RUSTFLAGS cfg under an armed compiler/Cargo stand-in toolchain:
+    implicit/explicit host, each cold and no-op, must succeed with 0/0 executions."""
+    hostflags(sc, source_sha, program_cfg=True, audit=True)
 
 def machine_lse(sc, source_sha, isolated=False):
     """AArch64 target-feature=lse must select actual atomic instructions, not just cfgs.
@@ -2557,6 +2590,7 @@ SCENARIOS = {
     "hostflags": hostflags,
     "host-codegen": host_codegen,
     "program-flag-cfg": program_flag_cfg,
+    "program-flag-cfg-owned": program_flag_cfg_owned,
     "machine-lse": machine_lse,
     "machine-lse-isolated": lambda sc, sha: machine_lse(sc, sha, isolated=True),
     "choice-stable": choice_stable,

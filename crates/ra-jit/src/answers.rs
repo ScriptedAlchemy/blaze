@@ -281,6 +281,16 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         if !is_question(&rustc_args) {
             return None;
         }
+        if !own::flag_sensitive(&rustc_args) {
+            // These answers do not depend on Cargo's CPU, features or relocation
+            // choices. Query-tail arguments that do affect a name remain in argv.
+            return Some(match own::answer(&rustc, &rustc_args, &[], &var) {
+                Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
+                None => Err(io::Error::other(format!(
+                    "owned toolchain print is not modeled: {rustc_args:?}; Cargo was not executed"
+                ))),
+            });
+        }
         // Cargo appends its effective flags before the rustc-only tail. In particular,
         // --cfg participates in both program parsing and platform dependency resolution.
         let explicit_target = rustc_args
@@ -311,8 +321,13 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         };
         let mut effective = flags.into_iter().map(OsString::from).collect::<Vec<_>>();
         effective.extend(rustc_args);
-        return own::answer(&rustc, &effective, &[], &var)
-            .map(|stdout| Ok(output(stdout, Vec::new(), 0)));
+        return Some(match own::answer(&rustc, &effective, &[], &var) {
+            Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
+            None => Err(io::Error::other(format!(
+                "owned toolchain query has no model for its effective flags: {effective:?}; \
+                 Cargo was not executed"
+            ))),
+        });
     }
     None
 }
@@ -530,5 +545,68 @@ mod tests {
         let result = cargo_question(&mut command).unwrap().unwrap();
         assert!(result.status.success());
         assert_ne!(result.stdout, b"");
+    }
+
+    #[test]
+    fn independent_cargo_prints_stay_owned_with_unmodeled_codegen_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = dir.path();
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        let rustlib = toolchain.join("lib/rustlib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(toolchain.join("lib/librustc_driver-test.so"), "").unwrap();
+        std::fs::write(rustlib.join("manifest-rustc-aarch64-unknown-linux-gnu"), "").unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        std::fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            format!("\n[pkg.rustc]\nversion = {:?}\n", release["version"].as_str().unwrap()),
+        )
+        .unwrap();
+        let executable = toolchain.join("bin/cargo");
+        std::fs::write(&executable, "this tool must not be executed").unwrap();
+        exercise_independent_prints(&executable, toolchain);
+        // The targeted ownership harness supplies an armed norustc stand-in tree.
+        // The synthetic non-executable control above always runs as well.
+        if let Some(path) = std::env::var_os("RA_JIT_TEST_QUERY_TOOLCHAIN") {
+            let path = PathBuf::from(path);
+            exercise_independent_prints(&path.join("bin/cargo"), &path);
+        }
+    }
+
+    fn exercise_independent_prints(executable: &Path, toolchain: &Path) {
+        for kind in ["target-libdir", "sysroot", "target-spec-json", "file-names"] {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args([
+                "rustc",
+                "-Z",
+                "unstable-options",
+                "--print",
+                kind,
+            ]);
+            if kind == "file-names" {
+                command.args(["--", "-", "--crate-name", "___", "--crate-type", "rlib"]);
+            } else if kind == "target-spec-json" {
+                command.args(["--", "-Z", "unstable-options"]);
+            }
+            command.env("RUSTFLAGS", "-Ctarget-cpu=native -Crelocation-model=pic");
+            command.env("RUSTC_BOOTSTRAP", "1");
+            for key in [
+                "SDKROOT",
+                "MACOSX_DEPLOYMENT_TARGET",
+                "RUST_TARGET_PATH",
+                "RUSTC_OVERRIDE_VERSION_STRING",
+            ] {
+                command.env_remove(key);
+            }
+            let answer = ask(&mut command).expect("must not hand the query to Cargo").unwrap();
+            assert!(answer.status.success() && !answer.stdout.is_empty(), "{kind}");
+        }
+        let mut command = Command::new(executable);
+        command.current_dir(toolchain).args(["rustc", "--print", "cfg", "--", "-O"]);
+        command.env("RUSTFLAGS", "-Ctarget-cpu=native");
+        command.env("RUSTC_BOOTSTRAP", "1");
+        let error = ask(&mut command).expect("cfg gap must not hand off to Cargo").unwrap_err();
+        assert!(error.to_string().contains("Cargo was not executed"), "{error}");
     }
 }

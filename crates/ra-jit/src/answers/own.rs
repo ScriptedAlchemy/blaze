@@ -161,6 +161,11 @@ fn yes(value: Option<&str>) -> Option<bool> {
 
 impl<'a> Given<'a> {
     fn of(args: &'a [&'a str]) -> Option<Given<'a>> {
+        let flag_sensitive = args.iter().enumerate().any(|(at, word)| {
+            word.strip_prefix("--print=")
+                .or_else(|| (*word == "--print").then(|| args.get(at + 1).copied()).flatten())
+                .is_some_and(|kind| matches!(kind, "cfg" | "check-cfg"))
+        });
         let mut given = Given::default();
         let mut words = args.iter().copied();
         while let Some(word) = words.next() {
@@ -198,11 +203,15 @@ impl<'a> Given<'a> {
                         "target-feature" => given.target_features.push(value?),
                         "extra-filename" => given.extra_filename = true,
                         name if IGNORED_CODEGEN.contains(&name) => {}
+                        // CPU, relocation and instrumentation do not affect a path or
+                        // target-spec print. Do not pretend their cfg effects are known.
+                        _ if !flag_sensitive => {}
                         _ => return None,
                     }
                 }
                 "-Z" => match value()? {
                     "unstable-options" => given.unstable_options = true,
+                    _ if !flag_sensitive => {}
                     _ => return None,
                 },
                 _ if LINTS.contains(&flag) || IGNORED_VALUED.contains(&flag) => {
@@ -219,6 +228,17 @@ impl<'a> Given<'a> {
     fn debug_assertions(&self) -> bool {
         self.debug_assertions.unwrap_or(matches!(self.opt_level, None | Some("0")))
     }
+}
+
+pub(super) fn flag_sensitive(args: &[OsString]) -> bool {
+    args.iter().enumerate().any(|(at, arg)| {
+        arg.to_str()
+            .and_then(|word| {
+                word.strip_prefix("--print=")
+                    .or_else(|| (word == "--print").then(|| args.get(at + 1)?.to_str()).flatten())
+            })
+            .is_some_and(|kind| matches!(kind, "cfg" | "check-cfg"))
+    })
 }
 
 /// The built-in cfgs of `target`, without running a compiler. Unlike a general query,
@@ -482,5 +502,18 @@ mod tests {
         assert!(Given::of(&["-C", "target-cpu=native", "--print", "cfg"]).is_none());
         assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_some());
         assert!(Given::of(&["-Z", "ub-checks", "--print", "cfg"]).is_none());
+    }
+
+    #[test]
+    fn independent_prints_do_not_require_a_cpu_or_codegen_model() {
+        for kind in ["sysroot", "target-libdir", "target-spec-json", "file-names"] {
+            let args = ["-Ctarget-cpu=native", "-Crelocation-model=pic", "--print", kind];
+            assert!(Given::of(&args).is_some(), "{kind}");
+        }
+        assert!(
+            Given::of(&["-Ctarget-cpu=native", "--print", "target-libdir", "--print", "cfg"])
+                .is_none(),
+            "a combined cfg answer must not silently ignore CPU semantics"
+        );
     }
 }
