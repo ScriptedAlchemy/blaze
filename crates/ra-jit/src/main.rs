@@ -10394,6 +10394,7 @@ fn run_holding(
                     packs,
                 )
                 .err();
+                lock(&as_built).remove(&object);
                 if failed.is_none() {
                     if from
                         .published(
@@ -10544,6 +10545,18 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 }
 
 impl Program {
+    /// Drop this program's link/patch baseline, not its compiled queries or other
+    /// programs. A shared output can have been replaced by another worker.
+    fn forget_link_baseline(&mut self, binary: Option<&Path>) {
+        if let Some(binary) = binary {
+            native_inputs::forget_binary(binary);
+        }
+        self.known.forget_base();
+        self.whole = None;
+        self.unbuilt.stale = true;
+        self.unbuilt.unlinked = true;
+    }
+
     /// Whether to build it again with nobody asking, for the code of the checkout its last
     /// build took from the store: no patch replaces that, so the first edit would wait for
     /// all of it to be compiled.
@@ -10779,10 +10792,10 @@ impl Program {
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
-        let Program { args, table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
-        if let Some((cmd, exe)) = own_link_line(db, args)? {
-            (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
+        if let Some((cmd, exe)) = own_link_line(db, &self.args)? {
+            (self.args.link_cmd, self.args.splice) = (Some(cmd), Some(exe));
         }
+        let args = &self.args;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         // A whole build's link line is the worker's own, which no client names.
@@ -10790,28 +10803,15 @@ impl Program {
             Some(_) => (link_cmd.or(args.link_cmd.clone()), splice.or(args.splice.clone())),
             None => (link_cmd, splice),
         };
-        let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
+        let effective = Args { out, patch, link_cmd, splice, ..args.clone() };
         // Capture the effective output's identity, not another checkout's or alias's. Recheck
         // here too: a native input may have changed after the request was admitted.
-        let native_link = native_inputs::begin(db, args);
-        if native_link.as_ref().is_some_and(|link| link.output_changed())
-            && let Some(binary) = args.splice.as_ref().or(args.exe.as_ref())
-        {
-            native_inputs::forget_binary(binary);
-            known.forget_base();
-            *whole = None;
-            unbuilt.stale = true;
-            unbuilt.unlinked = true;
+        let native_link = native_inputs::begin(db, &effective);
+        if native_link.as_ref().is_some_and(|link| link.changed() || link.output_changed()) {
+            self.forget_link_baseline(effective.splice.as_deref().or(effective.exe.as_deref()));
         }
-        if native_link.as_ref().is_some_and(|link| link.changed()) {
-            if let Some(binary) = args.splice.as_ref().or(args.exe.as_ref()) {
-                native_inputs::forget_binary(binary);
-            }
-            known.forget_base();
-            *whole = None;
-            unbuilt.stale = true;
-            unbuilt.unlinked = true;
-        }
+        let Program { table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
+        let args = &effective;
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
         if let Some(whole) = whole.as_ref().filter(|it| **it != args.out) {

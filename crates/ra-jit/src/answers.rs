@@ -294,16 +294,6 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         if !is_question(&rustc_args) {
             return None;
         }
-        if !own::flag_sensitive(&rustc_args) {
-            // These answers do not depend on Cargo's CPU, features or relocation
-            // choices. Query-tail arguments that do affect a name remain in argv.
-            return Some(match own::answer(&rustc, &rustc_args, &[], &var) {
-                Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
-                None => Err(io::Error::other(format!(
-                    "owned toolchain print is not modeled: {rustc_args:?}; Cargo was not executed"
-                ))),
-            });
-        }
         // Cargo appends its effective flags before the rustc-only tail. In particular,
         // --cfg participates in both program parsing and platform dependency resolution.
         let explicit_target = rustc_args
@@ -311,6 +301,7 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
             .find(|args| args[0] == "--target")
             .and_then(|args| args[1].to_str())
             .or_else(|| rustc_args.iter().find_map(|arg| arg.to_str()?.strip_prefix("--target=")));
+        // Past this point the query is ours: a missing model is a named gap, never Cargo's run.
         let gap = |what: &str| {
             Some(Err(io::Error::other(format!(
                 "owned toolchain query has no model for {what}: {rustc_args:?}; Cargo was not executed"
@@ -351,7 +342,7 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
             Some(stdout) => Ok(output(stdout, Vec::new(), 0)),
             None => Err(io::Error::other(format!(
                 "owned toolchain query has no model for its effective flags: {effective:?}; \
-                 Cargo was not executed"
+                 Cargo was not executed (docs/no-rustc.md#unmodeled-cpu-cfg-queries)"
             ))),
         });
     }
@@ -639,11 +630,34 @@ mod tests {
             let answer = ask(&mut command).expect("must not hand the query to Cargo").unwrap();
             assert!(answer.status.success() && !answer.stdout.is_empty(), "{kind}");
         }
+        for kind in ["sysroot", "target-libdir"] {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", kind]);
+            command.env("RUSTFLAGS", "--sysroot /elsewhere -Ctarget-cpu=native");
+            let answer = ask(&mut command).expect("sysroot flags stay owned").unwrap();
+            let text = String::from_utf8(answer.stdout).unwrap();
+            assert!(text.starts_with("/elsewhere"), "{kind}: {text}");
+        }
         let mut command = Command::new(executable);
         command.current_dir(toolchain).args(["rustc", "--print", "cfg", "--", "-O"]);
         command.env("RUSTFLAGS", "-Ctarget-cpu=native");
         command.env("RUSTC_BOOTSTRAP", "1");
         let error = ask(&mut command).expect("cfg gap must not hand off to Cargo").unwrap_err();
         assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+        // A target or bootstrap setting the answers do not model is a named gap, not Cargo's run.
+        for (target, bootstrap) in
+            [(Some("bogus-unknown-none"), "1"), (None, "somecrate"), (None, "-1")]
+        {
+            let mut command = Command::new(executable);
+            command.current_dir(toolchain).args(["rustc", "--print", "sysroot"]);
+            if let Some(target) = target {
+                command.args(["--target", target]);
+            }
+            command.env("RUSTC_BOOTSTRAP", bootstrap);
+            let answer = ask(&mut command).expect("an unmodeled print must not hand off to Cargo");
+            if let Err(error) = answer {
+                assert!(error.to_string().contains("Cargo was not executed"), "{error}");
+            }
+        }
     }
 }

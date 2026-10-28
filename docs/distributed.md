@@ -2165,14 +2165,34 @@ not in it, as in Bazel (**unverified**, inferred from what an action holds).
    there).
 4. **Flaky retries as Bazel's.** A test runs once, or up to three times when the manifest marks it
    `flaky`, as `--flaky_test_attempts=default` runs it (research/bazel-nativelink.md, citing
-   `ExecutionOptions.java:240-252`; **reported** here, read there); one that needed more than one attempt is reported FLAKY, and its pass is not cached
-   (whether Bazel caches such a result is **unverified**; not caching it costs only a rerun). What
-   a FLAKY test does to the job is the owner's `flake-policy` gate below.
+   `ExecutionOptions.java:240-252`; **reported** here, read there). One that passes on a later
+   attempt is reported FLAKY and its successful result is cached: Bazel retains `testPassed=true`
+   and `cachable=true` when changing PASSED to FLAKY (`StandaloneTestStrategy.java:228-239,678`),
+   and auto caching accepts it (`TestRunnerAction.java:576-588`; **read** in the T1 review).
+   What a FLAKY test does to the tracedecay job stays the owner's `flake-policy` gate below.
 
 How many of tracedecay's tests the contract caches is measured (gate GT), not assumed. Time is not
 virtualised and `HashMap`'s seed is not fixed: a test that reads either and passes is cached like any
 other passing test, as under Bazel, and the owner's `no-cache` marker is the remedy for a test that
 should not be.
+
+### Local affected-test implementation (T1)
+
+`RA_JIT_TESTS=affected` retains its existing per-test reach identities. In `blaze-tests.toml` at
+its workspace root, `data` declares files and directories and `env` names variables; the names
+in `RA_JIT_TEST_ENV` count too. Their contents, the effective configured environment,
+`--test-threads` and `RUST_TEST_THREADS` are digested into each pass. Changing them reruns the
+tests. `no_cache` and `external` name tests that always run, by libtest name, `package/name` or a
+pattern with `*` at an end. An unreadable manifest or declared input prevents reuse.
+Directory boundaries are part of the typed tree digest. Declared inherited environment
+values are forwarded to Linux sandboxed tests, with configured command overrides preserved.
+
+The manifest's `flaky` list gives a test three attempts, or `RA_JIT_FLAKY_TEST_ATTEMPTS` sets the
+number for all tests; otherwise a local test gets one attempt. Only failed tests retry, and an
+exhausted failure does not block another test's retry. A later pass is reported `Flaky` and
+cached. The existing Linux read-recording sandbox and the existing conservative behavior when
+no `data` is declared are unchanged by T1; no new effect classifier or audit mode is added.
+The remote `TestKey` and runtime bundle below belong to T2 and T3.
 
 ### Out of scope (owner, 2026-10-26): the stricter contract
 
@@ -2202,8 +2222,9 @@ manifest has to be matched against recordings:
 4. A manifest that holds in full is the pass's. The test is skipped and the report says so:
    "skipped: passed under the same inputs at abc1234". If none holds, or the test is marked
    `external` or `no-cache`, it runs.
-5. A passing run publishes its manifest and the verdict together; a failing run, or a run that
-   needed a retry, publishes nothing.
+5. A passing terminal result publishes its manifest and verdict together, including a success
+   after retries, which retains the `Flaky` verdict. A terminal failure publishes nothing.
+   Any job-level policy that rejects flaky results is separate from cache eligibility.
 
 ### Runtime bundles and shards
 
@@ -3333,22 +3354,33 @@ Verify: `python3 -I harness/dist/measure.py --gate GD --runs 3` (Mac and Docker 
 
 ### Phase 4: tests
 
-**T1 The cacheability contract (Bazel's).** Goal: section 6's rules 1 to 4: results cached as
-`cache_test_results=auto` caches them. Reduced by the scope ruling: **out of scope (owner,
-2026-10-26)** are the reach classifier that marks time, randomness, threads, sockets, unlisted
-spawns, foreign code and unlisted environment as always-run reasons, audit mode
-(`RA_JIT_TESTS=audit`) and 5% sampling. What remains: the key is the declared inputs; an
-`external` or `no-cache` marker from the owner's manifest makes a test always run; failures are
-never cached; flaky attempts as `flaky_test_attempts`. Files: `crates/ra-jit/src/cargo/affected.rs`,
-`harness/dist/fixtures/tests`. Depends: none. Acceptance: a fixture of tests, run twice: a pure
-test and a test that reads the clock and passes are each skipped the second time (as under Bazel);
-a change to a declared input (an argument, a declared environment variable, a bundle file's
-content or mode) runs the test; a test marked `external` and one marked `no-cache` run both
-times; a failing test runs again and is never served from the cache, and a later pass of it is
-cached; a test marked `flaky` that fails once and passes is run at most three times, reported
-FLAKY and not cached, and an unmarked one is run once; `--runs_per_test 2` is not cached.
+**T1 The cacheability contract.** Goal: section 6's contract, which is Bazel's
+`cache_test_results=auto` and no more (the owner's parity rule, 2026-10-26, which narrowed this
+unit from revision 3's classifier, audit mode and sampling). A pass is reused while the test, its
+declared inputs (`data` files and `env` variables of `blaze-tests.toml`) and the run configuration
+(`--test-threads`) are unchanged; `no_cache` and `external` opt a test out; a failed run keeps
+nothing; a test that fails is retried up to its attempts (`flaky` in the manifest,
+`RA_JIT_FLAKY_TEST_ATTEMPTS`) and reported `Flaky`. Files: `crates/ra-jit/src/cargo/affected.rs`,
+`crates/ra-jit/src/cargo/run.rs`, `harness/dist/fixtures/tests`, `harness/dist/tests.py`. Depends:
+none. The no-rustc audit (P0-A) remains pending: the fixtures have not run under it, and the
+harness says so. Acceptance: a fixture workspace in which an unchanged test is skipped
+on a second run; a changed test, a changed declared data file, a changed declared variable and a
+changed `--test-threads` or declared executable mode each rerun; a test opted out with
+`no_cache` and with `external` runs every time; a test that fails is not skipped at the next run,
+nor after its code goes back to what
+passed; a test that fails once is retried, reported `Flaky`, and cached, and with one attempt it
+fails the run. The complete parity gate also includes Bazel repeated-run requests
+(`--runs_per_test` above one) bypassing the cache; the current local harness has not measured
+that part. From the reviews:
+- [b-B2] "libc getpid/uname or listed child programs can observe unkeyed machine state; deny
+  unknown effects instead of assuming libc is closed." Closed by the owner's decision, not by
+  code: Bazel's key has the same blind spots (research 7.10) and blaze holds to Bazel's. What
+  the unit checks instead is what Bazel gives the owner against them: the opt-out marker (a test
+  that reads the clock, `getpid` or a default map's seed and fails now and then is marked
+  `no_cache` or `flaky`) and the rerun of every failure.
+
 Verify: `python3 -I harness/testselect.py && python3 -I harness/dist/tests.py --contract`. Where:
-Mac. From the reviews: [b-B2] is accepted at parity (appendix A).
+Mac; the sandbox steps on Linux (Docker), **not run** for this unit.
 
 **T2 Passes across machines.** Goal: `TestKey` and `InputManifest` of declared files (the bundle's
 digests, modes and lengths; nothing recorded by running), logical paths, the server's results

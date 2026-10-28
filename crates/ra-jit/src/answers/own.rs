@@ -87,6 +87,7 @@ impl Toolchain {
 #[derive(Default)]
 struct Given<'a> {
     target: Option<&'a str>,
+    sysroot: Option<&'a str>,
     opt_level: Option<&'a str>,
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
@@ -184,6 +185,7 @@ impl<'a> Given<'a> {
                 "-" => given.from_stdin = true,
                 "--print" => given.prints.push(value()?),
                 "--target" => given.target = Some(value()?),
+                "--sysroot" => given.sysroot = Some(value()?),
                 "--crate-name" => given.crate_name = Some(value()?),
                 "--crate-type" => given.crate_types.extend(value()?.split(',')),
                 "--cfg" => given.cfgs.push(value()?),
@@ -228,17 +230,6 @@ impl<'a> Given<'a> {
     fn debug_assertions(&self) -> bool {
         self.debug_assertions.unwrap_or(matches!(self.opt_level, None | Some("0")))
     }
-}
-
-pub(super) fn flag_sensitive(args: &[OsString]) -> bool {
-    args.iter().enumerate().any(|(at, arg)| {
-        arg.to_str()
-            .and_then(|word| {
-                word.strip_prefix("--print=")
-                    .or_else(|| (word == "--print").then(|| args.get(at + 1)?.to_str()).flatten())
-            })
-            .is_some_and(|kind| matches!(kind, "cfg" | "check-cfg"))
-    })
 }
 
 /// The built-in cfgs of `target`, without running a compiler. Unlike a general query,
@@ -422,12 +413,13 @@ pub(super) fn answer(
     }
     let tuple = given.target.unwrap_or(&toolchain.host);
     let target = release.targets.get(tuple)?;
+    let sysroot = given.sysroot.map(PathBuf::from).unwrap_or_else(|| toolchain.sysroot.clone());
     let mut out = String::new();
     for print in &given.prints {
         match *print {
-            "sysroot" => out += &format!("{}\n", toolchain.sysroot.to_str()?),
+            "sysroot" => out += &format!("{}\n", sysroot.to_str()?),
             "target-libdir" => {
-                let dir = toolchain.sysroot.join("lib/rustlib").join(tuple).join("lib");
+                let dir = sysroot.join("lib/rustlib").join(tuple).join("lib");
                 out += &format!("{}\n", dir.to_str()?);
             }
             "host-tuple" => out += &format!("{}\n", toolchain.host),
