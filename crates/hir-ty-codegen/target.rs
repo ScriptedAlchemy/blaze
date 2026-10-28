@@ -410,6 +410,44 @@ mod machine_tests {
     }
 
     #[test]
+    fn a_cpu_preset_changes_emitted_popcount_instructions() {
+        use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, UserFuncName};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let target = Target::parse("x86_64-unknown-linux-gnu").unwrap();
+        let options = hir_ty::mir::codegen_options::TargetMachine::from_flags(&[
+            "-Ctarget-cpu=haswell".to_owned(),
+        ]);
+        let configured = target.isa_for("backtracking", false, &options).unwrap();
+        let baseline = target.isa("backtracking", false).unwrap();
+        let emit = |isa: &OwnedTargetIsa| {
+            let mut signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
+            signature.params.push(AbiParam::new(types::I64));
+            signature.returns.push(AbiParam::new(types::I64));
+            let mut function = Function::with_name_signature(UserFuncName::default(), signature);
+            let mut context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut function, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let input = builder.block_params(block)[0];
+            let count = builder.ins().popcnt(input);
+            builder.ins().return_(&[count]);
+            builder.finalize(isa.frontend_config());
+            let mut context = cranelift_codegen::Context::for_function(function);
+            context.compile(&**isa, &mut Default::default()).unwrap();
+            context.compiled_code().unwrap().code_buffer().to_vec()
+        };
+        let cpu = emit(&configured);
+        let generic = emit(&baseline);
+        let popcnt = |bytes: &[u8]| bytes.windows(2).any(|bytes| bytes == b"\x0f\xb8");
+        assert!(popcnt(&cpu), "Haswell must select POPCNT, not only record its name");
+        assert!(!popcnt(&generic), "the generic target must use its software lowering");
+        assert_ne!(cpu, generic);
+    }
+
+    #[test]
     fn opt_level_selects_real_backend_passes() {
         let target = Target::parse("aarch64-unknown-linux-gnu").unwrap();
         let options =
