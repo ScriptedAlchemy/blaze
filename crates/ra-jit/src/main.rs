@@ -1296,10 +1296,10 @@ impl SymbolResolver for Resolver<'_> {
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = admitted_parallel_work(work);
+        let work = &work;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
-                let work = &work;
                 scope.spawn(move || {
                     let resolver = parts.over(&db);
                     hir::attach_db(&db, || {
