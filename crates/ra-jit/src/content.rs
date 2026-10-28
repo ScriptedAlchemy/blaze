@@ -390,9 +390,10 @@ fn macro_producer_identity(db: &RootDatabase, krate: Crate) -> Hash {
     if let Some(macros) = hir::ProcMacros::get_for_crate(db, krate)
         && let Some(macros) = macros.macros()
     {
-        let mut identities: Vec<_> = macros.iter().map(|item| {
-            (item.name.as_str(), item.expander.content_identity())
-        }).collect();
+        let mut identities: Vec<_> = macros
+            .iter()
+            .map(|item| (item.name.as_str(), item.expander.content_identity()))
+            .collect();
         identities.sort_unstable();
         for (name, identity) in identities {
             hash.update((name.len() as u64).to_le_bytes());

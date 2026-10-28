@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "derive"
 version = "0.1.0"
+dependencies = [
+ "macro-producer",
+]
+
+[[package]]
+name = "macro-producer"
+version = "0.1.0"

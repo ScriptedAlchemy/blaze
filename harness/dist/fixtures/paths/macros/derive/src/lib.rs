@@ -18,7 +18,8 @@ fn name_of(input: &TokenStream) -> String {
 #[proc_macro_derive(Describe)]
 pub fn describe(input: TokenStream) -> TokenStream {
     let name = name_of(&input);
-    format!("impl {name} {{ pub fn describe() -> &'static str {{ \"{name} was described\" }} }}")
+    let suffix = macro_producer::suffix();
+    format!("impl {name} {{ pub fn describe() -> &'static str {{ \"{name} was described {suffix}\" }} }}")
         .parse()
         .unwrap()
 }

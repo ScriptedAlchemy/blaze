@@ -550,6 +550,7 @@ def macro_content_report(work, bin_dir, machines, sources):
     machine = machines[0]
     ws = os.path.join(machine.checkout("macro-content", sources["macros"]), "macros")
     source = os.path.join(ws, "derive/src/lib.rs")
+    producer = os.path.join(ws, "producer/src/lib.rs")
     text = open(source).read().replace("{name} was described", "{name} was described ONE")
     with open(source, "w") as output:
         output.write(text)
@@ -559,14 +560,20 @@ def macro_content_report(work, bin_dir, machines, sources):
     rows = []
     previous_pids, previous_builds = None, -1
     try:
-        for step in ("initial", "same-size-restored-mtime"):
-            before = os.stat(source)
-            old_digest = hashlib.sha256(open(source, "rb").read()).hexdigest()
-            if step != "initial":
+        for step in ("initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"):
+            edited_source = producer if step == "dependency-restored-mtime" else source
+            before = os.stat(edited_source)
+            old_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
+            if step == "same-size-restored-mtime":
                 text = text.replace("described ONE", "described TWO")
                 with open(source, "w") as output:
                     output.write(text)
                 os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif step == "dependency-restored-mtime":
+                replacement = open(producer).read().replace('"base"', '"edit"')
+                with open(producer, "w") as output:
+                    output.write(replacement)
+                os.utime(producer, ns=(before.st_atime_ns, before.st_mtime_ns))
             _, built = side.cargo("build", "-p", "app")
             _, ready = wait_warm(side, ws)
             status = side.cargo("status")[1].stdout
@@ -580,9 +587,10 @@ def macro_content_report(work, bin_dir, machines, sources):
             rows.append(dict(step=step, right=actual == expected and generation and not recognized_fallback(built.stderr),
                              actual=actual, expected=expected, build_log=built.stderr, status=status, pids=pids,
                              worker_log=workers_log(side), old_sha256=old_digest,
-                             source_sha256=hashlib.sha256(open(source, "rb").read()).hexdigest(),
-                             same_size=os.stat(source).st_size == before.st_size,
-                             same_mtime=os.stat(source).st_mtime_ns == before.st_mtime_ns,
+                             source_sha256=hashlib.sha256(open(edited_source, "rb").read()).hexdigest(),
+                             edited_source=os.path.relpath(edited_source, ws),
+                             same_size=os.stat(edited_source).st_size == before.st_size,
+                             same_mtime=os.stat(edited_source).st_mtime_ns == before.st_mtime_ns,
                              dylibs={os.path.relpath(os.path.join(root, name), ws):
                                      hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
                                      for root, _, files in os.walk(os.path.join(ws, "target"))
