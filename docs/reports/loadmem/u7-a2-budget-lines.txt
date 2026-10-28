@@ -1,0 +1,50 @@
+load workspace: 64.4s
+memory after load: 4014 MB resident, 2406 MB live
+resolve: 586 crates in 25.9s
+memory after resolve: 10273 MB resident, 7011 MB live
+first build: rustc_binary None (a file: false), splice true, patch true, link_cmd true, socket true, isolate false, splicing true, RA_JIT_RUSTC_BASE=0 false, files written since rustc built 0, harnessed false
+build budget: gave back 12302 MB to 12251 MB
+build budget: 17 of 18 threads compile, the process holds 12336 of 16384 MB
+build budget: 16 of 18 threads compile, the process holds 12555 of 16384 MB
+build budget: gave back 12768 MB to 12702 MB
+build budget: 15 of 18 threads compile, the process holds 12785 of 16384 MB
+build budget: 14 of 18 threads compile, the process holds 12981 of 16384 MB
+build budget: gave back 13125 MB to 13096 MB
+build budget: 13 of 18 threads compile, the process holds 13229 of 16384 MB
+build budget: 12 of 18 threads compile, the process holds 13478 of 16384 MB
+build budget: gave back 13510 MB to 13422 MB
+build budget: 13 of 18 threads compile, the process holds 13422 of 16384 MB
+build budget: 12 of 18 threads compile, the process holds 13493 of 16384 MB
+build budget: 11 of 18 threads compile, the process holds 13666 of 16384 MB
+build budget: gave back 13742 MB to 13666 MB
+build budget: 10 of 18 threads compile, the process holds 13899 of 16384 MB
+build budget: gave back 14045 MB to 13994 MB
+build budget: 9 of 18 threads compile, the process holds 14149 of 16384 MB
+build budget: gave back 14329 MB to 14299 MB
+build budget: 8 of 18 threads compile, the process holds 14348 of 16384 MB
+build budget: gave back 14528 MB to 14516 MB
+build budget: 7 of 18 threads compile, the process holds 14592 of 16384 MB
+build budget: gave back 14812 MB to 14789 MB
+build budget: 6 of 18 threads compile, the process holds 14826 of 16384 MB
+build budget: 5 of 18 threads compile, the process holds 15057 of 16384 MB
+build budget: gave back 15094 MB to 15063 MB
+build budget: 4 of 18 threads compile, the process holds 15258 of 16384 MB
+build budget: gave back 15297 MB to 15258 MB
+build budget: 3 of 18 threads compile, the process holds 15494 of 16384 MB
+build budget: gave back 15522 MB to 15472 MB
+build budget: 4 of 18 threads compile, the process holds 15472 of 16384 MB
+build budget: 3 of 18 threads compile, the process holds 15492 of 16384 MB
+build budget: gave back 15717 MB to 15678 MB
+build budget: 2 of 18 threads compile, the process holds 15717 of 16384 MB
+build budget: gave back 15809 MB to 15795 MB
+build budget: gave back 15925 MB to 15918 MB
+build budget: 1 of 18 threads compile, the process holds 15934 of 16384 MB
+build budget: gave back 15988 MB to 15983 MB
+build budget: gave back 16044 MB to 16041 MB
+build budget: gave back 16101 MB to 16099 MB
+build budget: gave back 16156 MB to 16153 MB
+build budget: gave back 16205 MB to 16202 MB
+build budget: gave back 16261 MB to 16259 MB
+build budget: gave back 16315 MB to 16307 MB
+build budget: gave back 16362 MB to 16358 MB
+Error: out of memory to build in: the build held 16387 MB, more than the 16384 MB the process may (RA_JIT_WORKER_MEMORY, else RA_JIT_MEMORY_MAX): it was stopped before it held more
