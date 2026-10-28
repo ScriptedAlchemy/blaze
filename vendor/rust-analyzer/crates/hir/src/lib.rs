@@ -195,7 +195,7 @@ pub use {
         mod_path::{ModPath, PathKind, tool_path},
         name::{self, Name},
         prettify_macro_expansion,
-        proc_macro::{ProcMacros, ProcMacrosBuilder},
+        proc_macro::{CrateProcMacros, ProcMacros, ProcMacrosBuilder},
         tt,
     },
     // FIXME: Properly encapsulate mir

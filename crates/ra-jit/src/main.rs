@@ -5553,7 +5553,7 @@ fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// What cargo said of every crate when the checkouts were last loaded.
 struct CratesAsLoaded {
     crates: FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>,
-    macros: FxHashMap<ide_db::base_db::Crate, triomphe::Arc<hir_expand::proc_macro::CrateProcMacros>>,
+    macros: FxHashMap<ide_db::base_db::Crate, triomphe::Arc<hir::CrateProcMacros>>,
 }
 
 type CrateAsLoaded = (
@@ -5566,7 +5566,7 @@ type CrateAsLoaded = (
 impl CratesAsLoaded {
     fn of(db: &RootDatabase) -> CratesAsLoaded {
         let crates = ide_db::base_db::all_crates(db);
-        let macros = hir_expand::proc_macro::ProcMacros::try_get(db)
+        let macros = hir::ProcMacros::try_get(db)
             .map(|macros| macros.by_crate(db).clone())
             .unwrap_or_default();
         CratesAsLoaded {
@@ -5587,7 +5587,7 @@ impl CratesAsLoaded {
     /// The crates of `db` that cargo says something else of now, or that were not there.
     fn changed(&self, db: &RootDatabase) -> Vec<ide_db::base_db::Crate> {
         let crates = ide_db::base_db::all_crates(db);
-        let now = hir_expand::proc_macro::ProcMacros::try_get(db)
+        let now = hir::ProcMacros::try_get(db)
             .map(|macros| macros.by_crate(db).clone())
             .unwrap_or_default();
         let mut changed: FxHashSet<_> = crates
