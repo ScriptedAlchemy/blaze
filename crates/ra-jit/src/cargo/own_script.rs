@@ -314,8 +314,9 @@ fn build_command(
     if !shipped {
         ra_jit.env("RA_JIT_STD_FROM", "off");
     }
-    // A source-only producer cannot reach the remaining rustc query fallback.
-    if made.proc_macro && asked.is_some() {
+    // An owned source build cannot reach the remaining rustc query fallback,
+    // including while compiling a producer's build script.
+    if asked.is_some() {
         ra_jit.env("RA_JIT_ANSWERS", "own");
         ra_jit.env("BLAZE_ANSWERS", "own");
         ra_jit.env("RA_JIT_OWN_RESOLVE", "1");

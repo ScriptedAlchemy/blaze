@@ -7932,6 +7932,9 @@ fn main() -> anyhow::Result<()> {
         return cargo::script::command(std::env::args_os().skip(2));
     }
     match std::env::args().nth(1).as_deref() {
+        Some("producer-rustc") => {
+            return answers::producer_probe(std::env::args_os().skip(2).collect());
+        }
         Some("rustc-wrapper") => return cargo::wrapper::command(std::env::args_os().skip(2)),
         Some(cargo::own_macro::COMMAND) => {
             return cargo::own_macro::command(std::env::args_os().skip(2));

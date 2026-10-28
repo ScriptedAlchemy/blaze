@@ -287,6 +287,43 @@ pub(crate) fn run(
     run_with(&LEASES, workspace, asked)
 }
 
+/// Run the host projection of an owned producer plan, without folding target features
+/// into its scripts. The caller keeps this build's leases through producer compilation.
+pub(crate) fn run_producers(
+    cargo: &CargoWorkspace,
+    asked: &Asked<'_>,
+    sysroot: PathBuf,
+    flags: Vec<String>,
+    cfgs: Vec<String>,
+) -> anyhow::Result<(BTreeMap<String, (PathBuf, blaze_build_script::Output)>, World)> {
+    retrying(asked.build, false, || {
+        let result = (|| {
+            let mut runner = Runner::new(&LEASES, cargo, asked, sysroot.clone(), &[])?;
+            runner.host_flags = flags.clone();
+            runner.host_cfgs = Some(cfgs.clone());
+            let mut outputs = BTreeMap::new();
+            for package in cargo.packages() {
+                if runner.runs(package) {
+                    let done = runner
+                        .script(package, true)
+                        .map_err(|why| Attempt::of(runner.busy.take(), why))?;
+                    outputs.insert(
+                        cargo[package].id.repr.clone(),
+                        (done.out_dir.clone(), done.output.clone()),
+                    );
+                }
+            }
+            Ok((outputs, runner.judged))
+        })();
+        if matches!(result, Err(Attempt::Busy(_))) {
+            LEASES.yield_world(asked.build);
+        } else if !LEASES.in_operation(asked.build) {
+            LEASES.release_admission(asked.build);
+        }
+        result
+    })
+}
+
 fn run_with(
     leases: &Leases,
     workspace: &ProjectWorkspace,
@@ -729,6 +766,14 @@ impl<'a> Runner<'a> {
                     .and_then(|env| run::run(&unit, run::Invocation::of(&unit, env).command()))
                     .map_err(|it| it.0)
                     .and_then(|ran| {
+                        if let Some(path) = self.value("BLAZE_PRODUCER_PROBE_FAILURE")
+                            && Path::new(&path).exists()
+                        {
+                            return Err(format!(
+                                "blaze could not compile a producer's compiler probe: {}",
+                                std::fs::read_to_string(path).unwrap_or_default()
+                            ));
+                        }
                         ran.finish(&unit, &cx).map_err(|failed| {
                             let logged =
                                 failed.log_messages.iter().map(|(_, it)| format!("{it}\n"));

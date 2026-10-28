@@ -23,6 +23,55 @@ mod own;
 
 pub(crate) use own::target_cfg;
 
+/// Build-script probes name this launcher rather than a compiler outside blaze.
+/// Unsupported compile probes fail visibly; no wrapper fallback is reachable.
+pub(crate) fn producer_launcher(path: &Path) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+        let mut script = b"#!/bin/sh\nexec '".to_vec();
+        for &byte in exe.as_os_str().as_bytes() {
+            if byte == b'\'' {
+                script.extend_from_slice(b"'\\''");
+            } else {
+                script.push(byte);
+            }
+        }
+        script.extend_from_slice(b"' producer-rustc \"$@\"\n");
+        std::fs::write(path, script)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, exe);
+        Err(io::Error::other("the owned producer probe launcher is not implemented on this host"))
+    }
+}
+
+pub(crate) fn producer_probe(args: Vec<OsString>) -> anyhow::Result<()> {
+    let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| anyhow::anyhow!("the producer probe needs its absolute source toolchain"))?;
+    let program = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    if !is_question(&args) {
+        // A script may treat a failed probe as an unsupported compiler feature. Until
+        // blaze checks these sources itself, that would silently choose the wrong cfg.
+        // The producer scheduler must fail the build instead of accepting that output.
+        if let Some(path) = std::env::var_os("BLAZE_PRODUCER_PROBE_FAILURE") {
+            std::fs::write(path, format!("{args:?}"))?;
+        }
+        anyhow::bail!("blaze does not yet compile this producer's compiler probe");
+    }
+    let var = |name: &str| std::env::var_os(name);
+    let stdout = own::answer(&program, &args, &[], &var)
+        .ok_or_else(|| anyhow::anyhow!("blaze has no owned answer to the producer probe"))?;
+    io::stdout().write_all(&stdout)?;
+    Ok(())
+}
+
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
     "all-target-specs-json",

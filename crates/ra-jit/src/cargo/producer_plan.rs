@@ -1,6 +1,9 @@
 //! Host source producers from the application's own resolver and profile planner.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context as _, Result};
 use blaze_manifest::{
@@ -23,6 +26,7 @@ pub(crate) struct Producers {
     pub(crate) units: Vec<ResolvedUnit>,
     pub(crate) crates: Vec<Planned>,
     pub(crate) sources: Vec<(std::path::PathBuf, Vec<u8>)>,
+    scripts: BTreeSet<String>,
 }
 
 impl Producers {
@@ -40,7 +44,7 @@ impl Producers {
             let unit = &plan.units[at];
             anyhow::ensure!(unit.host, "a producer dependency is not a host unit");
             anyhow::ensure!(
-                !unit.build_script,
+                !unit.build_script || plan.scripts.contains(&unit.package),
                 "the producer scheduler must run the build script of {}",
                 unit.package
             );
@@ -51,8 +55,9 @@ impl Producers {
             );
             order.push(at);
             for dep in &unit.dependencies {
-                anyhow::ensure!(!dep.build, "an unresolved script dependency reached compilation");
-                visit(plan, dep.unit, root, order)?;
+                if !dep.build {
+                    visit(plan, dep.unit, root, order)?;
+                }
             }
             Ok(())
         }
@@ -76,6 +81,109 @@ impl Producers {
         )
         .map_err(anyhow::Error::msg)?;
         Ok(crates)
+    }
+
+    /// A CargoWorkspace is only an adapter for the existing owned script runner here.
+    /// Its nodes come from the host units, never metadata's folded feature set.
+    fn host_metadata(&self, target_dir: &Path) -> Result<Metadata> {
+        let mut metadata = serde_json::to_value(&self.metadata)?;
+        let units = &self.units;
+        let nodes = units.iter().filter(|unit| unit.host).map(|unit| {
+            let deps = unit.dependencies.iter().map(|dep| {
+                let child = &units[dep.unit];
+                anyhow::ensure!(child.host, "a host script dependency is not a host unit");
+                Ok(json!({
+                    "name": dep.name, "pkg": child.package,
+                    "dep_kinds": [{"kind": if dep.build { "build" } else { "normal" }, "target": null}],
+                }))
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(json!({
+                "id": unit.package, "features": unit.features, "deps": deps,
+                "dependencies": unit.dependencies.iter().map(|dep| &units[dep.unit].package).collect::<Vec<_>>(),
+            }))
+        }).collect::<Result<Vec<_>>>()?;
+        metadata["resolve"] = json!({"root": null, "nodes": nodes});
+        metadata["target_directory"] = json!(target_dir);
+        serde_json::from_value(metadata).map_err(Into::into)
+    }
+
+    fn run_scripts(
+        &mut self,
+        selection: &crate::plan::Selection,
+        sysroot: &Path,
+        host: &str,
+        dir: &Path,
+        build: u64,
+    ) -> Result<crate::scripts::World> {
+        let metadata = self.host_metadata(&dir.join("scripts"))?;
+        let manifest = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
+            metadata.workspace_root.join("Cargo.toml").into_std_path_buf(),
+        ))
+        .map_err(|path| anyhow::anyhow!("{path} is not a manifest path"))?;
+        let cargo = project_model::CargoWorkspace::new(
+            metadata,
+            manifest,
+            ide_db::base_db::Env::default(),
+            false,
+        );
+        let packages = self
+            .units
+            .iter()
+            .filter(|unit| unit.host)
+            .map(|unit| (unit.package.clone(), false))
+            .collect();
+        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        let probe = dir.join("producer-rustc");
+        crate::answers::producer_launcher(&probe)?;
+        env.insert("RUSTC".into(), probe.display().to_string());
+        env.insert("RUSTDOC".into(), probe.display().to_string());
+        env.remove("RUSTC_WRAPPER");
+        env.remove("RUSTC_WORKSPACE_WRAPPER");
+        let failure = dir.join("unsupported-probe");
+        match std::fs::remove_file(&failure) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        env.insert("BLAZE_PRODUCER_PROBE_FAILURE".into(), failure.display().to_string());
+        let root = self
+            .units
+            .iter()
+            .position(|unit| unit.proc_macro)
+            .context("the plan has no producer")?;
+        // The first flag belongs to the library profile. The runner calculates the
+        // build-script profile independently; only configured flags follow it.
+        let flags = self.crates[root].codegen_flags.iter().skip(1).cloned().collect();
+        let cfgs = crate::answers::target_cfg(sysroot, host, &env)
+            .context("blaze has no owned cfg for the producer host")?;
+        let asked = crate::scripts::Asked {
+            env: &env,
+            build,
+            profile: &selection.profile,
+            config: &selection.config,
+            host,
+            target: host,
+            explicit_target: selection.target.is_some(),
+            packages: Some(&packages),
+        };
+        let (outputs, world) =
+            crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs)?;
+        anyhow::ensure!(
+            !failure.exists(),
+            "blaze could not compile a producer's compiler probe: {}",
+            std::fs::read_to_string(&failure).unwrap_or_default(),
+        );
+        for (unit, krate) in self.units.iter().zip(&mut self.crates) {
+            if unit.host
+                && let Some((out_dir, output)) = outputs.get(&unit.package)
+            {
+                krate.cfg.extend(output.cfgs.clone());
+                krate.env.extend(output.env.clone());
+                krate.env.insert("OUT_DIR".into(), out_dir.display().to_string());
+                self.scripts.insert(unit.package.clone());
+            }
+        }
+        Ok(world)
     }
 }
 
@@ -272,7 +380,7 @@ pub(crate) fn of(
         });
     }
     sources.extend(ctx.sources());
-    Ok(Producers { metadata, units, crates, sources })
+    Ok(Producers { metadata, units, crates, sources, scripts: BTreeSet::new() })
 }
 
 /// A diagnostic rendering for the independent harness, not an alternate Cargo unit graph.
@@ -299,12 +407,44 @@ pub(crate) fn command(
     };
     anyhow::ensure!(args.next().is_none(), "unexpected producer plan argument");
     let selection = serde_json::from_slice(&std::fs::read(selection)?)?;
-    let planned = of(&manifest, &selection, &host, &target, std::env::vars().collect())?;
+    let mut planned = of(&manifest, &selection, &host, &target, std::env::vars().collect())?;
     if let Some(dir) = dir {
+        std::fs::create_dir_all(&dir)?;
         let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
             .map(std::path::PathBuf::from)
             .context("the source toolchain is not named")?;
         let env = std::env::vars().collect::<Vec<_>>();
+        // Reject nested producer graphs before any script or compiler child. This
+        // boundary is removed only when the nested scheduler supplies their images.
+        let mut preflight = Producers {
+            metadata: planned.metadata.clone(),
+            units: planned.units.clone(),
+            crates: planned.crates.clone(),
+            sources: vec![],
+            scripts: planned
+                .units
+                .iter()
+                .filter(|unit| unit.build_script)
+                .map(|unit| unit.package.clone())
+                .collect(),
+        };
+        for (root, unit) in preflight.units.iter().enumerate() {
+            if unit.proc_macro {
+                preflight.source_closure(root)?;
+            }
+        }
+        preflight.scripts.clear();
+        let build = crate::scripts::anonymous();
+        struct Release(u64);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                crate::scripts::release(self.0);
+            }
+        }
+        let _release = Release(build);
+        let _operation = crate::scripts::operation(build);
+        let world = planned.run_scripts(&selection, &sysroot, &host, &dir, build)?;
+        let _pin = crate::scripts::pin(build, &world)?;
         let closures = planned
             .units
             .iter()
@@ -374,7 +514,30 @@ mod tests {
             units: vec![unit("dep", false, vec![]), unit("derive", true, vec![edge()])],
             crates,
             sources: vec![],
+            scripts: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn host_adapter_does_not_fold_target_features_or_build_edges() {
+        let mut plan = plan();
+        plan.units[0].features = vec!["host".into()];
+        let mut target = plan.units[0].clone();
+        target.host = false;
+        target.features = vec!["target".into()];
+        plan.units.push(target);
+        plan.units[1].dependencies.push(blaze_metadata::UnitDependency {
+            name: "build_renamed".into(),
+            unit: 0,
+            build: true,
+        });
+        let metadata = plan.host_metadata(Path::new("/out/scripts")).unwrap();
+        let nodes = metadata.resolve.unwrap().nodes;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].features, ["host"]);
+        assert_eq!(nodes[1].deps.len(), 2);
+        let build = nodes[1].deps.iter().find(|dep| dep.name == "build_renamed").unwrap();
+        assert_eq!(build.dep_kinds[0].kind, cargo_metadata::DependencyKind::Build);
     }
 
     #[test]
@@ -387,6 +550,9 @@ mod tests {
         assert!(plan.source_closure(0).is_err());
         plan.units[0].build_script = true;
         assert!(plan.source_closure(1).err().unwrap().to_string().contains("build script"));
+        plan.scripts.insert("dep".into());
+        assert!(plan.source_closure(1).is_ok());
+        plan.scripts.clear();
         plan.units[0].build_script = false;
         plan.units[0].proc_macro = true;
         assert!(plan.source_closure(1).err().unwrap().to_string().contains("nested"));
