@@ -179,6 +179,28 @@ pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> 
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
     let rustc = toolchain_rustc(command.get_program(), &var);
+    if let Some(error) = rustc.as_ref().and_then(|it| own::deployment_error(it, &args, &var)) {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(1 << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(1)
+        };
+        // rustc reports target-construction errors but still emits requested prints
+        // from the target's default options before ending with status 1.
+        let defaults = |name: &str| {
+            if name == "MACOSX_DEPLOYMENT_TARGET" { None } else { var(name) }
+        };
+        let stdout = rustc
+            .as_ref()
+            .and_then(|it| own::answer(it, &args, stdin, &defaults))
+            .ok_or_else(|| io::Error::other("unmodelled print after deployment target error"))?;
+        return Ok(Output { status, stdout, stderr: error.into_bytes() });
+    }
     let stdout = rustc.as_ref().and_then(|rustc| own::answer(rustc, &args, stdin, &var));
     match stdout {
         Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
@@ -491,6 +513,7 @@ mod tests {
                     command.env_remove(name);
                 }
                 command.env("SDKROOT", "/deliberately/nonexistent/sdk");
+                command.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
                 let output = answer(&mut command, &[])
                     .unwrap_or_else(|error| panic!("{compiler:?} {args:?}: {error}"));
                 assert!(output.status.success() && !output.stdout.is_empty());
@@ -504,6 +527,31 @@ mod tests {
         assert!(
             answer(&mut command, &[]).unwrap_err().to_string().contains("Cargo was not executed")
         );
+    }
+
+    #[test]
+    fn deployment_versions_preserve_queries_and_invalid_versions_fail_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = synthetic_toolchain(dir.path());
+        for version in ["11.0", "14.2.1", ""] {
+            let mut command = Command::new(&compiler);
+            command.args(["--version"]).env("MACOSX_DEPLOYMENT_TARGET", version);
+            assert!(answer(&mut command, &[]).unwrap().status.success());
+            let mut command = Command::new(&compiler);
+            command
+                .args(["--print=cfg", "--target=aarch64-apple-darwin"])
+                .env("MACOSX_DEPLOYMENT_TARGET", version);
+            let output = answer(&mut command, &[]).unwrap();
+            assert_eq!(output.status.success(), !version.is_empty());
+        }
+        let mut command = Command::new(&compiler);
+        command
+            .args(["--print=sysroot", "--target=aarch64-apple-darwin"])
+            .env("MACOSX_DEPLOYMENT_TARGET", "not-a-real-secret");
+        let output = answer(&mut command, &[]).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!output.status.success() && stderr.contains("invalid digit"));
+        assert!(!stderr.contains("not-a-real-secret"));
     }
 
     fn question(args: &str) -> bool {

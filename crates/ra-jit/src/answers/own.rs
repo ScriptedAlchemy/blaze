@@ -324,17 +324,47 @@ fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>
     Some(cfgs)
 }
 
-/// Overrides not yet modelled by the owned query answers. SDKROOT is a linker
-/// input, not an input to these release, cfg, filename or target-spec prints.
-const UNSET: [&str; 7] = [
+/// Overrides not yet modelled by the owned query answers. SDKROOT and a valid
+/// MACOSX_DEPLOYMENT_TARGET do not alter release, cfg, filename or spec prints.
+/// Deployment-sensitive code generation and `--print deployment-target` stay
+/// separately modelled operations, never compiler-query fallbacks.
+const UNSET: [&str; 6] = [
     "RUSTC_OVERRIDE_VERSION_STRING",
     "RUST_TARGET_PATH",
-    "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
     "TVOS_DEPLOYMENT_TARGET",
     "WATCHOS_DEPLOYMENT_TARGET",
     "XROS_DEPLOYMENT_TARGET",
 ];
+
+/// rustc validates a Darwin deployment version when constructing the target, but
+/// version-only requests do not construct a target. Never echo the variable's value.
+pub(super) fn deployment_error(
+    rustc: &Path,
+    args: &[OsString],
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<String> {
+    let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
+    let given = Given::of(&args)?;
+    if given.prints.is_empty() {
+        return None;
+    }
+    let toolchain = Toolchain::of(rustc)?;
+    if !given.target.unwrap_or(&toolchain.host).ends_with("-apple-darwin") {
+        return None;
+    }
+    let value = var("MACOSX_DEPLOYMENT_TARGET")?;
+    let value = value.to_str()?;
+    for part in value.splitn(3, '.') {
+        if let Err(error) = part.parse::<u16>() {
+            return Some(format!(
+                "error: failed to parse deployment target specified in MACOSX_DEPLOYMENT_TARGET: {error}\n\n\
+                 error: aborting due to 1 previous error\n\n"
+            ));
+        }
+    }
+    None
+}
 
 /// The cfgs rustc sets itself, which it refuses as `--cfg`, by name or by what it starts with.
 const BUILTIN_CFGS: [&str; 13] = [
@@ -382,6 +412,9 @@ pub(super) fn answer(
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<Vec<u8>> {
     if UNSET.iter().any(|it| var(it).is_some()) {
+        return None;
+    }
+    if deployment_error(rustc, args, var).is_some() {
         return None;
     }
     let nightly = match var("RUSTC_BOOTSTRAP") {
