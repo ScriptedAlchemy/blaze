@@ -36,7 +36,7 @@ BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
 PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
-COUNTED = ("rustc", "rustdoc", "cargo")
+COUNTED = ("rustc", "rustdoc", "cargo", "rustup")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
 # The variable a harness puts in the environment of every process of a run, so that a process
@@ -131,6 +131,16 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
         shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
             out.write(STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+                                      run_id_env=run_id_env))
+        os.chmod(copy, 0o755)
+    # rustup is outside the toolchain's bin directory. Audit its query/discovery
+    # processes too; no row is allowed to hide them by calling them noncompiling.
+    rustup = shutil.which("rustup")
+    if rustup and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
+        copy = os.path.join(toolchain, "bin", "rustup")
+        with open(copy, "w") as out:
+            out.write(STAND_IN.format(tool="rustup", log=shlex.quote(log),
+                                      real=shlex.quote(os.path.realpath(rustup)),
                                       run_id_env=run_id_env))
         os.chmod(copy, 0o755)
     with open(marker, "w") as f:

@@ -671,4 +671,22 @@ mod tests {
         plan.units[0].host = false;
         assert!(plan.source_closure(1).is_err());
     }
+
+    #[test]
+    fn discovered_sysroot_tool_paths_need_no_rustup_process() {
+        let root = paths::AbsPathBuf::assert_utf8(std::env::temp_dir().join("no-rustup-tool-path"));
+        let sysroot = project_model::Sysroot::new(Some(root.clone()), None);
+        let env = ide_db::base_db::Env::default();
+        assert_eq!(
+            sysroot.tool_path(toolchain::Tool::Cargo, &root, &env),
+            paths::Utf8PathBuf::from(
+                root.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX))
+            )
+        );
+        let env = [("CARGO".to_owned(), "/explicit/cargo".to_owned())].into_iter().collect();
+        assert_eq!(
+            sysroot.tool_path(toolchain::Tool::Cargo, &root, &env),
+            paths::Utf8PathBuf::from("/explicit/cargo")
+        );
+    }
 }
