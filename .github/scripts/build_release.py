@@ -331,19 +331,27 @@ def interpreter(binary):
 
     Raises BadElf rather than returning None when the header is truncated, uses a class or
     byte order this does not read (little-endian ELF32/ELF64 are the targets here), or names a
-    `PT_INTERP` outside the file. A malformed file must not pass as static, because "static"
-    is what waives the store-binding check.
+    `PT_INTERP` that is empty, unterminated or outside the file. A malformed file must not pass
+    as static, because "static" is what waives the store-binding check -- so the class decides
+    the minimum header length (52 for ELF32, 64 for ELF64) before any class-specific field is
+    read, and every read is bounds-checked.
     """
     data = binary.read_bytes()
     if data[:4] != b"\x7fELF":
         return None
-    if len(data) < 0x34:
-        raise BadElf(f"{binary.name}: truncated ELF header ({len(data)} bytes)")
+    if len(data) < 0x06:
+        raise BadElf(f"{binary.name}: truncated ELF identification ({len(data)} bytes)")
+    if data[4] == 2:
+        wide, header = True, 0x40
+    elif data[4] == 1:
+        wide, header = False, 0x34
+    else:
+        raise BadElf(f"{binary.name}: ELF class {data[4]} is neither 32 nor 64 bit")
     if data[5] != 1:
         raise BadElf(f"{binary.name}: ELF data encoding {data[5]} is not little-endian")
-    wide = data[4] == 2
-    if not wide and data[4] != 1:
-        raise BadElf(f"{binary.name}: ELF class {data[4]} is neither 32 nor 64 bit")
+    if len(data) < header:
+        raise BadElf(f"{binary.name}: truncated ELF header ({len(data)} bytes, ELF{'64' if wide else '32'} "
+                     f"needs {header})")
     if wide:
         phoff, = struct.unpack_from("<Q", data, 0x20)
         phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
@@ -371,7 +379,15 @@ def interpreter(binary):
                          f"({len(data)} bytes)")
         if size == 0:
             raise BadElf(f"{binary.name}: PT_INTERP is empty")
-        return data[offset:offset + size].split(b"\0", 1)[0].decode(errors="replace")
+        raw = data[offset:offset + size]
+        # The loader path must be a terminated string inside the record: a prefix match on an
+        # unterminated slice would accept a record no loader could read.
+        end = raw.find(b"\0")
+        if end < 0:
+            raise BadElf(f"{binary.name}: PT_INTERP is not NUL-terminated in its {size} bytes")
+        if end == 0:
+            raise BadElf(f"{binary.name}: PT_INTERP names no loader (it is empty)")
+        return raw[:end].decode(errors="replace")
     return None
 
 

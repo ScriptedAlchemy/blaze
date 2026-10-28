@@ -142,6 +142,64 @@ def main() -> int:
         code, said = run_check(d, "nix-native")
         note("nix-native refuses a PT_INTERP past EOF", code == 1 and "past the file" in said, said[:80])
 
+        # The class decides the minimum header: an ELF64 header is 64 bytes, so every truncation
+        # from 52 (the ELF32 size) to 63 must fail by name, never as struct.error and never as
+        # "static" -- static is the waiver, so a short header must not reach it.
+        full64 = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0, 64, 56, 0, 0, 0, 0)
+        note("the ELF64 fixture is a full 64-byte header", len(full64) == 64)
+        bad_lengths = []
+        for n in range(52, 64):
+            d = tmp / f"elf64-truncated-{n}"
+            d.mkdir()
+            (d / "ra-jit").write_bytes(full64[:n])
+            code, said = run_check(d, "nix-native")
+            if not (code == 1 and "truncated ELF header" in said):
+                bad_lengths.append(f"{n}:{'accepted' if code == 0 else said[:40]}")
+        note("nix-native refuses every ELF64 header truncation 52..63", not bad_lengths, ",".join(bad_lengths))
+
+        d = tmp / "elf64-full-static"
+        d.mkdir()
+        (d / "ra-jit").write_bytes(full64)
+        code, said = run_check(d, "nix-native")
+        note("nix-native accepts a full 64-byte ELF64 header with no interpreter", code == 0, said[:60])
+
+        # ELF32 is the class whose 52-byte header the old check used for both: it must still be
+        # read, and its own truncations must fail by name too.
+        full32 = b"\x7fELF" + bytes([1, 1, 1]) + bytes(9) + struct.pack("<HHIIIIIHHHHHH", 2, 3, 1, 0, 52, 0,
+                                                                       0, 52, 32, 0, 0, 0, 0)
+        note("the ELF32 fixture is a full 52-byte header", len(full32) == 52)
+        d = tmp / "elf32-full-static"
+        d.mkdir()
+        (d / "ra-jit").write_bytes(full32)
+        code, said = run_check(d, "nix-native")
+        note("nix-native accepts a full 52-byte ELF32 header with no interpreter", code == 0, said[:60])
+        d = tmp / "elf32-truncated"
+        d.mkdir()
+        (d / "ra-jit").write_bytes(full32[:51])
+        code, said = run_check(d, "nix-native")
+        note("nix-native refuses a 51-byte ELF32 header", code == 1 and "truncated ELF header" in said, said[:70])
+
+        # A PT_INTERP record must be a terminated, nonempty string inside its own bytes: a prefix
+        # match on an unterminated slice would accept a loader record no loader could read.
+        store = b"/nix/store/abc-glibc-2.43/lib/ld-linux-x86-64.so.2"
+
+        def with_interp(name, raw, filesz):
+            d = tmp / name
+            d.mkdir()
+            hdr = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+            ph = struct.pack("<IIQQQQQQ", 3, 4, 120, 0, 0, filesz, filesz, 1)
+            (d / "ra-jit").write_bytes(hdr + ph + raw)
+            return d
+
+        code, said = run_check(with_interp("interp-terminated", store + b"\0", len(store) + 1), "nix-native")
+        note("nix-native accepts a NUL-terminated store loader", code == 0, said[:60])
+        code, said = run_check(with_interp("interp-unterminated", store, len(store)), "nix-native")
+        note("nix-native refuses an unterminated store loader",
+             code == 1 and "not NUL-terminated" in said, said[:80])
+        code, said = run_check(with_interp("interp-empty-name", b"\0", 1), "nix-native")
+        note("nix-native refuses a PT_INTERP that names no loader",
+             code == 1 and "names no loader" in said, said[:80])
+
         # --- the mode is a declaration, not a way to skip a check -------------------------
         d = tmp / "unknown-mode"
         d.mkdir()
