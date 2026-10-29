@@ -223,6 +223,7 @@ def main():
         shutil.rmtree(original)
         hostile = work / "unrelated"
         write(hostile, ".cargo/config.toml", '[build]\nrustflags=["--cfg", "hostile"]\n')
+        write(bundle, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
         hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
                            CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value")
         actual, _ = runner.run("replay-after-removal", [blaze, "cargo", "spec", "--run", spec],
@@ -265,6 +266,39 @@ def main():
         actual, _ = runner.run("escaped-inputs-replay", [blaze, "cargo", "spec", "--run", escaped],
                                hostile_env, hostile)
         assert actual == expected, (actual, expected)
+        project = work / "no-run"
+        shutil.copytree(template, project)
+        write(project, "app/src/main.rs", 'fn main() {}\n#[test]\nfn must_not_run() { panic!("no-run executed a test"); }\n')
+        expected, _ = runner.run("no-run-reference", [real / "bin/cargo", "test", "--no-run",
+            "--locked", "--offline", "--message-format=json", *selected], oracle_env,
+            project, guarded=False)
+        messages = [json.loads(line) for line in expected.splitlines()]
+        references = [Path(message["executable"]) for message in messages
+                      if message.get("reason") == "compiler-artifact"
+                      and message["profile"]["test"] and message.get("executable")]
+        assert len(references) == 1, references
+        saved_test = bundle / "no-run.cbor"
+        runner.run("no-run-save", [blaze, "cargo", "spec", "--out", saved_test,
+                   "test", "--no-run", *selected], env, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("no-run-replay", [blaze, "cargo", "spec", "--run", saved_test],
+                               hostile_env, hostile)
+        results = list(Path(str(saved_test) + ".outputs").glob("replay-*/result.json"))
+        assert len(results) == 1, results
+        result = json.loads(results[0].read_text())
+        assert json.loads(actual) == result, (actual, result)
+        artifacts = result["artifacts"]
+        assert len(artifacts) == 1, artifacts
+        executable = Path(artifacts[0]["executable"])
+        assert executable.is_file(), executable
+        reference, _ = runner.run("no-run-reference-list", [references[0], "--list"],
+                                  oracle_env, hostile, guarded=False)
+        listed, _ = runner.run("no-run-artifact-list", [executable, "--list"], env, hostile)
+        assert listed == reference, (listed, reference)
+        runner.run("no-run-reference-failure", [references[0], "--exact", "must_not_run"],
+                   oracle_env, hostile, expected=101, contains="test result: FAILED", guarded=False)
+        runner.run("no-run-artifact-failure", [executable, "--exact", "must_not_run"], env,
+                   hostile, expected=101, contains="test result: FAILED")
         # Each negative owns a fresh bundle; failed compilation/admission may not
         # leave a result that a caller could treat as a completed executable.
         for name in ("check", "external-include", "native-link"):
