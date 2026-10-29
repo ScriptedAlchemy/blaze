@@ -2,13 +2,15 @@
 """edges.py: a package whose build script runs after another package's (`links`) is run as often
 as cargo runs it, whatever the edge: normal, renamed, optional and on or off, for the platform or
 another, a dev-dependency (no edge) and a build-dependency (no edge, but cargo builds the script
-again).
+again, unless it is for another platform), and is built by whom each variant says (`EXPECTED`): a
+dropped edge or a spurious one sends a build to cargo, or keeps one from it, whatever it built.
 
 usage: edges.py [VARIANT...]    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 Each variant is a parent package whose script logs its runs beside `OUT_DIR` and generates a
 constant, so that its rerun prints and writes the same and the build can stay the daemon's, and a
-member `native` with `links = "probe"` whose script watches `data.txt`. Two edits of
+member `native` with `links = "probe"` whose script watches `data.txt` (and, in `normal-changing`,
+prints it as its metadata). Two edits of
 `native/data.txt` and one of the parent's `src/main.rs` are built with `cargo ra-jit`, and after
 each the program and the number of runs of both scripts are those of cargo alone in `target-ref`.
 
@@ -69,7 +71,23 @@ VARIANTS = {
     "build-dep": ('[build-dependencies]\nnative = { path = "native" }\n', '[workspace]\n'),
     # The same, with the parent's run count compiled into the program.
     "build-dep-counter": ('[build-dependencies]\nnative = { path = "native" }\n', '[workspace]\n'),
+    # A build-dependency only on another platform, of a member built anyway: no edge, and the
+    # parent's script is not compiled with it, so the build stays the daemon's.
+    "build-dep-off": ("[target.'cfg(windows)'.build-dependencies]\nnative = { path = \"native\" }\n",
+                      '[workspace]\ndefault-members = [".", "native"]\n'),
+    # A normal dependency whose metadata is what `data.txt` says: a dropped edge leaves the
+    # parent's program with the old value.
+    "normal-changing": ('[dependencies]\nnative = { path = "native" }\n', '[workspace]\n'),
 }
+
+# Who builds each edit (`data 2`, `data 3`, `main 8`): the daemon, or cargo, which a parent's
+# script that printed or wrote something else, or a build-dependency's that ran again, sends it to.
+EXPECTED = dict.fromkeys(VARIANTS, ("daemon",) * 3)
+EXPECTED.update({
+    "build-dep": ("cargo", "cargo", "daemon"),
+    "build-dep-counter": ("cargo",) * 3,
+    "normal-changing": ("cargo", "cargo", "daemon"),
+})
 
 
 def count(target, package):
@@ -85,7 +103,10 @@ def variant(bin_dir, name):
         "src/main.rs": MAIN,
         "native/Cargo.toml": '[package]\nname = "native"\nversion = "0.1.0"\nedition = "2021"\nlinks = "probe"\n',
         "native/src/lib.rs": "pub fn value() -> u32 { 1 }\n",
-        "native/build.rs": NATIVE_BUILD,
+        "native/build.rs": NATIVE_BUILD.replace(
+            'println!("cargo::metadata=val=1");',
+            'println!("cargo::metadata=val={}", fs::read_to_string("data.txt").unwrap().trim());',
+        ) if name == "normal-changing" else NATIVE_BUILD,
         "native/data.txt": "1\n",
     }
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-ed-", dir="/tmp"))
@@ -102,10 +123,13 @@ def variant(bin_dir, name):
     side, reference = Side(ws, env, True), Side(ws, env, False)
     wrong, rows = [], []
 
-    def compare(step, how):
+    def compare(step, how, expected=None):
         ours = subprocess.run([os.path.join(ws, "target/debug/parent")], capture_output=True)
         theirs = subprocess.run([os.path.join(ws, "target-ref/debug/parent")], capture_output=True)
         problems = differences(ours, theirs, built)
+        # A handoff the variant does not make is a dropped or spurious edge, whatever it built.
+        if expected and how.split(":")[0] != expected:
+            problems.append(f"built by {how}, expected {expected}")
         counts = tuple(count(os.path.join(ws, t), p) for p in ("parent", "native") for t in ("target", "target-ref"))
         if counts[0] != counts[1] or counts[2] != counts[3]:
             problems.append(f"runs parent {counts[0]}/{counts[1]}, native {counts[2]}/{counts[3]} (ours/cargo)")
@@ -126,11 +150,11 @@ def variant(bin_dir, name):
             raise SystemExit(f"{name}: not ready: {states}{tails(home)}")
         steps = [("data 2", "native/data.txt", "1\n", "2\n"), ("data 3", "native/data.txt", "2\n", "3\n"),
                  ("main 8", "src/main.rs", "    7\n", "    8\n")]
-        for step, path, old, new in steps:
+        for (step, path, old, new), expected in zip(steps, EXPECTED[name]):
             cargo_ra_jit.rewrite(os.path.join(ws, path), old, new)
             how = how_built(build(side, f"{name}: {step}", home))
             _, built = reference.cargo("build", "-q")
-            compare(step, how)
+            compare(step, how, expected)
     finally:
         side.cargo("stop")
         if wrong:

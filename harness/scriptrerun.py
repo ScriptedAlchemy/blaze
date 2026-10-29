@@ -35,6 +35,12 @@ edits (in a cargo home in which `ra-jit enable` was run) runs it no more than on
 alone does: after one edit, after two, and after that plain build, the program prints what cargo's
 reference program prints and the script ran as many times as under cargo alone.
 
+Then the runs cargo makes one after another (`links`): a package with `links` whose script runs
+again, the metadata it prints dropped and printed again (`depmeta`), and the same from a package
+that is not the workspace's (`not_a_member`): a registry crate, vendored, and a path dependency
+outside the workspace, which `cargo metadata --no-deps` does not list, but whose metadata cargo
+gives the workspace's script all the same.
+
 usage: scriptrerun.py --selftest    (the comparison alone, without a build)
 
 Python 3, stdlib only.
@@ -649,6 +655,119 @@ def depmeta(bin_dir):
     return wrong
 
 
+# A package with `links` that is not the workspace's, whose script counts its runs beside its
+# `OUT_DIR` and prints what `data.txt` says as its metadata.
+NOT_A_MEMBER = {
+    "Cargo.toml": '[package]\nname = "{name}"\nversion = "0.1.3"\nedition = "2021"\nlinks = "probe"\nbuild = "build.rs"\n',
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+fn main() {
+    println!("cargo::rerun-if-changed=data.txt");
+    let log = PathBuf::from(env::var("OUT_DIR").unwrap()).join("../runs");
+    let runs = fs::read_to_string(&log).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&log, runs.to_string()).unwrap();
+    println!("cargo::metadata=include={}", fs::read_to_string("data.txt").unwrap().trim());
+}
+""",
+    "src/lib.rs": "",
+    "data.txt": "/opt/probe\n",
+}
+
+
+def not_a_member(bin_dir, kind):
+    """A workspace's package whose script embeds the `DEP_PROBE_INCLUDE` cargo gives it, from a
+    package with `links` outside the workspace: `kind` "registry" has it from crates.io, vendored as
+    a directory source that replaces it (`probe-sys`), and "outside" as a path dependency outside
+    the workspace (`native`). `cargo metadata --no-deps` lists neither. Each edit of the program
+    has cargo run the workspace's script again, with that metadata: the program prints the
+    dependency's value as cargo's does, the build is the daemon's, and each script ran as often as
+    under cargo alone. In "outside", an edit of what the dependency prints after those has cargo
+    run both scripts again; the daemon does not run the dependency's, so that build is cargo's,
+    and the program prints the new value."""
+    name = {"registry": "probe-sys", "outside": "native"}[kind]
+    root = os.path.realpath(tempfile.mkdtemp(prefix=f"ra-jit-{kind[:3]}-", dir="/tmp"))
+    ws, home, dep = os.path.join(root, "ws"), os.path.join(root, "home"), os.path.join(root, name)
+    files = {
+        "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+                      '[dependencies]\n' + ('probe-sys = "0.1"\n' if kind == "registry" else 'native = { path = "../native" }\n')
+                      + '\n[workspace]\nexclude = ["target-ref"]\n',
+        "build.rs": r"""use std::{env, fs, path::PathBuf};
+fn main() {
+    println!("cargo::rerun-if-changed=src/main.rs");
+    let log = PathBuf::from(env::var("OUT_DIR").unwrap()).join("../runs");
+    let runs = fs::read_to_string(&log).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&log, runs.to_string()).unwrap();
+    let include = env::var("DEP_PROBE_INCLUDE").unwrap_or_else(|_| "unset".into());
+    println!("cargo::rustc-env=INCLUDE={include}");
+}
+""",
+        "src/main.rs": 'fn number() -> u32 {\n    7\n}\n\nfn main() {\n    println!("{} {}", env!("INCLUDE"), number());\n}\n',
+    }
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    vendor = os.path.join(root, "vendor")
+    at = os.path.join(vendor, name) if kind == "registry" else dep
+    for path, text in NOT_A_MEMBER.items():
+        os.makedirs(os.path.dirname(os.path.join(at, path)), exist_ok=True)
+        with open(os.path.join(at, path), "w") as out:
+            out.write(text.replace("{name}", name))
+    if kind == "registry":
+        # What `cargo vendor` writes, without the checksums, which cargo then does not check.
+        with open(os.path.join(at, ".cargo-checksum.json"), "w") as out:
+            out.write('{"files":{},"package":null}')
+        os.makedirs(os.path.join(ws, ".cargo"))
+        with open(os.path.join(ws, ".cargo", "config.toml"), "w") as out:
+            out.write(f'[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = "{vendor}"\n')
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env["RA_JIT_CACHE"] = "off"
+    for variable in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
+        env.pop(variable, None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+
+    def count(target, package):
+        found = glob.glob(os.path.join(ws, target, "debug", "build", f"{package}-*", "runs"))
+        return sum(int(open(p).read() or 0) for p in found)
+
+    try:
+        build(side, f"{kind}: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode:
+            raise SystemExit(built.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"{kind}: not ready: {states}{tails(home)}")
+        steps = [("an edit of the program", "ws/src/main.rs", "    7\n", "    8\n", "daemon"),
+                 ("another edit of the program", "ws/src/main.rs", "    8\n", "    9\n", "daemon")]
+        if kind == "outside":
+            steps += [("an edit of what the dependency prints", f"{name}/data.txt", "/opt/probe\n", "/opt/other\n", "cargo"),
+                      ("an edit of the program after it", "ws/src/main.rs", "    9\n", "    10\n", "daemon")]
+        for step, path, old, new, expected in steps:
+            cargo_ra_jit.rewrite(os.path.join(root, path), old, new)
+            how = how_built(build(side, f"{kind}: {step}", home))
+            _, built = reference.cargo("build", "-q")
+            ours = subprocess.run([os.path.join(ws, "target/debug/app")], capture_output=True)
+            theirs = subprocess.run([os.path.join(ws, "target-ref/debug/app")], capture_output=True)
+            problems = differences(ours, theirs, built)
+            counts = tuple(count(t, p) for p in ("app", name) for t in ("target", "target-ref"))
+            if counts[0] != counts[1] or counts[2] != counts[3]:
+                problems.append(f"runs app {counts[0]}/{counts[1]}, {name} {counts[2]}/{counts[3]} (ours/cargo)")
+            if how.split(":")[0] != expected:
+                problems.append(f"built by {how}, expected {expected}")
+            wrong.extend(f"{kind}: {step}: {why}" for why in problems)
+            print(f"{kind}: {step}: {ours.stdout!r}/{theirs.stdout!r} exit {ours.returncode}/{theirs.returncode}, "
+                  f"runs app {counts[0]}/{counts[1]} {name} {counts[2]}/{counts[3]}, {how}", flush=True)
+    finally:
+        side.cargo("stop")
+        if wrong:
+            print(f"kept {root}{tails(home, 15)}")
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
+
 def main():
     selftest()
     if sys.argv[1:] == ["--selftest"]:
@@ -721,6 +840,8 @@ def main():
     wrong += inactive_links(bin_dir)
     wrong += continuation_edit(bin_dir)
     wrong += depmeta(bin_dir)
+    wrong += not_a_member(bin_dir, "registry")
+    wrong += not_a_member(bin_dir, "outside")
     import edges
     wrong += edges.run(bin_dir)
     for why in wrong:
