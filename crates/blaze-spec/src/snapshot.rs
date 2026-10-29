@@ -14,7 +14,44 @@ use std::{
 };
 
 use anyhow::{Context as _, bail, ensure};
-use blaze_wire::{Digest, SourcePath, Wire};
+use blaze_wire::{Digest, Limits, SourcePath, Wire};
+
+/// What a manifest may hold. It is a blob of the store, not a wire message, so the 16 MiB
+/// message budget and the 65,536-item collection budget of the wire do not apply: a monorepo
+/// or a workspace with a large vendored tree has more files than that, and capturing one
+/// is the point of the snapshot. A manifest past this is refused by name, not as an oversize
+/// wire message.
+#[cfg(not(test))]
+const MANIFEST: Limits = Limits { request: 1 << 30, batch_items: 8 << 20, ..Limits::DOCUMENTED };
+
+/// Small enough for the unit tests of the refusal to reach it.
+#[cfg(test)]
+const MANIFEST: Limits = Limits { request: 1 << 20, batch_items: 100, ..Limits::DOCUMENTED };
+
+/// A manifest larger than [`MANIFEST`] allows: the tree has too many files to snapshot.
+#[derive(Debug)]
+pub struct ManifestTooLarge {
+    /// The entries (files, directories and links) the manifest lists, when known.
+    pub entries: Option<usize>,
+    /// The bytes of its canonical encoding.
+    pub bytes: usize,
+}
+
+impl std::fmt::Display for ManifestTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the source snapshot's manifest is too large: ")?;
+        if let Some(entries) = self.entries {
+            write!(f, "{entries} entries, ")?;
+        }
+        write!(
+            f,
+            "{} bytes; it holds at most {} entries and {} bytes",
+            self.bytes, MANIFEST.batch_items, MANIFEST.request
+        )
+    }
+}
+
+impl std::error::Error for ManifestTooLarge {}
 
 /// A file, directory or symlink: logical path, kind, executable bits, blob digest.
 /// Symlink blobs contain native target bytes, not lossy text.
@@ -143,7 +180,7 @@ impl Snapshot {
             );
         }
         let snapshot = Self { entries: capture.entries.into_values().collect() };
-        let bytes = blaze_wire::encode(&snapshot);
+        let bytes = encoded(&snapshot)?;
         parse(&bytes)?;
         put(store, &bytes)?;
         Ok(snapshot)
@@ -177,7 +214,7 @@ impl Snapshot {
         }
         entries.insert(path.clone(), Entry(path.clone(), 0, 0, put(store, bytes)?));
         let snapshot = Self { entries: entries.into_values().collect() };
-        let bytes = blaze_wire::encode(&snapshot);
+        let bytes = encoded(&snapshot)?;
         parse(&bytes)?;
         put(store, &bytes)?;
         Ok(snapshot)
@@ -313,7 +350,22 @@ impl Snapshot {
 }
 
 fn parse(bytes: &[u8]) -> anyhow::Result<Snapshot> {
-    Ok(blaze_wire::decode(bytes, &blaze_wire::Limits::default())?)
+    ensure!(
+        bytes.len() as u64 <= u64::from(MANIFEST.request),
+        ManifestTooLarge { entries: None, bytes: bytes.len() }
+    );
+    Ok(blaze_wire::decode(bytes, &MANIFEST)?)
+}
+
+/// The canonical bytes of `snapshot`, refused by name when they are more than a manifest holds.
+fn encoded(snapshot: &Snapshot) -> anyhow::Result<Vec<u8>> {
+    let bytes = blaze_wire::encode(snapshot);
+    ensure!(
+        bytes.len() as u64 <= u64::from(MANIFEST.request)
+            && snapshot.entries.len() as u64 <= u64::from(MANIFEST.batch_items),
+        ManifestTooLarge { entries: Some(snapshot.entries.len()), bytes: bytes.len() }
+    );
+    Ok(bytes)
 }
 
 struct Capture<'a> {
@@ -492,4 +544,28 @@ fn put(store: &Path, bytes: &[u8]) -> anyhow::Result<Digest> {
         Err(error) => return Err(error.into()),
     }
     Ok(digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_manifest_past_its_own_budget_is_refused_by_name() {
+        let source = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        for at in 0..=MANIFEST.batch_items {
+            fs::write(source.path().join(format!("file-{at}")), "x").unwrap();
+        }
+        let error = Snapshot::capture(source.path(), &[], &[], store.path()).unwrap_err();
+        let named = error.downcast_ref::<ManifestTooLarge>().expect("a named refusal");
+        assert_eq!(named.entries, Some(MANIFEST.batch_items as usize + 1));
+        assert!(error.to_string().contains("manifest is too large"), "{error}");
+        // The wire's message error is not what a caller sees.
+        assert!(error.downcast_ref::<blaze_wire::Error>().is_none());
+
+        let oversize = vec![0_u8; MANIFEST.request as usize + 1];
+        let error = parse(&oversize).unwrap_err();
+        assert!(error.downcast_ref::<ManifestTooLarge>().is_some(), "{error}");
+    }
 }

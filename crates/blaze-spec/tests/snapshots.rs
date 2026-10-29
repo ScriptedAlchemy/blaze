@@ -322,3 +322,21 @@ fn output_and_store_directory_aliases_are_excluded_before_following_links() {
     assert!(!destination.join("target").exists());
     assert!(!destination.join("store").exists());
 }
+
+#[test]
+fn a_manifest_may_list_more_files_than_a_wire_collection_holds() {
+    // 65,536 is the wire's bound on one collection; the manifest is a blob of the store, so a
+    // tree past it is still a snapshot. The files are equal, so the store holds one blob.
+    let source = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    for shard in 0..66 {
+        let directory = source.path().join(format!("d{shard}"));
+        fs::create_dir(&directory).unwrap();
+        for at in 0..1000 {
+            fs::write(directory.join(format!("f{at}")), "x").unwrap();
+        }
+    }
+    let captured = Snapshot::capture(source.path(), &[], &[], store.path()).unwrap();
+    let path = blaze_wire::SourcePath::new("d65/f999".to_owned()).unwrap();
+    assert_eq!(Snapshot::read_file(captured.digest(), store.path(), &path).unwrap(), b"x");
+}
