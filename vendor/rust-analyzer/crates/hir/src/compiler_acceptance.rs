@@ -13,7 +13,10 @@ use hir_expand::name::AsName as _;
 use hir_ide::{InferenceDiagnostic, InferenceResult, db::signature_anon_consts_and_diagnostics};
 use rustc_hash::FxHashSet;
 use salsa::SalsaValue;
-use syntax::{AstNode as _, ast};
+use syntax::{
+    AstNode as _,
+    ast::{self, HasName as _},
+};
 
 use crate::{
     Crate, HasCrate as _, HasSource as _, HasVisibility as _, Module, ModuleDef, PathResolution,
@@ -265,6 +268,18 @@ impl<'db> Check<'db> {
         let id = hir_def::ModuleId::from(module);
         let map = id.def_map(self.db);
         let scope = map.module(self.db, id).scope(self.db);
+        let mut names = Names::default();
+        for def in scope.declarations() {
+            names.declare(self.db, ModuleDef::from(def));
+        }
+        for decl in scope.extern_crate_decls() {
+            let decl = crate::ExternCrateDecl::from(decl);
+            if let Some(name) = decl.alias_or_name(self.db)
+                && name.as_str() != "_"
+            {
+                names.bind(name.as_str(), Namespace::Types);
+            }
+        }
         for import in scope.use_decls() {
             let source = import.lookup(self.db).source(self.db);
             self.sema.parse_or_expand(source.file_id);
@@ -273,6 +288,62 @@ impl<'db> Check<'db> {
                     self.reference(def, module, source.file_id.is_macro());
                 }
             }
+            if let Some(tree) = source.value.use_tree() {
+                self.import_names(&tree, &mut names);
+            }
+        }
+        for name in names.conflicts {
+            // E0252, E0254, E0255, E0259, E0260 and E0428: one name bound twice in a
+            // namespace of a module, by items, imports or extern crates.
+            self.result.errors.push(format!("the name `{name}` is defined multiple times"));
+        }
+    }
+
+    /// The names a `use` tree binds, in each namespace its path resolves in. A glob binds
+    /// nothing a later explicit name cannot shadow, and `as _` binds no name.
+    fn import_names(&mut self, tree: &ast::UseTree, names: &mut Names) {
+        if let Some(list) = tree.use_tree_list() {
+            for tree in list.use_trees() {
+                self.import_names(&tree, names);
+            }
+            return;
+        }
+        if tree.star_token().is_some() {
+            return;
+        }
+        let Some(path) = tree.path() else { return };
+        let Some(segment) = path.segment() else { return };
+        let rename = tree.rename();
+        if rename.as_ref().is_some_and(|it| it.underscore_token().is_some()) {
+            return;
+        }
+        // `a::{self}` binds the module `a`, in the type namespace only.
+        if segment.self_token().is_some() {
+            let name = rename
+                .and_then(|it| it.name())
+                .map(|it| it.text().to_string())
+                .or_else(|| use_prefix_name(tree));
+            if let Some(name) = name {
+                names.bind(&name, Namespace::Types);
+            }
+            return;
+        }
+        let name = match rename.and_then(|it| it.name()) {
+            Some(name) => name.text().to_string(),
+            None => match segment.name_ref() {
+                Some(name) => name.text().to_string(),
+                None => return,
+            },
+        };
+        let Some(per_ns) = self.sema.resolve_path_per_ns(&path) else { return };
+        if per_ns.type_ns.is_some() {
+            names.bind(&name, Namespace::Types);
+        }
+        if per_ns.value_ns.is_some() {
+            names.bind(&name, Namespace::Values);
+        }
+        if per_ns.macro_ns.is_some() {
+            names.bind(&name, Namespace::Macros);
         }
     }
 
@@ -354,4 +425,61 @@ fn const_children(
         return;
     }
     store.walk_child_exprs(expr, |child| const_children(store, child, found));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Namespace {
+    Types,
+    Values,
+    Macros,
+}
+
+/// The names bound in one module's namespaces, and those bound twice.
+#[derive(Default)]
+struct Names {
+    bound: FxHashSet<(String, Namespace)>,
+    conflicts: Vec<String>,
+}
+
+impl Names {
+    fn bind(&mut self, name: &str, ns: Namespace) {
+        if !self.bound.insert((name.to_owned(), ns)) {
+            self.conflicts.push(name.to_owned());
+        }
+    }
+
+    /// An item declared in the module binds its name where rustc puts it. A tuple or unit
+    /// struct also binds its constructor in the value namespace. `macro_rules!` is
+    /// textually scoped and may be redefined, so it binds nothing here.
+    fn declare(&mut self, db: &dyn HirDatabase, def: ModuleDef) {
+        let namespaces: &[Namespace] = match def {
+            ModuleDef::Module(_) | ModuleDef::Trait(_) | ModuleDef::TypeAlias(_) => {
+                &[Namespace::Types]
+            }
+            ModuleDef::Adt(crate::Adt::Struct(it)) if it.kind(db) != crate::StructKind::Record => {
+                &[Namespace::Types, Namespace::Values]
+            }
+            ModuleDef::Adt(_) => &[Namespace::Types],
+            ModuleDef::Function(_) | ModuleDef::Const(_) | ModuleDef::Static(_) => {
+                &[Namespace::Values]
+            }
+            ModuleDef::Macro(it) if !matches!(it.id, hir_def::MacroId::MacroRulesId(_)) => {
+                &[Namespace::Macros]
+            }
+            _ => &[],
+        };
+        let Some(name) = def.name(db) else { return };
+        if name.as_str() == "_" {
+            return;
+        }
+        for &ns in namespaces {
+            self.bind(name.as_str(), ns);
+        }
+    }
+}
+
+/// The last segment of the path a nested `use` tree list is under.
+fn use_prefix_name(tree: &ast::UseTree) -> Option<String> {
+    let segment = tree.parent_use_tree_list()?.parent_use_tree().path()?.segment()?;
+    Some(segment.name_ref()?.text().to_string())
 }

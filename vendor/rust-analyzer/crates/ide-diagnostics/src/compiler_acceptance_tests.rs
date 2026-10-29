@@ -178,3 +178,45 @@ pub const VALUE: u8 = 1;
         assert_eq!(checked(fixture), Default::default());
     }
 }
+
+#[test]
+fn source_acceptance_rejects_a_name_bound_twice_in_one_namespace() {
+    let library =
+        "//- /lib.rs crate:library\npub struct Value { pub field: u32 }\npub struct Unit;\n";
+    let probe =
+        |main: &str| checked(&format!("//- /main.rs crate:main deps:library\n{main}\n{library}"));
+    for twice in [
+        "use library::Value;\nuse library::Value;",
+        "use library::{Value, Value};",
+        "use library::Value;\nstruct Value;",
+        "use library::Unit;\nfn Unit() {}",
+        "mod m {}\nmod m {}",
+        "fn f() {}\nfn f() {}",
+        "struct S;\nfn S() {}",
+        "extern crate library;\nextern crate library;",
+        "extern crate library;\nuse library::Value as library;",
+        "mod inner { use library::Value; pub struct Value; }",
+    ] {
+        let result = probe(twice);
+        assert!(
+            result.errors.iter().any(|error| error.contains("defined multiple times")),
+            "{twice}: {result:?}"
+        );
+    }
+    for once in [
+        "use library::Value;",
+        "use library::Value;\nfn Value() {}",
+        "struct S { x: u32 }\nfn S() {}",
+        "use library::Value as _;\nuse library::Value as _;",
+        "use library::*;\nstruct Value;",
+        "macro_rules! m { () => {} }\nmacro_rules! m { () => {} }",
+        "use library::{self as lib, Value};",
+        "mod a { pub struct Value; }\nmod b { pub struct Value; }",
+    ] {
+        let result = probe(once);
+        assert!(
+            !result.errors.iter().any(|error| error.contains("defined multiple times")),
+            "{once}: {result:?}"
+        );
+    }
+}
