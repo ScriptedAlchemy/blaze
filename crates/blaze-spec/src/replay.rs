@@ -100,8 +100,26 @@ impl Wire for Record {
     }
 }
 
-fn relative(root: &Path, path: &Path) -> anyhow::Result<SourcePath> {
+/// `path` spelled below `root`. A system alias above the layout, such as macOS's `/var` for
+/// `/private/var`, names one directory two ways; a root made of both would be `/`, and
+/// capture would follow that link and walk the machine. Only the parent of a path that is
+/// not below `root` as written is resolved, so a link in the last component is kept.
+fn anchor(root: &Path, path: &Path) -> PathBuf {
     let path = blaze_manifest::paths::normalize_path(path);
+    if path.starts_with(root) {
+        return path;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(parent) = parent.canonicalize()
+        && parent.join(name).starts_with(root)
+    {
+        return parent.join(name);
+    }
+    path
+}
+
+fn relative(root: &Path, path: &Path) -> anyhow::Result<SourcePath> {
+    let path = anchor(root, path);
     let path = path.strip_prefix(root).with_context(|| {
         format!("{} is outside the captured source layout {}", path.display(), root.display())
     })?;
@@ -211,8 +229,12 @@ pub fn capture(
     trees.dedup();
     let mut layout = trees.clone();
     layout.extend(first.inputs.iter().filter_map(|(path, _)| path.parent().map(Path::to_owned)));
-    let root =
-        common_root(layout.into_iter().map(|path| blaze_manifest::paths::normalize_path(&path)))?;
+    // The layout is made of directories: spell each by its canonical name, so one directory
+    // never appears under two names in the common root.
+    let root = common_root(layout.into_iter().map(|path| {
+        let path = blaze_manifest::paths::normalize_path(&path);
+        path.canonicalize().unwrap_or(path)
+    }))?;
     let captured_ctx = Context {
         source_root: Some(&root),
         config_root: ctx.config_root,
@@ -246,12 +268,15 @@ pub fn capture(
     let mut excluded = resolved.outputs;
     excluded.extend_from_slice(outputs);
     excluded.push(store.to_owned());
-    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &resolved.inputs, store)?
+    let trees: Vec<_> = trees.iter().map(|path| anchor(&root, path)).collect();
+    let inputs: Vec<_> =
+        resolved.inputs.iter().map(|(path, bytes)| (anchor(&root, path), bytes.clone())).collect();
+    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &inputs, store)?
         .with_file(
-        &SourcePath::new(SOURCES.to_owned())?,
-        &blaze_wire::encode(&(1_u32, sources)),
-        store,
-    )?;
+            &SourcePath::new(SOURCES.to_owned())?,
+            &blaze_wire::encode(&(1_u32, sources)),
+            store,
+        )?;
     let mut made = resolved.spec;
     made.build.source = SourceRef::Root(RootRef { root: snapshot.digest() });
     // The warm front-end and configuration keys intentionally do not contain source.
@@ -273,8 +298,9 @@ pub fn capture(
             .inputs
             .iter()
             .any(|(path, _)| {
-                let path = blaze_manifest::paths::normalize_path(path);
-                path == home.join("config") || path == home.join("config.toml")
+                let path = anchor(&root, path);
+                path == anchor(&root, &home).join("config")
+                    || path == anchor(&root, &home).join("config.toml")
             })
             .then(|| relative(&root, &home))
             .transpose()?,
