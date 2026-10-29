@@ -306,7 +306,7 @@ fn made(
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let (mut whole, targeted) = resolve_ws(
+    let (whole, targeted) = resolve_ws(
         &mut PackageRegistry::new(registry),
         &resolving,
         Some(&lock),
@@ -314,7 +314,12 @@ fn made(
         &specs,
         has_dev_units,
     )?;
-    if lockfile::lockfile_to_write(&mut whole, Some(&lock_text), None, None)?.is_some() {
+    // This frontend never changes the lock. Cargo's locked contract compares
+    // the resolved packages, edges and checksums, rather than requiring its
+    // preferred comments, whitespace or serialization of equivalent entries.
+    let resolved_lock = lockfile::serialize_resolve(&whole, Some(&lock_text));
+    let locked = lockfile::Locked { flag: "--locked", path: &lock_path, path_deps: &path_deps };
+    if !lockfile::are_equal_lockfiles(&lock_text, &resolved_lock, Some(locked)) {
         bail!("{} would change: the manifests no longer agree with it", lock_path.display());
     }
 

@@ -6,6 +6,9 @@ on:
     paths:
       - crates/blaze-serve/**
       - crates/blaze-wire/**
+      - crates/blaze-metadata/**
+      - crates/blaze-manifest/**
+      - crates/blaze-resolve/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
       - vendor/rust-analyzer/crates/syntax/**
@@ -46,6 +49,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
+      - name: Test locked native dependency resolution
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p blaze-metadata -- --test-threads=2
       - name: Test owned compiler answers and empty-crate proofs
         if: ${{ !cancelled() }}
         run: |
