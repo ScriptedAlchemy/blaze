@@ -19,6 +19,7 @@ on:
       - vendor/rust-analyzer/crates/syntax/**
       - vendor/rust-analyzer/crates/cfg/**
       - vendor/rust-analyzer/crates/hir/**
+      - vendor/rust-analyzer/crates/hir-def/**
       - vendor/rust-analyzer/crates/hir-ty/**
       - vendor/rust-analyzer/crates/hir-ty-borrowck/**
       - vendor/rust-analyzer/crates/ide-db/**
@@ -94,6 +95,7 @@ jobs:
           cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit -- compiler_json:: cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
           cargo test --locked -p project-model --lib compiler_project -- --test-threads=2
+          cargo test --locked -p hir-def --lib -- non_unicode_process_environment unicode_crate_environment --test-threads=2
           cargo test --locked -p blaze-wire native::tests -- --test-threads=2
           python3 -I harness/dist/crossmachine.py --self-test
       - name: Test bootstrap protocol wire compatibility

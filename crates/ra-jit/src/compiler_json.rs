@@ -22,6 +22,18 @@ pub(crate) fn read(file: &Path) -> anyhow::Result<Value> {
     }
 }
 
+pub(crate) fn install_native(project: &Value) -> anyhow::Result<()> {
+    let units = match project.get(blaze_wire::native::UNIT_FIELD) {
+        Some(value) => {
+            let bytes: Vec<u8> = serde_json::from_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("invalid owned native transport"))?;
+            blaze_wire::native::decode_units(&bytes)?
+        }
+        None => BTreeMap::new(),
+    };
+    crate::native_inputs::set_native_units(units)
+}
+
 fn cached(
     cache: &OnceLock<Result<Value, String>>,
     reader: impl std::io::Read,
@@ -174,6 +186,15 @@ mod tests {
         assert_eq!(rendered["blaze_native_aliases"].as_array().unwrap().len(), 1);
         assert_eq!(decoded(&path(&source)).unwrap(), Some(source));
     }
+    #[test]
+    fn malformed_native_transport_never_echoes_private_values() {
+        let token = "not-a-real-native-transport-token";
+        let malformed = json!({blaze_wire::native::UNIT_FIELD: [token]});
+        let error = install_native(&malformed).unwrap_err().to_string();
+        assert!(!error.contains(token));
+        assert_eq!(error, "invalid owned native transport");
+    }
+
     #[test]
     fn private_transport_is_cached_without_a_second_read() {
         let cache = OnceLock::new();

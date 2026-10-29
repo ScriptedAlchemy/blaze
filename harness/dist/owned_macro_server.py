@@ -41,7 +41,7 @@ def main():
            "RA_JIT_OWN_RESOLVE": "1", "BLAZE_OWN_RESOLVE": "1",
            "CARGO_TARGET_DIR": str(work / "target"),
            "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store"),
-           "RA_JIT_PROC_MACRO_SERVER": "0", "RA_JIT_WHOLE_BUILD": "1"}
+           "RA_JIT_PROC_MACRO_SERVER": "0"}
     if args.default_sdk:
         env.pop("SDKROOT", None)
     executable = work / "blaze-proc-macro-srv"

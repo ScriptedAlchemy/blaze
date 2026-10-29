@@ -1010,7 +1010,13 @@ fn non_unicode_env(
     span: Span,
 ) -> Option<ExpandError> {
     let krate = arg_id.loc(db).krate;
-    if !krate.env(db).is_non_unicode(key.as_str()) {
+    let env = krate.env(db);
+    let non_unicode = if env.contains_key(key.as_str()) {
+        env.is_non_unicode(key.as_str())
+    } else {
+        base_db::process_env_is_non_unicode(db, key.as_str())
+    };
+    if !non_unicode {
         return None;
     }
     db.env_is_read(krate, key.as_str());

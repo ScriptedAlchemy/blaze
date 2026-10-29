@@ -368,6 +368,11 @@ pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
 }
 
+/// Whether the process supplied a value that cannot form a Rust string.
+pub fn process_env_is_non_unicode(db: &dyn salsa::Database, key: &str) -> bool {
+    ProcessEnv::try_get(db).is_some_and(|env| env.vars(db).is_non_unicode(key))
+}
+
 /// Has builds from here on be for a process with the variables `vars`.
 pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
     use salsa::Setter as _;

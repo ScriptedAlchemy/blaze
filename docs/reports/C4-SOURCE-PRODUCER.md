@@ -63,9 +63,22 @@ not the product's serialized graph. The product tool audit retains queries
 as well as compile calls. A Rust regression compares unit features directly
 with the owned resolver's result under resolver 1, 2 and 3.
 
-Next: schedule nested producers topologically with leases and unchanged image
-reuse. Close script parity gaps before switching both cold paths. Never derive
-a plan from rustc artifacts.
+The captured producer API in `scripts::captured` schedules authoritative source
+units, script compilations/runs and nested macros topologically. It retains
+producer generation leases through the caller's compilation, records source,
+runtime and generated inputs separately, and uses immutable macro images with
+before/after snapshots. The caller supplies the resolved graph; this API does
+not rediscover it through Cargo. This is separate from the diagnostic
+`proc-macro-build` adapter's remaining nested-producer restriction.
+
+Captured descriptions use compiler mode, explicit per-unit cfgs and target
+kinds. Native environments and flags retain OS bytes and per-description unit
+IDs, including distinct instances sharing a source file. The private transport
+goes over stdin; the public description redacts environment values. Producer
+image records also retain native source/output/alias path bytes. These data and
+consumer tests do not establish raw-filename source topology: the shared
+renderer currently aliases a raw filename without its sibling directory.
+Actual native-source runtime acceptance remains separate.
 
 ## Separate compiler witnesses
 
@@ -87,9 +100,21 @@ server-local span ids are ignored. It does not claim span parity.
 `harness/dist/owned_macro_server.py --blaze <blaze> --work <server-build>`
 builds the matching server executable through blaze, including its source
 `proc_macro`. It does not substitute the toolchain's server. The server's
-bootstrap still expands its own derives through the existing compile-time-deps
-handoff. `bootstrap-audit.json` retains every compiler/Cargo call, without
-excluding compile lines. This bootstrap is not a strict-gate pass.
+protocol uses explicit Serde implementations rather than production protocol
+derives, with independent JSON/postcard wire comparisons. Transitive upstream
+packages still declare unused proc-macro dependencies; the production dependency
+graph is not described as derive-free. Bootstrap disables the external macro
+server and blocks compiler/Cargo tools and the official toolchain server.
+`bootstrap-audit.json` and the absolute-exec census retain every attempted call,
+without excluding compile lines.
+
+On Linux x86_64, source head `42abdbad3b39ff682b20ae16dd745718058706b5`
+passed a fresh bootstrap in 611.024 seconds with its own target, home, store and
+work directory. Every linked image reported zero uncompiled functions; the new
+server's version check passed. Both audits were empty. Server SHA256 was
+`8e3237af6e96fd16ae18baaecce16a2ccfeb56b513f859e52853511b391ba8ed`.
+This receipt precedes native-context integration and does not certify later
+combined heads.
 
 The full source-producer witness audits both producer compilation and owned
 server loading/expansion. It retains the actual owned request/response
@@ -103,7 +128,10 @@ queries do not read that linker input. Owned answers preserve it rather than
 clearing the environment; 63 SDK/target differential controls match Rust 1.99.0.
 Deployment-target override modelling remains incomplete and fails by name.
 
-No cold path was switched. The strict initial seven-row witness remains FAIL.
+The default owned cold route is documented in [cargo.md](../cargo.md). The
+original strict seven-row witness failed at the earlier reviewed head; a fresh,
+unexcluded seven-row witness and plain token scan are still required on the
+final combined head. The isolated bootstrap receipt does not establish them.
 
 ## Owned producer scripts
 
@@ -117,13 +145,13 @@ compilation. Generated cfg, env and OUT_DIR reach each host library; the link
 reads native inputs from the script output beside OUT_DIR as before.
 
 Scripts name an owned probe launcher. Version and print questions go straight
-to `answers.rs`'s owned answers, never rustc. Compile probes remain
-unfinished as a general compiler interface. The frontend can report some
-source errors, including cfg-expanded channel gates, but cannot certify
-compiler acceptance: stability, privacy, const validity, dyn compatibility
-and unresolved signatures are not fully checked. An apparently valid probe
-through that partial checker therefore refuses loudly, as an undecided
-operation. It publishes no successful compile probe until those checks are complete. Unknown artifact
+to `answers.rs`'s owned answers, never rustc. Compile probes are
+validated through a tracked vendor compiler-acceptance query covering active
+signatures, resolved API stability/privacy, dyn compatibility, constant rules
+and borrow checking, combined with existing inference diagnostics. Unsupported
+validation remains an explicit producer error. At head `42abdbad`, all 22 review
+probes matched Rust 1.99, including eight positive cases and a positive script
+E2E witness. A loud undecided refusal does not pass this parity gate. Unknown artifact
 operations and bootstrap feature attributes also record a failure
 which the runner checks before publishing successful script output. A script
 cannot swallow an unsupported operation and silently select incomplete cfgs.
@@ -145,8 +173,8 @@ cfg output through the owned launcher and a separate Rust 1.99 oracle. The
 product's compiler tools were blocked and counted: zero calls, no unsupported
 marker or swallowed probe warning. The `autocfg` constructor consumed its
 emitted LLVM files normally. This closes the empty-source constructor failure;
-it does not establish the rest of the proc-macro server bootstrap or broaden
-the partial checker's acceptance.
+that constructor receipt alone does not establish server bootstrap. The later
+isolated bootstrap and probe receipts above are separate checks.
 
 `harness/dist/producer_scripts.py` uses the vendored token producer with a
 default feature and build script. It compares expansion with an independent
@@ -160,11 +188,8 @@ Every product tool call, including queries and expansion, remains audited.
 real registry syn, quote and proc-macro2 default features and scripts. Script
 stdout and normalized expansion matched the independent Cargo/rustc oracle
 at 623e738b. That partial checker failed open on broader compiler probes.
-The P8 review's 22 cases now require oracle parity or a loud undecided refusal.
-The default registry compiler-probe closure currently refuses; its earlier
-success is not current parity evidence. `producer_probes.py` also checks
-known errors and explicit undecided/bootstrap refusals. This is not a general
-metadata-emission or feature-catalog parity claim. The current default cold
-route is documented in [cargo.md](../cargo.md); neither that routing change
-nor the empty-library proof establishes full compiler acceptance or a passing
-strict native-server bootstrap gate.
+The 22-probe review gate now requires exact oracle parity without undecided
+refusals; it passed at `42abdbad`. The default registry source/script/expansion
+gate still needs an actual final combined-head run. Earlier output parity is
+not that receipt. Neither a focused semantic test nor an empty-library proof
+substitutes for the registry, fresh-server, seven-row or plain token gates.

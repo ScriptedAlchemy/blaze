@@ -4,7 +4,9 @@
 
 use ide_db::{
     RootDatabase,
-    base_db::{Crate, Env, ProcessEnv, process_env_var, set_process_env},
+    base_db::{
+        Crate, Env, ProcessEnv, process_env_is_non_unicode, process_env_var, set_process_env,
+    },
 };
 
 use std::{cell::RefCell, collections::BTreeMap, ffi::OsString, process::Command};
@@ -294,7 +296,9 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
         .env_read()
         .into_iter()
         .filter(|(krate, key)| {
-            !krate.env(db).contains_key(key) && process_env_var(db, key) != env.get(key)
+            !krate.env(db).contains_key(key)
+                && (process_env_var(db, key) != env.get(key)
+                    || process_env_is_non_unicode(db, key) != env.is_non_unicode(key))
         })
         .map(|(krate, _)| krate)
         .collect();
@@ -307,6 +311,42 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_turns_distinguish_absent_non_unicode_and_crate_overrides() {
+        use ide_db::base_db::{self, SourceDatabase as _};
+        let mut db = RootDatabase::default();
+        let mut graph = base_db::CrateGraphBuilder::default();
+        let root = graph.add_crate_root(
+            vfs::FileId::from_raw(1),
+            syntax::Edition::Edition2021,
+            None,
+            None,
+            Default::default(),
+            None,
+            Env::default(),
+            base_db::CrateOrigin::Local { repo: None, name: None },
+            Vec::new(),
+            base_db::TargetKind::Lib { is_proc_macro: false },
+            triomphe::Arc::new(paths::AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+            triomphe::Arc::new(base_db::CrateWorkspaceData {
+                target: Err("fixture".into()),
+                toolchain: None,
+            }),
+        );
+        let root = graph.set_in_db(&mut db)[&root];
+        db.env_is_read(root, "MAYBE");
+        set_process_env(&mut db, Env::default());
+        let mut raw = Env::default();
+        raw.set_non_unicode("MAYBE");
+        assert_eq!(turn(&mut db, raw.clone()), [root]);
+        assert!(turn(&mut db, raw.clone()).is_empty());
+        assert_eq!(turn(&mut db, Env::default()), [root]);
+        let mut overlaid = Env::default();
+        overlaid.set("MAYBE", "crate-value");
+        db.set_env(root, overlaid);
+        assert!(turn(&mut db, raw).is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

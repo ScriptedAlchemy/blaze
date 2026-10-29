@@ -3310,9 +3310,10 @@ fn workspace_at(
     let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
         && matches!(manifest, ProjectManifest::ProjectJson(_))
     {
-        let data: project_model::ProjectJsonData =
-            serde_json::from_value(crate::compiler_json::read(project)?)
-                .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
+        let private = crate::compiler_json::read(project)?;
+        crate::compiler_json::install_native(&private)?;
+        let data: project_model::ProjectJsonData = serde_json::from_value(private)
+            .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
         let json = project_model::ProjectJson::new(
             Some(manifest.manifest_path().to_owned()),
             manifest.manifest_path().parent(),
