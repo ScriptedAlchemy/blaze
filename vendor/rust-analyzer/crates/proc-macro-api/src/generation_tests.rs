@@ -61,6 +61,11 @@ fn poisoned_epochs_report_exit_without_waiting() {
         .is_err()
     );
     assert!(client.exited().unwrap().message.contains("poisoned"));
+    client.begin_load_epoch();
+    let dir = stdx::tempfile::NamedTempDir::new("poisoned-epoch-load").unwrap();
+    let library = paths::AbsPathBuf::assert_utf8(dir.path().join("library"));
+    std::fs::write(&library, b"library").unwrap();
+    assert!(client.load_dylib(MacroDylib::new(library)).unwrap_err().message.contains("poisoned"));
 }
 
 impl ProcessExit for ExitCounter {
@@ -137,6 +142,15 @@ fn thirty_generations_retire_only_after_the_last_consumer() {
     .unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 1);
     let first = client.load_dylib(MacroDylib::new(path.clone())).unwrap();
+    let first_content = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"rejected replacement").unwrap();
+    assert!(client.load_dylib(MacroDylib::new(path.clone())).is_err());
+    assert_eq!(live.load(Ordering::SeqCst), 1, "failed candidate epoch must retire");
+    std::fs::write(&path, &first_content).unwrap();
+    let restored = client.load_dylib(MacroDylib::new(path.clone())).unwrap();
+    assert!(Arc::ptr_eq(&first[0].pool, &restored[0].pool));
+    assert_eq!(first[0].dylib_path, restored[0].dylib_path);
+    drop(restored);
     let rejected = paths::AbsPathBuf::assert_utf8(
         std::path::Path::new(path.as_str()).with_extension("rejected"),
     );

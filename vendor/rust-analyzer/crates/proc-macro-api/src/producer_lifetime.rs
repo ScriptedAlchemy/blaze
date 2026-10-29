@@ -62,12 +62,18 @@ pub fn lease(generation: &Path) -> io::Result<File> {
     let _root = locked_root(root)?;
     ordinary(generation)?;
     if !generation.exists() {
-        let pending = root.join(format!(
-            "{PENDING}{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&pending)?;
+        let pending = loop {
+            let pending = root.join(format!(
+                "{PENDING}{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&pending) {
+                Ok(()) => break pending,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
         // Only a complete marker and lease are ever published under the content id.
         // A crash leaves a pending directory that collection can reclaim under this lock.
         let published = (|| {
@@ -246,6 +252,23 @@ mod tests {
         assert!(!bare.join(INVALID).exists());
         drop(recovered);
         assert_eq!(collect(root.path(), &root.path().join("current")).unwrap(), [bare]);
+    }
+
+    #[test]
+    fn stale_pending_claims_do_not_block_a_reused_pid() {
+        let root = stdx::tempfile::NamedTempDir::new("producer-pending-collision").unwrap();
+        // Cover every candidate that parallel tests can select while this test
+        // runs. Old pending directories belong to collection, not this claimant.
+        let start = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+        for sequence in start..start + 100 {
+            let pending = root.path().join(format!("{PENDING}{}-{sequence}", std::process::id()));
+            std::fs::create_dir(&pending).unwrap();
+        }
+        let generation = root.path().join("current");
+        let held = lease(&generation).unwrap();
+        assert_eq!(std::fs::read_to_string(generation.join(MARKER)).unwrap(), FORMAT);
+        assert_eq!(collect(root.path(), &generation).unwrap().len(), 100);
+        drop(held);
     }
 
     #[test]

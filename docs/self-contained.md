@@ -337,10 +337,10 @@ project 3.8 s (the daemon's load; `Finished ... [ra-jit]`), 9.2 s from the first
 10.7 s, 91 MB and 672 MB in `~/.rustup`. All **read**. The Linux release needs glibc 2.39, so
 Debian 12 cannot run it ([#351](https://github.com/indexable-inc/blaze/issues/351)).
 
-2026-10-25, K's first part: with `RA_JIT_WHOLE_BUILD=1`, `cargo blaze build` and `run` from
-nothing are the whole build above, no `cargo build` ([cargo.md](cargo.md#what-a-build-does));
+K's first part: eligible `cargo blaze build` and `run` requests from
+nothing now use the whole build above by default, no `cargo build` ([cargo.md](cargo.md#what-a-build-does));
 `harness/coldbuild.py` holds its fixtures to cargo's, and with `bench` does bench.py's projects:
 `cargo blaze build` from nothing against `cargo build`, each program's output the same, on
 dev-aws-8 (loaded): ripgrep 22.2 s against 6.0 s, fd 48.4 against 28.6, hyperfine 24.5 against
-5.8, just 29.2 against 8.3, bat 33.2 against 10.5, nushell 102.4 against 36.2. **read**. Off by
-default until axum's and biome's builds are whole and the cold times are near cargo's.
+5.8, just 29.2 against 8.3, bat 33.2 against 10.5, nushell 102.4 against 36.2. **read**. Broader
+acceptance remains open until axum's and biome's builds are whole and the cold times are near cargo's.

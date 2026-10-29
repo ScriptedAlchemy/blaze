@@ -2743,9 +2743,6 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_root").entered();
-    if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
-        eprintln!("input-codegen: root {:?}", func);
-    }
     let code = tier::for_build(|| root_code(db, func, false)).map(Produced::code);
     db.depend_on_included_inputs(func.krate(db));
     code
@@ -2939,13 +2936,6 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
-    if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
-        let name = match instance.def {
-            InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str().to_owned(),
-            _ => format!("{:?}", instance.def),
-        };
-        eprintln!("input-codegen: instance {name}");
-    }
     // The code can be instantiated in a caller crate, but its included literals
     // belong to the definition's crate, not the monomorphization environment.
     let krate = match instance.def {

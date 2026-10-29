@@ -3056,7 +3056,10 @@ fn package_alike(
     let names = |inside: &Path| {
         let mut names: Vec<_> = std::fs::read_dir(inside)
             .ok()?
-            .filter_map(|it| Some(it.ok()?.file_name()))
+            .map(|it| it.map(|it| it.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .ok()?
+            .into_iter()
             .filter(|name| !skipped(inside, name))
             .collect();
         names.sort_unstable();
@@ -3099,8 +3102,11 @@ fn package_alike(
 fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
     let Ok(inside) = dir.strip_prefix(base) else { return true };
     let names = |dir: &Path| {
-        let mut names: Vec<_> =
-            std::fs::read_dir(dir).ok()?.filter_map(|it| Some(it.ok()?.file_name())).collect();
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .ok()?
+            .map(|it| it.map(|it| it.file_name()))
+            .collect::<std::io::Result<_>>()
+            .ok()?;
         names.sort_unstable();
         Some(names)
     };
@@ -3112,7 +3118,10 @@ fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
             if path.is_dir() {
                 tree_alike(&path, base, over)
             } else {
-                std::fs::read(&path).ok() == std::fs::read(theirs.join(name)).ok()
+                match (std::fs::read(&path), std::fs::read(theirs.join(name))) {
+                    (Ok(ours), Ok(theirs)) => ours == theirs,
+                    _ => false,
+                }
             }
         })
 }
@@ -10104,17 +10113,7 @@ fn run_holding(
             eprintln!("included-watch: changed={}, sources={}", included.len(), sources.len());
         }
         for path in included {
-            let reloaded = db.reload_included_file(&path);
-            if std::env::var_os("RA_JIT_INPUT_TRACE").is_some() {
-                eprintln!("included-reload: path={path}, changed={reloaded}");
-                hir::attach_db(&db, || {
-                    for &krate in ide_db::base_db::all_crates(&db).iter() {
-                        if db.included_by(krate).iter().any(|(read, _)| read == &path) {
-                            eprintln!("included-owner: {:?}", krate);
-                        }
-                    }
-                });
-            }
+            db.reload_included_file(&path);
         }
         // Invalidate memoized code/listings only after the tracked input revision
         // advances, so patch bases cannot recapture the old included bytes.
@@ -11704,6 +11703,26 @@ fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate(
     assert_eq!(calls.get(), 1);
     assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
 }
+#[test]
+#[cfg(unix)]
+fn unreadable_trees_cannot_share_a_loaded_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    let over = root.path().join("over");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(&over).unwrap();
+    for dir in [&base, &over] {
+        std::os::unix::fs::symlink("missing", dir.join("input")).unwrap();
+    }
+    assert!(!tree_alike(&base, &base, &over));
+    assert!(!package_alike(&base, &base, &over, &FxHashSet::default(), &Compared::default()));
+    for dir in [&base, &over] {
+        std::fs::write(dir.join("missing"), b"same bytes").unwrap();
+    }
+    assert!(tree_alike(&base, &base, &over));
+    assert!(package_alike(&base, &base, &over, &FxHashSet::default(), &Compared::default()));
+}
+
 #[test]
 #[ignore = "bounded same-session full-read cost observation"]
 fn input_comparison_full_read_cost() {

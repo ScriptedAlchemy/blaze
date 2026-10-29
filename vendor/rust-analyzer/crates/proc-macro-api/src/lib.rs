@@ -365,7 +365,7 @@ impl ProcMacroClient {
     /// Existing consumers still own the previous epoch; an unused cold pool is reused.
     pub fn begin_load_epoch(&self) {
         if self.spawn_generation.is_some() {
-            let mut epochs = self.epochs.lock().unwrap();
+            let Ok(mut epochs) = self.epochs.lock() else { return };
             if epochs.initial.is_none() {
                 epochs.current = Weak::new();
             }
@@ -381,7 +381,10 @@ impl ProcMacroClient {
     pub fn load_dylib(&self, dylib: MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
         let prepared = pool::PreparedLibrary::copy(&dylib, self.snapshot_root.as_deref())?;
         // Serialize registration and rotation: concurrent loads must agree on an epoch.
-        let mut epochs = self.epochs.lock().unwrap();
+        let mut epochs = self.epochs.lock().map_err(|_| ServerError {
+            message: "proc-macro epoch state poisoned".into(),
+            io: None,
+        })?;
         let mut pool = epochs.current.upgrade();
         if let Some(factory) = &self.spawn_generation {
             if pool.as_ref().is_none_or(|pool| pool.replaces(&dylib.path, prepared.content)) {
@@ -389,15 +392,20 @@ impl ProcMacroClient {
                     message: "spawning proc-macro epoch".into(),
                     io: Some(Arc::new(error)),
                 })?);
-                epochs.current = Arc::downgrade(&next);
-                epochs.live.retain(|pool| pool.strong_count() != 0);
-                epochs.live.push(Arc::downgrade(&next));
                 pool = Some(next);
             }
         }
         let pool = pool.expect("non-replayable transport retains its initial pool");
         let handles = pool.load_dylib(&dylib, prepared)?;
         if self.spawn_generation.is_some() {
+            // Publish only a successfully loaded epoch. A rejected replacement
+            // must not displace the still-serving pool or break its reuse.
+            epochs.current = Arc::downgrade(&pool);
+            epochs.live.retain(|live| live.strong_count() != 0);
+            if !epochs.live.iter().any(|live| live.ptr_eq(&epochs.current)) {
+                let current = epochs.current.clone();
+                epochs.live.push(current);
+            }
             epochs.initial = None;
         }
         Ok(handles)

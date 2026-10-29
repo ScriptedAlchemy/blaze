@@ -570,7 +570,10 @@ def token_scan(roots, token):
         forms[f"base64-{index}"] = encoded[4 if index else 0:][:(len(raw) * 4) // 3 - 4]
     hits, errors, seen = [], [], set()
     for root in roots:
-        for directory, _, names in os.walk(root):
+        if not os.path.isdir(root):
+            errors.append(root)
+            continue
+        for directory, _, names in os.walk(root, onerror=lambda error: errors.append(error.filename)):
             for name in names:
                 path = os.path.realpath(os.path.join(directory, name))
                 if path in seen or not os.path.isfile(path):
@@ -1285,6 +1288,15 @@ def self_test():
               and len(scan["hits"]) == 1 and scan["hits"][0]["encoding"] == "hex")
         os.unlink(os.path.join(root, "load-env"))
         check("clean token scan passes", not token_scan([root], token)["hits"])
+        missing = os.path.join(root, "missing-root")
+        check("missing scan root fails coverage", token_scan([missing], token)["errors"] == [missing])
+        unreadable = os.path.join(root, "unreadable")
+        def failed_walk(path, onerror):
+            onerror(PermissionError(13, "permission denied", unreadable))
+            return iter(())
+        with mock.patch("os.walk", side_effect=failed_walk):
+            check("directory read errors fail scan coverage",
+                  token_scan([root], token)["errors"] == [unreadable])
 
     h = lambda s: hashlib.sha256(s.encode()).hexdigest()
     id_a, id_b = h("crate a")[:16], h("crate b")[:16]
