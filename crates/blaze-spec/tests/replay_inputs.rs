@@ -576,3 +576,67 @@ fn a_cargo_home_above_the_workspace_keeps_its_precedence_in_replay() {
     assert_eq!(effective["SHARED"], "from-home");
     assert_eq!(effective["ONLY_BASE"], "base");
 }
+
+#[test]
+fn a_replayed_program_gets_the_environment_cargo_gives_one() {
+    let f = fixture();
+    f.write(".cargo/config.toml", "[env]\nMESSAGE='configured'\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Run, &[], store.path());
+    drop(f);
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    let plans = blaze_spec::execution::programs(
+        &replay,
+        Path::new("/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let executor: std::collections::BTreeMap<String, OsString> = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", "/home/worker"),
+        ("LC_ALL", "C"),
+        ("RA_JIT_BACKEND", "llvm"),
+        ("AWS_SECRET_ACCESS_KEY", "worker-secret"),
+    ]
+    .map(|(name, value)| (name.to_owned(), OsString::from(value)))
+    .into_iter()
+    .collect();
+    let cargo = Path::new("/toolchain/bin/cargo");
+    let run = |executor: &_| {
+        blaze_spec::execution::runtime_environment(
+            &replay,
+            &plans[0],
+            executor,
+            cargo,
+            Path::new("/job/home"),
+        )
+        .unwrap()
+    };
+    let env = run(&executor);
+    // The values Cargo sets, placed where the package is on this worker.
+    assert_eq!(env["CARGO_MANIFEST_DIR"], replay.root.as_os_str());
+    assert_eq!(env["CARGO_MANIFEST_PATH"], replay.root.join("Cargo.toml").as_os_str());
+    assert!(Path::new(&env["CARGO_MANIFEST_DIR"]).join("Cargo.toml").is_file());
+    assert_eq!(env["CARGO_PKG_NAME"], "saved");
+    assert_eq!(env["CARGO_PKG_VERSION"], "0.1.0");
+    assert_eq!(env["CARGO"], cargo.as_os_str());
+    // The worker's base, and the configuration of the spec.
+    assert_eq!(env["PATH"], "/usr/bin:/bin");
+    assert_eq!(env["HOME"], "/home/worker");
+    assert_eq!(env["LC_ALL"], "C");
+    assert_eq!(env["MESSAGE"], "configured");
+    // Neither the worker's other variables nor what Cargo tells only the compiler.
+    for absent in [
+        "RA_JIT_BACKEND",
+        "AWS_SECRET_ACCESS_KEY",
+        "CARGO_CRATE_NAME",
+        "CARGO_BIN_NAME",
+        "CARGO_PRIMARY_PACKAGE",
+    ] {
+        assert!(!env.contains_key(absent), "{absent} reached the program");
+    }
+    // A worker with no HOME still gives the program one that exists.
+    let bare = executor.into_iter().filter(|(name, _)| name != "HOME").collect();
+    assert_eq!(run(&bare)["HOME"], "/job/home");
+}

@@ -351,7 +351,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         println!("{result}");
         return Ok(0);
     }
-    let env = prepared.execution_environment()?;
+    let cargo = sysroot.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
     let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
     let mut failed = 0;
     for program in programs.iter().filter(|program| program.run) {
@@ -359,6 +359,13 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
             blaze_wire::Command::Run(run) | blaze_wire::Command::Test(run) => run,
             _ => unreachable!("the execution plan runs only run/test commands"),
         };
+        let env = blaze_spec::execution::runtime_environment(
+            &prepared,
+            program,
+            &executor,
+            &cargo,
+            &compiler_home,
+        )?;
         let mut command = Command::new(&program.executable);
         command.env_clear().envs(&env).envs(run.env.iter().map(|(k, v)| (k, v)));
         if let blaze_wire::Command::Test(_) = &given.command {

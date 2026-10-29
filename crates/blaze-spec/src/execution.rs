@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -28,6 +29,39 @@ pub struct Program {
     pub executable: PathBuf,
     /// A complete source description. No Cargo project is passed to the compiler.
     pub project: Value,
+    /// The variables Cargo gives a program it runs, for its package: the manifest directory
+    /// and path, and the `CARGO_PKG_*` values. The paths are in the replayed tree.
+    pub package: BTreeMap<String, String>,
+}
+
+/// The variables of the worker that a replayed program is given, as Cargo gives a program the
+/// variables of the process that ran it: where to find programs, who runs it, where it may
+/// write, and how it is to speak. Nothing else of the worker's environment reaches it, and
+/// nothing of the requester's that was not in the spec.
+const WORKER_BASE: &[&str] =
+    &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "TERM", "LANG"];
+
+/// The environment a replayed program runs in, as `cargo run` and `cargo test` give theirs:
+/// the worker's base, the spec's configuration and script values, Cargo's package variables
+/// (placed in the replayed tree) and `CARGO`, the cargo of the toolchain. `home` stands in
+/// for a worker with no `HOME`.
+pub fn runtime_environment(
+    prepared: &Prepared,
+    program: &Program,
+    worker: &BTreeMap<String, OsString>,
+    cargo: &Path,
+    home: &Path,
+) -> anyhow::Result<BTreeMap<String, OsString>> {
+    let mut env: BTreeMap<String, OsString> = worker
+        .iter()
+        .filter(|(name, _)| WORKER_BASE.contains(&name.as_str()) || name.starts_with("LC_"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    env.entry("HOME".to_owned()).or_insert_with(|| home.as_os_str().to_owned());
+    env.extend(prepared.execution_environment()?);
+    env.extend(program.package.iter().map(|(name, value)| (name.clone(), value.into())));
+    env.insert("CARGO".to_owned(), cargo.as_os_str().to_owned());
+    Ok(env)
 }
 
 fn reachable(build: &BuildSpec, root: u32) -> BTreeSet<u32> {
@@ -311,7 +345,13 @@ pub fn programs(
             Command::Test(run) => unit.test && !run.no_run,
             _ => false,
         };
+        // Cargo gives rustc the crate's name and which package was asked for; it gives the
+        // program it runs neither.
+        let mut package = package_env(unit, &manifests, false)?;
+        package.remove("CARGO_CRATE_NAME");
+        package.remove("CARGO_BIN_NAME");
         result.push(Program {
+            package,
             unit: root,
             crate_name: unit.target.name.replace('-', "_"),
             harness: root_unit.test,

@@ -3051,6 +3051,13 @@ budgets) preserves application input paths and environment reads, including file
 line-oriented dep-info cannot represent. Replay checks that trace against the snapshot before an
 executable is advertised or run. This is admission after compilation, not a filesystem sandbox.
 
+A program that `run` or `test` starts gets the environment Cargo gives one, not an empty one: the
+worker's `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG` and `LC_*`; the
+spec's configuration and script values; Cargo's package variables (`CARGO_MANIFEST_DIR`,
+`CARGO_MANIFEST_PATH`, `CARGO_PKG_*`), whose paths are in the replayed tree; and `CARGO`, naming the
+toolchain's cargo. The worker's other variables do not reach it, and the dynamic-library search path
+Cargo extends is not set (programs are linked statically).
+
 `harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
 compiler tools blocked, including removal of the original tree and hostile worker configuration.
 Its result, the broader `buildspec.py` differential, native closure coverage, other platforms and

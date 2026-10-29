@@ -92,6 +92,31 @@ version = "0.1.0"
 ''')
 
 
+def standalone(work, name, files):
+    """A one-package project below `work`, with the lock file Cargo would write for it."""
+    project = work / name
+    package = files["Cargo.toml"].split('name="')[1].split('"')[0]
+    write(project, "Cargo.lock", 'version = 4\n[[package]]\nname = "' + package
+          + '"\nversion = "0.1.0"\n')
+    for path, text in files.items():
+        write(project, path, text)
+    return project
+
+
+def saved_equals_cargo(runner, blaze, real, name, project, env, oracle_env, replay_env, hostile,
+                       bundle, words=("run",)):
+    """Save `project`, delete it, replay from `hostile`; the output must be Cargo's."""
+    expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *words, "--locked",
+        "--offline"], oracle_env, project, guarded=False)
+    saved = bundle / (name + ".cbor")
+    runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved, *words], env, project)
+    shutil.rmtree(project)
+    actual, _ = runner.run(name + "-replay", [blaze, "cargo", "spec", "--run", saved],
+                           replay_env, hostile)
+    assert actual == expected, (name, actual, expected)
+    return expected
+
+
 class Runner:
     def __init__(self, binary, work, memory_mib, timeout):
         self.binary, self.work = binary, work
@@ -337,6 +362,16 @@ fn main() {}
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name
+        # A program sees the environment Cargo gives it, not an empty one: the package's own
+        # variables, the toolchain's cargo, and the worker's PATH and HOME.
+        names = ["CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO", "PATH", "HOME"]
+        project = standalone(work, "runtime-env", {
+            "Cargo.toml": '[package]\nname="runtime-env"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { for k in ' + json.dumps(names)
+                           + ' { println!("{}={}", k, std::env::var_os(k).is_some()); } }\n'})
+        expected = saved_equals_cargo(runner, blaze, real, "runtime-env", project, env,
+                                      oracle_env, hostile_env, hostile, bundle)
+        assert expected == "".join(name + "=true\n" for name in names), expected
         print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
     finally:
         calls = audit.read_text().splitlines() if audit.exists() else []
