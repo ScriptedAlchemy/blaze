@@ -23,6 +23,7 @@ on:
       - vendor/proc-macro-srv/**
       - harness/dist/**
       - harness/norustc.py
+      - harness/norustc_test.py
       - Cargo.toml
       - Cargo.lock
       - flake.nix
@@ -82,6 +83,8 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: build
+      - name: Verify execution tracing and audit integrity
+        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
       - name: Record exact source, host, and pinned compilers
         shell: bash
         run: |
@@ -96,8 +99,11 @@ jobs:
       - name: Validate complete native platform and immutable input contracts
         run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
       - name: Build the actual CLI with both owned backends
+        id: replay_cli
         run: nix develop .#bench --command cargo build --locked --release -p ra-jit --bins --features llvm
       - name: Bootstrap a fresh complete owned macro runtime
+        id: owned_runtime
+        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
@@ -105,7 +111,7 @@ jobs:
             --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
             > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
       - name: Original C2 generation and local command differential
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/buildspec.py \
@@ -115,7 +121,7 @@ jobs:
             --json "$RUNNER_TEMP/c2-evidence/local.json" \
             > "$RUNNER_TEMP/c2-evidence/local.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (Cranelift)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
@@ -124,7 +130,7 @@ jobs:
             --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
             --backend cranelift > "$RUNNER_TEMP/c2-evidence/cranelift.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (LLVM)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \

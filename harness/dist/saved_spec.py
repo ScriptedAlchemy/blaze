@@ -368,7 +368,7 @@ class Runner:
         argv = list(map(str, command))
         trace = self.work / (name + ".exec") if guarded and sys.platform == "linux" else None
         if trace:
-            argv = ["strace", "-f", "-e", "trace=execve", "-o", str(trace), *argv]
+            argv = norustc.exec_trace(argv, trace)
         child = subprocess.Popen(argv, cwd=cwd, env=env,
                                  stdin=subprocess.PIPE if private_input is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, errors="replace", start_new_session=True)

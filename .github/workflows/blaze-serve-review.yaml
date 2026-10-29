@@ -60,6 +60,8 @@ jobs:
         with:
           components: rustfmt
           llvm: build
+      - name: Verify execution tracing and audit integrity
+        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
       - name: Check server formatting
         run: cargo fmt -p blaze-serve -- --check
       - name: Test the actual server, HTTP routes, and publication races

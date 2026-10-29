@@ -1154,7 +1154,7 @@ class Blaze:
         traced = argv
         if sys.platform == "linux" and env.get("CARGO"):
             trace = os.path.join(self.trace_directory, "product-" + uuid.uuid4().hex + ".exec")
-            traced = ["strace", "-f", "-D", "-e", "trace=execve", "-o", trace, *argv]
+            traced = norustc.exec_trace(argv, trace, detached=True)
         began = time.monotonic()
         self.watchdog.take()
         with contextlib.ExitStack() as files:

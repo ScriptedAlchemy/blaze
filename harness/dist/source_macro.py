@@ -108,7 +108,7 @@ def expansions(server, library, work, env=None, transcript=None, trace=None):
     env = {**(env or os.environ), "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"}
     command = [str(server)]
     if trace and sys.platform == "linux":
-        command = ["strace", "-f", "-e", "trace=execve", "-o", str(trace), *command]
+        command = norustc.exec_trace(command, trace)
     process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     messages = []

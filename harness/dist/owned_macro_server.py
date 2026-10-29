@@ -41,7 +41,7 @@ def guarded_run(command, trace, *, cwd, env, blaze, memory_mib, timeout):
     env = dict(env, RA_JIT_RUN_ID=label)
     argv = list(map(str, command))
     if sys.platform == "linux":
-        argv = ["strace", "-f", "-D", "-e", "trace=execve", "-o", str(trace), *argv]
+        argv = norustc.exec_trace(argv, trace, detached=True)
     stdout, stderr = Path(str(trace) + ".stdout"), Path(str(trace) + ".stderr")
     started = time.monotonic()
     with stdout.open("w") as out, stderr.open("w") as err:

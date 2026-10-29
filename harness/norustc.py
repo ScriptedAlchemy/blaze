@@ -91,8 +91,42 @@ def run(argv, **kwargs):
 
 def external_execs(text):
     """Every external compiler/Cargo exec attempt, including split trace records."""
-    return [path for path in re.findall(r'execve\("([^"\n]+)"', text)
-            if os.path.basename(path).removesuffix(".real") in (*COUNTED, "rust-analyzer-proc-macro-srv")]
+    started, paths = False, []
+    calls = re.finditer(r'^\s*(?:(?:\d+|\[pid\s+\d+\])\s+)?(execve|seccomp|prctl)\((.*)$',
+                        text, re.MULTILINE)
+    for call in calls:
+        name, args = call.groups()
+        if name == "execve":
+            started = True
+            path = re.match(r'"([^"\n]+)"', args)
+            if path and os.path.basename(path[1]).removesuffix(".real") in (
+                    *COUNTED, "rust-analyzer-proc-macro-srv"):
+                paths.append(path[1])
+        elif started:
+            option = args.partition(",")[0].strip()
+            try:
+                numeric = int(option, 0) & 0xffffffff
+            except ValueError:
+                numeric = None
+            if ((name == "prctl" and (numeric == 22 or option == "PR_SET_SECCOMP"))
+                    or (name == "seccomp" and (numeric in (0, 1)
+                                              or option.startswith("SECCOMP_SET_MODE_")))):
+                raise RuntimeError("exec audit cannot certify a seccomp filter change attempt")
+    if not started:
+        raise RuntimeError("exec audit contains no initial execve")
+    return paths
+
+
+def exec_trace(argv, trace, *, detached=False):
+    """Keep exec attempts visible without ptrace stops on unrelated filesystem reads.
+
+    Filter changes are traced too: a later filter can hide exec attempts from seccomp-bpf,
+    so external_execs rejects that evidence. The tracer's own setup precedes the first exec.
+    Raw arguments keep private thread names and filter data out of the trace.
+    """
+    return ["strace", "--seccomp-bpf", "-f", *(["-D"] if detached else []),
+            "-e", "trace=execve,seccomp,prctl", "-e", "raw=prctl,seccomp",
+            "-o", os.fspath(trace), *argv]
 
 
 def traced_run(argv, trace, *, cwd, env, timeout=7200):
@@ -107,7 +141,7 @@ def traced_run(argv, trace, *, cwd, env, timeout=7200):
                               text=True, errors="replace", stdin=subprocess.DEVNULL)
     stdout, stderr = str(trace) + ".stdout", str(trace) + ".stderr"
     with open(stdout, "w") as out, open(stderr, "w") as err:
-        ran = subprocess.run(["strace", "-f", "-D", "-e", "trace=execve", "-o", str(trace), *argv],
+        ran = subprocess.run(exec_trace(argv, trace, detached=True),
                              cwd=cwd, env=env, timeout=timeout, stdout=out, stderr=err,
                              stdin=subprocess.DEVNULL)
     with open(stdout, errors="replace") as out, open(stderr, errors="replace") as err:
