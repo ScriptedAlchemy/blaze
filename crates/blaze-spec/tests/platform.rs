@@ -267,6 +267,33 @@ fn linux_glibc_platform() {
 }
 
 #[test]
+fn compiler_sysroot_libraries_are_bound_outside_distribution_paths() {
+    let mut fake = Fake { os: Some("linux 6.8".to_owned()), ..Fake::default() }
+        .file("/usr/bin/cc", b"gcc")
+        .file("/usr/bin/getconf", b"getconf")
+        .file("/custom/sysroot/lib/libc.so.6", b"sysroot libc")
+        .file("/custom/sysroot/lib/ld-linux-x86-64.so.2", b"sysroot loader")
+        .run("/usr/bin/getconf", &["GNU_LIBC_VERSION"], "glibc 2.39\n")
+        .run("/usr/bin/cc", &["-print-file-name=libc.so.6"], "/custom/sysroot/lib/libc.so.6\n")
+        .run(
+            "/usr/bin/cc",
+            &["-print-file-name=ld-linux-x86-64.so.2"],
+            "/custom/sysroot/lib/ld-linux-x86-64.so.2\n",
+        );
+    let env = vars(&[("PATH", "/usr/bin")]);
+    let cwd = Path::new("/");
+    let machine =
+        Machine { cwd, env: &env, triple: "x86_64-unknown-linux-gnu", cpu: "x86-64", linker: None };
+    let before = exec_platform(&machine, &fake).unwrap();
+    assert!(before.native_root.is_some());
+    fake.files.insert("/custom/sysroot/lib/libc.so.6".into(), b"changed libc".to_vec());
+    let after = exec_platform(&machine, &fake).unwrap();
+    assert_eq!(before.cc, after.cc);
+    assert_ne!(before.native_root, after.native_root);
+    assert_ne!(digest_of(&before), digest_of(&after));
+}
+
+#[test]
 fn linux_musl_platform() {
     let fake = Fake { os: Some("linux 6.6".to_owned()), ..Fake::default() }
         .file("/usr/bin/cc", b"musl-gcc")

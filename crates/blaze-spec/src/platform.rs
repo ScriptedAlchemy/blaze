@@ -464,6 +464,24 @@ pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPla
                     files.push((path.to_owned(), PathBuf::from(path)));
                 }
             }
+            // A compiler's sysroot need not use the distribution's /lib layout
+            // (Nix and explicit sysroots are ordinary examples).
+            if let Some(cc) = tool(probe, env, machine.triple, "CC", "cc") {
+                for name in
+                    ["libc.so.6", "libc.so", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1"]
+                {
+                    let args = [format!("-print-file-name={name}").into()];
+                    if let Some(path) = probe
+                        .run_path(&cc.path, &args)
+                        .and_then(|bytes| crate::git_path::decode_line(bytes).ok())
+                        && path.is_absolute()
+                        && probe.read(&path).is_some()
+                        && !files.iter().any(|(_, previous)| *previous == path)
+                    {
+                        files.push((format!("compiler/{name}"), path));
+                    }
+                }
+            }
             (None, Some(libc))
         }
     };
@@ -511,6 +529,7 @@ impl Family {
 
 /// A native tool as `ExecPlatform` names it.
 struct Tool {
+    path: PathBuf,
     name: String,
     version: String,
     digest: Digest,
@@ -609,7 +628,7 @@ fn named(
         hasher.update(&launcher_bytes);
     }
     let digest = hasher.finalize().into();
-    Some(Tool { name, version: version(probe, &path), digest })
+    Some(Tool { name, version: version(probe, &path), digest, path })
 }
 
 /// Whether `word` is a launcher `cc` skips to the compiler after it.
