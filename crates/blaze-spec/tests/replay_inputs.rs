@@ -348,7 +348,11 @@ fn no_run_builds_the_test_executables_without_a_doctest_producer() {
             let plans = plans.unwrap();
             assert!(!plans.is_empty());
             assert!(plans.iter().all(|plan| !plan.run));
-            assert!(plans.iter().any(|plan| plan.project["crates"][0]["kind"] == "test"));
+            assert!(
+                plans
+                    .iter()
+                    .any(|plan| plan.project["crates"][0]["build"]["target_kind"] == "test")
+            );
         }
     }
 }
