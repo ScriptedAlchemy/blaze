@@ -39,6 +39,7 @@ def main():
            "CARGO": str(audit / "bin" / "cargo"), "RA_JIT_STD_FROM": "off",
            "RA_JIT_ANSWERS": "own", "BLAZE_ANSWERS": "own",
            "RA_JIT_OWN_RESOLVE": "1", "BLAZE_OWN_RESOLVE": "1",
+           "CARGO_TARGET_DIR": str(work / "target"),
            "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store"),
            "RA_JIT_PROC_MACRO_SERVER": "0", "RA_JIT_WHOLE_BUILD": "1"}
     if args.default_sdk:

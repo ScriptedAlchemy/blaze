@@ -22,7 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import source_macro
 
 
-def fixture(work):
+def cross_target(host):
+    return "x86_64-unknown-linux-gnu" if host.startswith("aarch64-") else "aarch64-unknown-linux-gnu"
+
+
+def fixture(work, host=None):
+    host = host or norustc.reference_host(norustc.real_toolchain())
     root = work / "app"
     root.mkdir(parents=True, exist_ok=True)
     (root / "Cargo.toml").write_text('''[workspace]
@@ -61,7 +66,7 @@ edition = "2021"
 host = []
 target = []
 optional = ["dep:renamed"]
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 renamed = { package = "optional", path = "../optional", optional = true }
 ''', (source_macro.FIXTURE / "shared.rs").read_text() +
                   '\n#[cfg(all(feature="host", feature="optional"))]\n'
@@ -79,13 +84,13 @@ edition = "2021"
         (path / ("main.rs" if name == "app" else "lib.rs")).write_text(source)
     config = root / ".cargo"
     config.mkdir(exist_ok=True)
-    (config / "config.toml").write_text('''[env]
+    (config / "config.toml").write_text(f'''[env]
 PRODUCER_CONFIG_ENV = "from-config"
 PRODUCER_KEEP_ENV = "ignored"
-PRODUCER_FORCE_ENV = { value = "forced", force = true }
-[target.aarch64-apple-darwin]
+PRODUCER_FORCE_ENV = {{ value = "forced", force = true }}
+[target.{host}]
 rustflags = ["--cfg", "native_flag"]
-[target.aarch64-unknown-linux-gnu]
+[target.{cross_target(host)}]
 rustflags = ["--cfg", "target_only_flag"]
 ''')
     return root
@@ -166,10 +171,9 @@ def main():
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    root = fixture(work)
-    host = "aarch64-apple-darwin"
-    assert sys.platform == "darwin", "this fixture names macOS host predicates"
     real = Path(norustc.real_toolchain())
+    host = norustc.reference_host(real)
+    root = fixture(work, host)
     env = dict(os.environ, RUSTUP_TOOLCHAIN=str(real), RUSTC_BOOTSTRAP="1",
                PRODUCER_KEEP_ENV="caller", PRODUCER_FORCE_ENV="caller")
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
@@ -181,13 +185,14 @@ def main():
     product_env = {**env, "RUSTUP_TOOLCHAIN": str(audit),
                    "PATH": str(audit / "bin") + os.pathsep + env["PATH"],
                    "RA_JIT_PROC_MACRO_SERVER": "0", "RA_JIT_STD_FROM": "off",
-                   "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store")}
+                   "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store"),
+                   "CARGO_TARGET_DIR": str(work / "target")}
     sdk = product_env.pop("SDKROOT", None)
     (work / "sdk-choice.json").write_text(json.dumps({"default-sdk": True, "inherited": sdk}) + "\n")
     native = None
     for label, explicit, target in [
             ("native", False, host), ("explicit-native", True, host),
-            ("cross", True, "aarch64-unknown-linux-gnu")]:
+            ("cross", True, cross_target(host))]:
         selection = dict(profile="dev", features=[], no_default_features=False,
                          all_features=False, packages=["app"], workspace=False,
                          target=target if explicit else None, dev_deps=False, config=[])
@@ -218,7 +223,8 @@ def main():
     run([real / "bin/cargo", "build", "--offline", "-p", "app"],
         root, reference_env, work / "reference-build.log")
     run([work / "oracle-target/debug/app"], root, reference_env, work / "reference-target.log")
-    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*.dylib"))
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*" + suffix))
     assert len(images) == 1, images
     reference = images[0]
     theirs = source_macro.expansions(real / "libexec/rust-analyzer-proc-macro-srv", reference, work,

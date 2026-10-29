@@ -16,8 +16,8 @@ import producer_plan
 import source_macro
 
 
-def fixture(work, nested=False):
-    root = producer_plan.fixture(work)
+def fixture(work, nested=False, host=None):
+    root = producer_plan.fixture(work, host)
     derive = root / "derive"
     with (derive / "Cargo.toml").open("a") as out:
         out.write('''[features]
@@ -127,11 +127,10 @@ def main():
     args = parser.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    root = fixture(work, args.nested)
     norustc = producer_plan.norustc
     real = Path(norustc.real_toolchain())
-    host = "aarch64-apple-darwin"
-    assert sys.platform == "darwin"
+    host = norustc.reference_host(real)
+    root = fixture(work, args.nested, host)
     env = dict(os.environ, RUSTUP_TOOLCHAIN=str(real), PRODUCER_KEEP_ENV="caller")
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
                  "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "SDKROOT"):
@@ -148,7 +147,8 @@ def main():
                    RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
                    RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1",
                    RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER=str(args.owned_server.resolve()),
-                   RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"))
+                   RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"),
+                   CARGO_TARGET_DIR=str(work / "target"))
     # A synthetic credential, not a real secret. Child processes receive the
     # caller's environment, but producer/link diagnostics must not print it.
     secret = "c4-not-a-real-token-log-regression"
@@ -168,7 +168,8 @@ def main():
     reference_env = dict(env, CARGO_TARGET_DIR=str(work / "oracle-target"))
     run([real / "bin/cargo", "build", "--offline", "-p", "app"],
         root, reference_env, work / "reference-build.log")
-    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*.dylib"))
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*" + suffix))
     assert len(images) == 1, images
     theirs = source_macro.expansions(real / "libexec/rust-analyzer-proc-macro-srv", images[0], work,
                                      transcript=work / "oracle-transcript.json")

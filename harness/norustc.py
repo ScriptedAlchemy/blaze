@@ -127,6 +127,15 @@ def real_toolchain():
     return run(["rustc", "--print", "sysroot"], check=True).stdout.strip()
 
 
+def reference_host(toolchain):
+    """The independent oracle's actual host, never a product compilation request."""
+    version = run([os.path.join(toolchain, "bin", "rustc"), "-vV"], check=True).stdout
+    facts = dict(line.split(": ", 1) for line in version.splitlines() if ": " in line)
+    if facts.get("release") != TOOLCHAIN or not facts.get("host"):
+        raise RuntimeError(f"reference host requires Rust {TOOLCHAIN}: {version}")
+    return facts["host"]
+
+
 def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=False):
     """A copy of the pinned toolchain at `work/toolchain` whose rustc, rustdoc and cargo are
     stand-ins that append a line to `log` for each run and then run the real tool, which keeps

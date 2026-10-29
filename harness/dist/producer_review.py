@@ -70,8 +70,8 @@ def main():
         RA_JIT_PROC_MACRO_SERVER="0", RA_JIT_STD_FROM="off",
         RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"),
         RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
-        RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1")
-    host = "aarch64-apple-darwin"
+        RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1", CARGO_TARGET_DIR=str(work / "target"))
+    host = producer_plan.norustc.reference_host(real)
     rows = []
     if args.syntax_error or args.syntax_dependency:
         for root in (ours, oracle):
@@ -104,7 +104,7 @@ def main():
         return
     try:
         steps = [("native", None, None), ("explicit-native", host, None),
-                 ("cross", "aarch64-unknown-linux-gnu", None)]
+                 ("cross", producer_plan.cross_target(host), None)]
         if args.raw_env:
             steps = [(name, None, value) for name, value in (
                 ("raw-first", b"\xff\xfe"), ("raw-same", b"\xff\xfe"),
@@ -139,7 +139,8 @@ def main():
                 argv += ["--target", target]
             out = work / ("oracle-target-" + domain)
             run(argv, oracle, dict(oracle_step, CARGO_TARGET_DIR=str(out)), work / (name + "-oracle.log"))
-            images = list((out / "debug/deps").glob("libsource_derive*.dylib"))
+            suffix = ".dylib" if sys.platform == "darwin" else ".so"
+            images = list((out / "debug/deps").glob("libsource_derive*" + suffix))
             assert len(images) == 1, images
             expected = source_macro.expansions(real / "libexec/rust-analyzer-proc-macro-srv",
                 images[0], work, transcript=work / (name + "-oracle-transcript.json"))

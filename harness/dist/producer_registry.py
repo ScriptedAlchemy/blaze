@@ -18,8 +18,8 @@ import producer_plan
 import source_macro
 
 
-def fixture(work):
-    root = producer_plan.fixture(work)
+def fixture(work, host=None):
+    root = producer_plan.fixture(work, host)
     derive = root / "derive"
     text = (derive / "Cargo.toml").read_text()
     for name in ("syn", "quote"):
@@ -43,11 +43,10 @@ def main():
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     assert not (work / "producer").exists(), "use a fresh witness directory"
-    root = fixture(work)
     norustc = producer_plan.norustc
     real = Path(norustc.real_toolchain())
-    host = "aarch64-apple-darwin"
-    assert sys.platform == "darwin"
+    host = norustc.reference_host(real)
+    root = fixture(work, host)
     env = dict(os.environ, RUSTUP_TOOLCHAIN=str(real))
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
                  "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "SDKROOT",
@@ -67,7 +66,8 @@ def main():
         RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
         RA_JIT_OWN_RESOLVE="1", BLAZE_OWN_RESOLVE="1",
         RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0",
-        RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"))
+        RA_JIT_HOME=str(work / "home"), RA_JIT_CACHE=str(work / "store"),
+        CARGO_TARGET_DIR=str(work / "target"))
     try:
         plan = json.loads(run([args.blaze.resolve(), "proc-macro-plan",
             root / "Cargo.toml", selection, host, host],
@@ -119,7 +119,8 @@ def main():
         reference = outputs(work / "oracle-target/debug/build", package)
         assert len(owned) == len(reference) == 1, (owned, reference)
         assert owned == reference, (package, owned, reference)
-    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*.dylib"))
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    images = list((work / "oracle-target/debug/deps").glob("libsource_derive*" + suffix))
     assert len(images) == 1, images
     theirs = source_macro.expansions(real / "libexec/rust-analyzer-proc-macro-srv",
         images[0], work, transcript=work / "oracle-transcript.json")

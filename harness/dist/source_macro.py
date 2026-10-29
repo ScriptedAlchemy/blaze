@@ -30,7 +30,8 @@ FEATURES = {"syn": ["derive", "parsing", "printing", "clone-impls"]}
 
 
 def source(package):
-    paths = glob.glob(str(Path.home() / ".cargo" / "registry" / "src" / "*" /
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    paths = glob.glob(str(cargo_home / "registry" / "src" / "*" /
                           f"{package}-{VERSIONS[package]}" / "src" / "lib.rs"))
     if len(paths) != 1:
         raise RuntimeError(f"need one cached source of {package} {VERSIONS[package]}: {paths}")
@@ -103,9 +104,12 @@ def oracle(plan, sysroot, work):
     return built[0]
 
 
-def expansions(server, library, work, env=None, transcript=None):
+def expansions(server, library, work, env=None, transcript=None, trace=None):
     env = {**(env or os.environ), "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"}
-    process = subprocess.Popen([str(server)], env=env, stdin=subprocess.PIPE,
+    command = [str(server)]
+    if trace and sys.platform == "linux":
+        command = ["strace", "-f", "-e", "trace=execve", "-o", str(trace), *command]
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     messages = []
     def request(value):
@@ -196,24 +200,33 @@ def main():
                         "RA_JIT_SPARE": "0"}.items():
         assert os.environ.get(name) == value, f"run under the memory watchdog with {name}={value}"
     audit_log = work / "product-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log)))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log),
+                                 block=True, block_macro_server=True))
     env = {**os.environ, "PATH": str(audit / "bin") + os.pathsep + os.environ["PATH"],
            "RUSTUP_TOOLCHAIN": str(audit), "RA_JIT_STD_FROM": "off",
            "RA_JIT_HOME": str(work / "home"), "RA_JIT_CACHE": str(work / "store"),
-           "RA_JIT_PROC_MACRO_SERVER": "0"}
+           "RA_JIT_PROC_MACRO_SERVER": "0", "CARGO_TARGET_DIR": str(work / "target"),
+           "CARGO": str(audit / "bin/cargo"), "RUSTC": str(audit / "bin/rustc"),
+           "RUSTDOC": str(audit / "bin/rustdoc")}
     if args.default_sdk:
         env.pop("SDKROOT", None)
     (work / "environment.json").write_text(json.dumps(
         {"SDKROOT": env.get("SDKROOT"), "default_sdk": args.default_sdk}, indent=2) + "\n")
     before = len(norustc.runs(str(audit_log)))
     try:
-        library = Path(run([args.blaze.resolve(), "proc-macro-source", audit,
-                           work / "host-plan.json", work / "producer"],
-                          work / "product-build.log", env))
+        built = norustc.traced_run([str(args.blaze.resolve()), "proc-macro-source", str(audit),
+                                   str(work / "host-plan.json"), str(work / "producer")],
+                                  work / "build.exec", cwd=work, env=env)
+        (work / "product-build.log").write_text(built.stdout + built.stderr)
+        assert built.returncode == 0, f"source build exit {built.returncode}; see {work / 'product-build.log'}"
+        library = Path(built.stdout.strip())
     finally:
         calls = norustc.runs(str(audit_log))[before:]
         (work / "product-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
         assert not calls, f"product ran counted tools: {calls}"
+        execs = norustc.external_execs((work / "build.exec").read_text()) if sys.platform == "linux" else []
+        (work / "product-external-execs.json").write_text(json.dumps(execs, indent=2) + "\n")
+        assert not execs, f"source build attempted external compiler/Cargo execs: {execs}"
     if args.build_only:
         print(f"built {library}; zero rustc/cargo calls; expansion NOT CHECKED")
         return
@@ -226,11 +239,14 @@ def main():
     server = args.owned_server.resolve()
     before = len(norustc.runs(str(audit_log)))
     try:
-        ours = expansions(server, library, work, env, work / "owned-transcript.json")
+        ours = expansions(server, library, work, env, work / "owned-transcript.json", work / "expand.exec")
     finally:
         calls = norustc.runs(str(audit_log))[before:]
         (work / "expansion-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
         assert not calls, f"owned expansion ran counted tools: {calls}"
+        execs = norustc.external_execs((work / "expand.exec").read_text()) if sys.platform == "linux" else []
+        (work / "expansion-external-execs.json").write_text(json.dumps(execs, indent=2) + "\n")
+        assert not execs, f"owned expansion attempted external compiler/Cargo execs: {execs}"
     pins = {name: dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
             for name, path in [("blaze", args.blaze.resolve()), ("server", server),
                                ("producer", library), ("oracle", reference)]}
