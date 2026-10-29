@@ -14,6 +14,8 @@ mod apply_change;
 pub mod active_parameter;
 pub mod assists;
 pub mod code_identity;
+#[cfg(test)]
+mod probe_acceptance_tests;
 pub mod defs;
 pub mod documentation;
 pub mod famous_defs;

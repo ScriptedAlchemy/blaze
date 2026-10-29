@@ -48,6 +48,7 @@ use crate::{
 };
 
 pub mod docs;
+pub mod stability;
 
 pub use self::docs::{Docs, IsInnerDoc};
 

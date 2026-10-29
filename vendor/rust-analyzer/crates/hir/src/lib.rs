@@ -24,6 +24,7 @@ extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 mod attrs;
 mod channel_features;
+mod probe_acceptance;
 mod from_id;
 mod has_source;
 mod semantics;
@@ -152,6 +153,7 @@ pub use crate::{
     attrs::{AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     diagnostics::*,
     has_source::HasSource,
+    probe_acceptance::ProbeVerdict,
     semantics::{
         LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,

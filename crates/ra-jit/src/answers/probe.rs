@@ -30,6 +30,7 @@ struct Probe {
     target: Option<String>,
     out: std::path::PathBuf,
     emission: Emission,
+    lints_capped: bool,
 }
 
 fn parse(args: &[OsString]) -> Result<Probe> {
@@ -46,6 +47,7 @@ fn parse(args: &[OsString]) -> Result<Probe> {
         target: None,
         out: std::env::current_dir()?,
         emission: Emission::Metadata,
+        lints_capped: false,
     };
     let mut it = words.into_iter();
     let mut seen = BTreeSet::new();
@@ -87,7 +89,10 @@ fn parse(args: &[OsString]) -> Result<Probe> {
                     Emission::Metadata
                 });
             }
-            "--cap-lints" => anyhow::ensure!(value()? == "allow", "unsupported probe lint policy"),
+            "--cap-lints" => {
+                anyhow::ensure!(value()? == "allow", "unsupported probe lint policy");
+                probe.lints_capped = true;
+            }
             "-C" => probe.flags.push(format!("-C{}", value()?)),
             "-O" => probe.flags.push("-Copt-level=2".into()),
             _ if word.starts_with("-C") => probe.flags.push(word.into()),
@@ -124,6 +129,7 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
         super::target_cfg(sysroot, target, &env).is_some(),
         "unknown compiler probe target"
     );
+    let libraries = sysroot.join("lib/rustlib").join(target).join("lib");
     let mut cfg_args: Vec<_> = probe.flags.iter().map(OsString::from).collect();
     for cfg in &probe.cfg {
         cfg_args.extend([OsString::from("--cfg"), OsString::from(cfg)]);
@@ -209,7 +215,26 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
     let bootstrap = std::env::var("RUSTC_BOOTSTRAP")
         .ok()
         .is_some_and(|it| it == "1" || it.split(',').any(|name| name == probe.name));
-    crate::check::source(parsed, bootstrap)
+    let installed = |name: &str| installed(&libraries, name);
+    let context = crate::check::ProbeContext {
+        bootstrap,
+        lints_capped: probe.lints_capped,
+        installed: &installed,
+    };
+    crate::check::source(parsed, context)
+}
+
+/// rustc loads a probe's standard-library crates from the target's installed
+/// libraries; without them it fails with E0463 whatever the source says.
+fn installed(libraries: &Path, name: &str) -> bool {
+    let prefix = format!("lib{name}-");
+    std::fs::read_dir(libraries).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let file = entry.file_name();
+            let file = file.to_string_lossy();
+            file.starts_with(&prefix) && file.ends_with(".rlib")
+        })
+    })
 }
 
 fn emit_empty_ir(
@@ -314,6 +339,10 @@ mod tests {
         assert_eq!(parsed.source, "probe.rs");
         assert_eq!(parsed.edition, syntax::Edition::Edition2021);
         assert_eq!(parsed.emission, Emission::Metadata);
+        assert!(parsed.lints_capped);
+        let uncapped: Vec<_> = args.iter().filter(|it| *it != "--cap-lints=allow").collect();
+        let uncapped: Vec<_> = uncapped.into_iter().cloned().collect();
+        assert!(!parse(&uncapped).unwrap().lints_capped);
         for extra in ["--extern=other=/rustc.rmeta", "--emit=link", "--unknown"] {
             let mut args = args.clone();
             args.push(extra.into());
@@ -417,6 +446,21 @@ mod tests {
         std::fs::remove_file(&source).unwrap();
         assert!(emit_empty_ir(&sysroot, &probe, "", None, "unknown-target", &|_| None).is_err());
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn installed_libraries_are_the_target_rlibs_by_crate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["libcore-0123.rlib", "libproc_macro-4567.rmeta", "libstd-89ab.dylib"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        assert!(installed(dir.path(), "core"));
+        // The release ships each library as an rlib; a lone rmeta or dylib is not taken
+        // as installed, which can only make a probe undecided.
+        assert!(!installed(dir.path(), "proc_macro"));
+        assert!(!installed(dir.path(), "std"));
+        assert!(!installed(dir.path(), "co"));
+        assert!(!installed(&dir.path().join("absent"), "core"));
     }
 
     #[test]

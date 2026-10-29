@@ -79,9 +79,22 @@ pub(crate) fn syntax(
     Ok(crate::unparsed(db, &checked, &Sources { paths }, &args.checkout))
 }
 
+/// How a compiler probe is checked beyond its source.
+pub(crate) struct ProbeContext<'a> {
+    /// `RUSTC_BOOTSTRAP` enables this crate's feature gates.
+    pub(crate) bootstrap: bool,
+    /// `--cap-lints=allow`: no lint can fail the probe.
+    pub(crate) lints_capped: bool,
+    /// Whether the release has the named standard-library crate for the probe's target.
+    pub(crate) installed: &'a dyn Fn(&str) -> bool,
+}
+
 /// A metadata-only compiler probe checks all source bodies, including unreachable
 /// ones. It loads an owned source description, not a Cargo workspace or rmeta.
-pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
+pub(crate) fn source(args: Args, probe: ProbeContext<'_>) -> anyhow::Result<bool> {
+    // Without `#![feature]`, RUSTC_BOOTSTRAP enables no library item: it matters only
+    // to the feature gate below.
+    let bootstrap = probe.bootstrap;
     crate::process_wide();
     let config = crate::cargo_config(&args);
     let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
@@ -151,15 +164,37 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         eprintln!("{refused}");
         return Ok(false);
     }
-    // IDE diagnostics and MIR refusals are not a compiler acceptance proof.
-    // Stability, privacy, const validity, dyn compatibility and unresolved
-    // signatures are not all checked here. A script may swallow a negative
-    // status, so an undecided probe must mark the *producer build* unsupported
-    // rather than silently select an implementation from a wrong feature cfg.
-    anyhow::bail!(
-        "owned compiler probe acceptance is not proven: stability, privacy, \
-         const validity, dyn compatibility and name/type resolution need complete compiler checks"
-    )
+    // IDE diagnostics and MIR refusals are not a compiler acceptance proof. The
+    // probe fragment of `hir::probe_acceptance` checks every rule rustc applies to it
+    // (stability, privacy, resolution, exact types, moves and borrows). Outside it, a
+    // script may swallow a negative status, so an undecided probe must mark the
+    // *producer build* unsupported rather than select an implementation from a wrong
+    // feature cfg.
+    let undecided = |why: &str| {
+        anyhow::anyhow!(
+            "owned compiler probe acceptance is not proven: {why}; outside the decided \
+             fragment, stability, privacy, const validity, dyn compatibility and name/type \
+             resolution need complete compiler checks"
+        )
+    };
+    match hir::attach_db(&db, || krate.probe_verdict(&db)) {
+        hir::ProbeVerdict::Accepted { sysroot_crates } => {
+            if !probe.lints_capped {
+                return Err(undecided("deny-by-default lints are not capped"));
+            }
+            if let Some(name) = sysroot_crates.iter().find(|it| !(probe.installed)(it)) {
+                return Err(undecided(&format!(
+                    "the `{name}` library of the probe's target is not installed"
+                )));
+            }
+            Ok(true)
+        }
+        hir::ProbeVerdict::Rejected(why) => {
+            eprintln!("error[E0658]: {why}");
+            Ok(false)
+        }
+        hir::ProbeVerdict::Undecided(why) => Err(undecided(&why)),
+    }
 }
 
 /// What a checker answers when the workspace changed in a way only loading it again takes
