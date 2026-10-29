@@ -365,3 +365,38 @@ fn each_unit_keeps_its_profile_features_renamed_edges_and_primary_environment() 
     assert_eq!(app["env"]["CARGO_PRIMARY_PACKAGE"], "1");
     assert!(dependency["env"].get("CARGO_PRIMARY_PACKAGE").is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn another_name_for_a_directory_above_the_inputs_does_not_widen_the_layout() {
+    // As macOS's `/var` and `/private/var` do: the Cargo home is spelled through a link
+    // in an unrelated directory, the workspace by its real name.
+    let real = tempfile::tempdir().unwrap();
+    let real_root = real.path().canonicalize().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let alias = elsewhere.path().join("alias");
+    std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+    std::fs::create_dir_all(real_root.join("home")).unwrap();
+    std::fs::write(real_root.join("home/config.toml"), "[env]\nFROM_HOME='yes'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&real_root).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert("CARGO_HOME".to_owned(), alias.join("home").display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_HOME"));
+    let name = root.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        made.build.workspace_manifest.to_native().unwrap(),
+        Path::new(name).join("Cargo.toml"),
+        "the layout root is the real parent directory, not the unrelated one the alias lives in"
+    );
+}
