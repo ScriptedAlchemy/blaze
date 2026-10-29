@@ -19,7 +19,7 @@ pub(crate) struct ProcMacroServerPool {
 pub(crate) struct PreparedLibrary {
     snapshot: Arc<LibrarySnapshot>,
     pub(crate) content: [u8; 32],
-    _producer_lease: Arc<Option<std::fs::File>>,
+    _producer_leases: Arc<Vec<std::fs::File>>,
 }
 
 impl PreparedLibrary {
@@ -27,7 +27,7 @@ impl PreparedLibrary {
         dylib: &MacroDylib,
         root: Option<&std::path::Path>,
     ) -> Result<Self, ServerError> {
-        let lease =
+        let leases =
             crate::producer_lifetime::lease_for_library(dylib.path.as_ref()).map_err(|error| {
                 ServerError { message: "leasing macro producer".into(), io: Some(Arc::new(error)) }
             })?;
@@ -40,7 +40,7 @@ impl PreparedLibrary {
                 io: None,
             });
         }
-        Ok(Self { snapshot: Arc::new(snapshot), content, _producer_lease: Arc::new(lease) })
+        Ok(Self { snapshot: Arc::new(snapshot), content, _producer_leases: Arc::new(leases) })
     }
 }
 

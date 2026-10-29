@@ -137,13 +137,12 @@ pub fn invalidate(generation: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn lease_for_library(library: &Path) -> io::Result<Option<File>> {
-    for generation in library.ancestors() {
-        if generation.join(MARKER).is_file() {
-            return lease(generation).map(Some);
-        }
-    }
-    Ok(None)
+pub(crate) fn lease_for_library(library: &Path) -> io::Result<Vec<File>> {
+    let generations: Vec<_> =
+        library.ancestors().filter(|generation| generation.join(MARKER).is_file()).collect();
+    // Acquire outer leases first: collection of an enclosing generation must
+    // not remove its descendants while their leases are being acquired.
+    generations.into_iter().rev().map(lease).collect()
 }
 
 pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
@@ -291,6 +290,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn library_consumers_keep_enclosing_producer_generations() {
+        let root = stdx::tempfile::NamedTempDir::new("nested-producer-lease").unwrap();
+        let outer = root.path().join("outer");
+        let outer_build = lease(&outer).unwrap();
+        let inner = outer.join("images").join("inner");
+        let inner_build = lease(&inner).unwrap();
+        let library = inner.join("library");
+        std::fs::write(&library, b"bytes").unwrap();
+        let consumer = lease_for_library(&library).unwrap();
+        drop(outer_build);
+        drop(inner_build);
+        assert!(collect(root.path(), &root.path().join("current")).unwrap().is_empty());
+        assert!(
+            collect(inner.parent().unwrap(), &inner.with_file_name("current")).unwrap().is_empty()
+        );
+        assert_eq!(std::fs::read(&library).unwrap(), b"bytes");
+        drop(consumer);
+        assert_eq!(collect(root.path(), &root.path().join("current")).unwrap(), [outer]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn library_consumer_lease_keeps_its_generation_and_symlinks_are_not_collected() {
         use std::os::unix::fs::symlink;
         let root = stdx::tempfile::NamedTempDir::new("producer-library-lease").unwrap();
@@ -299,7 +320,7 @@ mod tests {
         std::fs::create_dir(old.join("deps")).unwrap();
         let library = old.join("deps/library");
         std::fs::write(&library, b"bytes").unwrap();
-        let consumer = lease_for_library(&library).unwrap().unwrap();
+        let consumer = lease_for_library(&library).unwrap();
         drop(build);
         assert!(collect(root.path(), &root.path().join("current")).unwrap().is_empty());
         drop(consumer);
