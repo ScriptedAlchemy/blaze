@@ -682,7 +682,9 @@ def not_a_member(bin_dir, kind):
     dependency's value as cargo's does, the build is the daemon's, and each script ran as often as
     under cargo alone. In "outside", an edit of what the dependency prints after those has cargo
     run both scripts again; the daemon does not run the dependency's, so that build is cargo's,
-    and the program prints the new value."""
+    and the program prints the new value. When rustc compiled the dependency's script (ra-jit
+    refused it, as under memory pressure), its run is not written down, and every build after a
+    change is cargo's and says why."""
     name = {"registry": "probe-sys", "outside": "native"}[kind]
     root = os.path.realpath(tempfile.mkdtemp(prefix=f"ra-jit-{kind[:3]}-", dir="/tmp"))
     ws, home, dep = os.path.join(root, "ws"), os.path.join(root, "home"), os.path.join(root, name)
@@ -732,18 +734,24 @@ fn main() {
         return sum(int(open(p).read() or 0) for p in found)
 
     try:
-        build(side, f"{kind}: cold", home)
+        cold = build(side, f"{kind}: cold", home)
         _, built = reference.cargo("build", "-q")
         if built.returncode:
             raise SystemExit(built.stderr)
         _, states = wait_warm(side, ws)
         if states != ["ready"]:
             raise SystemExit(f"{kind}: not ready: {states}{tails(home)}")
-        steps = [("an edit of the program", "ws/src/main.rs", "    7\n", "    8\n", "daemon"),
-                 ("another edit of the program", "ws/src/main.rs", "    8\n", "    9\n", "daemon")]
+        # A script rustc compiled (ra-jit refused it, as under memory pressure) runs without the
+        # stand-in, so its run is not written down: the build is cargo's, and has to say so.
+        unknown = f"rustc compiles the build script of `{name}`" in cold
+        edit = "cargo" if unknown else "daemon"
+        if unknown:
+            print(f"{kind}: rustc compiled the script of `{name}`, whose run is then not written down", flush=True)
+        steps = [("an edit of the program", "ws/src/main.rs", "    7\n", "    8\n", edit),
+                 ("another edit of the program", "ws/src/main.rs", "    8\n", "    9\n", edit)]
         if kind == "outside":
             steps += [("an edit of what the dependency prints", f"{name}/data.txt", "/opt/probe\n", "/opt/other\n", "cargo"),
-                      ("an edit of the program after it", "ws/src/main.rs", "    9\n", "    10\n", "daemon")]
+                      ("an edit of the program after it", "ws/src/main.rs", "    9\n", "    10\n", edit)]
         for step, path, old, new, expected in steps:
             cargo_ra_jit.rewrite(os.path.join(root, path), old, new)
             how = how_built(build(side, f"{kind}: {step}", home))
@@ -756,6 +764,8 @@ fn main() {
                 problems.append(f"runs app {counts[0]}/{counts[1]}, {name} {counts[2]}/{counts[3]} (ours/cargo)")
             if how.split(":")[0] != expected:
                 problems.append(f"built by {how}, expected {expected}")
+            elif unknown and expected == "cargo" and "no record of" not in how and "outside the workspace" not in how:
+                problems.append(f"built by {how}, not for the run the daemon has no record of")
             wrong.extend(f"{kind}: {step}: {why}" for why in problems)
             print(f"{kind}: {step}: {ours.stdout!r}/{theirs.stdout!r} exit {ours.returncode}/{theirs.returncode}, "
                   f"runs app {counts[0]}/{counts[1]} {name} {counts[2]}/{counts[3]}, {how}", flush=True)
