@@ -44,18 +44,27 @@ Flag refusals print `refused.what` and `refused.why` and return status 2.
 The CLI reads blaze's own answer table and installed toolchain records for host facts.
 It does not execute rustc to discover them.
 
-**Incomplete:** `--run` validates reproduction candidates against the current checkout.
-It reports a mismatch with status 2. A matching spec currently fails with a message
-that the owned unit executor is not connected. It never dispatches to the existing
-cargo/rustc fallback. Connecting an executor for libraries, tests, build scripts, proc
-macros and doctests, and passing the real local-run harness, remain C2 acceptance work.
-Config values now preserve literal/workspace-relative tags in CBOR. Original
-CLI configuration/profile overrides still need complete reconstruction without guessing.
+**Saved specs.** `--out FILE` writes the spec to `FILE` and keeps the source it was made from in
+`FILE.inputs/`: BLAKE3-addressed blobs of the workspace, its path dependencies, the locked registry
+and Git packages, and the configuration files resolution read, plus a replay record (the original
+words, the environment they ran in, the configuration layers in precedence order). `--run FILE`
+restores that source into a directory of its own, resolves it offline from exactly the captured
+configuration (nothing above the directory and nothing in the worker's Cargo home is read), checks
+that the result is the saved spec, and compiles and runs it with the owned compiler. The checkout it
+is run from, and whether the original still exists, make no difference. It never starts cargo or
+rustc. A Cargo home that is neither inside nor around the workspace is kept in the snapshot under
+`.blaze-cargo-home/`, so the layout root, and with it the spec's paths and digests, is the
+workspace's and not an absolute prefix or the Cargo home's place beside it. Tested: Mac and Linux.
+
+**Not run yet.** Libraries as the asked artifact, `check`, doctests, benchmarks, build scripts,
+proc macros and application native link inputs are refused by name, before any compile. Absolute
+path dependencies and absolute symlinks are not portable and are refused at capture.
 
 ## Tests
 
 ```
 cargo +1.99.0 test -p blaze-wire -p blaze-spec -p blaze-metadata
+python3 -I harness/dist/saved_spec.py --blaze /path/to/ra-jit --work /tmp/saved-spec
 python3 -I harness/dist/buildspec.py --bin /path/to/ra-jit
 ```
 

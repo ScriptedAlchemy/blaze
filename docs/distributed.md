@@ -3021,10 +3021,15 @@ so equivalent command spellings retain the same `BuildSpec` and `JobContent`. Th
 config-file operands, native values and source-relative working directory survive relocation.
 Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
 complete spec, and verifies the execution platform before creating compiler descriptions.
-An empty external Cargo home does not affect source identity. When external configuration,
-registry or Git trees are inputs, capture preserves their physical topology beneath the common
-source root; equivalent dependency layouts at different relative locations are not yet normalized
-to one identity.
+An empty external Cargo home does not affect source identity. A Cargo home beside or above the
+workspace (its configuration, registry and Git trees) is kept in the snapshot under
+`.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:
+the same project with its home in another place, or below other directories, has the same spec.
+The configuration files resolution read are part of the replay record, in precedence order, and
+replay reads exactly those; no file above the directory a worker materializes the snapshot in is
+read. Path dependencies outside the workspace still keep their relative topology below the common
+source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
+Linux unit tests; the layout independence of path dependencies is not normalized.)
 
 `ra-jit cargo spec --out FILE build|run|test ...` writes canonical BuildSpec CBOR to `FILE`
 and the immutable blobs plus replay recipe to `FILE.inputs/`. Copy both to replay elsewhere with
