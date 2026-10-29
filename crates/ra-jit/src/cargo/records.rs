@@ -304,7 +304,7 @@ fn written(path: &Path) -> std::io::Result<SystemTime> {
 /// directory named by `rerun-if-changed` (`paths::mtime_recursive`): a link counts by its own
 /// time and by its target's, and what cannot be read is left out. `None` when `path` is not
 /// there.
-fn written_below(path: &Path) -> Option<SystemTime> {
+pub(super) fn written_below(path: &Path) -> Option<SystemTime> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_dir() {
         return metadata.modified().ok();
@@ -368,9 +368,7 @@ impl Fingerprint {
     ) -> Result<Fingerprint, String> {
         let mut now = self.clone();
         for (package, hash, _) in dependencies {
-            let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
-            package.hash(&mut hasher);
-            let pkg_id = Hasher::finish(&hasher);
+            let pkg_id = package_hash(package);
             let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == pkg_id) else {
                 return Err(format!("no cargo run-unit dependency for {package}"));
             };
@@ -378,6 +376,18 @@ impl Fingerprint {
         }
         Ok(now)
     }
+
+    /// Declared dependencies can be optional or target-gated. Only Cargo's recorded
+    /// run-unit graph says which native dependencies this particular script run used.
+    pub(crate) fn depends_on(&self, package: &str) -> bool {
+        self.deps.iter().any(|it| it.pkg_id == package_hash(package))
+    }
+}
+
+fn package_hash(package: &str) -> u64 {
+    let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+    package.hash(&mut hasher);
+    Hasher::finish(&hasher)
 }
 
 /// Cargo's `impl Hash for Fingerprint`, field for field.

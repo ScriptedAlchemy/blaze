@@ -883,8 +883,10 @@ All notable changes to ra-jit are written here. The format follows
   `.cargo-lock` there shared; while a cargo holds them, neither its records nor its output
   directory are read. Baseline capture holds the same locks and requires a completed
   fingerprint. A script that prints no
-  `rerun-if-*` line, whose fingerprint cargo takes from every file of its package, is not run in
-  place. A run is compared with a record of the run the build had, taken when cargo built and when
+  `rerun-if-*` line is rerun in place when Cargo's package fingerprint changes.
+  Optional and target-gated native dependencies are selected from Cargo's recorded run graph.
+  A completed run is reused during the same hybrid build only while its inputs still match.
+  A run is compared with a record of the run the build had, taken when cargo built and when
   the daemon loaded, so a run that left the directory otherwise stays a difference. A link in
   `OUT_DIR` is read as what it leads to. The
   lines cargo reads are picked from the bytes, as cargo's `BuildOutput::parse` does: a line that

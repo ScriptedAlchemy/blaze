@@ -2,7 +2,7 @@
 //! This is not a cache: the private directory belongs to one live request, disappears on
 //! return, and is never offered to a later invocation.
 
-use std::{io::Write as _, path::PathBuf};
+use std::{collections::BTreeMap, io::Write as _, path::PathBuf, time::SystemTime};
 
 use super::{Ran, Run};
 
@@ -18,6 +18,74 @@ pub(crate) struct Completed {
     stderr: Vec<u8>,
     fingerprint: super::super::records::Fingerprint,
     began: std::time::SystemTime,
+    inputs: Inputs,
+}
+
+/// State after the execution, including the watches it dropped. Cargo may change its
+/// fingerprint's local rules before invoking the stand-in, so that fingerprint alone
+/// cannot establish whether this execution still belongs to the inputs Cargo sees.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Inputs {
+    files: Vec<(PathBuf, Option<SystemTime>, Option<Vec<u8>>)>,
+    variables: BTreeMap<String, Option<String>>,
+    metadata: BTreeMap<String, String>,
+    package: Option<String>,
+    executable: Vec<u8>,
+}
+
+impl Inputs {
+    pub(super) fn of(
+        ran: &Ran,
+        env: &BTreeMap<String, String>,
+        before: &blaze_build_script::Output,
+        after: &blaze_build_script::Output,
+        dependencies: &[(&str, u64, PathBuf)],
+    ) -> Result<Self, String> {
+        let paths: std::collections::BTreeSet<_> = before
+            .rerun_if_changed
+            .iter()
+            .chain(&after.rerun_if_changed)
+            .chain(dependencies.iter().map(|it| &it.2))
+            .cloned()
+            .collect();
+        let files = paths.into_iter().map(|path| Self::file(ran.cwd.join(path))).collect();
+        let variables = before
+            .rerun_if_env_changed
+            .iter()
+            .chain(&after.rerun_if_env_changed)
+            .map(|name| (name.clone(), env.get(name).cloned()))
+            .collect();
+        let metadata = Self::metadata(env);
+        let package = (after.rerun_if_changed.is_empty() && after.rerun_if_env_changed.is_empty())
+            .then(|| crate::scripts::path_package_fingerprint(&ran.cwd));
+        let executable = super::file_digest(&ran.real).map_err(|it| it.to_string())?;
+        Ok(Self { files, variables, metadata, package, executable })
+    }
+
+    fn file(path: PathBuf) -> (PathBuf, Option<SystemTime>, Option<Vec<u8>>) {
+        let modified = super::super::records::written_below(&path);
+        let digest =
+            if path.is_dir() { super::tree_digest(&path) } else { super::file_digest(&path) };
+        (path, modified, digest.ok())
+    }
+
+    fn metadata(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        env.iter()
+            .filter(|(name, _)| name.starts_with("DEP_"))
+            .map(|it| (it.0.clone(), it.1.clone()))
+            .collect()
+    }
+
+    fn unchanged(&self, ran: &Ran) -> bool {
+        let env: BTreeMap<_, _> = ran.env.iter().cloned().collect();
+        self.files.iter().all(|file| Self::file(file.0.clone()) == *file)
+            && self.variables.iter().all(|(name, value)| env.get(name) == value.as_ref())
+            && Self::metadata(&env) == self.metadata
+            && self.package.as_ref().is_none_or(|package| {
+                crate::scripts::path_package_fingerprint(&ran.cwd) == *package
+            })
+            && super::file_digest(&ran.real).is_ok_and(|it| it == self.executable)
+    }
 }
 
 impl Completed {
@@ -28,6 +96,7 @@ impl Completed {
         output: std::process::Output,
         fingerprint: super::super::records::Fingerprint,
         began: std::time::SystemTime,
+        inputs: Inputs,
     ) -> Self {
         Self {
             out_dir: out_dir.to_owned(),
@@ -38,6 +107,7 @@ impl Completed {
             stderr: output.stderr,
             fingerprint,
             began,
+            inputs,
         }
     }
 }
@@ -111,15 +181,22 @@ impl Drop for Continuation {
 
 pub(super) fn consume(ran: &Ran, out_dir: &std::path::Path) -> anyhow::Result<bool> {
     let Some(dir) = std::env::var_os(VARIABLE).map(PathBuf::from) else { return Ok(false) };
+    consume_in(ran, out_dir, &dir)
+}
+
+pub(super) fn consume_in(
+    ran: &Ran,
+    out_dir: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<bool> {
     let completed: Vec<Completed> = serde_json::from_slice(&std::fs::read(dir.join("runs"))?)?;
     let Some((index, done)) = completed.iter().enumerate().find(|(_, it)| it.out_dir == out_dir)
     else {
         return Ok(false);
     };
-    anyhow::ensure!(
-        done.real == ran.real && done.cwd == ran.cwd,
-        "the completed script's invocation changed"
-    );
+    if done.real != ran.real || done.cwd != ran.cwd || !done.inputs.unchanged(ran) {
+        return Ok(false);
+    }
     // Cargo owns the target locks while running this stand-in. Do not acquire them again.
     let run = Run::left(
         &std::fs::read(
@@ -128,7 +205,9 @@ pub(super) fn consume(ran: &Ran, out_dir: &std::path::Path) -> anyhow::Result<bo
         out_dir,
     )
     .map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(run == done.run, "the completed script's output changed");
+    if run != done.run {
+        return Ok(false);
+    }
     let used = dir.join(format!("used-{index}"));
     std::fs::File::options().write(true).create_new(true).open(used)?;
     std::io::stdout().write_all(&done.stdout)?;

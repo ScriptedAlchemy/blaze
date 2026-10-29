@@ -486,6 +486,92 @@ def links_only(bin_dir):
     return wrong
 
 
+def inactive_links(bin_dir):
+    """An independently built native member is not an edge of an inactive declaration."""
+    wrong = []
+    for kind, declaration in [
+        ("optional", '[dependencies]\nnative = { path = "native", optional = true }\n'),
+        ("target", '[target.\'cfg(any())\'.dependencies]\nnative = { path = "native" }\n'),
+    ]:
+        name = f"inactive_{kind}"
+        files = dict(LOGGER)
+        files["Cargo.toml"] = files["Cargo.toml"].replace("logger", name).replace(
+            "[workspace]\n", '[workspace]\nmembers = ["native"]\ndefault-members = [".", "native"]\n',
+        ) + declaration
+        files.update({
+            "native/Cargo.toml": '[package]\nname="native"\nversion="0.1.0"\nedition="2021"\nlinks="probe"\n',
+            "native/src/lib.rs": "pub fn value() -> u32 { 1 }\n",
+            "native/build.rs": 'fn main() { println!("cargo::rerun-if-changed=build.rs"); println!("cargo::metadata=val=1"); }\n',
+        })
+        wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, True)]
+    return wrong
+
+
+def continuation_edit(bin_dir):
+    """An edit at Cargo's stand-in must invalidate a run completed by the daemon."""
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-cont-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in COUNTER.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env["RA_JIT_CACHE"] = "off"
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+    try:
+        build(side, "continuation: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode:
+            raise SystemExit(built.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"continuation: not ready: {states}{tails(home)}")
+        wrappers = glob.glob(os.path.join(ws, "target/debug/build/*/build-script-build"))
+        if len(wrappers) != 1:
+            raise SystemExit(f"continuation: expected one stand-in, found {wrappers}")
+        wrapper = wrappers[0]
+        with open(wrapper) as source:
+            lines = source.read()
+        if not lines.startswith("#!/bin/sh\n") or "build-script" not in lines:
+            raise SystemExit(f"continuation: not a script stand-in: {wrapper}")
+        # This runs after Cargo chose to invoke the stand-in, immediately before
+        # production consume. It cannot affect the daemon's direct execution.
+        edit = '''if test -n "$RA_JIT_SCRIPT_CONTINUATION"; then
+python3 - <<'PY'
+import os
+from pathlib import Path
+p = Path(os.environ["CARGO_MANIFEST_DIR"]) / "src/main.rs"
+s = p.read_text()
+assert "    8\\n" in s
+p.write_text(s.replace("    8\\n", "    9\\n"))
+PY
+fi
+'''
+        with open(wrapper, "w") as out:
+            out.write(lines.replace("#!/bin/sh\n", "#!/bin/sh\n" + edit, 1))
+        source = os.path.join(ws, "src/main.rs")
+        cargo_ra_jit.rewrite(source, "    7\n", "    8\n")
+        # The reference executes once for the intermediate input, as judgment did.
+        _, built = reference.cargo("build", "-q")
+        if built.returncode:
+            raise SystemExit(built.stderr)
+        build(side, "continuation: edit during Cargo's leg", home)
+        _, built = reference.cargo("build", "-q")
+        ours = subprocess.run([os.path.join(ws, "target/debug/counter")], capture_output=True)
+        theirs = subprocess.run([os.path.join(ws, "target-ref/debug/counter")], capture_output=True)
+        wrong += differences(ours, theirs, built)
+        counts = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
+        if counts != (3, 3) or ours.stdout != b"3 9\n":
+            wrong.append(f"continuation: runs {counts}, output {ours.stdout!r}, expected (3, 3) and '3 9'")
+        print(f"continuation: input changed at consumption: {ours.stdout!r}/{theirs.stdout!r}, runs {counts}")
+    finally:
+        side.cargo("stop")
+        shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
+
 def main():
     selftest()
     if sys.argv[1:] == ["--selftest"]:
@@ -554,6 +640,8 @@ def main():
     wrong += newly_watched_env(bin_dir)
     wrong += failing_script(bin_dir)
     wrong += links_only(bin_dir)
+    wrong += inactive_links(bin_dir)
+    wrong += continuation_edit(bin_dir)
     for why in wrong:
         print(f"  {why}")
     if wrong:

@@ -1533,9 +1533,9 @@ fn guards(
     guards
 }
 
-/// Cargo's run-unit edges, not just changes to the metadata delivered over those edges. The
-/// metadata the daemon reads is `--no-deps`, with no resolved graph, so an edge is a member's
-/// declared normal dependency on a member with `links`.
+/// Candidates for Cargo's run-unit edges. The metadata is `--no-deps`, so declared normal
+/// dependencies identify candidates; script judgment filters them against Cargo's recorded
+/// fingerprint to select the optional and target-gated dependencies this run actually used.
 fn script_dependencies(metadata: &Metadata, scripts: &[BuildScript]) -> Vec<script::Dependency> {
     scripts
         .iter()

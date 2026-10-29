@@ -291,8 +291,8 @@ pub(crate) struct Cargo<'a> {
     /// The targets of the script's package, as `cargo metadata` lists them: cargo takes a
     /// `rustc-link-arg-bins` line and its like only from the script of a package that has one.
     pub(crate) targets: &'a [blaze_build_script::unit::Target],
-    /// Run-unit edges for native dependencies. Their output time matters even when the
-    /// metadata and fingerprint are identical, as in cargo's `check_filesystem`.
+    /// Candidate run-unit edges for native dependencies, selected by the run's fingerprint.
+    /// Their output time matters even when the metadata and fingerprint are identical.
     pub(crate) dependencies: &'a [Dependency],
 }
 
@@ -365,16 +365,18 @@ pub(crate) fn judge_for(
         }
         let unit = records::Unit::of(&out_dir)?;
         let dir = std::fs::canonicalize(unit.lock_dir()).map_err(|it| it.to_string())?;
-        units.entry(dir).or_insert(unit);
+        if let std::collections::btree_map::Entry::Vacant(entry) = units.entry(dir) {
+            entry.insert(unit.hold()?);
+        }
+        let recorded = unit.recorded()?;
         pending.extend(
             cargo
                 .dependencies
                 .iter()
-                .filter(|it| it.parents.contains(&out_dir))
+                .filter(|it| it.parents.contains(&out_dir) && recorded.depends_on(&it.package))
                 .map(|it| it.out_dir.clone()),
         );
     }
-    let _held = units.values().map(records::Unit::hold).collect::<Result<Vec<_>, _>>()?;
     judge_locked(out_dir, cargo, completed, &mut Vec::new())
 }
 
@@ -399,10 +401,16 @@ fn judge_locked_inner(
     completed: &mut Vec<Completed>,
     parents: &mut Vec<PathBuf>,
 ) -> Result<Run, JudgementError> {
+    let unit = records::Unit::of(out_dir)?;
+    let recorded = unit.recorded()?;
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
     let mut metadata_prefixes = Vec::new();
-    for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
+    for dep in cargo
+        .dependencies
+        .iter()
+        .filter(|it| it.parents.iter().any(|it| it == out_dir) && recorded.depends_on(&it.package))
+    {
         let context = Cargo { targets: &dep.targets, ..*cargo };
         judge_locked(&dep.out_dir, &context, completed, parents)?;
         let unit = records::Unit::of(&dep.out_dir)?;
@@ -435,7 +443,6 @@ fn judge_locked_inner(
     let out_dir = cargos.ok_or("ran in another directory than cargo's")?;
     let package = var("CARGO_MANIFEST_DIR").map(Path::new).ok_or("ran without a package")?;
     let unit = records::Unit::of(out_dir)?;
-    let recorded = unit.recorded()?;
     let fingerprint = recorded.with_dependencies(&dependencies)?;
     let output = unit.output();
     let printed = std::fs::read(&output).map_err(|it| format!("{}: {it}", output.display()))?;
@@ -525,7 +532,8 @@ fn judge_locked_inner(
     let fingerprint = fingerprint.with_local(reckoned(&said, &named).unwrap_or(now));
     unit.record(&fingerprint)?;
     let run = Run::left(&again.stdout, out_dir)?;
-    completed.push(Completed::new(&ran, out_dir, run.clone(), again, fingerprint, began));
+    let inputs = continuation::Inputs::of(&ran, &env, &last, &said, &dependencies)?;
+    completed.push(Completed::new(&ran, out_dir, run.clone(), again, fingerprint, began, inputs));
     Ok(run)
 }
 
@@ -996,6 +1004,28 @@ mod tests {
         assert_eq!(current(&parent, &cargo), Ok(rerun));
         for out_dir in [&native, &parent] {
             std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_inactive_native_dependency_is_not_locked_read_or_run() {
+        for kind in ["optional", "target"] {
+            let parent = ran_script(&format!("inactive-{kind}"), COUNTS, "");
+            let dependencies = [Dependency {
+                package: format!("native-{kind}"),
+                links: "probe".to_owned(),
+                // Cargo did not build this run unit for this parent. It need not exist.
+                out_dir: parent.join("not-built/out"),
+                parents: vec![parent.clone()],
+                targets: Vec::new(),
+            }];
+            let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+            changed(&parent);
+            current(&parent, &cargo).unwrap();
+            assert_eq!(runs(&parent), 1);
+            current(&parent, &cargo).unwrap();
+            assert_eq!(runs(&parent), 1);
+            std::fs::remove_dir_all(parent.ancestors().nth(4).unwrap()).unwrap();
         }
     }
 
@@ -1745,6 +1775,78 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(path.join("runs").exists());
         drop(continuation);
         assert!(!path.exists(), "a subsequent build cannot consume this run");
+    }
+
+    #[test]
+    fn a_completed_run_is_consumed_only_for_unchanged_inputs() {
+        for change in [
+            "file",
+            "directory",
+            "missing",
+            "variable",
+            "metadata",
+            "executable",
+            "output",
+            "dropped",
+            "quiet",
+        ] {
+            let lines = format!(
+                "{COUNTS}echo cargo::rerun-if-changed=inputs\necho cargo::rerun-if-changed=missing\necho cargo::rerun-if-env-changed=PR5_CONTINUE\n"
+            );
+            let out_dir = ran_script(&format!("continue-{change}"), &lines, "");
+            let mut ran = ran_of(&out_dir);
+            std::fs::create_dir(ran.cwd.join("inputs")).unwrap();
+            std::fs::write(ran.cwd.join("inputs/data"), "before").unwrap();
+            if matches!(change, "dropped" | "quiet") {
+                ran.real = ran.real.with_extension("inner");
+                std::fs::write(&ran.real, COUNTS).unwrap();
+                std::fs::write(ran.cwd.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+                if change == "quiet" {
+                    recorded(&out_dir, b"cargo::metadata=in=before\n");
+                    let edit = ran.cwd.join("package-edit");
+                    std::fs::write(&edit, "before").unwrap();
+                    set_written(&edit, SystemTime::now() + Duration::from_secs(1));
+                }
+            }
+            changed(&out_dir);
+            let mut completed = Vec::new();
+            judge_for(&out_dir, &CARGO, &mut completed).unwrap();
+            assert_eq!(runs(&out_dir), 1);
+            let continuation =
+                Continuation::for_command(&mut Command::new("sh"), &completed).unwrap().unwrap();
+            let path = continuation.path();
+            assert!(
+                continuation::consume_in(&ran, &out_dir, &path).unwrap(),
+                "{change}: unchanged"
+            );
+            std::fs::remove_file(path.join("used-0")).unwrap();
+            match change {
+                "file" | "dropped" => {
+                    std::fs::write(ran.cwd.join("watched"), "after").unwrap();
+                }
+                "directory" => {
+                    std::fs::write(ran.cwd.join("inputs/data"), "after").unwrap();
+                }
+                "missing" => {
+                    std::fs::write(ran.cwd.join("missing"), "appeared").unwrap();
+                }
+                "variable" => ran.env.push(("PR5_CONTINUE".to_owned(), "after".to_owned())),
+                "metadata" => ran.env.push(("DEP_PROBE_NEW".to_owned(), "after".to_owned())),
+                "executable" => std::fs::write(&ran.real, "#!/bin/sh\nexit 0\n").unwrap(),
+                "output" => std::fs::write(out_dir.join("made.rs"), "after").unwrap(),
+                "quiet" => {
+                    let edit = ran.cwd.join("new-file");
+                    std::fs::write(&edit, "after").unwrap();
+                    set_written(&edit, SystemTime::now() + Duration::from_secs(2));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!continuation::consume_in(&ran, &out_dir, &path).unwrap(), "{change}: changed");
+            assert!(!path.join("used-0").exists());
+            assert_eq!(runs(&out_dir), 1, "validation does not execute the script");
+            drop(continuation);
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
     }
 
     #[test]
