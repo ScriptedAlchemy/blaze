@@ -618,6 +618,11 @@ mod tests {
         std::fs::remove_file(other.join("rust-lld")).unwrap();
         std::fs::write(docs.join("version_info.html"), info.replace(commit, "unknown")).unwrap();
         assert!(own::host_tuple(&rustc).is_none());
+        std::fs::write(docs.join("version_info.html"), info.replace(version, "9.99.0")).unwrap();
+        assert!(
+            own::host_tuple(&rustc).is_none(),
+            "a known commit cannot override a wrong version"
+        );
     }
 
     #[cfg(unix)]
