@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blake3 = "1"
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-registry = { path = "../blaze-registry" }
@@ -23,10 +24,10 @@ blaze-wire.workspace = true
 cargo-util-schemas = "=0.14.3"
 serde_json.workspace = true
 sha2 = "0.10"
+tempfile = "3"
 
 [dev-dependencies]
 semver.workspace = true
-tempfile = "3"
 
 [lints]
 workspace = true

@@ -31,5 +31,6 @@ pub mod profile;
 mod refuse;
 pub mod run;
 pub mod rustflags;
+pub mod snapshot;
 
 pub use refuse::{Area, CATALOGUE, Entry, Reason, Refusal};

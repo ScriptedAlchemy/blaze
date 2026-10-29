@@ -122,8 +122,19 @@ impl Spec {
 /// The spec of `request` in `ctx`: refuses what blaze cannot honour, makes the unit graph and
 /// assembles the spec from it.
 pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal> {
+    Ok(build_spec_with_inputs(request, ctx)?.0)
+}
+
+/// A resolved spec, its package source directories and every structural input read
+/// to derive it. Snapshot capture checks these bytes before publishing an identity.
+pub fn build_spec_with_inputs(
+    request: &Request,
+    ctx: &Context<'_>,
+) -> Result<(Spec, Vec<PathBuf>, Vec<(PathBuf, Vec<u8>)>), Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
-    let offline = Opened::with(request, ctx, |opened| Ok(opened.resolved.offline))?;
+    let (offline, mut initial) = Opened::with(request, ctx, |opened| {
+        Ok((opened.resolved.offline, opened.manifests.sources()))
+    })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
     let asked = Asked {
         cargo_home: ctx.native_env.and_then(|env| environment::cargo_home(env, ctx.cwd)),
@@ -154,10 +165,17 @@ pub fn build_spec(request: &Request, ctx: &Context<'_>) -> Result<Spec, Refusal>
         targets,
         profile: request.profile.as_deref(),
     };
-    let graph = units::unit_graph(&wanted).map_err(|error| {
+    let (graph, mut inputs) = units::unit_graph_with_inputs(&wanted).map_err(|error| {
         Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
     })?;
-    assemble(request, ctx, &graph)
+    let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph)?;
+    inputs.append(&mut initial);
+    inputs.extend(assembly_inputs);
+    let mut directories: Vec<_> =
+        graph.units.iter().map(|unit| unit.package.manifest_dir.clone()).collect();
+    directories.sort();
+    directories.dedup();
+    Ok((spec, directories, inputs))
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -260,6 +278,14 @@ impl Opened<'_> {
 /// This is [`build_spec`] with the graph given, so that a spec is made without resolving
 /// anything: tests hand it graphs they build.
 pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Result<Spec, Refusal> {
+    Ok(assemble_with_inputs(request, ctx, graph)?.0)
+}
+
+fn assemble_with_inputs(
+    request: &Request,
+    ctx: &Context<'_>,
+    graph: &UnitGraph,
+) -> Result<(Spec, Vec<(PathBuf, Vec<u8>)>), Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let host = ctx.host;
     Opened::with(request, ctx, |opened| {
@@ -392,7 +418,10 @@ pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Resu
         let digest = digest_of(&build);
         let front_end = front_end_key(&build, &flags, &host.triple);
         let config = config_key(&build, kind_of(command));
-        Ok(Spec { build, platform, platform_digest, digest, front_end, config })
+        Ok((
+            Spec { build, platform, platform_digest, digest, front_end, config },
+            opened.manifests.sources(),
+        ))
     })
 }
 

@@ -347,6 +347,14 @@ fn refuse_what_is_not_read(config: &blaze_manifest::Config, host: &str) -> Resul
 /// a target other than the host, `links` overrides in the configuration, `[replace]`, and a
 /// manifest or lock file blaze-metadata does not read.
 pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
+    Ok(unit_graph_with_inputs(asked)?.0)
+}
+
+/// The graph and the exact structural input bytes used to resolve it. Repeated
+/// reads are retained, so a caller can detect a manifest changing during resolution.
+pub fn unit_graph_with_inputs(
+    asked: &UnitsAsked<'_>,
+) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>)> {
     let a = asked.asked;
     let Some(build) = &a.build else {
         bail!("the unit graph is that of a build: no `Build` was given")
@@ -456,7 +464,8 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
         shared.roots.clone_from(&shared.doctest_libraries);
     }
     warnings.extend(ctx.config.take_warnings());
-    assemble(&env, &shared, ws.root(), &locked, warnings)
+    let graph = assemble(&env, &shared, ws.root(), &locked, warnings)?;
+    Ok((graph, ctx.sources()))
 }
 
 /// The members of the workspace, as the package selection reads them.

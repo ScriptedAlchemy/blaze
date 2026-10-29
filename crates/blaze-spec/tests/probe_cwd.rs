@@ -58,7 +58,13 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(cwd.join("probe-version"), "request compiler 1\n").unwrap();
     let raw_bin = OsString::from_vec(b"tools-\xff".to_vec());
-    for bin in [PathBuf::new(), PathBuf::from("tools"), PathBuf::from(&raw_bin)] {
+    let mut bins = vec![PathBuf::new(), PathBuf::from("tools")];
+    // Linux accepts arbitrary non-NUL bytes in filenames. APFS rejects this
+    // spelling (EILSEQ); keep native-value tests on Mac without claiming raw
+    // filesystem support there.
+    #[cfg(target_os = "linux")]
+    bins.push(PathBuf::from(&raw_bin));
+    for bin in bins {
         std::fs::create_dir_all(cwd.join(&bin)).unwrap();
         let tool = cwd.join(bin).join("review-cc");
         std::fs::write(
@@ -70,13 +76,14 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
     }
     let mut raw_path = raw_bin;
     raw_path.push(":/usr/bin:/bin");
-    let cases = [
+    let mut cases = vec![
         (OsString::from("./tools/review-cc"), OsString::from("/usr/bin:/bin")),
         (OsString::from("review-cc"), OsString::from("tools:/usr/bin:/bin")),
         (OsString::from("review-cc"), OsString::from(":/usr/bin:/bin")),
-        (OsString::from("review-cc"), raw_path),
         (cwd.join("tools/review-cc").into_os_string(), OsString::from("/usr/bin:/bin")),
     ];
+    #[cfg(target_os = "linux")]
+    cases.push((OsString::from("review-cc"), raw_path));
     let host = native_host();
     for (cc, path) in cases {
         let mut native: BTreeMap<_, _> =
