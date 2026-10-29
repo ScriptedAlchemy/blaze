@@ -123,6 +123,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         native_env: Some(&native_env),
         source_root: None,
         config_root: None,
+        config_image: None,
         cwd: &cwd,
         env: &env,
         host: &host,

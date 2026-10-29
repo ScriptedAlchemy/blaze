@@ -134,6 +134,7 @@ pub fn context<'a>(
     Context {
         source_root: None,
         config_root: None,
+        config_image: None,
         native_env: None,
         cwd,
         env,

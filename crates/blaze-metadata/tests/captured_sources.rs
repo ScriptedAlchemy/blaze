@@ -62,6 +62,7 @@ fn graph(
         },
         captured,
         None,
+        None,
     )
 }
 

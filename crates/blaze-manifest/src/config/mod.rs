@@ -404,6 +404,17 @@ impl Config {
         Ok(self)
     }
 
+    /// The top-level config files this invocation reads, highest precedence first: the layers a
+    /// [`ConfigImage`] must name to be read the same way. Includes and CLI files are not layers.
+    pub fn layers(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut layers = Vec::new();
+        self.walk_tree(&self.cwd, &self.home, |path| {
+            layers.push(path.to_owned());
+            Ok(())
+        })?;
+        Ok(layers)
+    }
+
     /// Configuration source bytes used by this invocation, including included files.
     pub fn sources(&self) -> Vec<(PathBuf, Vec<u8>)> {
         self.sources.borrow().clone()

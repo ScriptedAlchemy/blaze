@@ -3023,9 +3023,11 @@ An empty external Cargo home does not affect source identity. A Cargo home besid
 workspace (its configuration, registry and Git trees) is kept in the snapshot under
 `.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:
 the same project with its home in another place, or below other directories, has the same spec.
-The configuration files resolution read are part of the replay record, in precedence order, and
-replay reads exactly those; no file above the directory a worker materializes the snapshot in is
-read. Path dependencies outside the workspace still keep their relative topology below the common
+The configuration files resolution read are part of the replay record (version 2), in precedence
+order, and every reading of the configuration during replay, the executor's included, is made from
+exactly those through `Config::from_image`, with no discovery: a Cargo home that was an ancestor's
+`.cargo` to the requester keeps its place, though the snapshot mounts it, and no file above the
+directory a worker materializes the snapshot in is read. Path dependencies outside the workspace still keep their relative topology below the common
 source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
 Linux unit tests; the layout independence of path dependencies is not normalized.)
 

@@ -528,3 +528,51 @@ fn configuration_above_the_original_root_is_captured_and_replayed() {
     assert_eq!(replay.resolved.spec.build, made.build);
     assert_eq!(replay.execution_environment().unwrap()["FROM_ABOVE"], "parent");
 }
+
+#[test]
+fn a_cargo_home_above_the_workspace_keeps_its_precedence_in_replay() {
+    // The home is an ancestor's `.cargo` to the requester's configuration walk, and nearer than
+    // the file above it. In the snapshot it is a mount no ancestor walk reaches: re-discovering
+    // the configuration would put it last, below the file it overrides.
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = base_root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(".cargo/config.toml", "[env]\nSHARED='from-base'\nONLY_BASE='base'\n");
+    write("user/.cargo/config.toml", "[env]\nSHARED='from-home'\n");
+    std::fs::create_dir_all(base_root.join("user/work")).unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(base_root.join("user/work")).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert("CARGO_HOME".to_owned(), base_root.join("user/.cargo").display().to_string());
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    let value = |name: &str| {
+        made.build
+            .config_env
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert!(value("SHARED").is_some() && value("ONLY_BASE").is_some());
+    drop(f);
+    drop(base);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    let effective = replay.execution_environment().unwrap();
+    assert_eq!(effective["SHARED"], "from-home");
+    assert_eq!(effective["ONLY_BASE"], "base");
+}
