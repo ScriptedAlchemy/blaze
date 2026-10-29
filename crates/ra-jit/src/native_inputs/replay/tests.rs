@@ -112,6 +112,29 @@ fn linker_script_group_input_include_and_library_references_admit_each_actual_fi
 }
 
 #[test]
+fn linker_script_inputs_search_the_script_directory_before_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let libraries = dir.path().join("libraries");
+    let cwd = dir.path().join("compiler-output");
+    fs::create_dir(&cwd).unwrap();
+    let selected = write(&libraries, "runtime.so.1", b"\x7fELFselected");
+    let script = write(&libraries, "runtime.so", b"GROUP ( runtime.so.1 )\n");
+    let args = vec![script.as_os_str().to_owned()];
+
+    let closure = bindings(&[("linker/libraries/0", &libraries)]);
+    let mut collector = Collector::new(&closure, cwd.clone(), false);
+    collector.arguments(args.clone()).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([script.clone(), selected.clone()]));
+
+    let ignored = write(&cwd, "runtime.so.1", b"\x7fELFwrong-directory");
+    let closure = bindings(&[("linker/libraries/0", &libraries), ("source", &cwd)]);
+    let mut collector = Collector::new(&closure, cwd, false);
+    collector.arguments(args).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([script, selected]));
+    assert!(!collector.seen.contains(&ignored));
+}
+
+#[test]
 fn selected_file_mutations_and_unbound_script_inputs_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let object = write(dir.path(), "selected.o", b"\x7fELForiginal");

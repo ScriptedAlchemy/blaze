@@ -394,13 +394,12 @@ impl<'a> Collector<'a> {
                             !input.starts_with('=') && !input.starts_with("$SYSROOT"),
                             "native script sysroot input is not owned: {input}"
                         );
-                        let mut dirs = vec![self.cwd.clone()];
-                        if include {
-                            dirs.extend(self.search.clone());
-                        } else {
+                        let mut dirs = Vec::new();
+                        if !include {
                             dirs.push(path.parent().unwrap_or(&self.cwd).to_owned());
-                            dirs.extend(self.search.clone());
                         }
+                        dirs.push(self.cwd.clone());
+                        dirs.extend(self.search.clone());
                         let mut selected = None;
                         for dir in dirs {
                             let candidate = dir.join(&input);
