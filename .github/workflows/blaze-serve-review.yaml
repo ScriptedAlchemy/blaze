@@ -2,17 +2,28 @@ name: cache server regressions
 
 on:
   pull_request:
-    branches: [dist/main]
+    branches: [dist/main, dist/c4-keys]
     paths:
       - crates/blaze-serve/**
       - crates/blaze-wire/**
+      - crates/blaze-metadata/**
+      - crates/blaze-manifest/**
+      - crates/blaze-resolve/**
+      - crates/hir-ty-codegen/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
       - crates/blaze-spec/**
-      - crates/blaze-manifest/**
-      - crates/blaze-metadata/**
-      - crates/hir-ty-codegen/**
       - vendor/rust-analyzer/crates/project-model/**
+      - vendor/proc-macro-srv/**
+      - vendor/rust-analyzer/crates/syntax/**
+      - vendor/rust-analyzer/crates/cfg/**
+      - vendor/rust-analyzer/crates/hir/**
+      - vendor/rust-analyzer/crates/hir-ty/**
+      - vendor/rust-analyzer/crates/hir-ty-borrowck/**
+      - vendor/rust-analyzer/crates/ide-db/**
+      - vendor/rust-analyzer/crates/ide-diagnostics/**
+      - vendor/rust-analyzer/crates/load-cargo/**
+      - vendor/rust-analyzer/crates/proc-macro-api/**
       - harness/**
       - Cargo.toml
       - Cargo.lock
@@ -53,13 +64,9 @@ jobs:
       - name: Test compiler project and replay profile integration
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p blaze-metadata -- --test-threads=2
           cargo test --locked -p project-model --lib -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit cargo::spec:: -- --test-threads=2
           python3 -I harness/tracedecay_test.py
-      - name: Test cleanup control flow with compiler assertions enabled
-        if: ${{ !cancelled() }}
-        run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
       - name: Execute saved source with compiler subprocesses blocked
         if: ${{ !cancelled() }}
         run: |
@@ -75,6 +82,49 @@ jobs:
           path: |
             ${{ runner.temp }}/saved-spec-review/results.json
             ${{ runner.temp }}/saved-spec-review/*.log
+          if-no-files-found: ignore
+      - name: Test owned dependency resolution and Cargo lock parity
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p blaze-metadata -p blaze-registry -p blaze-resolve --all-targets -- --test-threads=2
+          cargo build --locked -p blaze-metadata --example metadata
+          python3 crates/blaze-metadata/tests/cargo_oracle.py "$PWD/target/debug/examples/metadata"
+      - name: Test cleanup control flow with debug assertions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
+      - name: Test owned compiler answers and empty-crate proofs
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p syntax empty_crate:: -- --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit answers:: -- --test-threads=2
+      - name: Verify real probe artifacts with rustc and LLVM
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p ra-jit --bin ra-jit
+          python3 -I harness/dist/empty_probe.py --blaze target/debug/ra-jit --work target/empty-probe-review
+      - name: Test compiler acceptance and constant evaluation
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ide-diagnostics --lib compiler_acceptance_tests -- --test-threads=2
+          cargo test --locked -p hir-ide --lib tests::consteval -- --test-threads=2
+      - name: Test producer identities and lifetime boundaries
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p proc-macro-api --features span/salsa --lib -- generation_tests producer_lifetime --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
+          cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
+          python3 -I harness/dist/crossmachine.py --self-test
+      - name: Test bootstrap protocol wire compatibility
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-api --lib -- --test-threads=2
+      - name: Save owned probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: owned-empty-probe
+          path: |
+            target/empty-probe-review/results.json
+            target/empty-probe-review/*/*.log
           if-no-files-found: ignore
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}

@@ -248,8 +248,11 @@ impl Guard {
             Guard::AsLeft { file, written } => {
                 (written_at(file) != *written).then(|| format!("{} changed", file.display()))
             }
-            Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
-                .then(|| format!("the environment variable {name} changed")),
+            Guard::Env { name, value } => {
+                (crate::env_identity::value(std::env::var(&*name).ok().as_deref()).ok().as_ref()
+                    != Some(value))
+                .then(|| format!("the environment variable {name} changed"))
+            }
         }
     }
 
@@ -425,7 +428,7 @@ impl Staged {
                 env: worker_env(),
                 whole: false,
             };
-            daemon::Ahead { config, crates: roots.clone(), root }
+            daemon::Ahead { config, crates: roots.clone(), root, native_env: None }
         });
         Ok(Ok(Staged { roots, ahead }))
     }
@@ -458,7 +461,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         env: worker_env(),
         whole: false,
     };
-    Ok(daemon::Ahead { config, crates, root })
+    Ok(daemon::Ahead { config, crates, root, native_env: None })
 }
 
 impl Built {
@@ -489,6 +492,27 @@ impl Built {
         ahead: Option<&daemon::Ahead>,
     ) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
+        // Take producer bytes before the existing cargo build starts, not when a worker
+        // happens to load. Failure loses warmth, never adds a compiling cargo invocation.
+        let producer = match ahead {
+            Some(ahead) => {
+                Ok((ahead.root.join(&ahead.config.project), ahead.config.selection.clone()))
+            }
+            None => std::env::current_dir().and_then(|cwd| {
+                project(asked, &cwd, &metadata(asked))
+                    .map(|project| (project, asked.selection()))
+                    .map_err(std::io::Error::other)
+            }),
+        };
+        let producer_inputs = producer.ok().and_then(|(project, selection)| {
+            match crate::macro_inputs::ArtifactInputs::capture(&project, &selection) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    eprintln!("macro provenance: warm load unavailable: {error:#}");
+                    None
+                }
+            }
+        });
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
             Subcommand::Build | Subcommand::Run | Subcommand::Check => cargo.arg("build"),
@@ -515,6 +539,12 @@ impl Built {
         });
         for message in Message::parse_stream(BufReader::new(said)) {
             let message = message?;
+            if let Message::CompilerArtifact(artifact) = &message
+                && let Some(inputs) = &producer_inputs
+                && let Err(error) = inputs.record(artifact)
+            {
+                eprintln!("macro provenance: artifact not recorded: {error:#}");
+            }
             // The worker that loads the workspace meanwhile reads what the scripts said and
             // where the proc macros are from cargo's one build of them, and the symbols of
             // each library as it is built.
@@ -567,9 +597,9 @@ impl State {
     /// is something.
     pub(crate) fn read(key: &str) -> Result<State, Option<&'static str>> {
         let path = State::path(key).map_err(|_| None)?;
-        let text = std::fs::read_to_string(path).map_err(|_| None)?;
+        let value = crate::env_identity::read_json(&path).map_err(|_| None)?;
         let another = "this build's state was written by another build of ra-jit";
-        let state = serde_json::from_str::<State>(&text).map_err(|_| another)?;
+        let state = serde_json::from_value::<State>(value).map_err(|_| another)?;
         if state.version != daemon::version() {
             return Err(Some(another));
         }
@@ -624,7 +654,7 @@ impl State {
         let path = State::path(&self.key)?;
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
-        std::fs::write(&new, serde_json::to_vec(self)?)?;
+        std::fs::write(&new, crate::env_identity::disk_json(&path, &serde_json::to_value(self)?)?)?;
         std::fs::rename(&new, &path)?;
         for unit in self.programs.iter().filter_map(|it| it.unit.as_deref()) {
             if !State::of_unit(unit).contains(&self.key) {
@@ -889,6 +919,7 @@ impl State {
             programs: Vec::new(),
             sources: Vec::new(),
             env: env.clone(),
+            native_env: None,
             scripts: scripts.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
@@ -983,7 +1014,7 @@ impl State {
         let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts)?;
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -1165,6 +1196,15 @@ pub(super) fn metadata(asked: &Invocation) -> Metadata {
     super::metadata::no_deps(asked.flags.manifest_path.as_deref(), &asked.flags.config)
 }
 
+/// Program builds, cold or warm, use owned host producers and an owned whole
+/// app build. No wrapper state or earlier Cargo executable enters that path.
+pub(super) fn owned(asked: &Invocation) -> anyhow::Result<Option<i32>> {
+    if super::whole::asked_for(asked) {
+        return super::whole::build(asked);
+    }
+    Ok(None)
+}
+
 pub(super) fn package_dir(package: &Package) -> PathBuf {
     package.manifest_path.parent().map(|it| it.as_std_path().to_owned()).unwrap_or_default()
 }
@@ -1194,7 +1234,11 @@ fn used_by(artifacts: &[&Artifact], records: &[Record]) -> Vec<Record> {
 
 /// The directory of the package the build is of, whose features the daemon loads the
 /// workspace with. `Err` is why the selection is one it does not load.
-fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBuf, String> {
+pub(super) fn project(
+    asked: &Invocation,
+    cwd: &Path,
+    metadata: &Metadata,
+) -> Result<PathBuf, String> {
     let root = metadata.workspace_root.as_std_path();
     if let Some(named) = asked.flags.packages.first() {
         let name = named.split('@').next().unwrap_or(named);
@@ -1392,7 +1436,8 @@ fn guards(
     used: &[Record],
     scripts: &[BuildScript],
     checkouts: &[Checkout],
-) -> Vec<Guard> {
+) -> anyhow::Result<Vec<Guard>> {
+    let identity = crate::env_identity::Identity::load()?;
     let root = metadata.workspace_root.as_std_path();
     let manifests = metadata
         .workspace_packages()
@@ -1434,12 +1479,14 @@ fn guards(
     };
     for unit in used {
         let env = unit.inputs().env.into_iter().filter(|(name, _)| !set_for_rustc(name));
-        guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
+        guards.extend(
+            env.map(|(name, value)| Guard::Env { name, value: identity.value(value.as_deref()) }),
+        );
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
-        guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
+        guards.extend(package.map(|it| rerun_guards(it, script, &identity)).into_iter().flatten());
     }
     let linked = checkouts.iter().flat_map(|it| &it.programs);
     let mut linked: Vec<PathBuf> = linked.flat_map(|it| it.linked_as_built.clone()).collect();
@@ -1449,7 +1496,7 @@ fn guards(
     let built = built.filter(|it| it.inputs().files.iter().any(|file| linked.contains(file)));
     let cargo = built.flat_map(Record::cargo_dep_info).collect();
     guards.push(Guard::beside_tests(linked, cargo));
-    guards
+    Ok(guards)
 }
 
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
@@ -1483,7 +1530,11 @@ fn reached_from<'a>(mut found: Vec<&'a Record>, used: &'a [Record]) -> Vec<&'a R
 /// What the build script of `package` said it reruns for. One that said nothing reruns for
 /// any change to the package. A variable is the user's to change, and then cargo builds; for
 /// a file the daemon runs the script again, when it knows how cargo ran it.
-fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
+fn rerun_guards(
+    package: &Package,
+    script: &BuildScript,
+    identity: &crate::env_identity::Identity,
+) -> Vec<Guard> {
     let dir = package_dir(package);
     let what = format!("the build script of `{}` reruns for", package.name);
     let said = script::printed(script.out_dir.as_std_path());
@@ -1502,7 +1553,7 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
             });
         }
         if let Some(name) = directive(line, "rerun-if-env-changed") {
-            let value = std::env::var(&name).ok();
+            let value = identity.value(std::env::var(&name).ok().as_deref());
             variables.push(Guard::Env { name, value });
         }
     }

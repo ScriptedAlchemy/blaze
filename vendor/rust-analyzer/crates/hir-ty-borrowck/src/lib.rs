@@ -97,7 +97,22 @@ pub struct BorrowckResult {
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[salsa::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckResult {
-    let mode = mode();
+    borrowck_in_mode(db, def, mode(), false)
+}
+
+/// Metadata compilation uses the pinned stable compiler's NLL rules even when
+/// an interactive session selected another borrow-checking mode.
+#[salsa::tracked(returns(ref))]
+pub fn source_borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckResult {
+    borrowck_in_mode(db, def, Mode::Nll, true)
+}
+
+fn borrowck_in_mode<'db>(
+    db: &'db dyn HirDatabase,
+    def: DefWithBodyId,
+    mode: Mode,
+    compiler: bool,
+) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         return result;
@@ -130,7 +145,7 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     {
         return result;
     }
-    check_owner(db, owner, Some(def))
+    check_owner(db, owner, Some(def), mode, compiler)
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -148,7 +163,7 @@ pub fn borrowck_anon_const<'db>(
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return BorrowckResult::default();
     }
-    check_owner(db, owner, None)
+    check_owner(db, owner, None, mode(), false)
 }
 
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
@@ -157,8 +172,9 @@ fn check_owner<'db>(
     db: &'db dyn HirDatabase,
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
+    mode: Mode,
+    compiler: bool,
 ) -> BorrowckResult {
-    let mode = mode();
     let mut result = BorrowckResult::default();
     let infer = InferenceResult::of(db, owner);
     let body = match db.mir_body(owner) {
@@ -210,7 +226,19 @@ fn check_owner<'db>(
     for (body, closure, inline_const) in bodies.into_iter().rev() {
         let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
         ctx.inline_const = inline_const.is_some();
-        if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
+        if closure.is_none()
+            && (inline_const.is_none() || compiler)
+            && let Some(span) =
+                drops_in_const(&ctx, if inline_const.is_some() { None } else { def }, body)
+        {
+            if compiler {
+                result.diagnostics.push(BorrowckDiagnostic {
+                    code: "E0493",
+                    span,
+                    message: "destructor cannot be evaluated at compile time".into(),
+                    at_signature: false,
+                });
+            }
             return result;
         }
         let mut found = Vec::new();
@@ -237,7 +265,11 @@ fn check_owner<'db>(
 /// rustc's E0493, from checking a const context before borrow checking it: a `const` or
 /// `static` item or a `const fn` drops a value of a type with drop glue, and rustc does not
 /// borrow check it. What is moved out of, in part too, is taken not to be dropped.
-fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<'_>) -> bool {
+fn drops_in_const(
+    ctx: &Ctx<'_, '_>,
+    def: Option<DefWithBodyId>,
+    body: &MirBody<'_>,
+) -> Option<MirSpan> {
     use hir_ty::mir::{OperandKind, TerminatorKind};
     let const_context = match def {
         // A constant of a signature.
@@ -249,7 +281,7 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
         _ => false,
     };
     if !const_context {
-        return false;
+        return None;
     }
     let mut moved = rustc_hash::FxHashSet::default();
     let mut visit = |operand: &hir_ty::mir::Operand| {
@@ -265,17 +297,18 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
             terminator.kind.for_each_operand(&mut visit);
         }
     }
-    body.basic_blocks.iter().any(|(_, block)| {
-        let Some(terminator) = &block.terminator else { return false };
-        let TerminatorKind::Drop { place, .. } = &terminator.kind else { return false };
-        place.projection.as_slice().is_empty()
+    body.basic_blocks.iter().find_map(|(_, block)| {
+        let terminator = block.terminator.as_ref()?;
+        let TerminatorKind::Drop { place, .. } = &terminator.kind else { return None };
+        (place.projection.as_slice().is_empty()
             && place.local != return_slot()
             && !moved.contains(&place.local)
             && hir_ty::drop::has_drop_glue(
                 &ctx.infcx,
                 body.locals[place.local].ty.as_ref(),
                 ctx.env,
-            ) == hir_ty::drop::DropGlue::HasDropGlue
+            ) == hir_ty::drop::DropGlue::HasDropGlue)
+            .then_some(terminator.span)
     })
 }
 

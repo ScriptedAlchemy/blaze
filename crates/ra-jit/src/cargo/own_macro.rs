@@ -77,6 +77,31 @@ fn find() -> Option<PathBuf> {
 /// rustc compiled at `<library>` and prints where it is ([`libraries_of`]).
 pub(crate) const COMMAND: &str = "proc-macro-library";
 
+/// An independently invocable source-only producer build. The plan is a JSON rendering
+/// of `Vec<own_script::Planned>`, not a rust-project file or a wrapper record.
+pub(crate) const SOURCE_COMMAND: &str = "proc-macro-source";
+
+pub(crate) fn source_command(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    let sysroot = PathBuf::from(args.next().context("the source sysroot is named first")?);
+    let plan = PathBuf::from(args.next().context("then the owned host source plan")?);
+    let dir = std::path::absolute(args.next().context("then an exclusive build directory")?)?;
+    anyhow::ensure!(args.next().is_none(), "unexpected producer build argument");
+    let crates = serde_json::from_slice(&std::fs::read(plan)?)?;
+    let env = std::env::vars_os().collect::<Vec<_>>();
+    let library = own_script::link_macro_planned(
+        &sysroot,
+        crates,
+        &dir,
+        &env,
+        own_script::SourceMode::Legacy,
+    )
+    .map_err(anyhow::Error::msg)?;
+    println!("{}", library.display());
+    Ok(())
+}
+
 /// The directory, in the record of a proc macro rustc compiled, of ra-jit's library of it.
 const OWN: &str = "ra-jit";
 
@@ -368,7 +393,8 @@ pub(crate) fn rustc_first(rustc: &OsStr, args: &[String], cwd: &Path) -> anyhow:
         std::fs::copy(&library, &kept)
             .with_context(|| format!("copying {} to {}", library.display(), kept.display()))?;
         let mut compile = super::wrapper::rustc_of(rustc);
-        for (name, _) in std::env::vars().filter(|(name, _)| own_script::read_by_crates(name)) {
+        for (name, _) in crate::process::vars().filter(|(name, _)| own_script::read_by_crates(name))
+        {
             compile.env_remove(name);
         }
         compile.args(&record.args).envs(&record.crate_env).current_dir(&record.cwd);

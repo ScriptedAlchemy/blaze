@@ -42,6 +42,7 @@ fn try_graph(root: &Path, home: &Path) -> anyhow::Result<blaze_metadata::units::
     ]);
     let build = Build { packages: &[], workspace: false, excludes: &[], dev_units: false };
     let asked = Asked {
+        locked: false,
         cargo_home: Some(home.into()),
         cwd: root,
         env: env.into_iter().collect(),
@@ -196,6 +197,7 @@ fn native_resolution_keeps_manifest_lock_and_config_source_bytes() {
         (path, bytes)
     });
     let asked = Asked {
+        locked: false,
         cargo_home: Some(scratch.0.join("home")),
         cwd: &scratch.0,
         env: vec![("__CARGO_TEST_ROOT".to_owned(), scratch.0.to_str().unwrap().to_owned())],

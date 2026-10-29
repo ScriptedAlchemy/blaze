@@ -21,14 +21,24 @@ pub(crate) mod split;
 /// The request's linker environment, captured once per operation. Clearing the command's
 /// environment also honors variables absent in a request; process-global mutation would
 /// race detached links and scripts.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+
+impl std::fmt::Debug for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Environment").field("names", &self.0.keys().collect::<Vec<_>>()).finish()
+    }
+}
 
 impl Environment {
     pub(crate) fn of(db: &RootDatabase) -> Self {
         let vars = match base_db::ProcessEnv::try_get(db) {
-            Some(env) => env.vars(db).iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            None => std::env::vars_os().collect(),
+            Some(env) => crate::process::native()
+                .vars()
+                .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
+                .chain(env.vars(db).iter().map(|(k, v)| (k.into(), v.into())))
+                .collect(),
+            None => crate::process::native().vars().collect(),
         };
         Self(vars)
     }
@@ -47,6 +57,29 @@ mod environment_tests {
     use super::*;
 
     #[test]
+    fn command_diagnostics_never_render_request_environment_values() {
+        let secret = "not-a-real-token-c4-regression";
+        let env = Environment(
+            [("PRIVATE_TOKEN".into(), secret.into()), ("PATH".into(), "/private/path".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut command = Command::new("cc");
+        env.apply(&mut command);
+        command.args(["-o", "/output/program", "/input/object.o"]);
+        let shown = diagnostic_command(&command);
+        assert!(shown.contains("cc") && shown.contains("/input/object.o"));
+        assert!(!shown.contains(secret) && !shown.contains("/private/path"));
+        assert!(!format!("{env:?}").contains(secret));
+        assert!(format!("{env:?}").contains("PRIVATE_TOKEN"));
+        assert_eq!(
+            command.get_envs().find(|(name, _)| *name == "PRIVATE_TOKEN").unwrap().1,
+            Some(std::ffi::OsStr::new(secret)),
+            "redaction must not change the child environment"
+        );
+    }
+
+    #[test]
     fn a_link_command_retains_its_request_and_unsets_worker_variables() {
         let mut db = RootDatabase::default();
         let request =
@@ -63,6 +96,41 @@ mod environment_tests {
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("LIBRARY_PATH={want}\n"));
         }
+    }
+
+    #[test]
+    fn detached_link_snapshots_keep_native_bytes_after_the_operation_turns() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut db = RootDatabase::default();
+        base_db::set_process_env(
+            &mut db,
+            [("SOURCE".to_owned(), "same".to_owned())].into_iter().collect(),
+        );
+        let capture = |byte| {
+            let _native = crate::process::enter_native(crate::process::Native::of([(
+                "BYTE_VALUE".into(),
+                OsString::from_vec(vec![0xff, byte]),
+            )]));
+            Environment::of(&db)
+        };
+        let first = capture(b'a');
+        let second = capture(b'b');
+        std::thread::scope(|scope| {
+            for (env, byte) in [(first, b'a'), (second, b'b')] {
+                scope.spawn(move || {
+                    let mut command = Command::new("/usr/bin/printenv");
+                    env.apply(&mut command);
+                    command.env("SOURCE", "same");
+                    let output = command.output().unwrap();
+                    let want = [
+                        b'B', b'Y', b'T', b'E', b'_', b'V', b'A', b'L', b'U', b'E', b'=', 0xff,
+                        byte, b'\n',
+                    ];
+                    assert!(output.status.success());
+                    assert!(output.stdout.windows(want.len()).any(|it| it == want));
+                });
+            }
+        });
     }
 }
 
@@ -126,8 +194,9 @@ pub(crate) fn native_command(
     program: &[Crate],
     sysroot: Option<&Path>,
     exe: &Path,
+    shared: bool,
 ) -> anyhow::Result<(String, Environment)> {
-    let line = Line::of(db, program, sysroot, false)?;
+    let line = Line::of(db, program, sysroot, shared)?;
     let command = command_of(&line, &[], exe, CommandPurpose::NativeInputs)?;
     Ok((command, line.env))
 }
@@ -215,20 +284,29 @@ impl Line {
             }
         }
         cmd.args(&self.after).arg("-o").arg(exe);
-        eprintln!("link line: {cmd:?}");
+        let shown = diagnostic_command(&cmd);
+        eprintln!("link line: {shown}");
         let start = Instant::now();
-        let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+        let ran = cmd.output().with_context(|| format!("running {shown}"))?;
         if !ran.status.success() {
             bail!(
-                "the link of {} failed ({}):\n{:?}\n{}",
+                "the link of {} failed ({}):\n{}\n{}",
                 exe.display(),
                 ran.status,
-                cmd,
+                shown,
                 String::from_utf8_lossy(&ran.stderr)
             );
         }
         Ok(start.elapsed())
     }
+}
+
+/// Command's Debug includes all explicitly supplied environment values. A link
+/// diagnostic needs its argv, not credentials from the calling build request.
+fn diagnostic_command(command: &Command) -> String {
+    let mut argv = Command::new(command.get_program());
+    argv.args(command.get_args());
+    format!("{argv:?}")
 }
 
 /// The first bytes of the file at `path`, which tell an archive from an object.

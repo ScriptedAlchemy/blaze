@@ -6,7 +6,10 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved};
+use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved, stored_as};
+#[cfg(test)]
+use ide_db::code_identity::hash_source_files;
+use ide_db::code_identity::macro_producer_identity;
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -22,6 +25,7 @@ type Hash = [u8; 32];
 #[derive(Default)]
 pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
+    source_hashes: Mutex<FxHashMap<Crate, Hash>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -31,6 +35,16 @@ pub(crate) struct Contents {
 }
 
 impl Contents {
+    pub(crate) fn source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
+        if let Some(hash) = self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+        {
+            return *hash;
+        }
+        let hash = ide_db::code_identity::source_hash(db, krate);
+        self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, hash);
+        hash
+    }
+
     /// `None` for a crate that depends on one `stable_crate_id` has nothing for and that is
     /// not of the checkout.
     pub(crate) fn id(
@@ -206,9 +220,13 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
+            field(&macro_producer_identity(db, on));
             match on.data(db).origin.is_local() {
                 true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
-                false => field(&Self::outside(db, on, stable_crate_id(on))),
+                false => {
+                    field(&Self::outside(db, on, stable_crate_id(on)));
+                    field(&self.source_hash(db, on));
+                }
             }
         }
         Some(ContentId(hasher.finalize().into()))
@@ -223,6 +241,7 @@ impl Contents {
         db: &RootDatabase,
         krate: Crate,
         root: &Path,
+        checkout: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
@@ -234,13 +253,17 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit library 4");
+        field(b"ra-jit library 7");
         field(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         field(Self::version(db, krate).as_bytes());
-        // Where cargo fetched it to is under another directory on another machine.
+        field(&self.source_hash(db, krate));
+        // Where cargo fetched it to is under another directory on another machine, and so is
+        // a crate beside the checkout, which the path that reaches it from there names.
         let root = root.to_string_lossy();
         let home = self.cargo_home(db);
-        let there = home.and_then(|home| moved(&root, &home, CARGO_HOME));
+        let there = home
+            .and_then(|home| moved(&root, &home, CARGO_HOME))
+            .or_else(|| stored_as(&root, &checkout.to_string_lossy()));
         field(there.as_deref().unwrap_or(&root).as_bytes());
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
@@ -252,10 +275,19 @@ impl Contents {
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
+            field(&macro_producer_identity(db, on));
             match known(on) {
-                Some((None, root)) => field(&self.library(db, on, &root, known, process_reads).0),
-                Some((id, _)) => field(&Self::outside(db, on, id)),
-                None => field(&Self::outside(db, on, None)),
+                Some((None, root)) => {
+                    field(&self.library(db, on, &root, checkout, known, process_reads).0)
+                }
+                Some((id, _)) => {
+                    field(&Self::outside(db, on, id));
+                    field(&self.source_hash(db, on));
+                }
+                None => {
+                    field(&Self::outside(db, on, None));
+                    field(&self.source_hash(db, on));
+                }
             }
         }
         let id = ContentId(hasher.finalize().into());
@@ -350,7 +382,7 @@ impl FileHashes {
         {
             return *hash;
         }
-        let hash: Hash = Sha256::digest(text.as_bytes()).into();
+        let hash = ide_db::code_identity::file_hash(db, file);
         hashes.files.insert(file, (text.clone(), hash));
         hash
     }
@@ -364,6 +396,226 @@ impl FileHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_out_of_vfs_payload_invalidates_its_library_and_dependent_caller() {
+        check_payload_owner("pub fn value() -> u8 { include_bytes!(\"payload.bin\")[0] }", false);
+    }
+
+    #[test]
+    fn included_bytes_advance_mir_in_one_database() {
+        check_payload_owner(
+            "pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }",
+            false,
+        );
+    }
+
+    #[test]
+    fn lazy_const_and_type_owners_discover_payloads_before_any_identity_lookup() {
+        for body in [
+            "#[repr(u8)] enum E { X = include_bytes!(\"payload.bin\")[0] } pub fn value() -> u8 { E::X as u8 }",
+            "#[repr(u8)] enum E { X = include_str!(\"payload.bin\").as_bytes()[0] } pub fn value() -> u8 { E::X as u8 }",
+            "type A = [u8; include_bytes!(\"payload.bin\")[0] as usize]; pub fn value() -> u8 { 1 }",
+            "struct A([u8; include_bytes!(\"payload.bin\")[0] as usize]); pub fn value() -> u8 { 1 }",
+            "struct A<const N: usize = { include_bytes!(\"payload.bin\")[0] as usize }>; pub fn value() -> u8 { 1 }",
+        ] {
+            for caller_first in [false, true] {
+                check_payload_owner(body, caller_first);
+            }
+        }
+    }
+
+    fn check_payload_owner(body: &str, caller_first: bool) {
+        use test_fixture::WithFixture;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let top = std::env::temp_dir().join(format!(
+            "c4-payload-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(top.join("vendor/dep/src")).unwrap();
+        let payload = top.join("vendor/dep/src/payload.bin");
+        let fixture = format!(
+            "//- {}/app.rs crate:app deps:dep\nfn caller() -> u8 {{ dep::value() + 10 }}\n\
+             //- {}/vendor/dep/src/lib.rs crate:dep library new_source_root:library\n\
+             #[rustc_builtin_macro]\nmacro_rules! include_bytes {{ () => {{}} }}\n\
+             #[rustc_builtin_macro]\nmacro_rules! include_str {{ () => {{}} }}\n\
+             {body}\n",
+            top.display(),
+            top.display(),
+        );
+        let hash = |byte: u8| {
+            std::fs::write(&payload, [byte]).unwrap();
+            let (mut db, files) = RootDatabase::with_many_files(&fixture);
+            // WithFixture uses virtual paths. Replace the file sets with real paths so
+            // included_file resolves the on-disk payload through its production reader.
+            let mut change = ide_db::ChangeWithProcMacros::default();
+            let mut app_files = vfs::file_set::FileSet::default();
+            let mut dep_files = vfs::file_set::FileSet::default();
+            app_files.insert(
+                files[0].file_id(&db),
+                vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(top.join("app.rs"))),
+            );
+            dep_files.insert(
+                files[1].file_id(&db),
+                vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(
+                    top.join("vendor/dep/src/lib.rs"),
+                )),
+            );
+            change.set_roots(vec![
+                ide_db::base_db::SourceRoot::new_local(app_files),
+                ide_db::base_db::SourceRoot::new_library(dep_files),
+            ]);
+            db.apply_change(change);
+            let first = hir::attach_db(&db, || {
+                let crates = ide_db::base_db::all_crates(&db);
+                let find = |name: &str| {
+                    *crates
+                        .iter()
+                        .find(|krate| {
+                            krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                        })
+                        .unwrap()
+                };
+                let (dep, app) = (find("dep"), find("app"));
+                assert!(db.included_by(dep).is_empty());
+                let contents = Contents::default();
+                let caller_hash = caller_first.then(|| contents.source_hash(&db, app));
+                let dep_hash = contents.source_hash(&db, dep);
+                assert_eq!(db.included_by(dep)[0].1.as_deref(), Some(&[byte][..]));
+                let app_hash = caller_hash.unwrap_or_else(|| contents.source_hash(&db, app));
+                assert_eq!(dep_hash, ide_db::code_identity::source_hash(&db, dep));
+                assert_eq!(app_hash, ide_db::code_identity::source_hash(&db, app));
+                (dep_hash, app_hash)
+            });
+            let path = paths::AbsPathBuf::assert_utf8(payload.clone());
+            let bodies = |db: &RootDatabase| {
+                let dep = *ide_db::base_db::all_crates(db)
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(db).display_name.as_ref().unwrap().to_string() == "dep"
+                    })
+                    .unwrap();
+                let declared = crate::declared_in(db, dep.into());
+                declared
+                    .functions
+                    .iter()
+                    .map(|&id| {
+                        use hir_ty::db::HirDatabase as _;
+                        (
+                            format!("{:?}", hir_def::expr_store::body::Body::of(db, id.into())),
+                            format!("{:?}", db.runtime_mir_body(id.into())),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let old_bodies = hir::attach_db(&db, || bodies(&db));
+            std::fs::write(&payload, [byte + 10]).unwrap();
+            assert!(db.reload_included_file(&path));
+            let new_bodies = hir::attach_db(&db, || bodies(&db));
+            if body.contains("pub fn value() -> u8 { include_bytes!") {
+                assert_ne!(old_bodies, new_bodies, "lowered body must depend on included bytes");
+            }
+            if body.contains("-> &'static [u8; 1]") {
+                assert!(!old_bodies[0].1.starts_with("Err"), "{}", old_bodies[0].1);
+                assert_ne!(old_bodies[0].1, new_bodies[0].1, "MIR must depend on included bytes");
+            }
+            let second = hir::attach_db(&db, || {
+                let crates = ide_db::base_db::all_crates(&db);
+                let app = *crates
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == "app"
+                    })
+                    .unwrap();
+                Contents::default().source_hash(&db, app)
+            });
+            assert_ne!(first.1, second, "same database must advance included-input identity");
+            let dep = *ide_db::base_db::all_crates(&db)
+                .iter()
+                .find(|krate| {
+                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == "dep"
+                })
+                .unwrap();
+            let current = hir::attach_db(&db, || crate::current_input_paths(&db, dep));
+            assert!(current.contains(&path));
+            let replacement = "pub fn value() -> u8 { 42 }\n";
+            db.set_file_text_with_durability(
+                files[1].file_id(&db),
+                replacement,
+                ide_db::base_db::salsa::Durability::HIGH,
+            );
+            std::fs::remove_file(&payload).unwrap();
+            assert!(db.reload_included_file(&path));
+            let current = hir::attach_db(&db, || crate::current_input_paths(&db, dep));
+            assert!(current.is_empty(), "obsolete input must be retracted");
+            assert!(db.included_by(dep).iter().any(|(old, bytes)| old == &path && bytes.is_none()));
+            assert!(hir::attach_db(&db, || crate::missing_input_of(&db, dep)).is_none());
+            for source in [
+                "#[rustc_builtin_macro]\nmacro_rules! include_bytes { () => {} }\npub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }",
+                "#[rustc_builtin_macro]\nmacro_rules! include_bytes { () => {} }\n#[cfg(any())] pub fn value() -> &'static [u8; 1] { include_bytes!(\"payload.bin\") }",
+            ] {
+                db.set_file_text_with_durability(
+                    files[1].file_id(&db),
+                    source,
+                    ide_db::base_db::salsa::Durability::HIGH,
+                );
+                hir::attach_db(&db, || {
+                    crate::current_input_paths(&db, dep);
+                    let missing = crate::missing_input_of(&db, dep);
+                    if source.contains("cfg(any())") {
+                        assert!(missing.is_none());
+                    } else {
+                        assert_eq!(missing, Some(path.clone()));
+                    }
+                });
+            }
+            let new_source = "#[rustc_builtin_macro]\nmacro_rules! include_bytes { () => {} }\npub fn value() -> &'static [u8; 1] { include_bytes!(\"new-missing.bin\") }";
+            db.set_file_text_with_durability(
+                files[1].file_id(&db),
+                new_source,
+                ide_db::base_db::salsa::Durability::HIGH,
+            );
+            assert!(
+                !db.included_by(dep)
+                    .iter()
+                    .any(|(path, _)| path.as_str().ends_with("new-missing.bin"))
+            );
+            hir::attach_db(&db, || {
+                // Normal source/body discovery registers a new missing input before
+                // the fast validation probe. An empty historical map is not an
+                // exemption from normal compiler include expansion.
+                crate::prepare_changed_input_owners(&db, &[files[1].file_id(&db)]);
+                assert_eq!(
+                    crate::missing_input_of(&db, dep),
+                    Some(paths::AbsPathBuf::assert_utf8(
+                        top.join("vendor/dep/src/new-missing.bin")
+                    ))
+                );
+            });
+            first
+        };
+        let one = hash(1);
+        let other = hash(2);
+        assert_ne!(one.0, other.0);
+        assert_ne!(one.1, other.1);
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn equal_vendor_places_share_only_equal_source_bytes() {
+        let files = |home: &str, body: &[u8]| {
+            vec![
+                (format!("{home}/vendor/dep/src/lib.rs"), Sha256::digest(body).into()),
+                (format!("{home}/vendor/dep/src/other.rs"), Sha256::digest(b"same").into()),
+            ]
+        };
+        let one = hash_source_files(&files("/home/a/repo", b"fn value() -> u32 { 1 }"));
+        let other = hash_source_files(&files("/Users/b/repo", b"fn value() -> u32 { 1 }"));
+        let changed = hash_source_files(&files("/Users/b/repo", b"fn value() -> u32 { 2 }"));
+        assert_eq!(one, other);
+        assert_ne!(one, changed);
+    }
 
     #[test]
     fn the_cargo_home_is_told_from_a_file_cargo_fetched() {

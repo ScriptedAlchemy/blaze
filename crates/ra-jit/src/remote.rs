@@ -781,11 +781,18 @@ async fn send_pack(
     absent: &BTreeSet<Digest>,
 ) -> anyhow::Result<(Listed, u64)> {
     let from = store.to_owned();
-    let (size, keys) = tokio::task::spawn_blocking(move || keys_of(&from, pack)).await??;
+    let (size, keys) = tokio::task::spawn_blocking(move || {
+        keys_of(&from, pack)
+            .with_context(|| format!("reading keys from {}", from.join(pack_file(&pack)).display()))
+    })
+    .await??;
     let keys_digest = Digest::of(&keys);
     remote.send_named_by_hash(&keys_object(&keys_digest), keys).await?;
     let from = store.join(pack_file(&pack));
-    let packed = tokio::task::spawn_blocking(move || packed(&from, size)).await??;
+    let packed = tokio::task::spawn_blocking(move || {
+        packed(&from, size).with_context(|| format!("reading pack {}", from.display()))
+    })
+    .await??;
     let mut listed = Listed { size, keys: keys_digest, format: STORE_FORMAT, packed: None };
     if let Some(packed) = packed {
         let len = packed.len() as u64;
@@ -798,7 +805,9 @@ async fn send_pack(
     if !absent.contains(&pack) && remote.holds(&object, size).await? {
         return Ok((listed, 0));
     }
-    remote.send_file(&object, &store.join(pack_file(&pack)), size).await?;
+    remote.send_file(&object, &store.join(pack_file(&pack)), size).await.with_context(|| {
+        format!("sending {} as {object}", store.join(pack_file(&pack)).display())
+    })?;
     Ok((listed, size))
 }
 
@@ -987,6 +996,7 @@ const USAGE: &str = "usage: ra-jit cache push|pull REMOTE [PROJECT]\n       \
                      ra-jit cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
                      [--dry-run]\n       \
                      ra-jit cache verify\n       \
+                     ra-jit cache digests\n       \
                      ra-jit cache keygen FILE\n       \
                      ra-jit cache forget REMOTE";
 
@@ -1008,6 +1018,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         "stats" => stats(&store),
         "gc" => collect(&store, args),
         "verify" => verify(&store),
+        "digests" => digests(&store),
         "push" | "pull" => transfer_command(&store, &verb, args),
         "forget" => forget(&store, args),
         _ => bail!(USAGE),
@@ -1162,6 +1173,18 @@ fn verify(store: &Path) -> anyhow::Result<()> {
     }
     if !verified.corrupt.is_empty() {
         bail!("{} packs are not what was written", verified.corrupt.len());
+    }
+    Ok(())
+}
+
+/// `ra-jit cache digests`: a line for each value in the sealed packs, `KEY LENGTH SHA256`, the
+/// key as it is on disk. Two machines that built one commit have equal outputs when they hold
+/// the same entries (`harness/dist/crossmachine.py`).
+fn digests(store: &Path) -> anyhow::Result<()> {
+    let hex = |bytes: &[u8]| bytes.iter().map(|it| format!("{it:02x}")).collect::<String>();
+    let all = StoreDir::at(store).digests().with_context(|| store.display().to_string())?;
+    for (key, len, digest) in all {
+        println!("{} {len} {}", hex(&key), hex(&digest));
     }
     Ok(())
 }

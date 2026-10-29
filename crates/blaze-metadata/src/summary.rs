@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use blaze_resolve::workspace_resolve::Patch;
 use blaze_resolve::{
-    DepKind, Dependency, GitReference, InternedString, MemRegistry, Platform, QueryKind, Registry,
-    SourceId, Summary,
+    DepKind, Dependency, GitReference, InternedString, Platform, QueryKind, Registry, SourceId,
+    Summary,
 };
 use serde_json::Value;
 use url::Url;
@@ -222,7 +222,8 @@ pub(crate) fn read(package: &Value) -> Result<Read> {
             (InternedString::new(name), values.map(InternedString::new).collect())
         })
         .collect();
-    let summary = Summary::new(id, deps, &features, package["links"].as_str(), None)?;
+    let rust_version = package["rust_version"].as_str().map(str::parse).transpose()?;
+    let summary = Summary::new(id, deps, &features, package["links"].as_str(), rust_version)?;
     let kinds = |target: &Value| -> Vec<String> {
         let kinds = target["kind"].as_array().into_iter().flatten().filter_map(Value::as_str);
         kinds.map(str::to_owned).collect()
@@ -314,7 +315,7 @@ fn root_table(root: &Path, ctx: &blaze_manifest::Context) -> Result<toml::Table>
 /// package `registry` does not have (a patch the graph does not use).
 pub(crate) fn patch_tables(
     root: &Path,
-    registry: &MemRegistry,
+    registry: &impl Registry,
     ctx: &blaze_manifest::Context,
 ) -> Result<Vec<(Url, Vec<Patch>)>> {
     let manifest_path = root.join("Cargo.toml");
@@ -348,12 +349,12 @@ pub(crate) fn has_replace(root: &Path, ctx: &blaze_manifest::Context) -> Result<
     Ok(root_table(root, ctx)?.contains_key("replace"))
 }
 
-/// The output of a future that is ready at once, as [`MemRegistry`]'s are.
+/// Source queries currently finish synchronously, including their index reads.
 fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
     match future.as_mut().poll(cx) {
         std::task::Poll::Ready(output) => output,
-        std::task::Poll::Pending => unreachable!("a MemRegistry query is ready at once"),
+        std::task::Poll::Pending => unreachable!("source queries currently finish synchronously"),
     }
 }

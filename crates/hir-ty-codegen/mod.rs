@@ -116,6 +116,7 @@ mod imports;
 mod llvm;
 mod patch;
 mod places;
+mod relocate;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
@@ -216,6 +217,8 @@ pub const CARGO_HOME: &str = "/cargo";
 /// patch after for the same static and value: a running program keeps the copy the first gave
 /// it (`docs/live.md#types`).
 pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
+
+pub use relocate::{CHECKOUT, SHARED, names_checkout, read_as, stored_as};
 
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
@@ -372,6 +375,11 @@ pub trait SymbolResolver {
     /// Where the sources of the standard library are, when the toolchain tells where they
     /// were built.
     fn library_sources(&self) -> Option<LibrarySources> {
+        None
+    }
+    /// The checkout's directory, which [`CHECKOUT`] stands for in what is stored: a file below
+    /// it or beside it is written as that, and read as the directory it is here.
+    fn checkout(&self) -> Option<String> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -2549,9 +2557,9 @@ fn closures_of(
         .collect()
 }
 
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(copy), revisions = usize::MAX)]
+// Retain ordinary revision validation: included inputs can change without any
+// of the instance's arguments changing.
+#[salsa::tracked(returns(copy))]
 fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
@@ -2735,7 +2743,9 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_root").entered();
-    tier::for_build(|| root_code(db, func, false)).map(Produced::code)
+    let code = tier::for_build(|| root_code(db, func, false)).map(Produced::code);
+    db.depend_on_included_inputs(func.krate(db));
+    code
 }
 
 /// The instance a non-generic function is compiled as under its own symbol.
@@ -2919,16 +2929,22 @@ fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Com
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(ref), revisions = usize::MAX)]
+#[salsa::tracked(returns(ref))]
 fn compiled_instance<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
-    tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
+    // The code can be instantiated in a caller crate, but its included literals
+    // belong to the definition's crate, not the monomorphization environment.
+    let krate = match instance.def {
+        InstanceDef::Fn(func) => func.krate(db),
+        _ => env.krate,
+    };
+    let code = tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code);
+    db.depend_on_included_inputs(krate);
+    code
 }
 
 /// Whether a compile leaves LLVM's part to later ([`Produced::Pending`]): not at all, for a
@@ -5131,13 +5147,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .filter(|_| base.is_none() && std::env::var_os("RA_JIT_CACHE_CHECK").is_none())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
-                    std::sync::Arc::new(cached::Entries::new(
-                        store,
-                        debugged,
-                        program.flatten(),
-                        home,
-                        library,
-                    ))
+                    std::sync::Arc::new(
+                        cached::Entries::new(store, debugged, program.flatten(), home, library)
+                            .in_checkout(symbols.checkout()),
+                    )
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
@@ -6076,6 +6089,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let symbols = self.symbols;
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
+                .in_checkout(symbols.checkout())
         })
     }
 

@@ -56,6 +56,8 @@ struct Checkout {
     /// The variables of `FLAGS` as cargo was run with them.
     flags: Vec<(&'static str, Option<String>)>,
     scripts: Option<Scripts>,
+    /// Compile-time producer content, separate from workspace structural reads.
+    macro_reads: Vec<Watched>,
 }
 
 /// A file or a directory, and what it was when the daemon read it.
@@ -515,6 +517,7 @@ impl Inputs {
         own: Option<crate::scripts::Own>,
     ) {
         let mut files = Vec::new();
+        let mut macro_reads = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
                 files.push(Structural::new(dir.join(".cargo").join(name)));
@@ -525,6 +528,12 @@ impl Inputs {
         }
         let mut consistent = true;
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+            // A macro is a producer used while loading its callers. Source,
+            // included assets and dependency producers are content inputs, even
+            // when their size and timestamps were restored.
+            for producer in crate::macro_inputs::producers(workspace) {
+                macro_reads.push(Watched::new(producer.clone(), true));
+            }
             // These are the bytes that produced the resolved graph, including its features,
             // not the bytes a script may have left behind. Retain every structural read.
             for (path, bytes) in cargo.sources() {
@@ -556,7 +565,7 @@ impl Inputs {
         // The daemon was started by one of the processes that ask it for builds, and has its
         // variables.
         if self.asked_with.is_empty() {
-            self.asked_with.extend(std::env::vars().map(|it| it.0));
+            self.asked_with.extend(crate::process::vars().map(|it| it.0));
         }
         let mut scripts = Scripts::of(workspace, config, given, build, own);
         // A checkout loaded again has run its scripts again, where cargo found one to: a script
@@ -570,7 +579,14 @@ impl Inputs {
             }
         }
         self.checkouts.retain(|it| it.root != root);
-        self.checkouts.push(Checkout { root: root.to_owned(), files, consistent, flags, scripts });
+        self.checkouts.push(Checkout {
+            root: root.to_owned(),
+            files,
+            consistent,
+            flags,
+            scripts,
+            macro_reads,
+        });
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
@@ -590,7 +606,11 @@ impl Inputs {
             return Ok(false);
         };
         let flags = env.is_some_and(|env| checkout.flags.iter().any(|(n, was)| env.get(n) != *was));
-        if flags || !checkout.consistent || checkout.files.iter().any(Structural::changed) {
+        if flags
+            || !checkout.consistent
+            || checkout.files.iter().any(Structural::changed)
+            || checkout.macro_reads.iter().any(Watched::changed)
+        {
             // The workspace is read again whole, and the scripts run for it.
             if let Some(scripts) = &mut checkout.scripts {
                 scripts.ready = None;
@@ -747,13 +767,23 @@ impl Scripts {
             return Ok(true);
         }
         if let Some(own) = &self.own {
+            let _native =
+                env.is_none().then(|| crate::process::enter_native(own.native_env.clone()));
             // blaze judges each script itself, as cargo does at every build: a script whose
             // last run stands is not run, and the workspace is another only when what one
             // said is.
-            let asked: std::collections::BTreeMap<String, String> = match env {
+            let mut asked: std::collections::BTreeMap<String, String> = match env {
                 Some(env) => env.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
                 None => own.env.clone(),
             };
+            // These are this workspace's owned probes, not caller tool overrides.
+            for name in ["RUSTC", "RUSTDOC", "BLAZE_PRODUCER_PROBE_FAILURE"] {
+                if let Some(value) = own.env.get(name) {
+                    asked.insert(name.to_owned(), value.clone());
+                }
+            }
+            asked.remove("RUSTC_WRAPPER");
+            asked.remove("RUSTC_WORKSPACE_WRAPPER");
             let (said, world) = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
             let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind
             else {
@@ -879,11 +909,41 @@ fn stamp(path: &Path, package: bool) -> u64 {
     stamp_upto(path, package, None)
 }
 
+#[cfg(test)]
+pub(crate) fn measure_full_read_cost(path: &Path, runs: usize) -> Vec<f64> {
+    (0..runs)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            std::hint::black_box(stamp(path, true));
+            began.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect()
+}
+
 /// [`stamp`] of what was written before `limit`, when there is one.
 fn stamp_upto(path: &Path, package: bool, limit: Option<SystemTime>) -> u64 {
     let mut hasher = FxHasher::default();
     stamp_into(path, package, true, limit, &mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    #[test]
+    fn producer_change_is_detected_with_equal_size_and_restored_mtime() {
+        let dir = std::env::temp_dir().join(format!("c4-producer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, b"fn value() -> u8 { 1 }").unwrap();
+        let watched = Watched::new(dir.clone(), true);
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"fn value() -> u8 { 2 }").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        assert!(watched.changed());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Whether `entry`, below the directory of a package, is no file of it: a build's directory, a
@@ -936,7 +996,10 @@ fn stamp_into(
         if limit.is_some_and(|limit| written.is_none_or(|it| it >= limit)) {
             return;
         }
-        (metadata.len(), written).hash(hasher);
+        match std::fs::read(path) {
+            Ok(bytes) => bytes.hash(hasher),
+            Err(_) => "unreadable".hash(hasher),
+        }
         return;
     }
     let Ok(entries) = std::fs::read_dir(path) else { return };
@@ -976,6 +1039,7 @@ mod tests {
             consistent: true,
             flags: Vec::new(),
             scripts: None,
+            macro_reads: Vec::new(),
         });
         inputs
     }

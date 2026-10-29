@@ -16,7 +16,9 @@ All notable changes to ra-jit are written here. The format follows
   admission. Linux uses PSI and available memory against `RA_JIT_MEMORY_RESERVE`;
   macOS uses memorystatus. Unknown signals are logged once. Historical hard-cap results
   are labelled in [docs/reports/LOADMEM.md](docs/reports/LOADMEM.md), section 8.
-- The whole build (`RA_JIT_WHOLE_BUILD=1`) compiles and runs its build scripts itself, with no
+- Eligible program builds and runs use the owned whole build by default. The former
+  `RA_JIT_WHOLE_BUILD` and `BLAZE_WHOLE_BUILD` switches no longer select the route, including
+  when set to `0`. This route compiles and runs its build scripts itself, with no
   cargo and no rustc (`crates/ra-jit/src/scripts.rs`): each script and its build dependencies are
   compiled by blaze from source, run as cargo 1.99 runs them in an `OUT_DIR` below
   `target/ra-jit/build-scripts`, and what they print is given to the crates the load reads. When
@@ -26,8 +28,9 @@ All notable changes to ra-jit are written here. The format follows
   `PathSource` lists them (git's tracked and untracked files, `include`, `exclude`, hidden files,
   packages inside), the output of the last run, and the runs of the `links` dependencies. Its
   plan is blaze's too (blaze-manifest's profiles and flags, no `cargo build --unit-graph` or
-  `cargo config get`). A build whose graph has a proc macro still has cargo's check build it and
-  run the scripts (no-rustc step J). `harness/scriptedits.py` holds 42 probes of it to cargo, and
+  `cargo config get`). Host proc macros also use owned source compilation; unresolved compiler
+  capability probes fail the build visibly (no-rustc step J). `harness/scriptedits.py` holds
+  42 probes of it to cargo, and
   `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole
   build. A build holds the output of the scripts it judged until it ends (`scripts/leases.rs`), and
   a script runs once in each build whatever other builds ask in between. A consumer of that output (a
@@ -70,7 +73,7 @@ All notable changes to ra-jit are written here. The format follows
   duplicates cannot free a reused or draining slot. Worker completion expires subscribers
   before awarding outcomes; timer delivery order does not change their deadlines.
 
-- `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
+- The default whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no
   load and no `cargo build`. A whole build starts no spare worker, and its objects keep each
@@ -86,9 +89,8 @@ All notable changes to ra-jit are written here. The format follows
   blaze-registry, and the graph of the build the load is for, with the features `cargo build`
   of its selection would have, not those of every member unified. A load of axum's example
   no longer reaches crates whose build scripts its build never ran (`env!` of `mime_guess`'s
-  variable), and its whole build (`RA_JIT_WHOLE_BUILD=1`) builds. What blaze does not read yet
-  (no lock file or a stale one, `[replace]`, a git index) goes to cargo with the reason;
-  `RA_JIT_OWN_RESOLVE=0` sends every load there. `harness/own_metadata.py` holds the output
+  variable), and the whole build succeeds. Unsupported resolution inputs fail with a reason;
+  `RA_JIT_OWN_RESOLVE=0` refuses the owned route without running Cargo. `harness/own_metadata.py` holds the output
   equal to `cargo metadata --filter-platform` and to `cargo build --unit-graph`'s packages,
   features and edges.
 - blaze on Linux needs glibc 2.34 or newer (RHEL 9, Debian 12, Ubuntu 22.04), and the release
@@ -98,7 +100,7 @@ All notable changes to ra-jit are written here. The format follows
   does, on Ubuntu 22.04 with the server, and installs it with no Rust in Debian 13, Debian 12,
   Ubuntu 22.04 and RHEL 9 (UBI 9) containers, each running `blaze run` and a derive from
   crates.io expanded by blaze's server, edited once.
-- `RA_JIT_WHOLE_BUILD=1` (or `BLAZE_WHOLE_BUILD=1`): `cargo blaze build` and `run` from nothing
+- Eligible `cargo blaze build` and `run` requests from nothing
   build each program whole with blaze, every crate compiled by blaze over the shipped standard
   library and linked by blaze, and put it where cargo does, with no `cargo build`
   ([no-rustc.md](docs/no-rustc.md), step K, #91). A function the program can reach that blaze

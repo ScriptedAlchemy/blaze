@@ -4738,6 +4738,7 @@ pub fn mir_body_query<'db>(
         }
     };
     let infer = InferenceResult::of(db, def);
+    db.depend_on_included_inputs(krate);
     let mut result = lower_body_to_mir(db, def, store, infer, root_expr, self_param, params)?;
     result.shrink_to_fit();
     Ok(result)

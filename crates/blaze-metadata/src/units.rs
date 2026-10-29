@@ -24,6 +24,10 @@ use rustc_hash::FxHashMap;
 
 use crate::{Asked, CapturedSource, Locked, Packages, World};
 
+mod producer;
+pub(crate) use producer::of_build;
+pub use producer::{ResolvedUnit, UnitDependency};
+
 mod deps;
 mod json;
 mod model;
@@ -389,8 +393,6 @@ pub fn unit_graph_captured(
     let (ctx, offline) = crate::open(a, command, discovery_root)?;
     refuse_what_is_not_read(&ctx.config, platform.triple)?;
     let ws = Workspace::new(&root_manifest(a.manifest_path, &ctx)?, &ctx)?;
-    let locked = Locked::read_captured(&ws, &ctx, offline, a.store.clone(), captured)?;
-    let world = World::new(&ws, &locked)?;
     let mut warnings: Vec<String> = Vec::new();
     for warning in ws.workspace_warnings() {
         warnings.push(warning.to_string());
@@ -399,7 +401,8 @@ pub fn unit_graph_captured(
         warnings.push(format!("{}: {warning}", path.display()));
     }
 
-    let members = members_of(&ws, &world);
+    let ids = crate::member_ids(&ws)?;
+    let members = members_of(&ws, &ids);
     let select = Select::from_flags(build.workspace, build.excludes, build.packages)?;
     let specs = select.to_package_id_specs(&members, &mut warnings)?;
     let filter = Filter::of(asked.targets);
@@ -407,11 +410,14 @@ pub fn unit_graph_captured(
         if filter.need_dev_deps(intent) { HasDevUnits::Yes } else { HasDevUnits::No };
     let cli_features =
         CliFeatures::from_command_line(a.features, a.all_features, !a.no_default_features)?;
+    let selection = crate::ResolutionSelection::new(&specs, &cli_features, has_dev_units);
+    let locked = Locked::read_captured(&ws, &ctx, a, offline, &selection, captured)?;
+    let world = World::new(&ws, &locked)?;
     let resolved = world.resolve(&ws, &ctx, &specs, &cli_features, has_dev_units)?;
 
     let summaries = world.member_summaries();
     let member_features = members_with_features(&world.members(&summaries), &specs, &cli_features)?;
-    let packages = Packages { reads: &world.reads, platform: Some(platform) };
+    let packages = Packages { reads: &world.reads, platform: Some(platform), host: Some(platform) };
     let opts = FeatureOpts::new(world.behavior, has_dev_units, ForceAllTargets::No);
     let kinds = [blaze_resolve::resolver::CompileKind::Host];
     let features =
@@ -484,13 +490,13 @@ pub fn unit_graph_captured(
     }
     warnings.extend(ctx.config.take_warnings());
     let graph = assemble(&env, &shared, ws.root(), &locked, warnings)?;
-    Ok((graph, ctx.sources(), locked.sources.clone()))
+    Ok((graph, locked.inputs(&ctx), locked.sources.clone()))
 }
 
 /// The members of the workspace, as the package selection reads them.
-fn members_of<'w>(ws: &'w Workspace<'_>, world: &'w World<'_>) -> Members<'w> {
+fn members_of<'w>(ws: &'w Workspace<'_>, ids: &[PackageId]) -> Members<'w> {
     let members: Vec<(PackageId, &blaze_manifest::manifest::Manifest)> =
-        world.member_ids().iter().copied().zip(world.manifests.iter().copied()).collect();
+        ids.iter().copied().zip(ws.members().map(|(_, manifest)| manifest)).collect();
     let by_name =
         |name: &str| members.iter().map(|(id, _)| *id).find(|id| id.name().as_str() == name);
     let default_members =

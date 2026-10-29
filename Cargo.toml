@@ -164,6 +164,7 @@ salsa = { version = "0.28.5", default-features = false, features = [
     "salsa_unstable",
     "macros",
     "inventory",
+    "accumulator",
     "triomphe"
 ] }
 semver = "1.0.26"

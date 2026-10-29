@@ -280,6 +280,7 @@ fn host() -> anyhow::Result<(Host, StoreIdentity, PathBuf)> {
 
 fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json::Value> {
     let asked = blaze_metadata::Asked {
+        locked: request.locked,
         cargo_home: ctx
             .native_env
             .and_then(|env| blaze_spec::environment::cargo_home(env, ctx.cwd)),

@@ -4,12 +4,9 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    process::Stdio,
-    str::FromStr,
 };
 
 use anyhow::Context;
-use cargo_platform::{Cfg, Platform};
 use cfg::{CfgAtom, CfgDiff};
 use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -29,6 +26,10 @@ pub(crate) struct Selection {
     pub(crate) features: Vec<String>,
     pub(crate) no_default_features: bool,
     pub(crate) all_features: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) locked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) offline: bool,
     /// The packages asked for with `-p`: none is what `cargo build` builds where it is run.
     pub(crate) packages: Vec<String>,
     /// Whether every member of the workspace is built.
@@ -61,6 +62,8 @@ impl Default for Selection {
             features: Vec::new(),
             no_default_features: false,
             all_features: false,
+            locked: false,
+            offline: false,
             packages: Vec::new(),
             workspace: false,
             excludes: Vec::new(),
@@ -89,6 +92,12 @@ impl Selection {
         }
         if self.all_features {
             flags.push("--all-features".to_owned());
+        }
+        if self.locked {
+            flags.push("--locked".to_owned());
+        }
+        if self.offline {
+            flags.push("--offline".to_owned());
         }
         for package in &self.packages {
             flags.extend(["--package".to_owned(), package.clone()]);
@@ -129,48 +138,6 @@ pub(crate) struct Asked<'a> {
     pub(crate) cfg: &'a [CfgAtom],
     /// The variables of the process that asks, where they are not those of this one.
     pub(crate) env: &'a FxHashMap<String, Option<String>>,
-}
-
-/// cargo, run in `dir` with `env` for the variables of whoever asks.
-fn cargo_in(dir: &Path, env: &FxHashMap<String, Option<String>>) -> std::process::Command {
-    let mut command = toolchain::command("cargo", dir, env);
-    // The unit graph and `cargo config get` are not stable yet.
-    command.env("RUSTC_BOOTSTRAP", "1").stdin(Stdio::null());
-    crate::answers::ready_cargo(&mut command);
-    command
-}
-
-impl Asked<'_> {
-    fn var(&self, name: &str) -> Option<String> {
-        match self.env.get(name) {
-            Some(value) => value.clone(),
-            None => std::env::var(name).ok(),
-        }
-    }
-
-    /// cargo, run in `dir` as whoever asks would run it.
-    fn cargo(&self, dir: &Path) -> std::process::Command {
-        cargo_in(dir, self.env)
-    }
-
-    /// Whether the key of a `[target]` table of cargo's configuration names what is built for.
-    fn is(&self, key: &str) -> bool {
-        if key == self.triple {
-            return true;
-        }
-        let cfg: Vec<Cfg> = self
-            .cfg
-            .iter()
-            .filter_map(|atom| match atom {
-                CfgAtom::Flag(name) => Cfg::from_str(name.as_str()).ok(),
-                CfgAtom::KeyValue { key, value } => {
-                    Cfg::from_str(&format!("{key}={:?}", value.as_str())).ok()
-                }
-            })
-            .collect();
-        key.starts_with("cfg(")
-            && Platform::from_str(key).is_ok_and(|it| it.matches(self.triple, &cfg))
-    }
 }
 
 /// The settings of a profile that change what a program does.
@@ -390,42 +357,6 @@ struct Flags {
 }
 
 impl Flags {
-    /// The flags cargo passes in `dir` for what is `asked`: the first of
-    /// `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, the `[target]` tables that name what is built
-    /// for and `[build]` of the configuration that has any.
-    fn of(dir: &Path, asked: &Asked<'_>) -> anyhow::Result<Flags> {
-        if let Some(encoded) = asked.var("CARGO_ENCODED_RUSTFLAGS") {
-            return Ok(Flags::parse(encoded.split('\u{1f}')));
-        }
-        if let Some(flags) = asked.var("RUSTFLAGS") {
-            return Ok(Flags::parse(flags.split_whitespace()));
-        }
-        let mut command = asked.cargo(dir);
-        // `cargo config get` is how cargo says what its configuration files and variables
-        // come to.
-        command.args(["-Z", "unstable-options", "config", "get", "--format", "json"]);
-        let output = command.output().context("running `cargo config`")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`cargo config get` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        let config: Config =
-            serde_json::from_slice(&output.stdout).context("reading cargo's configuration")?;
-        // The table of the triple, then those of a cfg in the order of their keys.
-        let mut tables: Vec<_> = config.target.iter().filter(|(key, _)| asked.is(key)).collect();
-        tables.sort_by_key(|(key, _)| (key.starts_with("cfg("), key.as_str()));
-        let of_target: Vec<&str> = tables
-            .iter()
-            .filter_map(|(_, table)| table.rustflags.as_ref())
-            .flat_map(Words::words)
-            .collect();
-        if !of_target.is_empty() {
-            return Ok(Flags::parse(of_target.into_iter()));
-        }
-        Ok(Flags::parse(config.build.rustflags.iter().flat_map(Words::words)))
-    }
-
     fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Flags {
         let all: Vec<&str> = words.by_ref().collect();
         let mut words = all.iter().copied();
@@ -480,40 +411,10 @@ impl Flags {
     }
 }
 
-/// The part of cargo's configuration that has flags for rustc.
-#[derive(Deserialize, Default)]
-struct Config {
-    #[serde(default)]
-    build: ConfigFlags,
-    #[serde(default)]
-    target: FxHashMap<String, ConfigFlags>,
-}
-
-#[derive(Deserialize, Default)]
-struct ConfigFlags {
-    rustflags: Option<Words>,
-}
-
-/// Flags as a configuration has them: in one string, or one by one.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Words {
-    Joined(String),
-    Each(Vec<String>),
-}
-
-impl Words {
-    fn words(&self) -> Box<dyn Iterator<Item = &str> + '_> {
-        match self {
-            Words::Joined(joined) => Box::new(joined.split_whitespace()),
-            Words::Each(each) => Box::new(each.iter().map(String::as_str)),
-        }
-    }
-}
-
 /// The packages of a build by their id, each as it is built for the target.
 pub(crate) struct Plan {
     packages: FxHashMap<String, Built>,
+    host_cargo: Option<project_model::CargoWorkspace>,
     lto: bool,
     frame_pointers: bool,
     lints_capped: bool,
@@ -534,40 +435,7 @@ pub(crate) struct Whole {
 }
 
 impl Plan {
-    /// Asks cargo for the units of the build `selection` names of the package of `manifest`.
-    pub(crate) fn of(
-        manifest: &Path,
-        selection: &Selection,
-        asked: &Asked<'_>,
-    ) -> anyhow::Result<Plan> {
-        // The unit graph is the only place cargo says which features and which profile each
-        // package of one build has.
-        let (dir, manifest) = match &selection.asked_in {
-            Some(asked_in) if asked_in.is_dir() => (asked_in.as_path(), None),
-            Some(asked_in) => {
-                (asked_in.parent().unwrap_or(Path::new(".")), Some(asked_in.as_path()))
-            }
-            None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
-        };
-        // Cargo reads external --config files internally. Retain the owned reading of
-        // that configuration before asking for the graph, including its include closure.
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-        for (name, value) in asked.env {
-            match value {
-                Some(value) => env.insert(name.clone(), value.clone()),
-                None => env.remove(name),
-            };
-        }
-        let mut config = blaze_manifest::Config::load(dir, env, &[])?;
-        config.start("build", &selection.config)?;
-        let sources = config.sources();
-        let graph = UnitGraph::of(dir, manifest, selection, &[], asked.env)?;
-        let mut plan = graph.plan(&Flags::of(dir, asked)?, selection.target.is_some())?;
-        plan.sources = sources;
-        Ok(plan)
-    }
-
-    /// [`Plan::of`] made by blaze with no cargo, for the whole build: the packages of `cargo`,
+    /// The plan made by blaze with no cargo: the packages of `cargo`,
     /// the workspace blaze read and resolved itself for this build (`cargo/metadata.rs`), each
     /// with the features that reading has and the profile blaze-manifest gives it as cargo's
     /// `Profiles::get_profile` does (for the target when the packages the build selects reach
@@ -580,28 +448,53 @@ impl Plan {
         asked: &Asked<'_>,
     ) -> anyhow::Result<Plan> {
         use blaze_manifest::profiles::{Profiles, UnitFor};
-        use project_model::DepKind;
         let root: &Path = cargo.workspace_root().as_ref();
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (name, value) in asked.env {
             match value {
                 Some(value) => env.insert(name.clone(), value.clone()),
                 None => env.remove(name),
             };
         }
-        let mut config = blaze_manifest::Config::load(root, env.clone(), &[])?;
+        let (cwd, loaded_manifest) = match selection.asked_in.as_deref() {
+            Some(path) if path.is_dir() => (path, None),
+            Some(path) => (path.parent().unwrap_or(root), Some(path)),
+            None => (manifest.parent().unwrap_or(root), Some(manifest)),
+        };
+        let mut config = blaze_manifest::Config::load(cwd, env.clone(), &[])?;
         config.start("build", &selection.config)?;
         let ctx = blaze_manifest::Context::new(config);
         let root_manifest =
             blaze_manifest::metadata::root_manifest(Some(&root.join("Cargo.toml")), &ctx)?;
         let ws = blaze_manifest::Workspace::new(&root_manifest, &ctx)?;
-        let host = selection.target.is_none();
+        let native = selection.target.is_none();
+        let compiler = crate::answers::toolchain_rustc_of(std::ffi::OsStr::new("rustc"))
+            .context("owned planner has no toolchain; Cargo was not executed")?;
+        let host = crate::answers::host_tuple(&compiler)
+            .context("owned planner has no host facts; Cargo was not executed")?;
+        let sysroot = compiler
+            .parent()
+            .and_then(Path::parent)
+            .context("owned planner has no sysroot; Cargo was not executed")?;
+        env.insert("RUSTUP_TOOLCHAIN".into(), sysroot.display().to_string());
+        let mut resolved_selection = selection.clone();
+        if resolved_selection.asked_in.is_none() {
+            resolved_selection.asked_in = Some(cwd.to_owned());
+        }
+        let resolved = crate::cargo::producer_plan::of(
+            loaded_manifest.unwrap_or(manifest),
+            &resolved_selection,
+            &host,
+            asked.triple,
+            env,
+        )
+        .context("owned build units failed; Cargo was not executed")?;
         let profiles = Profiles::new(
             ws.profiles(),
             ws.unstable_features(),
             &ctx.config,
             &selection.profile,
-            asked.triple,
+            &host,
         )?;
         let flags = crate::scripts::rustflags(&ctx.config, asked.triple, asked.cfg)?;
         let flags = Flags::parse(flags.iter().map(String::as_str));
@@ -638,47 +531,44 @@ impl Plan {
         } else {
             let at: Vec<_> =
                 members.iter().copied().filter(|it| manifest_of(it) == asked_in).collect();
-            if at.is_empty() { members.clone() } else { at }
-        };
-        // Reached from the roots for the target, and for the host.
-        let mut target: FxHashSet<project_model::Package> = FxHashSet::default();
-        let mut hosted: FxHashSet<project_model::Package> = FxHashSet::default();
-        let is_macro = |it: project_model::Package| {
-            cargo[it].targets.iter().any(|&t| {
-                matches!(cargo[t].kind, ide_db::base_db::TargetKind::Lib { is_proc_macro: true })
-            })
-        };
-        let mut pending: Vec<(project_model::Package, bool)> =
-            roots.iter().map(|&it| (it, is_macro(it))).collect();
-        while let Some((package, for_host)) = pending.pop() {
-            let seen = match for_host {
-                true => &mut hosted,
-                false => &mut target,
-            };
-            if !seen.insert(package) {
-                continue;
+            if at.is_empty() {
+                let defaults = ws.default_members().map(|(path, _)| path).collect::<Vec<_>>();
+                members
+                    .iter()
+                    .copied()
+                    .filter(|it| defaults.contains(&manifest_of(it).as_path()))
+                    .collect()
+            } else {
+                at
             }
-            for dep in &cargo[package].dependencies {
-                let dep_host = for_host || dep.kind == DepKind::Build || is_macro(dep.pkg);
-                if dep.kind != DepKind::Dev || selection.dev_deps {
-                    pending.push((dep.pkg, dep_host));
-                }
-            }
-        }
+        };
         let kind = match &selection.target {
             Some(triple) => blaze_manifest::config::CompileKind::Target(triple.clone()),
             None => blaze_manifest::config::CompileKind::Host,
         };
         let mut packages = FxHashMap::default();
         let mut lto = false;
-        for package in target.iter().chain(hosted.iter().filter(|it| !target.contains(it))) {
-            let data = &cargo[*package];
-            let for_target = target.contains(package);
+        let mut units = resolved.units.iter().collect::<Vec<_>>();
+        // The adapter keeps the target unit when a package exists in both
+        // feature domains, but resolution itself never folds those domains.
+        units.sort_by_key(|unit| !unit.host);
+        for unit in units {
+            let package = cargo
+                .packages()
+                .find(|&it| cargo[it].id.repr == unit.package)
+                .with_context(|| {
+                    format!(
+                        "owned unit {} absent from workspace; Cargo was not executed",
+                        unit.package
+                    )
+                })?;
+            let data = &cargo[package];
+            let for_target = !unit.host;
             let unit_for = match for_target {
                 true => UnitFor::new_normal(),
                 false => UnitFor::new_host(false),
             };
-            let kind = match for_target && !host {
+            let kind = match for_target && !native {
                 true => kind.clone(),
                 false => blaze_manifest::config::CompileKind::Host,
             };
@@ -688,8 +578,10 @@ impl Plan {
             let profile: Profile = serde_json::from_value(serde_json::to_value(&profile)?)
                 .context("blaze-manifest's profile is not the unit graph's form")?;
             lto |= for_target && profile.links_from_bitcode();
+            let applies = for_target || selection.target.is_none();
+            let profile = if applies { profile.with(&flags) } else { profile };
             let built = Built {
-                features: data.active_features.iter().cloned().collect(),
+                features: unit.features.iter().cloned().collect(),
                 codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
                     .chain(
                         flags
@@ -699,8 +591,8 @@ impl Plan {
                             .cloned(),
                     )
                     .collect(),
-                profile: profile.with(&flags),
-                primary: roots.contains(package),
+                profile,
+                primary: roots.contains(&package),
                 for_target,
             };
             packages.insert(package_named(&data.id.repr), built);
@@ -708,12 +600,24 @@ impl Plan {
         if lto {
             eprintln!("{LTO_ACCEPTED}");
         }
+        let host_metadata = resolved.script_metadata(cargo.target_directory().as_ref())?;
+        let host_manifest = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
+            host_metadata.workspace_root.join("Cargo.toml").into_std_path_buf(),
+        ))
+        .map_err(|_| anyhow::anyhow!("host script manifest is not absolute"))?;
+        let host_cargo = project_model::CargoWorkspace::new(
+            host_metadata,
+            host_manifest,
+            ide_db::base_db::Env::default(),
+            false,
+        );
         Ok(Plan {
             packages,
+            host_cargo: Some(host_cargo),
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,
-            sources: ctx.sources(),
+            sources: ctx.sources().into_iter().chain(resolved.sources).collect(),
         })
     }
 
@@ -721,32 +625,8 @@ impl Plan {
         &self.sources
     }
 
-    /// The programs the build `selection` names, of the targets `targets` picks (`--bin`,
-    /// `--example`), asked for in `dir` (of the package of `manifest`, when there is one): the
-    /// units cargo would link an executable of.
-    pub(crate) fn programs(
-        dir: &Path,
-        manifest: Option<&Path>,
-        selection: &Selection,
-        targets: &[String],
-    ) -> anyhow::Result<Vec<Program>> {
-        let graph = UnitGraph::of(dir, manifest, selection, targets, &FxHashMap::default())?;
-        let roots = graph.roots.iter().filter_map(|&it| graph.units.get(it));
-        let programs = roots.filter(|unit| {
-            let target = &unit.target;
-            let kind = |it: &str| target.kind.iter().any(|kind| kind == it);
-            (kind("bin") || kind("example"))
-                && target.crate_types.iter().all(|it| it == "bin")
-                && unit.mode == "build"
-        });
-        let programs = programs.map(|unit| Program {
-            package: unit.pkg_id.clone(),
-            name: unit.target.name.clone(),
-            root: unit.target.src_path.clone(),
-            example: unit.target.kind.iter().any(|it| it == "example"),
-            platform: unit.platform.clone(),
-        });
-        Ok(programs.collect())
+    pub(crate) fn host_cargo(&self) -> Option<&project_model::CargoWorkspace> {
+        self.host_cargo.as_ref()
     }
 
     /// What the build has a debugger told of the packages cargo was asked to build: the
@@ -861,34 +741,6 @@ impl Unit {
 }
 
 impl UnitGraph {
-    /// What `cargo build --unit-graph` says of the build `selection` names, of the targets
-    /// `targets` picks, asked in `dir` of the package of `manifest` when there is one, with
-    /// `env` for the variables of whoever asks.
-    fn of(
-        dir: &Path,
-        manifest: Option<&Path>,
-        selection: &Selection,
-        targets: &[String],
-        env: &FxHashMap<String, Option<String>>,
-    ) -> anyhow::Result<UnitGraph> {
-        let mut command = cargo_in(dir, env);
-        command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
-        if let Some(manifest) = manifest {
-            command.arg("--manifest-path").arg(manifest);
-        }
-        command.args(selection.flags()).args(targets);
-        if selection.dev_deps {
-            command.arg("--all-targets");
-        }
-        let output = command.output().context("running `cargo build`")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`cargo build --unit-graph` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")
-    }
-
     /// The units that end up in the program: those the roots reach without going through one
     /// that runs on the host.
     fn for_target(&self) -> FxHashSet<usize> {
@@ -960,6 +812,7 @@ impl UnitGraph {
             .collect();
         Ok(Plan {
             packages,
+            host_cargo: None,
             lto,
             frame_pointers: flags.frame_pointers,
             lints_capped: flags.lints_capped,

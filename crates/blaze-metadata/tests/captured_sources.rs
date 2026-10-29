@@ -40,6 +40,7 @@ fn graph(
     captured: Option<&[CapturedSource]>,
 ) -> anyhow::Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>, Vec<CapturedSource>)> {
     let asked = Asked {
+        locked: false,
         cargo_home: Some(home.to_owned()),
         cwd: root,
         env: vec![("__CARGO_TEST_ROOT".to_owned(), root.to_str().unwrap().to_owned())],

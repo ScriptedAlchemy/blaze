@@ -349,12 +349,14 @@ impl<'db> Keeper<'_, 'db> {
         }
         let mut entry = Box::new(entry);
         let Some(check) = check else {
-            return Some(cached::Kept::Entry { key, entry });
+            let name = cached::keys_logged().then(|| Box::<str>::from(&*name));
+            return Some(cached::Kept::Entry { key, entry, name });
         };
         // The entry as it would be written is set against the one that is there.
         let stored = store.get(&key);
         let mut alone =
-            cached::Writer::alone(store, self.symbols.cargo_home(), self.symbols.library_sources());
+            cached::Writer::alone(store, self.symbols.cargo_home(), self.symbols.library_sources())
+                .in_checkout(self.symbols.checkout());
         let Some(bytes) = alone.encoded(&mut entry) else {
             return self.kept.unkept(OF_CARGO);
         };

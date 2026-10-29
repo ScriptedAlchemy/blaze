@@ -209,6 +209,15 @@ impl Semantics<'_, dyn HirDatabase> {
         let impl_ = SemanticsImpl::new(db);
         Semantics { db, imp: impl_ }
     }
+
+    pub(crate) fn new_dyn_within(
+        db: &'_ dyn HirDatabase,
+        crates: std::sync::Arc<rustc_hash::FxHashSet<base_db::Crate>>,
+    ) -> Semantics<'_, dyn HirDatabase> {
+        let impl_ = SemanticsImpl::new(db);
+        impl_.s2d_cache.borrow_mut().within = Some(crates);
+        Semantics { db, imp: impl_ }
+    }
 }
 
 impl<DB: HirDatabase> Semantics<'_, DB> {

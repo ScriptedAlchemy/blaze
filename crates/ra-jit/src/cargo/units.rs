@@ -79,7 +79,8 @@ impl Record {
     pub(crate) fn kept_copy(library: &Path) -> Option<PathBuf> {
         let unit = library.file_stem()?.to_str()?.strip_prefix("lib")?;
         let record = Record::dir_for(library.parent()?).join(unit).join("record.json");
-        let record: Record = serde_json::from_str(&std::fs::read_to_string(record).ok()?).ok()?;
+        let record: Record =
+            serde_json::from_value(crate::env_identity::read_json(&record).ok()?).ok()?;
         record.copy_of(library).map(Path::to_owned)
     }
 
@@ -102,8 +103,8 @@ impl Record {
         let mut records = Vec::new();
         for entry in entries {
             let path = entry?.path().join("record.json");
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let record = serde_json::from_str(&text)
+            let Ok(value) = crate::env_identity::read_json(&path) else { continue };
+            let record = serde_json::from_value(value)
                 .with_context(|| format!("{} is not a record", path.display()))?;
             records.push(record);
         }
@@ -115,7 +116,13 @@ impl Record {
         let unit = dir.join(&self.id);
         std::fs::create_dir_all(&unit)?;
         let new = unit.join(format!("record.{}.new", std::process::id()));
-        std::fs::write(&new, serde_json::to_vec(self)?)?;
+        std::fs::write(
+            &new,
+            crate::env_identity::disk_json(
+                &unit.join("record.json"),
+                &serde_json::to_value(self)?,
+            )?,
+        )?;
         std::fs::rename(&new, unit.join("record.json"))?;
         Ok(())
     }
@@ -128,7 +135,10 @@ impl Record {
         let unit = dir.join(&self.id);
         std::fs::create_dir_all(&unit)?;
         let new = unit.join(format!("{DESCRIBED}.{}.new", std::process::id()));
-        std::fs::write(&new, serde_json::to_vec(self)?)?;
+        std::fs::write(
+            &new,
+            crate::env_identity::disk_json(&unit.join(DESCRIBED), &serde_json::to_value(self)?)?,
+        )?;
         std::fs::rename(&new, unit.join(DESCRIBED))?;
         Ok(())
     }
@@ -136,10 +146,10 @@ impl Record {
     /// The record of the unit `id` in `dir`, of the workspace or described.
     pub(crate) fn described(dir: &Path, id: &str) -> Option<Record> {
         let unit = dir.join(id);
-        let text = std::fs::read_to_string(unit.join("record.json"))
-            .or_else(|_| std::fs::read_to_string(unit.join(DESCRIBED)))
+        let value = crate::env_identity::read_json(&unit.join("record.json"))
+            .or_else(|_| crate::env_identity::read_json(&unit.join(DESCRIBED)))
             .ok()?;
-        serde_json::from_str(&text).ok()
+        serde_json::from_value(value).ok()
     }
 
     fn value(&self, flag: &str) -> Option<&str> {

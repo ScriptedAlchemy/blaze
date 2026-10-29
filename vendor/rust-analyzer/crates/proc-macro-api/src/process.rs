@@ -229,6 +229,12 @@ impl ProcMacroServerProcess {
 
     /// Returns the server error if the process has exited.
     pub(crate) fn exited(&self) -> Option<&ServerError> {
+        if self.exited.get().is_none()
+            && let Ok(mut state) = self.state.try_lock()
+            && let Some(error) = state.process.exit_err()
+        {
+            self.exited.get_or_init(|| AssertUnwindSafe(error));
+        }
         self.exited.get().map(|it| &it.0)
     }
 

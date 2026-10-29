@@ -203,6 +203,7 @@ fn resolve_with_platform(
     })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
     let asked = Asked {
+        locked: request.locked,
         cargo_home: ctx.native_env.and_then(|env| environment::cargo_home(env, ctx.cwd)),
         cwd: ctx.cwd,
         env: ctx.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),

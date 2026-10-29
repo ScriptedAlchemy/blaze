@@ -106,6 +106,33 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     let Some(unit) = Unit::of(&args) else {
         std::process::exit(compiler.status()?.code().unwrap_or(1));
     };
+    // Plain Cargo has no ahead worker/message observer. Capture at the actual
+    // producer compile, before rustc runs, never from its later fresh artifact.
+    let producer_inputs = if unit.as_record(0, Vec::new(), None).is_proc_macro() {
+        let capture = || -> anyhow::Result<Option<crate::macro_inputs::ArtifactInputs>> {
+            let cargo = Cargo::above().map_err(anyhow::Error::msg)?;
+            let asked = cli::of_cargo(&cargo.args).context("no producer build selection")?;
+            let env = crate::process::unicode(cargo.env).collect::<Vec<_>>();
+            let metadata = super::metadata::no_deps_in(
+                &cargo.cwd,
+                asked.flags.manifest_path.as_deref(),
+                &asked.flags.config,
+                env.clone(),
+            )?;
+            let project =
+                super::state::project(&asked, &cargo.cwd, &metadata).map_err(anyhow::Error::msg)?;
+            crate::macro_inputs::ArtifactInputs::capture_in(&project, &asked.selection(), env)
+        };
+        match capture() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                eprintln!("macro provenance: warm load unavailable: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
     let dir = unit.records.join(&unit.id);
     if unit.script && std::env::var_os(own_script::BY_RUSTC).is_none() {
@@ -149,6 +176,15 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     }
     let status =
         compiler.status().with_context(|| format!("running {}", Path::new(&rustc).display()))?;
+    if status.success()
+        && let Some(inputs) = producer_inputs
+    {
+        for library in unit.as_record(0, Vec::new(), None).outputs() {
+            if let Err(error) = inputs.record_library(&library) {
+                eprintln!("macro provenance: artifact not recorded: {error:#}");
+            }
+        }
+    }
     if status.success()
         && let Err(error) = unit.record(stamp, &copies, unit.linked.then_some(line), &unit.source)
     {
@@ -603,10 +639,10 @@ impl Unit {
             stamp,
             copies,
             link_line,
-            env: std::env::vars()
+            env: crate::process::vars()
                 .filter(|(name, _)| name.starts_with(PROGRAM_OF) || name == SCRATCH)
                 .collect(),
-            crate_env: std::env::vars()
+            crate_env: crate::process::vars()
                 .filter(|(name, _)| super::own_script::read_by_crates(name))
                 .collect(),
         }

@@ -49,13 +49,12 @@ use proc_macro_api::{
     version::CURRENT_API_VERSION,
 };
 use ra_jit_store::{KEY, Store};
-use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
 /// What the key of an expansion starts with: another number when the key or the value is
 /// made otherwise.
-const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 2";
+const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 4";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -107,26 +106,60 @@ fn wrap(
         Mode::All | Mode::Check => false,
     } || config().compare
         || config().skip.iter().any(|it| **it == *name);
-    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, skipped })
+    let dylib = Dylib::at(dylib, inner.content_identity());
+    Arc::new(Kept { inner, dylib, name: name.into(), kind, skipped })
 }
 
-/// A dylib of proc macros, hashed the first time one of its macros expands.
+/// A loaded dylib generation, fingerprinted when its expansion wrapper is made.
 #[derive(Debug)]
 struct Dylib {
     path: AbsPathBuf,
     hash: OnceLock<Option<[u8; KEY]>>,
 }
 
+#[cfg(test)]
+mod dylib_identity_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_at_the_same_path_is_not_the_previous_expansion_library() {
+        let path = std::env::temp_dir().join(format!("c4-macro-{}.dylib", std::process::id()));
+        std::fs::write(&path, b"macro-one").unwrap();
+        let absolute = AbsPathBuf::assert_utf8(path.clone());
+        let first = Dylib::at(&absolute, None);
+        let before = *first.hash().unwrap();
+        let timestamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"macro-two").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(timestamp).unwrap();
+        let second = Dylib::at(&absolute, None);
+        assert_ne!(before, *second.hash().unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loaded_generation_identity_survives_producer_replacement_and_removal() {
+        let path =
+            std::env::temp_dir().join(format!("c4-loaded-macro-{}.dylib", std::process::id()));
+        let absolute = AbsPathBuf::assert_utf8(path.clone());
+        let loaded: [u8; KEY] = Sha256::digest(b"the server's immutable generation").into();
+        // The producer can replace its original path after the server copied the
+        // generation but before load-cargo wraps its expanders with this cache.
+        std::fs::write(&path, b"the next producer generation").unwrap();
+        assert_ne!(Dylib::at(&absolute, None).hash(), Some(&loaded));
+        assert_eq!(Dylib::at(&absolute, Some(loaded)).hash(), Some(&loaded));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(Dylib::at(&absolute, Some(loaded)).hash(), Some(&loaded));
+        assert_eq!(Dylib::at(&absolute, None).hash(), None);
+    }
+}
+
 impl Dylib {
-    /// The one dylib at `path`: the macros of a dylib share its hash.
-    fn at(path: &AbsPath) -> Arc<Dylib> {
-        static DYLIBS: Mutex<Option<FxHashMap<AbsPathBuf, Arc<Dylib>>>> = Mutex::new(None);
-        let mut dylibs = DYLIBS.lock().unwrap_or_else(|it| it.into_inner());
-        let dylibs = dylibs.get_or_insert_default();
-        let dylib = dylibs.entry(path.to_path_buf());
-        dylib
-            .or_insert_with(|| Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::new() }))
-            .clone()
+    /// Use the loader's immutable generation when available. Its original pathname
+    /// may already name a newer producer by the time the expansion wrapper is made.
+    fn at(path: &AbsPath, loaded: Option<[u8; KEY]>) -> Arc<Dylib> {
+        let hash =
+            loaded.or_else(|| std::fs::read(path).ok().map(|bytes| Sha256::digest(bytes).into()));
+        Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::from(hash) })
     }
 
     fn hash(&self) -> Option<&[u8; KEY]> {
@@ -149,6 +182,17 @@ struct Kept {
 struct Call {
     key: [u8; KEY],
     spans: Spans,
+    /// What each part of the key comes to, when `RA_JIT_KEYS_LOG` is set.
+    parts: Option<Parts>,
+}
+
+/// The parts of a key, each by the first eight bytes of its SHA-256 in hex: two machines that
+/// give one call different keys differ in one of these.
+struct Parts {
+    dylib: String,
+    input: String,
+    env: String,
+    cwd: String,
 }
 
 /// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
@@ -222,20 +266,41 @@ impl Kept {
             hasher.update(bytes);
         };
         field(DOMAIN);
-        field(self.dylib.hash()?);
+        let dylib = self.dylib.hash()?;
+        field(dylib);
         field(self.name.as_bytes());
         field(&[self.kind as u8]);
         field(&CURRENT_API_VERSION.to_le_bytes());
-        field(&postcard::to_allocvec(&input).ok()?);
-        field(&postcard::to_allocvec(&attrs).ok()?);
-        field(&postcard::to_allocvec(&shapes).ok()?);
+        let input = [
+            postcard::to_allocvec(&input).ok()?,
+            postcard::to_allocvec(&attrs).ok()?,
+            postcard::to_allocvec(&shapes).ok()?,
+        ];
+        input.iter().for_each(|it| field(it));
         field(&(env.len() as u64).to_le_bytes());
-        for (name, value) in env {
+        // A macro can branch on a path's length or read a file beneath it without putting
+        // that path in its output. Until observed reads/environment accesses are available,
+        // raw paths must remain in the lookup key and in the diagnostic hashes.
+        for (name, value) in &env {
             field(name.as_bytes());
             field(value.as_bytes());
         }
         field(current_dir.as_bytes());
-        Some(Call { key: hasher.finalize().into(), spans })
+        let key = hasher.finalize().into();
+        let env: Vec<(&str, std::borrow::Cow<'_, str>)> = env
+            .into_iter()
+            .map(|(name, value)| (name, std::borrow::Cow::Borrowed(value)))
+            .collect();
+        let parts = keys_logged().then(|| Parts {
+            dylib: short(dylib),
+            input: short(&input.concat()),
+            env: short(env_text(&env).as_bytes()),
+            cwd: short(current_dir.as_bytes()),
+        });
+        if parts.is_some() {
+            log_env(&env);
+        }
+        Some(Call { key, spans, parts })
     }
 }
 
@@ -259,6 +324,93 @@ fn read(bytes: &[u8], spans: &Spans) -> Option<tt::TopSubtree> {
 fn store() -> Option<&'static Store> {
     ra_jit_store::toolchain()?;
     Store::global()
+}
+
+/// Where `RA_JIT_KEYS_LOG` says to list the calls of this process, as hir-ty-codegen lists the
+/// entries it adds: `harness/dist/crossmachine.py` reads both.
+fn keys_log() -> Option<&'static Mutex<std::fs::File>> {
+    static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let open = || {
+        let path = std::env::var_os("RA_JIT_KEYS_LOG").filter(|it| !it.is_empty())?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    };
+    LOG.get_or_init(open).as_ref()
+}
+
+fn keys_logged() -> bool {
+    keys_log().is_some()
+}
+
+fn write_log(line: &str) {
+    use std::io::Write as _;
+    if let Some(log) = keys_log() {
+        _ = log.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
+    }
+}
+
+/// The first eight bytes of the SHA-256 of `bytes`, in hex.
+fn short(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)[..8].iter().map(|it| format!("{it:02x}")).collect()
+}
+
+/// A diagnostic fingerprint for each variable. Values may hold credentials; naming which
+/// variable differs between machines needs its digest, not its contents in a shared log.
+fn env_text(env: &[(&str, std::borrow::Cow<'_, str>)]) -> String {
+    env.iter().map(|(name, value)| format!("{name}={}\n", short(value.as_bytes()))).collect()
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::env_text;
+
+    #[test]
+    fn environment_diagnostics_fingerprint_values_without_printing_them() {
+        let text = env_text(&[("TOKEN", "private-token-value".into())]);
+        assert!(text.starts_with("TOKEN="));
+        assert!(!text.contains("private-token-value"));
+        assert_eq!(text, env_text(&[("TOKEN", "private-token-value".into())]));
+        assert_ne!(
+            env_text(&[("VALUE", "first\nsecond".into())]),
+            env_text(&[("VALUE", "first second".into())]),
+            "a newline changes the environment key too"
+        );
+    }
+}
+
+/// The environment of a call, once for each: its parts as the key has them, which say which
+/// variable still holds something of the machine when two machines give a call two keys.
+fn log_env(env: &[(&str, std::borrow::Cow<'_, str>)]) {
+    static SEEN: Mutex<Option<rustc_hash::FxHashSet<String>>> = Mutex::new(None);
+    let text = env_text(env);
+    let id = short(text.as_bytes());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_default().insert(id.clone()) {
+        let vars: Vec<String> = text.lines().map(|it| it.replace('\0', "$")).collect();
+        write_log(&format!("macro-env\t{id}\t{}\n", vars.join("\t")));
+    }
+}
+
+impl Call {
+    /// One line of the log for a call and what became of it: the macro, the parts of its key and
+    /// the key as it is on disk.
+    fn log(&self, kept: &Kept, store: &Store, outcome: &str) {
+        let Some(parts) = &self.parts else { return };
+        let disk: String = store.disk_key(&self.key).iter().map(|it| format!("{it:02x}")).collect();
+        write_log(&format!(
+            "macro\t{}\t{}\t{disk}\tdylib={}\tinput={}\tenv={}\tcwd={}\t{outcome}\n",
+            kind_name(kept.kind),
+            kept.name,
+            parts.dylib,
+            parts.input,
+            parts.env,
+            parts.cwd,
+        ));
+    }
+}
+
+fn kind_name(kind: ProcMacroKind) -> &'static str {
+    ["derive", "attribute", "function-like"][kind_index(kind)]
 }
 
 impl ProcMacroExpander for Kept {
@@ -300,6 +452,9 @@ impl ProcMacroExpander for Kept {
             && let Some(output) = read(bytes, &call.spans)
         {
             COUNTS.found.add(start.elapsed());
+            if let Some(store) = store {
+                call.log(self, store, "found");
+            }
             return Ok(output);
         }
         // What was found and could not be read is written again.
@@ -338,14 +493,19 @@ impl ProcMacroExpander for Kept {
             if expanded.is_err() {
                 COUNTS.failed.add(Duration::ZERO);
             }
+            if let (Some(store), Some(call)) = (store, &call) {
+                call.log(self, store, "failed");
+            }
             return expanded;
         };
         if load_cargo::asked() != asked {
             COUNTS.asked.add(Duration::ZERO);
+            call.log(self, store, "asked the database");
             return expanded;
         }
         let Some(bytes) = written(output, &call.spans) else {
             COUNTS.unspanned.add(Duration::ZERO);
+            call.log(self, store, "output has spans the call has not");
             return expanded;
         };
         match found {
@@ -359,6 +519,7 @@ impl ProcMacroExpander for Kept {
                 COUNTS.kept.add(Duration::ZERO);
             }
         }
+        call.log(self, store, "expanded");
         expanded
     }
 
@@ -366,6 +527,10 @@ impl ProcMacroExpander for Kept {
         (other as &dyn Any)
             .downcast_ref::<Kept>()
             .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
+    }
+
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        self.inner.content_identity().or_else(|| self.dylib.hash().copied())
     }
 }
 

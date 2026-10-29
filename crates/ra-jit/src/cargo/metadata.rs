@@ -14,17 +14,27 @@ use cargo_metadata::Metadata;
 /// its message, status 101.
 pub(crate) fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let config = Config::from_process().and_then(|mut process| {
-        process.start("metadata", config)?;
-        Ok(process)
-    });
-    match config.and_then(|config| read(config, manifest_path)) {
+    match no_deps_in(&cwd, manifest_path, config, crate::process::vars().collect()) {
         Ok(metadata) => metadata,
         Err(err) => {
             refused(&err, &cwd);
             std::process::exit(101)
         }
     }
+}
+
+/// Read from the invoking Cargo's directory, not the directory it runs rustc in.
+/// A caller that only collects provenance must not end a compile on a reader error.
+pub(super) fn no_deps_in(
+    cwd: &Path,
+    manifest_path: Option<&Path>,
+    config: &[String],
+    env: Vec<(String, String)>,
+) -> anyhow::Result<Metadata> {
+    let mut process = Config::load(cwd, env, &[])?;
+    process.start("metadata", config)?;
+    let manifest = manifest_path.map(|path| cwd.join(path));
+    read(process, manifest.as_deref())
 }
 
 fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata> {
@@ -43,10 +53,11 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
         return None;
     }
     let selection = selection.clone();
+    let offline = selection.offline;
     let root = |manifest: &project_model::ManifestPath| {
         let manifest: &Path = manifest.as_ref();
         let cwd = manifest.parent().unwrap_or(Path::new("/"));
-        let root = blaze_metadata::workspace_root(cwd, std::env::vars().collect(), manifest)?;
+        let root = blaze_metadata::workspace_root(cwd, crate::process::vars().collect(), manifest)?;
         let root = paths::AbsPathBuf::assert_utf8(root);
         Ok(project_model::ManifestPath::try_from(root).expect("a manifest is a file"))
     };
@@ -64,7 +75,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             }
             None => (loaded.parent().unwrap_or(Path::new("/")).to_owned(), Some(loaded)),
         };
-        let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (key, value) in env {
             match value {
                 Some(value) => vars.insert(key.clone(), value.clone()),
@@ -89,7 +100,8 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
                 dev_units: selection.dev_deps,
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
         };
         let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
@@ -100,7 +112,9 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),
         metadata: std::sync::Arc::new(metadata),
-        sysroot: std::sync::Arc::new(sysroot_metadata),
+        sysroot: std::sync::Arc::new(move |manifest, config, cfg| {
+            sysroot_metadata(manifest, config, cfg, offline)
+        }),
     })
 }
 
@@ -110,10 +124,11 @@ fn sysroot_metadata(
     manifest: &project_model::ManifestPath,
     config: &project_model::CargoMetadataConfig,
     cfg: &[cfg::CfgAtom],
+    offline: bool,
 ) -> anyhow::Result<Metadata> {
     let manifest: &Path = manifest.as_ref();
     let cwd = manifest.parent().context("std manifest has no directory")?;
-    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
     for (name, value) in &config.extra_env {
         match value {
             Some(value) => vars.insert(name.clone(), value.clone()),
@@ -139,7 +154,8 @@ fn sysroot_metadata(
         no_default_features: no_default,
         build: None,
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
-        offline: false,
+        offline,
+        locked: true,
         store: None,
     };
     let json = blaze_metadata::metadata(&asked)?;
@@ -182,7 +198,7 @@ pub(crate) fn programs(
         let asked = blaze_metadata::Asked {
             cargo_home: None,
             cwd,
-            env: std::env::vars().collect(),
+            env: crate::process::vars().collect(),
             manifest_path: manifest,
             config: &selection.config,
             features: &selection.features,
@@ -195,7 +211,8 @@ pub(crate) fn programs(
                 dev_units: selection.dev_deps,
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
         };
         Ok(blaze_metadata::programs(&asked, targets)?.1)
@@ -246,6 +263,30 @@ mod tests {
                 std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn provenance_reader_uses_cargo_cwd_and_returns_errors() {
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-provenance-cwd-{}", std::process::id()));
+        let workspace = root.join("macros");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='producer'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "").unwrap();
+        let env = vec![("CARGO_HOME".into(), root.join("home").display().to_string())];
+        let read = super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env.clone());
+        assert_eq!(read.unwrap().packages[0].name.as_str(), "producer");
+        assert!(
+            super::no_deps_in(&workspace, Some(Path::new("macros/Cargo.toml")), &[], env.clone())
+                .is_err()
+        );
+        std::fs::write(workspace.join("Cargo.toml"), "invalid = [").unwrap();
+        assert!(super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Each workspace of blaze-manifest's fixtures that cargo reads is, as `cargo_metadata`

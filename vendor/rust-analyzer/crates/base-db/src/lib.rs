@@ -395,6 +395,16 @@ pub struct IncludedFile {
     pub bytes: Option<std::sync::Arc<[u8]>>,
 }
 
+/// An include performed by the current tracked query execution. Unlike the
+/// historical watcher map, salsa accumulators retract observations when the
+/// query stops reading a file, and replay them on memo hits.
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentIncludedInput {
+    pub krate: Crate,
+    pub path: AbsPathBuf,
+}
+
 #[salsa::input(debug)]
 pub struct FileSourceRootInput {
     #[returns(copy)]
@@ -457,6 +467,18 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// as `krate` reads it.
     fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
         None
+    }
+
+    /// Record dependencies on the externally included inputs discovered for this crate.
+    /// Consumers retaining code across revisions call this after lowering, when the
+    /// complete read set is known. The bytes remain tracked salsa inputs.
+    fn depend_on_included_inputs(&self, _krate: Crate) {}
+
+    /// Tracked bytes of observed external inputs. Historical observations remain
+    /// available for conservative code identities; current required inputs are
+    /// separately accumulated by semantic owner discovery.
+    fn included_inputs(&self, _krate: Crate) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        Vec::new()
     }
 
     /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing

@@ -247,13 +247,8 @@ impl ProjectWorkspace {
         };
 
         // Resolve the Cargo.toml to the workspace root as we base the `target` dir off of it.
-        let own_root = config.own_metadata.as_ref().map(|own| (own.root)(cargo_toml));
-        let own_root = own_root.and_then(|it| {
-            it.inspect_err(|e| {
-                eprintln!("blaze could not find the workspace itself, so cargo does: {e:#}")
-            })
-            .ok()
-        });
+        let own_root =
+            config.own_metadata.as_ref().map(|own| (own.root)(cargo_toml)).transpose()?;
         let mut cmd = sysroot.tool(Tool::Cargo, workspace_dir, extra_env);
         cmd.args(["locate-project", "--workspace", "--manifest-path", cargo_toml.as_str()]);
         let cargo_toml = &match own_root {
@@ -298,18 +293,16 @@ impl ProjectWorkspace {
             .ok()
             .flatten();
 
-        // blaze's own `cargo metadata` needs the target's `cfg` first; cargo's is asked only
-        // when blaze's says no.
-        let mut own = config.own_metadata.as_ref().map(|own| {
-            let target = targets.first().map(Deref::deref);
-            let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
-            let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)
-                .inspect_err(|e| {
-                    eprintln!("blaze could not resolve the workspace itself, so cargo does: {e:#}")
-                })
-                .ok();
-            (cfg, metadata)
-        });
+        // blaze's own metadata needs the target's `cfg` first.
+        let mut own = match &config.own_metadata {
+            Some(own) => {
+                let target = targets.first().map(Deref::deref);
+                let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
+                let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)?;
+                Some((cfg, Some(metadata)))
+            }
+            None => None,
+        };
         let (own_metadata, sources) = match own.as_mut().and_then(|it| it.1.take()) {
             Some((metadata, sources)) => (Some(metadata), sources),
             None => (None, Vec::new()),

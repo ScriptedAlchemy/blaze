@@ -281,6 +281,7 @@ fn check(fixture: &Path, scratch: &Path) -> Outcome {
             env.push((key.clone(), value.as_str().unwrap().replace("$ROOT", &root_text)));
         }
         let asked = Asked {
+            locked: false,
             cargo_home: None,
             cwd: &root,
             env,

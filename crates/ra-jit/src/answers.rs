@@ -2,9 +2,8 @@
 //! `--print cfg`, `sysroot`, `target-libdir`, `target-spec-json`, the names of the files of
 //! each kind of crate, and the rest of what a release of rustc says the same way every time
 //! it is asked. ra-jit answers from what it knows of the release and its targets ([`own`]),
-//! running no rustc. A question it does not know the answer of is asked of rustc once per
-//! toolchain and the answer is kept, byte for byte; every later asker, the daemon's workers
-//! and spares among them, is given that.
+//! running no rustc. An unmodelled question fails with a named gap. It never executes the
+//! compiler or reads a cached answer produced by it.
 //!
 //! cargo asks through its wrapper, which is ra-jit's in the builds of `cargo ra-jit` and in
 //! the cargos ra-jit runs only to ask; rust-analyzer asks through [`ask`], which ra-jit hands
@@ -14,19 +13,72 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{Command, ExitStatus, Output},
 };
 
-use sha2::{Digest as _, Sha256};
-
 mod own;
+mod probe;
 
 /// Only blaze's ported answer rules, with no kept answer or process fallback.
 pub(crate) fn own_answer(rustc: &Path, args: &[OsString]) -> Option<Vec<u8>> {
     own::answer(rustc, args, &[], &|_| None)
 }
 
-pub(crate) use own::target_cfg;
+pub(crate) use own::{host_tuple, target_cfg};
+
+/// Build-script probes name this launcher rather than a compiler outside blaze.
+/// Unknown compile operations fail visibly; no wrapper fallback is reachable.
+pub(crate) fn producer_launcher(path: &Path) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+        let mut script = b"#!/bin/sh\nexec '".to_vec();
+        for &byte in exe.as_os_str().as_bytes() {
+            if byte == b'\'' {
+                script.extend_from_slice(b"'\\''");
+            } else {
+                script.push(byte);
+            }
+        }
+        script.extend_from_slice(b"' producer-rustc \"$@\"\n");
+        std::fs::write(path, script)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, exe);
+        Err(io::Error::other("the owned producer probe launcher is not implemented on this host"))
+    }
+}
+
+pub(crate) fn producer_probe(args: Vec<OsString>) -> anyhow::Result<()> {
+    let sysroot = std::env::var_os("RUSTUP_TOOLCHAIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| anyhow::anyhow!("the producer probe needs its absolute source toolchain"))?;
+    let program = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    if !is_question(&args) {
+        match probe::check(&sysroot, &args) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                // Unknown operations are not proof that a language feature is absent.
+                // A script swallowing that failure cannot publish incomplete output.
+                if let Some(path) = std::env::var_os("BLAZE_PRODUCER_PROBE_FAILURE") {
+                    std::fs::write(path, format!("{args:?}: {error:#}"))?;
+                }
+                anyhow::bail!("blaze could not check this producer's compiler probe: {error:#}");
+            }
+        }
+    }
+    let var = |name: &str| std::env::var_os(name);
+    let stdout = own::answer(&program, &args, &[], &var)
+        .ok_or_else(|| anyhow::anyhow!("blaze has no owned answer to the producer probe"))?;
+    io::stdout().write_all(&stdout)?;
+    Ok(())
+}
 
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
@@ -69,29 +121,12 @@ const ALSO_VALUED: [&str; 9] = [
 /// is part of the question.
 const ABOUT_INPUT: [&str; 2] = ["file-names", "crate-name"];
 
-/// The variables that change what rustc answers.
-const READ_BY_RUSTC: [&str; 9] = [
-    "RUSTC_BOOTSTRAP",
-    "RUSTC_OVERRIDE_VERSION_STRING",
-    "RUST_TARGET_PATH",
-    "SDKROOT",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "IPHONEOS_DEPLOYMENT_TARGET",
-    "TVOS_DEPLOYMENT_TARGET",
-    "WATCHOS_DEPLOYMENT_TARGET",
-    "XROS_DEPLOYMENT_TARGET",
-];
-
 /// The variable that names the wrapper cargo runs every rustc through.
 const WRAPPER: &str = "RUSTC_WRAPPER";
 
 /// The variable that tells ra-jit as cargo's wrapper only to answer questions, and to leave
 /// what cargo compiles as it would be without ra-jit.
 pub(crate) const ONLY_ASKS: &str = "RA_JIT_ONLY_ASKS";
-
-/// The variable that says which answers are given: `0` none, so rustc is asked every time;
-/// `own` only ra-jit's own, so a question it has no answer of fails.
-const OFF: &str = "RA_JIT_ANSWERS";
 
 /// Whether rustc run with `args` compiles nothing and says only what its release, the
 /// arguments and standard input decide.
@@ -143,47 +178,43 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
         && (kinds.iter().all(about_rustc) || (from_stdin && inputs == 0))
 }
 
-/// rustc's answer to what `command` asks it, given `stdin`: ra-jit's own, the kept answer, or
-/// rustc's now, kept when it is one. `command` runs rustc and asks a question ([`is_question`]).
+/// Answer from owned release and target facts, without executing `command`. There is no
+/// environment switch or cached compiler answer that can turn this into a subprocess.
 pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> {
-    let given = std::env::var_os(OFF);
-    if given.as_ref().is_none_or(|it| it != "0") {
-        let var = |name: &str| var_of(command, name);
-        let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-        let rustc = toolchain_rustc(command.get_program(), &var);
-        if let Some(stdout) = rustc.and_then(|rustc| own::answer(&rustc, &args, stdin, &var)) {
-            return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-        }
+    let var = |name: &str| var_of(command, name);
+    let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+    let rustc = toolchain_rustc(command.get_program(), command.get_current_dir(), &var);
+    if let Some(error) = rustc.as_ref().and_then(|it| own::deployment_error(it, &args, &var)) {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(1 << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(1)
+        };
+        // rustc reports target-construction errors but still emits requested prints
+        // from the target's default options before ending with status 1.
+        let defaults = |name: &str| {
+            if name == "MACOSX_DEPLOYMENT_TARGET" { None } else { var(name) }
+        };
+        let stdout = rustc
+            .as_ref()
+            .and_then(|it| own::answer(it, &args, stdin, &defaults))
+            .ok_or_else(|| io::Error::other("unmodelled print after deployment target error"))?;
+        return Ok(Output { status, stdout, stderr: error.into_bytes() });
     }
-    if given.is_some_and(|it| it == "own") {
-        return Err(io::Error::other("ra-jit has no answer of its own to this question"));
+    let stdout = rustc.as_ref().and_then(|rustc| own::answer(rustc, &args, stdin, &var));
+    match stdout {
+        Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
+        None => Err(io::Error::other(format!(
+            "owned compiler query has no model: {:?} {args:?} (toolchain {rustc:?}); \
+             rustc was not executed; Cargo was not executed",
+            command.get_program()
+        ))),
     }
-    let key = key(command, stdin);
-    let file = key.as_ref().and_then(|key| Some(dir()?.join(key)));
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    // The workers and spares of one load ask the same questions at once: one asks rustc, and
-    // the others wait for its answer.
-    let _held = file.as_deref().and_then(hold);
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    let mut child =
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    if let Some(mut input) = child.stdin.take() {
-        // rustc may answer without reading what it was given.
-        _ = input.write_all(stdin);
-    }
-    let output = child.wait_with_output()?;
-    // A question rustc did not answer is asked again, and what it warns of is said each time.
-    if let Some(file) = file
-        && output.status.success()
-        && output.stderr.is_empty()
-    {
-        keep(&file, &output.stdout);
-    }
-    Ok(output)
 }
 
 /// What rust-analyzer runs to learn of the toolchain, answered here when it asks rustc.
@@ -213,7 +244,7 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
     let args: Vec<String> =
         command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
     let var = |name: &str| var_of(command, name);
-    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
     for (name, value) in command.get_envs() {
         let name = name.to_str()?.to_owned();
         match value {
@@ -251,7 +282,12 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
         return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
     }
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
+    let Some(rustc) = toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
+    else {
+        return Some(Err(io::Error::other(format!(
+            "owned Cargo query has no toolchain model: {args:?}; Cargo was not executed"
+        ))));
+    };
     // A resolved Cargo path points into the same installation, but it is not rustc.
     let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     if args == ["--version"] {
@@ -379,52 +415,6 @@ pub(crate) fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>>
     }))
 }
 
-/// Where the answers are kept: in `RA_JIT_HOME` when it is set, else in the user's cache
-/// directory, which outlives the session.
-fn dir() -> Option<PathBuf> {
-    if std::env::var_os(OFF).is_some_and(|it| it == "0") {
-        return None;
-    }
-    if let Some(home) = std::env::var_os("RA_JIT_HOME").filter(|it| !it.is_empty()) {
-        return Some(Path::new(&home).join("answers"));
-    }
-    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
-    Some(caches.join("ra-jit/answers"))
-}
-
-/// The name of the question: the rustc that is asked, its arguments, what it reads of its
-/// environment and of standard input. `None` when which rustc runs is not known.
-fn key(command: &Command, stdin: &[u8]) -> Option<String> {
-    let var = |name: &str| var_of(command, name);
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
-    let is = std::fs::metadata(&rustc).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"ra-jit answer 1\0");
-    hasher.update(rustc.as_os_str().as_encoded_bytes());
-    hasher.update([0]);
-    hasher.update(is.len().to_le_bytes());
-    let modified = is.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    hasher.update(modified.as_nanos().to_le_bytes());
-    for arg in command.get_args() {
-        hasher.update(arg.as_encoded_bytes());
-        hasher.update([0]);
-    }
-    for name in READ_BY_RUSTC {
-        hasher.update(name);
-        match var(name) {
-            Some(value) => {
-                hasher.update([1]);
-                hasher.update(value.as_encoded_bytes());
-            }
-            None => hasher.update([0]),
-        }
-    }
-    hasher.update(stdin);
-    Some(hasher.finalize().iter().map(|it| format!("{it:02x}")).collect())
-}
-
 /// The variable `name` as `command` will have it.
 fn var_of(command: &Command, name: &str) -> Option<OsString> {
     match command.get_envs().find(|(it, _)| *it == name) {
@@ -435,57 +425,355 @@ fn var_of(command: &Command, name: &str) -> Option<OsString> {
 
 /// The rustc of the toolchain that `program`, as this process would run it, is.
 pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
-    toolchain_rustc(program, &|name| std::env::var_os(name))
+    toolchain_rustc(program, None, &|name| std::env::var_os(name))
 }
 
-/// The executable of the toolchain that `program` runs. rustup's proxy runs the toolchain
-/// rustup set for the process it started, and is not known without that.
-fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// Resolve rustup's installed selection from its records, without executing a proxy.
+/// Direct CLI invocations do not inherit rustup's RUSTUP_HOME or expanded toolchain name.
+fn toolchain_rustc(
+    program: &OsStr,
+    cwd: Option<&Path>,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let cwd = cwd.map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
     let found = if Path::new(program).components().count() > 1 {
-        PathBuf::from(program)
+        cwd.join(program)
     } else {
         let paths = var("PATH")?;
         let name = Path::new(program).with_extension(std::env::consts::EXE_EXTENSION);
         std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
     };
-    let real = std::fs::canonicalize(found).ok()?;
-    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"));
+    let real = std::fs::canonicalize(&found).ok()?;
+    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
+        || same_file::is_same_file(&real, found.with_file_name("rustup")).unwrap_or(false);
     if !proxy {
         return Some(real);
     }
-    let toolchain = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
-    let dir = if toolchain.is_absolute() {
-        toolchain
+    if let Some(selected) = var("RUSTUP_TOOLCHAIN")
+        && Path::new(&selected).is_absolute()
+    {
+        return std::fs::canonicalize(
+            PathBuf::from(selected)
+                .join("bin")
+                .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .ok();
+    }
+    let home = var("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
+        var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(|home| PathBuf::from(home).join(".rustup"))
+    })?;
+    let toolchain = installed_selection(&home, &cwd, var("RUSTUP_TOOLCHAIN"))?;
+    let toolchain = toolchain.to_str()?;
+    let dir = if Path::new(&toolchain).is_absolute() {
+        PathBuf::from(toolchain)
     } else {
-        PathBuf::from(var("RUSTUP_HOME")?).join("toolchains").join(toolchain)
+        let installed = home.join("toolchains");
+        let exact = installed.join(&toolchain);
+        if exact.is_dir() {
+            exact
+        } else {
+            // rustup expands an unqualified channel/version using its default host.
+            // The installed rustc manifest supplies the host; multiple matches are
+            // ambiguous unless settings names a default host.
+            let settings: toml::Value = toml::from_str(
+                &std::fs::read_to_string(home.join("settings.toml")).unwrap_or_default(),
+            )
+            .ok()?;
+            if let Some(host) = settings.get("default_host_triple").and_then(|it| it.as_str()) {
+                installed.join(format!("{toolchain}-{host}"))
+            } else {
+                let prefix = format!("{toolchain}-");
+                let mut matches =
+                    std::fs::read_dir(installed).ok()?.filter_map(Result::ok).filter(|entry| {
+                        let path = entry.path();
+                        path.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+                            name.starts_with(&prefix)
+                                && own::host_tuple(&path.join("bin/rustc"))
+                                    .is_some_and(|host| name == format!("{prefix}{host}"))
+                        })
+                    });
+                let selected = matches.next()?.path();
+                if matches.next().is_some() {
+                    return None;
+                }
+                selected
+            }
+        }
     };
     let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     std::fs::canonicalize(rustc).ok()
 }
 
-fn kept(file: &Path) -> Option<Vec<u8>> {
-    std::fs::read(file).ok()
-}
-
-/// The lock of the question whose answer is `file`, held until it is dropped.
-fn hold(file: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(file.parent()?).ok()?;
-    let lock = std::fs::File::create(file.with_extension("lock")).ok()?;
-    lock.lock().ok()?;
-    Some(lock)
-}
-
-fn keep(file: &Path, stdout: &[u8]) {
-    let Some(dir) = file.parent() else { return };
-    if std::fs::create_dir_all(dir).is_ok() {
-        // An answer not kept is asked again.
-        _ = ra_jit_store::write_file_whole(file, stdout);
+fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option<OsString> {
+    if let Some(selected) = env.filter(|it| !it.is_empty()) {
+        return Some(selected);
     }
+    let settings: toml::Value =
+        toml::from_str(&std::fs::read_to_string(home.join("settings.toml")).ok()?).ok()?;
+    let cwd = std::fs::canonicalize(cwd).ok()?;
+    for dir in cwd.ancestors() {
+        if let Some(selected) = settings
+            .get("overrides")
+            .and_then(|it| it.get(dir.to_str()?))
+            .and_then(|it| it.as_str())
+        {
+            return Some(selected.into());
+        }
+        for (file, is_toml) in [("rust-toolchain", false), ("rust-toolchain.toml", true)] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(file)) {
+                if !is_toml && !text.trim_start().starts_with('[') {
+                    return Some(text.trim().into());
+                }
+                let value: toml::Value = toml::from_str(&text).ok()?;
+                return value.get("toolchain")?.get("channel")?.as_str().map(OsString::from);
+            }
+        }
+    }
+    settings.get("default_toolchain")?.as_str().map(OsString::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_proxy_resolves_home_short_channel_and_directory_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".rustup");
+        let installed = home.join("toolchains/1.99.0-aarch64-apple-darwin");
+        let compiler = synthetic_toolchain(&installed);
+        std::fs::write(home.join("settings.toml"), "default_toolchain = '1.99.0'\n").unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("rustup"), "").unwrap();
+        // rustup proxies can be hard links as well as symlinks.
+        std::fs::hard_link(bin.join("rustup"), bin.join("rustc")).unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let vars = |name: &str| match name {
+            "HOME" => Some(root.path().as_os_str().to_owned()),
+            "PATH" => Some(bin.as_os_str().to_owned()),
+            _ => None,
+        };
+        let expected = std::fs::canonicalize(compiler).unwrap();
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars), Some(expected.clone()));
+        let selected = |name: &str| {
+            if name == "RUSTUP_TOOLCHAIN" { Some("1.99.0".into()) } else { vars(name) }
+        };
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &selected), Some(expected));
+        std::fs::write(cwd.join("rust-toolchain.toml"), "[toolchain]\nchannel='missing'\n")
+            .unwrap();
+        assert!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars).is_none());
+        assert_eq!(installed_selection(&home, &cwd, Some("1.99.0".into())), Some("1.99.0".into()));
+        let override_dir = installed.to_string_lossy();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "default_toolchain='missing'\n[overrides]\n'{}'='{}'\n",
+                std::fs::canonicalize(&cwd).unwrap().display(),
+                override_dir
+            ),
+        )
+        .unwrap();
+        assert_eq!(installed_selection(&home, &cwd, None), Some(installed.as_os_str().to_owned()));
+    }
+
+    pub(super) fn synthetic_toolchain(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let rustlib = dir.join("lib/rustlib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(dir.join("lib/librustc_driver-test.so"), "").unwrap();
+        std::fs::write(rustlib.join("manifest-rustc-aarch64-apple-darwin"), "").unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        std::fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            format!("\n[pkg.rustc]\nversion = {:?}\n", release["version"].as_str().unwrap()),
+        )
+        .unwrap();
+        let rustc = dir.join("bin/rustc");
+        std::fs::write(&rustc, "this compiler must not execute").unwrap();
+        rustc
+    }
+
+    #[test]
+    fn component_toolchains_use_installed_host_and_release_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = synthetic_toolchain(dir.path());
+        let rustlib = dir.path().join("lib/rustlib");
+        std::fs::remove_file(rustlib.join("manifest-rustc-aarch64-apple-darwin")).unwrap();
+        std::fs::remove_file(rustlib.join("multirust-channel-manifest.toml")).unwrap();
+        let host = rustlib.join("x86_64-unknown-linux-gnu/bin");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("rust-lld"), b"installed host linker").unwrap();
+        let docs = dir.path().join("share/doc/rust/html");
+        std::fs::create_dir_all(&docs).unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        let (version, rest) = release["version"].as_str().unwrap().split_once(" (").unwrap();
+        let (commit, _) = rest.split_once(' ').unwrap();
+        let info = format!("Rust</a> {version}</span><a>{commit}</a>");
+        std::fs::write(docs.join("version_info.html"), &info).unwrap();
+        assert_eq!(own::host_tuple(&rustc).as_deref(), Some("x86_64-unknown-linux-gnu"));
+        let other = rustlib.join("aarch64-unknown-linux-gnu/bin");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("rust-lld"), b"ambiguous second host").unwrap();
+        assert!(own::host_tuple(&rustc).is_none());
+        std::fs::remove_file(other.join("rust-lld")).unwrap();
+        std::fs::write(docs.join("version_info.html"), info.replace(commit, "unknown")).unwrap();
+        assert!(own::host_tuple(&rustc).is_none());
+        std::fs::write(docs.join("version_info.html"), info.replace(version, "9.99.0")).unwrap();
+        assert!(
+            own::host_tuple(&rustc).is_none(),
+            "a known commit cannot override a wrong version"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_queries_resolve_the_default_home_without_executing_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let toolchain = "1.99.0-aarch64-apple-darwin";
+        let default_root = home.join(".rustup/toolchains").join(toolchain);
+        let custom_home = dir.path().join("custom-rustup");
+        let custom_root = custom_home.join("toolchains").join(toolchain);
+        synthetic_toolchain(&default_root);
+        synthetic_toolchain(&custom_root);
+        let bin = home.join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let proxy = bin.join("rustup");
+        std::fs::write(&proxy, "this rustup proxy must not execute").unwrap();
+        let name = OsStr::new("rustc");
+        let executable = bin.join(name);
+        std::os::unix::fs::symlink(&proxy, &executable).unwrap();
+
+        for rustup_home in [None, Some(&custom_home)] {
+            let expected = if rustup_home.is_some() { &custom_root } else { &default_root };
+            for question in ["--print=sysroot", "-vV"] {
+                let mut command = Command::new(name);
+                command
+                    .env_remove("RUSTUP_HOME")
+                    .env_remove("RUSTC_OVERRIDE_VERSION_STRING")
+                    .env_remove("RUST_TARGET_PATH")
+                    .env("HOME", &home)
+                    .env("PATH", &bin)
+                    .env("RUSTUP_TOOLCHAIN", toolchain)
+                    .arg(question);
+                if let Some(home) = rustup_home {
+                    command.env("RUSTUP_HOME", home);
+                }
+                let output = answer(&mut command, &[]).unwrap();
+                assert!(output.status.success());
+                let text = String::from_utf8(output.stdout).unwrap();
+                if question == "--print=sysroot" {
+                    assert_eq!(text.trim(), expected.canonicalize().unwrap().to_str().unwrap());
+                } else {
+                    assert!(text.contains("host: aarch64-apple-darwin"), "{text}");
+                }
+            }
+        }
+
+        let mut command = Command::new(&executable);
+        command
+            .env("HOME", &home)
+            .env("RUSTUP_HOME", dir.path().join("missing-rustup"))
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .arg("--print=sysroot");
+        assert!(answer(&mut command, &[]).is_err());
+        command.env("RUSTUP_TOOLCHAIN", &custom_root);
+        let output = answer(&mut command, &[]).unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            custom_root.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn compiler_queries_never_execute_or_use_cached_external_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = synthetic_toolchain(dir.path());
+        let armed = std::env::var_os("RA_JIT_TEST_QUERY_TOOLCHAIN")
+            .map(PathBuf::from)
+            .map(|path| path.join("bin/rustc"));
+        for compiler in std::iter::once(compiler).chain(armed) {
+            for args in [
+                vec!["--version"],
+                vec!["--print=sysroot"],
+                vec!["--print=target-libdir"],
+                vec!["-vV"],
+                vec!["--print", "cfg", "-O", "--target", "aarch64-apple-darwin"],
+                vec!["-Z", "unstable-options", "--print", "target-spec-json"],
+                vec![
+                    "-",
+                    "--crate-name",
+                    "___",
+                    "--print=file-names",
+                    "--crate-type",
+                    "rlib",
+                    "--print=sysroot",
+                    "--print=split-debuginfo",
+                    "--print=crate-name",
+                    "--print=cfg",
+                ],
+            ] {
+                let mut command = Command::new(&compiler);
+                command.args(&args).env("RUSTC_BOOTSTRAP", "1");
+                command.env("RA_JIT_ANSWERS", "0");
+                for name in [
+                    "SDKROOT",
+                    "MACOSX_DEPLOYMENT_TARGET",
+                    "IPHONEOS_DEPLOYMENT_TARGET",
+                    "TVOS_DEPLOYMENT_TARGET",
+                    "WATCHOS_DEPLOYMENT_TARGET",
+                    "XROS_DEPLOYMENT_TARGET",
+                    "RUST_TARGET_PATH",
+                    "RUSTC_OVERRIDE_VERSION_STRING",
+                ] {
+                    command.env_remove(name);
+                }
+                command.env("SDKROOT", "/deliberately/nonexistent/sdk");
+                command.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
+                let output = answer(&mut command, &[])
+                    .unwrap_or_else(|error| panic!("{compiler:?} {args:?}: {error}"));
+                assert!(output.status.success() && !output.stdout.is_empty());
+                command.args(["-Ctarget-cpu=native", "--print=cfg"]);
+                let error = answer(&mut command, &[]).unwrap_err();
+                assert!(error.to_string().contains("Cargo was not executed"));
+            }
+        }
+        let mut command = Command::new(dir.path().join("nonexistent-rustc"));
+        command.arg("--version");
+        assert!(
+            answer(&mut command, &[]).unwrap_err().to_string().contains("Cargo was not executed")
+        );
+    }
+
+    #[test]
+    fn deployment_versions_preserve_queries_and_invalid_versions_fail_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = synthetic_toolchain(dir.path());
+        for version in ["11.0", "14.2.1", ""] {
+            let mut command = Command::new(&compiler);
+            command.args(["--version"]).env("MACOSX_DEPLOYMENT_TARGET", version);
+            assert!(answer(&mut command, &[]).unwrap().status.success());
+            let mut command = Command::new(&compiler);
+            command
+                .args(["--print=cfg", "--target=aarch64-apple-darwin"])
+                .env("MACOSX_DEPLOYMENT_TARGET", version);
+            let output = answer(&mut command, &[]).unwrap();
+            assert_eq!(output.status.success(), !version.is_empty());
+        }
+        let mut command = Command::new(&compiler);
+        command
+            .args(["--print=sysroot", "--target=aarch64-apple-darwin"])
+            .env("MACOSX_DEPLOYMENT_TARGET", "not-a-real-secret");
+        let output = answer(&mut command, &[]).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!output.status.success() && stderr.contains("invalid digit"));
+        assert!(!stderr.contains("not-a-real-secret"));
+    }
 
     fn question(args: &str) -> bool {
         let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();

@@ -51,6 +51,10 @@ pub struct LoadCargoConfig {
     pub proc_macro_processes: usize,
 }
 
+pub use proc_macro_api::producer_lifetime as proc_macro_producer_lifetime;
+/// Worker snapshot allocation and post-wait cleanup use the same API-owned layout.
+pub use proc_macro_api::snapshot_dir as proc_macro_snapshot_dir;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcMacroServerChoice {
     Sysroot,
@@ -144,9 +148,20 @@ pub struct Loaded {
     /// The server of the libraries that list their macros ([`serve_listed_with`]), started
     /// when the first of them is loaded.
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    snapshot_root: Option<std::path::PathBuf>,
+    expected_macro_images: FxHashMap<AbsPathBuf, [u8; 32]>,
 }
 
 impl Loaded {
+    pub fn set_proc_macro_image_identities(&mut self, images: FxHashMap<AbsPathBuf, [u8; 32]>) {
+        self.expected_macro_images = images;
+    }
+
+    /// Explicit worker ownership for snapshots, set before starting either server.
+    pub fn set_proc_macro_snapshot_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.snapshot_root = root;
+    }
+
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
         &self.workspaces
     }
@@ -158,6 +173,11 @@ impl Loaded {
 
     /// Puts `workspace` where the one at `index` is. It is loaded by the next [`Self::add`].
     pub fn replace(&mut self, index: usize, workspace: ProjectWorkspace) {
+        for server in [&self.proc_macro_server, &self.listed_server] {
+            if let Some(Ok(server)) = server {
+                server.begin_load_epoch();
+            }
+        }
         self.workspaces[index] = workspace;
     }
 
@@ -237,16 +257,23 @@ impl Loaded {
             Err(_) => false,
         });
         if self.proc_macro_server.is_none() && unlisted {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
+            self.proc_macro_server =
+                spawn_proc_macro_server(ws, extra_env, load_config).map(|server| {
+                    server.map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                });
         }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {
             let spawned =
                 ProcMacroClient::spawn(server, extra_env, None, load_config.proc_macro_processes);
-            self.listed_server = Some(spawned.map_err(|e| {
-                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
-            }));
+            self.listed_server = Some(
+                spawned
+                    .map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                    .map_err(|e| {
+                        ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
+                    }),
+            );
         }
         let proc_macros = {
             fn running(
@@ -273,7 +300,12 @@ impl Loaded {
                                 false => &proc_macro_server,
                             };
                             server.as_ref().map_err(Clone::clone).and_then(|proc_macro_server| {
-                                load_proc_macro(proc_macro_server, &path, &[])
+                                load_proc_macro_with_content(
+                                    proc_macro_server,
+                                    &path,
+                                    &[],
+                                    self.expected_macro_images.get(&path).copied(),
+                                )
                             })
                         }),
                     )
@@ -713,8 +745,20 @@ pub fn load_proc_macro(
     path: &AbsPath,
     ignored_macros: &[Box<str>],
 ) -> ProcMacroLoadResult {
+    load_proc_macro_with_content(server, path, ignored_macros, None)
+}
+
+fn load_proc_macro_with_content(
+    server: &ProcMacroClient,
+    path: &AbsPath,
+    ignored_macros: &[Box<str>],
+    expected: Option<[u8; 32]>,
+) -> ProcMacroLoadResult {
     let res: Result<Vec<_>, _> = (|| {
-        let dylib = MacroDylib::new(path.to_path_buf());
+        let dylib = match expected {
+            Some(content) => MacroDylib::new(path.to_path_buf()).with_expected_content(content),
+            None => MacroDylib::new(path.to_path_buf()),
+        };
         let vec = server.load_dylib(dylib).map_err(|e| {
             ProcMacroLoadingError::ProcMacroSrvError(format!("{e}").into_boxed_str())
         })?;
@@ -947,6 +991,10 @@ impl ProcMacroExpander for Expander {
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+    }
+
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        self.0.content_identity()
     }
 }
 

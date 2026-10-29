@@ -22,12 +22,17 @@ sandbox allows is the only exception, and is made to work rather than refused wh
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
 
-This describes where ra-jit is going, not where it is. Today rustc still does much of the work:
-it builds every program once before the daemon takes over, it compiles the standard library,
-the build scripts and the proc macros, it has the last word on errors, and it keeps a copy of
-every function ra-jit refuses. [Today](#today) lists those places. Each one is a bug with an
-issue labelled `no-rustc`. They are removed one at a time; none is extended, and no new one is
-added.
+This describes the full goal. Eligible `cargo blaze build` and `run` requests now use the
+owned whole-build route by default, on the first build and on edits, with owned host
+producers. They do not require `RA_JIT_WHOLE_BUILD=1`, and setting it to `0` does not select
+a Cargo first build. [Program builds](cargo.md#program-builds) defines the selection and
+remaining compatibility gaps, including compiler probes that the owned checker cannot yet
+accept. This default is not proof that all programs, tests, doctests or platforms work.
+
+The remaining wrapper and non-program paths still contain compiler handoffs. [Today](#today)
+and the dated measurements below record that work and earlier behavior; their Cargo-first
+counts do not describe the new default program route. Each handoff is a bug with an issue
+labelled `no-rustc`. They are removed one at a time; none is extended, and no new one is added.
 
 ## What counts as running rustc
 
@@ -427,7 +432,7 @@ the counts of [How often](#how-often) lower, measured by step A's check, and non
 | [H](https://github.com/indexable-inc/ra-jit/issues/88). ra-jit writes the test harness | the fallback when a test is added | G | medium | medium | the `no-rustc-hl` lane: done; the `no-rustc-l2` lane: ra-jit's harness always, done |
 | [I](https://github.com/indexable-inc/ra-jit/issues/89). Build scripts compiled and run by ra-jit | build scripts and their probes by rustc | B, G | medium | medium | the `no-rustc-l2` lane: first part done (scripts compiled and linked by ra-jit, their runs kept in the store); the F+G lane consumes it for the standard library's scripts |
 | [J](https://github.com/indexable-inc/ra-jit/issues/90). Proc macros compiled and loaded by ra-jit | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first |
-| [K](https://github.com/indexable-inc/ra-jit/issues/91). The cold build is ra-jit's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | the self-contained lane, with 54301ec5's first-build lane (#310); `RA_JIT_WHOLE_BUILD=1`: the build from nothing is G's whole build, no `cargo build` |
+| [K](https://github.com/indexable-inc/ra-jit/issues/91). The cold build is ra-jit's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | eligible `build` and `run` requests use G's whole build by default; other command paths and broad acceptance remain incomplete |
 | [L](https://github.com/indexable-inc/ra-jit/issues/92). Doctests by the daemon (#28) | probe and examples by rustc, rustdoc | B, G, D | medium | medium | the `no-rustc-hl` lane: first part done; the `no-rustc-l2` lane: second part (examples by ra-jit) done |
 | [M](https://github.com/indexable-inc/ra-jit/issues/93). Remove the wrapper and the fallback | `ra-jit-rustc`, `ra-jit-rustc-first`, stand-ins, dep-info, settle, `by_cargo`, `only_cargo` | all | medium | low | the self-contained lane |
 
@@ -1003,10 +1008,16 @@ rust-lang/rust at b940084d7, the commit `rustc 1.99.0 -vV` names):
   `vendor/rustc_abi` is rustc's crate from the 1.99.0 tag, with its loader replaced by the one
   that reads ra-jit's static. Its protocol is the toolchain server's: rust-analyzer already
   talks to that release's server today.
-- Building the server needs serde's derives expanded (`proc-macro-api`'s messages), so the
-  first server is built with what expands them today (rustc's `serde_derive` and the
-  toolchain's server), once per release when `ra-jit std` ships it; once J2 compiles
-  `serde_derive`, each server is built with the one before it.
+- The initial server bootstrap expanded `proc-macro-api`'s Serde derives with rustc's
+  `serde_derive` and the toolchain's server. That creates a cycle for a fresh owned build:
+  the toolchain server cannot load ra-jit's macro libraries. The protocol now implements
+  Serde with public visitors and declarative schemas, preserving both JSON and postcard
+  wire formats; independent derive-based reference types live only in its tests. The
+  release builder and strict bootstrap disable expansion servers with
+  `RA_JIT_PROC_MACRO_SERVER=0` and reject an image with uncompiled functions. Transitive
+  dependencies still include unused derives; a production dependency graph alone is not
+  evidence of a server-free bootstrap. `harness/dist/owned_macro_server.py` blocks and
+  traces compiler tools and the toolchain server, and checks the new executable separately.
 
 Where J stands (2026-10-24):
 
@@ -1037,8 +1048,8 @@ Where J stands (2026-10-24):
   manifest's header lists: the loader `dlopen`s a library and reads ra-jit's list where the
   release reads rustc's metadata, `rustc_proc_macro` is the standard library's `proc_macro`,
   `rustc_lexer` is the vendored crate, and the version string and the commit are written down
-  where build scripts ran rustc and git. ra-jit builds it with nothing of rustc's (`--exe`),
-  over rustc's `serde_derive` and the toolchain's server, the bootstrap above.
+  where build scripts ran rustc and git. ra-jit builds it with nothing of rustc's (`--exe`);
+  the initial Serde bootstrap above has been replaced by the derive-free protocol core.
 - `RA_JIT_PROC_MACRO_COMPARE` (`crates/ra-jit-expand/src/compare.rs`) names that server, and
   `RA_JIT_PROC_MACRO_LIBS` a directory of ra-jit's libraries: each call the toolchain's server
   expands with rustc's library is expanded again by ra-jit's server with ra-jit's library of
@@ -1224,11 +1235,12 @@ and `RA_JIT_WRAPS_RUSTC` are deleted, and step A's count is zero.
 
 ### The cold start without rustc
 
-Today `cargo ra-jit build` from nothing returns in about cargo's time (results.md: ripgrep 6.96
-s against cargo's 6.16, nushell 37.19 against 35.51) because it is cargo's build, and the
-daemon is ready for edits at about twice that (#11). The first edits patch rustc's executable
-so that they need not wait for ra-jit's own link. Without rustc the cold build is ra-jit
-compiling every crate, the standard library included.
+The earlier Cargo-first path returned in about cargo's time (results.md: ripgrep 6.96 s
+against cargo's 6.16, nushell 37.19 against 35.51), with the daemon ready for edits at about
+twice that (#11). Its first edits patched rustc's executable while waiting for ra-jit's own
+link. Eligible program builds now use the owned whole-build route by default: ra-jit compiles
+every crate, the standard library included, or takes its own artifacts from the store. The
+measurements below describe the dated stages of that work.
 
 That is kept fast by not compiling, rather than by compiling as fast as rustc:
 
