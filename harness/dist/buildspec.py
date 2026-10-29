@@ -2487,7 +2487,7 @@ def resolve(cwd, words, env):
                         edges.append((t, lib, pkg["name"]))
                     asked.append(t)
             edir = os.path.join(d, "examples")
-            for f in sorted(os.listdir(edir)) if os.path.isdir(edir) else []:
+            for f in sorted(os.listdir(edir)) if os.path.isdir(edir) and not o["positional"] else []:
                 if f.endswith(".rs"):
                     t = add(pkg, 3, f[:-3], False, False, True)
                     if lib:
@@ -2557,7 +2557,7 @@ def resolve(cwd, words, env):
     skip = [ta[i + 1] for i, a in enumerate(ta) if a == "--skip" and i + 1 < len(ta)]
     run = {"0": o["positional"] if cmd == "test" else [], "1": "--exact" in ta, "2": skip, "3": ignored,
            "4": o["no_run"], "5": o["nff"] and BUG != "nofailfast-same", "6": threads,
-           "7": (o["positional"] if cmd == "run" else []) + ta, "8": [], "9": 0 if o["lib"] else (2 if o["doc"] else 1)}
+           "7": (o["positional"] if cmd == "run" else []) + ta, "8": [], "9": 2 if o["doc"] else (0 if o["lib"] or o["positional"] else 1)}
     command = {"check": [0, None], "build": [1, None], "test": [2, run], "run": [3, run]}[cmd]
     lock = open(os.path.join(root, "Cargo.lock"), "rb").read() if os.path.exists(os.path.join(root, "Cargo.lock")) else b""
     script_env = sorted([k, [0, env[k]]] for k in ("CC", "CXX", "AR", "MACOSX_DEPLOYMENT_TARGET") if k in env)
@@ -2709,7 +2709,7 @@ def simulate(res, words, env):
     if failed and not o["nff"]:
         return "\n".join(out) + "\n", 101
     # doc tests of the libraries
-    if not o["lib"]:
+    if not o["lib"] and not o["positional"]:
         for key, u in sorted(units.items()):
             if u["kind"] == 0 and not u["test"] and not u["host"] and key[0] in {k[0] for k, _ in runs}:
                 lib = [os.path.join(p, "src", "lib.rs") for p in [res["root"], os.path.join(res["root"], "crates", u["pkg"])] if os.path.exists(os.path.join(p, "src", "lib.rs"))]
