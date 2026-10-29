@@ -1698,7 +1698,9 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(rerun_is_same(&out_dir).unwrap_err().starts_with("logged an error"));
         assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
         assert_eq!(std::fs::read(out_dir.parent().unwrap().join("output")).unwrap(), output);
-        // A key cargo does not know: cargo writes what it printed, and no fingerprint.
+        // A key cargo does not know: cargo 1.99.0 fails the build for `cargo::unknown-key=1`
+        // ("Unknown key", exit 101, measured), writing what it printed and no fingerprint. The old
+        // syntax, `cargo:unknown-key=1`, is metadata and cargo takes it.
         let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::unknown-key=1\n";
         let out_dir = ran_script("not-taken", lines, "");
         let result = rerun_is_same(&out_dir);
