@@ -840,7 +840,7 @@ fn compile_at(
                 command.arg("--exe").arg(&program.executable);
             }
             command.arg("--inputs").arg(dir.join("inputs.cbor"));
-            command.arg("--report").arg(dir.join("diagnostics"));
+            command.arg("--diagnostics").arg(dir.join("diagnostics"));
         }
     }
     if program.harness && program.output == blaze_spec::execution::Output::Executable {
@@ -862,7 +862,9 @@ fn compile_at(
     std::fs::write(dir.join("compiler.log"), &output.stderr)?;
     let said = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return Err(CompilerFailure(compiler_diagnostics(&dir.join("diagnostics"), &said)?).into());
+        let diagnostics = compiler_diagnostics(&dir.join("diagnostics"), &said)
+            .with_context(|| format!("owned compiler failed:\n{said}"))?;
+        return Err(CompilerFailure(diagnostics).into());
     }
     ensure!(
         !said.lines().any(|line| line.contains(" functions in it ra-jit could not compile")

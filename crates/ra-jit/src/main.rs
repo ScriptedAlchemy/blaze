@@ -136,6 +136,8 @@ struct Args {
     by_symbol: Vec<PathBuf>,
     /// Tab-separated per-function outcome, for the harness.
     report: Option<PathBuf>,
+    /// Directory for structured compiler diagnostics, independent of the statistics file.
+    diagnostics: Option<PathBuf>,
     /// File of function paths to leave to rustc, for bisecting miscompiles.
     deny: Option<PathBuf>,
     /// Directory that gets one object per compiled function, for testing each in isolation.
@@ -246,6 +248,7 @@ impl Args {
         let mut rustc_binary = None;
         let mut by_symbol = Vec::new();
         let mut report = None;
+        let mut diagnostics = None;
         let mut deny = None;
         let mut isolate = None;
         let mut prebuilt = None;
@@ -292,6 +295,7 @@ impl Args {
                     by_symbol.extend(listed.lines().map(PathBuf::from));
                 }
                 "--report" => report = Some(PathBuf::from(value()?)),
+                "--diagnostics" => diagnostics = Some(PathBuf::from(value()?)),
                 "--deny" => deny = Some(PathBuf::from(value()?)),
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--prebuilt" => prebuilt = Some(PathBuf::from(value()?)),
@@ -349,6 +353,7 @@ impl Args {
             rustc_binary,
             by_symbol,
             report,
+            diagnostics,
             deny,
             isolate,
             prebuilt,
@@ -6779,6 +6784,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             rustc_binary: None,
             by_symbol: Vec::new(),
             report: Some(report.join(format!("{krate}.tsv"))),
+            diagnostics: args.diagnostics.as_ref().map(|path| path.join(krate)),
             deny: None,
             isolate: None,
             prebuilt: args.prebuilt.clone(),
@@ -6817,9 +6823,9 @@ fn errors_for_the_daemon(args: &Args, said: &errors::Said) -> anyhow::Result<()>
     if let Some(socket) = &args.socket {
         std::fs::write(cargo::daemon::errors_beside(socket), serde_json::to_string(said)?)?;
     }
-    if let Some(report) = &args.report {
-        std::fs::create_dir_all(report)?;
-        std::fs::write(report.join("diagnostics.json"), serde_json::to_vec(said)?)?;
+    if let Some(directory) = &args.diagnostics {
+        std::fs::create_dir_all(directory)?;
+        std::fs::write(directory.join("diagnostics.json"), serde_json::to_vec(said)?)?;
     }
     Ok(())
 }
@@ -11420,7 +11426,9 @@ mod tests {
     #[test]
     fn compiler_diagnostics_report_preserves_the_daemon_error_record() {
         let work = tempfile::tempdir().unwrap();
-        let report = work.path().join("report");
+        let diagnostics = work.path().join("diagnostics");
+        let report = work.path().join("statistics.tsv");
+        std::fs::write(&report, "function\toutcome\n").unwrap();
         let socket = work.path().join("worker.sock");
         let args = Args::parse(
             [
@@ -11431,6 +11439,8 @@ mod tests {
                 work.path().join("app.o").to_str().unwrap().to_owned(),
                 "--report".to_owned(),
                 report.to_str().unwrap().to_owned(),
+                "--diagnostics".to_owned(),
+                diagnostics.to_str().unwrap().to_owned(),
                 "--socket".to_owned(),
                 socket.to_str().unwrap().to_owned(),
             ]
@@ -11448,13 +11458,14 @@ mod tests {
         ));
         errors_for_the_daemon(&args, &said).unwrap();
         let reported: errors::Said =
-            serde_json::from_slice(&std::fs::read(report.join("diagnostics.json")).unwrap())
+            serde_json::from_slice(&std::fs::read(diagnostics.join("diagnostics.json")).unwrap())
                 .unwrap();
         let daemon: errors::Said =
             serde_json::from_slice(&std::fs::read(cargo::daemon::errors_beside(&socket)).unwrap())
                 .unwrap();
         assert_eq!(reported, said);
         assert_eq!(daemon, said);
+        assert_eq!(std::fs::read_to_string(report).unwrap(), "function\toutcome\n");
     }
 
     #[test]
