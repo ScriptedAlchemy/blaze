@@ -511,7 +511,9 @@ def continuation_edit(bin_dir):
     """An edit at Cargo's stand-in must invalidate a run completed by the daemon."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-cont-", dir="/tmp"))
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
-    for path, text in COUNTER.items():
+    files = dict(DROPPER)
+    files["Cargo.toml"] = files["Cargo.toml"].replace("dropper", "counter")
+    for path, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         with open(os.path.join(ws, path), "w") as out:
             out.write(text)

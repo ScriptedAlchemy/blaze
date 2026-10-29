@@ -1786,6 +1786,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             "variable",
             "metadata",
             "executable",
+            "compiled",
             "output",
             "dropped",
             "quiet",
@@ -1833,6 +1834,9 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
                 "variable" => ran.env.push(("PR5_CONTINUE".to_owned(), "after".to_owned())),
                 "metadata" => ran.env.push(("DEP_PROBE_NEW".to_owned(), "after".to_owned())),
                 "executable" => std::fs::write(&ran.real, "#!/bin/sh\nexit 0\n").unwrap(),
+                "compiled" => {
+                    set_written(&ran.real, SystemTime::now() + Duration::from_secs(1));
+                }
                 "output" => std::fs::write(out_dir.join("made.rs"), "after").unwrap(),
                 "quiet" => {
                     let edit = ran.cwd.join("new-file");

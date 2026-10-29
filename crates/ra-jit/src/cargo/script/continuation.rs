@@ -30,7 +30,7 @@ pub(super) struct Inputs {
     variables: BTreeMap<String, Option<String>>,
     metadata: BTreeMap<String, String>,
     package: Option<String>,
-    executable: Vec<u8>,
+    executable: (SystemTime, Vec<u8>),
 }
 
 impl Inputs {
@@ -58,7 +58,10 @@ impl Inputs {
         let metadata = Self::metadata(env);
         let package = (after.rerun_if_changed.is_empty() && after.rerun_if_env_changed.is_empty())
             .then(|| crate::scripts::path_package_fingerprint(&ran.cwd));
-        let executable = super::file_digest(&ran.real).map_err(|it| it.to_string())?;
+        let compiled = std::fs::metadata(&ran.real)
+            .and_then(|it| it.modified())
+            .map_err(|it| it.to_string())?;
+        let executable = (compiled, super::file_digest(&ran.real).map_err(|it| it.to_string())?);
         Ok(Self { files, variables, metadata, package, executable })
     }
 
@@ -84,7 +87,10 @@ impl Inputs {
             && self.package.as_ref().is_none_or(|package| {
                 crate::scripts::path_package_fingerprint(&ran.cwd) == *package
             })
-            && super::file_digest(&ran.real).is_ok_and(|it| it == self.executable)
+            && std::fs::metadata(&ran.real)
+                .and_then(|it| it.modified())
+                .is_ok_and(|it| it == self.executable.0)
+            && super::file_digest(&ran.real).is_ok_and(|it| it == self.executable.1)
     }
 }
 
