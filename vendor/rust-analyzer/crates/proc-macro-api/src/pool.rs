@@ -34,6 +34,12 @@ impl PreparedLibrary {
         let (snapshot, content) = LibrarySnapshot::copy(&dylib.path, root).map_err(|error| {
             ServerError { message: "copying macro library".into(), io: Some(Arc::new(error)) }
         })?;
+        if dylib.expected_content.is_some_and(|expected| expected != content) {
+            return Err(ServerError {
+                message: "macro library changed after producer validation".into(),
+                io: None,
+            });
+        }
         Ok(Self { snapshot: Arc::new(snapshot), content, _producer_lease: Arc::new(lease) })
     }
 }

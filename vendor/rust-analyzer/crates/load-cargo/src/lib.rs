@@ -149,9 +149,14 @@ pub struct Loaded {
     /// when the first of them is loaded.
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
     snapshot_root: Option<std::path::PathBuf>,
+    expected_macro_images: FxHashMap<AbsPathBuf, [u8; 32]>,
 }
 
 impl Loaded {
+    pub fn set_proc_macro_image_identities(&mut self, images: FxHashMap<AbsPathBuf, [u8; 32]>) {
+        self.expected_macro_images = images;
+    }
+
     /// Explicit worker ownership for snapshots, set before starting either server.
     pub fn set_proc_macro_snapshot_root(&mut self, root: Option<std::path::PathBuf>) {
         self.snapshot_root = root;
@@ -295,7 +300,12 @@ impl Loaded {
                                 false => &proc_macro_server,
                             };
                             server.as_ref().map_err(Clone::clone).and_then(|proc_macro_server| {
-                                load_proc_macro(proc_macro_server, &path, &[])
+                                load_proc_macro_with_content(
+                                    proc_macro_server,
+                                    &path,
+                                    &[],
+                                    self.expected_macro_images.get(&path).copied(),
+                                )
                             })
                         }),
                     )
@@ -735,8 +745,20 @@ pub fn load_proc_macro(
     path: &AbsPath,
     ignored_macros: &[Box<str>],
 ) -> ProcMacroLoadResult {
+    load_proc_macro_with_content(server, path, ignored_macros, None)
+}
+
+fn load_proc_macro_with_content(
+    server: &ProcMacroClient,
+    path: &AbsPath,
+    ignored_macros: &[Box<str>],
+    expected: Option<[u8; 32]>,
+) -> ProcMacroLoadResult {
     let res: Result<Vec<_>, _> = (|| {
-        let dylib = MacroDylib::new(path.to_path_buf());
+        let dylib = match expected {
+            Some(content) => MacroDylib::new(path.to_path_buf()).with_expected_content(content),
+            None => MacroDylib::new(path.to_path_buf()),
+        };
         let vec = server.load_dylib(dylib).map_err(|e| {
             ProcMacroLoadingError::ProcMacroSrvError(format!("{e}").into_boxed_str())
         })?;

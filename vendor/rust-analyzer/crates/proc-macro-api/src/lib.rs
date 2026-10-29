@@ -129,12 +129,20 @@ impl fmt::Debug for ProcMacroClient {
 /// Represents a dynamically loaded library containing procedural macros.
 pub struct MacroDylib {
     path: AbsPathBuf,
+    expected_content: Option<[u8; 32]>,
 }
 
 impl MacroDylib {
     /// Creates a new MacroDylib instance with the given path.
     pub fn new(path: AbsPathBuf) -> MacroDylib {
-        MacroDylib { path }
+        MacroDylib { path, expected_content: None }
+    }
+
+    /// Bind a previously validated producer artifact to the immutable bytes
+    /// copied for loading, rather than checking its replaceable pathname again.
+    pub fn with_expected_content(mut self, content: [u8; 32]) -> Self {
+        self.expected_content = Some(content);
+        self
     }
 }
 
@@ -167,11 +175,17 @@ impl LibrarySnapshot {
         if let Some(root) = root {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dir = snapshot_dir::prepare(root, std::process::id())?;
-            let path = dir.join(format!(
-                "generation-{}",
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
+            let (path, mut file) = loop {
+                let path = dir.join(format!(
+                    "generation-{}",
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::File::options().write(true).create_new(true).open(&path) {
+                    Ok(file) => break (path, file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            };
             let snapshot = Self::WorkerOwned(path);
             let digest = Self::copy_and_hash(&mut input, &mut file)?;
             return Ok((snapshot, digest));

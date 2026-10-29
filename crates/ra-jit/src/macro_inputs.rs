@@ -45,6 +45,7 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
 /// load or a compiler query. Keep all platforms/dependency kinds conservatively: cargo
 /// can compile host producers outside the program's target graph.
 pub(crate) struct ArtifactInputs {
+    pub(crate) libraries: std::collections::BTreeMap<PathBuf, [u8; 32]>,
     paths: Vec<PathBuf>,
     context: Vec<u8>,
     configuration: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -162,7 +163,15 @@ impl ArtifactInputs {
             .join("target/rust-analyzer/producer-records")
             .join(&identity);
         let lease = load_cargo::proc_macro_producer_lifetime::lease(&root)?;
-        Ok(Some(Self { paths, context, configuration, root, identity, _lease: lease }))
+        Ok(Some(Self {
+            libraries: Default::default(),
+            paths,
+            context,
+            configuration,
+            root,
+            identity,
+            _lease: lease,
+        }))
     }
 
     fn current(&self) -> anyhow::Result<bool> {
@@ -206,7 +215,7 @@ impl ArtifactInputs {
         Ok(())
     }
 
-    fn accepts(&self, artifact: &cargo_metadata::Artifact) -> anyhow::Result<()> {
+    fn accepts(&mut self, artifact: &cargo_metadata::Artifact) -> anyhow::Result<()> {
         anyhow::ensure!(self.current()?, "macro producer changed during warm load");
         for library in artifact.filenames.iter().filter(|path| is_dylib(path.as_std_path())) {
             let hash = Sha256::digest(std::fs::read(library)?);
@@ -218,6 +227,7 @@ impl ArtifactInputs {
                  cargo's result stands, no rebuild was requested",
                 library
             );
+            self.libraries.insert(library.as_std_path().to_owned(), hash.into());
         }
         Ok(())
     }
@@ -247,7 +257,7 @@ pub(crate) fn validate_artifacts(
     if artifacts.is_empty() {
         return Ok(None);
     }
-    let inputs = ArtifactInputs::capture(project, selection)?
+    let mut inputs = ArtifactInputs::capture(project, selection)?
         .context("refusing warm load: proc-macro artifact outside the producer closure")?;
     for artifact in artifacts {
         inputs.accepts(&artifact)?;

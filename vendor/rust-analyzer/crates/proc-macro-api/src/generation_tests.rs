@@ -92,6 +92,27 @@ fn failed_snapshot_copy_leaves_no_empty_file() {
 }
 
 #[test]
+fn artifact_validation_binds_the_snapshot_before_native_loading() {
+    use sha2::{Digest as _, Sha256};
+    let dir = stdx::tempfile::NamedTempDir::new("validated-macro-snapshot").unwrap();
+    let path = paths::AbsPathBuf::assert_utf8(dir.path().join("library"));
+    std::fs::write(&path, b"validated bytes").unwrap();
+    let expected: [u8; 32] = Sha256::digest(b"validated bytes").into();
+    let dylib = || MacroDylib::new(path.clone()).with_expected_content(expected);
+    std::fs::write(&path, b"replacement bytes").unwrap();
+    let error = crate::pool::PreparedLibrary::copy(&dylib(), Some(dir.path())).unwrap_err();
+    assert!(error.message.contains("changed after producer validation"));
+    let snapshots = crate::snapshot_dir::worker_dir(dir.path(), std::process::id());
+    assert_eq!(std::fs::read_dir(&snapshots).unwrap().count(), 1, "rejected snapshot removed");
+    std::fs::write(&path, b"validated bytes").unwrap();
+    let admitted = crate::pool::PreparedLibrary::copy(&dylib(), Some(dir.path())).unwrap();
+    assert_eq!(admitted.content, expected);
+    assert_eq!(std::fs::read_dir(&snapshots).unwrap().count(), 2);
+    drop(admitted);
+    assert_eq!(std::fs::read_dir(&snapshots).unwrap().count(), 1);
+}
+
+#[test]
 fn thirty_generations_retire_only_after_the_last_consumer() {
     let live = Arc::new(AtomicUsize::new(0));
     let count = live.clone();

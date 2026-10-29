@@ -2542,6 +2542,7 @@ impl Checkouts {
             self.loaded.replace(at, self.split(base, &over, &own));
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
+        self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
     }
 
@@ -2756,6 +2757,7 @@ impl Checkouts {
         world.sort();
         world.dedup();
         let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
+        self.refresh_macro_image_identities();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         for (root, workspace, config, build, own) in watched {
             self.inputs.watch(&root, &workspace, &config, &FxHashMap::default(), build, own);
@@ -2895,6 +2897,7 @@ impl Checkouts {
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
             self.debug[at] = self.debug[base];
         }
+        self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.collect_macro_generations();
         failed
@@ -2910,6 +2913,17 @@ impl Checkouts {
                 _ => {}
             }
         }
+    }
+
+    fn refresh_macro_image_identities(&mut self) {
+        let images = self
+            .macro_generations
+            .values()
+            .filter_map(|generation| generation.artifacts.as_ref())
+            .flat_map(|artifacts| artifacts.libraries.iter())
+            .map(|(path, content)| (AbsPathBuf::assert_utf8(path.clone()), *content))
+            .collect();
+        self.loaded.set_proc_macro_image_identities(images);
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
@@ -8545,6 +8559,7 @@ fn follow_cargo(
             let mut workspace = workspace.clone();
             workspace.set_build_scripts(scripts);
             checkouts.loaded.replace(beside.at, workspace);
+            checkouts.refresh_macro_image_identities();
             let Checkouts { loaded, cargo_config, load_config, .. } = checkouts;
             loaded.add(Vec::new(), &cargo_config.extra_env, load_config, vfs, db)?;
             beside.applied = lines.len();
