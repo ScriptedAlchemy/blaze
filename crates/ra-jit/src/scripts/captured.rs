@@ -81,6 +81,7 @@ pub(crate) use blaze_wire::native::Unit as NativeUnit;
 
 #[derive(Default)]
 pub(crate) struct Context<'a> {
+    pub(crate) compiler_environment: Option<&'a crate::process::Native>,
     pub(crate) native: BTreeMap<usize, NativeUnit>,
     pub(crate) runtime: Option<&'a serde_json::Value>,
     pub(crate) bindings: Option<&'a dyn Fn(&Prepared) -> Result<serde_json::Value>>,
@@ -305,6 +306,20 @@ fn configure(
     }
 }
 
+fn probe_environment(
+    environment: &crate::process::Native,
+    probe: &Path,
+    failure: &Path,
+) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<_, _> = environment.vars().collect();
+    env.insert("RUSTC".into(), probe.as_os_str().to_owned());
+    env.insert("RUSTDOC".into(), probe.as_os_str().to_owned());
+    env.insert("BLAZE_PRODUCER_PROBE_FAILURE".into(), failure.as_os_str().to_owned());
+    env.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
+    env.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
+    env
+}
+
 fn host_environment(
     graph: &Graph,
     root: usize,
@@ -379,7 +394,8 @@ pub(crate) fn run_with_context(
     environment: crate::process::Native,
     context: Context<'_>,
 ) -> Result<Prepared> {
-    let Context { native, runtime, bindings, source_root, workspace_members } = context;
+    let Context { compiler_environment, native, runtime, bindings, source_root, workspace_members } =
+        context;
     ensure!(
         native.keys().all(|&at| at < graph.units.len()),
         "native context is outside captured graph"
@@ -414,13 +430,9 @@ pub(crate) fn run_with_context(
     let probe = generation.join("producer-rustc");
     crate::answers::producer_launcher(&probe)?;
     let failure = generation.join("unsupported-probe");
-    let mut env: BTreeMap<OsString, OsString> = environment.vars().collect();
-    env.insert("RUSTC".into(), probe.as_os_str().to_owned());
-    env.insert("RUSTDOC".into(), probe.as_os_str().to_owned());
-    env.insert("BLAZE_PRODUCER_PROBE_FAILURE".into(), failure.as_os_str().to_owned());
-    env.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
-    env.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
-    let env_map = env;
+    let env_map = probe_environment(&environment, &probe, &failure);
+    let compiler_env_map =
+        probe_environment(compiler_environment.unwrap_or(&environment), &probe, &failure);
     let env: Vec<_> = env_map.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
     let mut prepared = Prepared {
         units: graph.units.iter().map(|unit| unit.source.clone()).collect(),
@@ -478,8 +490,14 @@ pub(crate) fn run_with_context(
                 let naming =
                     source_root.map(|root| own_script::SourceNaming { root, members: &members });
                 let bound = bindings.map(|make| make(&prepared)).transpose()?;
-                let compiler_env =
-                    host_environment(&graph, action, &prepared, &env_map, &generation, sysroot)?;
+                let compiler_env = host_environment(
+                    &graph,
+                    action,
+                    &prepared,
+                    &compiler_env_map,
+                    &generation,
+                    sysroot,
+                )?;
                 let image = producer_image::link(
                     sysroot,
                     crates,
@@ -541,8 +559,14 @@ pub(crate) fn run_with_context(
             },
         )
         .map_err(anyhow::Error::msg)?;
-        let compiler_env =
-            host_environment(&graph, run.compiler, &prepared, &env_map, &generation, sysroot)?;
+        let compiler_env = host_environment(
+            &graph,
+            run.compiler,
+            &prepared,
+            &compiler_env_map,
+            &generation,
+            sysroot,
+        )?;
         own_script::link_planned(
             &described,
             &dir,
@@ -671,6 +695,34 @@ mod tests {
         };
         graph.units[1].run = Some(0);
         graph
+    }
+
+    #[test]
+    fn producer_execution_keeps_live_inputs_separate_from_compiler_policy() {
+        let caller = crate::process::Native::of([
+            ("CUSTOM_INPUT".into(), "value".into()),
+            ("OPENSSL_DIR".into(), "/sdk/ssl".into()),
+            ("RUSTFLAGS".into(), "--cfg caller".into()),
+            ("RUSTC_WRAPPER".into(), "external-wrapper".into()),
+        ]);
+        let compiler = crate::process::Native::of([("RA_JIT_BACKEND".into(), "llvm".into())]);
+        let probe = Path::new("/owned/producer-rustc");
+        let failure = Path::new("/owned/failure");
+        let execution = probe_environment(&caller, probe, failure);
+        let policy = probe_environment(&compiler, probe, failure);
+        let mut unit = unit::Unit::default();
+        unit.package.name = "fixture".into();
+        unit.out_dir = "/owned/out".into();
+        unit.rustflags = vec!["--cfg".into(), "caller".into()];
+        let env =
+            blaze_build_script::env(&unit, &execution.into_iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(env.vars[std::ffi::OsStr::new("CUSTOM_INPUT")], "value");
+        assert_eq!(env.vars[std::ffi::OsStr::new("OPENSSL_DIR")], "/sdk/ssl");
+        assert!(!env.vars.contains_key(std::ffi::OsStr::new("RUSTFLAGS")));
+        assert_eq!(env.vars[std::ffi::OsStr::new("CARGO_ENCODED_RUSTFLAGS")], "--cfg\x1fcaller");
+        assert!(!env.vars.contains_key(std::ffi::OsStr::new("RUSTC_WRAPPER")));
+        assert!(!policy.contains_key(std::ffi::OsStr::new("CUSTOM_INPUT")));
+        assert_eq!(policy[std::ffi::OsStr::new("RA_JIT_BACKEND")], "llvm");
     }
 
     #[test]

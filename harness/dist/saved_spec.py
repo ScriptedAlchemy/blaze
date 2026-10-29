@@ -161,10 +161,11 @@ version="0.1.0"
     assert!(command.status().unwrap().success());
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=dylib=saved_dynamic");
+    println!("cargo:rustc-env=OUT_DIR=/native-script-marker");
     println!("cargo:rerun-if-changed=answer.c");
 }
 ''')
-    write(root, "native/src/lib.rs", 'unsafe extern "C" { fn saved_dynamic_answer() -> u32; }\npub fn answer() -> u32 { unsafe { saved_dynamic_answer() } }\n')
+    write(root, "native/src/lib.rs", 'unsafe extern "C" { fn saved_dynamic_answer() -> u32; }\npub fn answer() -> u32 { assert_eq!(env!("OUT_DIR"), "/native-script-marker"); unsafe { saved_dynamic_answer() } }\n')
     write(root, "mac/Cargo.toml", '[package]\nname="saved-dynamic-macro"\nversion="0.1.0"\nedition="2021"\n[lib]\nproc-macro=true\n[dependencies]\nnative={package="saved-dynamic-native",path="../native"}\n')
     write(root, "mac/src/lib.rs", 'extern crate proc_macro;\n#[proc_macro] pub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { format!("{}u32", native::answer()).parse().unwrap() }\n')
     write(root, "app/Cargo.toml", '[package]\nname="saved-dynamic-app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nnative={package="saved-dynamic-native",path="../native"}\nmac={package="saved-dynamic-macro",path="../mac"}\n[build-dependencies]\nnative={package="saved-dynamic-native",path="../native"}\n')

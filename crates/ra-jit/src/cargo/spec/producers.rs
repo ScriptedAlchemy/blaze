@@ -344,7 +344,7 @@ fn prepare_with(
         Ok(serde_json::json!(full.encode_bindings()))
     };
     let mut producer_environment: BTreeMap<OsString, OsString> =
-        process_environment.vars().collect();
+        effective.iter().map(|(name, value)| (name.into(), value.clone())).collect();
     producer_environment.insert("CARGO".into(), cargo.as_os_str().to_owned());
     let prepared = captured::run_with_context(
         graph,
@@ -352,6 +352,7 @@ fn prepare_with(
         work,
         crate::process::Native::of(producer_environment),
         captured::Context {
+            compiler_environment: Some(&process_environment),
             native,
             runtime,
             source_root: Some(&replay.resolved.graph.root),
