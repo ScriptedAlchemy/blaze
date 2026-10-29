@@ -59,8 +59,10 @@ fn system_child_probes_receive_exactly_the_request_environment() {
     .unwrap();
     std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = native_host();
+    let system_path = std::env::var_os("PATH").unwrap();
+    let env_tool = System.which_native(OsStr::new("env"), &system_path).unwrap();
     let mut env = BTreeMap::from([
-        ("PATH".to_owned(), OsString::from("/usr/bin:/bin")),
+        ("PATH".to_owned(), system_path),
         ("CC".to_owned(), compiler.into_os_string()),
     ]);
     for value in ["first request", "second request"] {
@@ -71,7 +73,7 @@ fn system_child_probes_receive_exactly_the_request_environment() {
         assert_eq!(platform.cc.unwrap().1, format!("{value}:unset"));
         // Unlike a shell, env adds no variables of its own: this exercises the
         // byte-output path used for SDK lookup as well as text version probes.
-        let bytes = System.run_path_in(&root, &env, Path::new("/usr/bin/env"), &[]).unwrap();
+        let bytes = System.run_path_in(&root, &env, &env_tool, &[]).unwrap();
         let output = String::from_utf8(bytes).unwrap();
         let got: BTreeMap<_, _> = output
             .lines()
@@ -111,16 +113,21 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
         .unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut raw_path = raw_bin;
-    raw_path.push(":/usr/bin:/bin");
+    let system_path = std::env::var_os("PATH").unwrap();
+    let prefixed = |prefix: &OsStr| {
+        let mut path = prefix.to_owned();
+        path.push(":");
+        path.push(&system_path);
+        path
+    };
     let mut cases = vec![
-        (OsString::from("./tools/review-cc"), OsString::from("/usr/bin:/bin")),
-        (OsString::from("review-cc"), OsString::from("tools:/usr/bin:/bin")),
-        (OsString::from("review-cc"), OsString::from(":/usr/bin:/bin")),
-        (cwd.join("tools/review-cc").into_os_string(), OsString::from("/usr/bin:/bin")),
+        (OsString::from("./tools/review-cc"), system_path.clone()),
+        (OsString::from("review-cc"), prefixed(OsStr::new("tools"))),
+        (OsString::from("review-cc"), prefixed(OsStr::new(""))),
+        (cwd.join("tools/review-cc").into_os_string(), system_path.clone()),
     ];
     #[cfg(target_os = "linux")]
-    cases.push((OsString::from("review-cc"), raw_path));
+    cases.push((OsString::from("review-cc"), prefixed(&raw_bin)));
     let host = native_host();
     for (cc, path) in cases {
         let mut native: BTreeMap<_, _> =

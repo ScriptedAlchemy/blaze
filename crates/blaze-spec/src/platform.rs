@@ -392,9 +392,8 @@ impl Probe for System {
             "linux" => {
                 // Kernel facts do not require a distribution's layout of coreutils.
                 // Keep uname for environments that do not mount procfs.
-                let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .ok()
-                    .or_else(|| {
+                let release =
+                    std::fs::read_to_string("/proc/sys/kernel/osrelease").ok().or_else(|| {
                         ["/usr/bin/uname", "/bin/uname"]
                             .iter()
                             .find_map(|it| self.run_in(cwd, env, Path::new(it), &["-r"]))
