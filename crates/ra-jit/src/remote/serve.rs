@@ -788,6 +788,9 @@ mod tests {
 
     type Reply = (StatusCode, Vec<(&'static str, String)>, Vec<u8>);
 
+    // The ceiling also bounds schema maps, including ExecPlatform's ten fields in hello.
+    const PAGINATED_BATCH_ITEMS: u32 = 16;
+
     struct Fake {
         url: Url,
         task: tokio::task::JoinHandle<()>,
@@ -903,7 +906,7 @@ mod tests {
         .unwrap();
         let mut config = blaze_serve::Config::at(dir.path(), 0);
         config.limits.request = 1024;
-        config.limits.batch_items = 8;
+        config.limits.batch_items = PAGINATED_BATCH_ITEMS;
         config.limits.lookup_items = 8;
         let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -925,7 +928,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = blaze_serve::Config::at(dir.path(), 0);
         config.limits.request = 256;
-        config.limits.batch_items = 8;
+        config.limits.batch_items = PAGINATED_BATCH_ITEMS;
         config.limits.lookup_items = 8;
         let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
         for name in ["manifests/a", "manifests/b", "manifests/c"] {
@@ -998,7 +1001,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = blaze_serve::Config::at(dir.path(), 0);
         config.limits.request = 512;
-        config.limits.batch_items = 8;
+        config.limits.batch_items = PAGINATED_BATCH_ITEMS;
         config.limits.lookup_items = 8;
         let server = Arc::new(blaze_serve::Server::open(&config).unwrap());
         let bytes = b"referenced unit";

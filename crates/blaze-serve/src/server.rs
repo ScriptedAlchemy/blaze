@@ -931,6 +931,66 @@ mod tests {
         }
     }
 
+    fn hello_request() -> HelloRequest {
+        HelloRequest {
+            versions: Set::new(vec![VERSION]),
+            identity: blaze_wire::StoreIdentity([0; 32]),
+            platform: blaze_wire::ExecPlatform {
+                triple: "aarch64-apple-darwin".into(),
+                os: "macos".into(),
+                sdk: None,
+                libc: None,
+                linker: ("".into(), "".into(), [0; 32]),
+                cpu: "aarch64".into(),
+                cc: None,
+                cxx: None,
+                ar: None,
+                native_root: None,
+            },
+            role: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_hello_with_small_limits_preserves_collection_bounds() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.limits.request = 512;
+            // The collection ceiling must also fit ExecPlatform's ten-field map in hello.
+            config.limits.batch_items = 16;
+            config.limits.lookup_items = 8;
+            config
+        })
+        .await;
+        let mut hello = hello_request();
+        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let answer: HelloAnswer = decode(&body, run.server.limits()).unwrap();
+        assert_eq!(answer.limits, *run.server.limits());
+
+        hello.versions = Set::new((0..=answer.limits.batch_items).collect());
+        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
+        assert_eq!(status, 400);
+        let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
+        assert!(error.message.contains("oversize item"));
+
+        for count in [8u32, 9] {
+            let request = CacheMissingRequest {
+                blobs: Set::new((0..count).map(|at| sha256(&at.to_le_bytes())).collect()),
+            };
+            let (status, _, body) =
+                run.request("POST", "/v1/cache/missing", "", &encode(&request)).await;
+            if count == 8 {
+                assert_eq!(status, 200);
+                let answer: CacheMissingAnswer = decode(&body, run.server.limits()).unwrap();
+                assert_eq!(answer.missing, request.blobs);
+            } else {
+                assert_eq!(status, 400);
+                let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
+                assert!(error.message.contains("oversize item"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_idle_upload_times_out_without_blocking_a_healthy_client() {
         let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
@@ -1195,23 +1255,7 @@ mod tests {
             blobs: Set::new((0..4097u32).map(|at| sha256(&at.to_le_bytes())).collect()),
         };
         assert_ne!(run.request("POST", "/v1/cache/missing", "", &encode(&request)).await.0, 200);
-        let hello = HelloRequest {
-            versions: Set::new(vec![VERSION]),
-            identity: blaze_wire::StoreIdentity([0; 32]),
-            platform: blaze_wire::ExecPlatform {
-                triple: "aarch64-apple-darwin".into(),
-                os: "macos".into(),
-                sdk: None,
-                libc: None,
-                linker: ("".into(), "".into(), [0; 32]),
-                cpu: "aarch64".into(),
-                cc: None,
-                cxx: None,
-                ar: None,
-                native_root: None,
-            },
-            role: 0,
-        };
+        let hello = hello_request();
         let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
         assert_eq!(status, 200);
         let answer: HelloAnswer = decode(&body, &Limits::DOCUMENTED).unwrap();
