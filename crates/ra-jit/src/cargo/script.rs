@@ -278,6 +278,11 @@ pub(crate) struct Dependency {
     pub(crate) links: String,
     pub(crate) out_dir: PathBuf,
     pub(crate) parents: Vec<PathBuf>,
+    /// The scripts of the packages that have this one as a build-dependency. Cargo adds no
+    /// run-unit edge for it, but a run of this script makes the library the parent's script is
+    /// built with again, and cargo compiles the script and runs it.
+    #[serde(default)]
+    pub(crate) build_parents: Vec<PathBuf>,
     pub(crate) targets: Vec<blaze_build_script::unit::Target>,
 }
 
@@ -373,7 +378,10 @@ pub(crate) fn judge_for(
             cargo
                 .dependencies
                 .iter()
-                .filter(|it| it.parents.contains(&out_dir) && recorded.depends_on(&it.package))
+                .filter(|it| {
+                    it.build_parents.contains(&out_dir)
+                        || it.parents.contains(&out_dir) && recorded.depends_on(&it.package)
+                })
                 .map(|it| it.out_dir.clone()),
         );
     }
@@ -403,6 +411,22 @@ fn judge_locked_inner(
 ) -> Result<Run, JudgementError> {
     let unit = records::Unit::of(out_dir)?;
     let recorded = unit.recorded()?;
+    // A build-dependency's script that runs makes cargo compile this script again before it
+    // runs it, and the daemon compiles nothing: the build is cargo's, which finds the run made
+    // here, and runs this script once.
+    for dep in
+        cargo.dependencies.iter().filter(|it| it.build_parents.iter().any(|it| it == out_dir))
+    {
+        let context = Cargo { targets: &dep.targets, ..*cargo };
+        judge_locked(&dep.out_dir, &context, completed, parents)?;
+        if completed.iter().any(|it| it.out_dir() == dep.out_dir) {
+            return Err(format!(
+                "has a build-dependency, `{}`, whose script ran again, so cargo builds this script again",
+                dep.package
+            )
+            .into());
+        }
+    }
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
     let mut metadata_prefixes = Vec::new();
@@ -928,6 +952,7 @@ mod tests {
             links: "probe".to_owned(),
             out_dir: native.clone(),
             parents: vec![parent.clone()],
+            build_parents: Vec::new(),
             targets: Vec::new(),
         }];
         let cargo = Cargo { dependencies: &dependencies, ..CARGO };
@@ -985,6 +1010,7 @@ mod tests {
             links: "native-probe".to_owned(),
             out_dir: native.clone(),
             parents: vec![parent.clone()],
+            build_parents: Vec::new(),
             targets: Vec::new(),
         }];
         let cargo = Cargo { dependencies: &dependencies, ..CARGO };
@@ -1017,6 +1043,7 @@ mod tests {
                 // Cargo did not build this run unit for this parent. It need not exist.
                 out_dir: parent.join("not-built/out"),
                 parents: vec![parent.clone()],
+                build_parents: Vec::new(),
                 targets: Vec::new(),
             }];
             let cargo = Cargo { dependencies: &dependencies, ..CARGO };
@@ -1027,6 +1054,37 @@ mod tests {
             assert_eq!(runs(&parent), 1);
             std::fs::remove_dir_all(parent.ancestors().nth(4).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn a_build_dependency_whose_script_ran_again_leaves_this_script_to_cargo() {
+        // Cargo has no run-unit edge for a build-dependency, but a run of its script makes the
+        // library this script is built with again, and cargo compiles the script and runs it.
+        // The daemon compiles nothing, so it would leave the program built from the older run.
+        let native = ran_script("native-build", COUNTS, "");
+        let parent = ran_script("parent-build", COUNTS, "");
+        let dependencies = [Dependency {
+            package: "native-build".to_owned(),
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: Vec::new(),
+            build_parents: vec![parent.clone()],
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let built = Run::of(&parent).unwrap();
+        assert_eq!(current(&parent, &cargo), Ok(built));
+        assert_eq!((runs(&native), runs(&parent)), (0, 0));
+        changed(&native);
+        let mut completed = Vec::new();
+        let result = judge_for(&parent, &cargo, &mut completed);
+        assert!(
+            matches!(&result, Err(JudgementError::Unavailable(it)) if it.contains("build-dependency")),
+            "{result:?}"
+        );
+        // The run made is kept for cargo's leg, which takes it as its own and runs the parent once.
+        assert_eq!((runs(&native), runs(&parent)), (1, 0));
+        assert_eq!(completed.len(), 1);
     }
 
     #[test]

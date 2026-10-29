@@ -1542,23 +1542,26 @@ fn script_dependencies(metadata: &Metadata, scripts: &[BuildScript]) -> Vec<scri
         .filter_map(|run| {
             let package = metadata.packages.iter().find(|it| it.id == run.package_id)?;
             let links = package.links.clone()?;
-            let parents = metadata
-                .packages
-                .iter()
-                .filter(|parent| {
-                    parent
-                        .dependencies
-                        .iter()
-                        .any(|dep| dep.kind == DependencyKind::Normal && *dep.name == *package.name)
-                })
-                .flat_map(|parent| scripts.iter().filter(move |it| it.package_id == parent.id))
-                .map(|it| it.out_dir.clone().into_std_path_buf())
-                .collect();
+            let parents = |kind| {
+                metadata
+                    .packages
+                    .iter()
+                    .filter(|parent| {
+                        parent
+                            .dependencies
+                            .iter()
+                            .any(|dep| dep.kind == kind && *dep.name == *package.name)
+                    })
+                    .flat_map(|parent| scripts.iter().filter(move |it| it.package_id == parent.id))
+                    .map(|it| it.out_dir.clone().into_std_path_buf())
+                    .collect()
+            };
             Some(script::Dependency {
                 package: package.name.to_string(),
                 links,
                 out_dir: run.out_dir.clone().into_std_path_buf(),
-                parents,
+                parents: parents(DependencyKind::Normal),
+                build_parents: parents(DependencyKind::Build),
                 targets: package
                     .targets
                     .iter()

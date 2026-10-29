@@ -827,27 +827,32 @@ impl Scripts {
                         it.root == Path::new(cargo[package].manifest.parent().as_str())
                     })?;
                     let out_dir = script.ran()?;
-                    let parents = cargo
-                        .packages()
-                        .filter(|&parent| {
-                            cargo[parent].dependencies.iter().any(|dep| {
-                                dep.pkg == package && dep.kind == project_model::DepKind::Normal
+                    let parents = |kind| {
+                        cargo
+                            .packages()
+                            .filter(|&parent| {
+                                cargo[parent]
+                                    .dependencies
+                                    .iter()
+                                    .any(|dep| dep.pkg == package && dep.kind == kind)
                             })
-                        })
-                        .filter_map(|parent| {
-                            self.scripts
-                                .iter()
-                                .find(|it| {
-                                    it.root == Path::new(cargo[parent].manifest.parent().as_str())
-                                })
-                                .and_then(Script::ran)
-                        })
-                        .collect();
+                            .filter_map(|parent| {
+                                self.scripts
+                                    .iter()
+                                    .find(|it| {
+                                        it.root
+                                            == Path::new(cargo[parent].manifest.parent().as_str())
+                                    })
+                                    .and_then(Script::ran)
+                            })
+                            .collect()
+                    };
                     Some(crate::cargo::script::Dependency {
                         package: cargo[package].name.clone(),
                         links,
                         out_dir,
-                        parents,
+                        parents: parents(project_model::DepKind::Normal),
+                        build_parents: parents(project_model::DepKind::Build),
                         targets: script.output_targets.clone(),
                     })
                 })

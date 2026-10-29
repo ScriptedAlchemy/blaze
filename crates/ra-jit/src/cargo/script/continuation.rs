@@ -95,6 +95,10 @@ impl Inputs {
 }
 
 impl Completed {
+    pub(super) fn out_dir(&self) -> &std::path::Path {
+        &self.out_dir
+    }
+
     pub(super) fn new(
         ran: &Ran,
         out_dir: &std::path::Path,
