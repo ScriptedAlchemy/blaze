@@ -11,18 +11,24 @@ on:
       - crates/blaze-manifest/**
       - crates/blaze-metadata/**
       - crates/blaze-resolve/**
-      - crates/ra-jit/src/cargo/spec.rs
-      - crates/ra-jit/src/compiler_json.rs
-      - crates/ra-jit/src/check.rs
-      - crates/ra-jit/src/doctest.rs
-      - crates/ra-jit/src/dep_info.rs
+      - crates/ra-jit/src/**
+      - crates/hir-ty-codegen/**
       - vendor/rust-analyzer/crates/base-db/**
       - vendor/rust-analyzer/crates/project-model/**
       - vendor/rust-analyzer/crates/hir-expand/**
+      - vendor/rust-analyzer/crates/paths/**
+      - vendor/rust-analyzer/crates/vfs/**
+      - vendor/rust-analyzer/crates/vfs-notify/**
+      - vendor/rust-analyzer/crates/ide-db/**
+      - vendor/proc-macro-srv/**
       - harness/dist/**
       - harness/norustc.py
       - Cargo.toml
       - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - .github/actions/toolchain/**
       - .github/workflows/blaze-dist-review.yaml
   workflow_dispatch:
 
@@ -90,14 +96,22 @@ jobs:
       - name: Validate complete native platform and immutable input contracts
         run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
       - name: Build the actual CLI with both owned backends
-        run: nix develop .#bench --command cargo build --locked -p ra-jit --bins --features llvm
+        run: nix develop .#bench --command cargo build --locked --release -p ra-jit --bins --features llvm
+      - name: Bootstrap a fresh complete owned macro runtime
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
+            > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
       - name: Original C2 generation and local command differential
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/buildspec.py \
-            --bin "$GITHUB_WORKSPACE/target/debug/ra-jit" \
-            --work "$RUNNER_TEMP/c2-local" --memory-mib 6144 --timeout 1200 --shared-store \
+            --bin "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-local" --memory-mib 8192 --timeout 1200 --shared-store \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
             --json "$RUNNER_TEMP/c2-evidence/local.json" \
             > "$RUNNER_TEMP/c2-evidence/local.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (Cranelift)
@@ -105,16 +119,18 @@ jobs:
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
-            --blaze "$GITHUB_WORKSPACE/target/debug/ra-jit" \
-            --work "$RUNNER_TEMP/c2-cranelift" --memory-mib 6144 --timeout 1200 \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-cranelift" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
             --backend cranelift > "$RUNNER_TEMP/c2-evidence/cranelift.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (LLVM)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
-            --blaze "$GITHUB_WORKSPACE/target/debug/ra-jit" \
-            --work "$RUNNER_TEMP/c2-llvm" --memory-mib 6144 --timeout 1200 \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-llvm" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
             --backend llvm > "$RUNNER_TEMP/c2-evidence/llvm.log" 2>&1
       - name: Keep C2 runtime and tool audit evidence
         if: ${{ always() }}
@@ -123,8 +139,18 @@ jobs:
           name: c2-runtime-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/c2-evidence
+            ${{ runner.temp }}/c2-owned-server/image-pins.json
+            ${{ runner.temp }}/c2-owned-server/tool-controls.json
+            ${{ runner.temp }}/c2-owned-server/*.watchdog.json
+            ${{ runner.temp }}/c2-owned-server/*audit.json
+            ${{ runner.temp }}/c2-owned-server/*external-execs.json
+            ${{ runner.temp }}/c2-owned-server/*.exec
+            ${{ runner.temp }}/c2-local/*.exec
+            ${{ runner.temp }}/c2-local/product-tools.log
             ${{ runner.temp }}/c2-cranelift/results.json
+            ${{ runner.temp }}/c2-cranelift/*.exec
             ${{ runner.temp }}/c2-cranelift/*.log
             ${{ runner.temp }}/c2-llvm/results.json
+            ${{ runner.temp }}/c2-llvm/*.exec
             ${{ runner.temp }}/c2-llvm/*.log
           if-no-files-found: warn

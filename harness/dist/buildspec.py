@@ -52,10 +52,10 @@ The arms:
                 the programs built, the tests run, the doc tests run, what the programs and the
                 custom harness printed, and the exit status have to be equal. Both runs are under
                 tracedecay.py's memory guard (RA_JIT_MEMORY_MAX=16G, RA_JIT_OWN_BASE_MEMORY=12G,
-                RA_JIT_SPARE=0 and its watchdog) and audited with norustc.py's stand-in rustc,
-                rustdoc and cargo: blaze's cold build still hands work to cargo (docs/no-rustc.md,
-                a known bug), so the number of cargo runs is reported as `cargo dispatched: N` and
-                never fails a case. The daemon of each run is stopped and its directories deleted.
+                RA_JIT_SPARE=0 and its watchdog) and audited with executable, fail/count stand-ins
+                for rustc, rustdoc, cargo, rustup and the official macro server. Every attempted
+                dispatch fails the case. An explicitly pinned owned server is execution policy,
+                excluded from spec capture. Each run's daemon is stopped before cleanup.
 
 The harness never runs cargo or rustc for the thing under test. Python 3.9+, standard library only
 (and `tracedecay.py` and `norustc.py` beside it, which it imports for the guard and the stand-ins:
@@ -76,6 +76,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.dirname(HERE)
@@ -87,6 +88,7 @@ for _dir in (HARNESS, HERE):
         sys.path.insert(0, _dir)
 import norustc  # noqa: E402
 import tracedecay  # noqa: E402
+from owned_macro_server import runtime_record
 
 TOOLCHAIN = open(os.path.join(HARNESS, "toolchain")).read().strip()
 DEFAULT_BIN = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target", "release", "ra-jit")
@@ -1085,9 +1087,10 @@ def fixtures():
 # --- Running ra-jit under the guard --------------------------------------------------------------
 
 class Run:
-    def __init__(self, argv, code, out, err, seconds, timed_out=False, watchdog=None):
+    def __init__(self, argv, code, out, err, seconds, timed_out=False, watchdog=None, external_execs=None):
         self.argv, self.code, self.out, self.err = argv, code, out, err
         self.seconds, self.timed_out, self.watchdog = seconds, timed_out, watchdog
+        self.external_execs = external_execs or []
 
 
 class Blaze:
@@ -1100,6 +1103,7 @@ class Blaze:
         self.bindir = os.path.dirname(self.bin)
         self.run_id = run_id
         self.timeout = timeout
+        self.trace_directory = None
         self.guard = dict(tracedecay.GUARD_ENV)
         if memory_mib is not None:
             if not 0 < memory_mib <= 16384:
@@ -1135,28 +1139,41 @@ class Blaze:
             env["PATH"] = standins + os.pathsep + self.bindir + os.pathsep + env.get("PATH", "")
             for name, exe in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo")):
                 env[name] = os.path.join(standins, exe)
+            env["RUSTUP_TOOLCHAIN"] = os.path.dirname(standins)
         return env
 
     def run(self, args, cwd, env, merge=False, timeout=None):
         argv = [self.bin, *args]
+        trace = None
+        traced = argv
+        if sys.platform == "linux" and env.get("CARGO"):
+            trace = os.path.join(self.trace_directory, "product-" + uuid.uuid4().hex + ".exec")
+            traced = ["strace", "-f", "-D", "-e", "trace=execve", "-o", trace, *argv]
         began = time.monotonic()
         self.watchdog.take()
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT if merge else subprocess.PIPE, text=True,
-                                errors="replace", start_new_session=True)
-        self.watchdog.client = lambda: proc.pid
-        timed_out = False
-        try:
-            out, err = proc.communicate(timeout=timeout or self.timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            out, err = proc.communicate()
-        finally:
-            self.watchdog.client = None
+        with contextlib.ExitStack() as files:
+            stdout = files.enter_context(open(trace + ".stdout", "w")) if trace else subprocess.PIPE
+            stderr = subprocess.STDOUT if merge else (
+                files.enter_context(open(trace + ".stderr", "w")) if trace else subprocess.PIPE)
+            proc = subprocess.Popen(traced, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout,
+                                    stderr=stderr, text=True, errors="replace", start_new_session=True)
+            self.watchdog.client = lambda: proc.pid
+            timed_out = False
+            try:
+                out, err = proc.communicate(timeout=timeout or self.timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                out, err = proc.communicate()
+            finally:
+                self.watchdog.client = None
+        if trace:
+            out = open(trace + ".stdout", errors="replace").read()
+            err = "" if merge else open(trace + ".stderr", errors="replace").read()
         trip = self.watchdog.take().get("watchdog")
-        return Run(argv, proc.returncode, out or "", err or "", time.monotonic() - began, timed_out, trip)
+        execs = norustc.external_execs(open(trace).read()) if trace else []
+        return Run(argv, proc.returncode, out or "", err or "", time.monotonic() - began, timed_out, trip, execs)
 
     def stop(self, home, cwd, env):
         """`ra-jit cargo stop` for the daemon of `home`."""
@@ -1515,8 +1532,8 @@ def count_dispatched(ctx_audit, offset):
         with open(log, "rb") as f:
             f.seek(offset)
             data = f.read()
-    except OSError:
-        return {"cargo": 0, "rustc": 0, "rustdoc": 0}
+    except OSError as error:
+        raise HarnessError("the product tool audit became unreadable") from error
     slice_path = log + ".slice"
     with open(slice_path, "wb") as f:
         f.write(data)
@@ -1524,7 +1541,10 @@ def count_dispatched(ctx_audit, offset):
         runs = norustc.runs(slice_path)
     finally:
         os.unlink(slice_path)
-    return {tool: sum(1 for r in runs if r["tool"] == tool) for tool in ("cargo", "rustc", "rustdoc")}
+    if len(data.splitlines()) != len(runs):
+        raise HarnessError("the product tool audit contains a malformed record")
+    return {tool: sum(1 for r in runs if r["tool"] == tool)
+            for tool in (*norustc.COUNTED, "rust-analyzer-proc-macro-srv")}
 
 
 # --- The harness ---------------------------------------------------------------------------------
@@ -1539,6 +1559,7 @@ class Ctx:
         os.makedirs(self.work, exist_ok=True)
         self.run_id = "bs-%s-%d" % (time.strftime("%m%d%H%M%S"), os.getpid())
         self.blaze = Blaze(args.bin, self.run_id, args.timeout, getattr(args, "memory_mib", None))
+        self.blaze.trace_directory = self.work
         self.cargo_home = os.path.join(self.work, "cargo-home")
         os.makedirs(self.cargo_home, exist_ok=True)
         self.spec_home = self.blaze.new_home()
@@ -1546,6 +1567,12 @@ class Ctx:
         self.mismatch = []
         self.audit = None  # (log, standins bin) or None
         self.audit_why = None
+        self.audit_controls = []
+        server = getattr(args, "owned_server", None)
+        self.owned_server = None
+        if server:
+            server = os.path.realpath(server)
+            self.owned_server = runtime_record(server, args.bin)
 
     def say(self, *a):
         if not self.quiet:
@@ -1746,15 +1773,23 @@ class Ctx:
             self.audit_why = "--no-audit"
             return
         try:
-            log = os.path.join(self.work, "audit.log")
+            log = os.path.join(self.work, "product-tools.log")
             open(log, "w").close()
-            standins = os.path.join(norustc.stand_ins(os.path.join(self.work, "standins"), log), "bin")
-            control = subprocess.run([os.path.join(standins, "cargo"), "--version"], capture_output=True)
-            if control.returncode != 0 or not norustc.runs(log):
-                raise HarnessError("the Cargo audit stand-in did not execute and record its control")
+            toolchain = norustc.stand_ins(os.path.join(self.work, "standins"), log, block=True, block_macro_server=True)
+            standins = os.path.join(toolchain, "bin")
+            names = (*norustc.COUNTED, "rust-analyzer-proc-macro-srv")
+            for name in names:
+                path = os.path.join(toolchain, "libexec" if name == "rust-analyzer-proc-macro-srv" else "bin", name)
+                control = subprocess.run([path, "--version"], capture_output=True)
+                self.audit_controls.append({"tool": name, "path": path, "code": control.returncode})
+                if control.returncode != 97:
+                    raise HarnessError("a blocked-tool positive control did not execute")
+            if [row["tool"] for row in norustc.runs(log)] != list(names):
+                raise HarnessError("blocked-tool positive controls were not recorded")
+            open(log, "w").close()
             self.audit = (log, standins)
-        except Exception as e:  # no rustup toolchain, no rustc to copy: the audit is skipped, said so
-            self.audit_why = f"the stand-ins could not be made: {clip(e, 160)}"
+        except Exception as e:
+            raise HarnessError(f"the strict audit could not be established: {clip(e, 160)}") from e
 
     def local_run(self, case, args, cwd_in, env_extra, label, shared_store):
         """One run of ra-jit in a fresh copy: returns (summary, run, dispatched)."""
@@ -1764,6 +1799,8 @@ class Ctx:
         store = shared_store or os.path.join(local, "store")
         env = self.blaze.env(scrubbed_env(env_extra), home=home, target=target, store=store,
                              cargo_home=self.cargo_home, standins=self.audit[1] if self.audit else None)
+        if self.owned_server:
+            env["RA_JIT_PROC_MACRO_SERVER"] = self.owned_server["path"]
         offset = self.audit_offset()
         saved = len(args) == 4 and args[:3] == ["cargo", "spec", "--run"]
         outputs = args[3] + ".outputs" if saved else None
@@ -1802,15 +1839,32 @@ class Ctx:
             if not self.args.keep:
                 shutil.rmtree(local, ignore_errors=True)
         out["dispatched"] = {"command": da, "spec_run": db}
+        out["external_execs"] = {"command": ra.external_execs, "spec_run": rb.external_execs}
         out["command"], out["spec_run"] = sa, sb
         out["exit"] = {"command": ra.code, "spec_run": rb.code}
         for which, run in (("the command", ra), ("the spec run", rb)):
+            if run.external_execs:
+                out["status"] = "ERROR"
+                out["diffs"].append(f"{which} attempted external compiler/Cargo/server execs: {run.external_execs}")
             if run.watchdog:
                 out["status"] = "KILLED"
                 out["diffs"].append(f"{which} was killed by the watchdog: {run.watchdog['reason']}")
             elif run.timed_out:
                 out["status"] = "ERROR"
                 out["diffs"].append(f"{which} timed out after {run.seconds:.0f} s")
+        for which, calls in (("the command", da), ("the spec run", db)):
+            if calls and any(calls.values()):
+                out["status"] = "ERROR"
+                out["diffs"].append(f"{which} invoked blocked tools: {calls}")
+        if self.owned_server:
+            with open(self.owned_server["path"], "rb") as source:
+                if sha256(source.read()) != self.owned_server["sha256"]:
+                    out["status"] = "ERROR"
+                    out["diffs"].append("the pinned owned server changed during the local gate")
+            with open(self.args.bin, "rb") as compiler:
+                if sha256(compiler.read()) != self.owned_server["compiler_sha256"]:
+                    out["status"] = "ERROR"
+                    out["diffs"].append("the compiler changed during the local gate")
         if out["status"] != "match":
             return out
         if rb.code == 2 and "does not match the spec" in rb.out:
@@ -2013,8 +2067,7 @@ def print_report(ctx, reported):
             for which in (loc.get("dispatched") or {}).values():
                 total.update(which or {})
         if ctx.locals:
-            print(f"\ncargo dispatched: {total['cargo']}, rustc runs: {total['rustc']}, rustdoc runs: {total['rustdoc']} "
-                  f"over {len(ctx.locals)} local pairs (docs/no-rustc.md: a known bug, reported and not failed)")
+            print(f"\nblocked tool calls: {dict(total)} over {len(ctx.locals)} local pairs; any call fails")
 
 
 def self_audit_on(ctx):
@@ -2060,6 +2113,7 @@ def json_results(ctx, reported, fails):
             "error": res.error if res else None, "summary": res.summary if res else None,
             "units": ctx.units.get(case.full), "local": ctx.locals.get(case.full)})
     return {"bin": ctx.args.bin, "toolchain": TOOLCHAIN, "cases": cases, "mismatch": ctx.mismatch,
+            "owned_server": ctx.owned_server, "tool_controls": ctx.audit_controls,
             "failures": [{"case": c, "arm": a, "why": w} for c, a, w in fails], "ok": not fails}
 
 
@@ -2089,6 +2143,7 @@ def parse_args(argv):
     ap.add_argument("--list", action="store_true", help="list the fixtures and cases")
     ap.add_argument("--timeout", type=int, default=900, help="seconds a ra-jit run may take (default 900)")
     ap.add_argument("--memory-mib", type=int, help="lower the compiler and process-tree memory ceiling for hosted runners (at most 16384)")
+    ap.add_argument("--owned-server", help="fresh compiler-owned runtime for execution only; excluded from spec capture")
     ap.add_argument("--shared-store", action="store_true", help="local runs share one RA_JIT_CACHE (faster, less independent)")
     ap.add_argument("--no-audit", action="store_true", help="do not put norustc.py's stand-ins on PATH for the local runs")
     ap.add_argument("--units-with-doctest", action="store_true", help="compare cargo's doctest units too")
@@ -3154,7 +3209,7 @@ def self_test_oracle(t, tmp):
 
 def fake_args(fake, **kw):
     base = dict(bin=fake, work=None, only=[], no_local=True, no_cargo=True, keep=False, self_test=False, json=None, list=False,
-                timeout=300, shared_store=False, no_audit=False, units_with_doctest=False, spec_run_in="root")
+                timeout=300, shared_store=False, no_audit=False, units_with_doctest=False, spec_run_in="root", owned_server=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -3202,7 +3257,7 @@ def self_test(args):
         out_json = os.path.join(tmp, "results.json")
         print("\nthe whole harness against the fake ra-jit (the fake's `--unit-graph` is cargo's own, so the units arm "
               + ("compares equal graphs" if cargo else "is skipped: no cargo +%s here" % TOOLCHAIN) + "):")
-        with environment(FAKE_LOG=log, FAKE_DISPATCH="1", FAKE_BUG=None, FAKE_LLVM=None):
+        with environment(FAKE_LOG=log, FAKE_DISPATCH=None, FAKE_BUG=None, FAKE_LLVM=None):
             status, ctx, reported, fails = run_harness(fake_args(fake, no_local=False, no_cargo=not cargo, json=out_json))
         t.check(status == 0 and not fails, "every case of every fixture, in every arm, meets its expectation", "; ".join(f"{c} [{a}] {w}" for c, a, w in fails[:6]))
         data = json.load(open(out_json))
@@ -3227,9 +3282,15 @@ def self_test(args):
                 "the test double changes source/job identity and reproduces both nested workspaces; this is not a real CLI pass")
         if ctx.audit is not None:
             dispatched = sum((l["dispatched"]["command"] or {}).get("cargo", 0) for l in ctx.locals.values())
-            t.check(dispatched >= len(ctx.locals), "cargo dispatched is counted by the stand-in and not a failure", str(dispatched))
+            t.check(dispatched == 0, "the passing local arm has zero blocked-tool dispatches", str(dispatched))
         else:
             print(f"  skip the audit: {ctx.audit_why}")
+        with environment(FAKE_LOG=log, FAKE_DISPATCH="1", FAKE_BUG=None, FAKE_LLVM=None):
+            blocked_status, _, _, blocked_fails = run_harness(
+                fake_args(fake, only=["basic/base"], no_local=False, no_cargo=True), quiet=True)
+        t.check(blocked_status != 0 and any("blocked tools" in why for _, _, why in blocked_fails),
+                "a successful test double that invokes Cargo still fails the strict local audit",
+                str(blocked_fails))
         calls = [json.loads(l) for l in open(log)]
         guard = [c for c in calls if c["args"][:2] != ["cargo", "stop"] or True]
         t.check(all(c["env"]["RA_JIT_MEMORY_MAX"] == "16G" and c["env"]["RA_JIT_OWN_BASE_MEMORY"] == "12G" and c["env"]["RA_JIT_SPARE"] == "0"

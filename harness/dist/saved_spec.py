@@ -8,6 +8,7 @@ an unrelated directory with hostile ambient compiler configuration. Corrupt
 inputs and unsupported input closures must produce no advertised executable.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS))
 import norustc
 import tracedecay
+from owned_macro_server import runtime_record
 
 
 def write(root, name, contents):
@@ -39,11 +41,13 @@ def blocked_toolchain(real, root, audit):
     toolchain = root / "toolchains" / name
     (toolchain / "bin").mkdir(parents=True)
     for entry in real.iterdir():
-        if entry.name != "bin":
+        if entry.name not in ("bin", "libexec"):
             (toolchain / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-    for name in ("rustc", "rustdoc", "cargo", "rustup"):
-        path = toolchain / "bin" / name
-        path.write_text("#!" + (shutil.which("sh") or "/bin/sh") + "\nprintf '%s\\n' " + shlex.quote(name)
+    for tool_name in ("rustc", "rustdoc", "cargo", "rustup", "rust-analyzer-proc-macro-srv"):
+        directory = toolchain / ("libexec" if tool_name == "rust-analyzer-proc-macro-srv" else "bin")
+        directory.mkdir(exist_ok=True)
+        path = directory / tool_name
+        path.write_text("#!" + (shutil.which("sh") or "/bin/sh") + "\nprintf '%s\\n' " + shlex.quote(tool_name)
                         + " >> " + shlex.quote(str(audit)) + "\nexit 97\n")
         path.chmod(0o755)
     write(root, "settings.toml", 'version = "12"\ndefault_toolchain = ' + json.dumps(name) + "\n")
@@ -92,19 +96,162 @@ version = "0.1.0"
 ''')
 
 
+def producer_fixture(root):
+    write(root, "Cargo.toml", '[workspace]\nmembers=["app","mac","words"]\nresolver="2"\n[profile.dev.package.saved-producer-words]\ndebug-assertions=false\n')
+    write(root, "app/Cargo.toml", '[package]\nname="saved-producer-app"\nversion="0.1.0"\nedition="2021"\nbuild="build.rs"\n[dependencies]\nmac={package="saved-producer-mac",path="../mac"}\nwords={package="saved-producer-words",path="../words"}\n')
+    write(root, "app/build.rs", 'fn main() {\nlet out=std::env::var("OUT_DIR").unwrap();\nstd::fs::write(std::path::Path::new(&out).join("generated.rs"), "const GENERATED: u32 = 5;\\n").unwrap();\nprintln!("cargo:rustc-check-cfg=cfg(owned_generated)");\nprintln!("cargo:rustc-cfg=owned_generated");\nprintln!("cargo:rustc-env=PRODUCER_LABEL=owned-build");\n}\n')
+    write(root, "app/src/main.rs", '#[cfg(not(owned_generated))]\ncompile_error!("lost generated cfg");\ninclude!(concat!(env!("OUT_DIR"),"/generated.rs"));\nfn main() { println!("{}|{}", mac::answer!() + words::extra() + GENERATED, env!("PRODUCER_LABEL")); }\n')
+    write(root, "mac/Cargo.toml", '[package]\nname="saved-producer-mac"\nversion="0.1.0"\nedition="2021"\n[lib]\nproc-macro=true\n')
+    write(root, "mac/src/lib.rs", 'extern crate proc_macro;\n#[proc_macro]\npub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { "35u32".parse().unwrap() }\n')
+    write(root, "words/Cargo.toml", '[package]\nname="saved-producer-words"\nversion="0.1.0"\nedition="2021"\n')
+    write(root, "words/src/lib.rs", '#[cfg(debug_assertions)]\ncompile_error!("lost package profile");\npub fn extra() -> u32 { 2 }\n')
+    write(root, "Cargo.lock", 'version=4\n[[package]]\nname="saved-producer-app"\nversion="0.1.0"\ndependencies=["saved-producer-mac","saved-producer-words"]\n[[package]]\nname="saved-producer-mac"\nversion="0.1.0"\n[[package]]\nname="saved-producer-words"\nversion="0.1.0"\n')
+
+
+def native_fixture(root):
+    write(root, "Cargo.toml", '[package]\nname="saved-native"\nversion="0.1.0"\nedition="2021"\nbuild="build.rs"\n')
+    write(root, "Cargo.lock", 'version=4\n[[package]]\nname="saved-native"\nversion="0.1.0"\n')
+    write(root, "answer.c", "unsigned native_answer(void) { return 42; }\n")
+    write(root, "build.rs", r'''fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let object = out.join("answer.o");
+    let library = out.join("libsaved_native.a");
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    assert!(std::process::Command::new(cc).arg("-c").arg("answer.c").arg("-o").arg(&object).status().unwrap().success());
+    let ar = std::env::var_os("AR").unwrap_or_else(|| "ar".into());
+    assert!(std::process::Command::new(ar).arg("crs").arg(&library).arg(&object).status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=saved_native");
+    println!("cargo:rerun-if-changed=answer.c");
+}
+''')
+    write(root, "src/main.rs", 'unsafe extern "C" { fn native_answer() -> u32; }\nfn main() { println!("{}", unsafe { native_answer() }); }\n')
+
+
+def workspace_libraries(root):
+    write(root, "Cargo.toml", '[workspace]\nmembers=["a","b"]\nresolver="2"\n')
+    for name, value in (("a", 41), ("b", 1)):
+        package = "saved-doc-" + name
+        write(root, name + "/Cargo.toml", '[package]\nname=' + json.dumps(package) + '\nversion="0.1.0"\nedition="2021"\n')
+        write(root, name + "/src/lib.rs", '/// ```\n/// assert_eq!(saved_doc_' + name + '::answer(), ' + str(value) + ');\n/// ```\n#[no_mangle]\npub extern "C" fn saved_' + name + '() -> u32 { answer() }\npub fn answer() -> u32 { ' + str(value) + ' }\n')
+    write(root, "Cargo.lock", 'version=4\n[[package]]\nname="saved-doc-a"\nversion="0.1.0"\n[[package]]\nname="saved-doc-b"\nversion="0.1.0"\n')
+
+
+def raw_compiler_case(runner, blaze, real, work, env, oracle_env):
+    if sys.platform != "linux":
+        return
+    source = work / os.fsdecode(b"raw-source-\xff")
+    root = source / "a" / os.fsdecode(b"nested-\xfe") / "src" / os.fsdecode(b"main-\xfd.rs")
+    root.parent.mkdir(parents=True)
+    write(root.parent, "child.rs", "pub fn answer() -> u32 { 42 }\n")
+    write(source, "peer/data", "raw sibling")
+    root.write_text('mod child;\nfn main() { println!("{}|{}", child::answer(), include_str!("../../../peer/data")); }\n')
+    reference = work / "raw-reference"
+    runner.run("raw-filename-reference-build", [real / "bin/rustc", "--edition=2021", "--crate-name", "raw_projection", root, "-o", reference], oracle_env, work, guarded=False)
+    expected, _ = runner.run("raw-filename-reference-run", [reference], oracle_env, work, guarded=False)
+    assert expected == "42|raw sibling\n", expected
+    prefix = work / "raw-logical-namespace"
+
+    def logical(path):
+        parts = []
+        for part in path.parts[1:]:
+            text = ""
+            for ch in part:
+                if 0xDC80 <= ord(ch) <= 0xDCFF:
+                    text += "~%02x" % (ord(ch) - 0xDC00)
+                else:
+                    text += "~7e" if ch == "~" else ch
+            parts.append(text)
+        return str(prefix.joinpath(*parts))
+
+    cfg = subprocess.check_output([real / "bin/rustc", "--print", "cfg"], env=oracle_env, text=True).splitlines()
+    project = {
+        "compiler_mode": True, "blaze_native_projection": str(prefix),
+        "sysroot": str(real), "sysroot_src": str(real / "lib/rustlib/src/rust/library"),
+        "crates": [{"display_name": "raw_projection", "root_module": logical(root), "edition": "2021",
+                    "deps": [], "cfg": cfg, "env": {}, "is_workspace_member": True,
+                    "build": {"label": "raw_projection", "build_file": logical(root), "target_kind": "bin"}}],
+    }
+    descriptor = write(work, "raw-rust-project.json", "{}\n")
+    binary = work / "raw-owned"
+    runner.run("raw-filename-owned-build", [blaze, descriptor, "--crate", "raw_projection", "--out", work / "raw.o", "--exe", binary],
+               dict(env, RA_JIT_PROJECT_STDIN="1", RA_JIT_PROC_MACRO_SERVER="0"), work,
+               private_input=json.dumps(project))
+    actual, _ = runner.run("raw-filename-owned-run", [binary], env, work)
+    assert actual == expected, (actual, expected)
+    assert not prefix.exists(), "native projection created a filesystem mirror"
+
+
+def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile):
+    def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True):
+        expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *command, "--locked", "--offline"], reference_env, project, guarded=False)
+        saved = bundle / (name + ".cbor")
+        runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved, *command], capture_env, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run(name + "-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile)
+        if check_stdout:
+            assert actual == expected, (name, actual, expected)
+        return saved, expected, actual
+
+    raw_compiler_case(runner, blaze, real, work, env, oracle_env)
+    profile = ["--config", "profile.dev.debug=0"]
+    project = work / "producer-profile"
+    producer_fixture(project)
+    _, expected, _ = roundtrip("producer-profile", project, ["run", *profile])
+    assert expected == "42|owned-build\n", expected
+
+    project = work / "native-dependency"
+    native_fixture(project)
+    compiler = shutil.which("cc", path=oracle_env["PATH"])
+    assert compiler, "native C oracle compiler is unavailable"
+    wrapper = write(work, "native-tools/bound-cc", "#!" + (shutil.which("sh") or "/bin/sh") + "\nexec " + shlex.quote(compiler) + ' "$@"\n')
+    wrapper.chmod(0o755)
+    native_env, native_oracle = dict(env, CC=str(wrapper)), dict(oracle_env, CC=str(wrapper))
+    saved, expected, _ = roundtrip("native-dependency", project, ["run", *profile], native_env, native_oracle)
+    assert expected == "42\n", expected
+    results = list(Path(str(saved) + ".outputs").glob("replay-*/result.json"))
+    with wrapper.open("a") as output:
+        output.write("# compiler bytes changed; version and behavior are unchanged\n")
+    runner.run("native-compiler-bytes-changed", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile,
+               expected=None, contains="platform")
+    assert list(Path(str(saved) + ".outputs").glob("replay-*/result.json")) == results
+
+    project = work / "workspace-libraries"
+    workspace_libraries(project)
+    _, _, actual = roundtrip("workspace-libraries", project, ["build", "--workspace", *profile], check_stdout=False)
+    artifacts = json.loads(actual)["artifacts"]
+    assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
+    caller = write(work, "workspace-caller.c", "extern unsigned saved_a(void), saved_b(void);\nint main(void) { return saved_a() + saved_b() == 42 ? 0 : 1; }\n")
+    binary = work / "workspace-caller"
+    support = list(dict.fromkeys(item["runtime"] for item in artifacts if item.get("runtime")))
+    runner.run("workspace-native-link", [compiler, caller, *[item["artifact"] for item in artifacts], *support, "-o", binary], env, hostile)
+    runner.run("workspace-native-run", [binary], env, hostile)
+
+    project = work / "workspace-doctests"
+    workspace_libraries(project)
+    _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
+    from buildspec import parse_run
+    assert parse_run(actual) == parse_run(expected), (actual, expected)
+    assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
+
+
 class Runner:
     def __init__(self, binary, work, memory_mib, timeout):
         self.binary, self.work = binary, work
         self.memory_mib, self.timeout = memory_mib, timeout
         self.rows = []
 
-    def run(self, name, command, env, cwd, expected=0, contains=None, guarded=True):
+    def run(self, name, command, env, cwd, expected=0, contains=None, guarded=True, private_input=None):
         label = "saved-spec-" + uuid.uuid4().hex
         env = dict(env, RA_JIT_RUN_ID=label) if guarded else dict(env)
         started = time.monotonic()
-        child = subprocess.Popen(list(map(str, command)), cwd=cwd, env=env,
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+        argv = list(map(str, command))
+        trace = self.work / (name + ".exec") if guarded and sys.platform == "linux" else None
+        if trace:
+            argv = ["strace", "-f", "-e", "trace=execve", "-o", str(trace), *argv]
+        child = subprocess.Popen(argv, cwd=cwd, env=env,
+                                 stdin=subprocess.PIPE if private_input is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, errors="replace", start_new_session=True)
         watch = None
         if guarded:
             watch = tracedecay.Watchdog(str(self.binary.parent), self.memory_mib,
@@ -120,7 +267,7 @@ class Runner:
                     try:
                         if os.getsid(pid) == child.pid:
                             members.add(pid)
-                    except ProcessLookupError:
+                    except (PermissionError, ProcessLookupError):
                         pass
                 return members | client_tree | tracedecay.descendants(rows, members)
 
@@ -128,7 +275,7 @@ class Runner:
             watch.start()
         timed_out = False
         try:
-            out, err = child.communicate(timeout=self.timeout)
+            out, err = child.communicate(input=private_input, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             if watch:
@@ -145,12 +292,16 @@ class Runner:
                "seconds": round(time.monotonic() - started, 3), "timed_out": timed_out}
         if watch:
             row.update(watch.take())
+        if trace:
+            row["external_execs"] = norustc.external_execs(trace.read_text())
         self.rows.append(row)
-        write(self.work, name + ".log", "$ " + shlex.join(list(map(str, command)))
+        shown = shlex.join(list(map(str, command))).encode("utf-8", "backslashreplace").decode("utf-8")
+        write(self.work, name + ".log", "$ " + shown
               + "\n" + out + err)
         write(self.work, "results.json", json.dumps({"rows": self.rows}, indent=2) + "\n")
         print(f"{name}: exit={child.returncode}, seconds={row['seconds']}", flush=True)
         assert not timed_out and "watchdog" not in row, row
+        assert not row.get("external_execs"), row
         if expected is None:
             assert child.returncode != 0, (name, out, err)
         else:
@@ -167,12 +318,17 @@ def main():
     parser.add_argument("--memory-mib", type=int, default=8192)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--backend", choices=("cranelift", "llvm"), default="cranelift")
+    parser.add_argument("--owned-server", type=Path, required=True,
+                        help="fresh compiler-owned server; supplied only to execution, never to capture")
     parser.add_argument("--linker-library-path", help="explicit captured loader path for an externally packaged native linker")
     args = parser.parse_args()
     assert 0 < args.memory_mib <= tracedecay.WATCHDOG_MB
     assert args.timeout > 0
     blaze, work = args.blaze.resolve(), args.work.resolve()
     work.mkdir(parents=True, exist_ok=False)
+    owned_server = args.owned_server.resolve(strict=True)
+    server_pin = runtime_record(owned_server, blaze)
+    write(work, "owned-server.json", json.dumps(server_pin, indent=2) + "\n")
     # A missing process sampler must fail the guard instead of silently treating
     # every command as a zero-footprint success.
     assert any(pid == os.getpid() for pid, _, _, _ in tracedecay.ps_table(env=False)), "process sampler is unavailable"
@@ -181,13 +337,14 @@ def main():
     audit = work / "product-tools.log"
     blocked = blocked_toolchain(real, work / "rustup", audit)
     controls = []
-    for name in ("rustc", "rustdoc", "cargo", "rustup"):
-        control = subprocess.run([blocked / "bin" / name, "--version"], capture_output=True)
-        controls.append({"tool": name, "path": str(blocked / "bin" / name), "code": control.returncode})
+    for name in ("rustc", "rustdoc", "cargo", "rustup", "rust-analyzer-proc-macro-srv"):
+        path = blocked / ("libexec" if name == "rust-analyzer-proc-macro-srv" else "bin") / name
+        control = subprocess.run([path, "--version"], capture_output=True)
+        controls.append({"tool": name, "path": str(path), "code": control.returncode})
         assert control.returncode == 97, controls
     assert audit.read_text().splitlines() == [row["tool"] for row in controls], controls
     write(work, "tool-controls.json", json.dumps(controls, indent=2) + "\n")
-    audit.unlink()
+    audit.write_text("")
     original = work / "original"
     fixture(original)
     if args.linker_library_path:
@@ -240,7 +397,8 @@ def main():
         write(hostile, ".cargo/config.toml", '[build]\nrustflags=["--cfg", "hostile"]\n')
         write(bundle, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
         hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
-                           CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value")
+                           CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value",
+                           RA_JIT_PROC_MACRO_SERVER=str(owned_server))
         actual, _ = runner.run("replay-after-removal", [blaze, "cargo", "spec", "--run", spec],
                                hostile_env, hostile)
         assert actual == expected, (actual, expected)
@@ -354,7 +512,7 @@ def main():
                    env, hostile)
         runner.run("library-native-run", [native], env, hostile)
 
-        if os.name == "posix":
+        if sys.platform == "linux":
             project = work / "native-source"
             shutil.copytree(template, project)
             words = project / os.fsdecode(b"words-\xff")
@@ -383,7 +541,9 @@ def main():
                        hostile_env, hostile, expected=None, contains="not a valid Unicode string")
             assert not list(Path(str(invalid) + ".outputs").glob("replay-*/result.json"))
 
-        for name in ("check-invalid", "external-include", "native-link"):
+        required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile)
+
+        for name in ("check-invalid", "external-include"):
             project = work / name
             shutil.copytree(template, project)
             if name == "check-invalid":
@@ -392,26 +552,22 @@ def main():
                 external = write(work, "uncaptured\nexternal.txt", "outside source snapshot")
                 write(project, "app/src/main.rs", 'fn main() { println!("{}", include_str!('
                       + json.dumps(str(external)) + ')); }\n')
-            elif name == "native-link":
-                write(project, "app/src/main.rs", '''macro_rules! native {
-    () => { #[link(name="m")] unsafe extern "C" { fn cos(x: f64) -> f64; } };
-}
-native!();
-fn main() {}
-''')
             saved = bundle / (name + ".cbor")
             runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved,
                        "check" if name == "check-invalid" else "build", *selected], env, project)
-            reason = {"check-invalid": "mismatched types", "external-include": "outside the immutable source snapshot",
-                      "native-link": "native link inputs"}[name]
+            reason = {"check-invalid": "mismatched types", "external-include": "outside the immutable source snapshot"}[name]
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name
-        print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
+        print("saved source execution matches Cargo after origin removal; corrupt and unbound inputs refused", flush=True)
     finally:
-        calls = audit.read_text().splitlines() if audit.exists() else []
+        calls = audit.read_text().splitlines()
         write(work, "results.json", json.dumps({"backend": args.backend, "rows": runner.rows,
-              "tool_controls": controls, "product_tool_calls": calls}, indent=2) + "\n")
+              "tool_controls": controls, "product_tool_calls": calls,
+              "owned_server": server_pin,
+              "native_filename_filesystem": "tested" if sys.platform == "linux" else "not applicable: invalid Unix filename fixture requires Linux"}, indent=2) + "\n")
+        assert hashlib.sha256(owned_server.read_bytes()).hexdigest() == server_pin["sha256"], "owned server changed during the gate"
+        assert hashlib.sha256(blaze.read_bytes()).hexdigest() == server_pin["compiler_sha256"], "compiler changed during the gate"
         assert not calls, f"the product invoked blocked compiler tools: {calls}"
 
 

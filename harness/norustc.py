@@ -150,7 +150,7 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
     sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
     marker = os.path.join(toolchain, ".stand-in-log")
-    marker_text = log + ("\nblocked" if block else "") + ("\nblocked-server" if block_macro_server else "")
+    marker_text = log + ("\nblocked-v2" if block else "") + ("\nblocked-server-v2" if block_macro_server else "")
     if os.path.exists(marker) and open(marker).read().strip() == marker_text:
         return toolchain  # made for this log already: every blaze run of the work directory shares it
     if os.path.exists(toolchain):
@@ -168,7 +168,7 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
             shutil.copy2(source, copy)
     for entry in os.listdir(os.path.join(sysroot, "bin")):
         source, copy = os.path.join(sysroot, "bin", entry), os.path.join(toolchain, "bin", entry)
-        if entry not in COUNTED:
+        if entry not in COUNTED and not (block_macro_server and entry == "rust-analyzer-proc-macro-srv"):
             os.symlink(source, copy)
             continue
         if not block:
@@ -176,13 +176,13 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
         with open(copy, "w") as out:
             script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
                                     run_id_env=run_id_env)
-            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 97\n" if block or entry == "rust-analyzer-proc-macro-srv" else script)
         os.chmod(copy, 0o755)
     if block_macro_server:
         source = os.path.join(sysroot, "libexec")
         destination = os.path.join(toolchain, "libexec")
         os.makedirs(destination)
-        for name in os.listdir(source) if os.path.isdir(source) else []:
+        for name in sorted(set(os.listdir(source) if os.path.isdir(source) else []) | {"rust-analyzer-proc-macro-srv"}):
             path = os.path.join(destination, name)
             if name != "rust-analyzer-proc-macro-srv":
                 os.symlink(os.path.join(source, name), path)
@@ -190,19 +190,29 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
                 script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=name, log=shlex.quote(log), real="unused",
                                         run_id_env=run_id_env)
                 with open(path, "w") as output:
-                    output.write(script.rsplit("exec ", 1)[0] + "exit 86\n")
+                    output.write(script.rsplit("exec ", 1)[0] + "exit 97\n")
                 os.chmod(path, 0o755)
     # rustup is outside the toolchain's bin directory. Audit its query/discovery
     # processes too; no row is allowed to hide them by calling them noncompiling.
-    rustup = shutil.which("rustup")
-    if rustup and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
+    rustup = None if block else shutil.which("rustup")
+    if (block or rustup) and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
         copy = os.path.join(toolchain, "bin", "rustup")
         with open(copy, "w") as out:
             script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool="rustup", log=shlex.quote(log),
-                                    real=shlex.quote(os.path.realpath(rustup)),
+                                    real=shlex.quote(os.path.realpath(rustup)) if rustup else "unused",
                                     run_id_env=run_id_env)
-            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 97\n" if block else script)
         os.chmod(copy, 0o755)
+    if block:
+        for name in COUNTED:
+            copy = os.path.join(toolchain, "bin", name)
+            if os.path.exists(copy):
+                continue
+            script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=name,
+                                    log=shlex.quote(log), real="unused", run_id_env=run_id_env)
+            with open(copy, "w") as out:
+                out.write(script.rsplit("exec ", 1)[0] + "exit 97\n")
+            os.chmod(copy, 0o755)
     with open(marker, "w") as f:
         f.write(marker_text + "\n")
     return toolchain
