@@ -277,7 +277,8 @@ pub(crate) fn of(
             .target
             .as_ref()
             .map(|_| TargetPlatform { triple: target, cfg: &target_cfg }),
-        offline: false,
+        offline: selection.offline,
+        locked: selection.locked,
         store: None,
     };
     let (metadata, units, mut sources) =

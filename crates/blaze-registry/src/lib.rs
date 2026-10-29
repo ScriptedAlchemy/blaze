@@ -112,19 +112,47 @@ impl PackageCacheLock {
 
 /// Writes a file under a temporary name and renames it into place, so that a reader finds
 /// all of it or none.
-pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        let target = match std::fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let target = std::fs::read_link(path)?;
+                path.parent().unwrap_or(Path::new(".")).join(target)
+            }
+            Err(error) => return Err(error),
+        };
+        return write_whole(&target, bytes);
+    }
+    let permissions = match std::fs::metadata(path) {
+        Ok(metadata) => {
+            OpenOptions::new().write(true).open(path)?;
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().and_then(|it| it.to_str()).unwrap_or("file");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let temporary = path.with_file_name(format!(".{name}.{}-{nanos}.tmp", std::process::id()));
-    let written = File::create(&temporary).and_then(|mut file| file.write_all(bytes));
+    let (temporary, mut file) = loop {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_file_name(format!(".{name}.{}-{id}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = permissions
+        .map_or(Ok(()), |permissions| file.set_permissions(permissions))
+        .and_then(|()| file.write_all(bytes));
+    drop(file);
     match written.and_then(|()| std::fs::rename(&temporary, path)) {
         Ok(()) => Ok(()),
-        Err(e) => {
+        Err(error) => {
             _ = std::fs::remove_file(&temporary);
-            Err(e)
+            Err(error)
         }
     }
 }

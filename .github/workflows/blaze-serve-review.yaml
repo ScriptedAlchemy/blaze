@@ -59,9 +59,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
-      - name: Test locked native dependency resolution
+      - name: Test owned dependency resolution and Cargo lock parity
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p blaze-metadata -- --test-threads=2
+        run: |
+          cargo test --locked -p blaze-metadata -p blaze-registry -p blaze-resolve --all-targets -- --test-threads=2
+          cargo build --locked -p blaze-metadata --example metadata
+          python3 crates/blaze-metadata/tests/cargo_oracle.py "$PWD/target/debug/examples/metadata"
       - name: Test cleanup control flow with debug assertions
         if: ${{ !cancelled() }}
         run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2

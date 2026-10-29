@@ -707,10 +707,12 @@ dependencies = [
  "blaze-registry",
  "blaze-resolve",
  "cargo-util-schemas",
+ "flate2",
  "rustc-hash 2.1.2",
  "semver",
  "serde",
  "serde_json",
+ "tar",
  "toml",
  "url",
 ]

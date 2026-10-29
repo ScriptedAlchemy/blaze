@@ -2,7 +2,7 @@
 //! which compares it with cargo's.
 //!
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
-//!                 [--all-features] [--no-default-features] [--offline]
+//!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
 //!                  [--programs [--bin NAME | --example NAME]]]
 //!
@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     let mut cfg_file = None;
     let mut features = Vec::new();
     let (mut all_features, mut no_default_features, mut offline) = (false, false, false);
+    let mut locked = false;
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
     let (mut packages, mut excludes) = (Vec::new(), Vec::new());
     let (mut listed, mut bin, mut example) = (false, None, None);
@@ -39,6 +40,11 @@ fn main() -> Result<()> {
             "--all-features" => all_features = true,
             "--no-default-features" => no_default_features = true,
             "--offline" => offline = true,
+            "--locked" => locked = true,
+            "--frozen" => {
+                locked = true;
+                offline = true;
+            }
             "--build" => build = true,
             "--workspace" => workspace = true,
             "--dev-units" => dev_units = true,
@@ -76,6 +82,7 @@ fn main() -> Result<()> {
         }),
         platform: triple.as_deref().map(|triple| TargetPlatform { triple, cfg: &cfg }),
         offline,
+        locked,
         store: None,
     };
     if listed {

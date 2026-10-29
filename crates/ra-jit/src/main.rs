@@ -260,6 +260,7 @@ impl Args {
         let mut no_default_features = false;
         let (mut packages, mut workspace) = (Vec::new(), false);
         let mut all_features = false;
+        let (mut locked, mut offline) = (false, false);
         let mut profile = None;
         let mut config = Vec::new();
         let (mut excludes, mut unstable) = (Vec::new(), Vec::new());
@@ -312,6 +313,12 @@ impl Args {
                 "--exclude" => excludes.push(value()?),
                 "-Z" => unstable.push(value()?),
                 "--all-features" => all_features = true,
+                "--locked" => locked = true,
+                "--offline" => offline = true,
+                "--frozen" => {
+                    locked = true;
+                    offline = true;
+                }
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
                 }
@@ -357,6 +364,8 @@ impl Args {
                 features,
                 no_default_features,
                 all_features,
+                locked,
+                offline,
                 packages,
                 workspace,
                 excludes,
@@ -6072,6 +6081,12 @@ fn selected(args: &Args) -> Vec<String> {
     for config in &selection.config {
         selected.extend(["--config".to_owned(), config.clone()]);
     }
+    if selection.locked {
+        selected.push("--locked".to_owned());
+    }
+    if selection.offline {
+        selected.push("--offline".to_owned());
+    }
     selected
 }
 
@@ -11252,6 +11267,23 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_builds_preserve_lockfile_policy_for_owned_loads() {
+        for (flag, locked, offline) in
+            [("--locked", true, false), ("--offline", false, true), ("--frozen", true, true)]
+        {
+            let args = Args::parse(
+                ["project", "--crate", "app", "--out", "app.o", flag]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!((args.selection.locked, args.selection.offline), (locked, offline));
+            let forwarded = selected(&args);
+            assert_eq!(forwarded.iter().any(|arg| arg == "--locked"), locked);
+            assert_eq!(forwarded.iter().any(|arg| arg == "--offline"), offline);
+        }
+    }
     #[test]
     fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
         let dir = tempfile::tempdir().unwrap();

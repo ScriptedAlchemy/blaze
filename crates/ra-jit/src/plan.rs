@@ -26,6 +26,10 @@ pub(crate) struct Selection {
     pub(crate) features: Vec<String>,
     pub(crate) no_default_features: bool,
     pub(crate) all_features: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) locked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) offline: bool,
     /// The packages asked for with `-p`: none is what `cargo build` builds where it is run.
     pub(crate) packages: Vec<String>,
     /// Whether every member of the workspace is built.
@@ -58,6 +62,8 @@ impl Default for Selection {
             features: Vec::new(),
             no_default_features: false,
             all_features: false,
+            locked: false,
+            offline: false,
             packages: Vec::new(),
             workspace: false,
             excludes: Vec::new(),
@@ -86,6 +92,12 @@ impl Selection {
         }
         if self.all_features {
             flags.push("--all-features".to_owned());
+        }
+        if self.locked {
+            flags.push("--locked".to_owned());
+        }
+        if self.offline {
+            flags.push("--offline".to_owned());
         }
         for package in &self.packages {
             flags.extend(["--package".to_owned(), package.clone()]);

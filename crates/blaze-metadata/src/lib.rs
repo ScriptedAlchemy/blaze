@@ -1,17 +1,11 @@
 //! `cargo metadata --format-version 1` with its `resolve`, made by blaze with no cargo: the
-//! workspace read by blaze-manifest, every package `Cargo.lock` locks fetched by
-//! blaze-registry where cargo would have it and read from its manifest, and the two resolves
-//! of cargo's `resolve_ws_with_opts` made by blaze-resolve, guided by the lock file. Either
-//! the whole workspace's graph, as `cargo metadata` prints it, or that of one build
-//! ([`Build`]), whose features are a build's and not unified over every member
-//! (docs/self-contained.md, "Resolution and fetching").
-//!
-//! What it does not do yet is an error the caller can take to cargo: a lock file that is
-//! missing or that the manifests no longer agree with (choosing versions needs the index,
-//! #321), `[replace]`, a registry with a git index, and a dependency of a registry package
-//! whose `.crate` cannot be fetched.
+//! workspace read by blaze-manifest, versions chosen by blaze-resolve from blaze-registry's
+//! sources, and selected packages fetched and read from their manifests. The previous
+//! `Cargo.lock`, when present, guides version choices; an ordinary resolve creates or
+//! updates it, while `Asked::locked` preserves Cargo's locked contract.
 
 mod graph;
+mod registry;
 mod summary;
 mod units;
 
@@ -57,6 +51,8 @@ pub struct Asked<'a> {
     /// `--filter-platform`: the target's triple and its `cfg`.
     pub platform: Option<TargetPlatform<'a>>,
     pub offline: bool,
+    /// `--locked`; combine with `offline` for `--frozen`.
+    pub locked: bool,
     /// blaze's store, which keeps `.crate` files by their sha256.
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
 }
@@ -226,8 +222,16 @@ fn made(
         bail!("`[replace]` is not read by blaze yet");
     }
     let lock_path = root.join("Cargo.lock");
-    let lock_text = String::from_utf8(ctx.read_source(&lock_path)?)
-        .with_context(|| format!("no lock file at {}", lock_path.display()))?;
+    let lock_text = match ctx.read_source(&lock_path) {
+        Ok(bytes) => Some(
+            String::from_utf8(bytes)
+                .with_context(|| format!("failed to read {}", lock_path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", lock_path.display()));
+        }
+    };
 
     let path_packages = path_packages(&ws, &root, &ctx)?;
     let mut path_deps = PathDeps::default();
@@ -237,27 +241,34 @@ fn made(
         let entry = path_deps.entry(m.package_id.name.clone()).or_default();
         entry.insert(m.package_id.version.clone(), SourceId::for_path(&dir)?);
     }
-    let lock = lockfile::into_resolve(lockfile::parse(&lock_text)?, &lock_text, &path_deps)?;
-    let fetched = fetch(&lock, &ctx, offline, asked.store.clone())?;
+    let lock = lock_text
+        .as_deref()
+        .map(|text| {
+            lockfile::parse(text)
+                .and_then(|parsed| lockfile::into_resolve(parsed, text, &path_deps))
+                .with_context(|| format!("failed to parse {}", lock_path.display()))
+        })
+        .transpose()?;
+    let mut context = blaze_registry::Context::new(
+        ctx.config.home().to_owned(),
+        blaze_registry::http::HyperHttp::shared()?,
+    );
+    context.net.offline = offline;
+    context.store = asked.store.clone();
+    let context = Arc::new(context);
+    let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, context.clone())?;
 
     let mut serialized: Vec<SerializedPackage<'_>> =
         ws.members().map(|(path, m)| export_package(path, m)).collect();
     let member_count = serialized.len();
-    for package in path_packages.iter().chain(&fetched) {
-        let mut it = export_package(&package.manifest_path, &package.manifest);
-        if let Some(source) = &package.locked_source {
-            it.set_source(source.clone());
-        }
-        serialized.push(it);
+    for package in &path_packages {
+        serialized.push(export_package(&package.manifest_path, &package.manifest));
     }
     let mut reads = FxHashMap::default();
     let mut ids = Vec::with_capacity(serialized.len());
     for package in &serialized {
-        let mut read = summary::read(&serde_json::to_value(package)?)?;
+        let read = summary::read(&serde_json::to_value(package)?)?;
         let id = read.summary.package_id();
-        if let Some(Some(checksum)) = lock.checksums().get(&id) {
-            read.summary.set_checksum(checksum.clone());
-        }
         ids.push(id);
         reads.insert(id, read);
     }
@@ -266,14 +277,17 @@ fn made(
     for read in reads.values() {
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
+    let registry = registry::SourcesRegistry::new(registry, &sources, &context, &ctx);
     let patch = summary::patch_tables(&root, &registry, &ctx)?;
     let by_path: FxHashMap<SourceId, Summary> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
         .collect();
-    let member_ids = &ids[..member_count];
-    let members: Vec<&Summary> = member_ids.iter().map(|id| &reads[id].summary).collect();
+    let member_ids = ids[..member_count].to_vec();
+    let member_summaries: Vec<Summary> =
+        member_ids.iter().map(|id| reads[id].summary.clone()).collect();
+    let members: Vec<&Summary> = member_summaries.iter().collect();
     let current =
         ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
     let behavior = match ws.resolve_behavior() {
@@ -290,12 +304,35 @@ fn made(
         replace: &[],
         require_optional_deps: true,
         version_ordering: VersionOrdering::MaximumVersionsFirst,
-        rust_versions: None,
-        resolve_version: ResolveVersion::default(),
+        rust_versions: {
+            let fallback = ctx.config.get_string("resolver.incompatible-rust-versions")?;
+            let fallback = fallback
+                .as_ref()
+                .map(|it| it.val.as_str())
+                .unwrap_or(if behavior == ResolveBehavior::V3 { "fallback" } else { "allow" });
+            match fallback {
+                "allow" => None,
+                "fallback" => {
+                    let mut versions = members
+                        .iter()
+                        .filter_map(|it| it.rust_version())
+                        .map(|it| it.to_partial())
+                        .collect::<Vec<_>>();
+                    if versions.is_empty() {
+                        versions.push(env!("CARGO_PKG_RUST_VERSION").parse()?);
+                    }
+                    Some(versions)
+                }
+                value => bail!("invalid resolver.incompatible-rust-versions value `{value}`"),
+            }
+        },
+        resolve_version: ResolveVersion::with_rust_version(
+            members.iter().filter_map(|it| it.rust_version()).min(),
+        ),
     };
     let specs: Vec<PackageIdSpec> = match &asked.build {
         None => member_ids.iter().map(|id| id.to_spec()).collect(),
-        Some(build) => selected(&ws, member_ids, build)?,
+        Some(build) => selected(&ws, &member_ids, build)?,
     };
     let cli_features = CliFeatures::from_command_line(
         asked.features,
@@ -306,21 +343,39 @@ fn made(
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let (whole, targeted) = resolve_ws(
+    let (mut whole, targeted) = resolve_ws(
         &mut PackageRegistry::new(registry),
         &resolving,
-        Some(&lock),
+        lock.as_ref(),
         &cli_features,
         &specs,
         has_dev_units,
     )?;
-    // This frontend never changes the lock. Cargo's locked contract compares
-    // the resolved packages, edges and checksums, rather than requiring its
-    // preferred comments, whitespace or serialization of equivalent entries.
-    let resolved_lock = lockfile::serialize_resolve(&whole, Some(&lock_text));
-    let locked = lockfile::Locked { flag: "--locked", path: &lock_path, path_deps: &path_deps };
-    if !lockfile::are_equal_lockfiles(&lock_text, &resolved_lock, Some(locked)) {
-        bail!("{} would change: the manifests no longer agree with it", lock_path.display());
+    let locked = asked.locked.then_some(lockfile::Locked {
+        flag: "--locked",
+        path: &lock_path,
+        path_deps: &path_deps,
+    });
+    let lowest_rust_version = members.iter().filter_map(|it| it.rust_version()).min();
+    let new_lock =
+        lockfile::lockfile_to_write(&mut whole, lock_text.as_deref(), lowest_rust_version, locked)?;
+    if let Some(text) = &new_lock {
+        write_lockfile(&lock_path, text)?;
+    }
+    let fetched = fetch(&targeted, &ctx, &sources)?;
+    for package in &fetched {
+        let mut exported = export_package(&package.manifest_path, &package.manifest);
+        if let Some(source) = &package.locked_source {
+            exported.set_source(source.clone());
+        }
+        let mut read = summary::read(&serde_json::to_value(&exported)?)?;
+        let id = read.summary.package_id();
+        if let Some(Some(checksum)) = whole.checksums().get(&id) {
+            read.summary.set_checksum(checksum.clone());
+        }
+        ids.push(id);
+        reads.insert(id, read);
+        serialized.push(exported);
     }
 
     let kinds = match &asked.platform {
@@ -331,7 +386,7 @@ fn made(
     let mut roots = Vec::new();
     let mut resolved_units = Vec::new();
     let resolve = match &asked.build {
-        None => resolve_graph(&targeted, member_ids, current, &packages, &kinds)?,
+        None => resolve_graph(&targeted, &member_ids, current, &packages, &kinds)?,
         Some(build) => {
             let member_features = members_with_features(&members_of(), &specs, &cli_features)?;
             let opts = FeatureOpts::new(behavior, has_dev_units, ForceAllTargets::No);
@@ -388,7 +443,12 @@ fn made(
     if let Some(units) = units {
         *units = resolved_units;
     }
-    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), ctx.sources()))
+    let mut inputs = ctx.sources();
+    if let Some(text) = new_lock {
+        inputs.retain(|(path, _)| path != &lock_path);
+        inputs.push((lock_path, text.into_bytes()));
+    }
+    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), inputs))
 }
 
 /// What the resolve graph and the feature resolver read of the packages.
@@ -503,20 +563,11 @@ fn path_dependencies(package: &serde_json::Value) -> Vec<PathBuf> {
 fn fetch(
     lock: &blaze_resolve::Resolve,
     ctx: &Context,
-    offline: bool,
-    store: Option<Arc<dyn blaze_registry::Blobs>>,
+    sources: &blaze_registry::Sources,
 ) -> Result<Vec<Package>> {
-    let mut context = blaze_registry::Context::new(
-        ctx.config.home().to_owned(),
-        blaze_registry::http::HyperHttp::shared()?,
-    );
-    context.net.offline = offline;
-    context.store = store;
-    let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, Arc::new(context))?;
     let mut locked = Vec::new();
     let mut ids = Vec::new();
-    // The `[[patch.unused]]` entries too, which the resolve has to see to keep them unused.
-    for id in lock.sort().into_iter().chain(lock.unused_patches().iter().copied()) {
+    for id in lock.sort() {
         if id.source_id().is_path() {
             continue;
         }
@@ -553,7 +604,10 @@ fn fetch(
 }
 
 /// The source of a package the lock file pins to `source`, as blaze-manifest names it.
-fn manifest_source(source: &str, config: &Config) -> Result<blaze_manifest::source::SourceId> {
+pub(crate) fn manifest_source(
+    source: &str,
+    config: &Config,
+) -> Result<blaze_manifest::source::SourceId> {
     use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};
     use cargo_util_schemas::core::GitReference;
     let (kind, rest) = source.split_once('+').context("a source with no kind")?;
@@ -627,4 +681,121 @@ fn source_config(config: &Config) -> Result<blaze_registry::SourceConfig> {
     out.crates_io_git =
         config.get_string("registries.crates-io.protocol")?.is_some_and(|it| it.val == "git");
     Ok(out)
+}
+
+fn write_lockfile(path: &Path, text: &str) -> Result<()> {
+    blaze_registry::write_whole(path, text.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod lock_publication_tests {
+    use super::write_lockfile;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "blaze-lock-publication-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_see_only_complete_lockfiles() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        let old = format!("version = 4\n# old {}\n", "x".repeat(64 * 1024));
+        let new = format!("version = 4\n# new {}\n", "y".repeat(64 * 1024));
+        write_lockfile(&path, &old).unwrap();
+        let done = AtomicBool::new(false);
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.wait();
+                for n in 0..128 {
+                    write_lockfile(&path, if n % 2 == 0 { &new } else { &old }).unwrap();
+                }
+                done.store(true, Ordering::Release);
+            });
+            started.wait();
+            let mut reads = 0;
+            while !done.load(Ordering::Acquire) || reads == 0 {
+                let read = std::fs::read_to_string(&path).unwrap();
+                assert!(read == old || read == new, "partial lockfile: {} bytes", read.len());
+                reads += 1;
+            }
+        });
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_preserves_private_permissions_and_symlink_identity() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let target = fixture.0.join("shared.lock");
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&target, "version = 4\n# old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink("shared.lock", &path).unwrap();
+        write_lockfile(&path, "version = 4\n# new\n").unwrap();
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "version = 4\n# new\n");
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_refuses_a_read_only_lockfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&path, "version = 4\n# authoritative\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            return;
+        }
+        assert!(write_lockfile(&path, "version = 4\n# replacement\n").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "version = 4\n# authoritative\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_publication_preserves_the_authoritative_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&path, "version = 4\n# authoritative\n").unwrap();
+        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = fixture.0.join("permission-probe");
+        if std::fs::write(&probe, "").is_ok() {
+            std::fs::remove_file(probe).unwrap();
+            return;
+        }
+        assert!(write_lockfile(&path, "version = 4\n# replacement\n").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "version = 4\n# authoritative\n");
+    }
 }

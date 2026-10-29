@@ -97,7 +97,8 @@ impl ArtifactInputs {
             no_default_features: selection.no_default_features,
             build: None,
             platform: None,
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
         };
         let mut metadata: cargo_metadata::Metadata =

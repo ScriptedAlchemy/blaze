@@ -53,6 +53,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
         return None;
     }
     let selection = selection.clone();
+    let offline = selection.offline;
     let root = |manifest: &project_model::ManifestPath| {
         let manifest: &Path = manifest.as_ref();
         let cwd = manifest.parent().unwrap_or(Path::new("/"));
@@ -98,7 +99,8 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
                 dev_units: selection.dev_deps,
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
         };
         let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
@@ -109,7 +111,9 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),
         metadata: std::sync::Arc::new(metadata),
-        sysroot: std::sync::Arc::new(sysroot_metadata),
+        sysroot: std::sync::Arc::new(move |manifest, config, cfg| {
+            sysroot_metadata(manifest, config, cfg, offline)
+        }),
     })
 }
 
@@ -119,6 +123,7 @@ fn sysroot_metadata(
     manifest: &project_model::ManifestPath,
     config: &project_model::CargoMetadataConfig,
     cfg: &[cfg::CfgAtom],
+    offline: bool,
 ) -> anyhow::Result<Metadata> {
     let manifest: &Path = manifest.as_ref();
     let cwd = manifest.parent().context("std manifest has no directory")?;
@@ -147,7 +152,8 @@ fn sysroot_metadata(
         no_default_features: no_default,
         build: None,
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
-        offline: false,
+        offline,
+        locked: true,
         store: None,
     };
     let json = blaze_metadata::metadata(&asked)?;
@@ -202,7 +208,8 @@ pub(crate) fn programs(
                 dev_units: selection.dev_deps,
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
         };
         Ok(blaze_metadata::programs(&asked, targets)?.1)

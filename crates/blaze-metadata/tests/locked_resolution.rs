@@ -40,6 +40,7 @@ fn metadata(root: &Path) -> anyhow::Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
         build: None,
         platform: None,
         offline: true,
+        locked: true,
         store: None,
     };
     blaze_metadata::metadata_with_sources(&asked)
@@ -73,6 +74,6 @@ fn locked_resolution_accepts_equivalent_toml_but_rejects_changed_edges() {
     let changed = text.replace("dependencies=['dep']\n", "");
     scratch.write("Cargo.lock", &changed);
     let error = metadata(&scratch.0).unwrap_err();
-    assert!(format!("{error:#}").contains("manifests no longer agree"), "{error:#}");
+    assert!(format!("{error:#}").contains("cannot update the lock file"), "{error:#}");
     assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), changed);
 }
