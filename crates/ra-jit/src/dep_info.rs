@@ -27,7 +27,6 @@ impl DepInfo {
         krates: &[hir::Crate],
         asked: &str,
     ) -> anyhow::Result<Self> {
-        use hir_ty::db::HirDatabase as _;
         use ide_db::base_db::SourceDatabase as _;
 
         let mut files = Vec::new();
@@ -152,22 +151,20 @@ impl ReplayTrace {
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        use blaze_wire::InputText;
-        let files: Vec<_> = self.files.iter().cloned().map(InputText).collect();
-        let env: Vec<_> =
-            self.env.iter().map(|(name, value)| (InputText(name.clone()), *value)).collect();
-        blaze_wire::encode(&(2_u32, files, env))
+        blaze_wire::encode(&(2_u32, self.files.clone(), self.env.clone()))
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        use blaze_wire::InputText;
-        let (version, files, env): (u32, Vec<InputText>, Vec<(InputText, Option<[u8; 32]>)>) =
-            blaze_wire::decode(bytes, &blaze_wire::Limits::DOCUMENTED)?;
+        // Native path projection can expand legal filenames past the general string
+        // budget. This private trace remains bounded by the complete message limit.
+        let limits = blaze_wire::Limits {
+            string: blaze_wire::Limits::DOCUMENTED.request,
+            ..blaze_wire::Limits::DOCUMENTED
+        };
+        let (version, files, env): (u32, Vec<String>, Vec<(String, Option<[u8; 32]>)>) =
+            blaze_wire::decode(bytes, &limits)?;
         anyhow::ensure!(version == 2, "unknown replay input trace version {version}");
-        Ok(Self {
-            files: files.into_iter().map(|file| file.0).collect(),
-            env: env.into_iter().map(|(name, value)| (name.0, value)).collect(),
-        })
+        Ok(Self { files, env })
     }
 
     pub(crate) fn value_matches(
@@ -304,8 +301,8 @@ mod tests {
         assert!(ensure_replay_key(&mut serde_json::Value::Null).is_err());
         let malformed = blaze_wire::encode(&(
             2_u32,
-            vec![blaze_wire::InputText("/source/lib.rs".into())],
-            vec![(blaze_wire::InputText("TOKEN".into()), Some([1_u8; 31]))],
+            vec![String::from("/source/lib.rs")],
+            vec![(String::from("TOKEN"), Some([1_u8; 31]))],
         ));
         assert!(ReplayTrace::decode(&malformed).is_err());
     }

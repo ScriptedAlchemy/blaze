@@ -989,7 +989,13 @@ impl Resolver<'_> {
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
         let place = crate_place(&root, self.inside(&root), home.as_deref(), &self.root);
-        let named = format!("ra-jit crate {} {place}", name.crate_name());
+        let mut named = format!("ra-jit crate {} {place}", name.crate_name());
+        if let Some(unit) = krate.extra_data(self.db).blaze_native_unit {
+            // Captured compiler instances can share source and library name while
+            // carrying different cfg, environment or native options. Their stable
+            // graph IDs distinguish linkage without renaming it on a source edit.
+            named.push_str(&format!(" compiler unit {unit}"));
+        }
         Some(short_hash(&named))
     }
 
