@@ -392,6 +392,41 @@ fn main() {}
         runner.run("option-env-set-refusal", [blaze, "cargo", "spec", "--run", saved],
                    dict(hostile_env, SAVED_SPEC_SET="worker-value"), hostile, expected=None,
                    contains="undeclared environment value SAVED_SPEC_SET")
+        # A tool the requester shipped is never run by the worker: CC names a script in the
+        # tree, and the platform names it by its bytes.
+        marker = work / "requester-tool-ran"
+        project = standalone(work, "requester-tool", {
+            "Cargo.toml": '[package]\nname="requester-tool"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { println!("built"); }\n',
+            "tools/cc": "#!/bin/sh\necho ran >> " + shlex.quote(str(marker)) + "\necho cc\n"})
+        (project / "tools/cc").chmod(0o755)
+        expected, _ = runner.run("requester-tool-reference", [real / "bin/cargo", "run",
+            "--locked", "--offline"], oracle_env, project, guarded=False)
+        saved = bundle / "requester-tool.cbor"
+        requester = dict(env, CC="./tools/cc")
+        runner.run("requester-tool-save", [blaze, "cargo", "spec", "--out", saved, "run"],
+                   requester, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("requester-tool-replay", [blaze, "cargo", "spec", "--run", saved],
+                               dict(hostile_env, CC="./tools/cc"), hostile)
+        assert actual == expected, (actual, expected)
+        assert not marker.exists(), "a tool from the requester's tree was run"
+        # A Cargo home that is an ancestor's .cargo (here $HOME/.cargo, with no CARGO_HOME) is
+        # nearer than the files above it, and stays so in the replay.
+        layers = work / "layers"
+        write(layers, ".cargo/config.toml", '[env]\nLAYER_VALUE="from-above"\n')
+        write(layers, "home/.cargo/config.toml", '[env]\nLAYER_VALUE="from-home"\n')
+        project = standalone(layers / "home", "proj", {
+            "Cargo.toml": '[package]\nname="layered"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { println!("{}", env!("LAYER_VALUE")); }\n'})
+        homed = {key: value for key, value in env.items() if key != "CARGO_HOME"}
+        homed.update(HOME=str(layers / "home"))
+        homed_oracle = {key: value for key, value in oracle_env.items() if key != "CARGO_HOME"}
+        homed_oracle.update(HOME=str(layers / "home"))
+        expected = saved_equals_cargo(runner, blaze, real, "home-layers", project, homed,
+            homed_oracle, {key: value for key, value in hostile_env.items() if key != "CARGO_HOME"},
+            hostile, bundle)
+        assert expected == "from-home\n", expected
         print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
     finally:
         calls = audit.read_text().splitlines() if audit.exists() else []
