@@ -624,11 +624,13 @@ fn source_path(
     let source_root = db.source_root(source_root).source_root(db);
     let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
     let path = paths::native::resolve(Path::new(&logical)).ok()?;
-    let base = base.and_then(|base| path.strip_prefix(base).ok());
+    let root = paths::native::resolve(root).ok()?;
+    let base = base.and_then(|base| paths::native::resolve(base).ok());
+    let base = base.as_deref().and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
     let relative =
-        (!source_root.is_library).then(|| path.strip_prefix(root).ok().or(base)).flatten();
+        (!source_root.is_library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
     Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
@@ -2137,6 +2139,16 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
     let mut found = crates_called(db, krate, args);
+    if !args.library
+        && krate == args.krate
+        && std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && let Some(unit) =
+            crate::compiler_json::source_unit(&crate::compiler_json::read(&args.project)?)?
+    {
+        found.retain(|krate| {
+            ide_db::base_db::Crate::from(*krate).extra_data(db).blaze_native_unit == Some(unit)
+        });
+    }
     if args.library {
         found.retain(|it| ide_db::base_db::Crate::from(*it).data(db).origin.is_lang());
     }
@@ -3314,11 +3326,12 @@ fn workspace_at(
     {
         let private = crate::compiler_json::read(project)?;
         crate::compiler_json::install_native(&private)?;
+        let source_root = crate::compiler_json::source_root(&private)?;
         let data: project_model::ProjectJsonData = serde_json::from_value(private)
             .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
         let json = project_model::ProjectJson::new(
             Some(manifest.manifest_path().to_owned()),
-            manifest.manifest_path().parent(),
+            source_root.as_deref().unwrap_or_else(|| manifest.manifest_path().parent()),
             data,
         );
         ProjectWorkspace::load_inline(json, &config, &|_| {})?

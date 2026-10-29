@@ -1136,7 +1136,16 @@ impl<'a> Runner<'a> {
             .join(self.profiles.get_dir_name())
             .join("build")
             .join(format!("{}-{hash:016x}", data.name));
-        let described = crate::cargo::own_script::planned_description(&self.sysroot, crates);
+        let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
+        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
+        let described = crate::cargo::own_script::with_mode(
+            crate::cargo::own_script::planned_description(&self.sysroot, crates),
+            crate::cargo::own_script::SourceMode::Cargo {
+                root: self.cargo.workspace_root().as_ref(),
+                members: &members,
+                env: &env,
+            },
+        )?;
         let fingerprint = fresh::hash_bytes(
             json!([described, self.host_flags, self.rustc]).to_string().as_bytes(),
         );
@@ -1149,7 +1158,6 @@ impl<'a> Runner<'a> {
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         let began = SystemTime::now();
-        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         crate::cargo::own_script::link_planned(&described, &dir, &exe, &inputs, &env)?;
         // What was read is dated when the compile began, as cargo dates its dep-info: a file
         // written while it compiled is a change for the next build.
@@ -1246,12 +1254,17 @@ impl<'a> Runner<'a> {
             self.add_source(package, &mut crates, &mut FxHashMap::default())?;
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
+            let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
             crate::cargo::producer_image::link(
                 &self.sysroot,
                 crates,
                 &dir,
                 &env,
-                crate::cargo::own_script::SourceMode::Legacy,
+                crate::cargo::own_script::SourceMode::Cargo {
+                    root: self.cargo.workspace_root().as_ref(),
+                    members: &members,
+                    env: &env,
+                },
             )
             .map_err(|it| format!("{it:#}"))
         })();
@@ -1408,6 +1421,7 @@ impl<'a> Runner<'a> {
             cfg.extend(ran.output.cfgs.iter().cloned());
         }
         Ok(crate::cargo::own_script::Planned {
+            workspace_member: data.is_member,
             name: name.to_owned(),
             root: root.to_owned(),
             edition: data.edition.to_string(),

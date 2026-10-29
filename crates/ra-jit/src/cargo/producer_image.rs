@@ -323,7 +323,7 @@ pub(crate) fn link(
     let inputs = attempt.join("producer.inputs");
     let bytes = std::fs::read(&inputs)?;
     let files = match mode {
-        own_script::SourceMode::Legacy => {
+        own_script::SourceMode::Legacy | own_script::SourceMode::Cargo { .. } => {
             crate::dep_info::DepInfo::parse(std::str::from_utf8(&bytes)?).files
         }
         own_script::SourceMode::Captured { .. } => {

@@ -208,6 +208,7 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
     let plan = crate::cargo::own_script::planned_description(
         sysroot,
         vec![crate::cargo::own_script::Planned {
+            workspace_member: false,
             proc_macro: None,
             name: probe.name.clone(),
             root: source,

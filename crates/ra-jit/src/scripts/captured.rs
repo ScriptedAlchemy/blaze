@@ -525,6 +525,7 @@ mod tests {
     fn node(name: &str, kind: Kind, host: bool, deps: &[(&str, usize)]) -> Unit {
         Unit {
             source: Planned {
+                workspace_member: false,
                 name: name.into(),
                 root: std::env::temp_dir().join(format!("{name}.rs")),
                 edition: "2021".into(),

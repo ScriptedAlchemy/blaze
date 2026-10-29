@@ -75,6 +75,27 @@ fn decoded(value: &Value) -> anyhow::Result<Option<PathBuf>> {
 
 const PROJECTION_FIELD: &str = "blaze_native_projection";
 
+/// The workspace used for source names by an owned compiler description.
+pub(crate) fn source_root(project: &Value) -> anyhow::Result<Option<paths::AbsPathBuf>> {
+    let Some(root) = project.get("blaze_compiler_source_root") else { return Ok(None) };
+    source_unit(project)?;
+    let root = root["path"].as_str().context("invalid owned source naming root")?;
+    let root = paths::AbsPathBuf::try_from(root)
+        .map_err(|_| anyhow::anyhow!("owned source naming root is not absolute"))?;
+    Ok(Some(root))
+}
+
+pub(crate) fn source_unit(project: &Value) -> anyhow::Result<Option<u32>> {
+    let Some(root) = project.get("blaze_compiler_source_root") else { return Ok(None) };
+    ensure!(
+        project["compiler_mode"] == json!(true) && root["version"] == json!(1),
+        "unknown owned compiler source naming format"
+    );
+    let unit = serde_json::from_value(root["unit"].clone())
+        .map_err(|_| anyhow::anyhow!("invalid owned compiler root unit"))?;
+    Ok(Some(unit))
+}
+
 fn projection(project: &Value) -> anyhow::Result<Option<paths::native::Projection>> {
     let Some(prefix) = project.get(PROJECTION_FIELD) else { return Ok(None) };
     let prefix = prefix.as_str().context("invalid native path namespace")?;
@@ -303,6 +324,48 @@ mod tests {
         assert!(logical.is_absolute());
         assert_eq!(physical_path(&sent, logical).unwrap(), native);
         assert!(!native.exists());
+    }
+
+    #[test]
+    fn source_naming_root_requires_the_owned_versioned_absolute_contract() {
+        let work = tempfile::tempdir().unwrap();
+        let mut project = json!({
+            "compiler_mode": true,
+            "blaze_compiler_source_root": {"version": 1, "unit": 7, "path": work.path()},
+        });
+        assert_eq!(Path::new(source_root(&project).unwrap().unwrap().as_str()), work.path());
+        assert_eq!(source_unit(&project).unwrap(), Some(7));
+        project["blaze_compiler_source_root"]["unit"] = json!(u64::from(u32::MAX) + 1);
+        assert!(source_root(&project).is_err());
+        project["blaze_compiler_source_root"]["unit"] = json!(7);
+        project["blaze_compiler_source_root"]["version"] = json!(2);
+        assert!(source_root(&project).is_err());
+        project["blaze_compiler_source_root"]["version"] = json!(1);
+        project["blaze_compiler_source_root"]["path"] = json!("relative");
+        assert!(source_root(&project).is_err());
+        project["blaze_compiler_source_root"]["path"] = json!(work.path());
+        project["compiler_mode"] = json!(false);
+        assert!(source_root(&project).is_err());
+        assert!(source_root(&json!({})).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn source_naming_root_round_trips_native_bytes_without_creating_native_files() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join(OsString::from_vec(b"workspace-\xff".to_vec()));
+        let project = json!({
+            "compiler_mode": true,
+            "blaze_compiler_source_root": {"version": 1, "unit": 7, "path": path(&root)},
+        });
+        let sent: Value = serde_json::from_slice(
+            &write(&work.path().join("rust-project.json"), &project).unwrap(),
+        )
+        .unwrap();
+        let logical = source_root(&sent).unwrap().unwrap();
+        assert_eq!(physical_path(&sent, Path::new(logical.as_str())).unwrap(), root);
+        assert!(!root.exists());
     }
 
     #[test]
