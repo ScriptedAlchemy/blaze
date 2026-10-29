@@ -122,11 +122,31 @@ unfinished as a general compiler interface. The frontend can report some
 source errors, including cfg-expanded channel gates, but cannot certify
 compiler acceptance: stability, privacy, const validity, dyn compatibility
 and unresolved signatures are not fully checked. An apparently valid probe
-therefore refuses loudly, as an undecided operation. No successful compile
-probe is published until those checks are complete. Unknown artifact
+through that partial checker therefore refuses loudly, as an undecided
+operation. It publishes no successful compile probe until those checks are complete. Unknown artifact
 operations and bootstrap feature attributes also record a failure
 which the runner checks before publishing successful script output. A script
 cannot swallow an unsupported operation and silently select incomplete cfgs.
+
+An empty library translation unit now has a separate complete proof in
+`syntax::empty_crate`: every syntax node and token must be accounted for, with
+no items, recovery, conditional attributes or unchecked crate attributes. An
+exact inner `no_std` attribute selects core; ordinary empty source selects
+std. Both require the corresponding source libraries. The owned compiler
+validates the crate name, edition, target and emission request, then atomically
+writes a genuine `.ll` module with the owned target layout and triple,
+including macOS deployment-version clamping. Unknown codegen options and
+other requested artifacts remain unsupported. No compiler or Cargo process
+implements this case.
+
+On 2026-10-29, the real `autocfg` 1.5.1 constructor and the cached `memoffset`
+0.6.5 and 0.9.1 build scripts produced identical version decisions and cargo
+cfg output through the owned launcher and a separate Rust 1.99 oracle. The
+product's compiler tools were blocked and counted: zero calls, no unsupported
+marker or swallowed probe warning. The `autocfg` constructor consumed its
+emitted LLVM files normally. This closes the empty-source constructor failure;
+it does not establish the rest of the proc-macro server bootstrap or broaden
+the partial checker's acceptance.
 
 `harness/dist/producer_scripts.py` uses the vendored token producer with a
 default feature and build script. It compares expansion with an independent
@@ -144,7 +164,7 @@ The P8 review's 22 cases now require oracle parity or a loud undecided refusal.
 The default registry compiler-probe closure currently refuses; its earlier
 success is not current parity evidence. `producer_probes.py` also checks
 known errors and explicit undecided/bootstrap refusals. This is not a general
-metadata-emission or feature-catalog parity claim. Complete compiler checks,
-nested producer scheduling and image generation
-reuse still need implementation. Both cold paths and the native server
-bootstrap retain their old handoff. The PR stays draft and strict gate FAIL.
+metadata-emission or feature-catalog parity claim. The current default cold
+route is documented in [cargo.md](../cargo.md); neither that routing change
+nor the empty-library proof establishes full compiler acceptance or a passing
+strict native-server bootstrap gate.

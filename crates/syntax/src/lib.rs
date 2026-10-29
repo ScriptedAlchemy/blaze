@@ -40,6 +40,7 @@ mod validation;
 
 pub mod algo;
 pub mod ast;
+pub mod empty_crate;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod hacks;
