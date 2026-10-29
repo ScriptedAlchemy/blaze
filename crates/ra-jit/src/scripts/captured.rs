@@ -259,15 +259,16 @@ fn configure(
     run: &unit::Unit,
     output: &Output,
 ) {
+    source.out_dir = Some(run.out_dir.clone());
     source.cfg.extend(output.cfgs.clone());
-    source.env.extend(output.env.iter().cloned());
-    native.env.extend(output.env.iter().map(|(key, value)| (key.into(), value.into())));
     native.env.insert("OUT_DIR".into(), run.out_dir.as_os_str().to_owned());
     if let Some(out) = run.out_dir.to_str() {
         source.env.insert("OUT_DIR".into(), out.into());
     } else {
         source.env.remove("OUT_DIR");
     }
+    source.env.extend(output.env.iter().cloned());
+    native.env.extend(output.env.iter().map(|(key, value)| (key.into(), value.into())));
     fn flags(source: &mut Planned, native: &mut NativeUnit, args: Vec<OsString>) {
         if let Some(text) = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>() {
             source.codegen_flags.extend(text.into_iter().map(str::to_owned));
@@ -635,6 +636,7 @@ mod tests {
     fn node(name: &str, kind: Kind, host: bool, deps: &[(&str, usize)]) -> Unit {
         Unit {
             source: Planned {
+                out_dir: None,
                 workspace_member: false,
                 name: name.into(),
                 root: std::env::temp_dir().join(format!("{name}.rs")),
@@ -669,6 +671,21 @@ mod tests {
         };
         graph.units[1].run = Some(0);
         graph
+    }
+
+    #[test]
+    fn script_out_dir_directive_wins_for_host_compilation() {
+        let mut source = node("helper", Kind::Rust, true, &[]).source;
+        let mut native = NativeUnit::default();
+        let mut run = unit::Unit::default();
+        run.out_dir = "/actual/generated/out".into();
+        let output =
+            Output { env: vec![("OUT_DIR".into(), "/script-marker".into())], ..Default::default() };
+        configure(&mut source, &mut native, &unit::Target::default(), &run, &output);
+        assert_eq!(source.env["OUT_DIR"], "/script-marker");
+        assert_eq!(native.env[std::ffi::OsStr::new("OUT_DIR")], "/script-marker");
+        assert_eq!(source.out_dir.as_deref(), Some(Path::new("/actual/generated/out")));
+        assert_eq!(run.out_dir, Path::new("/actual/generated/out"));
     }
 
     #[test]
