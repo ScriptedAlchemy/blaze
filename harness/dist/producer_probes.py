@@ -46,6 +46,10 @@ def main():
         ("bootstrap", '#![feature(proc_macro_span)]\npub fn value() {}\n', [], True),
         ("stable-span", "extern crate proc_macro;\npub fn line(s: proc_macro::Span) -> usize { s.line() }\n",
          [], False),
+        # Errors rust-analyzer finds in lowering, which the borrow checker never sees.
+        ("destructuring-record-update", "pub struct S { pub a: u8 }\n"
+         "pub fn f(s: S) -> u8 { let a; S { a, ..s } = S { a: 1 }; a }\n", [], False),
+        ("missing-body", "pub fn f();\n", [], False),
     ]
     rows = []
     cached = Path(producer_plan.source_macro.source("proc-macro2")).parent / "probe"

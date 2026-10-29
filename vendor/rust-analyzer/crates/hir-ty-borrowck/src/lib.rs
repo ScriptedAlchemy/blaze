@@ -90,7 +90,7 @@ pub struct BorrowckDiagnostic {
 pub struct BorrowckResult {
     pub diagnostics: Vec<BorrowckDiagnostic>,
     /// Why the body, or a closure in it, was not checked: MIR lowering does not support
-    /// something in it.
+    /// something in it, or, for the compiler's check, an error kept it from being made.
     pub skipped: Option<String>,
 }
 
@@ -119,8 +119,16 @@ fn borrowck_in_mode<'db>(
     }
     let owner = InferBodyId::DefWithBodyId(def);
     let infer = InferenceResult::of(db, owner);
+    // A compiler check that was not made is no answer: the error that kept it from being
+    // made may be rust-analyzer's alone, and the body is then unchecked, not accepted.
+    let unchecked = |mut result: BorrowckResult, why: &str| {
+        if compiler {
+            result.skipped = Some(why.to_owned());
+        }
+        result
+    };
     if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
-        return result;
+        return unchecked(result, "the body has an error in its types");
     }
     // rustc borrow checks no body its lowering or type check found an error in, which an
     // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
@@ -128,7 +136,7 @@ fn borrowck_in_mode<'db>(
     if source_map.diagnostics().iter().any(|it| {
         !matches!(it, hir_def::expr_store::ExpressionStoreDiagnostics::InactiveCode { .. })
     }) {
-        return result;
+        return unchecked(result, "the body has an error in its lowering");
     }
     // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
     // borrow checked; a `const` is checked all the same.

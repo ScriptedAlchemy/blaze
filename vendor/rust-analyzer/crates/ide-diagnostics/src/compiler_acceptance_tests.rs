@@ -310,6 +310,37 @@ fn source_acceptance_rejects_only_certain_type_mismatches() {
     }
 }
 
+/// A body the borrow checker did not check is no answer: rustc may accept it, or reject it
+/// for what kept the check from being made, so the probe is undecided unless an error that
+/// decides it was found.
+#[test]
+fn source_acceptance_leaves_an_unchecked_body_undecided() {
+    let result = checked(
+        "pub struct S { pub a: u8 }\n\
+         pub fn f(s: S) -> u8 { let a; S { a, ..s } = S { a: 1 }; a }\n",
+    );
+    assert!(
+        result.unsupported.iter().any(|it| it.contains("borrow checking not done")),
+        "{result:?}"
+    );
+    let result = checked("pub fn value() -> u32 { let f = 1u8; f }\n");
+    assert!(
+        result.unsupported.iter().any(|it| it.contains("borrow checking not done")),
+        "{result:?}"
+    );
+}
+
+/// A function must have a body but in a trait or an `extern` block.
+#[test]
+fn source_acceptance_rejects_a_function_without_a_body() {
+    for fixture in ["pub fn f();\n", "pub struct S;\nimpl S { pub fn f(); }\n"] {
+        let result = checked(fixture);
+        assert!(result.errors.iter().any(|it| it.contains("without a body")), "{result:?}");
+    }
+    let declared = checked("pub trait T { fn f(); }\nextern \"C\" { pub fn g(); }\n");
+    assert_eq!(declared, Default::default());
+}
+
 /// A method of a trait's impl is written without `pub`, and is as visible as the trait.
 #[test]
 fn source_acceptance_takes_trait_impl_items_as_visible_as_their_trait() {

@@ -72,6 +72,16 @@ impl<'db> Check<'db> {
                     .is_some(),
             };
             if !has_body {
+                // rust-analyzer reports a constant, static or type alias without one, not a
+                // function: one outside a trait or an `extern` block must have a body.
+                if let DefWithBodyId::FunctionId(id) = def
+                    && matches!(
+                        id.lookup(db).container,
+                        hir_def::ItemContainerId::ModuleId(_) | hir_def::ItemContainerId::ImplId(_)
+                    )
+                {
+                    self.result.errors.push("function without a body".into());
+                }
                 return;
             }
         }
@@ -286,8 +296,10 @@ impl<'db> Check<'db> {
                         self.result.unsupported.push(format!("borrow checking: {}", diag.message));
                     }
                 }
+                // Undecided, never a "no": rustc may accept what the borrow checker could
+                // not check. An error that decides the probe is in `errors` already.
                 if let Some(reason) = &borrowed.skipped {
-                    self.result.unsupported.push(format!("borrow checking: {reason}"));
+                    self.result.unsupported.push(format!("borrow checking not done: {reason}"));
                 }
                 match def {
                     DefWithBodyId::ConstId(id) => {

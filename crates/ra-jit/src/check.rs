@@ -130,8 +130,13 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
             .into_iter()
             .filter(|it| it.severity == ide_db::Severity::Error)
             .filter(|it| {
-                matches!(it.code, ide_diagnostics::DiagnosticCode::RustcHardError(_))
-                    || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
+                // A syntax error found in lowering, as `..base` in a destructuring assignment
+                // or a free function without a body, is one rustc reports too.
+                matches!(
+                    it.code,
+                    ide_diagnostics::DiagnosticCode::RustcHardError(_)
+                        | ide_diagnostics::DiagnosticCode::SyntaxError
+                ) || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
             })
             .partition(|it| {
                 let code = it.code.as_str();
