@@ -413,7 +413,8 @@ fn judge_locked_inner(
     let recorded = unit.recorded()?;
     // A build-dependency's script that runs makes cargo compile this script again before it
     // runs it, and the daemon compiles nothing: the build is cargo's, which finds the run made
-    // here, and runs this script once.
+    // here, and runs this script once. A handoff to cargo, a bug of the rule:
+    // docs/no-rustc.md#a-build-dependencys-script-that-ran-again.
     for dep in
         cargo.dependencies.iter().filter(|it| it.build_parents.iter().any(|it| it == out_dir))
     {

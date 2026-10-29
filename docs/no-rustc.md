@@ -936,6 +936,25 @@ is a proc macro is refused with the reason; `harness/scriptedits.py` holds the r
 `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole build
 ([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md), "blaze runs the scripts").
 
+#### A build-dependency's script that ran again
+
+A build script whose package has a build-dependency with `links` is handed to cargo when that
+dependency's script runs again (`cargo/script.rs` `judge_locked_inner`: "has a
+build-dependency, `native`, whose script ran again, so cargo builds this script again"). Cargo
+1.99 gives the parent's run no edge to a build-dependency's run, but that run makes cargo build
+the dependency's library again, and with it the parent's script, which it then runs. The daemon
+judges a script by running the executable rustc linked, and compiles none: a run of the old
+executable is not cargo's run of the new one, and a script that counts its runs or reads what
+the library generated would print something else (`harness/edges.py`, `build-dep-counter`: the
+daemon's own judgment printed `none1 7` where cargo prints `none2 7`). So the daemon keeps the
+dependency's run for cargo's leg, which uses it and compiles and runs the parent's script once,
+and the program is cargo's (`edges.py` `build-dep` and `build-dep-counter`, every step equal).
+Owning it needs the hybrid build's judgment to compile the parent's script itself when a library
+it links was built again, as the whole build does (`own_script::link_planned`, step I), with
+cargo 1.99's rule for when the script's compile is fresh (its dep-info and the fingerprints of
+the libraries it links), and the new executable then judged and run here as any other. Only a
+build-dependency with `links` is followed this way; one without is not (not measured).
+
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,
 loads. `proc_macro` is ra-jit's from F, so the bridge matches the server, which is built from the
