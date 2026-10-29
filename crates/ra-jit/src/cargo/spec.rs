@@ -453,7 +453,12 @@ fn compile(
     command.arg("--exe").arg(&program.executable);
     command.arg("--inputs").arg(dir.join("inputs.cbor"));
     if program.harness {
-        command.arg("--cfg-test");
+        // The prebuilt std unit excludes libtest. Compile that runtime with the
+        // harness, selecting its source even when the application is named `test`.
+        let library = program.project["sysroot_src"]
+            .as_str()
+            .context("test compiler description has no sysroot sources")?;
+        command.args(["--cfg-test", "--crate"]).arg(Path::new(library).join("test/src/lib.rs"));
     }
     let output = command.output().context("starting the owned replay compiler")?;
     std::fs::write(dir.join("compiler.log"), &output.stderr)?;
