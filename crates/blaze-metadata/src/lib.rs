@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail, ensure};
-use blaze_manifest::config::RegistryConfig;
+use blaze_manifest::config::{Discovery, RegistryConfig};
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::{SerializedPackage, export, export_package, root_manifest};
 use blaze_manifest::{Config, Context, Workspace};
@@ -217,7 +217,7 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
 
 /// The metadata of `asked`, and the ids of the members its build selects.
 fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
-    let (ctx, offline) = open(asked, "metadata", None)?;
+    let (ctx, offline) = open(asked, "metadata", Discovery::Live)?;
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let locked = Locked::read(&ws, &ctx, offline, asked.store.clone())?;
     let world = World::new(&ws, &locked)?;
@@ -287,18 +287,9 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
 
 /// The configuration `asked` is read with, for the command cargo would be run as, and whether
 /// the run is offline.
-fn open(
-    asked: &Asked<'_>,
-    command: &str,
-    discovery_root: Option<&Path>,
-) -> Result<(Context, bool)> {
-    let mut config = match &asked.cargo_home {
-        Some(home) => Config::load_with_home(asked.cwd, asked.env.clone(), &[], home.clone())?,
-        None => Config::load(asked.cwd, asked.env.clone(), &[])?,
-    };
-    if let Some(root) = discovery_root {
-        config = config.with_discovery_root(root)?;
-    }
+fn open(asked: &Asked<'_>, command: &str, discovery: Discovery<'_>) -> Result<(Context, bool)> {
+    let mut config =
+        Config::load_in(asked.cwd, asked.env.clone(), &[], asked.cargo_home.clone(), discovery)?;
     config.start(command, asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
     Ok((Context::new(config), offline))

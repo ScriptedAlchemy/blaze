@@ -133,7 +133,7 @@ pub fn context<'a>(
     let _ = fixture;
     Context {
         source_root: None,
-        config_root: None,
+        config: blaze_manifest::config::Discovery::Live,
         native_env: None,
         cwd,
         env,

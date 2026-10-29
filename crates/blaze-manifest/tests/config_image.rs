@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use blaze_manifest::Config;
-use blaze_manifest::config::{ConfigImage, ConfigRelativePath};
+use blaze_manifest::config::{ConfigImage, ConfigRelativePath, Discovery};
 
 struct Tree {
     root: PathBuf,
@@ -452,4 +452,32 @@ fn image_file_paths_retain_native_bytes() {
     let config = tree.replay(&tree.root, &[], image).unwrap();
     assert_eq!(config.get::<u32>("build.jobs").unwrap(), 2);
     assert_eq!(config.sources(), [(path, bytes)]);
+}
+
+#[test]
+fn a_live_walk_reports_the_layers_that_replay_the_same_precedence() {
+    let tree = Tree::new();
+    // The Cargo home is an ancestor's `.cargo` too, and lies between two others: live discovery
+    // visits it there and skips it at the end.
+    tree.write(".cargo/config.toml", "[env]\nWHO='root'\nROOT_ONLY='root'\n");
+    tree.write("work/.cargo/config.toml", "[env]\nWHO='home'\nHOME_ONLY='home'\n");
+    let cwd = tree.root.join("work/member");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = tree.root.join("work/.cargo");
+    let live = Config::load_in(&cwd, tree.env(), &[], Some(home.clone()), Discovery::Live).unwrap();
+    assert_eq!(live.env_config().unwrap()["WHO"], OsString::from("home"));
+    let layers = live.layers();
+    assert_eq!(
+        layers,
+        [tree.root.join("work/.cargo/config.toml"), tree.root.join(".cargo/config.toml")]
+    );
+
+    let image = ConfigImage { layers, files: live.sources().into_iter().collect() };
+    // A tree that no longer has the files, or has others, cannot change what replays.
+    tree.write(".cargo/config.toml", "[poisoned");
+    tree.write("work/member/.cargo/config.toml", "[env]\nWHO='worker'\n");
+    let replay =
+        Config::load_in(&cwd, tree.env(), &[], Some(home), Discovery::Image(&image)).unwrap();
+    assert_eq!(replay.env_config().unwrap(), live.env_config().unwrap());
+    assert_eq!(replay.layers(), live.layers());
 }

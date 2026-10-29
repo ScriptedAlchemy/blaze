@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail, ensure};
+use blaze_manifest::config::{ConfigImage, Discovery};
 use blaze_wire::{
     BuildSpec, ConfigEnvValue, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity, Wire,
 };
@@ -42,6 +43,9 @@ pub struct Prepared {
     pub request: Request,
     /// Only recorded compiler/configuration/native-tool values; no replay caller values.
     pub environment: BTreeMap<String, OsString>,
+    /// The configuration files of the original resolution, in the snapshot, in their recorded
+    /// precedence. Nothing else is read as configuration.
+    pub config: ConfigImage,
     /// Toolchain-derived target cfg facts, verified against the saved platform.
     pub host: Host,
 }
@@ -69,25 +73,29 @@ struct Record {
     recipe: ReplayRecipe,
     manifest: SourcePath,
     cargo_home: Option<SourcePath>,
+    /// The configuration files resolution read, as snapshot paths: the top-level files in
+    /// precedence order, highest first, then every file read, sorted.
+    config: (Vec<SourcePath>, Vec<SourcePath>),
     platform: ExecPlatform,
 }
 
 impl Wire for Record {
     fn encode(&self, e: &mut blaze_wire::Encoder) {
-        e.array(5);
-        1_u32.encode(e);
+        e.array(6);
+        2_u32.encode(e);
         self.recipe.encode(e);
         self.manifest.encode(e);
         self.cargo_home.encode(e);
+        self.config.encode(e);
         self.platform.encode(e);
     }
 
     fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
-        r.array_start(5)?;
+        r.array_start(6)?;
         let at = r.position();
-        if u32::decode(r)? != 1 {
+        if u32::decode(r)? != 2 {
             return Err(blaze_wire::Error {
-                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 1" },
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 2" },
                 at,
             });
         }
@@ -95,6 +103,7 @@ impl Wire for Record {
             recipe: <ReplayRecipe as Wire>::decode(r)?,
             manifest: SourcePath::decode(r)?,
             cargo_home: Option::decode(r)?,
+            config: <(Vec<SourcePath>, Vec<SourcePath>)>::decode(r)?,
             platform: ExecPlatform::decode(r)?,
         };
         r.array_end()?;
@@ -264,7 +273,7 @@ pub fn capture(
     };
     let captured_ctx = Context {
         source_root: Some(&root),
-        config_root: ctx.config_root,
+        config: ctx.config,
         source: SourceRef::Root(RootRef { root: [0; 32] }),
         cwd: ctx.cwd,
         env: ctx.env,
@@ -331,9 +340,18 @@ pub fn capture(
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    let mut layers = Vec::new();
+    for layer in &resolved.config.layers {
+        layers.push(place(layer)?);
+    }
+    let mut files =
+        resolved.config.files.iter().map(|file| place(file)).collect::<Result<Vec<_>, _>>()?;
+    files.sort();
+    files.dedup();
     let record = Record {
         recipe: ReplayRecipe::capture(&made.build, subcommand, words, &recipe_env, &config_files)?,
         manifest: place(&resolved.manifest)?,
+        config: (layers, files),
         // An empty external Cargo home is not a source input and must not make the
         // source root depend on the absolute spelling of a checkout's location.
         cargo_home: if has_home {
@@ -475,9 +493,24 @@ fn prepare_record(
     };
     native.insert("CARGO_HOME".to_owned(), cargo_home.into());
     let env = environment::text_view(&native)?;
+    // Configuration is exactly the files the original resolution read, in the order it read
+    // them, from the authenticated snapshot: not what the worker's tree would discover.
+    let (layers, files) = &record.config;
+    let image = ConfigImage {
+        layers: layers
+            .iter()
+            .map(|path| Ok(root.join(path.to_native()?)))
+            .collect::<anyhow::Result<_>>()?,
+        files: files
+            .iter()
+            .map(|path| {
+                Ok((root.join(path.to_native()?), Snapshot::read_file(source.root, store, path)?))
+            })
+            .collect::<anyhow::Result<_>>()?,
+    };
     let ctx = Context {
         source_root: Some(&root),
-        config_root: Some(&root),
+        config: Discovery::Image(&image),
         cwd: &cwd,
         env: &env,
         native_env: Some(&native),
@@ -537,7 +570,15 @@ fn prepare_record(
     if let Some(difference) = crate::run::first_difference(given, &verified.build) {
         bail!("execution machine does not match the BuildSpec: {difference}");
     }
-    Ok(Prepared { resolved, root, cwd, request, environment: native, host: host.clone() })
+    Ok(Prepared {
+        resolved,
+        root,
+        cwd,
+        request,
+        environment: native,
+        config: image,
+        host: host.clone(),
+    })
 }
 
 fn source_root(build: &BuildSpec) -> anyhow::Result<blaze_wire::Digest> {

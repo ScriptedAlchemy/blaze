@@ -58,7 +58,7 @@ impl Project {
         let context = Context {
             native_env: None,
             source_root: None,
-            config_root: None,
+            config: blaze_manifest::config::Discovery::Live,
             cwd: &self.root,
             env: &env,
             host: &host,

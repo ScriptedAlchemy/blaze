@@ -528,3 +528,47 @@ fn configuration_above_the_original_root_is_captured_and_replayed() {
     assert_eq!(replay.resolved.spec.build, made.build);
     assert_eq!(replay.execution_environment().unwrap()["FROM_ABOVE"], "parent");
 }
+
+#[test]
+fn a_cargo_home_between_two_ancestors_replays_in_its_captured_position() {
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    // `$CARGO_HOME` is `base/p/.cargo`: an ancestor's `.cargo` of the workspace, between the
+    // workspace and a configuration above it. Live discovery visits it there, so it wins over
+    // the file above; a replay that found it last would let the file above win. A forced value
+    // is what layering decides: a plain one is replayed as the environment variable it became.
+    std::fs::create_dir_all(base_root.join(".cargo")).unwrap();
+    std::fs::write(
+        base_root.join(".cargo/config.toml"),
+        "[env]\nWHO={value='above',force=true}\nABOVE_ONLY='above'\n",
+    )
+    .unwrap();
+    let home = base_root.join("p/.cargo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "[env]\nWHO={value='home',force=true}\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(base_root.join("p")).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    env.insert("CARGO_HOME".to_owned(), home.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    let who = made.build.config_env.iter().find(|(name, _)| name == "WHO").unwrap();
+    assert_eq!(who.1.text(), "home");
+    drop(f);
+    drop(base);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    let env = replay.execution_environment().unwrap();
+    assert_eq!(env["WHO"], "home");
+    assert_eq!(env["ABOVE_ONLY"], "above");
+}

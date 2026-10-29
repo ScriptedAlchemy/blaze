@@ -257,6 +257,18 @@ pub struct ConfigImage {
     pub files: BTreeMap<PathBuf, Vec<u8>>,
 }
 
+/// Where a configuration is discovered.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Discovery<'a> {
+    /// Cargo's own: the ancestors of the working directory and the Cargo home.
+    #[default]
+    Live,
+    /// Cargo's own, but ancestors stop at this directory.
+    Within(&'a Path),
+    /// Exactly the captured files, in the recorded precedence, and nothing else.
+    Image(&'a ConfigImage),
+}
+
 #[derive(Debug)]
 enum ConfigSource {
     Live,
@@ -304,9 +316,40 @@ pub struct Config {
     target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     warnings: RefCell<Vec<String>>,
     sources: RefCell<Vec<(PathBuf, Vec<u8>)>>,
+    /// The top-level files of the last walk, highest precedence first.
+    layers: RefCell<Vec<PathBuf>>,
 }
 
 impl Config {
+    /// The configuration seen from `cwd`, discovered as `discovery` says, with Cargo home
+    /// `home` or the one `env` names.
+    pub fn load_in(
+        cwd: &Path,
+        env: impl IntoIterator<Item = (String, String)>,
+        cli: &[String],
+        home: Option<PathBuf>,
+        discovery: Discovery<'_>,
+    ) -> anyhow::Result<Config> {
+        let env: BTreeMap<String, String> = env.into_iter().collect();
+        let home = match home {
+            Some(home) => home,
+            None => cargo_home(cwd, &env)?,
+        };
+        match discovery {
+            Discovery::Live => Self::load_with_home(cwd, env, cli, home),
+            Discovery::Within(root) => {
+                Self::load_with_home(cwd, env, cli, home)?.with_discovery_root(root)
+            }
+            Discovery::Image(image) => Self::from_image(cwd, home, env, cli, image.clone()),
+        }
+    }
+
+    /// The top-level configuration files the last discovery visited, highest precedence
+    /// first: what [`ConfigImage::layers`] records.
+    pub fn layers(&self) -> Vec<PathBuf> {
+        self.layers.borrow().clone()
+    }
+
     /// The configuration seen from `cwd` with the variables of `env` and the `--config`
     /// arguments `cli`, as `cargo` started there would. `--config` reads the files at once.
     pub fn load(
@@ -383,6 +426,7 @@ impl Config {
             target_cfgs: OnceCell::new(),
             warnings: RefCell::new(Vec::new()),
             sources: RefCell::new(Vec::new()),
+            layers: RefCell::new(Vec::new()),
         };
         config.merge_cli_args(cli)?;
         Ok(config)
@@ -482,6 +526,11 @@ impl Config {
         home: &Path,
         mut walk: impl FnMut(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let mut walk = |path: &Path| {
+            self.layers.borrow_mut().push(path.to_owned());
+            walk(path)
+        };
+        self.layers.borrow_mut().clear();
         if let ConfigSource::Image(image) = &self.source {
             for path in &image.layers {
                 walk(path)?;

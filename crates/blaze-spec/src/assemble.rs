@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use blaze_manifest::config::Discovery;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::{Config, Workspace};
@@ -74,9 +75,9 @@ pub struct Context<'a> {
     /// Materialized root of `source` (Git repository root, or the Root snapshot).
     /// Git requires Some; only an intentionally workspace-rooted Root snapshot permits None.
     pub source_root: Option<&'a Path>,
-    /// Ancestor configuration boundary for authenticated replay. None preserves
-    /// normal Cargo discovery while capturing an original request.
-    pub config_root: Option<&'a Path>,
+    /// Where configuration is discovered. `Live` preserves normal Cargo discovery while
+    /// capturing an original request; a replay names exactly the files that were captured.
+    pub config: Discovery<'a>,
     /// The directory the command was run in, absolute.
     pub cwd: &'a Path,
     /// The requester's environment, all of it: what is refused, carried or ignored is decided
@@ -157,6 +158,17 @@ pub struct Resolved {
     pub outputs: Vec<PathBuf>,
     /// The complete locked external package closure, including unselected packages.
     pub sources: Vec<blaze_metadata::CapturedSource>,
+    /// The configuration files the resolution read, in the precedence it read them.
+    pub config: ConfigTrace,
+}
+
+/// The configuration files a resolution read: what a replay must be given to read the same.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigTrace {
+    /// The top-level files, highest precedence first.
+    pub layers: Vec<PathBuf>,
+    /// Every file read, including includes and `--config` files, in no particular order.
+    pub files: Vec<PathBuf>,
 }
 
 /// Resolve without discarding the native graph an owned executor needs.
@@ -195,12 +207,17 @@ fn resolve_with_platform(
     sources: Option<&[blaze_metadata::CapturedSource]>,
 ) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
-    let (offline, mut initial, manifest, outputs) = Opened::with(request, ctx, |opened| {
+    let (offline, mut initial, manifest, outputs, config) = Opened::with(request, ctx, |opened| {
+        let config = &opened.manifests.config;
         Ok((
             opened.resolved.offline,
             opened.manifests.sources(),
             opened.workspace.current_manifest().to_owned(),
             vec![opened.workspace.target_dir(), opened.workspace.build_dir()],
+            ConfigTrace {
+                layers: config.layers(),
+                files: config.sources().into_iter().map(|(path, _)| path).collect(),
+            },
         ))
     })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
@@ -233,14 +250,14 @@ fn resolve_with_platform(
         targets,
         profile: request.profile.as_deref(),
     };
-    let (graph, mut inputs, sources) =
-        units::unit_graph_captured(&wanted, sources, ctx.config_root).map_err(|error| {
+    let (graph, mut inputs, sources) = units::unit_graph_captured(&wanted, sources, ctx.config)
+        .map_err(|error| {
             Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
         })?;
     let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
     inputs.extend(assembly_inputs);
-    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources })
+    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, config })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -310,16 +327,8 @@ impl Opened<'_> {
         };
         let native_home =
             ctx.native_env.and_then(|native| environment::cargo_home(native, ctx.cwd));
-        let mut config = match native_home {
-            Some(home) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
-            None => Config::load(ctx.cwd, ctx.env.clone(), &[]),
-        }
-        .map_err(|error| rejected("the configuration", error))?;
-        if let Some(root) = ctx.config_root {
-            config = config
-                .with_discovery_root(root)
-                .map_err(|error| rejected("the configuration root", error))?;
-        }
+        let mut config = Config::load_in(ctx.cwd, ctx.env.clone(), &[], native_home, ctx.config)
+            .map_err(|error| rejected("the configuration", error))?;
         config
             .start(command.name(), &request.config)
             .map_err(|error| rejected("--config", error))?;

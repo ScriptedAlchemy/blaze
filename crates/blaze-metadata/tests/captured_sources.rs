@@ -61,7 +61,7 @@ fn graph(
             profile: None,
         },
         captured,
-        None,
+        blaze_manifest::config::Discovery::Live,
     )
 }
 
