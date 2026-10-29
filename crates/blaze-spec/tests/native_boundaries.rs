@@ -74,6 +74,10 @@ struct NativeProbe {
     launcher: &'static [u8],
 }
 impl Probe for NativeProbe {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        common::FakeMachine.native_tree(path)
+    }
+
     fn run_native(&self, p: &Path, a: &[OsString]) -> Option<String> {
         common::FakeMachine.run_native(p, a)
     }
@@ -164,6 +168,10 @@ fn git_path_line_removes_only_terminator_and_root_keeps_spaces() {
 fn xcrun_path_stdout_preserves_raw_sdk_bytes_separately_from_version_text() {
     struct RawSdk;
     impl Probe for RawSdk {
+        fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+            common::FakeMachine.native_tree(path)
+        }
+
         fn which_native(&self, n: &OsStr, p: &OsStr) -> Option<PathBuf> {
             common::FakeMachine.which_native(n, p)
         }

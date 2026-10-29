@@ -964,7 +964,8 @@ fn included_bytes<'db>(
     // outside VFS. Accumulate before reading so missing inputs are live too.
     let root = db.file_source_root(anchor).source_root_id(db);
     let sources = db.source_root(root).source_root(db);
-    let absolute = sources.path_for_file(&anchor)?.as_path()?.parent()?.absolutize(path.path);
+    let absolute =
+        paths::native::absolutize(sources.path_for_file(&anchor)?.as_path()?.parent()?, path.path)?;
     base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
     file.bytes(db).as_deref()
 }
@@ -1010,7 +1011,13 @@ fn non_unicode_env(
     span: Span,
 ) -> Option<ExpandError> {
     let krate = arg_id.loc(db).krate;
-    if !krate.env(db).is_non_unicode(key.as_str()) {
+    let env = krate.env(db);
+    let non_unicode = if env.contains_key(key.as_str()) {
+        env.is_non_unicode(key.as_str())
+    } else {
+        base_db::process_env_is_non_unicode(db, key.as_str())
+    };
+    if !non_unicode {
         return None;
     }
     db.env_is_read(krate, key.as_str());

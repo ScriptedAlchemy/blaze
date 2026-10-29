@@ -177,6 +177,10 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
 struct SdkFiles;
 
 impl Probe for SdkFiles {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        blaze_spec::native_tree::Tree::capture(path)
+    }
+
     fn which_native(&self, name: &OsStr, path: &OsStr) -> Option<PathBuf> {
         common::FakeMachine.which_native(name, path)
     }

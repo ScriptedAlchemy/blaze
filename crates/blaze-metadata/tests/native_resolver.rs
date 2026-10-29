@@ -42,7 +42,7 @@ fn try_graph(root: &Path, home: &Path) -> anyhow::Result<blaze_metadata::units::
     ]);
     let build = Build { packages: &[], workspace: false, excludes: &[], dev_units: false };
     let asked = Asked {
-        locked: false,
+        locked: true,
         cargo_home: Some(home.into()),
         cwd: root,
         env: env.into_iter().collect(),
@@ -86,7 +86,7 @@ fn locked_resolution_accepts_equivalent_toml_but_rejects_changed_edges() {
     let changed = text.replace("dependencies=['dep']\n", "");
     scratch.write("Cargo.lock", &changed);
     let error = try_graph(&scratch.0, &home).unwrap_err();
-    assert!(format!("{error:#}").contains("manifests no longer agree"), "{error:#}");
+    assert!(format!("{error:#}").contains("cannot update the lock file"), "{error:#}");
     assert_eq!(std::fs::read_to_string(scratch.0.join("Cargo.lock")).unwrap(), changed);
 }
 

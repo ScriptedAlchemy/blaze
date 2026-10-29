@@ -71,34 +71,6 @@ impl DepInfo {
         Ok(Self { files: paths, env })
     }
 
-    /// Replay input trace version 1: `[version, files, [[name, value-or-null], ...]]`.
-    /// Unlike Cargo's dep-info, deterministic CBOR preserves newlines, carriage returns
-    /// and trailing backslashes in filenames. Free-form values use the message budget.
-    pub(crate) fn encode_replay(&self) -> Vec<u8> {
-        use blaze_wire::InputText;
-        let files: Vec<_> = self.files.iter().cloned().map(InputText).collect();
-        let env: Vec<_> = self
-            .env
-            .iter()
-            .map(|(name, value)| (InputText(name.clone()), value.clone().map(InputText)))
-            .collect();
-        blaze_wire::encode(&(1_u32, files, env))
-    }
-
-    pub(crate) fn decode_replay(bytes: &[u8]) -> anyhow::Result<Self> {
-        use blaze_wire::InputText;
-        let (version, files, env): (u32, Vec<InputText>, Vec<(InputText, Option<InputText>)>) =
-            blaze_wire::decode(bytes, &blaze_wire::Limits::DOCUMENTED)?;
-        anyhow::ensure!(version == 1, "unknown replay input trace version {version}");
-        Ok(Self {
-            files: files.into_iter().map(|file| file.0).collect(),
-            env: env
-                .into_iter()
-                .map(|(name, value)| (name.0, value.map(|value| value.0)))
-                .collect(),
-        })
-    }
-
     /// Reads the text of a dep-info file. What a file cut short has of its last path is not a
     /// path.
     pub(crate) fn parse(text: &str) -> DepInfo {
@@ -123,6 +95,89 @@ impl DepInfo {
             info.files = files_of(files);
         }
         info
+    }
+}
+
+pub(crate) const TRACE_KEY_FIELD: &str = "blaze_replay_trace_key";
+
+static REPLAY_KEY: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+
+pub(crate) fn replay_key(project: &serde_json::Value) -> anyhow::Result<[u8; 32]> {
+    serde_json::from_value(project.get(TRACE_KEY_FIELD).cloned().unwrap_or_default())
+        .map_err(|_| anyhow::anyhow!("missing or invalid private replay trace key"))
+}
+
+pub(crate) fn ensure_replay_key(project: &mut serde_json::Value) -> anyhow::Result<()> {
+    anyhow::ensure!(project.is_object(), "invalid private replay descriptor");
+    if project.get(TRACE_KEY_FIELD).is_some() {
+        replay_key(project)?;
+        return Ok(());
+    }
+    let mut key = [0; 32];
+    getrandom::fill(&mut key).map_err(|_| anyhow::anyhow!("replay trace entropy"))?;
+    project[TRACE_KEY_FIELD] = serde_json::json!(key);
+    Ok(())
+}
+
+pub(crate) fn install_replay_key(project: &serde_json::Value) -> anyhow::Result<()> {
+    let key = project.get(TRACE_KEY_FIELD).map(|_| replay_key(project)).transpose()?;
+    *crate::lock(&REPLAY_KEY) = key;
+    Ok(())
+}
+
+pub(crate) fn installed_replay_key() -> Option<[u8; 32]> {
+    crate::lock(&REPLAY_KEY).as_ref().copied()
+}
+
+/// Private replay traces contain keyed value identities; source-observed values stay in memory.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReplayTrace {
+    pub(crate) files: Vec<String>,
+    pub(crate) env: Vec<(String, Option<[u8; 32]>)>,
+}
+
+impl ReplayTrace {
+    pub(crate) fn from_inputs(inputs: &DepInfo, key: [u8; 32]) -> Self {
+        let identity = crate::env_identity::Identity::from_key(key);
+        Self {
+            files: inputs.files.clone(),
+            env: inputs
+                .env
+                .iter()
+                .map(|(name, value)| {
+                    (name.clone(), value.as_ref().map(|value| identity.digest(value.as_bytes())))
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        use blaze_wire::InputText;
+        let files: Vec<_> = self.files.iter().cloned().map(InputText).collect();
+        let env: Vec<_> =
+            self.env.iter().map(|(name, value)| (InputText(name.clone()), *value)).collect();
+        blaze_wire::encode(&(2_u32, files, env))
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        use blaze_wire::InputText;
+        let (version, files, env): (u32, Vec<InputText>, Vec<(InputText, Option<[u8; 32]>)>) =
+            blaze_wire::decode(bytes, &blaze_wire::Limits::DOCUMENTED)?;
+        anyhow::ensure!(version == 2, "unknown replay input trace version {version}");
+        Ok(Self {
+            files: files.into_iter().map(|file| file.0).collect(),
+            env: env.into_iter().map(|(name, value)| (name.0, value)).collect(),
+        })
+    }
+
+    pub(crate) fn value_matches(
+        actual: Option<&[u8; 32]>,
+        value: Option<&str>,
+        key: [u8; 32],
+    ) -> bool {
+        let expected = value
+            .map(|value| crate::env_identity::Identity::from_key(key).digest(value.as_bytes()));
+        actual.copied() == expected
     }
 }
 
@@ -196,13 +251,63 @@ mod tests {
             ],
             env: vec![("VALUE".into(), Some("line\nbreak\\\r".into())), ("ABSENT".into(), None)],
         };
-        let encoded = trace.encode_replay();
-        assert_eq!(DepInfo::decode_replay(&encoded).unwrap(), trace);
-        assert!(DepInfo::decode_replay(&encoded[..encoded.len() - 1]).is_err());
+        let protected = ReplayTrace::from_inputs(&trace, [7; 32]);
+        let encoded = protected.encode();
+        assert_eq!(ReplayTrace::decode(&encoded).unwrap(), protected);
+        assert!(ReplayTrace::decode(&encoded[..encoded.len() - 1]).is_err());
         let mut newer = encoded;
-        newer[1] = 2;
-        assert!(DepInfo::decode_replay(&newer).unwrap_err().to_string().contains("version 2"));
-        assert!(DepInfo::decode_replay(b"target: /source/file.rs\n").is_err());
+        newer[1] = 3;
+        assert!(ReplayTrace::decode(&newer).unwrap_err().to_string().contains("version 3"));
+        assert!(ReplayTrace::decode(b"target: /source/file.rs\n").is_err());
+    }
+
+    #[test]
+    fn replay_records_keyed_values_without_raw_environment_or_key_material() {
+        let token = "not-a-real-replay-environment-token";
+        let key = [0x71; 32];
+        let inputs = DepInfo {
+            files: vec!["/source/lib.rs".into()],
+            env: vec![
+                ("TOKEN".into(), Some(token.into())),
+                ("EMPTY".into(), Some(String::new())),
+                ("ABSENT".into(), None),
+            ],
+        };
+        let trace = ReplayTrace::from_inputs(&inputs, key);
+        let bytes = trace.encode();
+        assert!(!bytes.windows(token.len()).any(|part| part == token.as_bytes()));
+        assert!(!bytes.windows(key.len()).any(|part| part == key));
+        let decoded = ReplayTrace::decode(&bytes).unwrap();
+        assert_eq!(decoded, trace);
+        assert!(ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some(token), key));
+        assert!(!ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some(token), [0x72; 32]));
+        assert!(!ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some("changed"), key));
+        assert!(ReplayTrace::value_matches(decoded.env[1].1.as_ref(), Some(""), key));
+        assert!(!ReplayTrace::value_matches(decoded.env[1].1.as_ref(), None, key));
+        assert!(ReplayTrace::value_matches(decoded.env[2].1.as_ref(), None, key));
+        assert!(!ReplayTrace::value_matches(decoded.env[2].1.as_ref(), Some(""), key));
+    }
+
+    #[test]
+    fn replay_key_is_fresh_per_description_and_invalid_transport_is_redacted() {
+        let mut first = serde_json::json!({"crates": []});
+        let mut second = first.clone();
+        ensure_replay_key(&mut first).unwrap();
+        let before = replay_key(&first).unwrap();
+        ensure_replay_key(&mut first).unwrap();
+        assert_eq!(replay_key(&first).unwrap(), before);
+        ensure_replay_key(&mut second).unwrap();
+        assert_ne!(replay_key(&second).unwrap(), before);
+        let malformed = serde_json::json!({TRACE_KEY_FIELD: "not-a-real-private-trace-token"});
+        let why = replay_key(&malformed).unwrap_err().to_string();
+        assert_eq!(why, "missing or invalid private replay trace key");
+        assert!(ensure_replay_key(&mut serde_json::Value::Null).is_err());
+        let malformed = blaze_wire::encode(&(
+            2_u32,
+            vec![blaze_wire::InputText("/source/lib.rs".into())],
+            vec![(blaze_wire::InputText("TOKEN".into()), Some([1_u8; 31]))],
+        ));
+        assert!(ReplayTrace::decode(&malformed).is_err());
     }
 
     #[test]

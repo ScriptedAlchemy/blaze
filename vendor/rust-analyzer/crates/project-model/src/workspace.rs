@@ -1183,6 +1183,7 @@ fn project_json_to_crate_graph(
                     cfg,
                     target,
                     codegen_flags,
+                    blaze_native_unit,
                     env,
                     invalid_env,
                     crate_attrs,
@@ -1287,6 +1288,7 @@ fn project_json_to_crate_graph(
                     crate_ws_data.clone(),
                 );
                 crate_graph.set_codegen_flags(crate_graph_crate_id, codegen_flags.clone());
+                crate_graph.set_native_unit(crate_graph_crate_id, *blaze_native_unit);
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),

@@ -322,3 +322,34 @@ fn output_and_store_directory_aliases_are_excluded_before_following_links() {
     assert!(!destination.join("target").exists());
     assert!(!destination.join("store").exists());
 }
+
+#[test]
+fn materialized_verification_rejects_non_rust_changes_and_membership_without_writing_blobs() {
+    let source = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("include")).unwrap();
+    fs::write(source.path().join("include/native.h"), b"before").unwrap();
+    let snapshot = Snapshot::capture(source.path(), &[], &[], store.path()).unwrap();
+    let at = worker.path().join("source");
+    Snapshot::materialize(snapshot.digest(), store.path(), &at).unwrap();
+    let count = || fs::read_dir(store.path()).unwrap().count();
+    let blobs = count();
+    Snapshot::verify_materialized(snapshot.digest(), store.path(), &at).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(at.join("include/native.h"), fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    fs::write(at.join("include/native.h"), b"after!").unwrap();
+    assert!(Snapshot::verify_materialized(snapshot.digest(), store.path(), &at).is_err());
+    fs::write(at.join("include/native.h"), b"before").unwrap();
+    Snapshot::verify_materialized(snapshot.digest(), store.path(), &at).unwrap();
+    fs::write(at.join("new-native-library.a"), b"unrecorded").unwrap();
+    assert!(Snapshot::verify_materialized(snapshot.digest(), store.path(), &at).is_err());
+    fs::remove_file(at.join("new-native-library.a")).unwrap();
+    fs::remove_file(at.join("include/native.h")).unwrap();
+    assert!(Snapshot::verify_materialized(snapshot.digest(), store.path(), &at).is_err());
+    assert_eq!(count(), blobs, "verification must not publish changed source bytes");
+}

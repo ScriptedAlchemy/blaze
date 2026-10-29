@@ -4,7 +4,9 @@
 
 use ide_db::{
     RootDatabase,
-    base_db::{Crate, Env, ProcessEnv, process_env_var, set_process_env},
+    base_db::{
+        Crate, Env, ProcessEnv, process_env_is_non_unicode, process_env_var, set_process_env,
+    },
 };
 
 use std::{cell::RefCell, collections::BTreeMap, ffi::OsString, process::Command};
@@ -32,25 +34,25 @@ impl<'de> serde::Deserialize<'de> for Native {
 type NativeWire = (u8, u8, Vec<(blaze_wire::Bytes, blaze_wire::Bytes)>);
 
 #[cfg(unix)]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
 #[cfg(unix)]
-fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+pub(crate) fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
     use std::os::unix::ffi::OsStringExt as _;
     Ok(OsString::from_vec(value))
 }
 
 #[cfg(windows)]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt as _;
     value.encode_wide().flat_map(u16::to_le_bytes).collect()
 }
 
 #[cfg(windows)]
-fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+pub(crate) fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
     use std::os::windows::ffi::OsStringExt as _;
     if value.len() % 2 != 0 {
         return Err("invalid native environment");
@@ -143,7 +145,16 @@ impl Native {
     }
 
     pub(crate) fn unicode(&self) -> Env {
-        unicode(self.vars()).collect()
+        let mut env = Env::default();
+        for (key, value) in &self.0 {
+            if let Some(key) = key.to_str() {
+                match value.to_str() {
+                    Some(value) => env.set(key, value),
+                    None => env.set_non_unicode(key),
+                }
+            }
+        }
+        env
     }
 
     pub(crate) fn over(&self, vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
@@ -285,7 +296,9 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
         .env_read()
         .into_iter()
         .filter(|(krate, key)| {
-            !krate.env(db).contains_key(key) && process_env_var(db, key) != env.get(key)
+            !krate.env(db).contains_key(key)
+                && (process_env_var(db, key) != env.get(key)
+                    || process_env_is_non_unicode(db, key) != env.is_non_unicode(key))
         })
         .map(|(krate, _)| krate)
         .collect();
@@ -298,6 +311,42 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_turns_distinguish_absent_non_unicode_and_crate_overrides() {
+        use ide_db::base_db::{self, SourceDatabase as _};
+        let mut db = RootDatabase::default();
+        let mut graph = base_db::CrateGraphBuilder::default();
+        let root = graph.add_crate_root(
+            vfs::FileId::from_raw(1),
+            syntax::Edition::Edition2021,
+            None,
+            None,
+            Default::default(),
+            None,
+            Env::default(),
+            base_db::CrateOrigin::Local { repo: None, name: None },
+            Vec::new(),
+            base_db::TargetKind::Lib { is_proc_macro: false },
+            triomphe::Arc::new(paths::AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+            triomphe::Arc::new(base_db::CrateWorkspaceData {
+                target: Err("fixture".into()),
+                toolchain: None,
+            }),
+        );
+        let root = graph.set_in_db(&mut db)[&root];
+        db.env_is_read(root, "MAYBE");
+        set_process_env(&mut db, Env::default());
+        let mut raw = Env::default();
+        raw.set_non_unicode("MAYBE");
+        assert_eq!(turn(&mut db, raw.clone()), [root]);
+        assert!(turn(&mut db, raw.clone()).is_empty());
+        assert_eq!(turn(&mut db, Env::default()), [root]);
+        let mut overlaid = Env::default();
+        overlaid.set("MAYBE", "crate-value");
+        db.set_env(root, overlaid);
+        assert!(turn(&mut db, raw).is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -320,6 +369,7 @@ mod tests {
         assert!(!decode_native("native-env-v1:bad-secret").unwrap_err().contains("bad-secret"));
         assert_eq!(env.unicode().get("EMPTY"), Some(String::new()));
         assert_eq!(env.unicode().get("BYTE_VALUE"), None);
+        assert!(env.unicode().is_non_unicode("BYTE_VALUE"));
         let mut command = Command::new("/usr/bin/printenv");
         command.env("DAEMON_ONLY", "must-not-leak");
         env.apply(&mut command);

@@ -26,7 +26,7 @@ mod native_pin_tests {
         assert!(!root.exists());
         std::fs::create_dir_all(root.join("a/src")).unwrap();
         std::fs::create_dir_all(root.join("b/src")).unwrap();
-        std::fs::write(root.join("a/Cargo.toml"),"[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nb={path='../b'}\n").unwrap();
+        std::fs::write(root.join("a/Cargo.toml"),"[package]\nname='a'\nversion='0.1.0'\nedition='2021'\nrust-version='1.90'\n[dependencies]\nb={path='../b'}\n").unwrap();
         std::fs::write(root.join("a/src/lib.rs"), "").unwrap();
         std::fs::write(
             root.join("b/Cargo.toml"),
@@ -57,6 +57,8 @@ mod native_pin_tests {
         exported.set_source(locked.to_owned());
         let previous = super::read(&serde_json::to_value(exported).unwrap()).unwrap();
         assert!(native.summary.source_id().full_eq(previous.summary.source_id()));
+        assert_eq!(native.summary.rust_version(), previous.summary.rust_version());
+        assert_eq!(native.summary.rust_version().unwrap().to_string(), "1.90");
         let actual = native.summary.dependencies()[0].source_id();
         let expected = previous.summary.dependencies()[0].source_id();
         assert_eq!(actual, expected, "ordinary equality may ignore precise");
@@ -124,7 +126,9 @@ pub(crate) fn native_manifest(
             )
         })
         .collect();
-    let summary = Summary::new(id, deps, &features, m.metadata.links.as_deref(), None)?;
+    let rust_version =
+        m.metadata.rust_version.as_ref().map(|version| version.to_string().parse()).transpose()?;
+    let summary = Summary::new(id, deps, &features, m.metadata.links.as_deref(), rust_version)?;
     let lib = m.targets.iter().find(|t| t.is_lib());
     Ok(Read {
         summary,

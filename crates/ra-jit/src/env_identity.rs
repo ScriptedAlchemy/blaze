@@ -33,26 +33,36 @@ impl Identity {
         bytes.try_into().map(Self).map_err(|_| anyhow::anyhow!("invalid environment identity key"))
     }
 
+    pub(crate) fn from_key(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub(crate) fn digest(&self, value: &[u8]) -> [u8; 32] {
+        let mut inner = Sha256::new();
+        let mut pad = [0x36; 64];
+        for (to, from) in pad.iter_mut().zip(self.0) {
+            *to ^= from;
+        }
+        inner.update(pad);
+        inner.update(b"blaze-env-identity-v1\0");
+        inner.update(value);
+        let mut outer = Sha256::new();
+        let mut pad = [0x5c; 64];
+        for (to, from) in pad.iter_mut().zip(self.0) {
+            *to ^= from;
+        }
+        outer.update(pad);
+        outer.update(inner.finalize());
+        outer.finalize().into()
+    }
+
     pub(crate) fn value(&self, value: Option<&str>) -> Option<String> {
         value.map(|value| {
-            // HMAC-SHA256 with one private per-home key for the whole freshness
-            // judgment. No file I/O or fallible lookup inside freshness callbacks.
-            let mut inner = Sha256::new();
-            let mut pad = [0x36; 64];
-            for (to, from) in pad.iter_mut().zip(self.0) {
-                *to ^= from;
-            }
-            inner.update(pad);
-            inner.update(b"blaze-env-identity-v1\0");
-            inner.update(value.as_bytes());
-            let mut outer = Sha256::new();
-            let mut pad = [0x5c; 64];
-            for (to, from) in pad.iter_mut().zip(self.0) {
-                *to ^= from;
-            }
-            outer.update(pad);
-            outer.update(inner.finalize());
-            format!("hmac-sha256-v1:{:x}", outer.finalize())
+            let digest = self.digest(value.as_bytes());
+            format!(
+                "hmac-sha256-v1:{}",
+                digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            )
         })
     }
 }

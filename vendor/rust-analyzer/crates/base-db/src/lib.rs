@@ -163,6 +163,13 @@ impl Files {
 
     /// Where the file known as `path` is read from.
     pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        let resolved = match paths::native::resolve(path) {
+            Ok(path) => path,
+            // This non-fallible watcher API must never read a physical shadow of
+            // a malformed logical name. NUL is invalid on every host filesystem.
+            Err(_) => return std::path::PathBuf::from("\0invalid-native-source-path"),
+        };
+        let path = resolved.as_ref();
         let views = self.views.read().unwrap_or_else(|it| it.into_inner());
         let over = views
             .iter()
@@ -366,6 +373,11 @@ pub struct ProcessEnv {
 /// The variable `key` of the process the build is for.
 pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
+}
+
+/// Whether the process supplied a value that cannot form a Rust string.
+pub fn process_env_is_non_unicode(db: &dyn salsa::Database, key: &str) -> bool {
+    ProcessEnv::try_get(db).is_some_and(|env| env.vars(db).is_non_unicode(key))
 }
 
 /// Has builds from here on be for a process with the variables `vars`.

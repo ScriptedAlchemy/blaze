@@ -1,132 +1,11 @@
-//! The `ExecPlatform` of this machine: the native side of a build, with the C and C++
-//! compilers, the archiver and the linker by the digest of their executables and the SDK or
-//! sysroot by what is in it (review B M5).
+//! Request-scoped native execution platforms, with complete SDK and compiler search trees.
 //!
-//! [`exec_platform`] is a pure function of a [`Machine`] and a [`Probe`]: every variable it
-//! reads is in `Machine::env`, and every program it runs and file it reads goes through the
-//! probe in `Machine::cwd`. It reads no variable of the process's own environment, so two calls
-//! with one machine and probe give one platform, and a variable the build does not see cannot
-//! change it.
-//! [`System`] is the probe that runs this machine's programs and reads its files.
-//!
-//! # What each field is
-//!
-//! `triple` and `cpu` are the machine's, copied. `os` is what the probe names: `macos` with the
-//! full product version, `linux` with the kernel's major and minor. A machine whose operating
-//! system cannot be named is refused. Which of `sdk` and `libc` is read follows `os`, the
-//! machine's own operating system, and not the triple: blaze does not cross-build, so a caller
-//! gives the machine's own triple, and one that named another OS would make the platform
-//! contradict itself.
-//!
-//! ## `cc`, `cxx`, `ar`
-//!
-//! The program is the one the `cc` crate (1.4.3, which the workspace locks) would run for a
-//! build script of this triple with the host equal to the target, because blaze never
-//! cross-builds. The value is the first set of `CC_<triple>`,
-//! `CC_<triple with `-` and `.` replaced by `_>`, `HOST_CC` and `CC`; `CXX` and
-//! `AR` the same, with the defaults `c++` and `ar`. Read from `cc` 1.4.3 (`lib.rs:3166-3260`,
-//! `:3470-3530`, `:4078-4085`, `:4207-4222`): `target_envs` writes the triple's two names and
-//! then `HOST_CC`, because `get_is_cross_compile` is false when the host is the target.
-//! `TARGET_CC` is unused for native builds. An empty selected value is not skipped:
-//! cc's `env_tool` discards it and uses the default tool, not a lower-priority variable.
-//! `cc`'s default is `cc`
-//! and not `gcc`: `gcc` is its name only on Solaris and illumos, which blaze does not build
-//! for (`lib.rs:3195-3207`).
-//!
-//! A value may carry arguments (`clang --target=x`). The words are split as a shell splits
-//! them, on whitespace and quotes, so that a value a makefile wrote names its program and its
-//! arguments; `cc` itself splits on whitespace alone (`lib.rs:3520`), so quotes are what a
-//! shell would do and not what `cc` does. A value that is a path with a separator and exists is
-//! used whole, so that a path with a space in it survives (`cc` checks the whole value first,
-//! `lib.rs:3479-3484`). A launcher in front of the compiler (`ccache`, `sccache`, `distcc`,
-//! `icecc`, `cachepot`, `buildcache`, `kache`, and `CC_KNOWN_WRAPPER_CUSTOM`'s name,
-//! `lib.rs:3506-3517`) is skipped to the compiler after it, and the launcher's bytes fold into
-//! the digest, so the same compiler behind a different launcher is a different platform. A
-//! launcher that cannot be resolved is not there to run the compiler, so the tool is absent.
-//!
-//! The program is resolved in the directories of `Machine::env`'s `PATH`, with relative paths
-//! and empty PATH entries rooted at `Machine::cwd`. Probes run in that directory without
-//! changing the serving process's cwd. Child processes receive exactly `Machine::env`,
-//! with no serving-process variables inherited. No program by that name means the field is `None`: a
-//! build with no C dependency needs no compiler, and two machines that differ only in that one
-//! has a compiler do not share a platform, which is the safe direction.
-//!
-//! The tuple is the program's file name as resolved, the first line of its `--version` output
-//! trimmed (empty when it cannot be run), and the SHA-256 of its bytes. The bytes are those of
-//! the file read through the probe, which follows a symlink; the name is that of the path the
-//! program was resolved to, not of the symlink's target, so `CC=cc` and `CC=clang` name
-//! differently while digesting the same bytes. A launcher's bytes are appended to the
-//! compiler's before the digest is taken.
-//!
-//! On macOS the tools in `/usr/bin` (`cc`, `c++`, `ar`, `ld`, `clang`, `gcc`) are shims that run
-//! whatever the active developer directory holds — all six are one 118,640-byte stub here, read
-//! on macOS 26.6.2 — so their bytes do not name the compiler. A shim is resolved with
-//! `xcrun --find <name>` and that executable is digested; when `xcrun` is missing or names
-//! nothing, the shim's own bytes are digested and the version line is what names the tool.
-//! `DEVELOPER_DIR` is passed through `/usr/bin/env` for canned probes as well as the real
-//! request-scoped process environment. The serving process's directory cannot reach `xcrun`.
-//!
-//! ## `linker`
-//!
-//! The program that links: `Machine::linker` (`target.<triple>.linker` from cargo's
-//! configuration) when it is set, else `cc`, which is what rustc runs for this triple's
-//! `darwin-cc` and `gnu-cc` link flavours and what blaze's own link runs
-//! (`crates/ra-jit/src/link.rs:119`), resolved and named as the tools above. `cc` does not read
-//! `CC`: a machine whose compiler is named only in `CC` still links with `cc`. A linker that
-//! cannot be resolved is refused, naming it as it was written: the build cannot link.
-//!
-//! ## `sdk`
-//!
-//! macOS only; `None` on Linux. The SDK directory is `SDKROOT` from the environment when it is
-//! set, else what `xcrun --show-sdk-path` names. The name is the directory's file name without
-//! `.sdk`, lowercased and cut at its first digit, so `MacOSX15.4.sdk` and `MacOSX.sdk` are both
-//! `macosx`. The version is what `xcrun --show-sdk-version` prints, or, with `SDKROOT` set, the
-//! `Version` key of `<sdk>/SDKSettings.json` (read with `serde_json`, already a dependency of
-//! this crate). The deployment target is `MACOSX_DEPLOYMENT_TARGET` from the environment when
-//! it is set, else rustc's default for the triple: 11.0 for `aarch64-apple-darwin` and 10.12 for
-//! `x86_64-apple-darwin`, as `crates/ra-jit/src/answers/rustc-1.99.0.json` states them in each
-//! target spec's `metadata.description` ("ARM64 Apple macOS (11.0+, Big Sur+)", "x86_64 Apple
-//! macOS (10.12+, Sierra+)"), which `rustc +1.99.0 --print deployment-target` answers the same
-//! way on this machine. An SDK that cannot be found or named is refused.
-//!
-//! ## `libc`
-//!
-//! Linux only; `None` on macOS. `glibc` with the second word of `getconf GNU_LIBC_VERSION`
-//! ("glibc 2.39" is "2.39"), or `musl` with the version its loader prints for `--version` (the
-//! word after `Version`) when a `/lib/ld-musl-*` or a `/lib/libc.musl-*` is at one of the paths
-//! blaze knows and no glibc answers. A Linux machine that answers neither is refused.
-//!
-//! ## `native_root`
-//!
-//! A proxy for what the native side holds, so that two machines whose SDK or sysroot differs
-//! do not share a platform: the SHA-256 over, in this order, each file's relative path as 8
-//! little-endian bytes, the path, its length as 8 little-endian bytes and its bytes.
-//!
-//! On macOS the files are `SDKSettings.json` and `usr/lib/libSystem.tbd` of the SDK directory.
-//! That covers the SDK's settings and the names libSystem exports, and it does not cover the
-//! SDK's headers, its other `.tbd` stubs, libc++, or the compiler: two SDKs that differ only in
-//! something this does not read get the same digest, a limitation of the proxy.
-//!
-//! On Linux they are the libc shared object and the dynamic loader, from a fixed list, because
-//! a probe has no way to list a directory and `/proc/self/maps` is not a file a probe reads for
-//! this: `/lib/x86_64-linux-gnu/libc.so.6`, `/lib/aarch64-linux-gnu/libc.so.6`,
-//! `/lib64/libc.so.6`, `/usr/lib/libc.so.6`, then `/lib/libc.musl-*.so.1`; and
-//! `/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`, `/lib/ld-musl-*.so.1`. The path
-//! as listed is what the digest folds, so two machines whose libc is at different listed paths
-//! differ even when the bytes are equal, which is the safe direction. A file that cannot be
-//! read folds as a length of `u64::MAX` and no bytes, so its absence is part of the digest;
-//! `None` when none of the files could be read.
-//!
-//! # Unverified
-//!
-//! - The Linux half: this machine is macOS, so the libc and loader paths, what `getconf
-//!   GNU_LIBC_VERSION` prints, what a musl loader prints for `--version`, and what `uname -r`
-//!   gives are unverified here.
-//! - That `cc`'s launcher handling and this one agree for every launcher: the list is `cc`'s,
-//!   read from its source, and a launcher `cc` learns from `CC_KNOWN_WRAPPER_CUSTOM` is read
-//!   here too.
-//! - That no launcher in front of a compiler names it: the compiler's bytes are digested, and a
-//!   launcher that is itself the compiler (a script that runs it) is not seen through.
+//! Tools follow the native `cc` crate's variable precedence and launcher selection. Their
+//! executable bytes, launcher bytes and selected arguments contribute to identity. Files,
+//! directory membership, missing paths, native names, modes and symlink referents are bound
+//! by complete trees. SDK identities do not contain the SDK's physical root location.
+//! Every filesystem read and process query goes through `Probe`; `System` uses the exact
+//! request cwd and environment. `describe` retains the trees for saved-input admission.
 
 use std::{
     collections::BTreeMap,
@@ -157,9 +36,6 @@ const SDK_SETTINGS: &str = "SDKSettings.json";
 /// Where macOS's `xcrun` is.
 const XCRUN: &str = "/usr/bin/xcrun";
 
-/// The TAPI stub that names what libSystem exports: the SDK's own libc.
-const LIBSYSTEM: &str = "usr/lib/libSystem.tbd";
-
 /// rustc's default `MACOSX_DEPLOYMENT_TARGET` for an apple triple, from the target specs in
 /// `crates/ra-jit/src/answers/rustc-1.99.0.json`.
 const DEPLOYMENT_TARGETS: [(&str, &str); 2] =
@@ -188,6 +64,25 @@ const LOADERS: [&str; 4] = [
 
 /// What the platform is read from: this machine's programs and files, or canned answers.
 pub trait Probe {
+    /// Complete native tree, including missing paths and symlink referents.
+    fn native_tree(&self, path: &Path) -> std::io::Result<crate::native_tree::Tree>;
+
+    /// Capture one observation of overlapping roots without repeated file reads.
+    fn native_trees(&self, paths: &[PathBuf]) -> std::io::Result<Vec<crate::native_tree::Tree>> {
+        paths.iter().map(|path| self.native_tree(path)).collect()
+    }
+
+    /// Raw process output for native compiler search-path queries.
+    fn run_output_in(
+        &self,
+        cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.run_path_in(cwd, env, program, args).map(|stdout| (stdout, Vec::new()))
+    }
+
     /// Lossless native lookup. Existing text-only test probes may override this for raw bytes.
     fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf>;
 
@@ -275,6 +170,21 @@ struct InDirectory<'a> {
 }
 
 impl Probe for InDirectory<'_> {
+    fn native_trees(&self, paths: &[PathBuf]) -> std::io::Result<Vec<crate::native_tree::Tree>> {
+        self.probe.native_trees(&paths.iter().map(|path| self.cwd.join(path)).collect::<Vec<_>>())
+    }
+    fn native_tree(&self, path: &Path) -> std::io::Result<crate::native_tree::Tree> {
+        self.probe.native_tree(&self.cwd.join(path))
+    }
+    fn run_output_in(
+        &self,
+        _cwd: &Path,
+        _env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.probe.run_output_in(self.cwd, self.env, &self.cwd.join(program), args)
+    }
     fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
         self.probe.which_native_in(self.cwd, name, path).map(|path| self.cwd.join(path))
     }
@@ -302,6 +212,28 @@ impl Probe for InDirectory<'_> {
 pub struct System;
 
 impl Probe for System {
+    fn native_trees(&self, paths: &[PathBuf]) -> std::io::Result<Vec<crate::native_tree::Tree>> {
+        crate::native_tree::Tree::capture_many(paths)
+    }
+    fn native_tree(&self, path: &Path) -> std::io::Result<crate::native_tree::Tree> {
+        crate::native_tree::Tree::capture(path)
+    }
+    fn run_output_in(
+        &self,
+        cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let output = Command::new(program)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env)
+            .args(args)
+            .output()
+            .ok()?;
+        output.status.success().then_some((output.stdout, output.stderr))
+    }
     fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
         let output = Command::new(program).args(args).output().ok()?;
         output.status.success().then_some(output.stdout)
@@ -433,69 +365,73 @@ pub struct Machine<'a> {
 /// The `ExecPlatform` of `machine`, read through `probe`, or a [`Refusal`] naming the field
 /// blaze cannot name.
 pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
+    Ok(describe(machine, probe)?.platform)
+}
+
+/// Native platform identity together with the complete trees that justify it.
+pub struct Description {
+    /// The wire execution platform.
+    pub platform: ExecPlatform,
+    /// Complete native input bindings, available to the saved executor.
+    pub native: crate::native::Closure,
+}
+
+/// Discover the platform and retain its native closure in one observation.
+pub fn describe(machine: &Machine<'_>, probe: &dyn Probe) -> Result<Description, Refusal> {
     let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env };
     let probe: &dyn Probe = &scoped;
     let os = probe
         .os()
         .ok_or_else(|| Refusal::new("os", "the machine's operating system cannot be named"))?;
-    // The machine's own OS, not its triple, says which native side it has: blaze does not
-    // cross-build, so a caller gives the machine's own triple, and one that named another OS
-    // would make the platform contradict itself.
     let family = Family::of_os(&os).ok_or_else(|| {
         Refusal::new(os.clone(), "blaze names the native side of macOS and Linux")
     })?;
     let env = machine.env;
-
-    // The files `native_root` folds, and where they are read: the SDK's on macOS, the libc's
-    // and loader's on Linux.
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    let (sdk, libc) = match family {
-        Family::Macos => {
-            let (sdk, dir) = macos_sdk(probe, env, machine.triple)?;
-            for name in [SDK_SETTINGS, LIBSYSTEM] {
-                files.push((name.to_owned(), dir.join(name)));
-            }
-            (Some(sdk), None)
-        }
-        Family::Linux => {
-            let libc = linux_libc(probe, env)?;
-            for path in [first_of(probe, &LIBCS), first_of(probe, &LOADERS)].into_iter().flatten() {
-                if !files.iter().any(|(name, _)| name.as_str() == path) {
-                    files.push((path.to_owned(), PathBuf::from(path)));
-                }
-            }
-            // A compiler's sysroot need not use the distribution's /lib layout
-            // (Nix and explicit sysroots are ordinary examples).
-            if let Some(cc) = tool(probe, env, machine.triple, "CC", "cc") {
-                for name in
-                    ["libc.so.6", "libc.so", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1"]
-                {
-                    let args = [format!("-print-file-name={name}").into()];
-                    if let Some(path) = probe
-                        .run_path(&cc.path, &args)
-                        .and_then(|bytes| crate::git_path::decode_line(bytes).ok())
-                        && path.is_absolute()
-                        && probe.read(&path).is_some()
-                        && !files.iter().any(|(_, previous)| *previous == path)
-                    {
-                        files.push((format!("compiler/{name}"), path));
-                    }
-                }
-            }
-            (None, Some(libc))
-        }
-    };
-
     let linker_value = machine.linker.map(str::trim).filter(|it| !it.is_empty()).unwrap_or("cc");
     let linker = resolve(probe, env, std::ffi::OsStr::new(linker_value)).ok_or_else(|| {
         Refusal::new(linker_value, "the linker cannot be resolved: a build cannot link without it")
     })?;
-
     let cc = tool(probe, env, machine.triple, "CC", "cc");
     let cxx = tool(probe, env, machine.triple, "CXX", "c++");
     let ar = tool(probe, env, machine.triple, "AR", "ar");
-
-    Ok(ExecPlatform {
+    let mut roots = Vec::new();
+    let (sdk, libc) = match family {
+        Family::Macos => {
+            let (sdk, dir) = macos_sdk(probe, env, machine.triple)?;
+            roots.push(("sdk".to_owned(), dir));
+            (Some(sdk), None)
+        }
+        Family::Linux => {
+            let libc = linux_libc(probe, env)?;
+            for path in LIBCS.iter().chain(LOADERS.iter()) {
+                roots.push((format!("system{path}"), PathBuf::from(path)));
+            }
+            for path in ["/usr/include", "/usr/local/include"] {
+                roots.push((format!("system{path}"), PathBuf::from(path)));
+            }
+            (None, Some(libc))
+        }
+    };
+    for (role, compiler, language) in
+        [("cc", cc.as_ref(), "c"), ("cxx", cxx.as_ref(), "c++"), ("linker", Some(&linker), "c")]
+    {
+        if let Some(compiler) = compiler {
+            compiler_roots(probe, env, role, compiler, language, &mut roots)?;
+        }
+    }
+    native_environment_roots(env, machine.triple, &mut roots)?;
+    let mut native = crate::native::Closure::default();
+    let paths: Vec<_> = roots.iter().map(|(_, path)| machine.cwd.join(path)).collect();
+    let trees = probe.native_trees(&paths).map_err(|error| {
+        Refusal::new("native roots", format!("cannot bind the complete native trees: {error}"))
+    })?;
+    if trees.len() != paths.len() {
+        return Err(Refusal::new("native roots", "the probe did not return every requested tree"));
+    }
+    for ((name, _), tree) in roots.into_iter().zip(trees) {
+        native.roots.push(crate::native::Root { name, tree });
+    }
+    let platform = ExecPlatform {
         triple: machine.triple.to_owned(),
         os,
         sdk,
@@ -505,8 +441,154 @@ pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPla
         cc: cc.map(Tool::tuple),
         cxx: cxx.map(Tool::tuple),
         ar: ar.map(Tool::tuple),
-        native_root: native_root(probe, &files),
-    })
+        native_root: Some(native.digest()),
+    };
+    Ok(Description { platform, native })
+}
+
+fn native_environment_roots(
+    env: &BTreeMap<String, std::ffi::OsString>,
+    triple: &str,
+    roots: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Refusal> {
+    for (name, value) in env {
+        if name == "LIBRARY_PATH"
+            || matches!(
+                name.as_str(),
+                "CPATH" | "C_INCLUDE_PATH" | "CPLUS_INCLUDE_PATH" | "OBJC_INCLUDE_PATH"
+            )
+        {
+            let role = if name == "LIBRARY_PATH" { "linker/libraries" } else { "native/headers" };
+            for (at, path) in std::env::split_paths(value).enumerate() {
+                roots.push((format!("{role}/env/{name}/{at}"), path));
+            }
+        } else if (name.starts_with("NIX_LDFLAGS") || name.starts_with("NIX_CFLAGS_"))
+            && crate::environment::is_script_var(name, triple)
+        {
+            let words: Vec<_> = value
+                .as_encoded_bytes()
+                .split(u8::is_ascii_whitespace)
+                .filter(|word| !word.is_empty())
+                .collect();
+            let mut at = 0;
+            while at < words.len() {
+                let word = words[at];
+                at += 1;
+                let (role, rest) = if let Some(path) = word.strip_prefix(b"-L") {
+                    ("linker/libraries", path)
+                } else if let Some(path) = word.strip_prefix(b"-I") {
+                    ("native/headers", path)
+                } else if let Some(path) = word.strip_prefix(b"-F") {
+                    ("linker/frameworks", path)
+                } else if matches!(
+                    word,
+                    b"-isystem" | b"-idirafter" | b"-iframework" | b"-isysroot"
+                ) {
+                    ("native/headers", &b""[..])
+                } else {
+                    continue;
+                };
+                let path = if rest.is_empty() {
+                    let path = words.get(at).ok_or_else(|| {
+                        Refusal::new(name, "native wrapper search flag needs a path")
+                    })?;
+                    at += 1;
+                    *path
+                } else {
+                    rest
+                };
+                roots.push((format!("{role}/flags/{name}/{at}"), native_path(path)?));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compiler_roots(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    role: &str,
+    compiler: &Tool,
+    language: &str,
+    roots: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Refusal> {
+    let query = |words: &[&str]| {
+        let mut args = compiler.args.clone();
+        args.extend(words.iter().map(std::ffi::OsString::from));
+        probe.run_output_in(Path::new("."), env, &compiler.path, &args)
+    };
+    for (name, flag) in [
+        ("sysroot", "-print-sysroot"),
+        ("include", "-print-file-name=include"),
+        ("resources", "-print-resource-dir"),
+        ("libc", "-print-file-name=libc.so"),
+        ("libc-runtime", "-print-file-name=libc.so.6"),
+        ("loader", "-print-file-name=ld-linux-x86-64.so.2"),
+        ("loader-arm", "-print-file-name=ld-linux-aarch64.so.1"),
+    ] {
+        if let Some((stdout, _)) = query(&[flag])
+            && !stdout.iter().all(u8::is_ascii_whitespace)
+            && let Ok(path) = crate::git_path::decode_line(stdout)
+            && path.is_absolute()
+            && path != Path::new("/")
+        {
+            roots.push((format!("{role}/{name}"), path));
+        }
+    }
+    if let Some((stdout, _)) = query(&["-print-search-dirs"]) {
+        for line in stdout.split(|b| *b == b'\n') {
+            let Some(paths) =
+                line.strip_prefix(b"libraries: =").or_else(|| line.strip_prefix(b"libraries: "))
+            else {
+                continue;
+            };
+            for (at, bytes) in paths.split(|b| *b == b':').enumerate() {
+                if !bytes.is_empty() {
+                    roots.push((format!("{role}/libraries/{at}"), native_path(bytes)?));
+                }
+            }
+        }
+    }
+    if let Some((stdout, stderr)) = query(&["-E", "-x", language, "-", "-v"]) {
+        for bytes in [stdout, stderr] {
+            let mut listing = false;
+            for line in bytes.split(|b| *b == b'\n') {
+                if line == b"#include <...> search starts here:" {
+                    listing = true;
+                    continue;
+                }
+                if line == b"End of search list." {
+                    listing = false;
+                }
+                if listing {
+                    let line = line.strip_prefix(b" ").unwrap_or(line);
+                    let line = line.strip_suffix(b" (framework directory)").unwrap_or(line);
+                    if !line.is_empty() {
+                        let at = roots.len();
+                        roots.push((format!("{role}/headers/{at}"), native_path(line)?));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_path(bytes: &[u8]) -> Result<PathBuf, Refusal> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        if bytes.contains(&0) {
+            return Err(Refusal::new("native search path", "path contains a NUL"));
+        }
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec()).map(PathBuf::from).map_err(|_| {
+            Refusal::new("native search path", "path is not representable on this host")
+        })
+    }
 }
 
 /// Which native side a triple has: the two blaze builds for.
@@ -530,6 +612,7 @@ impl Family {
 /// A native tool as `ExecPlatform` names it.
 struct Tool {
     path: PathBuf,
+    args: Vec<std::ffi::OsString>,
     name: String,
     version: String,
     digest: Digest,
@@ -601,7 +684,20 @@ fn resolve(
         [first, ..] => (None, first.as_os_str()),
         [] => return None,
     };
-    named(probe, env, Path::new(program), launcher)
+    let mut tool = named(probe, env, Path::new(program), launcher)?;
+    let skip = if launcher.is_some() { 2 } else { 1 };
+    tool.args = split.into_iter().skip(skip).collect();
+    if !tool.args.is_empty() {
+        let mut hash = Sha256::new();
+        hash.update(tool.digest);
+        for arg in &tool.args {
+            let bytes = arg.as_encoded_bytes();
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        tool.digest = hash.finalize().into();
+    }
+    Some(tool)
 }
 
 /// The tool of the program `program`, behind the launcher `launcher` when there is one.
@@ -628,7 +724,7 @@ fn named(
         hasher.update(&launcher_bytes);
     }
     let digest = hasher.finalize().into();
-    Some(Tool { name, version: version(probe, &path), digest, path })
+    Some(Tool { name, version: version(probe, &path), digest, path, args: Vec::new() })
 }
 
 /// Whether `word` is a launcher `cc` skips to the compiler after it.
@@ -862,27 +958,6 @@ fn major_minor(release: &str) -> String {
 /// The first of `list` that is there.
 fn first_of(probe: &dyn Probe, list: &[&'static str]) -> Option<&'static str> {
     list.iter().copied().find(|it| probe.read(Path::new(it)).is_some())
-}
-
-/// The digest of the native side's files, folded in the order given.
-fn native_root(probe: &dyn Probe, files: &[(String, PathBuf)]) -> Option<Digest> {
-    let mut hasher = Sha256::new();
-    let mut any = false;
-    for (name, path) in files {
-        let bytes = probe.read(path);
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        match &bytes {
-            Some(bytes) => {
-                any = true;
-                hasher.update((bytes.len() as u64).to_le_bytes());
-                hasher.update(bytes);
-            }
-            // A file that is not there is part of the digest as a length no file has.
-            None => hasher.update(u64::MAX.to_le_bytes()),
-        }
-    }
-    any.then(|| hasher.finalize().into())
 }
 
 fn trim_native(value: &std::ffi::OsStr) -> std::ffi::OsString {

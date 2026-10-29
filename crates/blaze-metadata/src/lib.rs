@@ -5,11 +5,13 @@
 //! canonical saved unit graph. Missing or stale locks are resolved and published under
 //! the requested locked/offline policy. Captured replay uses only authenticated roots.
 
+mod facts;
 mod graph;
 mod registry;
 mod summary;
 pub mod units;
 
+pub use facts::{DependencyFacts, PackageFacts, ResolverFacts};
 pub use units::{ResolvedUnit, UnitDependency};
 
 use std::collections::BTreeMap;
@@ -91,6 +93,13 @@ pub struct CapturedSource {
     pub version: String,
     /// The absolute directory containing the captured `Cargo.toml`.
     pub root: PathBuf,
+}
+
+/// Authenticated source roots and resolver facts for one closed replay.
+#[derive(Clone, Copy)]
+pub struct CapturedResolution<'a> {
+    pub sources: &'a [CapturedSource],
+    pub facts: &'a ResolverFacts,
 }
 
 impl TargetPlatform<'_> {
@@ -363,10 +372,10 @@ struct Locked {
     lock_path: PathBuf,
     lock_text: String,
     lock: blaze_resolve::Resolve,
-    targeted: Option<blaze_resolve::Resolve>,
+    targeted: blaze_resolve::Resolve,
+    facts: ResolverFacts,
     selection: ResolutionSelection,
     rewritten: bool,
-    path_deps: PathDeps,
     path_packages: Vec<Package>,
     fetched: Vec<Package>,
     sources: Vec<CapturedSource>,
@@ -380,7 +389,7 @@ impl Locked {
         offline: bool,
         selection: &ResolutionSelection,
     ) -> Result<Self> {
-        Self::read_with_sources(ws, ctx, asked, offline, selection, None, false)
+        Self::read_with_sources(ws, ctx, asked, offline, selection, None)
     }
 
     fn read_captured(
@@ -389,9 +398,9 @@ impl Locked {
         asked: &Asked<'_>,
         offline: bool,
         selection: &ResolutionSelection,
-        captured: Option<&[CapturedSource]>,
+        captured: Option<CapturedResolution<'_>>,
     ) -> Result<Self> {
-        Self::read_with_sources(ws, ctx, asked, offline, selection, captured, true)
+        Self::read_with_sources(ws, ctx, asked, offline, selection, captured)
     }
 
     fn read_with_sources(
@@ -400,8 +409,7 @@ impl Locked {
         asked: &Asked<'_>,
         offline: bool,
         selection: &ResolutionSelection,
-        captured: Option<&[CapturedSource]>,
-        complete_sources: bool,
+        captured: Option<CapturedResolution<'_>>,
     ) -> Result<Self> {
         let root = ws.root();
         if summary::has_replace(root, ctx)? {
@@ -455,19 +463,41 @@ impl Locked {
             })
             .transpose()?;
         if let Some(captured) = captured {
-            let lock =
+            let previous_lock =
                 previous_lock.context("captured replay requires its authenticated Cargo.lock")?;
             let lock_text =
                 previous.context("captured replay requires its authenticated Cargo.lock")?;
-            let (fetched, sources) = fetch(&lock, ctx, FetchFrom::Captured(captured))?;
+            let mut registry = MemRegistry::new();
+            for read in reads.values() {
+                registry.add(IndexSummary::Candidate(read.summary.clone()));
+            }
+            captured.facts.add_to(&mut registry, &previous_lock)?;
+            let (lock, targeted, facts) = resolve_packages(
+                ws,
+                ctx,
+                &reads,
+                &ids[..member_count],
+                registry,
+                Some(&previous_lock),
+                selection,
+            )?;
+            let current = lockfile::serialize_resolve(&lock, Some(&lock_text));
+            let policy =
+                lockfile::Locked { flag: "--locked", path: &lock_path, path_deps: &path_deps };
+            ensure!(
+                lockfile::are_equal_lockfiles(&lock_text, &current, Some(policy)),
+                "{} would change: the manifests no longer agree with it",
+                lock_path.display()
+            );
+            let (fetched, sources) = fetch(&targeted, ctx, FetchFrom::Captured(captured.sources))?;
             return Ok(Self {
                 lock_path,
                 lock_text,
                 lock,
-                targeted: None,
+                targeted,
+                facts,
                 selection: selection.clone(),
                 rewritten: false,
-                path_deps,
                 path_packages,
                 fetched,
                 sources,
@@ -486,54 +516,37 @@ impl Locked {
             registry.add(IndexSummary::Candidate(read.summary.clone()));
         }
         let registry = registry::SourcesRegistry::new(registry, &sources, &context, ctx);
-        let patch = summary::patch_tables(root, &registry, ctx)?;
-        let by_path =
-            reads.values().map(|read| (read.summary.source_id(), read.summary.clone())).collect();
-        let members: Vec<_> = ids[..member_count].iter().map(|id| &reads[id].summary).collect();
-        let current =
-            ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| ids[at]);
-        let behavior = resolve_behavior(ws);
-        let resolving = resolver_workspace(
-            Members {
-                members: &members,
-                current,
-                new_cli_feature_behavior: behavior != ResolveBehavior::V1 || ws.is_virtual(),
-            },
-            &by_path,
-            &patch,
-            behavior,
+        let (mut lock, targeted, facts) = resolve_packages(
+            ws,
             ctx,
-        )?;
-        let (mut lock, targeted) = resolve_ws(
-            &mut PackageRegistry::new(registry),
-            &resolving,
+            &reads,
+            &ids[..member_count],
+            registry,
             previous_lock.as_ref(),
-            &selection.features,
-            &selection.specs,
-            selection.dev,
+            selection,
         )?;
         let policy = asked.locked.then_some(lockfile::Locked {
             flag: "--locked",
             path: &lock_path,
             path_deps: &path_deps,
         });
-        let lowest = members.iter().filter_map(|m| m.rust_version()).min();
+        let lowest =
+            ids[..member_count].iter().filter_map(|id| reads[id].summary.rust_version()).min();
         let new_lock = lockfile::lockfile_to_write(&mut lock, previous.as_deref(), lowest, policy)?;
         let rewritten = new_lock.is_some();
         if let Some(text) = &new_lock {
             write_lockfile(&lock_path, text)?;
         }
         let lock_text = new_lock.or(previous).context("owned resolution produced no lock file")?;
-        let fetched_resolve = if complete_sources { &lock } else { &targeted };
-        let (fetched, sources) = fetch(fetched_resolve, ctx, FetchFrom::Owned(&sources))?;
+        let (fetched, sources) = fetch(&targeted, ctx, FetchFrom::Owned(&sources))?;
         Ok(Self {
             lock_path,
             lock_text,
             lock,
-            targeted: Some(targeted),
+            targeted,
+            facts,
             selection: selection.clone(),
             rewritten,
-            path_deps,
             path_packages,
             fetched,
             sources,
@@ -548,6 +561,46 @@ impl Locked {
         }
         inputs
     }
+}
+
+fn resolve_packages<R: blaze_resolve::Registry>(
+    ws: &Workspace<'_>,
+    ctx: &Context,
+    reads: &FxHashMap<PackageId, Read>,
+    member_ids: &[PackageId],
+    registry: R,
+    previous: Option<&blaze_resolve::Resolve>,
+    selection: &ResolutionSelection,
+) -> Result<(blaze_resolve::Resolve, blaze_resolve::Resolve, ResolverFacts)> {
+    let patch = summary::patch_tables(ws.root(), &registry, ctx)?;
+    let by_path =
+        reads.values().map(|read| (read.summary.source_id(), read.summary.clone())).collect();
+    let members: Vec<_> = member_ids.iter().map(|id| &reads[id].summary).collect();
+    let current =
+        ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
+    let behavior = resolve_behavior(ws);
+    let resolving = resolver_workspace(
+        Members {
+            members: &members,
+            current,
+            new_cli_feature_behavior: behavior != ResolveBehavior::V1 || ws.is_virtual(),
+        },
+        &by_path,
+        &patch,
+        behavior,
+        ctx,
+    )?;
+    let mut registry = PackageRegistry::new(registry);
+    let (whole, targeted) = resolve_ws(
+        &mut registry,
+        &resolving,
+        previous,
+        &selection.features,
+        &selection.specs,
+        selection.dev,
+    )?;
+    let facts = ResolverFacts::capture(&whole, registry.patches().values().flatten())?;
+    Ok((whole, targeted, facts))
 }
 
 fn member_ids(ws: &Workspace<'_>) -> Result<Vec<PackageId>> {
@@ -653,6 +706,9 @@ impl<'a> World<'a> {
         for (at, manifest) in manifests.iter().enumerate() {
             let mut read = summary::native_manifest(manifest, locked_sources[at])?;
             let id = read.summary.package_id();
+            if !id.source_id().is_path() {
+                locked.facts.validate_manifest(&read.summary)?;
+            }
             if let Some(Some(checksum)) = locked.lock.checksums().get(&id) {
                 read.summary.set_checksum(checksum.clone());
             }
@@ -694,12 +750,10 @@ impl<'a> World<'a> {
         }
     }
 
-    /// The selected resolve already made by the owned sources, or its closed reproduction
-    /// from authenticated captured manifests without consulting transports.
     fn resolve(
         &self,
-        ws: &Workspace<'_>,
-        ctx: &Context,
+        _ws: &Workspace<'_>,
+        _ctx: &Context,
         specs: &[PackageIdSpec],
         cli_features: &CliFeatures,
         has_dev_units: HasDevUnits,
@@ -708,45 +762,7 @@ impl<'a> World<'a> {
             self.lock.selection == ResolutionSelection::new(specs, cli_features, has_dev_units),
             "locked source selection differs from the requested unit selection"
         );
-        if let Some(targeted) = &self.lock.targeted {
-            return Ok(Resolved { whole: self.lock.lock.clone(), targeted: targeted.clone() });
-        }
-        let mut registry = MemRegistry::new();
-        for read in self.reads.values() {
-            registry.add(IndexSummary::Candidate(read.summary.clone()));
-        }
-        let patch = summary::patch_tables(ws.root(), &registry, ctx)?;
-        let by_path: FxHashMap<SourceId, Summary> = self
-            .reads
-            .values()
-            .filter(|it| it.summary.source_id().is_path())
-            .map(|it| (it.summary.source_id(), it.summary.clone()))
-            .collect();
-        let summaries = self.member_summaries();
-        let resolving =
-            resolver_workspace(self.members(&summaries), &by_path, &patch, self.behavior, ctx)?;
-        let (whole, targeted) = resolve_ws(
-            &mut PackageRegistry::new(registry),
-            &resolving,
-            Some(&self.lock.lock),
-            cli_features,
-            specs,
-            has_dev_units,
-        )?;
-        // This frontend never changes the lock. Cargo's locked contract compares
-        // the resolved packages, edges and checksums, rather than requiring its
-        // preferred comments, whitespace or serialization of equivalent entries.
-        let current = lockfile::serialize_resolve(&whole, Some(&self.lock.lock_text));
-        let locked = lockfile::Locked {
-            flag: "--locked",
-            path: &self.lock.lock_path,
-            path_deps: &self.lock.path_deps,
-        };
-        if !lockfile::are_equal_lockfiles(&self.lock.lock_text, &current, Some(locked)) {
-            let path = self.lock.lock_path.display();
-            bail!("{path} would change: the manifests no longer agree with it");
-        }
-        Ok(Resolved { whole, targeted })
+        Ok(Resolved { whole: self.lock.lock.clone(), targeted: self.lock.targeted.clone() })
     }
 }
 
@@ -866,14 +882,6 @@ fn native_path_dependencies(manifest: &blaze_manifest::manifest::Manifest) -> Ve
         .collect()
 }
 
-fn path_dependencies(package: &serde_json::Value) -> Vec<PathBuf> {
-    let deps = package["dependencies"].as_array().into_iter().flatten();
-    deps.filter(|it| it["source"].is_null())
-        .filter_map(|it| it["path"].as_str())
-        .map(|it| summary::normalize(Path::new(it)))
-        .collect()
-}
-
 /// Every package of `lock` that is not a path package, fetched where cargo would have it and
 /// read from its manifest.
 enum FetchFrom<'a> {
@@ -886,13 +894,9 @@ fn fetch(
     ctx: &Context,
     from: FetchFrom<'_>,
 ) -> Result<(Vec<Package>, Vec<CapturedSource>)> {
-    // Include unused patches: their manifests are needed to prove that the lock still
-    // leaves them unused. A captured list must cover this exact set, even if the command
-    // selects no unit from some of the packages.
     let ids: Vec<_> = lock
         .sort()
         .into_iter()
-        .chain(lock.unused_patches().iter().copied())
         .filter(|id| !id.source_id().is_path())
         .map(|id| (id, id.source_id().as_url().to_string()))
         .collect();
@@ -920,7 +924,10 @@ fn fetch(
                 format!("missing captured source for {} {} from {source}", id.name(), id.version())
             })?);
         }
-        ensure!(roots.is_empty(), "captured source list contains packages not in Cargo.lock");
+        ensure!(
+            roots.is_empty(),
+            "captured source list contains packages not selected by the build"
+        );
         // No registry, Git database, transport, archive cache or source-replacement
         // lookup is consulted when replay supplies authenticated package roots.
         return read_fetched(ids, selected, ctx);

@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 /// A machine of canned files and canned programs, so that a platform of any machine can be
 /// asserted without having that machine.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Fake {
     os: Option<String>,
     /// The files the probe reads, by absolute path.
@@ -38,6 +38,13 @@ fn run_key(program: &str, args: &[&str]) -> String {
 }
 
 impl Probe for Fake {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        blaze_spec::native_tree::Tree::from_files(
+            path,
+            self.files.iter().map(|(path, bytes)| (PathBuf::from(path), bytes.clone())),
+        )
+    }
+
     fn which_native(&self, n: &std::ffi::OsStr, p: &std::ffi::OsStr) -> Option<PathBuf> {
         self.which(n.to_str()?, p.to_str()?)
     }
@@ -67,24 +74,6 @@ impl Probe for Fake {
     fn os(&self) -> Option<String> {
         self.os.clone()
     }
-}
-
-/// The digest `native_root` is documented to fold, computed here from the specification and not
-/// by the code under test.
-fn root(files: &[(&str, Option<&[u8]>)]) -> Digest {
-    let mut hasher = Sha256::new();
-    for (name, bytes) in files {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        match bytes {
-            Some(bytes) => {
-                hasher.update((bytes.len() as u64).to_le_bytes());
-                hasher.update(bytes);
-            }
-            None => hasher.update(u64::MAX.to_le_bytes()),
-        }
-    }
-    hasher.finalize().into()
 }
 
 /// The SHA-256 of `bytes`, as a platform's digest.
@@ -190,13 +179,62 @@ fn macos_platform() {
         ))
     );
     assert_eq!(platform.ar, Some(("ar".to_owned(), String::new(), digest(AR))));
-    assert_eq!(
-        platform.native_root,
-        Some(root(&[
-            ("SDKSettings.json", Some(br#"{"Version": "26.0", "DisplayName": "macOS 26.0"}"#)),
-            ("usr/lib/libSystem.tbd", Some(b"the names libSystem exports")),
-        ]))
-    );
+    assert!(platform.native_root.is_some());
+}
+
+#[test]
+fn sdk_platform_binds_headers_other_libraries_and_new_members() {
+    let original = macos()
+        .file(&format!("{SDK}/usr/include/nested/config.h"), b"header")
+        .file(&format!("{SDK}/usr/lib/libc++.tbd"), b"other library")
+        .file(
+            &format!("{SDK}/System/Library/Frameworks/Metal.framework/Modules/module.modulemap"),
+            b"framework module",
+        );
+    let env = macos_env();
+    let before = exec_platform(&macos_machine(&env, None), &original).unwrap();
+    for (path, bytes) in [
+        ("usr/include/nested/config.h", b"changed header".as_slice()),
+        ("usr/lib/libc++.tbd", b"changed library"),
+        ("System/Library/Frameworks/Metal.framework/Modules/module.modulemap", b"changed module"),
+        ("usr/include/new.h", b"new member"),
+    ] {
+        let changed = original.clone().file(&format!("{SDK}/{path}"), bytes);
+        let after = exec_platform(&macos_machine(&env, None), &changed).unwrap();
+        assert_eq!(before.cc, after.cc);
+        assert_eq!(before.sdk, after.sdk);
+        assert_ne!(before.native_root, after.native_root, "unbound SDK member {path}");
+        assert_ne!(digest_of(&before), digest_of(&after));
+    }
+    let mut deleted = original.clone();
+    deleted.files.remove(&format!("{SDK}/usr/lib/libc++.tbd"));
+    let after = exec_platform(&macos_machine(&env, None), &deleted).unwrap();
+    assert_ne!(before.native_root, after.native_root);
+}
+
+#[test]
+fn the_same_complete_sdk_at_a_different_location_has_the_same_platform() {
+    let first = macos()
+        .file(&format!("{SDK}/usr/include/config.h"), b"header")
+        .file(&format!("{SDK}/usr/lib/libc++.tbd"), b"other library");
+    let moved_sdk = "/relocated/SDKs/MacOSX26.0.sdk";
+    let mut moved = first.clone();
+    moved.files = first
+        .files
+        .iter()
+        .map(|(path, bytes)| {
+            let path = path
+                .strip_prefix(SDK)
+                .map_or_else(|| path.clone(), |suffix| format!("{moved_sdk}{suffix}"));
+            (path, bytes.clone())
+        })
+        .collect();
+    let first_env = vars(&[("PATH", "/usr/bin"), ("SDKROOT", SDK)]);
+    let moved_env = vars(&[("PATH", "/usr/bin"), ("SDKROOT", moved_sdk)]);
+    let before = exec_platform(&macos_machine(&first_env, None), &first).unwrap();
+    let after = exec_platform(&macos_machine(&moved_env, None), &moved).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(digest_of(&before), digest_of(&after));
 }
 
 #[test]
@@ -257,13 +295,7 @@ fn linux_glibc_platform() {
             digest(b"binutils ar")
         ))
     );
-    assert_eq!(
-        platform.native_root,
-        Some(root(&[
-            ("/lib/x86_64-linux-gnu/libc.so.6", Some(b"glibc 2.39")),
-            ("/lib64/ld-linux-x86-64.so.2", Some(b"the loader")),
-        ]))
-    );
+    assert!(platform.native_root.is_some());
 }
 
 #[test]
@@ -294,6 +326,46 @@ fn compiler_sysroot_libraries_are_bound_outside_distribution_paths() {
 }
 
 #[test]
+fn compiler_search_trees_bind_headers_libraries_and_absent_candidates() {
+    let original = Fake { os: Some("linux 6.8".to_owned()), ..Fake::default() }
+        .file("/usr/bin/cc", b"gcc")
+        .file("/usr/bin/getconf", b"getconf")
+        .file("/lib/x86_64-linux-gnu/libc.so.6", b"glibc")
+        .file("/custom/include/nested/config.h", b"header")
+        .file("/custom/lib/libdependency.a", b"library")
+        .run("/usr/bin/getconf", &["GNU_LIBC_VERSION"], "glibc 2.39\n")
+        .run("/usr/bin/cc", &["-print-search-dirs"], "libraries: =/custom/lib:/custom/absent\n")
+        .run(
+            "/usr/bin/cc",
+            &["-E", "-x", "c", "-", "-v"],
+            "#include <...> search starts here:\n /custom/include\nEnd of search list.\n",
+        );
+    let env = vars(&[("PATH", "/usr/bin")]);
+    let machine = Machine {
+        cwd: Path::new("/"),
+        triple: "x86_64-unknown-linux-gnu",
+        cpu: "x86-64",
+        env: &env,
+        linker: None,
+    };
+    let before = exec_platform(&machine, &original).unwrap();
+    for path in [
+        "/custom/include/nested/config.h",
+        "/custom/include/new.h",
+        "/custom/lib/libdependency.a",
+        "/custom/lib/libnew.a",
+        "/custom/absent/libnew.a",
+    ] {
+        let changed = original.clone().file(path, b"changed member");
+        let after = exec_platform(&machine, &changed).unwrap();
+        assert_eq!(before.cc, after.cc);
+        assert_eq!(before.libc, after.libc);
+        assert_ne!(before.native_root, after.native_root, "unbound compiler search member {path}");
+        assert_ne!(digest_of(&before), digest_of(&after));
+    }
+}
+
+#[test]
 fn linux_musl_platform() {
     let fake = Fake { os: Some("linux 6.6".to_owned()), ..Fake::default() }
         .file("/usr/bin/cc", b"musl-gcc")
@@ -319,8 +391,8 @@ fn linux_musl_platform() {
     // No `c++` and no `ar` on the machine: the fields are absent, not guessed.
     assert_eq!(platform.cxx, None);
     assert_eq!(platform.ar, None);
-    // musl's loader is its libc, so one file is folded twice and deduplicated to one.
-    assert_eq!(platform.native_root, Some(root(&[("/lib/ld-musl-x86_64.so.1", Some(b"musl"))])));
+    // The complete native closure includes missing candidates and the musl loader.
+    assert!(platform.native_root.is_some());
 }
 
 #[test]

@@ -233,6 +233,9 @@ const SCRIPT_TARGETED: &[&str] = &[
 
 /// Whether a build script of a build for `triple` may read the variable `name`.
 pub fn is_script_var(name: &str, triple: &str) -> bool {
+    if nix_wrapper_var(name, triple) {
+        return true;
+    }
     if SCRIPT_EXACT.contains(&name) {
         return true;
     }
@@ -251,6 +254,56 @@ pub fn is_script_var(name: &str, triple: &str) -> bool {
         [triple, underscored.as_str()].iter().any(|it| name == format!("{base}_{it}"))
             || name == format!("HOST_{base}")
             || name == format!("TARGET_{base}")
+    })
+}
+
+// Native controls read by nixpkgs' cc-wrapper/cc-wrapper.sh and
+// bintools-wrapper/ld-wrapper.sh, including their target-salt variants.
+fn nix_wrapper_var(name: &str, triple: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "NIX_CC",
+        "NIX_BINTOOLS",
+        "NIX_STORE",
+        "NIX_ENFORCE_PURITY",
+        "NIX_HARDENING_ENABLE",
+        "NIX_BUILD_TOP",
+    ];
+    const TARGETED: &[&str] = &[
+        "NIX_CC",
+        "NIX_BINTOOLS",
+        "NIX_CFLAGS_COMPILE",
+        "NIX_CFLAGS_LINK",
+        "NIX_LDFLAGS",
+        "NIX_LDFLAGS_BEFORE",
+        "NIX_LDFLAGS_AFTER",
+        "NIX_CC_WRAPPER_FLAGS_SET",
+        "NIX_BINTOOLS_WRAPPER_FLAGS_SET",
+        "NIX_CC_WRAPPER_TARGET_BUILD",
+        "NIX_CC_WRAPPER_TARGET_HOST",
+        "NIX_CC_WRAPPER_TARGET_TARGET",
+        "NIX_BINTOOLS_WRAPPER_TARGET_BUILD",
+        "NIX_BINTOOLS_WRAPPER_TARGET_HOST",
+        "NIX_BINTOOLS_WRAPPER_TARGET_TARGET",
+        "NIX_PKG_CONFIG_WRAPPER_TARGET_BUILD",
+        "NIX_PKG_CONFIG_WRAPPER_TARGET_HOST",
+        "NIX_PKG_CONFIG_WRAPPER_TARGET_TARGET",
+        "NIX_ENFORCE_NO_NATIVE",
+        "NIX_DONT_SET_RPATH",
+        "NIX_NO_SELF_RPATH",
+        "NIX_SET_BUILD_ID",
+        "NIX_DYNAMIC_LINKER",
+        "NIX_IGNORE_LD_THROUGH_GCC",
+        "NIX_LINK_TYPE",
+    ];
+    if EXACT.contains(&name) {
+        return true;
+    }
+    let salt = triple.replace('-', "_");
+    TARGETED.iter().any(|base| {
+        name == *base
+            || name == format!("{base}_{salt}")
+            || name == format!("{base}_FOR_BUILD")
+            || name == format!("{base}_FOR_TARGET")
     })
 }
 

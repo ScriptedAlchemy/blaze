@@ -77,10 +77,13 @@ impl Prepared {
     }
 }
 
+pub(crate) use blaze_wire::native::Unit as NativeUnit;
+
 #[derive(Default)]
-pub(crate) struct NativeUnit {
-    pub(crate) env: BTreeMap<OsString, OsString>,
-    pub(crate) flags: Vec<OsString>,
+pub(crate) struct Context<'a> {
+    pub(crate) native: BTreeMap<usize, NativeUnit>,
+    pub(crate) runtime: Option<&'a serde_json::Value>,
+    pub(crate) bindings: Option<&'a dyn Fn(&Prepared) -> Result<serde_json::Value>>,
 }
 
 impl Graph {
@@ -158,7 +161,7 @@ impl Graph {
         Ok(order)
     }
 
-    fn closure(&self, root: usize, prepared: &[Planned]) -> Result<Vec<Planned>> {
+    fn closure_indices(&self, root: usize, prepared: &[Planned]) -> Result<Vec<usize>> {
         fn visit(
             graph: &Graph,
             root: usize,
@@ -185,6 +188,23 @@ impl Graph {
         }
         let mut order = Vec::new();
         visit(self, root, root, prepared, &mut order)?;
+        Ok(order)
+    }
+
+    fn native_closure(
+        &self,
+        root: usize,
+        prepared: &Prepared,
+    ) -> Result<BTreeMap<u32, NativeUnit>> {
+        self.closure_indices(root, &prepared.units)?
+            .into_iter()
+            .enumerate()
+            .map(|(id, at)| Ok((u32::try_from(id)?, prepared.native[&at].clone())))
+            .collect()
+    }
+
+    fn closure(&self, root: usize, prepared: &[Planned]) -> Result<Vec<Planned>> {
+        let order = self.closure_indices(root, prepared)?;
         let indexes: BTreeMap<_, _> = order.iter().enumerate().map(|(i, &at)| (at, i)).collect();
         Ok(order
             .into_iter()
@@ -255,15 +275,15 @@ fn configure(
 }
 
 fn read_inputs(path: &Path) -> Result<BTreeSet<PathBuf>> {
-    let read = crate::dep_info::DepInfo::parse(&std::fs::read_to_string(path)?);
+    let read = crate::dep_info::ReplayTrace::decode(&std::fs::read(path)?)?;
+    let directory = path.parent().context("input directory")?;
+    let project: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("rust-project.json"))?)?;
     let mut inputs = BTreeSet::new();
     for file in read.files {
         let file = PathBuf::from(file);
-        inputs.insert(if file.is_absolute() {
-            file
-        } else {
-            path.parent().context("input directory")?.join(file)
-        });
+        let file = if file.is_absolute() { file } else { directory.join(file) };
+        inputs.insert(crate::compiler_json::physical_path(&project, &file)?);
     }
     Ok(inputs)
 }
@@ -275,8 +295,41 @@ pub(crate) fn run(
     work: &Path,
     environment: crate::process::Native,
 ) -> Result<Prepared> {
+    run_with_native(graph, sysroot, work, environment, BTreeMap::new())
+}
+
+/// Execute with complete native contexts supplied by the authoritative caller.
+/// The compatibility entry derives them from the common environment and text projection.
+pub(crate) fn run_with_native(
+    graph: Graph,
+    sysroot: &Path,
+    work: &Path,
+    environment: crate::process::Native,
+    native: BTreeMap<usize, NativeUnit>,
+) -> Result<Prepared> {
+    run_with_context(graph, sysroot, work, environment, Context { native, ..Context::default() })
+}
+
+/// Execute the captured graph with explicitly pinned runtime policy.
+pub(crate) fn run_with_context(
+    graph: Graph,
+    sysroot: &Path,
+    work: &Path,
+    environment: crate::process::Native,
+    context: Context<'_>,
+) -> Result<Prepared> {
+    let Context { native, runtime, bindings } = context;
+    ensure!(
+        native.keys().all(|&at| at < graph.units.len()),
+        "native context is outside captured graph"
+    );
+    let encoded = native
+        .iter()
+        .map(|(&at, unit)| Ok((u32::try_from(at)?, unit.clone())))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    blaze_wire::native::decode_units(&blaze_wire::native::encode_units(&encoded))?;
     let order = graph.order()?;
-    let runtime = if graph.units.iter().any(|unit| unit.kind != Kind::Rust) {
+    let runtime_paths = if graph.units.iter().any(|unit| unit.kind != Kind::Rust) {
         producer_image::runtime_paths(sysroot)?
     } else {
         BTreeSet::new()
@@ -335,6 +388,7 @@ pub(crate) fn run(
         _lease: lease,
         _lock: lock,
     };
+    prepared.native.extend(native);
     let mut runs: BTreeMap<usize, unit::Unit> = BTreeMap::new();
     for action in order {
         if action < graph.units.len() {
@@ -352,13 +406,20 @@ pub(crate) fn run(
             if node.kind == Kind::ProcMacro {
                 let crates = graph.closure(action, &prepared.units)?;
                 let before = producer_image::snapshot(sysroot, &crates)?;
-                prepared.observe(before.paths().cloned(), &runtime, &generation);
+                prepared.observe(before.paths().cloned(), &runtime_paths, &generation);
+                let native = graph.native_closure(action, &prepared)?;
+                let bound = bindings.map(|make| make(&prepared)).transpose()?;
                 let image = producer_image::link(
                     sysroot,
                     crates,
                     &generation.join(format!("macro-{action}")),
                     &env,
-                    own_script::SourceMode::Captured(node.profile.as_ref()),
+                    own_script::SourceMode::Captured {
+                        profile: node.profile.as_ref(),
+                        units: Some(&native),
+                        runtime,
+                        bindings: bound.as_ref(),
+                    },
                 )?;
                 ensure!(
                     producer_image::snapshot(sysroot, &graph.closure(action, &prepared.units)?)?
@@ -366,7 +427,11 @@ pub(crate) fn run(
                     "captured macro source changed during compilation"
                 );
                 let dir = image.parent().context("macro image directory")?;
-                prepared.observe(read_inputs(&dir.join("producer.inputs"))?, &runtime, &generation);
+                prepared.observe(
+                    read_inputs(&dir.join("producer.inputs"))?,
+                    &runtime_paths,
+                    &generation,
+                );
                 let native = dir.join("producer.native.json");
                 prepared.opaque_native |= !crate::native_inputs::image_still(&native);
                 if native.is_file() {
@@ -381,13 +446,20 @@ pub(crate) fn run(
         let run = &graph.runs[at];
         let crates = graph.closure(run.compiler, &prepared.units)?;
         let before = producer_image::snapshot(sysroot, &crates)?;
-        prepared.observe(before.paths().cloned(), &runtime, &generation);
+        prepared.observe(before.paths().cloned(), &runtime_paths, &generation);
         let dir = generation.join(format!("script-{at}"));
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
         let inputs = dir.join("producer.inputs");
+        let native = graph.native_closure(run.compiler, &prepared)?;
+        let bound = bindings.map(|make| make(&prepared)).transpose()?;
         let described = own_script::with_mode(
             own_script::planned_description(sysroot, crates.clone()),
-            own_script::SourceMode::Captured(graph.units[run.compiler].profile.as_ref()),
+            own_script::SourceMode::Captured {
+                profile: graph.units[run.compiler].profile.as_ref(),
+                units: Some(&native),
+                runtime,
+                bindings: bound.as_ref(),
+            },
         )
         .map_err(anyhow::Error::msg)?;
         own_script::link_planned(&described, &dir, &exe, &inputs, &env)
@@ -396,7 +468,7 @@ pub(crate) fn run(
             producer_image::snapshot(sysroot, &crates)? == before,
             "captured script source changed during compilation"
         );
-        prepared.observe(read_inputs(&inputs)?, &runtime, &generation);
+        prepared.observe(read_inputs(&inputs)?, &runtime_paths, &generation);
         let native = inputs.with_extension("native.json");
         prepared.opaque_native |= !crate::native_inputs::image_still(&native);
         if native.is_file() {
@@ -438,7 +510,7 @@ pub(crate) fn run(
             } else {
                 unit.package.manifest_dir.join(input)
             };
-            prepared.observe([path], &runtime, &generation);
+            prepared.observe([path], &runtime_paths, &generation);
         }
         prepared.outputs.insert(at, (unit.out_dir.clone(), output));
         runs.insert(at, unit);

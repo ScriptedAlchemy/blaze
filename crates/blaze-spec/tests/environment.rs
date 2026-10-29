@@ -10,6 +10,32 @@ fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 #[test]
+fn native_nix_wrapper_controls_are_recorded_without_carrying_arbitrary_nix_values() {
+    let triple = "x86_64-unknown-linux-gnu";
+    let captured = env(&[
+        ("NIX_CFLAGS_COMPILE", "-isystem /sdk/include"),
+        ("NIX_LDFLAGS", "-L/sdk/lib"),
+        ("NIX_CFLAGS_COMPILE_FOR_BUILD", "-I/build/include"),
+        ("NIX_LDFLAGS_BEFORE_x86_64_unknown_linux_gnu", "-L/first/lib"),
+        ("NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu", "1"),
+        ("NIX_HARDENING_ENABLE", "fortify bindnow"),
+        ("NIX_ENFORCE_NO_NATIVE", "1"),
+        ("NIX_PRIVATE_TOKEN", "must-not-be-staged"),
+    ]);
+    let script = environment::script_env(&captured, triple);
+    for (name, value) in &captured {
+        assert_eq!(
+            script.contains(&(name.clone(), value.clone())),
+            name != "NIX_PRIVATE_TOKEN",
+            "{name}"
+        );
+    }
+    assert!(!environment::is_script_var("NIX_LDFLAGS_BEFORE_aarch64_unknown_linux_gnu", triple));
+    assert!(!environment::is_script_var("NIX_CONFIG", triple));
+    assert!(!environment::is_script_var("NIX_PATH", triple));
+}
+
+#[test]
 fn each_refused_variable_is_named() {
     for (name, reason) in REFUSED {
         let name = *name;

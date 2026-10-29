@@ -81,6 +81,17 @@ impl Fixture {
 pub struct FakeMachine;
 
 impl Probe for FakeMachine {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        blaze_spec::native_tree::Tree::from_files(
+            path,
+            ["SDKSettings.json", "usr/lib/libSystem.tbd"].into_iter().map(|name| {
+                let file = path.join(name);
+                let bytes = self.read(&file).unwrap();
+                (file, bytes)
+            }),
+        )
+    }
+
     fn which_native(&self, name: &std::ffi::OsStr, _path: &std::ffi::OsStr) -> Option<PathBuf> {
         Some(PathBuf::from("/usr/bin").join(name))
     }

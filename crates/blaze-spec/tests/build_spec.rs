@@ -119,6 +119,10 @@ fn actual_native_compiler_bytes_change_spec_and_job_with_unused_target_cc_fixed(
     use std::path::{Path, PathBuf};
     struct Compiler(&'static [u8]);
     impl Probe for Compiler {
+        fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+            common::FakeMachine.native_tree(path)
+        }
+
         fn which_native(&self, n: &std::ffi::OsStr, p: &std::ffi::OsStr) -> Option<PathBuf> {
             common::FakeMachine.which_native(n, p)
         }

@@ -17,6 +17,26 @@ use blaze_spec::{
 use blaze_wire::{BuildSpec, Namespace, ProfileSpec, RootRef, SourceRef, StoreIdentity};
 use sha2::{Digest as _, Sha256};
 
+mod producers;
+mod runtime;
+
+/// Install saved native admission independently of the shared source descriptor loader.
+pub(crate) fn install_bindings(project: Option<&serde_json::Value>) -> anyhow::Result<()> {
+    let bindings: Option<Vec<u8>> = project
+        .and_then(|project| project.get(blaze_wire::native::BINDINGS_FIELD))
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("invalid owned native bindings transport"))
+        })
+        .transpose()?;
+    crate::native_inputs::set_replay_bindings(bindings.as_deref())
+}
+
+/// Validate the explicitly pinned runtime carried only in the private descriptor.
+pub(crate) fn runtime_server(project: &serde_json::Value) -> anyhow::Result<Option<PathBuf>> {
+    runtime::server(project)
+}
+
 /// The owned JSON compiler's global debug/link decisions, explicitly supplied by a
 /// validated replay rather than inferred from its caller's environment.
 pub(crate) fn project_profile(project: &Path) -> anyhow::Result<Option<crate::plan::Whole>> {
@@ -346,22 +366,86 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         &blaze_spec::platform::System,
         &executor,
     )?;
-    let mut programs =
-        blaze_spec::execution::programs(&prepared, &sysroot, &job.path().join("artifacts"))?;
+    blaze_spec::execution::preflight(&prepared, true)?;
+    let compiler_home = job.path().join("compiler-home");
+    std::fs::create_dir(&compiler_home)?;
+    let compiler_env = compiler_environment(&prepared, &compiler_home, &executor)?;
+    let has_macros = prepared
+        .resolved
+        .graph
+        .units
+        .iter()
+        .any(|unit| unit.target.kind == blaze_metadata::units::TargetKind::ProcMacro);
+    let runtime =
+        if has_macros {
+            Some(runtime::pin(&executor, &job.path().join("runtime"))?.context(
+                "saved producer graph requires an explicitly pinned owned macro runtime",
+            )?)
+        } else {
+            None
+        };
+    prepared.validate_sources(&store)?;
+    let mut bindings = prepared.native_closure(&blaze_spec::platform::System)?;
+    for (name, path) in
+        [("source", prepared.root.as_path()), ("toolchain/sysroot", sysroot.as_path())]
+    {
+        bindings.roots.push(blaze_spec::native::Root {
+            name: name.into(),
+            tree: blaze_spec::native_tree::Tree::capture(path)?,
+        });
+    }
+    prepared.validate_sources(&store)?;
+    bindings.roots.push(blaze_spec::native::Root {
+        name: "runtime/compiler".into(),
+        tree: blaze_spec::native_tree::Tree::capture(&std::env::current_exe()?)?,
+    });
+    if let Some(runtime) = &runtime {
+        let path = runtime::server(&serde_json::json!({ runtime::FIELD: runtime }))?
+            .context("pinned owned macro runtime disappeared")?;
+        bindings.roots.push(blaze_spec::native::Root {
+            name: "runtime/macro-server".into(),
+            tree: blaze_spec::native_tree::Tree::capture(&path)?,
+        });
+    }
+    let producers = producers::prepare(
+        &prepared,
+        &sysroot,
+        &job.path().join("producers"),
+        crate::process::Native::of(
+            compiler_env.iter().map(|(name, value)| (name.into(), value.clone())),
+        ),
+        runtime.as_ref(),
+        &bindings,
+    )?;
+    prepared.validate_sources(&store)?;
+    producers.admit_inputs()?;
+    let mut programs = blaze_spec::execution::programs_with(
+        &prepared,
+        &sysroot,
+        &job.path().join("artifacts"),
+        Some(&producers.units),
+    )?;
     let SourceRef::Root(source) = &given.source else { bail!("replay requires a source snapshot") };
     for program in &mut programs {
+        crate::dep_info::ensure_replay_key(&mut program.project)?;
+        program.project[blaze_wire::native::BINDINGS_FIELD] =
+            serde_json::json!(producers.bindings.encode_bindings());
+        program.project["blaze_spec_generated_bindings"] =
+            serde_json::json!(producers.generated.encode_bindings());
+        if let Some(runtime) = &runtime {
+            program.project[runtime::FIELD] = runtime.clone();
+        }
         program.project["blaze_spec_inputs"] = serde_json::json!({
             "root": prepared.root, "store": store, "source": source.root,
         });
     }
     // All command and unit support checks happen before the first compiler starts.
-    let compiler_home = job.path().join("compiler-home");
-    std::fs::create_dir(&compiler_home)?;
-    let compiler_env = compiler_environment(&prepared, &compiler_home, &executor)?;
-    for program in &programs {
+    for program in &mut programs {
         compile(program, &compiler_env)?;
         admit_inputs(program)?;
     }
+    prepared.validate_sources(&store)?;
+    producers.bindings.validate()?;
     let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
     let result = serde_json::json!({
         "spec": hex(&blaze_wire::digest_of(&given)),
@@ -530,13 +614,14 @@ fn compiler_environment(
 }
 
 fn compile(
-    program: &blaze_spec::execution::Program,
+    program: &mut blaze_spec::execution::Program,
     env: &BTreeMap<String, OsString>,
 ) -> anyhow::Result<()> {
     let dir = program.executable.parent().context("artifact has no directory")?;
     std::fs::create_dir_all(dir)?;
     let project = dir.join("rust-project.json");
     let described = crate::compiler_json::write(&project, &program.project)?;
+    program.project = serde_json::from_slice(&described)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .env_clear()
@@ -608,12 +693,12 @@ fn admit_inputs(program: &blaze_spec::execution::Program) -> anyhow::Result<()> 
     let dir = program.executable.parent().context("artifact has no directory")?;
     let trace = std::fs::read(dir.join("inputs.cbor"))
         .context("owned compiler did not report its complete source inputs")?;
-    let inputs = crate::dep_info::DepInfo::decode_replay(&trace)?;
+    let inputs = crate::dep_info::ReplayTrace::decode(&trace)?;
     admit_trace(&inputs, &program.project)
 }
 
 pub(crate) fn admit_trace(
-    inputs: &crate::dep_info::DepInfo,
+    inputs: &crate::dep_info::ReplayTrace,
     project: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let bound = &project["blaze_spec_inputs"];
@@ -621,27 +706,64 @@ pub(crate) fn admit_trace(
     let store = Path::new(bound["store"].as_str().context("no admitted source store")?);
     let source: [u8; 32] = serde_json::from_value(bound["source"].clone())?;
     ensure!(!inputs.files.is_empty(), "owned compiler reported an empty source trace");
+    let root = root.canonicalize()?;
+    let generated = match project.get("blaze_spec_generated_bindings") {
+        Some(value) => {
+            let bytes: Vec<u8> = serde_json::from_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("invalid generated input bindings"))?;
+            let closure = blaze_spec::native::Closure::from_bindings(&bytes)?;
+            ensure!(
+                closure.roots.iter().all(|root| root.name.starts_with("producer/out/")
+                    || root.name.starts_with("producer/image/")),
+                "unexpected generated input binding role"
+            );
+            closure
+        }
+        None => blaze_spec::native::Closure::default(),
+    };
     for path in &inputs.files {
-        let path = Path::new(path).canonicalize()?;
-        let relative = path.strip_prefix(root).with_context(|| {
-            format!("compiler read {} outside the immutable source snapshot", path.display())
-        })?;
-        let logical = blaze_wire::SourcePath::from_native(relative)?;
-        let captured = blaze_spec::snapshot::Snapshot::read_file(source, store, &logical)?;
-        ensure!(
-            std::fs::read(&path)? == captured,
-            "compiler input {} changed after snapshot validation",
-            path.display()
-        );
+        let physical = crate::compiler_json::physical_path(project, Path::new(path))?;
+        let path = physical.canonicalize()?;
+        if let Ok(relative) = path.strip_prefix(&root) {
+            let logical = blaze_wire::SourcePath::from_native(relative)?;
+            let captured = blaze_spec::snapshot::Snapshot::read_file(source, store, &logical)?;
+            ensure!(
+                std::fs::read(&path)? == captured,
+                "compiler input {} changed after snapshot validation",
+                path.display()
+            );
+        } else {
+            let observed = blaze_spec::native_tree::Tree::capture(&physical)?;
+            let entry =
+                observed.entry(Path::new("")).context("generated input has no root entry")?;
+            ensure!(
+                matches!(entry.kind, blaze_spec::native_tree::Kind::File { .. }),
+                "compiler input {} is not a generated file",
+                physical.display()
+            );
+            generated.admit(&physical, entry).with_context(|| {
+                format!(
+                    "compiler read {} outside authenticated source and producer inputs",
+                    physical.display()
+                )
+            })?;
+        }
     }
+    generated.validate()?;
     let crates =
         project["crates"].as_array().context("no source crates in compiler description")?;
+    let trace_key = crate::dep_info::replay_key(project)?;
     for (name, value) in &inputs.env {
-        let declared = value.as_deref().is_some_and(|value| {
-            crates.iter().any(|krate| {
-                krate["env"].get(name).and_then(serde_json::Value::as_str) == Some(value)
-            })
-        });
+        let declared = value.is_some()
+            && crates.iter().any(|krate| {
+                krate["env"].get(name).and_then(serde_json::Value::as_str).is_some_and(|declared| {
+                    crate::dep_info::ReplayTrace::value_matches(
+                        value.as_ref(),
+                        Some(declared),
+                        trace_key,
+                    )
+                })
+            });
         // Cargo derives these absences per crate. An arbitrary option_env! read is
         // not proof of a captured absence: the requester may have had a secret value.
         let derived_absence = value.is_none()
@@ -684,6 +806,45 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn generated_source_admission_requires_the_complete_unchanged_bound_tree() {
+        use blaze_spec::{
+            native::{Closure, Root},
+            native_tree::Tree,
+        };
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        let generated = work.path().join("generated");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&generated).unwrap();
+        let file = generated.join("generated.rs");
+        std::fs::write(&file, "pub const VALUE: u8 = 42;").unwrap();
+        let closure = Closure {
+            roots: vec![Root {
+                name: "producer/out/0".into(),
+                tree: Tree::capture(&generated).unwrap(),
+            }],
+        };
+        let mut project = serde_json::json!({
+            "blaze_spec_inputs": {"root": source, "store": work.path(), "source": vec![0_u8; 32]},
+            "blaze_spec_generated_bindings": closure.encode_bindings(), "crates": [],
+        });
+        crate::dep_info::ensure_replay_key(&mut project).unwrap();
+        let trace = crate::dep_info::ReplayTrace {
+            files: vec![file.to_str().unwrap().to_owned()],
+            env: Vec::new(),
+        };
+        admit_trace(&trace, &project).unwrap();
+        project.as_object_mut().unwrap().remove("blaze_spec_generated_bindings");
+        assert!(admit_trace(&trace, &project).is_err());
+        project["blaze_spec_generated_bindings"] = serde_json::json!(closure.encode_bindings());
+        std::fs::write(generated.join("later.rs"), "unexpected membership").unwrap();
+        assert!(admit_trace(&trace, &project).is_err());
+        std::fs::remove_file(generated.join("later.rs")).unwrap();
+        std::fs::write(&file, "pub const VALUE: u8 = 43;").unwrap();
+        assert!(admit_trace(&trace, &project).is_err());
     }
 
     #[test]

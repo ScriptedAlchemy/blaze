@@ -149,9 +149,119 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    /// Check a materialized tree against its authenticated complete member/type/content
+    /// manifest without writing blobs or changing the source directory.
+    pub fn verify_materialized(root: Digest, store: &Path, directory: &Path) -> anyhow::Result<()> {
+        let snapshot = parse(&get(store, &root)?)?;
+        let expected: BTreeMap<_, _> = snapshot
+            .entries
+            .iter()
+            .map(|entry| Ok((entry.0.to_native()?, entry)))
+            .collect::<anyhow::Result<_>>()?;
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![PathBuf::new()];
+        while let Some(parent) = pending.pop() {
+            for item in fs::read_dir(directory.join(&parent))? {
+                let item = item?;
+                let relative = parent.join(item.file_name());
+                let Entry(_, kind, mode, digest) = expected.get(&relative).with_context(|| {
+                    format!("unrecorded snapshot member {}", relative.display())
+                })?;
+                let path = directory.join(&relative);
+                let metadata = fs::symlink_metadata(&path)?;
+                match *kind {
+                    0 => {
+                        ensure!(
+                            metadata.is_file(),
+                            "snapshot input {} changed type",
+                            path.display()
+                        );
+                        ensure!(
+                            hash(&fs::read(&path)?) == *digest,
+                            "snapshot input {} changed bytes",
+                            path.display()
+                        );
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            ensure!(
+                                metadata.permissions().mode() & 0o111 == *mode,
+                                "snapshot input {} changed executable mode",
+                                path.display()
+                            );
+                        }
+                    }
+                    1 => {
+                        ensure!(
+                            metadata.is_dir(),
+                            "snapshot directory {} changed type",
+                            path.display()
+                        );
+                        pending.push(relative.clone());
+                    }
+                    2 => {
+                        ensure!(
+                            metadata.is_symlink(),
+                            "snapshot alias {} changed type",
+                            path.display()
+                        );
+                        let target = fs::read_link(&path)?;
+                        #[cfg(unix)]
+                        let bytes = {
+                            use std::os::unix::ffi::OsStrExt as _;
+                            target.as_os_str().as_bytes().to_vec()
+                        };
+                        #[cfg(not(unix))]
+                        let bytes = target
+                            .to_str()
+                            .context("unrepresentable snapshot alias")?
+                            .as_bytes()
+                            .to_vec();
+                        ensure!(
+                            hash(&bytes) == *digest,
+                            "snapshot alias {} changed target",
+                            path.display()
+                        );
+                    }
+                    _ => unreachable!("authenticated snapshot kind"),
+                }
+                seen.insert(relative);
+            }
+        }
+        ensure!(seen.len() == expected.len(), "materialized snapshot lost members");
+        Ok(())
+    }
+
     /// The BLAKE3 root named by `SourceRef::Root`.
     pub fn digest(&self) -> Digest {
         hash(&blaze_wire::encode(self))
+    }
+
+    /// Add authenticated replay metadata at a deterministic unused root filename.
+    /// A source tree may use any proposed metadata name; user bytes are never replaced.
+    pub fn with_unique_file(
+        self,
+        stem: &str,
+        bytes: &[u8],
+        store: &Path,
+    ) -> anyhow::Result<(Self, SourcePath)> {
+        let first = SourcePath::new(stem.to_owned())?;
+        ensure!(
+            first.to_native()?.components().count() == 1,
+            "snapshot metadata name is not a basename"
+        );
+        let mut index = 0_u64;
+        loop {
+            let name = SourcePath::new(if index == 0 {
+                stem.to_owned()
+            } else {
+                format!("{stem}.{index}")
+            })?;
+            if !self.entries.iter().any(|entry| entry.0 == name) {
+                return Ok((self.with_file(&name, bytes, store)?, name));
+            }
+            index = index.checked_add(1).context("snapshot metadata filename space exhausted")?;
+        }
     }
 
     /// Add an authenticated regular file without replacing source content or following

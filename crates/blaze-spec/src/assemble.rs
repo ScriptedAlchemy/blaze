@@ -155,8 +155,10 @@ pub struct Resolved {
     pub manifest: PathBuf,
     /// Cargo's resolved target and intermediate output directories, excluded from capture.
     pub outputs: Vec<PathBuf>,
-    /// The complete locked external package closure, including unselected packages.
+    /// External source trees selected for compilation by this request.
     pub sources: Vec<blaze_metadata::CapturedSource>,
+    /// Normalized whole-lock summaries, independent of selected source archives.
+    pub facts: blaze_metadata::ResolverFacts,
 }
 
 /// Resolve without discarding the native graph an owned executor needs.
@@ -182,15 +184,21 @@ pub fn resolve_captured(
     ctx: &Context<'_>,
     platform: &ExecPlatform,
     sources: &[blaze_metadata::CapturedSource],
+    facts: &blaze_metadata::ResolverFacts,
 ) -> Result<Resolved, Refusal> {
-    resolve_with_platform(request, ctx, Some(platform), Some(sources))
+    resolve_with_platform(
+        request,
+        ctx,
+        Some(platform),
+        Some(blaze_metadata::CapturedResolution { sources, facts }),
+    )
 }
 
 fn resolve_with_platform(
     request: &Request,
     ctx: &Context<'_>,
     platform: Option<&ExecPlatform>,
-    sources: Option<&[blaze_metadata::CapturedSource]>,
+    sources: Option<blaze_metadata::CapturedResolution<'_>>,
 ) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let (offline, mut initial, manifest, outputs) = Opened::with(request, ctx, |opened| {
@@ -232,14 +240,14 @@ fn resolve_with_platform(
         targets,
         profile: request.profile.as_deref(),
     };
-    let (graph, mut inputs, sources) =
+    let units::GraphResolution { graph, mut inputs, sources, facts } =
         units::unit_graph_captured(&wanted, sources, ctx.config_root).map_err(|error| {
             Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
         })?;
     let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
     inputs.extend(assembly_inputs);
-    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources })
+    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, facts })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.

@@ -22,7 +22,7 @@ use blaze_resolve::{InternedString, PackageId};
 use cargo_util_schemas::core::SourceKind;
 use rustc_hash::FxHashMap;
 
-use crate::{Asked, CapturedSource, Locked, Packages, World};
+use crate::{Asked, CapturedResolution, CapturedSource, Locked, Packages, ResolverFacts, World};
 
 mod producer;
 pub(crate) use producer::of_build;
@@ -361,23 +361,28 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
 pub fn unit_graph_with_inputs(
     asked: &UnitsAsked<'_>,
 ) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>)> {
-    let (graph, inputs, _) = unit_graph_captured(asked, None, None)?;
-    Ok((graph, inputs))
+    let resolution = unit_graph_captured(asked, None, None)?;
+    Ok((resolution.graph, resolution.inputs))
 }
 
-/// Resolve from captured locked-package roots, or collect those roots while resolving
-/// normally. A supplied list must match every non-path lock-file package exactly,
-/// including unused patches; no registry or Git transport is used in that case.
-///
-/// The caller must authenticate the captured roots and their content. Their original
-/// registry/Git identities are retained in the graph, and every manifest read remains
-/// in the returned structural trace for the caller to check against its snapshot.
-/// `discovery_root` bounds ancestor configuration reads to the materialized snapshot.
+/// One resolution's graph, structural trace, selected source roots and whole-lock facts.
+#[derive(Debug)]
+pub struct GraphResolution {
+    pub graph: UnitGraph,
+    pub inputs: Vec<(PathBuf, Vec<u8>)>,
+    pub sources: Vec<CapturedSource>,
+    pub facts: ResolverFacts,
+}
+
+/// Resolve using owned source indexes, or only authenticated facts and selected roots.
+/// Unselected packages contribute resolver facts without requiring their source archives.
+/// The caller authenticates facts and source contents; original registry/Git identities
+/// remain authoritative. `discovery_root` bounds configuration reads during replay.
 pub fn unit_graph_captured(
     asked: &UnitsAsked<'_>,
-    captured: Option<&[CapturedSource]>,
+    captured: Option<CapturedResolution<'_>>,
     discovery_root: Option<&Path>,
-) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>, Vec<CapturedSource>)> {
+) -> Result<GraphResolution> {
     let a = asked.asked;
     let Some(build) = &a.build else {
         bail!("the unit graph is that of a build: no `Build` was given")
@@ -452,11 +457,22 @@ pub fn unit_graph_captured(
         &requested,
         platform.triple,
     )?;
-    let in_lock: Vec<ProfilePkg<'_>> = resolved
+    let profile_packages = resolved
         .whole
         .iter()
-        .map(|id| ProfilePkg(&env_packages[&id].manifest.package_id))
-        .collect();
+        .map(|id| {
+            Ok(blaze_manifest::manifest::PackageId {
+                name: id.name().to_string(),
+                version: id.version().clone(),
+                source_id: if let Some(path) = id.source_id().local_path() {
+                    blaze_manifest::source::SourceId::for_path(&path)?
+                } else {
+                    crate::manifest_source(&id.source_id().as_url().to_string(), &ctx.config)?
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let in_lock: Vec<ProfilePkg<'_>> = profile_packages.iter().map(ProfilePkg).collect();
     let in_lock: Vec<&dyn ProfilePackage> =
         in_lock.iter().map(|it| it as &dyn ProfilePackage).collect();
     profiles.validate_packages(ws.profiles(), &in_lock, &mut warnings)?;
@@ -490,7 +506,12 @@ pub fn unit_graph_captured(
     }
     warnings.extend(ctx.config.take_warnings());
     let graph = assemble(&env, &shared, ws.root(), &locked, warnings)?;
-    Ok((graph, locked.inputs(&ctx), locked.sources.clone()))
+    Ok(GraphResolution {
+        graph,
+        inputs: locked.inputs(&ctx),
+        sources: locked.sources.clone(),
+        facts: locked.facts.clone(),
+    })
 }
 
 /// The members of the workspace, as the package selection reads them.

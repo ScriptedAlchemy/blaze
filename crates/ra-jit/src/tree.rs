@@ -60,7 +60,7 @@ impl Tree {
                 continue;
             }
             let Some(parent) = path.parent() else { continue };
-            let listed = std::fs::metadata(parent).and_then(|it| it.modified()).ok();
+            let listed = std::fs::metadata(db.on_disk(parent)).and_then(|it| it.modified()).ok();
             self.directories.entry(parent.to_owned()).or_insert(Directory { root, listed });
         }
     }
@@ -88,7 +88,7 @@ impl Tree {
         })
     }
 
-    pub(crate) fn added(&mut self, db: &mut RootDatabase) -> Moved {
+    pub(crate) fn added(&mut self, db: &mut RootDatabase) -> anyhow::Result<Moved> {
         let mut stale: Vec<PathBuf> = self
             .directories
             .iter()
@@ -105,14 +105,28 @@ impl Tree {
             let root = dir.root;
             let on_disk = db.on_disk(&path);
             dir.listed = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
-            let Ok(entries) = std::fs::read_dir(&on_disk) else { continue };
+            let entries = match std::fs::read_dir(&on_disk) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             // A package's directory holds much that is not source: only the directories
             // with source right in them are looked into there.
             let package = on_disk.join("Cargo.toml").exists();
-            for entry in entries.flatten() {
-                let (entry_on_disk, entry_path) = (entry.path(), path.join(entry.file_name()));
-                let Ok(kind) = entry.file_type() else { continue };
-                let hidden = entry.file_name().to_str().is_none_or(|it| it.starts_with('.'));
+            for entry in entries {
+                let entry = entry?;
+                let entry_on_disk = entry.path();
+                let entry_path = if paths::native::is_projected(&path) {
+                    paths::native::encode(&entry_on_disk)?.into()
+                } else {
+                    path.join(entry.file_name())
+                };
+                let kind = match entry.file_type() {
+                    Ok(kind) => kind,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let hidden = entry.file_name().as_encoded_bytes().starts_with(b".");
                 if kind.is_dir() {
                     let source = !hidden
                         && (!package
@@ -155,7 +169,7 @@ impl Tree {
             }
             self.rewrite(db, root, files, &FxHashSet::default());
         }
-        moved
+        Ok(moved)
     }
 
     /// Puts the files an `include!` or a module declaration named that were not loaded, as

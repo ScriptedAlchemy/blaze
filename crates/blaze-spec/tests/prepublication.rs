@@ -53,6 +53,10 @@ fn raw_ambient_values_respect_force_for_literal_dotted_env_names() {
 
 struct Tools(&'static [u8]);
 impl Probe for Tools {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        common::FakeMachine.native_tree(path)
+    }
+
     fn which_native(&self, n: &std::ffi::OsStr, _p: &std::ffi::OsStr) -> Option<PathBuf> {
         Some(PathBuf::from("/usr/bin").join(n))
     }

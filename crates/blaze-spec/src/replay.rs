@@ -27,6 +27,7 @@ use crate::{
 };
 
 const SOURCES: &str = ".blaze-sources.cbor";
+const FACTS: &str = ".blaze-resolver-facts.cbor";
 
 /// The inputs that have passed source, request, graph, toolchain and platform validation.
 pub struct Prepared {
@@ -45,6 +46,45 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// Manifest/configuration context scoped to the authenticated materialized replay.
+    pub fn manifests(&self) -> anyhow::Result<blaze_manifest::Context> {
+        let env = environment::text_view(&self.environment)?;
+        let home = environment::cargo_home(&self.environment, &self.cwd)
+            .context("replay has no Cargo home")?;
+        let mut config = blaze_manifest::Config::load_with_home(&self.cwd, env, &[], home)?
+            .with_discovery_root(&self.root)?;
+        config.start(
+            self.request.command.unwrap_or(Subcommand::Build).name(),
+            &self.request.config,
+        )?;
+        Ok(blaze_manifest::Context::new(config))
+    }
+
+    /// Complete native trees probed with the same effective environment and machine
+    /// facts that authenticated this replay's execution platform.
+    pub fn native_closure(&self, probe: &dyn Probe) -> anyhow::Result<crate::native::Closure> {
+        let mut env = self.environment.clone();
+        env.extend(self.execution_environment()?);
+        let machine = crate::platform::Machine {
+            cwd: &self.cwd,
+            triple: &self.host.triple,
+            cpu: &self.host.cpu,
+            env: &env,
+            linker: None,
+        };
+        let described = crate::platform::describe(&machine, probe)?;
+        ensure!(
+            described.platform == self.resolved.spec.platform,
+            "native execution platform changed after replay validation"
+        );
+        Ok(described.native)
+    }
+
+    /// Revalidate all materialized source bytes, kinds, native names and membership.
+    pub fn validate_sources(&self, store: &Path) -> anyhow::Result<()> {
+        Snapshot::verify_materialized(source_root(&self.resolved.spec.build)?, store, &self.root)
+    }
+
     /// The effective compiler/run environment, after applying the spec's configuration
     /// values. Configuration-derived relative paths must not be ambient overrides while
     /// reproducing the configuration itself.
@@ -68,24 +108,28 @@ struct Record {
     manifest: SourcePath,
     cargo_home: Option<SourcePath>,
     platform: ExecPlatform,
+    sources: SourcePath,
+    facts: SourcePath,
 }
 
 impl Wire for Record {
     fn encode(&self, e: &mut blaze_wire::Encoder) {
-        e.array(5);
-        1_u32.encode(e);
+        e.array(7);
+        2_u32.encode(e);
         self.recipe.encode(e);
         self.manifest.encode(e);
         self.cargo_home.encode(e);
         self.platform.encode(e);
+        self.sources.encode(e);
+        self.facts.encode(e);
     }
 
     fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
-        r.array_start(5)?;
+        r.array_start(7)?;
         let at = r.position();
-        if u32::decode(r)? != 1 {
+        if u32::decode(r)? != 2 {
             return Err(blaze_wire::Error {
-                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 1" },
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 2" },
                 at,
             });
         }
@@ -94,6 +138,8 @@ impl Wire for Record {
             manifest: SourcePath::decode(r)?,
             cargo_home: Option::decode(r)?,
             platform: ExecPlatform::decode(r)?,
+            sources: SourcePath::decode(r)?,
+            facts: SourcePath::decode(r)?,
         };
         r.array_end()?;
         Ok(record)
@@ -200,8 +246,8 @@ pub fn capture(
     let home = blaze_manifest::paths::normalize_path(&home);
     let mut trees = vec![first.graph.root.clone()];
     trees.extend(first.graph.units.iter().map(|unit| unit.package.manifest_dir.clone()));
-    // Resolution reads packages that are locked but not selected, too. Preserve their
-    // source roots so the same offline resolution can prove they remain unselected.
+    // Path-package manifests read during resolution remain source inputs. Inactive
+    // registry/Git packages contribute authenticated summaries rather than archives.
     trees.extend(first.inputs.iter().filter_map(|(path, _)| {
         (path.file_name().is_some_and(|name| name == "Cargo.toml"))
             .then(|| path.parent().map(Path::to_owned))
@@ -228,8 +274,13 @@ pub fn capture(
     };
     // This pass also resolves workspace-relative configuration paths against the
     // final layout, rather than the provisional workspace root.
-    let mut resolved =
-        assemble::resolve_captured(request, &captured_ctx, &first.spec.platform, &first.sources)?;
+    let mut resolved = assemble::resolve_captured(
+        request,
+        &captured_ctx,
+        &first.spec.platform,
+        &first.sources,
+        &first.facts,
+    )?;
     resolved.inputs.extend(first.inputs);
     let config_files = config_files(words, ctx.cwd, &root, &resolved.inputs)?;
     let mut sources: Vec<_> = resolved
@@ -246,10 +297,12 @@ pub fn capture(
     let mut excluded = resolved.outputs;
     excluded.extend_from_slice(outputs);
     excluded.push(store.to_owned());
-    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &resolved.inputs, store)?
-        .with_file(
-        &SourcePath::new(SOURCES.to_owned())?,
-        &blaze_wire::encode(&(1_u32, sources)),
+    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &resolved.inputs, store)?;
+    let (snapshot, sources_path) =
+        snapshot.with_unique_file(SOURCES, &blaze_wire::encode(&(1_u32, sources)), store)?;
+    let (snapshot, facts_path) = snapshot.with_unique_file(
+        FACTS,
+        &crate::resolver_facts::encode(&resolved.facts)?,
         store,
     )?;
     let mut made = resolved.spec;
@@ -279,6 +332,8 @@ pub fn capture(
             .then(|| relative(&root, &home))
             .transpose()?,
         platform: made.platform.clone(),
+        sources: sources_path,
+        facts: facts_path,
     };
     let relocated = tempfile::tempdir()?;
     prepare_record(
@@ -339,7 +394,7 @@ fn prepare_record(
         record.recipe.spec_digest() == blaze_wire::digest_of(given),
         "recipe does not match the BuildSpec"
     );
-    let bytes = Snapshot::read_file(source.root, store, &SourcePath::new(SOURCES.to_owned())?)?;
+    let bytes = Snapshot::read_file(source.root, store, &record.sources)?;
     let (version, captured): (u32, Vec<((String, String, String), SourcePath)>) =
         blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?;
     ensure!(version == 1, "unknown captured source mapping version");
@@ -426,7 +481,9 @@ fn prepare_record(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let resolved = assemble::resolve_captured(&request, &ctx, &record.platform, &sources)?;
+    let facts =
+        crate::resolver_facts::decode(&Snapshot::read_file(source.root, store, &record.facts)?)?;
+    let resolved = assemble::resolve_captured(&request, &ctx, &record.platform, &sources, &facts)?;
     if let Some(difference) = crate::run::first_difference(given, &resolved.spec.build) {
         bail!("captured request does not match the BuildSpec: {difference}");
     }

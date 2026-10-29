@@ -57,8 +57,10 @@ The connected executor builds binaries/examples from source dependencies and sup
 unit/integration test executables. `test --no-run` builds those executables and skips
 implicit doctests, as Cargo does. It retains successful artifacts and `result.json`
 under `FILE.outputs/`; failed compilation or input admission publishes no result.
-A version-1 CBOR input trace preserves filenames that Cargo dep-info cannot represent,
-and every traced application source read is checked against the snapshot before execution.
+A version-2 CBOR input trace preserves filenames that Cargo dep-info cannot represent.
+Environment reads carry HMAC identities; the per-description key travels only through
+private stdin. Every traced application source read is checked against the snapshot
+or its authenticated producer generation before execution.
 This is admission after compilation, not a filesystem sandbox.
 
 **Incomplete:** check/doctest/benchmark units, standalone library artifacts, build scripts,

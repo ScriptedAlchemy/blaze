@@ -2,7 +2,7 @@
 //! which compares it with cargo's.
 //!
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
-//!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen]
+//!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen] [--unit-graph]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
 //!                  [--programs [--bin NAME | --example NAME]]]
 //!
@@ -27,6 +27,7 @@ fn main() -> Result<()> {
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
     let (mut packages, mut excludes) = (Vec::new(), Vec::new());
     let (mut listed, mut bin, mut example) = (false, None, None);
+    let mut unit_graph = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} takes a value"));
@@ -49,6 +50,10 @@ fn main() -> Result<()> {
             "--workspace" => workspace = true,
             "--dev-units" => dev_units = true,
             "--programs" => listed = true,
+            "--unit-graph" => {
+                unit_graph = true;
+                build = true;
+            }
             "--bin" => bin = Some(value()?),
             "--example" => example = Some(value()?),
             _ => bail!("unknown argument {arg}"),
@@ -86,7 +91,16 @@ fn main() -> Result<()> {
         locked,
         store: None,
     };
-    if listed {
+    if unit_graph {
+        use blaze_metadata::units::{Command, TargetFilter, UnitsAsked};
+        let graph = blaze_metadata::units::unit_graph(&UnitsAsked {
+            asked: &asked,
+            command: Command::Build,
+            targets: &TargetFilter::default(),
+            profile: None,
+        })?;
+        println!("{}", graph.to_cargo_json());
+    } else if listed {
         let targets = Targets { bin: bin.as_deref(), example: example.as_deref() };
         println!("{}", serde_json::to_string(&programs(&asked, targets)?.1)?);
     } else {

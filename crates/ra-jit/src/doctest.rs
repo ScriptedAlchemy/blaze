@@ -1589,6 +1589,7 @@ fn add_crates(
             proc_macro_cwd: data.proc_macro_cwd.clone(),
         };
         let extra = ExtraCrateData {
+            blaze_native_unit: library.extra_data(db).blaze_native_unit,
             version: None,
             display_name: Some(CrateDisplayName::from_canonical_name(&name)),
             potential_cfg_options: None,
@@ -1682,7 +1683,9 @@ fn admit_example(db: &RootDatabase, asked: &Asked, name: &str) -> anyhow::Result
         .filter(|krate| !krate.origin(db).is_lang())
         .collect();
     let inputs = crate::dep_info::DepInfo::from_crates(db, &crates, name)?;
-    crate::cargo::spec::admit_trace(&inputs, project)
+    let trace =
+        crate::dep_info::ReplayTrace::from_inputs(&inputs, crate::dep_info::replay_key(project)?);
+    crate::cargo::spec::admit_trace(&trace, project)
 }
 
 /// What the examples are built with: the run of ra-jit that loaded the library, with nothing

@@ -622,14 +622,14 @@ fn source_path(
 ) -> Option<String> {
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);
-    let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-    let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
+    let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
+    let path = paths::native::resolve(Path::new(&logical)).ok()?;
+    let base = base.and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
-    let relative = (!source_root.is_library)
-        .then(|| Path::new(&path).strip_prefix(root).ok().or(base))
-        .flatten();
-    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    let relative =
+        (!source_root.is_library).then(|| path.strip_prefix(root).ok().or(base)).flatten();
+    Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
 impl<'a> Resolver<'a> {
@@ -2348,11 +2348,33 @@ fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
 fn load(
     projects: &[&Path],
     cargo_config: &CargoConfig,
-    load_config: LoadCargoConfig,
+    mut load_config: LoadCargoConfig,
     selection: plan::Selection,
     beside: Option<Beside>,
     scripts_said: Option<Vec<String>>,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
+    let replay = std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1");
+    if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && let Some(project) = projects.first()
+    {
+        let private = compiler_json::read(project)?;
+        cargo::spec::install_bindings(Some(&private))?;
+        if let Some(server) = cargo::spec::runtime_server(&private)? {
+            load_config.with_proc_macro_server = ProcMacroServerChoice::Explicit(
+                AbsPathBuf::try_from(
+                    server.to_str().context("owned runtime server path is not UTF-8")?,
+                )
+                .map_err(|_| anyhow::anyhow!("owned runtime server path is not absolute UTF-8"))?,
+            );
+        } else if replay {
+            load_config.with_proc_macro_server = ProcMacroServerChoice::None;
+        }
+    } else {
+        cargo::spec::install_bindings(None)?;
+        if replay {
+            load_config.with_proc_macro_server = ProcMacroServerChoice::None;
+        }
+    }
     let mut checkouts = Checkouts {
         compared: Default::default(),
         roots: Vec::new(),
@@ -3310,7 +3332,10 @@ fn workspace_at(
     let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
         && matches!(manifest, ProjectManifest::ProjectJson(_))
     {
-        let data = serde_json::from_value(crate::compiler_json::read(project)?)?;
+        let private = crate::compiler_json::read(project)?;
+        crate::compiler_json::install_native(&private)?;
+        let data: project_model::ProjectJsonData = serde_json::from_value(private)
+            .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
         let json = project_model::ProjectJson::new(
             Some(manifest.manifest_path().to_owned()),
             manifest.manifest_path().parent(),
@@ -4972,9 +4997,10 @@ fn write_dep_info_of(
 ) -> anyhow::Result<()> {
     let dep_info::DepInfo { files: paths, env } =
         dep_info::DepInfo::from_crates(db, krates, asked)?;
-    if private && std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1") {
-        let trace = dep_info::DepInfo { files: paths, env };
-        return std::fs::write(path, trace.encode_replay())
+    if private && let Some(key) = dep_info::installed_replay_key() {
+        let inputs = dep_info::DepInfo { files: paths, env };
+        let trace = dep_info::ReplayTrace::from_inputs(&inputs, key);
+        return std::fs::write(path, trace.encode())
             .with_context(|| format!("writing {}", path.display()));
     }
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
@@ -9945,7 +9971,7 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db).added {
+            for (file, path) in tree.added(&mut db)?.added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,

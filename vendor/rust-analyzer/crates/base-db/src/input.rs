@@ -388,6 +388,7 @@ impl FromStr for ReleaseChannel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UniqueCrateData {
     root_file_id: FileId,
+    blaze_native_unit: Option<u32>,
     disambiguator: Option<Box<(BuiltCrateData, HashableCfgOptions)>>,
 }
 
@@ -420,6 +421,8 @@ pub type BuiltCrateData = CrateData<Crate>;
 /// Crate data unrelated to analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraCrateData {
+    /// Compiler-description unit identity for native settings, never an environment value.
+    pub blaze_native_unit: Option<u32>,
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
     /// its `[package].name` can be different for other project types or even
@@ -621,7 +624,12 @@ impl CrateGraphBuilder {
                 codegen_flags: Vec::new(),
                 proc_macro_cwd,
             },
-            extra: ExtraCrateData { version, display_name, potential_cfg_options },
+            extra: ExtraCrateData {
+                blaze_native_unit: None,
+                version,
+                display_name,
+                potential_cfg_options,
+            },
             cfg_options,
             env,
             ws_data,
@@ -652,6 +660,10 @@ impl CrateGraphBuilder {
 
     pub fn set_codegen_flags(&mut self, krate: CrateBuilderId, flags: Vec<String>) {
         self.arena[krate].basic.codegen_flags = flags;
+    }
+
+    pub fn set_native_unit(&mut self, krate: CrateBuilderId, unit: Option<u32>) {
+        self.arena[krate].extra.blaze_native_unit = unit;
     }
 
     pub fn set_in_db(self, db: &mut dyn SourceDatabase) -> CratesIdMap {
@@ -733,8 +745,11 @@ impl CrateGraphBuilder {
                 Some(Box::new((crate_data.clone(), krate.cfg_options.to_hashable())))
             };
 
-            let unique_crate_data =
-                UniqueCrateData { root_file_id: krate.basic.root_file_id, disambiguator };
+            let unique_crate_data = UniqueCrateData {
+                root_file_id: krate.basic.root_file_id,
+                blaze_native_unit: krate.extra.blaze_native_unit,
+                disambiguator,
+            };
             let crate_input = match crates_map.0.entry(unique_crate_data) {
                 Entry::Occupied(entry) => {
                     let old_crate = *entry.get();

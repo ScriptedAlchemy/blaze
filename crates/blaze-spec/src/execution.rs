@@ -54,15 +54,94 @@ pub struct Program {
     pub project: Value,
 }
 
-fn reachable(build: &BuildSpec, root: u32) -> BTreeSet<u32> {
+/// The source and native settings after the owned producer scheduler has completed.
+/// Indices are canonical BuildSpec unit identities, including distinct instances that
+/// happen to share one source file.
+#[derive(Clone, Debug)]
+pub struct ProducedUnit {
+    /// Complete configured target/profile/features and producer cfg.
+    pub cfg: Vec<String>,
+    /// Frontend text settings; native linker settings remain lossless below.
+    pub codegen_flags: Vec<String>,
+    /// Full per-instance environment and native linker settings.
+    pub native: blaze_wire::native::Unit,
+    /// An immutable, leased macro image, when this unit is an expansion leaf.
+    pub proc_macro: Option<PathBuf>,
+}
+
+/// Complete target/profile/features cfg before a producer adds its output.
+pub fn unit_cfg(prepared: &Prepared, at: usize) -> Vec<String> {
+    prepared
+        .host
+        .cfg
+        .iter()
+        .map(ToString::to_string)
+        .filter(|cfg| {
+            let key = cfg.split('=').next().unwrap_or(cfg).trim();
+            !matches!(key, "panic" | "debug_assertions" | "overflow_checks")
+        })
+        .chain(prepared.resolved.spec.build.units[at].cfg.iter().map(|cfg| cfg.0.clone()))
+        .collect()
+}
+
+fn reachable(build: &BuildSpec, native: &[&Unit], root: u32) -> BTreeSet<u32> {
     let mut seen = BTreeSet::new();
     let mut next = vec![root];
     while let Some(at) = next.pop() {
-        if seen.insert(at) {
+        if native[at as usize].target.kind == TargetKind::CustomBuild
+            || (at != root
+                && !matches!(
+                    native[at as usize].target.kind,
+                    TargetKind::Lib | TargetKind::ProcMacro
+                ))
+        {
+            continue;
+        }
+        if seen.insert(at) && native[at as usize].target.kind != TargetKind::ProcMacro {
             next.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
         }
     }
     seen
+}
+
+fn roots(build: &BuildSpec, native: &[&Unit]) -> Vec<u32> {
+    let mut roots: BTreeSet<_> = build.asked.iter().copied().collect();
+    if matches!(build.command, Command::Test(_)) {
+        let mut seen = BTreeSet::new();
+        let mut pending: Vec<_> = roots.iter().copied().collect();
+        while let Some(at) = pending.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let unit = native[at as usize];
+            if unit.target.kind == TargetKind::Bin && !unit.test {
+                roots.insert(at);
+            }
+            pending.extend(build.units[at as usize].deps.iter().map(|(at, _)| *at));
+        }
+    }
+    if let Command::Test(run) = &build.command
+        && run.doc != 0
+        && !run.no_run
+    {
+        let selected: BTreeSet<_> =
+            build.asked.iter().map(|&at| &native[at as usize].package.id).collect();
+        roots.extend(
+            native
+                .iter()
+                .enumerate()
+                .filter(|(_, unit)| {
+                    matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
+                        && unit.mode == Mode::Build
+                        && unit.target.doctest
+                        && selected.contains(&unit.package.id)
+                })
+                .map(|(at, _)| at as u32),
+        );
+    }
+    let mut roots: Vec<_> = roots.into_iter().collect();
+    roots.sort_by_key(|&at| (native[at as usize].test, at));
+    roots
 }
 
 fn is_program(unit: &Unit) -> bool {
@@ -151,28 +230,38 @@ pub fn programs(
     sysroot: &Path,
     artifacts: &Path,
 ) -> anyhow::Result<Vec<Program>> {
+    programs_with(prepared, sysroot, artifacts, None)
+}
+
+/// Check execution shapes before a producer or compiler is started.
+pub fn preflight(prepared: &Prepared, allow_producers: bool) -> anyhow::Result<()> {
     let build = &prepared.resolved.spec.build;
     let native = canonical_units(build, &prepared.resolved.graph)?;
     for (at, unit) in native.iter().enumerate() {
         let label = format!("{}:{}", unit.package.name, unit.target.name);
-        match unit.target.kind {
-            TargetKind::CustomBuild => {
-                bail!("owned BuildSpec replay has no build-script producer for {label}")
+        if !allow_producers {
+            match unit.target.kind {
+                TargetKind::CustomBuild => {
+                    bail!("owned BuildSpec replay has no build-script producer for {label}")
+                }
+                TargetKind::ProcMacro => {
+                    bail!("owned BuildSpec replay has no proc-macro producer for {label}")
+                }
+                _ => {}
             }
-            TargetKind::ProcMacro => {
-                bail!("owned BuildSpec replay has no proc-macro producer for {label}")
-            }
-            _ => {}
+        }
+        if unit.target.kind == TargetKind::CustomBuild {
+            continue;
         }
         ensure!(
-            !unit.for_host,
+            allow_producers || !unit.for_host,
             "owned BuildSpec replay cannot collapse host unit {label} into target units"
         );
         ensure!(
             unit.target
                 .crate_types
                 .iter()
-                .all(|kind| matches!(kind.as_str(), "lib" | "rlib" | "bin")),
+                .all(|kind| matches!(kind.as_str(), "lib" | "rlib" | "bin" | "proc-macro")),
             "owned BuildSpec replay cannot emit {:?} for {label}",
             unit.target.crate_types
         );
@@ -185,31 +274,65 @@ pub fn programs(
             "owned BuildSpec replay does not yet strip native symbols for {label}"
         );
     }
-    let mut roots: Vec<_> = build.asked.iter().copied().collect();
-    // Cargo builds auxiliary binaries before the tests that use CARGO_BIN_EXE_*.
-    roots.sort_by_key(|&at| (native[at as usize].test, at));
+    for root in roots(build, &native) {
+        let root_profile = &build.units[root as usize].profile;
+        for at in reachable(build, &native, root) {
+            let unit = native[at as usize];
+            let profile = &build.units[at as usize].profile;
+            ensure!(
+                unit.target.kind == TargetKind::ProcMacro
+                    || (profile.debug, profile.strip, profile.split_debuginfo)
+                        == (root_profile.debug, root_profile.strip, root_profile.split_debuginfo),
+                "owned BuildSpec replay cannot mix per-unit debug/strip/split settings in {}:{}",
+                unit.package.name,
+                unit.target.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Plan roots using the owned scheduler's completed source/producer settings. The
+/// caller retains the producer generation leases through compilation and admission.
+pub fn programs_with(
+    prepared: &Prepared,
+    sysroot: &Path,
+    artifacts: &Path,
+    produced: Option<&BTreeMap<u32, ProducedUnit>>,
+) -> anyhow::Result<Vec<Program>> {
+    let build = &prepared.resolved.spec.build;
+    let native = canonical_units(build, &prepared.resolved.graph)?;
+    preflight(prepared, produced.is_some())?;
+    if let Some(produced) = produced {
+        for (at, unit) in native.iter().enumerate() {
+            if unit.target.kind == TargetKind::CustomBuild {
+                continue;
+            }
+            let configured = produced
+                .get(&(at as u32))
+                .with_context(|| format!("missing configured canonical unit {at}"))?;
+            ensure!(
+                unit.target.kind != TargetKind::ProcMacro || configured.proc_macro.is_some(),
+                "missing owned macro image for {}:{}",
+                unit.package.name,
+                unit.target.name
+            );
+        }
+    }
+    // Cargo builds auxiliary binaries before tests that use CARGO_BIN_EXE_*.
+    let roots = roots(build, &native);
     let executable = |at| {
         artifacts
             .join(format!("unit-{at}"))
             .join(format!("program{}", std::env::consts::EXE_SUFFIX))
     };
-    let env = crate::environment::text_view(&prepared.environment)?;
     let execution_env = prepared.execution_environment()?;
-    let cargo_home = crate::environment::cargo_home(&prepared.environment, &prepared.cwd)
-        .context("replay has no Cargo home")?;
-    let mut config =
-        blaze_manifest::Config::load_with_home(&prepared.cwd, env.clone(), &[], cargo_home)?
-            .with_discovery_root(&prepared.root)?;
-    config.start(
-        prepared.request.command.unwrap_or(crate::flags::Subcommand::Build).name(),
-        &prepared.request.config,
-    )?;
-    let manifests = blaze_manifest::Context::new(config);
+    let manifests = prepared.manifests()?;
     let mut result = Vec::new();
     for &root in &roots {
         let root_unit = &build.units[root as usize];
         let mut order = vec![root];
-        order.extend(reachable(build, root).into_iter().filter(|&at| at != root));
+        order.extend(reachable(build, &native, root).into_iter().filter(|&at| at != root));
         let indexes: BTreeMap<_, _> =
             order.iter().enumerate().map(|(at, &original)| (original, at)).collect();
         let mut crates = Vec::new();
@@ -217,25 +340,21 @@ pub fn programs(
         for &at in &order {
             let spec = &build.units[at as usize];
             let unit = native[at as usize];
-            // The current owned writer has one debug context per linked program.
-            // Carrying unequal settings in JSON would falsely claim to honor them.
-            ensure!(
-                (spec.profile.debug, spec.profile.strip, spec.profile.split_debuginfo)
-                    == (
-                        root_unit.profile.debug,
-                        root_unit.profile.strip,
-                        root_unit.profile.split_debuginfo
-                    ),
-                "owned BuildSpec replay cannot mix per-unit debug/strip/split settings in {}:{}",
-                unit.package.name,
-                unit.target.name
-            );
+            let configured = produced.and_then(|units| units.get(&at));
             let mut crate_env = execution_env.clone();
             let primary = build
                 .asked
                 .iter()
                 .any(|&asked| native[asked as usize].package.id == unit.package.id);
             crate_env.extend(package_env(unit, &manifests, primary)?);
+            if let Some(configured) = configured {
+                crate_env = configured
+                    .native
+                    .env
+                    .iter()
+                    .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.clone())))
+                    .collect();
+            }
             if unit.test {
                 for &binary in &roots {
                     let other = native[binary as usize];
@@ -252,22 +371,15 @@ pub fn programs(
             }
             let kind = if spec.test {
                 "test"
-            } else if matches!(unit.target.kind, TargetKind::Lib) {
+            } else if matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro) {
                 "lib"
             } else {
                 "bin"
             };
-            let cfg: Vec<String> = prepared
-                .host
-                .cfg
-                .iter()
-                .map(ToString::to_string)
-                .filter(|cfg| {
-                    let key = cfg.split('=').next().unwrap_or(cfg).trim();
-                    !matches!(key, "panic" | "debug_assertions" | "overflow_checks")
-                })
-                .chain(spec.cfg.iter().map(|cfg| cfg.0.clone()))
-                .collect();
+            let cfg =
+                configured.map_or_else(|| unit_cfg(prepared, at as usize), |unit| unit.cfg.clone());
+            let codegen_flags = configured
+                .map_or_else(|| flags(&spec.profile, build), |unit| unit.codegen_flags.clone());
             let invalid_env: Vec<_> = crate_env
                 .iter()
                 .filter(|(_, value)| value.to_str().is_none())
@@ -279,27 +391,47 @@ pub fn programs(
                 .collect();
             native_units.insert(
                 at,
-                blaze_wire::native::Unit {
-                    env: crate_env
-                        .iter()
-                        .map(|(name, value)| (name.into(), value.clone()))
-                        .collect(),
-                    flags: flags(&spec.profile, build).into_iter().map(Into::into).collect(),
-                },
+                configured.map_or_else(
+                    || blaze_wire::native::Unit {
+                        env: crate_env
+                            .iter()
+                            .map(|(name, value)| (name.into(), value.clone()))
+                            .collect(),
+                        flags: flags(&spec.profile, build).into_iter().map(Into::into).collect(),
+                    },
+                    |unit| {
+                        let mut native = unit.native.clone();
+                        native.env.extend(
+                            crate_env.iter().map(|(name, value)| (name.into(), value.clone())),
+                        );
+                        native
+                    },
+                ),
             );
+            let dependencies: Vec<_> = if unit.target.kind == TargetKind::ProcMacro {
+                Vec::new()
+            } else {
+                spec.deps
+                    .iter()
+                    .filter_map(|(dep, name)| {
+                        indexes.get(dep).map(|index| json!({"crate": index, "name": name}))
+                    })
+                    .collect()
+            };
             crates.push(json!({
                 "display_name": unit.target.name.replace('-', "_"),
                 "root_module": compiler_path(&unit.target.src_path),
                 "edition": spec.edition.to_string(),
                 "version": unit.package.version,
-                "deps": spec.deps.iter().map(|(dep, name)| json!({"crate": indexes[dep], "name": name})).collect::<Vec<_>>(),
+                "deps": dependencies,
                 "cfg": cfg,
-                "codegen_flags": flags(&spec.profile, build),
+                "codegen_flags": codegen_flags,
                 "env": text_env,
                 "blaze_invalid_env": invalid_env,
                 "blaze_native_unit": at,
                 "is_workspace_member": at == root,
-                "is_proc_macro": false,
+                "is_proc_macro": unit.target.kind == TargetKind::ProcMacro,
+                "proc_macro_dylib_path": configured.and_then(|unit| unit.proc_macro.as_deref()).map(compiler_path),
                 "build": {"label": unit.target.name, "build_file": compiler_path(&unit.package.manifest_dir.join("Cargo.toml")), "target_kind": kind},
             }));
         }
@@ -365,7 +497,7 @@ pub fn programs(
                     let mut project = program.project.clone();
                     let crates = project["crates"].as_array_mut()?;
                     let root = crates.iter().position(|krate| {
-                        krate["root_module"] == compiler_path(&unit.target.src_path)
+                        krate["blaze_native_unit"] == json!(at)
                             && krate["build"]["target_kind"] == "lib"
                     })?;
                     for krate in crates.iter_mut() {

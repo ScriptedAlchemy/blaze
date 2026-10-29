@@ -26,6 +26,7 @@
             ),
         },
         extra: ExtraCrateData {
+            blaze_native_unit: None,
             version: None,
             display_name: Some(
                 CrateDisplayName {

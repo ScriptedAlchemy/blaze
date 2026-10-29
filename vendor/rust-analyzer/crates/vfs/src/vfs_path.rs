@@ -50,7 +50,7 @@ impl VfsPath {
     pub fn join(&self, path: &str) -> Option<VfsPath> {
         match &self.0 {
             VfsPathRepr::PathBuf(it) => {
-                let res = it.join(path).normalize();
+                let res = paths::native::absolutize(it, path)?;
                 Some(VfsPath(VfsPathRepr::PathBuf(res)))
             }
             VfsPathRepr::VirtualPath(it) => {

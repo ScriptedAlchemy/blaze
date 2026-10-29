@@ -241,6 +241,10 @@ fn original_profile_inline_and_file_config_and_relative_env_are_reproduced() {
 
 struct NoProbe;
 impl Probe for NoProbe {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        panic!("unvalidated native tree")
+    }
+
     fn which_native(&self, _: &OsStr, _: &OsStr) -> Option<PathBuf> {
         panic!("unvalidated native lookup")
     }
@@ -485,4 +489,172 @@ fn each_unit_keeps_its_profile_features_renamed_edges_and_primary_environment() 
     assert!(app["codegen_flags"].as_array().unwrap().contains(&serde_json::json!("-Copt-level=0")));
     assert_eq!(app["env"]["CARGO_PRIMARY_PACKAGE"], "1");
     assert!(dependency["env"].get("CARGO_PRIMARY_PACKAGE").is_none());
+}
+
+#[test]
+fn configured_producers_leave_only_owned_macro_images_in_the_final_source_graph() {
+    use blaze_metadata::units::TargetKind;
+    use blaze_spec::execution::{ProducedUnit, programs_with};
+    use std::collections::BTreeMap;
+    let f = Fixture::with_root(
+        "[package]\nname='configured'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nderive={path='derive'}\n[profile.dev.build-override]\ndebug=0\nopt-level=1\n",
+    );
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write("build.rs", "fn main() { println!(\"cargo:rustc-cfg=generated\"); }\n");
+    f.write("derive/Cargo.toml", "[package]\nname='derive'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[dependencies]\nhelper={path='../helper'}\n");
+    f.write("derive/src/lib.rs", "extern crate proc_macro; #[proc_macro] pub fn make(_: proc_macro::TokenStream)->proc_macro::TokenStream { helper::value().parse().unwrap() }\n");
+    f.write("helper/Cargo.toml", "[package]\nname='helper'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("helper/src/lib.rs", "pub fn value()->&'static str { \"1\" }\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+    let canonical =
+        blaze_spec::assemble::canonical_units(&made.build, &prepared.resolved.graph).unwrap();
+    let mut produced = BTreeMap::new();
+    for (at, unit) in canonical.iter().enumerate() {
+        if unit.target.kind == TargetKind::CustomBuild {
+            continue;
+        }
+        produced.insert(
+            at as u32,
+            ProducedUnit {
+                cfg: vec!["generated".into()],
+                codegen_flags: vec![format!("-Copt-level={at}")],
+                native: blaze_wire::native::Unit {
+                    env: BTreeMap::from([
+                        ("CARGO_PKG_NAME".into(), unit.package.name.clone().into()),
+                        ("OUT_DIR".into(), worker.path().join("generated-out").into_os_string()),
+                    ]),
+                    flags: vec![format!("-Clink-arg=unit-{at}").into()],
+                },
+                proc_macro: (unit.target.kind == TargetKind::ProcMacro)
+                    .then(|| worker.path().join("owned-macro-image.so")),
+            },
+        );
+    }
+    let plans = programs_with(
+        &prepared,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+        Some(&produced),
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 1);
+    let crates = plans[0].project["crates"].as_array().unwrap();
+    assert_eq!(crates.len(), 2, "host-only dependencies are behind the admitted macro leaf");
+    let image = crates.iter().find(|unit| unit["is_proc_macro"] == true).unwrap();
+    assert!(image["deps"].as_array().unwrap().is_empty());
+    assert_eq!(
+        image["proc_macro_dylib_path"],
+        serde_json::json!(worker.path().join("owned-macro-image.so"))
+    );
+    assert!(crates.iter().all(|unit| unit["cfg"] == serde_json::json!(["generated"])));
+    let encoded: Vec<u8> =
+        serde_json::from_value(plans[0].project["blaze_native_units"].clone()).unwrap();
+    let contexts = blaze_wire::native::decode_units(&encoded).unwrap();
+    for unit in crates {
+        let id = unit["blaze_native_unit"].as_u64().unwrap() as u32;
+        assert_eq!(contexts[&id], produced[&id].native);
+    }
+    produced.remove(&(image["blaze_native_unit"].as_u64().unwrap() as u32));
+    assert!(
+        programs_with(
+            &prepared,
+            Path::new("/owned/toolchain"),
+            &worker.path().join("artifacts"),
+            Some(&produced)
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("missing configured canonical unit")
+    );
+}
+
+#[test]
+fn integration_test_auxiliary_binaries_are_artifacts_not_rust_library_dependencies() {
+    let f = fixture();
+    f.write(
+        "tests/uses_binary.rs",
+        "#[test] fn binary() { let _ = env!(\"CARGO_BIN_EXE_saved\"); }\n",
+    );
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--test", "uses_binary", "--no-run"], store.path());
+    let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+    let plans = blaze_spec::execution::programs(
+        &prepared,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 2);
+    let auxiliary = plans.iter().find(|plan| plan.crate_name == "saved").unwrap();
+    let test = plans.iter().find(|plan| plan.crate_name == "uses_binary").unwrap();
+    assert!(!auxiliary.run && !test.run);
+    assert_eq!(test.project["crates"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        test.project["crates"][0]["env"]["CARGO_BIN_EXE_saved"],
+        serde_json::json!(auxiliary.executable)
+    );
+    assert!(test.project["crates"][0]["deps"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn implicit_doctests_of_a_standalone_library_have_their_own_normal_library_graph() {
+    let f = fixture();
+    std::fs::remove_file(f.root().join("src/main.rs")).unwrap();
+    f.write(
+        "src/lib.rs",
+        "/// ```\n/// assert_eq!(saved::answer(), 42);\n/// ```\npub fn answer() -> u32 { 42 }\n",
+    );
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &[], store.path());
+    let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+    let plans = blaze_spec::execution::programs(
+        &prepared,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let docs: Vec<_> = plans
+        .iter()
+        .filter(|program| program.output == blaze_spec::execution::Output::Doctest)
+        .collect();
+    assert_eq!(docs.len(), 1);
+    let normal = plans
+        .iter()
+        .find(|program| program.output == blaze_spec::execution::Output::Object)
+        .unwrap();
+    assert_eq!(docs[0].unit, normal.unit);
+    assert_eq!(docs[0].project["crates"][0]["blaze_native_unit"], serde_json::json!(normal.unit));
+    assert!(!normal.harness && !normal.run && docs[0].run);
+}
+
+#[test]
+fn source_owned_replay_metadata_names_are_preserved_without_reservation() {
+    let f = fixture();
+    for (name, bytes) in [
+        (".blaze-sources.cbor", "source-owned sources"),
+        (".blaze-sources.cbor.1", "source-owned numbered sources"),
+        (".blaze-resolver-facts.cbor", "source-owned facts"),
+    ] {
+        f.write(name, bytes);
+    }
+    f.write("src/main.rs", "const USER: &str = include_str!(\"../.blaze-resolver-facts.cbor\"); fn main() { println!(\"{USER}\"); }\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Run, &[], store.path());
+    drop(f);
+    let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+    for (name, bytes) in [
+        (".blaze-sources.cbor", "source-owned sources"),
+        (".blaze-sources.cbor.1", "source-owned numbered sources"),
+        (".blaze-resolver-facts.cbor", "source-owned facts"),
+    ] {
+        assert_eq!(std::fs::read(prepared.cwd.join(name)).unwrap(), bytes.as_bytes());
+    }
+    prepared.validate_sources(store.path()).unwrap();
 }

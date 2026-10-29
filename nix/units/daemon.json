@@ -1,8 +1,8 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "af882d1faf26e0abbc9ebae45cc7d9cca097ee50ed64ba0592ca6dde1edf20fe",
-  "Cargo.toml": "f01052c63e318e1116994d5efbb359fb7054bc2030ea9ec8712b97b2381981a3"
+  "Cargo.lock": "330ffd5de4ef024a8986731720df9a237611e11485bcad8932eb1a2a72214e65",
+  "Cargo.toml": "d01d0e3aa1aa049db80f3e5a60cee5cbb73976be91d4c854520602023d581644"
  },
  "packages": {
   "adler2@2.0.1": {
@@ -11014,6 +11014,10 @@
        "name": "la_arena"
       },
       {
+       "i": 289,
+       "name": "paths"
+      },
+      {
        "i": 355,
        "name": "rustc_hash"
       },
@@ -11787,6 +11791,10 @@
       {
        "i": 127,
        "name": "ed25519_dalek"
+      },
+      {
+       "i": 395,
+       "name": "serde_json"
       },
       {
        "i": 401,
@@ -15693,6 +15701,10 @@
        "name": "parser"
       },
       {
+       "i": 289,
+       "name": "paths"
+      },
+      {
        "i": 355,
        "name": "rustc_hash"
       },
@@ -17271,6 +17283,10 @@
        "name": "parser"
       },
       {
+       "i": 289,
+       "name": "paths"
+      },
+      {
        "i": 306,
        "name": "profile"
       },
@@ -17285,6 +17301,10 @@
       {
        "i": 376,
        "name": "salsa"
+      },
+      {
+       "i": 401,
+       "name": "sha2"
       },
       {
        "i": 412,
@@ -20192,6 +20212,10 @@
       {
        "i": 395,
        "name": "serde_json"
+      },
+      {
+       "i": 401,
+       "name": "sha2"
       },
       {
        "i": 415,
@@ -24242,6 +24266,7 @@
      ],
      "edition": "2024",
      "features": [
+      "accumulator",
       "inventory",
       "macros",
       "rayon",
@@ -24267,7 +24292,9 @@
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "accumulator"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "salsa-macro-rules@0.28.5",
@@ -30725,6 +30752,10 @@
        "name": "la_arena"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 358,
        "name": "rustc_hash"
       },
@@ -31498,6 +31529,10 @@
       {
        "i": 125,
        "name": "ed25519_dalek"
+      },
+      {
+       "i": 396,
+       "name": "serde_json"
       },
       {
        "i": 402,
@@ -35324,6 +35359,10 @@
        "name": "parser"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 358,
        "name": "rustc_hash"
       },
@@ -36902,6 +36941,10 @@
        "name": "parser"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 309,
        "name": "profile"
       },
@@ -36916,6 +36959,10 @@
       {
        "i": 379,
        "name": "salsa"
+      },
+      {
+       "i": 402,
+       "name": "sha2"
       },
       {
        "i": 413,
@@ -39986,6 +40033,10 @@
       {
        "i": 396,
        "name": "serde_json"
+      },
+      {
+       "i": 402,
+       "name": "sha2"
       },
       {
        "i": 416,
@@ -44041,6 +44092,7 @@
      ],
      "edition": "2024",
      "features": [
+      "accumulator",
       "inventory",
       "macros",
       "rayon",
@@ -44066,7 +44118,9 @@
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "accumulator"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "salsa-macro-rules@0.28.5",
@@ -50449,6 +50503,10 @@
        "name": "la_arena"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 356,
        "name": "rustc_hash"
       },
@@ -51226,6 +51284,10 @@
       {
        "i": 128,
        "name": "ed25519_dalek"
+      },
+      {
+       "i": 396,
+       "name": "serde_json"
       },
       {
        "i": 402,
@@ -55163,6 +55225,10 @@
        "name": "parser"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 356,
        "name": "rustc_hash"
       },
@@ -56741,6 +56807,10 @@
        "name": "parser"
       },
       {
+       "i": 290,
+       "name": "paths"
+      },
+      {
        "i": 307,
        "name": "profile"
       },
@@ -56755,6 +56825,10 @@
       {
        "i": 377,
        "name": "salsa"
+      },
+      {
+       "i": 402,
+       "name": "sha2"
       },
       {
        "i": 413,
@@ -59662,6 +59736,10 @@
       {
        "i": 396,
        "name": "serde_json"
+      },
+      {
+       "i": 402,
+       "name": "sha2"
       },
       {
        "i": 416,
@@ -63708,6 +63786,7 @@
      ],
      "edition": "2024",
      "features": [
+      "accumulator",
       "inventory",
       "macros",
       "rayon",
@@ -63733,7 +63812,9 @@
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "accumulator"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "salsa-macro-rules@0.28.5",
@@ -70191,6 +70272,10 @@
        "name": "la_arena"
       },
       {
+       "i": 291,
+       "name": "paths"
+      },
+      {
        "i": 359,
        "name": "rustc_hash"
       },
@@ -70968,6 +71053,10 @@
       {
        "i": 126,
        "name": "ed25519_dalek"
+      },
+      {
+       "i": 397,
+       "name": "serde_json"
       },
       {
        "i": 403,
@@ -74825,6 +74914,10 @@
        "name": "parser"
       },
       {
+       "i": 291,
+       "name": "paths"
+      },
+      {
        "i": 359,
        "name": "rustc_hash"
       },
@@ -76403,6 +76496,10 @@
        "name": "parser"
       },
       {
+       "i": 291,
+       "name": "paths"
+      },
+      {
        "i": 310,
        "name": "profile"
       },
@@ -76417,6 +76514,10 @@
       {
        "i": 380,
        "name": "salsa"
+      },
+      {
+       "i": 403,
+       "name": "sha2"
       },
       {
        "i": 414,
@@ -79487,6 +79588,10 @@
       {
        "i": 397,
        "name": "serde_json"
+      },
+      {
+       "i": 403,
+       "name": "sha2"
       },
       {
        "i": 417,
@@ -83538,6 +83643,7 @@
      ],
      "edition": "2024",
      "features": [
+      "accumulator",
       "inventory",
       "macros",
       "rayon",
@@ -83563,7 +83669,9 @@
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "accumulator"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "salsa-macro-rules@0.28.5",
