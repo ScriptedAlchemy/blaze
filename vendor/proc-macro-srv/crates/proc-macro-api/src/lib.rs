@@ -12,6 +12,11 @@
 )]
 #![allow(internal_features, unused_features)]
 
+#[macro_use]
+mod wire;
+#[cfg(test)]
+mod wire_tests;
+
 pub mod bidirectional_protocol;
 pub mod legacy_protocol;
 pub mod pool;
@@ -62,17 +67,17 @@ impl fmt::Display for ProtocolFormat {
     }
 }
 
+wire_enum! {
 /// Represents different kinds of procedural macros that can be expanded by the external server.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ProcMacroKind {
     /// A macro that derives implementations for a struct or enum.
     CustomDerive,
     /// An attribute-like procedural macro.
     Attr,
     // This used to be called FuncLike, so that's what the server expects currently.
-    #[serde(alias = "Bang")]
-    #[serde(rename(serialize = "FuncLike", deserialize = "FuncLike"))]
-    Bang,
+    Bang["FuncLike", "Bang"],
+}
 }
 
 /// A handle to proc-macro server process pool which load dylibs with macros (.so or .dll)

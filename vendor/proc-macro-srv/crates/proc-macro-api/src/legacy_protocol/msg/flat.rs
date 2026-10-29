@@ -41,7 +41,6 @@ use std::collections::VecDeque;
 
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use serde_derive::{Deserialize, Serialize};
 use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
 
 use crate::{
@@ -85,7 +84,8 @@ pub fn deserialize_span_data_index_map(map: &[u32]) -> SpanDataIndexMap {
         .collect()
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+wire_struct! {
+#[derive(Debug, Clone)]
 pub struct FlatTree {
     subtree: Vec<u32>,
     literal: Vec<u32>,
@@ -93,6 +93,7 @@ pub struct FlatTree {
     ident: Vec<u32>,
     token_tree: Vec<u32>,
     text: Vec<String>,
+}
 }
 
 struct SubtreeRepr {
