@@ -20,6 +20,7 @@
             target_kind: Lib {
                 is_proc_macro: false,
             },
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$",
             ),

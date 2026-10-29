@@ -22,12 +22,17 @@ sandbox allows is the only exception, and is made to work rather than refused wh
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
 
-This describes where ra-jit is going, not where it is. Today rustc still does much of the work:
-it builds every program once before the daemon takes over, it compiles the standard library,
-the build scripts and the proc macros, it has the last word on errors, and it keeps a copy of
-every function ra-jit refuses. [Today](#today) lists those places. Each one is a bug with an
-issue labelled `no-rustc`. They are removed one at a time; none is extended, and no new one is
-added.
+This describes the full goal. Eligible `cargo blaze build` and `run` requests now use the
+owned whole-build route by default, on the first build and on edits, with owned host
+producers. They do not require `RA_JIT_WHOLE_BUILD=1`, and setting it to `0` does not select
+a Cargo first build. [Program builds](cargo.md#program-builds) defines the selection and
+remaining compatibility gaps, including compiler probes that the owned checker cannot yet
+accept. This default is not proof that all programs, tests, doctests or platforms work.
+
+The remaining wrapper and non-program paths still contain compiler handoffs. [Today](#today)
+and the dated measurements below record that work and earlier behavior; their Cargo-first
+counts do not describe the new default program route. Each handoff is a bug with an issue
+labelled `no-rustc`. They are removed one at a time; none is extended, and no new one is added.
 
 ## What counts as running rustc
 
@@ -427,7 +432,7 @@ the counts of [How often](#how-often) lower, measured by step A's check, and non
 | [H](https://github.com/indexable-inc/ra-jit/issues/88). ra-jit writes the test harness | the fallback when a test is added | G | medium | medium | the `no-rustc-hl` lane: done; the `no-rustc-l2` lane: ra-jit's harness always, done |
 | [I](https://github.com/indexable-inc/ra-jit/issues/89). Build scripts compiled and run by ra-jit | build scripts and their probes by rustc | B, G | medium | medium | the `no-rustc-l2` lane: first part done (scripts compiled and linked by ra-jit, their runs kept in the store); the F+G lane consumes it for the standard library's scripts |
 | [J](https://github.com/indexable-inc/ra-jit/issues/90). Proc macros compiled and loaded by ra-jit | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first |
-| [K](https://github.com/indexable-inc/ra-jit/issues/91). The cold build is ra-jit's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | the self-contained lane, with 54301ec5's first-build lane (#310); `RA_JIT_WHOLE_BUILD=1`: the build from nothing is G's whole build, no `cargo build` |
+| [K](https://github.com/indexable-inc/ra-jit/issues/91). The cold build is ra-jit's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | eligible `build` and `run` requests use G's whole build by default; other command paths and broad acceptance remain incomplete |
 | [L](https://github.com/indexable-inc/ra-jit/issues/92). Doctests by the daemon (#28) | probe and examples by rustc, rustdoc | B, G, D | medium | medium | the `no-rustc-hl` lane: first part done; the `no-rustc-l2` lane: second part (examples by ra-jit) done |
 | [M](https://github.com/indexable-inc/ra-jit/issues/93). Remove the wrapper and the fallback | `ra-jit-rustc`, `ra-jit-rustc-first`, stand-ins, dep-info, settle, `by_cargo`, `only_cargo` | all | medium | low | the self-contained lane |
 
@@ -1224,11 +1229,12 @@ and `RA_JIT_WRAPS_RUSTC` are deleted, and step A's count is zero.
 
 ### The cold start without rustc
 
-Today `cargo ra-jit build` from nothing returns in about cargo's time (results.md: ripgrep 6.96
-s against cargo's 6.16, nushell 37.19 against 35.51) because it is cargo's build, and the
-daemon is ready for edits at about twice that (#11). The first edits patch rustc's executable
-so that they need not wait for ra-jit's own link. Without rustc the cold build is ra-jit
-compiling every crate, the standard library included.
+The earlier Cargo-first path returned in about cargo's time (results.md: ripgrep 6.96 s
+against cargo's 6.16, nushell 37.19 against 35.51), with the daemon ready for edits at about
+twice that (#11). Its first edits patched rustc's executable while waiting for ra-jit's own
+link. Eligible program builds now use the owned whole-build route by default: ra-jit compiles
+every crate, the standard library included, or takes its own artifacts from the store. The
+measurements below describe the dated stages of that work.
 
 That is kept fast by not compiling, rather than by compiling as fast as rustc:
 

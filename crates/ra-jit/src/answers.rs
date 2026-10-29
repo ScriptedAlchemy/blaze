@@ -441,7 +441,14 @@ fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> O
     let dir = if toolchain.is_absolute() {
         toolchain
     } else {
-        PathBuf::from(var("RUSTUP_HOME")?).join("toolchains").join(toolchain)
+        // rustup does not export RUSTUP_HOME for its default installation. Use the
+        // command's home, just as toolchain selection does, so worker queries see
+        // the same installed compiler without starting a rustup proxy.
+        let home = var("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
+            var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".rustup"))
+        })?;
+        home.join("toolchains").join(toolchain)
     };
     let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     std::fs::canonicalize(rustc).ok()
@@ -467,6 +474,66 @@ mod tests {
         let rustc = dir.join("bin/rustc");
         std::fs::write(&rustc, "this compiler must not execute").unwrap();
         rustc
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_queries_resolve_the_default_home_without_executing_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let toolchain = "1.99.0-aarch64-apple-darwin";
+        let default_root = home.join(".rustup/toolchains").join(toolchain);
+        let custom_home = dir.path().join("custom-rustup");
+        let custom_root = custom_home.join("toolchains").join(toolchain);
+        synthetic_toolchain(&default_root);
+        synthetic_toolchain(&custom_root);
+        let bin = home.join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let proxy = bin.join("rustup");
+        std::fs::write(&proxy, "this rustup proxy must not execute").unwrap();
+        let name = OsStr::new("rustc");
+        let executable = bin.join(name);
+        std::os::unix::fs::symlink(&proxy, &executable).unwrap();
+
+        for rustup_home in [None, Some(&custom_home)] {
+            let expected = if rustup_home.is_some() { &custom_root } else { &default_root };
+            for question in ["--print=sysroot", "-vV"] {
+                let mut command = Command::new(name);
+                command
+                    .env_remove("RUSTUP_HOME")
+                    .env_remove("RUSTC_OVERRIDE_VERSION_STRING")
+                    .env_remove("RUST_TARGET_PATH")
+                    .env("HOME", &home)
+                    .env("PATH", &bin)
+                    .env("RUSTUP_TOOLCHAIN", toolchain)
+                    .arg(question);
+                if let Some(home) = rustup_home {
+                    command.env("RUSTUP_HOME", home);
+                }
+                let output = answer(&mut command, &[]).unwrap();
+                assert!(output.status.success());
+                let text = String::from_utf8(output.stdout).unwrap();
+                if question == "--print=sysroot" {
+                    assert_eq!(text.trim(), expected.canonicalize().unwrap().to_str().unwrap());
+                } else {
+                    assert!(text.contains("host: aarch64-apple-darwin"), "{text}");
+                }
+            }
+        }
+
+        let mut command = Command::new(&executable);
+        command
+            .env("HOME", &home)
+            .env("RUSTUP_HOME", dir.path().join("missing-rustup"))
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .arg("--print=sysroot");
+        assert!(answer(&mut command, &[]).is_err());
+        command.env("RUSTUP_TOOLCHAIN", &custom_root);
+        let output = answer(&mut command, &[]).unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            custom_root.canonicalize().unwrap().to_str().unwrap()
+        );
     }
 
     #[test]

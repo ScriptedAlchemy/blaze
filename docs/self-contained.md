@@ -202,19 +202,21 @@ serde_derive, thiserror-impl, tokio-macros and clap_derive equal to the toolchai
    rustc then compiles no proc macro and none of `syn`, `quote` and `proc-macro2` for one: most
    of what rustc compiles in the cold build of a crate with derives.
 
-**K, the cold build** ([#91](https://github.com/indexable-inc/blaze/issues/91)). Today, with
-#310 (54301ec5's first-build lane), cargo builds the workspace and the daemon takes over after.
-K replaces cargo's build in that flow, keeping 54301ec5's lane on the rest of it:
+**K, the cold build** ([#91](https://github.com/indexable-inc/blaze/issues/91)). Eligible
+`cargo blaze build` and `run` requests now take the owned whole-build route by default,
+before reading legacy wrapper state. [Program builds](cargo.md#program-builds) defines the
+selection and remaining compatibility gaps. The stages below describe the route's design;
+test and other non-program paths still need their remaining compiler handoffs removed:
 
 1. `cargo blaze build` and `run` from nothing build the program whole with blaze (step G's
    build, every crate from source over the shipped standard library, linked by blaze), and
    write each executable where cargo would, so `run`, scripts and IDEs find it. The build
    scripts are compiled by blaze (I) and run by blaze's runner ([build scripts](#build-scripts));
    the proc macros are J's. What blaze cannot compile and the program reaches fails the build
-   with the reason: there is no build by cargo to go to. While it is shown equal on the bench
-   apps (each program's runs printing what cargo's does, as `allrajit.py` checks), it is behind
-   a setting, then the default. Behind `RA_JIT_WHOLE_BUILD=1` since 2026-10-25, with the build
-   scripts and proc macros still the load's ([Status](#status)).
+   with the reason: there is no build by cargo to go to. Introduced behind
+   `RA_JIT_WHOLE_BUILD=1` on 2026-10-25, this program route is now the default, including
+   owned host producers. The switch no longer selects it. Broad benchmark, platform and
+   compiler-probe acceptance remains separate from that routing change ([Status](#status)).
 2. The first edits patch blaze's own executable, not rustc's (#11): no rustc base.
 3. `cargo blaze test` from nothing the same, with blaze's harness (H).
 
