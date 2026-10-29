@@ -27,11 +27,19 @@ Validation on `ubuntu-main`, Linux x86_64, Rust/Cargo 1.99.0:
   cross-registry dependencies, and read-only locks. Product Cargo/rustc/rustdoc
   blockers recorded zero calls.
 - Two direct/Cargo CLI lock-policy tests passed; native debug product binaries
-  built successfully.
+  rebuilt successfully after the final read-only-file refinement. All 23 changed
+  inputs matched the source hash receipt.
 - The strict product CLI initially exposed the loader's Cargo retry on an owned
   `--locked` error. With that retry removed, missing-lock `--locked` and `--frozen`
-  return errors with empty proxy and absolute-exec audits. Positive cold compile
-  acceptance is recorded separately from these negative cases.
+  return errors with empty proxy and absolute-exec audits. Direct `--offline`
+  compilation from a missing lock passed in 496.22 seconds; an existing-lock
+  `--frozen` build passed in 124.87 seconds. Both executables matched independent
+  Cargo stdout and generated identical lock bytes, with empty proxy and absolute
+  external-exec audits. Those CLI runs preceded only the final read-only-file
+  refinement, which the 191 tests and 33 comparisons include.
+- Restoring truncate-and-write made the concurrent-reader regression fail in
+  0.05 seconds on an empty authoritative lock. After restoring atomic publication,
+  all four publication regressions passed.
 - Daemon Nix graphs regenerated for all four targets with pinned Cargo 1.99;
   only the lock hash changed. This is graph generation, not a Nix product build.
 - Formatting, harness imports, compiler-site audit and focused actionlint pass.
@@ -43,6 +51,7 @@ bootstrap, cross-machine, macOS, or LLVM acceptance.
 
 Remote evidence is under the task-owned
 `sourcecheck/evidence/cold-final-{units,example,oracle}.log`,
-`cold-review-flags.log`, `cold-strict-build.log`, `cold-nix-graph.log`, and
+`cold-review-flags.log`, `cold-final-build.log`, `cold-final-source-hashes.json`,
+`cold-atomic-{negative-control,restored}.log`, `cold-nix-graph.log`, and
 `cold-cli-fallback-before/`. The strict product trace is in
 `sourcecheck/cold-cli-strict/` until final evidence collection and cleanup.
