@@ -497,3 +497,34 @@ fn identity_does_not_depend_on_where_the_sources_and_cargo_home_are() {
     assert_eq!(here.build, there.build);
     assert_eq!(here.digest, there.digest);
 }
+
+#[test]
+fn configuration_above_the_original_root_is_captured_and_replayed() {
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base_root.join(".cargo")).unwrap();
+    std::fs::write(base_root.join(".cargo/config.toml"), "[env]\nFROM_ABOVE='parent'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&base_root).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    // The requester's own config walk reaches the file above the workspace.
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_ABOVE"));
+    drop(f);
+    drop(base);
+    assert!(!base_root.exists());
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert_eq!(replay.execution_environment().unwrap()["FROM_ABOVE"], "parent");
+}
