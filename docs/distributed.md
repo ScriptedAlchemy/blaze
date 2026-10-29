@@ -3019,6 +3019,8 @@ so equivalent command spellings retain the same `BuildSpec` and `JobContent`. Th
 config-file operands, native values and source-relative working directory survive relocation.
 Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
 complete spec, and verifies the execution platform before creating compiler descriptions.
+The snapshot manifest has its own budget, 4,194,304 entries in 256 MiB (the wire's message and batch
+budgets would refuse a tree of 70,000 files); a larger tree is refused at capture by name.
 An empty external Cargo home does not affect source identity. A Cargo home beside or above the
 workspace (its configuration, registry and Git trees) is kept in the snapshot under
 `.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:

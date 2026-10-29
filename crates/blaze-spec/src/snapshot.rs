@@ -144,6 +144,7 @@ impl Snapshot {
         }
         let snapshot = Self { entries: capture.entries.into_values().collect() };
         let bytes = blaze_wire::encode(&snapshot);
+        within_budget(snapshot.entries.len(), bytes.len())?;
         parse(&bytes)?;
         put(store, &bytes)?;
         Ok(snapshot)
@@ -178,6 +179,7 @@ impl Snapshot {
         entries.insert(path.clone(), Entry(path.clone(), 0, 0, put(store, bytes)?));
         let snapshot = Self { entries: entries.into_values().collect() };
         let bytes = blaze_wire::encode(&snapshot);
+        within_budget(snapshot.entries.len(), bytes.len())?;
         parse(&bytes)?;
         put(store, &bytes)?;
         Ok(snapshot)
@@ -312,8 +314,33 @@ impl Snapshot {
     }
 }
 
+/// What a manifest may hold. It is a blob of the store listing a tree, not a wire message: the
+/// 16 MiB message budget and the 65,536 items of a batch would refuse a tree of 70,000 files,
+/// which a workspace with a vendored or ignored directory is.
+const MANIFEST: blaze_wire::Limits = blaze_wire::Limits {
+    request: 256 << 20,
+    batch_items: 4 << 20,
+    ..blaze_wire::Limits::DOCUMENTED
+};
+
+/// Whether a manifest of `entries` entries in `bytes` bytes is within [`MANIFEST`], as a named
+/// refusal rather than a wire-level oversize item.
+fn within_budget(entries: usize, bytes: usize) -> anyhow::Result<()> {
+    ensure!(
+        entries as u64 <= u64::from(MANIFEST.batch_items)
+            && bytes as u64 <= u64::from(MANIFEST.request),
+        "the source snapshot lists {entries} files, directories and links in {bytes} bytes; a \
+         manifest holds at most {} entries in {} bytes: capture a smaller tree (a vendored or \
+         generated directory does not belong in the workspace)",
+        MANIFEST.batch_items,
+        MANIFEST.request,
+    );
+    Ok(())
+}
+
 fn parse(bytes: &[u8]) -> anyhow::Result<Snapshot> {
-    Ok(blaze_wire::decode(bytes, &blaze_wire::Limits::default())?)
+    within_budget(0, bytes.len())?;
+    Ok(blaze_wire::decode(bytes, &MANIFEST)?)
 }
 
 struct Capture<'a> {
@@ -492,4 +519,37 @@ fn put(store: &Path, bytes: &[u8]) -> anyhow::Result<Digest> {
         Err(error) => return Err(error.into()),
     }
     Ok(digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(files: usize) -> Snapshot {
+        let directory = SourcePath::new("d".to_owned()).unwrap();
+        let mut entries = vec![Entry(directory, 1, 0, [0; 32])];
+        entries.extend((0..files).map(|at| {
+            Entry(SourcePath::new(format!("d/f{at:08}")).unwrap(), 0, 0, [at as u8; 32])
+        }));
+        Snapshot { entries }
+    }
+
+    #[test]
+    fn a_manifest_of_a_large_tree_is_read_under_its_own_budget() {
+        // More files than a wire batch holds, and more bytes than a wire message.
+        let snapshot = tree(400_000);
+        let bytes = blaze_wire::encode(&snapshot);
+        assert!(bytes.len() > 16 << 20 && snapshot.entries.len() > 65_536);
+        assert_eq!(parse(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn a_manifest_over_its_budget_is_refused_by_name() {
+        let message = within_budget(5 << 20, 1 << 20).unwrap_err().to_string();
+        assert!(message.contains("source snapshot lists 5242880 files"), "{message}");
+        assert!(within_budget(1, 300 << 20).is_err());
+        within_budget(4 << 20, 256 << 20).unwrap();
+        let message = parse(&vec![0; 300 << 20]).unwrap_err().to_string();
+        assert!(message.contains("source snapshot lists"), "{message}");
+    }
 }
