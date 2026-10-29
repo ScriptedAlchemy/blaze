@@ -17,7 +17,7 @@ use super::own_script::{self, Planned};
 type Files = BTreeMap<PathBuf, [u8; 32]>;
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     files: Files,
     /// Keep the route by which source was read, even when both possible targets
     /// of a symlink already occur elsewhere in the input closure.
@@ -51,9 +51,24 @@ impl Revision {
 }
 
 impl Snapshot {
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.files.keys().chain(
+            self.bindings
+                .iter()
+                .filter_map(|(route, target)| self.files.contains_key(target).then_some(route)),
+        )
+    }
+
     fn same_content(&self, other: &Self) -> bool {
         self.files == other.files && self.bindings == other.bindings
     }
+}
+
+pub(crate) fn runtime_paths(sysroot: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut inputs = Snapshot::default();
+    walk(&sysroot.join("lib/rustlib/src/rust/library"), &mut inputs, &mut BTreeSet::new())?;
+    walk(&std::env::current_exe()?, &mut inputs, &mut BTreeSet::new())?;
+    Ok(inputs.paths().cloned().collect())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,7 +120,7 @@ fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> R
     Ok(())
 }
 
-fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
+pub(crate) fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
     let mut inputs = Snapshot::default();
     let mut roots = BTreeSet::new();
     for krate in crates {
@@ -146,9 +161,11 @@ pub(crate) fn link(
     crates: Vec<Planned>,
     dir: &Path,
     env: &[(OsString, OsString)],
+    mode: own_script::SourceMode<'_>,
 ) -> Result<PathBuf> {
     let description = own_script::planned_macro_description(sysroot, crates.clone())
         .map_err(anyhow::Error::msg)?;
+    let description = own_script::with_mode(description, mode).map_err(anyhow::Error::msg)?;
     let before = snapshot(sysroot, &crates)?;
     let context =
         serde_json::to_vec(&(description, crate::process::Native::of(env.iter().cloned())))?;
@@ -198,7 +215,8 @@ pub(crate) fn link(
         .map(|it| generation.join(format!("build-{it}")))
         .find(|it| !it.exists())
         .context("no producer attempt directory")?;
-    let library = match own_script::link_macro_planned(sysroot, crates.clone(), &attempt, env) {
+    let library = match own_script::link_macro_planned(sysroot, crates.clone(), &attempt, env, mode)
+    {
         Ok(library) => library,
         Err(error) => {
             load_cargo::proc_macro_producer_lifetime::invalidate(&generation)?;

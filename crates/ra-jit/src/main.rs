@@ -9011,11 +9011,7 @@ fn run_holding(
             harnessed,
         );
     }
-    let image_native = args
-        .inputs
-        .as_ref()
-        .filter(|_| args.shared)
-        .and_then(|_| native_inputs::image_before(&db, &args));
+    let image_native = args.inputs.as_ref().and_then(|_| native_inputs::image_before(&db, &args));
     let cold = match rustcs_to_patch(&args, written.is_empty() && !harnessed) {
         Some(rustcs) => {
             let start = Instant::now();

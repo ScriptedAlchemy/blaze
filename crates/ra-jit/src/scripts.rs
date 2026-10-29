@@ -1151,14 +1151,6 @@ impl<'a> Runner<'a> {
         let began = SystemTime::now();
         let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         crate::cargo::own_script::link_planned(&described, &dir, &exe, &inputs, &env)?;
-        if let Some(line) = std::fs::read_to_string(dir.join("ra-jit.log"))
-            .unwrap_or_default()
-            .lines()
-            .find(|it| it.contains(" functions in it ra-jit could not compile"))
-            && !line.ends_with(", 0 functions in it ra-jit could not compile")
-        {
-            return Err(format!("it calls functions blaze could not compile ({line})"));
-        }
         // What was read is dated when the compile began, as cargo dates its dep-info: a file
         // written while it compiled is a change for the next build.
         std::fs::File::options()
@@ -1249,8 +1241,14 @@ impl<'a> Runner<'a> {
             self.add_source(package, &mut crates, &mut FxHashMap::default())?;
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
-            crate::cargo::producer_image::link(&self.sysroot, crates, &dir, &env)
-                .map_err(|it| format!("{it:#}"))
+            crate::cargo::producer_image::link(
+                &self.sysroot,
+                crates,
+                &dir,
+                &env,
+                crate::cargo::own_script::SourceMode::Legacy,
+            )
+            .map_err(|it| format!("{it:#}"))
         })();
         self.making_images.pop();
         let image = result?;
@@ -1647,6 +1645,8 @@ impl ProfilePackage for Named<'_> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod captured;
 
 pub(crate) mod barrier;
 mod leases;

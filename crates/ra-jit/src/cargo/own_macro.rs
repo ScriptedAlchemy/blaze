@@ -90,8 +90,14 @@ pub(crate) fn source_command(
     anyhow::ensure!(args.next().is_none(), "unexpected producer build argument");
     let crates = serde_json::from_slice(&std::fs::read(plan)?)?;
     let env = std::env::vars_os().collect::<Vec<_>>();
-    let library =
-        own_script::link_macro_planned(&sysroot, crates, &dir, &env).map_err(anyhow::Error::msg)?;
+    let library = own_script::link_macro_planned(
+        &sysroot,
+        crates,
+        &dir,
+        &env,
+        own_script::SourceMode::Legacy,
+    )
+    .map_err(anyhow::Error::msg)?;
     println!("{}", library.display());
     Ok(())
 }
