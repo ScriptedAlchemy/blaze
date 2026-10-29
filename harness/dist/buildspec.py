@@ -2565,6 +2565,8 @@ def resolve(cwd, words, env):
             "4": top, "5": plat_digest, "6": rustflags, "7": sorted([k, v] for k, v in config_tags.items()),
             "8": script_env, "9": logical_path(os.path.relpath(start, root)),
             "10": command, "11": sha("toolchain"), "12": logical_path(os.path.relpath(os.path.join(root, "Cargo.toml"), checkout))}
+    if BUG == "sibling-source-same":
+        spec["12"] = "Cargo.toml"
     spec_digest = sha("spec" + canon(spec))
     digests = {"spec": spec_digest, "platform": plat_digest, "front_end": sha("front" + canon([docs, spec["1"], rustflags])),
                "config": sha("config" + canon([cmd, sorted(canon(docs[index[k]]) for k in asked), top, plat_digest, rustflags])),
