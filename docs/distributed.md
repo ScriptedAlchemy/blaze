@@ -3003,15 +3003,13 @@ name; whether the deployment target changes a function's code is recorded. From 
 
 Verify: `cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
 
-Review status of the C2 prototype: the Linux Rust 1.99.0 tests of `blaze-spec`,
-`blaze-metadata` and `blaze-wire` pass (197 tests, including the test over all 317 recorded
-Cargo unit graphs). The graph now keeps proc-macro doctest libraries under their host/build
-profile, and a normal check and test check of the same library or binary remain distinct.
+The graph tests compare all 317 recorded Cargo unit graphs. The graph keeps proc-macro
+doctest libraries under their host/build profile, and a normal check and test check of the
+same library or binary remain distinct.
 The host debuginfo-sharing probe uses Cargo's explicit target kind, including for proc macros,
 so a build-only unit cannot match itself and incorrectly retain the runtime debug level.
-A custom test harness receives `cfg(test)` without acquiring the libtest harness. A clean
-`cargo +1.99.0 check --locked --tests -p ra-jit` also passes on Linux, including the CLI and
-test targets. These checks do not establish local execution acceptance or the macOS gate.
+A custom test harness receives `cfg(test)` without acquiring the libtest harness. CLI checks
+and Rust unit tests do not establish local execution acceptance or the macOS gate.
 
 The CLI now saves the actual source inputs, including dirty and untracked files, selected
 path/registry/Git dependency trees, configuration reads and relative symlink targets. A canonical
