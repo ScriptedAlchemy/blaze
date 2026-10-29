@@ -1,5 +1,26 @@
 # Why every edit of tracedecay's CLI went to cargo: its build script printed something else
 
+## Ambient dependency environment follow-up, 2026-10-29
+
+Independent review of `f7b3ca93` found that an ambient `DEP_*` variable without
+an active native dependency could still be restored from the previous script
+invocation. After changing `DEP_USER_VALUE` from `x` to `new`, the script read
+`x` while its fingerprint recorded `new`, so Cargo could retain stale output.
+
+`cargo_sets` now reserves only Cargo's own settings. Ambient `DEP_*` values come
+from the current caller, and current native dependency metadata is overlaid
+separately. The metadata regression supplies the caller's unrelated prefix
+explicitly. A new process regression and the live `newly_watched_env` fixture
+cover a recorded ambient dependency variable changing alongside the source.
+
+On `ubuntu-main` Linux x86-64, the native release build passed in 7 m 26 s;
+all 50 script tests passed (one measurement ignored). The live Cargo comparison
+now prints `3 8` on both sides, with the script's changed output correctly
+requiring recompilation. Formatting, harness self-test and whitespace checks
+passed. The earlier complete backend suites below preceded this follow-up;
+LLVM and the complete harness were not rerun for this environment-only change.
+
+
 ## Review closure, 2026-10-29
 
 The earlier reports and their parking statements describe the revisions they name. The current review inventory

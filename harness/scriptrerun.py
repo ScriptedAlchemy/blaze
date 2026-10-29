@@ -316,16 +316,19 @@ def failing_script(bin_dir):
     return wrong
 
 
-def newly_watched_env(bin_dir):
+def newly_watched_env(bin_dir, variable="VP5_VAR", initial=None):
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-se-", dir="/tmp"))
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
     for path, text in NEWENV.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         with open(os.path.join(ws, path), "w") as out:
-            out.write(text)
+            out.write(text.replace("VP5_VAR", variable))
     env = cargo_ra_jit.base_env(home)
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
-    env.pop("VP5_VAR", None)
+    if initial is None:
+        env.pop(variable, None)
+    else:
+        env[variable] = initial
     side, reference = Side(ws, env, True), Side(ws, env, False)
     wrong = []
     try:
@@ -336,7 +339,7 @@ def newly_watched_env(bin_dir):
         _, states = wait_warm(side, ws)
         if states != ["ready"]:
             raise SystemExit(f"newenv: the daemon did not get ready: {states}{tails(home)}")
-        side.env["VP5_VAR"] = reference.env["VP5_VAR"] = "new"
+        side.env[variable] = reference.env[variable] = "new"
         cargo_ra_jit.rewrite(os.path.join(ws, "src/main.rs"), "    7\n", "    8\n")
         how = how_built(build(side, "newenv: an edit", home))
         _, built = reference.cargo("build", "-q")
@@ -640,6 +643,7 @@ def main():
                                 ("dropper", DROPPER, False)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
+    wrong += newly_watched_env(bin_dir, "DEP_USER_VALUE", "x")
     wrong += failing_script(bin_dir)
     wrong += links_only(bin_dir)
     wrong += inactive_links(bin_dir)
