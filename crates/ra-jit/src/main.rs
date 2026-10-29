@@ -8176,9 +8176,17 @@ fn cargo_config(args: &Args) -> CargoConfig {
 
 /// How a workspace is loaded, whichever it is.
 fn load_config() -> LoadCargoConfig {
+    let disabled = matches!(
+        std::env::var_os(cargo::own_macro::SERVER).as_deref().and_then(|it| it.to_str()),
+        Some("0" | "off")
+    );
     LoadCargoConfig {
         load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+        with_proc_macro_server: if disabled {
+            ProcMacroServerChoice::None
+        } else {
+            ProcMacroServerChoice::Sysroot
+        },
         prefill_caches: false,
         num_worker_threads: 1,
         proc_macro_processes: 1,

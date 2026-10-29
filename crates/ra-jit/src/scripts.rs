@@ -1,5 +1,5 @@
-//! Build scripts compiled, run and judged by blaze in the whole build (`RA_JIT_WHOLE_BUILD=1`;
-//! docs/no-rustc.md, step I; docs/reports/SCRIPTEDITS.md, "blaze runs the scripts"). The load
+//! Build scripts compiled, run and judged by blaze in the default owned whole build
+//! (docs/no-rustc.md, step I; docs/reports/SCRIPTEDITS.md, "blaze runs the scripts"). The load
 //! of the whole build asks no cargo for them: each script of the build is compiled by blaze
 //! with its build dependencies, every crate from source over the standard library's unit
 //! (`own_script::link_planned`), run as cargo 1.99 runs it (`blaze_build_script::run`, in its

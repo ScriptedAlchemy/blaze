@@ -75,8 +75,8 @@ commit measured, with `pnpm install --frozen-lockfile` run in it for the dashboa
 Tools (T):
     cargo         cargo with the toolchain the project pins (nightly-2026-10-18), as its developers run it
     cargo199      cargo with rustc 1.99.0, the compiler blaze builds with
-    blaze         `blaze build`: cargo builds first with blaze's wrapper, then the daemon takes over
-    blaze-whole   `BLAZE_WHOLE_BUILD=1`: blaze builds the program itself, with no cargo build
+    blaze         `blaze build`: eligible programs use the owned whole build by default
+    blaze-whole   the historical whole-build label; now the same owned route as blaze
     blaze-nightly `BLAZE_OTHER_TOOLCHAIN=1`: blaze builds with the project's own toolchain
 
 Each tool builds into a directory of its own below the tracedecay checkout's `target/`, the one
