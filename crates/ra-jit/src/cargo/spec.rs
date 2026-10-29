@@ -146,7 +146,14 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         .iter()
         .flat_map(|path| [path.clone(), companion(path, "inputs"), companion(path, "outputs")])
         .collect();
-    let made = blaze_spec::replay::capture(&request, &words[at + 1..], &ctx, &store, &outputs)?;
+    let made = match blaze_spec::replay::capture(&request, &words[at + 1..], &ctx, &store, &outputs)
+    {
+        Ok(made) => made,
+        Err(error) => match error.downcast_ref::<Refusal>() {
+            Some(why) => return refused(why),
+            None => return Err(error),
+        },
+    };
     if let Some(out) = &out {
         // Blobs are immutable and atomically installed before this final publication.
         // Replacing a spec leaves the previous spec's blobs usable by concurrent readers.
@@ -161,7 +168,13 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
 }
 
 fn refused(why: &Refusal) -> anyhow::Result<i32> {
-    println!("{}", serde_json::json!({"refused": {"what": why.what, "why": why.why}}));
+    println!(
+        "{}",
+        serde_json::json!({
+            "refused": {"what": why.what, "why": why.why},
+            "digests": null, "summary": null, "spec": null, "platform": null,
+        })
+    );
     Ok(2)
 }
 
