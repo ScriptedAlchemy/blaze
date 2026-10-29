@@ -51,16 +51,17 @@ pub(crate) struct ArtifactInputs {
     configuration: Vec<(PathBuf, Option<Vec<u8>>)>,
     root: PathBuf,
     identity: String,
+    target_directory: PathBuf,
     _lease: std::fs::File,
 }
 
-fn artifact_digest(paths: &[PathBuf], context: &[u8]) -> anyhow::Result<String> {
+fn artifact_digest(paths: &[PathBuf], context: &[u8], target: &Path) -> anyhow::Result<String> {
     let mut hash = Sha256::new();
     field(&mut hash, b"blaze supplied macro producer inputs 1");
     field(&mut hash, context);
     for path in paths {
         field(&mut hash, path.as_os_str().as_encoded_bytes());
-        hash_tree(path, path, &mut BTreeSet::new(), &mut hash)
+        hash_tree(path, path, &mut BTreeSet::new(), &mut hash, Some(target))
             .with_context(|| format!("reading macro producer inputs {}", path.display()))?;
     }
     Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
@@ -135,6 +136,7 @@ impl ArtifactInputs {
         }
         // Selection includes profile, target, features and config. The worker's build
         // environment is stable across client and worker; output/safety env is not input.
+        let target_directory = metadata.target_directory.clone();
         metadata.target_directory = Default::default();
         let context = serde_json::to_vec(&(selection, producer_env, &metadata))?;
         let mut configuration = Vec::new();
@@ -155,13 +157,12 @@ impl ArtifactInputs {
             }
         }
         let context = serde_json::to_vec(&(context, &configuration))?;
-        let identity = artifact_digest(&paths, &context)?;
-        let root = metadata
-            .workspace_root
+        let identity = artifact_digest(&paths, &context, target_directory.as_std_path())?;
+        let root = target_directory
             .as_std_path()
             // Artifact proof outlives a loaded generation and a daemon restart. It is
             // not a build output and must not share Generation::collect's namespace.
-            .join("target/rust-analyzer/producer-records")
+            .join("rust-analyzer/producer-records")
             .join(&identity);
         let lease = load_cargo::proc_macro_producer_lifetime::lease(&root)?;
         Ok(Some(Self {
@@ -171,6 +172,7 @@ impl ArtifactInputs {
             configuration,
             root,
             identity,
+            target_directory: target_directory.into_std_path_buf(),
             _lease: lease,
         }))
     }
@@ -186,7 +188,7 @@ impl ArtifactInputs {
                 return Ok(false);
             }
         }
-        Ok(artifact_digest(&self.paths, &self.context)? == self.identity)
+        Ok(artifact_digest(&self.paths, &self.context, &self.target_directory)? == self.identity)
     }
 
     /// This is evidence of a completed existing build, never permission to start one.
@@ -271,6 +273,9 @@ pub(crate) fn generation(
     workspace: &ProjectWorkspace,
     config: &CargoConfig,
 ) -> anyhow::Result<Option<String>> {
+    let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
+        return Ok(None);
+    };
     let paths = producers(workspace);
     if paths.is_empty() {
         return Ok(None);
@@ -287,8 +292,14 @@ pub(crate) fn generation(
     field(&mut hash, format!("{env:?}").as_bytes());
     for path in paths {
         field(&mut hash, path.as_os_str().as_encoded_bytes());
-        hash_tree(&path, &path, &mut BTreeSet::new(), &mut hash)
-            .with_context(|| format!("reading macro producer inputs {}", path.display()))?;
+        hash_tree(
+            &path,
+            &path,
+            &mut BTreeSet::new(),
+            &mut hash,
+            Some(cargo.target_directory().as_ref()),
+        )
+        .with_context(|| format!("reading macro producer inputs {}", path.display()))?;
     }
     Ok(Some(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()))
 }
@@ -310,11 +321,14 @@ impl Generation {
         workspace: &ProjectWorkspace,
         config: &mut CargoConfig,
     ) -> anyhow::Result<Option<Self>> {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
+            return Ok(None);
+        };
         let Some(identity) = generation(workspace, config)? else { return Ok(None) };
-        // Separate from earlier unmarked producer targets: never claim/delete those.
-        let path = PathBuf::from(workspace.workspace_root().to_string())
-            .join("target/rust-analyzer/producer-inputs")
-            .join(identity);
+        // Respect Cargo's selected output root while keeping generations separate
+        // from unmarked build outputs and the longer-lived artifact proofs.
+        let target_directory: &Path = cargo.target_directory().as_ref();
+        let path = target_directory.join("rust-analyzer/producer-inputs").join(identity);
         let lease = load_cargo::proc_macro_producer_lifetime::lease(&path)
             .with_context(|| format!("leasing macro input generation {}", path.display()))?;
         config.target_dir_config = project_model::TargetDirectoryConfig::Directory(
@@ -356,6 +370,7 @@ fn hash_tree(
     path: &Path,
     active: &mut BTreeSet<PathBuf>,
     hash: &mut Sha256,
+    target: Option<&Path>,
 ) -> std::io::Result<()> {
     let metadata = std::fs::metadata(path)?;
     if metadata.is_dir() {
@@ -371,14 +386,15 @@ fn hash_tree(
             .collect::<Result<_, _>>()?;
         entries.sort();
         for entry in entries {
-            if entry.ends_with(".git")
+            if target.is_some_and(|target| entry == target)
+                || entry.ends_with(".git")
                 || path == root && entry.ends_with("target")
                 || entry.join("CACHEDIR.TAG").exists()
                 || entry.join("Cargo.toml").exists()
             {
                 continue;
             }
-            hash_tree(root, &entry, active, hash)?;
+            hash_tree(root, &entry, active, hash, target)?;
         }
         active.remove(&canonical);
     } else if metadata.is_file() {
@@ -396,8 +412,101 @@ mod tests {
 
     fn digest(root: &Path) -> std::io::Result<[u8; 32]> {
         let mut hash = Sha256::new();
-        hash_tree(root, root, &mut BTreeSet::new(), &mut hash)?;
+        hash_tree(root, root, &mut BTreeSet::new(), &mut hash, None)?;
         Ok(hash.finalize().into())
+    }
+
+    #[test]
+    fn producer_leases_follow_the_resolved_target_directory() {
+        for mode in ["env", "config", "within-workspace"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(temp.path()).unwrap();
+            let root = base.join("workspace");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("Cargo.toml"),
+                "[package]\nname='producer'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n[workspace]\n").unwrap();
+            std::fs::write(root.join("src/lib.rs"), "extern crate proc_macro;\n").unwrap();
+            let target = if mode == "within-workspace" {
+                root.join("build-area")
+            } else {
+                base.join("selected-target")
+            };
+            let mut env =
+                vec![("CARGO_HOME".into(), base.join("cargo-home").display().to_string())];
+            if mode == "env" {
+                env.push(("CARGO_TARGET_DIR".into(), target.display().to_string()));
+            } else {
+                std::fs::create_dir(root.join(".cargo")).unwrap();
+                std::fs::write(
+                    root.join(".cargo/config.toml"),
+                    format!("[build]\ntarget-dir = {}\n", serde_json::json!(target)),
+                )
+                .unwrap();
+            }
+            let manifest = root.join("Cargo.toml");
+            let asked = blaze_metadata::Asked {
+                cwd: &root,
+                env: env.clone(),
+                manifest_path: Some(&manifest),
+                config: &[],
+                features: &[],
+                all_features: false,
+                no_default_features: false,
+                build: None,
+                platform: None,
+                offline: true,
+                locked: false,
+                store: None,
+            };
+            let metadata: cargo_metadata::Metadata =
+                serde_json::from_str(&blaze_metadata::metadata(&asked).unwrap()).unwrap();
+            assert_eq!(metadata.target_directory.as_std_path(), target);
+            let cargo = project_model::CargoWorkspace::new(
+                metadata,
+                project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest))
+                    .unwrap(),
+                Default::default(),
+                false,
+            );
+            let workspace = ProjectWorkspace {
+                kind: ProjectWorkspaceKind::Cargo {
+                    cargo,
+                    error: None,
+                    build_scripts: Default::default(),
+                    rustc: Err(None),
+                },
+                sysroot: project_model::Sysroot::empty(),
+                rustc_cfg: Vec::new(),
+                toolchain: None,
+                target: Err("unused target layout in metadata lease test".into()),
+                cfg_overrides: Default::default(),
+                extra_includes: Vec::new(),
+                set_test: false,
+            };
+            let mut config = CargoConfig::default();
+            let generation = Generation::prepare(&workspace, &mut config).unwrap().unwrap();
+            assert!(generation.path().starts_with(target.join("rust-analyzer/producer-inputs")));
+            let artifacts =
+                ArtifactInputs::capture_in(&root, &crate::plan::Selection::default(), env)
+                    .unwrap()
+                    .unwrap();
+            assert!(artifacts.root.starts_with(target.join("rust-analyzer/producer-records")));
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("debug/output"), b"generated bytes").unwrap();
+            generation.verify(&workspace, &config).unwrap();
+            assert!(artifacts.current().unwrap(), "build outputs are not producer sources");
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "extern crate proc_macro; pub const EDIT: u8 = 2;\n",
+            )
+            .unwrap();
+            assert!(generation.verify(&workspace, &config).is_err());
+            assert!(!artifacts.current().unwrap(), "source edits must remain visible");
+            assert!(
+                !root.join("target").exists(),
+                "producer state must not escape the selected target"
+            );
+        }
     }
 
     #[test]
