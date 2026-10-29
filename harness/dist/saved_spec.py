@@ -163,6 +163,7 @@ def main():
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--memory-mib", type=int, default=8192)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--backend", choices=("cranelift", "llvm"), default="cranelift")
     args = parser.parse_args()
     assert 0 < args.memory_mib <= tracedecay.WATCHDOG_MB
     assert args.timeout > 0
@@ -188,7 +189,7 @@ def main():
                CARGO_HOME=str(work / "request-cargo"), RA_JIT_CACHE="off",
                RA_JIT_MEMORY_MAX=str(args.memory_mib) + "M",
                RA_JIT_OWN_BASE_MEMORY=str(args.memory_mib * 3 // 4) + "M",
-               RA_JIT_SPARE="0", RUST_BACKTRACE="0")
+               RA_JIT_BACKEND=args.backend, RA_JIT_SPARE="0", RUST_BACKTRACE="0")
     Path(env["HOME"]).mkdir()
     Path(env["CARGO_HOME"]).mkdir()
     runner = Runner(blaze, work, args.memory_mib, args.timeout)
@@ -233,6 +234,10 @@ def main():
         assert len(results) == 1, results
         artifact = json.loads(results[0].read_text())["artifacts"][0]["executable"]
         assert Path(artifact).is_file(), artifact
+        if args.backend == "llvm":
+            compiler_log = Path(artifact).parent / "compiler.log"
+            assert any(line.startswith("backend: llvm ")
+                       for line in compiler_log.read_text().splitlines()), compiler_log
         store = Path(str(spec) + ".inputs")
         source_blob = next(path for path in store.iterdir()
                            if path.is_file() and path.read_bytes() == b"captured")
@@ -287,7 +292,8 @@ fn main() {}
         print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
     finally:
         calls = audit.read_text().splitlines() if audit.exists() else []
-        write(work, "results.json", json.dumps({"rows": runner.rows, "product_tool_calls": calls}, indent=2) + "\n")
+        write(work, "results.json", json.dumps({"backend": args.backend, "rows": runner.rows,
+              "product_tool_calls": calls}, indent=2) + "\n")
         assert not calls, f"the product invoked blocked compiler tools: {calls}"
 
 
