@@ -244,16 +244,6 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
     let args: Vec<String> =
         command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
     let var = |name: &str| var_of(command, name);
-    let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
-    for (name, value) in command.get_envs() {
-        let name = name.to_str()?.to_owned();
-        match value {
-            Some(value) => env.insert(name, value.to_str()?.to_owned()),
-            None => env.remove(&name),
-        };
-    }
-    let cwd =
-        command.get_current_dir().map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
     let output = |stdout: Vec<u8>, stderr: Vec<u8>, code: u8| {
         #[cfg(unix)]
         let status = {
@@ -267,6 +257,27 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         };
         Output { status, stdout, stderr }
     };
+    if args == ["--version"] {
+        let version = toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
+            .and_then(|rustc| {
+                own::cargo_version(
+                    &rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+                )
+            });
+        return Some(version.map(|stdout| output(stdout, Vec::new(), 0)).ok_or_else(|| {
+            io::Error::other("owned Cargo version facts unavailable; Cargo was not executed")
+        }));
+    }
+    let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
+    for (name, value) in command.get_envs() {
+        let name = name.to_str()?.to_owned();
+        match value {
+            Some(value) => env.insert(name, value.to_str()?.to_owned()),
+            None => env.remove(&name),
+        };
+    }
+    let cwd =
+        command.get_current_dir().map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
     if args.windows(2).any(|args| args == ["config", "get"]) {
         let mut normalized = Vec::new();
         let mut at = 0;
@@ -290,9 +301,6 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
     };
     // A resolved Cargo path points into the same installation, but it is not rustc.
     let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
-    if args == ["--version"] {
-        return own::cargo_version(&rustc).map(|stdout| Ok(output(stdout, Vec::new(), 0)));
-    }
     if args.first().is_some_and(|it| it == "rustc")
         && args.iter().any(|it| it == "--print" || it.starts_with("--print="))
     {
@@ -842,6 +850,39 @@ mod tests {
         let result = cargo_question(&mut command).unwrap().unwrap();
         assert!(result.status.success());
         assert_ne!(result.stdout, b"");
+    }
+
+    #[test]
+    fn cargo_version_never_hands_off_when_installed_facts_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_toolchain(dir.path());
+        let executable = dir.path().join("bin/cargo");
+        std::fs::write(&executable, "this tool must not execute").unwrap();
+        let query = || {
+            let mut command = Command::new(&executable);
+            command.current_dir(dir.path()).arg("--version");
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt as _;
+                command.env("UNREAD_RAW_VALUE", OsString::from_vec(vec![0xff]));
+            }
+            ask(&mut command).expect("an owned version query must never execute Cargo")
+        };
+        let why = query().unwrap_err().to_string();
+        assert_eq!(why, "owned Cargo version facts unavailable; Cargo was not executed");
+        let manifest = dir.path().join("lib/rustlib/multirust-channel-manifest.toml");
+        let rustc = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            format!("{rustc}\n[pkg.cargo]\nversion = \"0.100.0 (123456789 2026-10-01)\"\n"),
+        )
+        .unwrap();
+        let version = query().unwrap();
+        assert!(version.status.success());
+        assert_eq!(version.stdout, b"cargo 1.99.0 (123456789 2026-10-01)\n");
+        std::fs::write(&manifest, format!("{rustc}\n[pkg.cargo]\nversion = \"malformed\"\n"))
+            .unwrap();
+        assert!(query().unwrap_err().to_string().contains("Cargo was not executed"));
     }
 
     #[test]
