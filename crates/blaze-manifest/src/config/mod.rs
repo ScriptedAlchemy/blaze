@@ -245,6 +245,49 @@ pub fn env_key(key: &str) -> String {
     ConfigKey::parse(key).as_env_key().to_owned()
 }
 
+/// Captured configuration files, with no filesystem discovery.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigImage {
+    /// Top-level config files in precedence order, highest first, as live discovery visits
+    /// them. Includes and CLI files belong only in `files`, unless also top-level layers.
+    pub layers: Vec<PathBuf>,
+    /// Original file bytes indexed by their logical native paths. Paths here and in `layers`
+    /// may be absolute or relative to the invocation's cwd. Lookups normalize `.` and `..`
+    /// lexically and never resolve filesystem symlinks. An absent entry is an absent file.
+    pub files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum ConfigSource {
+    Live,
+    Image(ConfigImage),
+}
+
+impl ConfigSource {
+    fn exists(&self, path: &Path) -> bool {
+        match self {
+            Self::Live => path.exists(),
+            Self::Image(image) => image.files.contains_key(&paths::normalize_path(path)),
+        }
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        match self {
+            Self::Live => std::fs::read_to_string(path),
+            Self::Image(image) => {
+                let bytes = image.files.get(&paths::normalize_path(path)).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "configuration file is absent from the supplied image",
+                    )
+                })?;
+                String::from_utf8(bytes.clone())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }
+        }
+    }
+}
+
 /// The configuration of one invocation: what cargo's `GlobalContext` holds of it.
 #[derive(Debug)]
 pub struct Config {
@@ -252,6 +295,7 @@ pub struct Config {
     home: PathBuf,
     env: BTreeMap<String, String>,
     cli: Vec<String>,
+    source: ConfigSource,
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
     values: OnceCell<FxHashMap<String, ConfigValue>>,
@@ -282,12 +326,56 @@ impl Config {
         cli: &[String],
         home: PathBuf,
     ) -> anyhow::Result<Config> {
+        Self::with_source(cwd, home, env, cli, ConfigSource::Live)
+    }
+
+    /// The configuration from exactly `image`, using the live parser and precedence rules.
+    /// No ancestor or home config is discovered. Includes, optional-include probes and CLI
+    /// file arguments consult only the image. `home` is retained as the invocation's Cargo
+    /// home, but its config must be an explicit layer to participate.
+    ///
+    /// Files keep their recorded origins for relative values, including the grandparent
+    /// rule of [`Definition::root`] for CLI files. Rebase logical paths before calling this
+    /// method when replaying in another layout. Config files remain lazy unless `cli` is
+    /// nonempty, as with [`Config::load_with_home`].
+    pub fn from_image(
+        cwd: &Path,
+        home: PathBuf,
+        env: impl IntoIterator<Item = (String, String)>,
+        cli: &[String],
+        image: ConfigImage,
+    ) -> anyhow::Result<Config> {
+        let mut files = BTreeMap::new();
+        for (path, bytes) in image.files {
+            let path = paths::normalize_path(&cwd.join(path));
+            if let Some(previous) = files.get(&path)
+                && previous != &bytes
+            {
+                bail!("conflicting configuration image files at `{}`", path.display());
+            }
+            files.insert(path, bytes);
+        }
+        let image = ConfigImage {
+            layers: image.layers.into_iter().map(|path| cwd.join(path)).collect(),
+            files,
+        };
+        Self::with_source(cwd, home, env, cli, ConfigSource::Image(image))
+    }
+
+    fn with_source(
+        cwd: &Path,
+        home: PathBuf,
+        env: impl IntoIterator<Item = (String, String)>,
+        cli: &[String],
+        source: ConfigSource,
+    ) -> anyhow::Result<Config> {
         let env: BTreeMap<String, String> = env.into_iter().collect();
         let mut config = Config {
             cwd: cwd.to_path_buf(),
             home,
             env,
             cli: Vec::new(),
+            source,
             values: OnceCell::new(),
             build_config: OnceCell::new(),
             target_cfgs: OnceCell::new(),
@@ -376,6 +464,12 @@ impl Config {
         home: &Path,
         mut walk: impl FnMut(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        if let ConfigSource::Image(image) = &self.source {
+            for path in &image.layers {
+                walk(path)?;
+            }
+            return Ok(());
+        }
         let mut seen_dir = FxHashSet::default();
         let stop = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
         for current in paths::ancestors(pwd, stop.as_deref()) {
@@ -406,7 +500,9 @@ impl Config {
         if !seen.insert(path.to_path_buf()) {
             bail!("config `include` cycle detected with path `{}`", path.display());
         }
-        let contents = std::fs::read_to_string(path)
+        let contents = self
+            .source
+            .read_to_string(path)
             .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
         self.sources.borrow_mut().push((path.to_owned(), contents.as_bytes().to_vec()));
         let toml: toml::Table = contents.parse().with_context(|| {
@@ -451,7 +547,7 @@ impl Config {
             _ => &self.cwd,
         };
         let abs_path = paths::normalize_path(&base.join(&include.path));
-        (!include.optional || abs_path.exists()).then_some(abs_path)
+        (!include.optional || self.source.exists(&abs_path)).then_some(abs_path)
     }
 
     /// Each config file on its own, includes before what includes them, as cargo's
@@ -512,7 +608,7 @@ impl Config {
         let mut loaded = CV::Table(FxHashMap::default(), Definition::Cli(None));
         for arg in &self.cli {
             let arg_as_path = self.cwd.join(arg);
-            let table = if !arg.is_empty() && arg_as_path.exists() {
+            let table = if !arg.is_empty() && self.source.exists(&arg_as_path) {
                 self.load_file(&arg_as_path, &mut FxHashSet::default(), true, true).with_context(
                     || format!("failed to load config from `{}`", arg_as_path.display()),
                 )?
