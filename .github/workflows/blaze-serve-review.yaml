@@ -12,6 +12,7 @@ on:
       - crates/hir-ty-codegen/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
+      - vendor/proc-macro-srv/**
       - vendor/rust-analyzer/crates/syntax/**
       - vendor/rust-analyzer/crates/cfg/**
       - vendor/rust-analyzer/crates/hir/**
@@ -86,6 +87,9 @@ jobs:
           cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
           cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
           python3 -I harness/dist/crossmachine.py --self-test
+      - name: Test bootstrap protocol wire compatibility
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-api --lib -- --test-threads=2
       - name: Save owned probe evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 HARNESS = Path(__file__).resolve().parents[1]
@@ -31,7 +30,7 @@ def main():
                         "RA_JIT_SPARE": "0"}.items():
         assert os.environ.get(name) == value, f"run under memory watchdog with {name}={value}"
     work = args.work.resolve()
-    work.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=False)
     log = work / "bootstrap-tools.log"
     audit = Path(norustc.stand_ins(str(work / "audit"), str(log), block=True, block_macro_server=True))
     env = {**os.environ, "PATH": str(audit / "bin") + os.pathsep + os.environ["PATH"],
@@ -61,9 +60,12 @@ def main():
     pins = {name: dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
             for name, path in [("blaze", args.blaze.resolve()), ("server", executable)]}
     (work / "image-pins.json").write_text(json.dumps(pins, indent=2) + "\n")
-    check = subprocess.run([str(executable), "--version"], capture_output=True, text=True,
-                           env={**env, "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"})
+    check = norustc.traced_run([str(executable), "--version"], work / "version.exec", cwd=work,
+                              env={**env, "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"})
     assert check.returncode == 0, check.stderr
+    execs += norustc.external_execs((work / "version.exec").read_text()) if sys.platform == "linux" else []
+    (work / "bootstrap-external-execs.json").write_text(json.dumps(execs, indent=2) + "\n")
+    assert not execs, f"server version attempted external compiler/Cargo execs: {execs}"
     calls = norustc.runs(str(log))
     (work / "bootstrap-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
     assert not calls, f"bootstrap attempted blocked compiler/Cargo calls: {calls}"

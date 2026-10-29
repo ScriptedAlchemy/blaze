@@ -7,6 +7,7 @@ On Linux, strace also records the real process tree. The matching owned server m
 be freshly built separately; no toolchain server is substituted by this harness.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -80,7 +81,10 @@ def main():
     watchdog = Watchdog(str(bins), run_id=product["RA_JIT_RUN_ID"],
         homes=(product["RA_JIT_HOME"],), series=str(work / "watchdog.jsonl"))
     watchdog.start()
-    result = dict(rows=[], server=str(args.owned_server.resolve()))
+    result = dict(rows=[], images={name: dict(path=str(path),
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest()) for name, path in [
+            ("server", args.owned_server.resolve()), ("blaze", bins / "ra-jit"),
+            ("cargo-ra-jit", bins / "cargo-ra-jit")]})
     roots = [str(work), home]
     try:
         for step, command in [("build", ["build", "--locked", "-p", "app"]),
