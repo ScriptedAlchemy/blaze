@@ -372,6 +372,26 @@ fn main() {}
         expected = saved_equals_cargo(runner, blaze, real, "runtime-env", project, env,
                                       oracle_env, hostile_env, hostile, bundle)
         assert expected == "".join(name + "=true\n" for name in names), expected
+        # option_env! of a variable the requester did not have is None for Cargo and in the
+        # replay, whatever the worker has; one the requester had cannot be reproduced and is
+        # refused rather than answered with a different value.
+        main_rs = 'fn main() { println!("{:?}|{:?}", option_env!("SAVED_SPEC_UNSET"), option_env!("SAVED_SPEC_SET")); }\n'
+        files = {"Cargo.toml": '[package]\nname="optional"\nversion="0.1.0"\nedition="2021"\n',
+                 "src/main.rs": main_rs}
+        project = standalone(work, "option-env-unset", files)
+        expected = saved_equals_cargo(runner, blaze, real, "option-env-unset", project, env,
+            oracle_env, dict(hostile_env, SAVED_SPEC_UNSET="worker-value", SAVED_SPEC_SET="worker-value"),
+            hostile, bundle)
+        assert expected == "None|None\n", expected
+        project = standalone(work, "option-env-set", files)
+        requester = dict(env, SAVED_SPEC_SET="requester-secret")
+        saved = bundle / "option-env-set.cbor"
+        runner.run("option-env-set-save", [blaze, "cargo", "spec", "--out", saved, "run"],
+                   requester, project)
+        shutil.rmtree(project)
+        runner.run("option-env-set-refusal", [blaze, "cargo", "spec", "--run", saved],
+                   dict(hostile_env, SAVED_SPEC_SET="worker-value"), hostile, expected=None,
+                   contains="undeclared environment value SAVED_SPEC_SET")
         print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
     finally:
         calls = audit.read_text().splitlines() if audit.exists() else []

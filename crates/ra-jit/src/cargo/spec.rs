@@ -490,6 +490,18 @@ fn compile(
     Ok(())
 }
 
+/// Whether a variable the compiler found unset is unset as the requester had it. The compiler
+/// runs with the spec's environment alone, so an `option_env!` of a name the spec does not
+/// carry reads absent whatever the worker has; that is Cargo's answer exactly when the
+/// requester's process lacked the name too. One it had, which the spec does not carry (a
+/// secret, say), would be answered `None` where Cargo answered the requester's value.
+/// Cargo derives the three names of its own per crate.
+fn absent_as_saved(name: &str, value: Option<&str>, requester_had: impl Fn(&str) -> bool) -> bool {
+    value.is_none()
+        && (matches!(name, "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR")
+            || !requester_had(name))
+}
+
 /// The complete non-language dependency trace includes modules and all include macros.
 /// Admission happens before any executable is run or advertised. This is a correctness
 /// check after compilation, not a filesystem sandbox or a claim of pre-read confinement.
@@ -528,11 +540,11 @@ fn admit_inputs(
                 krate["env"].get(name).and_then(serde_json::Value::as_str) == Some(value)
             })
         });
-        // Cargo derives these absences per crate. An arbitrary option_env! read is
-        // not proof of a captured absence: the requester may have had a secret value.
-        let derived_absence = value.is_none()
-            && matches!(name.as_str(), "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR");
-        ensure!(declared || derived_absence, "compiler read undeclared environment value {name}");
+        ensure!(
+            declared
+                || absent_as_saved(name, value.as_deref(), |name| prepared.requester_had(name)),
+            "compiler read undeclared environment value {name}"
+        );
     }
     Ok(())
 }
@@ -570,6 +582,18 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn an_unset_variable_reads_as_the_requester_had_it() {
+        let had = |name: &str| name == "SECRET";
+        // Unset for the requester and for the compiler: Cargo's answer, whatever the worker has.
+        assert!(absent_as_saved("NEVER_SET", None, had));
+        assert!(absent_as_saved("OUT_DIR", None, |_| true));
+        // The requester had it and the spec does not carry it: not reproducible.
+        assert!(!absent_as_saved("SECRET", None, had));
+        // A value the compiler found is declared by the spec or refused, never absent.
+        assert!(!absent_as_saved("NEVER_SET", Some("worker"), had));
     }
 
     #[test]

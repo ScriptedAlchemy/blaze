@@ -640,3 +640,29 @@ fn a_replayed_program_gets_the_environment_cargo_gives_one() {
     let bare = executor.into_iter().filter(|(name, _)| name != "HOME").collect();
     assert_eq!(run(&bare)["HOME"], "/job/home");
 }
+
+#[test]
+fn a_replay_knows_which_variables_the_requester_had_without_holding_their_names() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let mut env = f.env();
+    env.insert("PRIVATE_API_TOKEN".into(), "secret-that-must-not-persist".into());
+    let args: Vec<String> = Vec::new();
+    let request = Request::parse(Subcommand::Build, &args).unwrap();
+    let root = f.root();
+    let host = host(false);
+    let made =
+        capture(&request, &args, &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    // Unset for the requester: a program reading it with option_env! was answered None.
+    assert!(!replay.requester_had("SAVED_SPEC_NEVER_SET"));
+    // Set for the requester, though no spec carries it: the answer cannot be reproduced.
+    assert!(replay.requester_had("PRIVATE_API_TOKEN"));
+    assert!(replay.requester_had("PATH"));
+    let digest: String = made.digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let record = std::fs::read(store.path().join(format!("replay-{digest}.cbor"))).unwrap();
+    for held in [&b"PRIVATE_API_TOKEN"[..], b"secret-that-must-not-persist"] {
+        assert!(!record.windows(held.len()).any(|window| window == held));
+    }
+}

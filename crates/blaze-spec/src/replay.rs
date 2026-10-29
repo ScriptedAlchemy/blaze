@@ -6,7 +6,7 @@
 //! compares the entire BuildSpec. Only then is the execution platform probed.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::Write as _,
     path::{Path, PathBuf},
@@ -15,8 +15,10 @@ use std::{
 use anyhow::{Context as _, bail, ensure};
 use blaze_manifest::config::ConfigImage;
 use blaze_wire::{
-    BuildSpec, ConfigEnvValue, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity, Wire,
+    BuildSpec, ConfigEnvValue, Digest, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity,
+    Wire,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     assemble::{self, Context, Host, Resolved, Spec},
@@ -48,9 +50,25 @@ pub struct Prepared {
     /// The configuration files the capture read, at their places in the snapshot: what every
     /// later reading of the configuration (the executor's too) is made from.
     pub config_image: ConfigImage,
+    /// The names of the variables the requester's process had, as digests: the record never
+    /// holds a name or a value. See [`Prepared::requester_had`].
+    requester_names: BTreeSet<Digest>,
+}
+
+/// What a variable name is recorded as.
+fn name_digest(name: &str) -> Digest {
+    Sha256::digest(name.as_bytes()).into()
 }
 
 impl Prepared {
+    /// Whether the requester's process had a variable called `name`, whether or not the spec
+    /// carries it. A program that reads one it did not have (`option_env!`) is given the same
+    /// answer by a replay, which never passes it the worker's value; one it did have, and
+    /// the spec does not carry, cannot be answered.
+    pub fn requester_had(&self, name: &str) -> bool {
+        self.requester_names.contains(&name_digest(name))
+    }
+
     /// The effective compiler/run environment, after applying the spec's configuration
     /// values. Configuration-derived relative paths must not be ambient overrides while
     /// reproducing the configuration itself.
@@ -69,7 +87,7 @@ impl Prepared {
 }
 
 /// The version of the replay record's encoding.
-const RECORD_VERSION: u32 = 2;
+const RECORD_VERSION: u32 = 3;
 
 /// The configuration files resolution read, placed in the snapshot. Replay reads these and no
 /// others, in this order: discovery from the worker's tree could fold a file in at another
@@ -123,25 +141,28 @@ struct Record {
     cargo_home: Option<SourcePath>,
     platform: ExecPlatform,
     config: ConfigLayers,
+    /// The digests of the names of the requester's variables, in order.
+    requester: Vec<Digest>,
 }
 
 impl Wire for Record {
     fn encode(&self, e: &mut blaze_wire::Encoder) {
-        e.array(6);
+        e.array(7);
         RECORD_VERSION.encode(e);
         self.recipe.encode(e);
         self.manifest.encode(e);
         self.cargo_home.encode(e);
         self.platform.encode(e);
         self.config.encode(e);
+        self.requester.encode(e);
     }
 
     fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
-        r.array_start(6)?;
+        r.array_start(7)?;
         let at = r.position();
         if u32::decode(r)? != RECORD_VERSION {
             return Err(blaze_wire::Error {
-                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 2" },
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 3" },
                 at,
             });
         }
@@ -151,6 +172,7 @@ impl Wire for Record {
             cargo_home: Option::decode(r)?,
             platform: ExecPlatform::decode(r)?,
             config: ConfigLayers::decode(r)?,
+            requester: Vec::decode(r)?,
         };
         r.array_end()?;
         Ok(record)
@@ -392,6 +414,12 @@ pub fn capture(
     };
     let record = Record {
         recipe: ReplayRecipe::capture(&made.build, subcommand, words, &recipe_env, &config_files)?,
+        requester: native
+            .keys()
+            .map(|name| name_digest(name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         config: ConfigLayers {
             layers: configuration(&resolved.config.layers)?,
             files: configuration(&resolved.config.files)?,
@@ -610,6 +638,7 @@ fn prepare_record(
         environment: native,
         host: host.clone(),
         config_image,
+        requester_names: record.requester.iter().copied().collect(),
     })
 }
 
