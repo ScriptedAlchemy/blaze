@@ -99,7 +99,11 @@ impl Probe for FakeMachine {
         self.run(p, &args.iter().map(|v| v.to_str()).collect::<Option<Vec<_>>>()?)
     }
     fn run_path(&self, p: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
-        self.run_native(p, args).map(String::into_bytes)
+        if args.last().is_some_and(|arg| arg == "--show-sdk-path") {
+            self.run_native(p, args).map(String::into_bytes)
+        } else {
+            None
+        }
     }
     fn which(&self, name: &str, _path: &str) -> Option<PathBuf> {
         Some(PathBuf::from("/usr/bin").join(name))
