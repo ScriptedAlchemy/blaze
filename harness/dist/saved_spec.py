@@ -182,7 +182,8 @@ def main():
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("RA_JIT_", "BLAZE_", "CARGO_", "RUSTC", "RUSTDOC"))
            and key not in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET")}
-    env.update(PATH=str(blocked / "bin") + os.pathsep + "/usr/bin:/bin",
+    native_path = os.environ.get("PATH", os.defpath)
+    env.update(PATH=str(blocked / "bin") + os.pathsep + native_path,
                RUSTUP_HOME=str(work / "rustup"), HOME=str(work / "request-home"),
                CARGO_HOME=str(work / "request-cargo"), RA_JIT_CACHE="off",
                RA_JIT_MEMORY_MAX=str(args.memory_mib) + "M",
@@ -197,7 +198,7 @@ def main():
     oracle_env = {key: value for key, value in env.items()
                   if not key.startswith(("RA_JIT_", "BLAZE_"))}
     oracle_env.update(RUSTUP_HOME=str(real.parent.parent), RUSTUP_TOOLCHAIN=str(real),
-                      PATH=str(real / "bin") + os.pathsep + "/usr/bin:/bin",
+                      PATH=str(real / "bin") + os.pathsep + native_path,
                       CARGO_TARGET_DIR=str(work / "oracle-target"), RUST_BACKTRACE="0")
     try:
         expected, _ = runner.run("reference", [real / "bin/cargo", "run", "--locked", "--offline",
