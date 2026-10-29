@@ -509,10 +509,39 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
+            let linkage_and_content = |db: &RootDatabase| {
+                let dep = *ide_db::base_db::all_crates(db)
+                    .iter()
+                    .find(|krate| {
+                        krate.extra_data(db).display_name.as_ref().unwrap().to_string() == "dep"
+                    })
+                    .unwrap();
+                let table = crate::symbols::SymbolTable::default();
+                let known = hir_ty_codegen::Rejections::default();
+                let listed = crate::Listed::default();
+                let contents = Contents::default();
+                let mut args = crate::Args::parse(
+                    [top.to_str().unwrap(), "--crate", "app", "--out", "app.o"]
+                        .into_iter()
+                        .map(str::to_owned),
+                )
+                .unwrap();
+                args.checkout = top.clone();
+                let resolver = crate::Resolver::of(db, &table, &args, &known, &contents, &listed);
+                use hir_ty_codegen::SymbolResolver as _;
+                (resolver.own_crate_id(dep), resolver.content_id(dep).map(|id| id.0))
+            };
+            let old_identity = hir::attach_db(&db, || linkage_and_content(&db));
             let old_bodies = hir::attach_db(&db, || bodies(&db));
             std::fs::write(&payload, [byte + 10]).unwrap();
             assert!(db.reload_included_file(&path));
             let new_bodies = hir::attach_db(&db, || bodies(&db));
+            let new_identity = hir::attach_db(&db, || linkage_and_content(&db));
+            assert_eq!(old_identity.0, new_identity.0, "native linkage must survive an input edit");
+            assert_ne!(
+                old_identity.1, new_identity.1,
+                "stored code must retain current content identity"
+            );
             if body.contains("pub fn value() -> u8 { include_bytes!") {
                 assert_ne!(old_bodies, new_bodies, "lowered body must depend on included bytes");
             }
