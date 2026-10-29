@@ -203,6 +203,30 @@ reads and blaze can't honor yet stops it with an error naming it: rustdoc's flag
 While a build waits, the client prints each unit's lines as the daemon sends them; there is no
 live progress view in v2.
 
+## Save and replay a BuildSpec
+
+The experimental C2 command saves the selected request and its source inputs:
+
+```sh
+ra-jit cargo spec --out saved.cbor build --bin app
+ra-jit cargo spec --run saved.cbor
+```
+
+Keep `saved.cbor` together with `saved.cbor.inputs/`. The latter contains verified source blobs
+and the original invocation recipe; the original checkout can then be removed. Replay requires the
+same Blaze/toolchain identity and a matching execution platform. It reconstructs the source, resolves
+and checks the entire request, and compiles from an explicit source graph. Successful artifact paths
+are printed and recorded below `saved.cbor.outputs/`. Saving a `run` request also saves its program
+arguments; replay returns the program's exit status.
+
+This executor currently targets host Rust binary/example graphs, including libraries compiled from
+source as their dependencies. Unit/integration test execution has a dedicated path. Standalone library
+artifacts, `check`, doctests, benchmarks, build scripts and proc macros remain explicit capability
+errors. Application native link dependencies and source reads outside the saved snapshot are rejected.
+The language runtime's native platform digest remains incomplete, so this is not full native closure
+or distributed execution acceptance. The precise gate and current limitations are in
+[the C2 section](distributed.md) and `harness/dist/saved_spec.py`.
+
 ## What a build does
 
 blaze never runs rustc, and a build has one path ([no-rustc.md](no-rustc.md)). The daemon
