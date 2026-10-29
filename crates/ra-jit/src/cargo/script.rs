@@ -401,6 +401,7 @@ fn judge_locked_inner(
 ) -> Result<Run, JudgementError> {
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
+    let mut metadata_prefixes = Vec::new();
     for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
         let context = Cargo { targets: &dep.targets, ..*cargo };
         judge_locked(&dep.out_dir, &context, completed, parents)?;
@@ -412,16 +413,11 @@ fn judge_locked_inner(
             .and_then(|it| serde_json::from_slice(&it).map_err(|it| it.to_string()))?;
         let said = said_to_cargo(&printed, &dep.out_dir, &dep.out_dir, &ran, &context)
             .map_err(|it| it.to_string())?;
+        let prefix = format!("DEP_{}_", blaze_build_script::envify(&dep.links));
         for (key, value) in said.metadata {
-            metadata.insert(
-                format!(
-                    "DEP_{}_{}",
-                    blaze_build_script::envify(&dep.links),
-                    blaze_build_script::envify(&key)
-                ),
-                value,
-            );
+            metadata.insert(format!("{prefix}{}", blaze_build_script::envify(&key)), value);
         }
+        metadata_prefixes.push(prefix);
         dependencies.push((dep.package.as_str(), fingerprint.hash_u64(), unit.output()));
     }
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
@@ -492,7 +488,9 @@ fn judge_locked_inner(
         }
     }
     for (name, value) in &ran.env {
-        if cargo_sets(name) {
+        // Cargo replaces dependency metadata; a dropped key must use the current
+        // caller's environment, not the value injected for the previous run.
+        if cargo_sets(name) && !metadata_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
             env.insert(name.clone(), value.clone());
         }
     }
@@ -940,6 +938,65 @@ mod tests {
         changed(&native);
         assert_eq!(current(&parent, &cargo), Ok(built));
         assert_eq!((runs(&native), runs(&parent)), (2, 2));
+    }
+
+    #[test]
+    fn a_native_dependency_replaces_its_metadata_in_the_parents_environment() {
+        use std::hash::{Hash as _, Hasher};
+
+        let native =
+            ran_script("native-metadata", "#!/bin/sh\necho cargo::metadata=updated=new\n", "");
+        recorded(
+            &native,
+            b"cargo::metadata=val=old\ncargo::metadata=updated=old\ncargo:rerun-if-changed=watched\n",
+        );
+        let parent = ran_script(
+            "parent-metadata",
+            "#!/bin/sh\nprintf '%s|%s|%s' \"${DEP_NATIVE_PROBE_VAL-unset}\" \"$DEP_NATIVE_PROBE_UPDATED\" \"$DEP_NATIVE_PROBE2_VAL\" > \"$OUT_DIR/observed\"\n",
+            "",
+        );
+        for name in ["DEP_NATIVE_PROBE_VAL", "DEP_NATIVE_PROBE_UPDATED", "DEP_NATIVE_PROBE2_VAL"] {
+            with_variable(&parent, name, Path::new("old"));
+        }
+        std::fs::write(parent.join("observed"), "old|old|old").unwrap();
+        let built = Run::of(&parent).unwrap();
+        let unit = records::Unit::of(&parent).unwrap();
+        let native_hash = records::Unit::of(&native).unwrap().recorded().unwrap().hash_u64();
+        let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+        "native-metadata".hash(&mut hasher);
+        let mut json = serde_json::to_value(unit.recorded().unwrap()).unwrap();
+        json["deps"].as_array_mut().unwrap().push(serde_json::json!([
+            Hasher::finish(&hasher),
+            "build_script_build",
+            false,
+            native_hash
+        ]));
+        unit.record(&serde_json::from_value(json).unwrap()).unwrap();
+        let dependencies = [Dependency {
+            package: "native-metadata".to_owned(),
+            links: "native-probe".to_owned(),
+            out_dir: native.clone(),
+            parents: vec![parent.clone()],
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        changed(&native);
+        let rerun = current(&parent, &cargo).unwrap();
+        assert_eq!(std::fs::read_to_string(parent.join("observed")).unwrap(), "unset|new|old");
+        assert_ne!(rerun, built);
+        assert_eq!(current(&parent, &cargo), Ok(rerun));
+        let env = |name: &str| match name {
+            "DEP_NATIVE_PROBE_VAL" => Some("ambient".to_owned()),
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &env, ..cargo };
+        changed(&native);
+        let rerun = current(&parent, &cargo).unwrap();
+        assert_eq!(std::fs::read_to_string(parent.join("observed")).unwrap(), "ambient|new|old");
+        assert_eq!(current(&parent, &cargo), Ok(rerun));
+        for out_dir in [&native, &parent] {
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
     }
 
     #[test]
