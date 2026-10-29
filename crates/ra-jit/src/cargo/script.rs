@@ -354,14 +354,57 @@ pub(crate) fn judge_for(
     cargo: &Cargo<'_>,
     completed: &mut Vec<Completed>,
 ) -> Result<Run, JudgementError> {
-    // Run dependencies before taking the parent's lock: both usually share a build directory.
+    // Keep every run-unit input stable through the parent's judgment. Dependencies often
+    // share the parent's directory, so acquire each directory's Cargo locks only once.
+    let mut pending = vec![out_dir.to_owned()];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut units = std::collections::BTreeMap::new();
+    while let Some(out_dir) = pending.pop() {
+        if !seen.insert(out_dir.clone()) {
+            continue;
+        }
+        let unit = records::Unit::of(&out_dir)?;
+        let dir = std::fs::canonicalize(unit.lock_dir()).map_err(|it| it.to_string())?;
+        units.entry(dir).or_insert(unit);
+        pending.extend(
+            cargo
+                .dependencies
+                .iter()
+                .filter(|it| it.parents.contains(&out_dir))
+                .map(|it| it.out_dir.clone()),
+        );
+    }
+    let _held = units.values().map(records::Unit::hold).collect::<Result<Vec<_>, _>>()?;
+    judge_locked(out_dir, cargo, completed, &mut Vec::new())
+}
+
+fn judge_locked(
+    out_dir: &Path,
+    cargo: &Cargo<'_>,
+    completed: &mut Vec<Completed>,
+    parents: &mut Vec<PathBuf>,
+) -> Result<Run, JudgementError> {
+    if parents.iter().any(|it| it == out_dir) {
+        return Err("a cycle in cargo's run-unit dependencies".into());
+    }
+    parents.push(out_dir.to_owned());
+    let result = judge_locked_inner(out_dir, cargo, completed, parents);
+    parents.pop();
+    result
+}
+
+fn judge_locked_inner(
+    out_dir: &Path,
+    cargo: &Cargo<'_>,
+    completed: &mut Vec<Completed>,
+    parents: &mut Vec<PathBuf>,
+) -> Result<Run, JudgementError> {
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
     for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
         let context = Cargo { targets: &dep.targets, ..*cargo };
-        judge_for(&dep.out_dir, &context, completed)?;
+        judge_locked(&dep.out_dir, &context, completed, parents)?;
         let unit = records::Unit::of(&dep.out_dir)?;
-        let _held = unit.hold()?;
         let fingerprint = unit.recorded()?;
         let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
         let ran: Ran = std::fs::read(dep.out_dir.parent().ok_or("no run directory")?.join(RAN))
@@ -381,11 +424,9 @@ pub(crate) fn judge_for(
         }
         dependencies.push((dep.package.as_str(), fingerprint.hash_u64(), unit.output()));
     }
-    let unit = records::Unit::of(out_dir)?;
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
     // reading the invocation too, which cargo can replace with another environment.
-    let _held = unit.hold()?;
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
     let ran: Ran = std::fs::read(run_dir.join(RAN))
         .map_err(|it| format!("{RAN}: {it}"))
@@ -859,7 +900,7 @@ mod tests {
 
     #[test]
     fn a_native_dependency_rerun_invalidates_its_parent_even_with_identical_metadata() {
-        use std::hash::{Hash as _, Hasher as _};
+        use std::hash::{Hash as _, Hasher};
 
         let native = ran_script("native-edge", COUNTS, "");
         let parent = ran_script("parent-edge", COUNTS, "");

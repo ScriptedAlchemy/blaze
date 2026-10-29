@@ -70,6 +70,10 @@ impl Unit {
         self.run_dir.join("output")
     }
 
+    pub(crate) fn lock_dir(&self) -> &Path {
+        &self.dest
+    }
+
     /// The locks cargo 1.99 takes for a build in this build directory (`Layout::new`):
     /// `.cargo-build-lock` there, exclusively, and `.cargo-lock`, shared, which cargo takes in
     /// the directory of what it builds for an older cargo, and which is this one when the build
