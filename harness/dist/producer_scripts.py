@@ -31,6 +31,7 @@ renamed_build = { package = "build_helper", path = "../build-helper" }
     text = (root / "shared/Cargo.toml").read_text()
     (root / "shared/Cargo.toml").write_text(text.replace('edition = "2021"', 'edition = "2021"\nlinks = "host_bits"'))
     (root / "shared/build.rs").write_text('''fn main() {
+    assert!(cfg!(any(unix, windows)));
     assert_eq!(file!(), "shared/build.rs");
     let domain = if std::env::var_os("CARGO_FEATURE_HOST").is_some() {
         assert!(std::env::var_os("CARGO_FEATURE_TARGET").is_none());
@@ -49,6 +50,7 @@ edition = "2021"
 ''')
     (helper / "lib.rs").write_text('pub fn label() -> &' + "'static str { assert_eq!(file!(), \"build-helper/src/lib.rs\"); \"host-only\" }\n")
     (derive / "build.rs").write_text('''fn main() {
+    assert!(cfg!(any(unix, windows)));
     assert_eq!(file!(), "derive/build.rs");
     assert!(std::env::var_os("CARGO_FEATURE_SCRIPT_FEATURE").is_some());
     let label = renamed_build::label();

@@ -839,3 +839,54 @@ fn host_overflow_and_panic_flags_change_the_effective_script_profile() {
     assert!(!effective.overflow_checks);
     assert_eq!(effective.panic.name(), "unwind");
 }
+
+#[test]
+fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
+    let base = [
+        "unix",
+        "proc_macro",
+        "target_arch=\"x86_64\"",
+        "target_pointer_width=\"64\"",
+        "debug_assertions",
+        "overflow_checks",
+        "panic=\"unwind\"",
+    ]
+    .map(str::to_owned);
+    let flags = [
+        "-Cdebug-assertions=off",
+        "-Coverflow-checks=off",
+        "-Cpanic=abort",
+        "--cfg",
+        "custom_host",
+    ]
+    .map(str::to_owned);
+    let profile =
+        crate::plan::Profile::for_script(&blaze_manifest::profiles::Profile::default(), &flags)
+            .unwrap();
+    let cfg =
+        source_cfgs(&base, &["feature=\"selected\"".into()], &profile, &apply_flags(&flags).cfgs);
+    for fact in [
+        "unix",
+        "proc_macro",
+        "target_arch=\"x86_64\"",
+        "target_pointer_width=\"64\"",
+        "feature=\"selected\"",
+        "custom_host",
+        "panic=\"abort\"",
+    ] {
+        assert!(cfg.iter().any(|it| it == fact), "missing {fact}: {cfg:?}");
+    }
+    for absent in ["debug_assertions", "overflow_checks", "panic=\"unwind\""] {
+        assert!(!cfg.iter().any(|it| it == absent), "stale profile cfg {absent}: {cfg:?}");
+    }
+    let flags =
+        ["-Cdebug-assertions=on", "-Coverflow-checks=on", "-Cpanic=unwind"].map(str::to_owned);
+    let profile =
+        crate::plan::Profile::for_script(&blaze_manifest::profiles::Profile::default(), &flags)
+            .unwrap();
+    let cfg = source_cfgs(&["unix".into(), "panic=\"abort\"".into()], &[], &profile, &[]);
+    for fact in ["unix", "debug_assertions", "overflow_checks", "panic=\"unwind\""] {
+        assert!(cfg.iter().any(|it| it == fact));
+    }
+    assert!(!cfg.iter().any(|it| it == "panic=\"abort\""));
+}

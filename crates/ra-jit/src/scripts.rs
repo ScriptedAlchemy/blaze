@@ -1359,9 +1359,6 @@ impl<'a> Runner<'a> {
         ran: Option<&Done>,
     ) -> Result<crate::cargo::own_script::Planned, String> {
         let data = &self.cargo[package];
-        let mut cfg: Vec<String> =
-            data.active_features.iter().map(|it| format!("feature={it:?}")).collect();
-        cfg.sort();
         // Host flags follow the profile's arguments, just as they do on rustc's command
         // line. Overflow and panic settings must reach MIR/codegen, not only fingerprints.
         let applied = apply_flags(&self.host_flags);
@@ -1370,18 +1367,12 @@ impl<'a> Runner<'a> {
         }
         let effective = crate::plan::Profile::for_script(profile, &self.host_flags)
             .map_err(|error| format!("the profile of {name}: {error:#}"))?;
-        if effective.debug_assertions {
-            cfg.push("debug_assertions".to_owned());
-        }
-        if effective.overflow_checks {
-            cfg.push("overflow_checks".to_owned());
-        }
-        cfg.push(format!("panic={:?}", effective.panic.name()));
-        for extra in applied.cfgs {
-            if !cfg.contains(&extra) {
-                cfg.push(extra);
-            }
-        }
+        let host_cfgs = self.host_cfgs.as_deref().ok_or_else(|| {
+            format!("blaze has no built-in cfg answer for build-script host `{}`", self.asked.host)
+        })?;
+        let features =
+            data.active_features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
+        let mut cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
         let package_dir: &Path = data.manifest.parent().as_ref();
         let manifest: &Path = data.manifest.as_ref();
         let version = &data.version;
@@ -1434,6 +1425,34 @@ impl<'a> Runner<'a> {
             proc_macro: None,
         })
     }
+}
+
+fn source_cfgs(
+    host: &[String],
+    features: &[String],
+    profile: &crate::plan::Profile,
+    user: &[String],
+) -> Vec<String> {
+    let mut cfg: Vec<_> = host
+        .iter()
+        .filter(|cfg| {
+            let key = cfg.split_once('=').map_or(cfg.as_str(), |(key, _)| key).trim();
+            !matches!(key, "debug_assertions" | "overflow_checks" | "panic")
+        })
+        .cloned()
+        .collect();
+    cfg.extend_from_slice(features);
+    if profile.debug_assertions {
+        cfg.push("debug_assertions".into());
+    }
+    if profile.overflow_checks {
+        cfg.push("overflow_checks".into());
+    }
+    cfg.push(format!("panic={:?}", profile.panic.name()));
+    cfg.extend_from_slice(user);
+    cfg.sort();
+    cfg.dedup();
+    cfg
 }
 
 /// What the flags for rustc a crate is compiled with say that blaze's compile applies.
