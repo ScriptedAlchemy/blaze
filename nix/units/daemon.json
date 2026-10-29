@@ -1,7 +1,7 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "48b4991667b47d8fbaae2dfc2cf24b2029129843c8278b83340486f3190cd7bf",
+  "Cargo.lock": "f26c69771593c805a4518a3ef8d46d575ce0a735cf7d33eed19a175ce4a93007",
   "Cargo.toml": "623314cd86027a8e88dc726a1e614a2b9beebc4f140e516a679a4d385d8391e7"
  },
  "packages": {
@@ -17047,6 +17047,10 @@
       {
        "i": 371,
        "name": "salsa"
+      },
+      {
+       "i": 396,
+       "name": "sha2"
       },
       {
        "i": 407,
@@ -36474,6 +36478,10 @@
       {
        "i": 374,
        "name": "salsa"
+      },
+      {
+       "i": 397,
+       "name": "sha2"
       },
       {
        "i": 408,
@@ -56107,6 +56115,10 @@
        "name": "salsa"
       },
       {
+       "i": 397,
+       "name": "sha2"
+      },
+      {
        "i": 408,
        "name": "smallvec"
       },
@@ -75559,6 +75571,10 @@
       {
        "i": 375,
        "name": "salsa"
+      },
+      {
+       "i": 398,
+       "name": "sha2"
       },
       {
        "i": 409,
