@@ -1533,24 +1533,25 @@ fn guards(
     guards
 }
 
-/// Cargo's run-unit edges, not just changes to the metadata delivered over those edges.
+/// Cargo's run-unit edges, not just changes to the metadata delivered over those edges. The
+/// metadata the daemon reads is `--no-deps`, with no resolved graph, so an edge is a member's
+/// declared normal dependency on a member with `links`.
 fn script_dependencies(metadata: &Metadata, scripts: &[BuildScript]) -> Vec<script::Dependency> {
-    let Some(resolve) = &metadata.resolve else { return Vec::new() };
     scripts
         .iter()
         .filter_map(|run| {
             let package = metadata.packages.iter().find(|it| it.id == run.package_id)?;
             let links = package.links.clone()?;
-            let parents = resolve
-                .nodes
+            let parents = metadata
+                .packages
                 .iter()
-                .filter(|node| {
-                    node.deps.iter().any(|dep| {
-                        dep.pkg == package.id
-                            && dep.dep_kinds.iter().any(|kind| kind.kind == DependencyKind::Normal)
-                    })
+                .filter(|parent| {
+                    parent
+                        .dependencies
+                        .iter()
+                        .any(|dep| dep.kind == DependencyKind::Normal && *dep.name == *package.name)
                 })
-                .flat_map(|node| scripts.iter().filter(move |it| it.package_id == node.id))
+                .flat_map(|parent| scripts.iter().filter(move |it| it.package_id == parent.id))
                 .map(|it| it.out_dir.clone().into_std_path_buf())
                 .collect();
             Some(script::Dependency {
@@ -1659,6 +1660,48 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's metadata is `--no-deps`, with no resolved graph: the run-unit edge from a
+    /// package to the member with `links` it depends on is read from the declared dependencies.
+    #[test]
+    fn a_links_dependency_edge_is_found_without_a_resolved_graph() {
+        let package = |name: &str, links: Option<&str>, depends_on: &[&str]| {
+            serde_json::json!({
+                "name": name, "version": "0.1.0", "id": format!("path+file:///w/{name}#0.1.0"),
+                "license": null, "license_file": null, "description": null, "source": null,
+                "dependencies": depends_on.iter().map(|it| serde_json::json!({
+                    "name": it, "source": null, "req": "*", "kind": null, "rename": null,
+                    "optional": false, "uses_default_features": true, "features": [],
+                    "target": null, "registry": null, "path": format!("/w/{it}"),
+                })).collect::<Vec<_>>(),
+                "targets": [], "features": {}, "manifest_path": format!("/w/{name}/Cargo.toml"),
+                "metadata": null, "publish": null, "authors": [], "categories": [],
+                "keywords": [], "readme": null, "repository": null, "homepage": null,
+                "documentation": null, "edition": "2021", "links": links, "default_run": null,
+                "rust_version": null,
+            })
+        };
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [package("parent", None, &["native"]), package("native", Some("probe"), &[])],
+            "workspace_members": ["path+file:///w/parent#0.1.0", "path+file:///w/native#0.1.0"],
+            "workspace_default_members": ["path+file:///w/parent#0.1.0"],
+            "resolve": null, "target_directory": "/w/target", "build_directory": "/w/target",
+            "version": 1, "workspace_root": "/w", "metadata": null,
+        }))
+        .unwrap();
+        let run = |name: &str| -> BuildScript {
+            serde_json::from_value(serde_json::json!({
+                "linked_libs": [], "linked_paths": [], "cfgs": [], "env": [],
+                "out_dir": format!("/w/target/debug/build/{name}-0/out"),
+                "package_id": format!("path+file:///w/{name}#0.1.0"),
+            }))
+            .unwrap()
+        };
+        let edges = script_dependencies(&metadata, &[run("parent"), run("native")]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!((edges[0].package.as_str(), edges[0].links.as_str()), ("native", "probe"));
+        assert_eq!(edges[0].parents, [PathBuf::from("/w/target/debug/build/parent-0/out")]);
+    }
 
     #[test]
     fn a_program_is_run_with_the_libraries_cargo_runs_it_with() {
