@@ -151,3 +151,30 @@ fn source_acceptance_defers_unused_inline_constant_evaluation() {
     );
     assert_eq!(result, Default::default());
 }
+
+#[test]
+fn source_acceptance_checks_discarded_unresolved_expression_paths() {
+    for fixture in [
+        "mod known {} fn caller() { let _ = known::missing::VALUE; }\n",
+        "fn caller() { let _ = missing; }\n",
+        r#"
+//- /main.rs crate:main deps:library
+pub fn caller() { let _ = library::missing::VALUE; }
+//- /lib.rs crate:library
+pub const VALUE: u8 = 1;
+"#,
+    ] {
+        let result = checked(fixture);
+        assert!(
+            result.errors.iter().any(|error| error.contains("unresolved expression")),
+            "{result:?}"
+        );
+    }
+    for fixture in [
+        "mod known { pub const VALUE: u8 = 1; } fn caller() { let _ = known::VALUE; }\n",
+        "trait HasValue { const VALUE: u8; } fn caller<T: HasValue>() { let _ = T::VALUE; }\n",
+        "fn caller(value: u8) { let _ = value; }\n",
+    ] {
+        assert_eq!(checked(fixture), Default::default());
+    }
+}

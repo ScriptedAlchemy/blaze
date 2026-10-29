@@ -10,7 +10,7 @@ use hir_def::{
     src::HasSource as _,
 };
 use hir_expand::name::AsName as _;
-use hir_ide::{InferenceResult, db::signature_anon_consts_and_diagnostics};
+use hir_ide::{InferenceDiagnostic, InferenceResult, db::signature_anon_consts_and_diagnostics};
 use rustc_hash::FxHashSet;
 use salsa::SalsaValue;
 use syntax::{AstNode as _, ast};
@@ -86,7 +86,13 @@ impl<'db> Check<'db> {
                 if ty.contains_unknown() {
                     self.result.errors.push(format!("unresolved type `{node}`"));
                 }
-                self.ty(&ty);
+                if !node
+                    .syntax()
+                    .parent()
+                    .is_some_and(|parent| ast::TypeBound::can_cast(parent.kind()))
+                {
+                    self.ty(&ty);
+                }
             } else {
                 self.result.unsupported.push(format!("cannot validate type `{node}`"));
             }
@@ -134,6 +140,13 @@ impl<'db> Check<'db> {
                 for part in path.syntax().descendants().filter_map(ast::Path::cast) {
                     if let Some(def) = self.resolve_reference(&part) {
                         self.reference(def, module, source.file_id.is_macro());
+                    } else if part.qualifier().is_some_and(|qualifier| {
+                        matches!(
+                            self.sema.resolve_path(&qualifier),
+                            Some(PathResolution::Def(ModuleDef::Module(_)))
+                        )
+                    }) {
+                        self.result.errors.push(format!("unresolved expression path `{part}`"));
                     }
                 }
             }
@@ -191,6 +204,11 @@ impl<'db> Check<'db> {
                 let inferred = InferenceResult::of(db, def);
                 if inferred.has_type_mismatches() || inferred.is_erroneous() {
                     self.result.errors.push("type inference failed".into());
+                }
+                if inferred.diagnostics().iter().any(|diagnostic| {
+                    matches!(diagnostic, InferenceDiagnostic::UnresolvedIdent { .. })
+                }) {
+                    self.result.errors.push("unresolved expression identifier".into());
                 }
                 for (_, ty) in inferred.expression_types() {
                     self.ty(&Type::new_body(db, owner, ty));
