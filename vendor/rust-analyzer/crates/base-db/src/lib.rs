@@ -474,6 +474,13 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// complete read set is known. The bytes remain tracked salsa inputs.
     fn depend_on_included_inputs(&self, _krate: Crate) {}
 
+    /// Tracked bytes of observed external inputs. Historical observations remain
+    /// available for conservative code identities; current required inputs are
+    /// separately accumulated by semantic owner discovery.
+    fn included_inputs(&self, _krate: Crate) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        Vec::new()
+    }
+
     /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing
     /// for: a file that is not source by its extension, or one outside its package, which the
     /// VFS does not load until it is asked to.

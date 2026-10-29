@@ -13,6 +13,7 @@ mod apply_change;
 
 pub mod active_parameter;
 pub mod assists;
+pub mod code_identity;
 pub mod defs;
 pub mod documentation;
 pub mod famous_defs;
@@ -248,6 +249,13 @@ impl SourceDatabase for RootDatabase {
             _ = self.files.included_by(self, dependency);
         }
         _ = self.files.included_by(self, krate);
+    }
+
+    fn included_inputs(
+        &self,
+        krate: base_db::Crate,
+    ) -> Vec<(base_db::AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        self.files.included_by(self, krate)
     }
 
     fn env_is_unset(&self, krate: base_db::Crate, key: &str) {

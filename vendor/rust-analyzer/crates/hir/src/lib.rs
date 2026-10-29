@@ -31,6 +31,7 @@ mod source_analyzer;
 
 pub mod db;
 pub mod diagnostics;
+pub mod input_owners;
 pub mod symbols;
 pub mod term_search;
 

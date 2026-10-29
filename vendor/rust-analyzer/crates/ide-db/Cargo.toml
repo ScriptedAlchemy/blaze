@@ -28,6 +28,7 @@ triomphe.workspace = true
 nohash-hasher.workspace = true
 bitflags.workspace = true
 smallvec.workspace = true
+sha2 = "0.10"
 
 # local deps
 base-db.workspace = true

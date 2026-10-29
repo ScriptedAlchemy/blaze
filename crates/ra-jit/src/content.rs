@@ -7,6 +7,9 @@ use std::{
 };
 
 use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved, stored_as};
+#[cfg(test)]
+use ide_db::code_identity::hash_source_files;
+use ide_db::code_identity::macro_producer_identity;
 use ide_db::{
     RootDatabase,
     base_db::{Crate, SourceDatabase as _},
@@ -23,9 +26,6 @@ type Hash = [u8; 32];
 pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     source_hashes: Mutex<FxHashMap<Crate, Hash>>,
-    /// Direct discovery/hash work is done once per crate, even when many roots
-    /// share its dependency closure. No mutex is held while salsa lowers bodies.
-    direct_hashes: Mutex<FxHashMap<Crate, std::sync::Arc<OnceLock<Hash>>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -40,20 +40,9 @@ impl Contents {
         {
             return *hash;
         }
-        let hash = library_source_hash(self, db, krate);
+        let hash = ide_db::code_identity::source_hash(db, krate);
         self.source_hashes.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, hash);
         hash
-    }
-
-    fn direct_source_hash(&self, db: &RootDatabase, krate: Crate) -> Hash {
-        let slot = self
-            .direct_hashes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(krate)
-            .or_default()
-            .clone();
-        *slot.get_or_init(|| library_own_source_hash(db, krate))
     }
 
     /// `None` for a crate that depends on one `stable_crate_id` has nothing for and that is
@@ -358,104 +347,6 @@ fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
     }
 }
 
-/// Source replacements are mutable even when cargo calls their origin "registry".
-/// Cover the loaded source root, including included binary/text files. Relative names
-/// preserve portability; source bytes ensure equal vendor locations do not alias edits.
-/// Hashing the whole source root is conservative when it contains multiple packages.
-fn library_source_hash(contents: &Contents, db: &RootDatabase, krate: Crate) -> Hash {
-    fn closure(
-        contents: &Contents,
-        db: &RootDatabase,
-        krate: Crate,
-        seen: &mut FxHashSet<Crate>,
-    ) -> Hash {
-        if !seen.insert(krate) {
-            return Sha256::digest(b"already hashed library dependency").into();
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(contents.direct_source_hash(db, krate));
-        hasher.update(macro_producer_identity(db, krate));
-        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
-        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        for dep in dependencies {
-            hasher.update((dep.name.as_str().len() as u64).to_le_bytes());
-            hasher.update(dep.name.as_str().as_bytes());
-            hasher.update(closure(contents, db, dep.crate_id, seen));
-        }
-        hasher.finalize().into()
-    }
-    closure(contents, db, krate, &mut FxHashSet::default())
-}
-
-fn macro_producer_identity(db: &RootDatabase, krate: Crate) -> Hash {
-    let mut hash = Sha256::new();
-    hash.update(b"ra-jit loaded macro producer 1");
-    if let Some(macros) = hir::ProcMacros::get_for_crate(db, krate)
-        && let Some(macros) = macros.macros()
-    {
-        let mut identities: Vec<_> = macros
-            .iter()
-            .map(|item| (item.name.as_str(), item.expander.content_identity()))
-            .collect();
-        identities.sort_unstable();
-        for (name, identity) in identities {
-            hash.update((name.len() as u64).to_le_bytes());
-            hash.update(name.as_bytes());
-            hash.update([u8::from(identity.is_some())]);
-            if let Some(identity) = identity {
-                hash.update(identity);
-            }
-        }
-    }
-    hash.finalize().into()
-}
-
-fn library_own_source_hash(db: &RootDatabase, krate: Crate) -> Hash {
-    // Body lowering expands include_bytes!/include_str! and populates included_by.
-    // Discover those inputs before the compilation-scoped identity is memoized.
-    _ = crate::declared_in(db, krate.into());
-    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
-    let sources = db.source_root(root).source_root(db);
-    let mut files: Vec<_> = sources
-        .iter()
-        .filter_map(|file| {
-            let path = sources.path_for_file(&file)?.as_path()?.to_string();
-            Some((path, file))
-        })
-        .collect();
-    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let mut hashed: Vec<_> = files
-        .iter()
-        .map(|(path, file)| (path.clone(), file_hash(db, *file, Path::new(path))))
-        .collect();
-    hashed.extend(db.included_by(krate).into_iter().map(|(path, bytes)| {
-        let mut hash = Sha256::new();
-        // Missing input differs from an existing empty file.
-        hash.update([u8::from(bytes.is_some())]);
-        hash.update(bytes.as_deref().unwrap_or_default());
-        (path.as_str().to_owned(), hash.finalize().into())
-    }));
-    hashed.sort_unstable();
-    hash_source_files(&hashed)
-}
-
-fn hash_source_files(files: &[(String, Hash)]) -> Hash {
-    let common = files.first().map(|(path, _)| Path::new(path).parent().unwrap());
-    let common = common.and_then(|first| {
-        first.ancestors().find(|dir| files.iter().all(|(path, _)| Path::new(path).starts_with(dir)))
-    });
-    let mut hasher = Sha256::new();
-    hasher.update(b"ra-jit library sources 1");
-    for (path, hash) in files {
-        let relative = common.and_then(|dir| Path::new(path).strip_prefix(dir).ok());
-        let name = relative.unwrap_or(Path::new(path)).to_string_lossy();
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update(hash);
-    }
-    hasher.finalize().into()
-}
-
 /// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry
 /// are in its `registry/src`, those of git in its `git/checkouts`.
 fn cargo_home_of(path: &Path) -> Option<&Path> {
@@ -491,7 +382,7 @@ impl FileHashes {
         {
             return *hash;
         }
-        let hash: Hash = Sha256::digest(text.as_bytes()).into();
+        let hash = ide_db::code_identity::file_hash(db, file);
         hashes.files.insert(file, (text.clone(), hash));
         hash
     }
@@ -593,15 +484,8 @@ mod tests {
                 let dep_hash = contents.source_hash(&db, dep);
                 assert_eq!(db.included_by(dep)[0].1.as_deref(), Some(&[byte][..]));
                 let app_hash = caller_hash.unwrap_or_else(|| contents.source_hash(&db, app));
-                assert_eq!(contents.direct_hashes.lock().unwrap().len(), 2);
-                assert!(
-                    contents
-                        .direct_hashes
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .all(|slot| slot.get().is_some())
-                );
+                assert_eq!(dep_hash, ide_db::code_identity::source_hash(&db, dep));
+                assert_eq!(app_hash, ide_db::code_identity::source_hash(&db, app));
                 (dep_hash, app_hash)
             });
             let path = paths::AbsPathBuf::assert_utf8(payload.clone());

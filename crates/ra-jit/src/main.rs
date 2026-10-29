@@ -4106,33 +4106,7 @@ impl Listed {
     }
 }
 
-#[salsa::tracked]
-fn discover_current_inputs(db: &dyn HirDatabase, krate: ide_db::base_db::Crate) {
-    let mut declared = Declared::default();
-    declared.in_modules(db, krate.into());
-    while !declared.bodies.is_empty() || !declared.provided.is_empty() {
-        let bodies = std::mem::take(&mut declared.bodies);
-        let provided = std::mem::take(&mut declared.provided);
-        for body in bodies.into_iter().chain(provided) {
-            for (_, map) in Body::of(db, body).blocks(db) {
-                for (_, module) in map.modules(db) {
-                    declared.in_scope(db, module.scope(db));
-                }
-            }
-        }
-    }
-}
-
-fn current_input_paths(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<AbsPathBuf> {
-    let mut paths: Vec<_> =
-        discover_current_inputs::accumulated::<ide_db::base_db::CurrentIncludedInput>(db, krate)
-            .into_iter()
-            .map(|input| input.path.clone())
-            .collect();
-    paths.sort();
-    paths.dedup();
-    paths
-}
+use hir::input_owners::{current_input_paths, discover_current_inputs};
 
 /// The common path reads tracked observations only. Current-owner discovery is
 /// needed to disambiguate live from obsolete reads only when something is missing.
