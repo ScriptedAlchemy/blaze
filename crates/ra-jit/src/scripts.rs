@@ -590,6 +590,8 @@ struct Runner<'a> {
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
     images: FxHashMap<Package, PathBuf>,
+    /// The leases on images of a request that names no build, which it holds while it runs.
+    image_leases: Vec<std::fs::File>,
     making_images: Vec<Package>,
 }
 
@@ -671,6 +673,7 @@ impl<'a> Runner<'a> {
             judged: Vec::new(),
             making: Vec::new(),
             images: FxHashMap::default(),
+            image_leases: Vec::new(),
             making_images: Vec::new(),
         })
     }
@@ -1270,8 +1273,13 @@ impl<'a> Runner<'a> {
         })();
         self.making_images.pop();
         let image = result?;
-        self.images.insert(package, image.clone());
-        Ok(image)
+        // The image is loaded after this pass, by the build that asked for it.
+        match self.asked.build {
+            0 => self.image_leases.extend(image.leases),
+            build => self.leases.keep_images(build, image.leases),
+        }
+        self.images.insert(package, image.library.clone());
+        Ok(image.library)
     }
 
     fn add(

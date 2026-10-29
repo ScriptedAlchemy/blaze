@@ -440,6 +440,14 @@ impl Image {
     }
 }
 
+/// The record of an image that links nothing native, for tests of the image store.
+#[cfg(test)]
+pub(crate) fn write_empty_image(path: &Path) -> anyhow::Result<()> {
+    let inputs = Inputs::default();
+    let before = inputs.digest()?;
+    Image { inputs, before }.write(path)
+}
+
 pub(crate) fn image_still(path: &Path) -> bool {
     let image = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Image>(&bytes).ok());
     image.is_some_and(|it| it.inputs.digest().ok() == Some(it.before))

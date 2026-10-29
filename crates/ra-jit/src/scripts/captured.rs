@@ -54,6 +54,8 @@ pub(crate) struct Prepared {
     pub(crate) generated_inputs: BTreeSet<PathBuf>,
     pub(crate) native_records: BTreeSet<PathBuf>,
     pub(crate) opaque_native: bool,
+    /// The leases on the macro images the prepared units load.
+    images: Vec<File>,
     _lease: File,
     _lock: File,
 }
@@ -386,6 +388,7 @@ pub(crate) fn run_with_context(
         generated_inputs: BTreeSet::new(),
         native_records: BTreeSet::new(),
         opaque_native: false,
+        images: Vec::new(),
         _lease: lease,
         _lock: lock,
     };
@@ -427,6 +430,8 @@ pub(crate) fn run_with_context(
                         == before,
                     "captured macro source changed during compilation"
                 );
+                prepared.images.extend(image.leases);
+                let image = image.library;
                 let dir = image.parent().context("macro image directory")?;
                 prepared.observe(
                     read_inputs(&dir.join("producer.inputs"))?,

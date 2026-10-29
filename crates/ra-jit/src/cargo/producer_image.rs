@@ -1,5 +1,10 @@
 //! Immutable owned producer images. Publication follows stable before/after source
 //! snapshots; loaded macro clients lease the generation through proc-macro-api.
+//!
+//! `<dir>/images/<recipe>/<image>/build-N`: a recipe is what was compiled and how (the
+//! description, the environment, the standard library's source and the compiler), an image
+//! one compilation of it, reused while the files it read are unchanged. Both are producer
+//! generations: a recipe or image no one leases is collected when another is made.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -61,6 +66,7 @@ impl Snapshot {
         )
     }
 
+    #[cfg(test)]
     fn same_content(&self, other: &Self) -> bool {
         self.files == other.files && self.bindings == other.bindings
     }
@@ -75,11 +81,47 @@ pub(crate) fn runtime_paths(sysroot: &Path) -> Result<BTreeSet<PathBuf>> {
 
 #[derive(Serialize, Deserialize)]
 struct Record {
-    files: Snapshot,
+    /// The files the compilation read, by the path it read each through.
+    #[serde(with = "native_paths")]
+    inputs: BTreeMap<PathBuf, Read>,
+    /// The entries of each directory it read a file in, which decide what a module is.
+    #[serde(with = "native_paths")]
+    directories: Files,
     #[serde(with = "native_paths")]
     outputs: Files,
     #[serde(with = "native_path")]
     library: PathBuf,
+}
+
+/// A file a compilation read: the file its path was then, and its content.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Read {
+    #[serde(with = "native_path")]
+    file: PathBuf,
+    digest: [u8; 32],
+}
+
+impl Record {
+    /// Whether the image in `generation` still is what compiling the source in `before` makes.
+    fn still(&self, generation: &Path, before: &Snapshot) -> bool {
+        self.library.starts_with(generation)
+            && self.outputs.contains_key(&self.library)
+            && self.outputs.len() == 4
+            && self.outputs.keys().all(|it| it.starts_with(generation))
+            && unchanged(&self.outputs)
+            && self.inputs.iter().all(|(route, read)| {
+                std::fs::canonicalize(route).is_ok_and(|it| it == read.file)
+                    && before.files.get(&read.file) == Some(&read.digest)
+            })
+            && self.directories.iter().all(|(dir, was)| entries(dir).ok().as_ref() == Some(was))
+    }
+}
+
+/// An admitted image, and the leases that keep it from collection while they are held:
+/// for as long as the build that asked for it may load it.
+pub(crate) struct Image {
+    pub(crate) library: PathBuf,
+    pub(crate) leases: Vec<File>,
 }
 
 mod native_path {
@@ -233,6 +275,52 @@ fn unchanged(files: &Files) -> bool {
     files.iter().all(|(path, was)| digest(path).ok().as_ref() == Some(was))
 }
 
+/// The names in `dir`, in order: a file that comes or goes there can change which file a
+/// module is, without changing any file the compilation read.
+fn entries(dir: &Path) -> Result<[u8; 32]> {
+    let mut names = std::fs::read_dir(dir)?
+        .map(|it| it.map(|it| crate::process::os_bytes(&it.file_name())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    let mut hash = Sha256::new();
+    for name in names {
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name);
+    }
+    Ok(hash.finalize().into())
+}
+
+/// What is compiled and how, but not the content of the crates' own source, which the
+/// record of each image of it checks: the description, the environment, and the standard
+/// library's source and the compiler, which no record lists.
+fn recipe(
+    sysroot: &Path,
+    description: &str,
+    env: &[(OsString, OsString)],
+    before: &Snapshot,
+) -> Result<String> {
+    let context = serde_json::to_vec(&(
+        image_description(description)?,
+        crate::process::Native::of(env.iter().cloned()),
+    ))?;
+    let library = std::fs::canonicalize(sysroot.join("lib/rustlib/src/rust/library"))?;
+    let compiler = std::fs::canonicalize(std::env::current_exe()?)?;
+    anyhow::ensure!(before.files.contains_key(&compiler), "the producer snapshot has no compiler");
+    let mut hash = Sha256::new();
+    hash.update(b"blaze owned producer image 4\0");
+    hash.update((context.len() as u64).to_le_bytes());
+    hash.update(context);
+    for (path, digest) in &before.files {
+        if path.starts_with(&library) || *path == compiler {
+            let path = crate::process::os_bytes(path.as_os_str());
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(digest);
+        }
+    }
+    Ok(hash.finalize().iter().map(|it| format!("{it:02x}")).collect())
+}
+
 // The random trace key protects one invocation's private input report. It is
 // transport entropy, not a source, native environment or codegen input.
 fn image_description(description: &str) -> Result<String> {
@@ -244,31 +332,66 @@ fn image_description(description: &str) -> Result<String> {
     Ok(serde_json::to_string(&project)?)
 }
 
-/// No rebuild of an admitted immutable image. A missing/corrupt completed generation
-/// fails rather than replacing bytes a live proc-macro client may still have mapped.
+/// No rebuild of an admitted immutable image. A missing/corrupt completed image is not
+/// reused, and a new one is made beside it rather than over bytes a live proc-macro client
+/// may still have mapped.
 pub(crate) fn link(
     sysroot: &Path,
     crates: Vec<Planned>,
     dir: &Path,
     env: &[(OsString, OsString)],
     mode: own_script::SourceMode<'_>,
-) -> Result<PathBuf> {
+) -> Result<Image> {
     let description = own_script::planned_macro_description(sysroot, crates.clone())
         .map_err(anyhow::Error::msg)?;
     let description = own_script::with_mode(description, mode).map_err(anyhow::Error::msg)?;
     let before = snapshot(sysroot, &crates)?;
-    let context = serde_json::to_vec(&(
-        image_description(&description)?,
-        crate::process::Native::of(env.iter().cloned()),
-    ))?;
-    let mut hash = Sha256::new();
-    hash.update(b"blaze owned producer image 3\0");
-    hash.update((context.len() as u64).to_le_bytes());
-    hash.update(context);
-    hash.update(serde_json::to_vec(&before)?);
-    let key = hash.finalize().iter().map(|it| format!("{it:02x}")).collect::<String>();
-    let root = dir.join("images");
-    std::fs::create_dir_all(&root)?;
+    let key = recipe(sysroot, &description, env, &before)?;
+    stored(&dir.join("images"), &key, &before, |attempt| {
+        let library = own_script::link_macro_planned(sysroot, crates.clone(), attempt, env, mode)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            snapshot(sysroot, &crates)? == before,
+            "producer source changed during owned compilation; image not admitted"
+        );
+        let bytes = std::fs::read(attempt.join("producer.inputs"))?;
+        let read = match mode {
+            own_script::SourceMode::Legacy | own_script::SourceMode::Cargo { .. } => {
+                crate::dep_info::DepInfo::parse(std::str::from_utf8(&bytes)?).files
+            }
+            own_script::SourceMode::Captured { .. } => {
+                crate::dep_info::ReplayTrace::decode(&bytes)?.files
+            }
+        };
+        Ok(Built { library, read, dep_info: attempt.join(format!("{}.d", crates[0].name)) })
+    })
+    .and_then(|(image, reused)| {
+        anyhow::ensure!(
+            !reused || snapshot(sysroot, &crates)? == before,
+            "producer source changed while reusing its image"
+        );
+        Ok(image)
+    })
+}
+
+/// What a compilation in an attempt directory made, and the files it says it read.
+struct Built {
+    library: PathBuf,
+    read: Vec<String>,
+    dep_info: PathBuf,
+}
+
+/// The image of `recipe` under `root` for the source in `before`: one whose record says it
+/// still is, or the one `build` makes in a new attempt directory, recorded when what it read
+/// is known, and whether it was one made before. Recipes and images no one leases are
+/// collected.
+fn stored(
+    root: &Path,
+    recipe: &str,
+    before: &Snapshot,
+    build: impl FnOnce(&Path) -> Result<Built>,
+) -> Result<(Image, bool)> {
+    std::fs::create_dir_all(root)?;
     // Separate from generation/GC locks: one writer per image store, held in this command.
     let lock = File::options()
         .read(true)
@@ -277,86 +400,93 @@ pub(crate) fn link(
         .truncate(false)
         .open(root.join(".build"))?;
     lock.lock()?;
-    let generation = root.join(key);
-    let _lease = load_cargo::proc_macro_producer_lifetime::lease(&generation)?;
-    let record = generation.join("complete.json");
-    if record.exists() {
-        let kept: Record = serde_json::from_slice(&std::fs::read(&record)?)?;
-        anyhow::ensure!(
-            kept.files.same_content(&before)
-                && kept.library.starts_with(&generation)
-                && kept.outputs.contains_key(&kept.library)
-                && kept.outputs.len() == 4
-                && kept.outputs.keys().all(|it| it.starts_with(&generation))
-                && unchanged(&kept.outputs),
-            "completed owned producer image is corrupt; no leased image was replaced"
-        );
-        if crate::native_inputs::image_still(
-            &kept.library.parent().context("image directory")?.join("producer.native.json"),
-        ) {
-            anyhow::ensure!(
-                snapshot(sysroot, &crates)? == before,
-                "producer source changed while reusing its image"
-            );
-            return Ok(kept.library);
+    let lifetime = |path: &Path| load_cargo::proc_macro_producer_lifetime::lease(path);
+    let recipe = root.join(recipe);
+    let mut leases = vec![lifetime(&recipe)?];
+    // Another compiler, environment or description: no build that could load one leases it.
+    load_cargo::proc_macro_producer_lifetime::collect(root, &recipe)?;
+    let mut images = std::fs::read_dir(&recipe)?
+        .map(|it| it.map(|it| it.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    images.retain(|it| it.join("complete.json").is_file());
+    images.sort();
+    for image in images {
+        // Collection or invalidation may have taken it since it was listed.
+        let Ok(lease) = lifetime(&image) else { continue };
+        let Ok(kept) = std::fs::read(image.join("complete.json"))
+            .map_err(anyhow::Error::from)
+            .and_then(|it| Ok(serde_json::from_slice::<Record>(&it)?))
+        else {
+            continue;
+        };
+        let native = kept.library.parent().map(|it| it.join("producer.native.json"));
+        if kept.still(&image, before)
+            && native.is_some_and(|it| crate::native_inputs::image_still(&it))
+        {
+            load_cargo::proc_macro_producer_lifetime::collect(&recipe, &image)?;
+            leases.push(lease);
+            return Ok((Image { library: kept.library, leases }, true));
         }
     }
+    let generation = (0u64..)
+        .map(|it| recipe.join(it.to_string()))
+        .find(|it| !it.exists())
+        .context("no producer image directory")?;
+    leases.push(lifetime(&generation)?);
+    // Images of source that is no more, which no build leases.
+    load_cargo::proc_macro_producer_lifetime::collect(&recipe, &generation)?;
     // Uncacheable includes and crashes get another attempt directory. Never compile
     // over bytes a reader could still have loaded from an earlier attempt.
     let attempt = (0u64..)
         .map(|it| generation.join(format!("build-{it}")))
         .find(|it| !it.exists())
         .context("no producer attempt directory")?;
-    let library = match own_script::link_macro_planned(sysroot, crates.clone(), &attempt, env, mode)
-    {
-        Ok(library) => library,
+    let Built { library, read: files, dep_info } = match build(&attempt) {
+        Ok(built) => built,
         Err(error) => {
             load_cargo::proc_macro_producer_lifetime::invalidate(&generation)?;
-            return Err(anyhow::Error::msg(error));
+            return Err(error);
         }
     };
-    let after = snapshot(sysroot, &crates)?;
-    if after != before {
-        load_cargo::proc_macro_producer_lifetime::invalidate(&generation)?;
-        anyhow::bail!("producer source changed during owned compilation; image not admitted");
-    }
-    let inputs = attempt.join("producer.inputs");
-    let bytes = std::fs::read(&inputs)?;
-    let files = match mode {
-        own_script::SourceMode::Legacy | own_script::SourceMode::Cargo { .. } => {
-            crate::dep_info::DepInfo::parse(std::str::from_utf8(&bytes)?).files
-        }
-        own_script::SourceMode::Captured { .. } => {
-            crate::dep_info::ReplayTrace::decode(&bytes)?.files
-        }
-    };
+    let image = Image { library: library.clone(), leases };
     let project: serde_json::Value =
         serde_json::from_slice(&std::fs::read(attempt.join("rust-project.json"))?)?;
     // Unknown external include inputs were not read before compilation. Build succeeds,
     // but do not certify an image for reuse from a post-build-only observation.
-    if files.iter().any(|it| {
-        crate::compiler_json::physical_path(&project, &attempt.join(it))
-            .and_then(|path| Ok(std::fs::canonicalize(path)?))
+    let mut read = BTreeMap::new();
+    for file in &files {
+        let Ok(route) = crate::compiler_json::physical_path(&project, &attempt.join(file)) else {
+            return Ok((image, false));
+        };
+        let Some((file, digest)) = std::fs::canonicalize(&route)
             .ok()
-            .is_none_or(|path| !before.files.contains_key(&path))
-    }) {
-        return Ok(library);
+            .and_then(|file| before.files.get(&file).map(|digest| (file, *digest)))
+        else {
+            return Ok((image, false));
+        };
+        read.insert(route, Read { file, digest });
     }
     let native = attempt.join("producer.native.json");
     if !crate::native_inputs::image_still(&native) {
-        return Ok(library);
+        return Ok((image, false));
     }
-    let dep_info = attempt.join(format!("{}.d", crates[0].name));
-    let outputs = [library.clone(), inputs, dep_info, native]
+    let directories = read
+        .keys()
+        .filter_map(|route| route.parent())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|dir| Ok((dir.to_owned(), entries(dir)?)))
+        .collect::<Result<Files>>()?;
+    let outputs = [library.clone(), attempt.join("producer.inputs"), dep_info, native]
         .into_iter()
         .map(|path| Ok((path.clone(), digest(&path)?)))
         .collect::<Result<Files>>()?;
-    let kept = Record { files: before, outputs, library: library.clone() };
+    let kept = Record { inputs: read, directories, outputs, library };
     let pending = generation.join("complete.pending");
     std::fs::write(&pending, serde_json::to_vec(&kept)?)?;
     File::open(&pending)?.sync_all()?;
-    std::fs::rename(pending, record)?;
-    Ok(library)
+    std::fs::rename(pending, generation.join("complete.json"))?;
+    Ok((image, false))
 }
 
 #[cfg(test)]
@@ -428,20 +558,19 @@ mod tests {
         let source = raw(b"/source-\xff/main.rs");
         let alias = raw(b"/alias-\xfe/main.rs");
         let image = raw(b"/generation-\xfd/macro.so");
-        let before = Snapshot {
-            files: BTreeMap::from([(source.clone(), [7; 32])]),
-            bindings: BTreeMap::from([(alias.clone(), source.clone())]),
-            ..Snapshot::default()
-        };
         let record = Record {
-            files: before,
+            inputs: BTreeMap::from([(
+                alias.clone(),
+                Read { file: source.clone(), digest: [7; 32] },
+            )]),
+            directories: BTreeMap::from([(raw(b"/alias-\xfe"), [9; 32])]),
             outputs: BTreeMap::from([(image.clone(), [8; 32])]),
             library: image.clone(),
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         let decoded: Record = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded.files.files, record.files.files);
-        assert_eq!(decoded.files.bindings, record.files.bindings);
+        assert_eq!(decoded.inputs, record.inputs);
+        assert_eq!(decoded.directories, record.directories);
         assert_eq!(decoded.outputs, record.outputs);
         assert_eq!(decoded.library, image);
         let alternate = Record { library: raw(b"/generation-\xfc/macro.so"), ..decoded };
@@ -522,6 +651,88 @@ mod tests {
         assert!(before.same_content(&after));
         assert_eq!(serde_json::to_vec(&before).unwrap(), serde_json::to_vec(&after).unwrap());
         assert_ne!(before, after, "A-to-B-to-A writes must invalidate an in-flight build");
+    }
+
+    /// A fake compilation of `source`'s `lib.rs` into `attempt`, as the owned one leaves it.
+    fn built(source: &Path, attempt: &Path, made: &std::cell::Cell<u32>) -> Result<Built> {
+        made.set(made.get() + 1);
+        std::fs::create_dir_all(attempt)?;
+        let library = attempt.join("libmacro.dylib");
+        std::fs::write(&library, std::fs::read(source.join("lib.rs"))?)?;
+        let lib = source.join("lib.rs");
+        std::fs::write(attempt.join("producer.inputs"), format!("out: {}\n", lib.display()))?;
+        std::fs::write(attempt.join("macro.d"), b"out:\n")?;
+        std::fs::write(attempt.join("rust-project.json"), b"{}")?;
+        crate::native_inputs::write_empty_image(&attempt.join("producer.native.json"))?;
+        Ok(Built {
+            library,
+            read: vec![lib.display().to_string()],
+            dep_info: attempt.join("macro.d"),
+        })
+    }
+
+    fn images(recipe: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(recipe)
+            .unwrap()
+            .map(|it| it.unwrap().path())
+            .filter(|it| it.is_dir() && it.join("complete.json").is_file())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// An image is the source it read: a file it did not read keeps it, a file it read makes
+    /// a new one, and an image or recipe no build leases is collected when another is made.
+    #[test]
+    fn images_follow_what_they_read_and_unleased_ones_are_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::fs::canonicalize(dir.path()).unwrap().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("lib.rs"), b"ONE").unwrap();
+        std::fs::write(source.join("README.md"), b"read me").unwrap();
+        let root = dir.path().join("images");
+        let made = std::cell::Cell::new(0);
+        let capture = || {
+            let mut snapshot = Snapshot::default();
+            walk(&source, &mut snapshot, &mut BTreeSet::new()).unwrap();
+            snapshot
+        };
+        let link = |recipe: &str| {
+            stored(&root, recipe, &capture(), |attempt| built(&source, attempt, &made)).unwrap().0
+        };
+        let first = link("r");
+        assert_eq!(std::fs::read(&first.library).unwrap(), b"ONE");
+        drop(first.leases);
+        std::fs::write(source.join("README.md"), b"changed, but never read").unwrap();
+        let again = link("r");
+        assert_eq!((made.get(), &again.library), (1, &first.library), "an unread file is no input");
+        drop(again.leases);
+
+        std::fs::write(source.join("lib.rs"), b"TWO").unwrap();
+        let second = link("r");
+        assert_eq!(made.get(), 2);
+        assert_eq!(std::fs::read(&second.library).unwrap(), b"TWO");
+        assert!(!first.library.exists(), "an unleased image of old source is collected");
+        assert_eq!(images(&root.join("r")).len(), 1);
+
+        // A leased image stays while another is made and collected beside it.
+        std::fs::write(source.join("lib.rs"), b"THREE").unwrap();
+        let third = link("r");
+        assert!(second.library.exists(), "a leased image is never collected");
+        drop(second.leases);
+        std::fs::write(source.join("new.rs"), b"").unwrap();
+        let fourth = link("r");
+        assert_eq!(made.get(), 4, "a file that comes beside a read one may be a module");
+        assert!(third.library.exists());
+        drop(third.leases);
+        assert_eq!(images(&root.join("r")).len(), 2);
+
+        // Another recipe: the earlier one goes when no build leases it.
+        drop(fourth.leases);
+        let other = link("s");
+        assert!(!root.join("r").exists(), "an unleased recipe is collected");
+        assert_eq!(images(&root.join("s")).len(), 1);
+        drop(other);
     }
 
     #[test]
