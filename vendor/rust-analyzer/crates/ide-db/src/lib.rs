@@ -234,7 +234,7 @@ impl SourceDatabase for RootDatabase {
         let root = self.source_root(root).source_root(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
-        let path = anchor.parent()?.absolutize(path.path);
+        let path = paths::native::absolutize(anchor.parent()?, path.path)?;
         Some(self.files.included_file(self, krate, &path, durability))
     }
 
@@ -267,8 +267,9 @@ impl SourceDatabase for RootDatabase {
         let root = self.source_root(root_id).source_root(self);
         if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
             && let Some(parent) = anchor.parent()
+            && let Some(path) = paths::native::absolutize(parent, path.path)
         {
-            self.files.include_source(&parent.absolutize(path.path), root_id);
+            self.files.include_source(&path, root_id);
         }
     }
 

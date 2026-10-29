@@ -217,7 +217,12 @@ fn compile_in(
         build(&described, dir, made, super::daemon::store(), true, None)?;
         if let Some(key) = key {
             let inputs = crates.iter().filter_map(|it| it.inputs.as_ref());
-            super::own_macro::keep(&key, made, inputs.map(|(info, cwd)| (&**info, &**cwd)));
+            super::own_macro::keep(
+                &key,
+                made,
+                &dir.join("rust-project.json"),
+                inputs.map(|(info, cwd)| (&**info, &**cwd)),
+            );
         }
     }
     let read = std::fs::read_to_string(&made.dep_info).map_err(|it| it.to_string())?;
@@ -416,21 +421,29 @@ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> Strin
 #[derive(Clone, Copy)]
 pub(crate) enum SourceMode<'a> {
     Legacy,
-    Captured(Option<&'a Value>),
-    CapturedNative {
+    Captured {
         profile: Option<&'a Value>,
-        units: &'a BTreeMap<u32, blaze_wire::native::Unit>,
+        units: Option<&'a BTreeMap<u32, blaze_wire::native::Unit>>,
+        runtime: Option<&'a Value>,
+        bindings: Option<&'a Value>,
     },
 }
 
 pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<String, String> {
-    let (profile, native) = match mode {
+    let (profile, native, runtime, bindings) = match mode {
         SourceMode::Legacy => return Ok(described),
-        SourceMode::Captured(profile) => (profile, None),
-        SourceMode::CapturedNative { profile, units } => (profile, Some(units)),
+        SourceMode::Captured { profile, units, runtime, bindings } => {
+            (profile, units, runtime, bindings)
+        }
     };
     let mut project: Value = serde_json::from_str(&described).map_err(|it| it.to_string())?;
     project["compiler_mode"] = Value::Bool(true);
+    if let Some(runtime) = runtime {
+        project["blaze_owned_proc_macro_server"] = runtime.clone();
+    }
+    if let Some(bindings) = bindings {
+        project[blaze_wire::native::BINDINGS_FIELD] = bindings.clone();
+    }
     if let Some(profile) = profile {
         project["blaze_spec_profile"] = profile.clone();
     }
@@ -462,6 +475,7 @@ pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<Strin
     if let Some(native) = native {
         project[blaze_wire::native::UNIT_FIELD] = json!(blaze_wire::native::encode_units(native));
     }
+    crate::dep_info::ensure_replay_key(&mut project).map_err(|error| error.to_string())?;
     serde_json::to_string(&project).map_err(|it| it.to_string())
 }
 
@@ -687,7 +701,12 @@ mod tests {
         ]);
         let described = with_mode(
             project.to_string(),
-            SourceMode::CapturedNative { profile: None, units: &native },
+            SourceMode::Captured {
+                profile: None,
+                units: Some(&native),
+                runtime: None,
+                bindings: None,
+            },
         )
         .unwrap();
         let private: Value = serde_json::from_str(&described).unwrap();
@@ -739,18 +758,33 @@ mod tests {
         let plain = planned_description(Path::new("/sysroot"), crates.clone());
         assert_eq!(with_mode(plain.clone(), SourceMode::Legacy).unwrap(), plain);
         let profile = json!({"version": 1, "profile": [1, 2], "rustflags": []});
-        let captured: Value =
-            serde_json::from_str(&with_mode(plain, SourceMode::Captured(Some(&profile))).unwrap())
-                .unwrap();
+        let captured: Value = serde_json::from_str(
+            &with_mode(
+                plain,
+                SourceMode::Captured {
+                    profile: Some(&profile),
+                    units: None,
+                    runtime: None,
+                    bindings: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(captured["compiler_mode"], true);
         assert_eq!(captured["blaze_spec_profile"], profile);
         assert_eq!(captured["crates"][0]["build"]["target_kind"], "bin");
         assert_eq!(captured["crates"][1]["build"]["target_kind"], "lib");
         assert_eq!(captured["crates"][0]["cfg"], json!(["captured_feature"]));
         let macro_graph = planned_macro_description(Path::new("/sysroot"), crates).unwrap();
-        let captured: Value =
-            serde_json::from_str(&with_mode(macro_graph, SourceMode::Captured(None)).unwrap())
-                .unwrap();
+        let captured: Value = serde_json::from_str(
+            &with_mode(
+                macro_graph,
+                SourceMode::Captured { profile: None, units: None, runtime: None, bindings: None },
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(captured["crates"][0]["build"]["target_kind"], "lib");
         assert_eq!(captured["crates"][0]["is_proc_macro"], true);
     }

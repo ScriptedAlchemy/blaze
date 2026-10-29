@@ -60,7 +60,7 @@ mod tests {
             let krate = graph.add_crate_root(
                 vfs::FileId::from_raw(1),
                 syntax::Edition::Edition2021,
-                None,
+                Some(base_db::CrateDisplayName::from_canonical_name("shared")),
                 None,
                 Default::default(),
                 None,
@@ -84,6 +84,37 @@ mod tests {
             asked.iter().map(|id| mapped[id]).collect::<std::collections::HashSet<_>>().len(),
             3
         );
+        let root = std::env::current_dir().unwrap();
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(
+            vfs::FileId::from_raw(1),
+            vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(root.join("same-source.rs"))),
+        );
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(vec![base_db::SourceRoot::new_local(files)]);
+        change.change_file(vfs::FileId::from_raw(1), Some("pub fn value() -> u8 { 1 }".into()));
+        db.apply_change(change);
+        let linkage = |db: &RootDatabase| {
+            let table = crate::symbols::SymbolTable::default();
+            let known = hir_ty_codegen::Rejections::default();
+            let listed = crate::Listed::default();
+            let contents = crate::content::Contents::default();
+            let mut args = crate::Args::parse(
+                [root.to_str().unwrap(), "--crate", "shared", "--out", "app.o"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .unwrap();
+            args.checkout = root.clone();
+            let resolver = crate::Resolver::of(db, &table, &args, &known, &contents, &listed);
+            asked.iter().map(|id| resolver.own_crate_id(mapped[id]).unwrap()).collect::<Vec<_>>()
+        };
+        let before = linkage(&db);
+        assert_eq!(before.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.change_file(vfs::FileId::from_raw(1), Some("pub fn value() -> u8 { 2 }".into()));
+        db.apply_change(change);
+        assert_eq!(linkage(&db), before, "source edits keep each instance's linkage stable");
         set_native_units(
             (0..3)
                 .map(|id| {

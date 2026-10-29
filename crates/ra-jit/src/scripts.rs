@@ -1193,8 +1193,13 @@ impl<'a> Runner<'a> {
         let made = std::fs::metadata(exe).and_then(|it| it.modified()).ok()?;
         let began = std::fs::metadata(inputs).and_then(|it| it.modified()).ok()?;
         let read = crate::dep_info::DepInfo::parse(&std::fs::read_to_string(inputs).ok()?);
+        let project: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(inputs.parent()?.join("rust-project.json")).ok()?,
+        )
+        .ok()?;
         for file in &read.files {
-            let written = std::fs::metadata(file).and_then(|it| it.modified()).ok()?;
+            let file = crate::compiler_json::physical_path(&project, Path::new(file)).ok()?;
+            let written = std::fs::metadata(&file).and_then(|it| it.modified()).ok()?;
             if written > began {
                 return None;
             }

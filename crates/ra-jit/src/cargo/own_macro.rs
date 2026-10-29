@@ -251,6 +251,7 @@ pub(crate) fn restored(key: &[u8; 32], made: &Made<'_>) -> bool {
 pub(crate) fn keep<'a>(
     key: &[u8; 32],
     made: &Made<'_>,
+    project: &Path,
     inputs: impl Iterator<Item = (&'a Path, &'a Path)>,
 ) {
     let Some(store) = store() else { return };
@@ -258,21 +259,39 @@ pub(crate) fn keep<'a>(
     else {
         return;
     };
+    let Ok(project) = std::fs::read(project).and_then(|bytes| {
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+    }) else {
+        return;
+    };
     let mut files = BTreeMap::new();
-    let read = |files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, info: &[u8], from: &Path| {
+    let read = |files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+                info: &[u8],
+                from: &Path,
+                project: Option<&serde_json::Value>| {
         let info = crate::dep_info::DepInfo::parse(&String::from_utf8_lossy(info));
         for file in info.files {
             let path = from.join(&file);
+            let path = match project {
+                Some(project) => match crate::compiler_json::physical_path(project, &path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        files.insert(path, None);
+                        continue;
+                    }
+                },
+                None => path,
+            };
             let digest = std::fs::read(&path).ok().map(|it| Sha256::digest(it).to_vec());
             files.insert(path, digest);
         }
     };
     let parent = made.dep_info.parent().unwrap_or(Path::new(""));
-    read(&mut files, &dep_info, parent);
+    read(&mut files, &dep_info, parent, Some(&project));
     for (info, from) in inputs {
         let Ok(bytes) = std::fs::read(info) else { return };
         files.insert(info.to_owned(), Some(Sha256::digest(&bytes).to_vec()));
-        read(&mut files, &bytes, from);
+        read(&mut files, &bytes, from, None);
     }
     let Some(files) = files.into_iter().map(|(path, it)| Some((path, it?))).collect() else {
         return;

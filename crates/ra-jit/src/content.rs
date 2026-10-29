@@ -160,7 +160,7 @@ impl Contents {
             } else {
                 continue;
             };
-            let hash = file_hash(db, file, path);
+            let hash = file_hash(db, file, path)?;
             files.push((by, relative.to_string_lossy().into_owned(), hash));
         }
         files.sort_unstable();
@@ -322,28 +322,33 @@ impl Contents {
 
 /// What a build script wrote to `out` that the source root of `krate` holds: the path of each
 /// file below `out` and the hash of what is in it, in the order of their paths.
-pub(crate) fn written_to(db: &RootDatabase, krate: Crate, out: &str) -> Vec<(String, Hash)> {
+pub(crate) fn written_to(
+    db: &RootDatabase,
+    krate: Crate,
+    out: &str,
+) -> Option<Vec<(String, Hash)>> {
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     let root = db.source_root(root).source_root(db);
-    let mut files: Vec<(String, Hash)> = root
-        .iter()
-        .filter_map(|file| {
-            let path = root.path_for_file(&file)?.as_path()?.to_string();
-            let relative = Path::new(&path).strip_prefix(out).ok()?;
-            Some((relative.to_string_lossy().into_owned(), file_hash(db, file, Path::new(&path))))
-        })
-        .collect();
+    let mut files = Vec::new();
+    for file in root.iter() {
+        let Some(path) = root.path_for_file(&file).and_then(|it| it.as_path()) else {
+            continue;
+        };
+        let path = Path::new(path.as_str());
+        let Ok(relative) = path.strip_prefix(out) else { continue };
+        files.push((relative.to_string_lossy().into_owned(), file_hash(db, file, path)?));
+    }
     files.sort_unstable();
-    files
+    Some(files)
 }
 
-/// The hash of the file `file` at `path`. One that is not UTF-8 has no text: it is hashed as
-/// it is on disk, where an `include_bytes!` reads it from.
-fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
+/// The hash of the file `file` at `path`. Native non-text inputs are read from
+/// the active filesystem view. A read error supplies no reusable identity.
+fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Option<Hash> {
     if db.has_file_text(file) {
-        FileHashes::of(db, file)
+        Some(FileHashes::of(db, file))
     } else {
-        Sha256::digest(std::fs::read(path).unwrap_or_default()).into()
+        Some(Sha256::digest(std::fs::read(db.on_disk(path)).ok()?).into())
     }
 }
 
@@ -396,6 +401,34 @@ impl FileHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_file_identity_reads_the_active_filesystem_view() {
+        let work = tempfile::tempdir().unwrap();
+        let base = work.path().join("base");
+        let active = work.path().join("active");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&active).unwrap();
+        let name = "payload.bin";
+        let stale = [0xfe, 0, 3];
+        let current = [0xff, 0, 7];
+        std::fs::write(base.join(name), stale).unwrap();
+        std::fs::write(active.join(name), current).unwrap();
+        let db = RootDatabase::default();
+        let file = vfs::FileId::from_raw(1);
+        assert!(!db.has_file_text(file));
+        db.set_view(&base, &active, Vec::new());
+        let path = base.join(name);
+        assert_eq!(std::fs::read(db.on_disk(&path)).unwrap(), current);
+        assert_eq!(file_hash(&db, file, &path), Some(<Hash>::from(Sha256::digest(current))));
+        assert_ne!(file_hash(&db, file, &path), Some(<Hash>::from(Sha256::digest(stale))));
+        std::fs::remove_file(active.join(name)).unwrap();
+        assert_eq!(
+            file_hash(&db, file, &path),
+            None,
+            "missing active bytes are not empty or stale bytes"
+        );
+    }
 
     #[test]
     fn an_out_of_vfs_payload_invalidates_its_library_and_dependent_caller() {

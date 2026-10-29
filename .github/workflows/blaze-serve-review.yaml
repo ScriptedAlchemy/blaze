@@ -22,6 +22,9 @@ on:
       - vendor/rust-analyzer/crates/hir-def/**
       - vendor/rust-analyzer/crates/hir-ty/**
       - vendor/rust-analyzer/crates/hir-ty-borrowck/**
+      - vendor/rust-analyzer/crates/paths/**
+      - vendor/rust-analyzer/crates/vfs/**
+      - vendor/rust-analyzer/crates/vfs-notify/**
       - vendor/rust-analyzer/crates/ide-db/**
       - vendor/rust-analyzer/crates/ide-diagnostics/**
       - vendor/rust-analyzer/crates/load-cargo/**
@@ -93,7 +96,8 @@ jobs:
           cargo test --locked -p proc-macro-api --features span/salsa --lib -- generation_tests producer_lifetime --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
           cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit -- compiler_json:: cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit -- compiler_json:: dep_info:: native_inputs::units::tests cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
+          cargo test --locked -p paths --lib native:: -- --test-threads=2
           cargo test --locked -p project-model --lib compiler_project -- --test-threads=2
           cargo test --locked -p hir-def --lib -- non_unicode_process_environment unicode_crate_environment --test-threads=2
           cargo test --locked -p blaze-wire native::tests -- --test-threads=2

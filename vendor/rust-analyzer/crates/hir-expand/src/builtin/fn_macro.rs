@@ -964,7 +964,8 @@ fn included_bytes<'db>(
     // outside VFS. Accumulate before reading so missing inputs are live too.
     let root = db.file_source_root(anchor).source_root_id(db);
     let sources = db.source_root(root).source_root(db);
-    let absolute = sources.path_for_file(&anchor)?.as_path()?.parent()?.absolutize(path.path);
+    let absolute =
+        paths::native::absolutize(sources.path_for_file(&anchor)?.as_path()?.parent()?, path.path)?;
     base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
     file.bytes(db).as_deref()
 }

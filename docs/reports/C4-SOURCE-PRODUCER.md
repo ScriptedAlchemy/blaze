@@ -75,10 +75,30 @@ Captured descriptions use compiler mode, explicit per-unit cfgs and target
 kinds. Native environments and flags retain OS bytes and per-description unit
 IDs, including distinct instances sharing a source file. The private transport
 goes over stdin; the public description redacts environment values. Producer
-image records also retain native source/output/alias path bytes. These data and
-consumer tests do not establish raw-filename source topology: the shared
-renderer currently aliases a raw filename without its sibling directory.
-Actual native-source runtime acceptance remains separate.
+image records also retain native source/output/alias path bytes. The shared
+renderer now uses a reversible logical path namespace, with native reads at the
+VFS boundary. The Linux regression loads a raw filename below nested raw
+ancestors, its sibling module and an include three ancestors away through the
+real project loader. Ordinary UTF-8 projects need no projection. Windows native
+source projection remains unvalidated.
+
+Captured producer inputs use versioned CBOR instead of Cargo's text dep-info,
+which cannot represent every legal filename. Source-observed environment values
+are HMAC identities under a fresh stdin-only key; public descriptions and input
+traces contain neither those values nor that key. Transport entropy is excluded
+from producer-image identity while source, environment, flags, runtime and
+binding inputs remain significant. Legacy Cargo dep-info is unchanged.
+
+The retained-daemon payload and nonfunction witnesses exposed stale execution
+at cfb74568: changed library source renamed native definitions while callers
+still referenced the old definitions. Commit 64a4bad3 keeps native linkage stable
+across source changes, with current bytes retained in content identity. Both
+16-row witnesses then passed. These are two checkout paths on one Linux host,
+not a physical multi-host result. Captured instances additionally need distinct
+native namespaces when their source and library name coincide; the independent
+Cargo reduction accepts two packages sharing that source. Non-text file hashes
+also read the active filesystem view; an unreadable input yields no reusable
+content or frozen-map identity instead of certifying empty bytes.
 
 ## Separate compiler witnesses
 

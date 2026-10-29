@@ -622,14 +622,14 @@ fn source_path(
 ) -> Option<String> {
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);
-    let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-    let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
+    let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
+    let path = paths::native::resolve(Path::new(&logical)).ok()?;
+    let base = base.and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
-    let relative = (!source_root.is_library)
-        .then(|| Path::new(&path).strip_prefix(root).ok().or(base))
-        .flatten();
-    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    let relative =
+        (!source_root.is_library).then(|| path.strip_prefix(root).ok().or(base)).flatten();
+    Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
 impl<'a> Resolver<'a> {
@@ -989,7 +989,13 @@ impl Resolver<'_> {
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
         let place = crate_place(&root, self.inside(&root), home.as_deref(), &self.root);
-        let named = format!("ra-jit crate {} {place}", name.crate_name());
+        let mut named = format!("ra-jit crate {} {place}", name.crate_name());
+        if let Some(unit) = krate.extra_data(self.db).blaze_native_unit {
+            // Captured compiler instances can share source and library name while
+            // carrying different cfg, environment or native options. Their stable
+            // graph IDs distinguish linkage without renaming it on a source edit.
+            named.push_str(&format!(" compiler unit {unit}"));
+        }
         Some(short_hash(&named))
     }
 
@@ -4961,55 +4967,33 @@ fn write_dep_info_of(
     db: &RootDatabase,
     krates: &[Crate],
     asked: &str,
-    vfs: &vfs::Vfs,
+    _vfs: &vfs::Vfs,
     exe: &Path,
     path: &Path,
     private: bool,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    for &krate in krates {
-        let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
-        files.extend(modules.map(|it| it.original_file(db).file_id(db)));
-        let included = hir_def::include_macro_invoc(db, krate.into()).iter();
-        files.extend(included.map(|(_, file)| file.file_id(db)));
+    let dep_info::DepInfo { files: paths, env } =
+        dep_info::DepInfo::from_crates(db, krates, asked)?;
+    if private && let Some(key) = dep_info::installed_replay_key() {
+        let inputs = dep_info::DepInfo { files: paths, env };
+        let trace = dep_info::ReplayTrace::from_inputs(&inputs, key);
+        return std::fs::write(path, trace.encode())
+            .with_context(|| format!("writing {}", path.display()));
     }
-    let named = |id: &vfs::FileId| Some(vfs.file_path(*id).as_path()?.to_string());
-    let mut paths: Vec<String> = Vec::new();
-    // What `include_str!` and `include_bytes!` read from outside the VFS, as rustc names it.
-    let read = krates.iter().flat_map(|it| db.included_by((*it).into()));
-    let read: Vec<String> = read.map(|(path, _)| path.to_string()).collect();
-    for path in files.iter().filter_map(named).chain(read) {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
     let target = dep_info::escaped(&exe.display().to_string());
     let mut text = format!("{target}: {}\n\n", escaped.join(" "));
     for file in &escaped {
         text += &format!("{file}:\n");
     }
-    // Cargo reads ordinary dep-info literally. Private owned inputs use keyed
-    // identities; Cargo's file contains only values source actually read.
-    let mut env: Vec<(String, Option<String>)> = db
-        .env_read()
-        .into_iter()
-        .filter(|(krate, _)| krates.iter().any(|it| ide_db::base_db::Crate::from(*it) == *krate))
-        .map(|(krate, key)| {
-            let value = krate.env(db).get(&key);
-            let value = value.or_else(|| ide_db::base_db::process_env_var(db, &key));
-            (key, value)
-        })
-        .collect();
-    env.sort_unstable();
-    env.dedup();
+    // Ordinary Cargo dep-info carries source-observed values; private producer
+    // identities use keyed values below.
     if !env.is_empty() {
         text.push('\n');
     }
-    for (key, value) in env {
+    for (key, value) in &env {
         let key = dep_info::escaped_variable(&key);
-        let value = if private { env_identity::value(value.as_deref())? } else { value };
+        let value = if private { env_identity::value(value.as_deref())? } else { value.clone() };
         match value {
             Some(value) => {
                 text += &format!("# env-dep:{key}={}\n", dep_info::escaped_variable(&value))
@@ -9080,11 +9064,17 @@ fn run_holding(
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
-                if let Some(path) = &args.inputs {
-                    write_inputs(&db, &args, tree.vfs(), exe, path)?;
-                    if let Some(native) = image_native {
-                        native.write(&path.with_extension("native.json"))?;
-                    }
+            }
+            if let Some(path) = &args.inputs {
+                write_inputs(
+                    &db,
+                    &args,
+                    tree.vfs(),
+                    args.exe.as_deref().unwrap_or(&args.out),
+                    path,
+                )?;
+                if let Some(native) = image_native {
+                    native.write(&path.with_extension("native.json"))?;
                 }
             }
             // The first program is compiled and linked: a process no daemon's build started
@@ -9957,7 +9947,7 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db).added {
+            for (file, path) in tree.added(&mut db)?.added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,

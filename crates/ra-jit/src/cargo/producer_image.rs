@@ -233,6 +233,17 @@ fn unchanged(files: &Files) -> bool {
     files.iter().all(|(path, was)| digest(path).ok().as_ref() == Some(was))
 }
 
+// The random trace key protects one invocation's private input report. It is
+// transport entropy, not a source, native environment or codegen input.
+fn image_description(description: &str) -> Result<String> {
+    let mut project: serde_json::Value = serde_json::from_str(description)?;
+    project
+        .as_object_mut()
+        .context("invalid owned producer description")?
+        .remove(crate::dep_info::TRACE_KEY_FIELD);
+    Ok(serde_json::to_string(&project)?)
+}
+
 /// No rebuild of an admitted immutable image. A missing/corrupt completed generation
 /// fails rather than replacing bytes a live proc-macro client may still have mapped.
 pub(crate) fn link(
@@ -246,8 +257,10 @@ pub(crate) fn link(
         .map_err(anyhow::Error::msg)?;
     let description = own_script::with_mode(description, mode).map_err(anyhow::Error::msg)?;
     let before = snapshot(sysroot, &crates)?;
-    let context =
-        serde_json::to_vec(&(description, crate::process::Native::of(env.iter().cloned())))?;
+    let context = serde_json::to_vec(&(
+        image_description(&description)?,
+        crate::process::Native::of(env.iter().cloned()),
+    ))?;
     let mut hash = Sha256::new();
     hash.update(b"blaze owned producer image 3\0");
     hash.update((context.len() as u64).to_le_bytes());
@@ -308,11 +321,22 @@ pub(crate) fn link(
         anyhow::bail!("producer source changed during owned compilation; image not admitted");
     }
     let inputs = attempt.join("producer.inputs");
-    let read = crate::dep_info::DepInfo::parse(&std::fs::read_to_string(&inputs)?);
+    let bytes = std::fs::read(&inputs)?;
+    let files = match mode {
+        own_script::SourceMode::Legacy => {
+            crate::dep_info::DepInfo::parse(std::str::from_utf8(&bytes)?).files
+        }
+        own_script::SourceMode::Captured { .. } => {
+            crate::dep_info::ReplayTrace::decode(&bytes)?.files
+        }
+    };
+    let project: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attempt.join("rust-project.json"))?)?;
     // Unknown external include inputs were not read before compilation. Build succeeds,
     // but do not certify an image for reuse from a post-build-only observation.
-    if read.files.iter().any(|it| {
-        std::fs::canonicalize(attempt.join(it))
+    if files.iter().any(|it| {
+        crate::compiler_json::physical_path(&project, &attempt.join(it))
+            .and_then(|path| Ok(std::fs::canonicalize(path)?))
             .ok()
             .is_none_or(|path| !before.files.contains_key(&path))
     }) {
@@ -338,6 +362,30 @@ pub(crate) fn link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_entropy_does_not_change_producer_identity() {
+        let mode = own_script::SourceMode::Captured {
+            profile: None,
+            units: None,
+            runtime: None,
+            bindings: None,
+        };
+        let described = serde_json::json!({"crates": [{"env": {"INPUT": "one"}}]}).to_string();
+        let first = own_script::with_mode(described.clone(), mode).unwrap();
+        let second = own_script::with_mode(described, mode).unwrap();
+        assert_ne!(first, second, "each trace must have independent protection");
+        let identity = image_description(&first).unwrap();
+        assert_eq!(identity, image_description(&second).unwrap());
+        let mut changed: serde_json::Value = serde_json::from_str(&second).unwrap();
+        changed["crates"][0]["env"]["INPUT"] = serde_json::json!("two");
+        assert_ne!(identity, image_description(&changed.to_string()).unwrap());
+        changed[blaze_wire::native::UNIT_FIELD] = serde_json::json!([1, 2, 3]);
+        assert_ne!(
+            image_description(&second).unwrap(),
+            image_description(&changed.to_string()).unwrap()
+        );
+    }
 
     #[cfg(unix)]
     #[test]
