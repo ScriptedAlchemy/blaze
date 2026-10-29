@@ -150,9 +150,9 @@ struct Args {
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
-    /// Where to write, after `exe` is linked, the dep-info of every crate it links but the
-    /// standard library's: what blaze's runner of build scripts compiles a script again for
-    /// (`scripts.rs`), the script's own crate and its build dependencies alike.
+    /// Where to write, after `exe` is linked, the inputs of every crate it links but the
+    /// standard library's. Build scripts use Cargo dep-info; saved BuildSpec replay uses
+    /// a versioned CBOR trace so legal filenames cannot lose inputs at admission.
     inputs: Option<PathBuf>,
     /// The build is of the standard library alone ([`std_unit`]): a crate it names is the
     /// library's, not another of that name the program has too.
@@ -4746,7 +4746,7 @@ fn write_dep_info(
     path: &Path,
 ) -> anyhow::Result<()> {
     let krates = crates_named(db, &args.krate, args)?;
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, false)
 }
 
 /// Writes to `path` the dep-info of every crate `exe` links but those of the standard library:
@@ -4771,7 +4771,8 @@ fn write_inputs(
             krates.push(krate);
         }
     }
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    let replay = std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1");
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, replay)
 }
 
 /// The dep-info of `krates`, the files of their modules and what `include!` and its kin read,
@@ -4783,6 +4784,7 @@ fn write_dep_info_of(
     vfs: &vfs::Vfs,
     exe: &Path,
     path: &Path,
+    replay: bool,
 ) -> anyhow::Result<()> {
     let mut files = Vec::new();
     for &krate in krates {
@@ -4802,12 +4804,6 @@ fn write_dep_info_of(
         }
     }
     anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
-    let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
-    let target = dep_info::escaped(&exe.display().to_string());
-    let mut text = format!("{target}: {}\n\n", escaped.join(" "));
-    for file in &escaped {
-        text += &format!("{file}:\n");
-    }
     // The variables `env!` and `option_env!` read, with what each was, so that cargo builds
     // again when one changes.
     let mut env: Vec<(String, Option<String>)> = db
@@ -4822,6 +4818,17 @@ fn write_dep_info_of(
         .collect();
     env.sort_unstable();
     env.dedup();
+    if replay {
+        let trace = dep_info::DepInfo { files: paths, env };
+        return std::fs::write(path, trace.encode_replay())
+            .with_context(|| format!("writing {}", path.display()));
+    }
+    let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
+    let target = dep_info::escaped(&exe.display().to_string());
+    let mut text = format!("{target}: {}\n\n", escaped.join(" "));
+    for file in &escaped {
+        text += &format!("{file}:\n");
+    }
     if !env.is_empty() {
         text.push('\n');
     }
@@ -4833,16 +4840,6 @@ fn write_dep_info_of(
             }
             None => text += &format!("# env-dep:{key}\n"),
         }
-    }
-    if std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1") {
-        // Admission treats this trace as exhaustive. Cargo's line-oriented format
-        // cannot represent every Unix filename; refuse any loss instead of letting
-        // a newline, target delimiter, or trailing escape hide a source input.
-        let decoded = dep_info::DepInfo::parse(&text);
-        anyhow::ensure!(
-            decoded.files == paths && decoded.env == env,
-            "saved BuildSpec replay cannot represent its complete input trace in dep-info"
-        );
     }
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }

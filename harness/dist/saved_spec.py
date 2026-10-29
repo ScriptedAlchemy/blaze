@@ -204,8 +204,17 @@ def main():
             *selected, "--", "argument"], oracle_env, original, guarded=False)
         assert expected == "captured|config-value|argument\n", expected
         spec = bundle / "saved.cbor"
-        runner.run("save", [blaze, "cargo", "spec", "--out", spec, "run", *selected,
-                            "--", "argument"], env, original)
+        saved, _ = runner.run("save", [blaze, "cargo", "spec", "--out", spec, "run", *selected,
+                                       "--", "argument"], env, original)
+        source = original / "app/src/main.rs"
+        body = source.read_text()
+        source.write_text(body.replace("renamed::word()", '"edited body"'))
+        changed, _ = runner.run("dirty-body-save", [blaze, "cargo", "spec", "--out",
+            bundle / "dirty.cbor", "run", *selected, "--", "argument"], env, original)
+        before, after = json.loads(saved), json.loads(changed)
+        assert before["spec"]["2"] == after["spec"]["2"], (before, after)
+        assert before["digests"]["job_content"] != after["digests"]["job_content"], (before, after)
+        source.write_text(body)
         # Prove the request describes the captured content, rather than HEAD or the
         # mutable checkout: change it, then remove that entire original tree.
         write(original, "words/message.txt", "mutated after capture")
@@ -231,19 +240,34 @@ def main():
                    expected=None, contains="corrupt")
         assert list(Path(str(spec) + ".outputs").glob("replay-*/result.json")) == results
         source_blob.write_bytes(b"captured")
+        # Every one of these filenames is legal on Unix, but cannot round-trip
+        # through Cargo's line-oriented dep-info. Replay owns a CBOR input trace.
+        project = work / "escaped-inputs"
+        shutil.copytree(template, project)
+        names = ["line\nbreak.txt", "carriage\rreturn.txt", "trailing\\"]
+        for index, name in enumerate(names):
+            write(project, "app/" + name, str(index))
+        included = ",".join("include_str!(" + json.dumps("../" + name) + ")" for name in names)
+        write(project, "app/src/main.rs", 'fn main() { println!("{}|{}|{}", ' + included + '); }\n')
+        expected, _ = runner.run("escaped-inputs-reference", [real / "bin/cargo", "run",
+            "--locked", "--offline", *selected], oracle_env, project, guarded=False)
+        assert expected == "0|1|2\n", expected
+        escaped = bundle / "escaped.cbor"
+        runner.run("escaped-inputs-save", [blaze, "cargo", "spec", "--out", escaped,
+                   "run", *selected], env, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("escaped-inputs-replay", [blaze, "cargo", "spec", "--run", escaped],
+                               hostile_env, hostile)
+        assert actual == expected, (actual, expected)
         # Each negative owns a fresh bundle; failed compilation/admission may not
         # leave a result that a caller could treat as a completed executable.
-        for name in ("check", "external-include", "native-link", "unrepresentable-include"):
+        for name in ("check", "external-include", "native-link"):
             project = work / name
             shutil.copytree(template, project)
             if name == "external-include":
-                external = write(work, "uncaptured.txt", "outside source snapshot")
+                external = write(work, "uncaptured\nexternal.txt", "outside source snapshot")
                 write(project, "app/src/main.rs", 'fn main() { println!("{}", include_str!('
                       + json.dumps(str(external)) + ')); }\n')
-            elif name == "unrepresentable-include":
-                write(project, "app/line\nbreak.txt", "captured line-break input")
-                write(project, "app/src/main.rs", 'fn main() { println!("{}", include_str!('
-                      + json.dumps("../line\nbreak.txt") + ')); }\n')
             elif name == "native-link":
                 write(project, "app/src/main.rs", '''macro_rules! native {
     () => { #[link(name="m")] unsafe extern "C" { fn cos(x: f64) -> f64; } };
@@ -255,8 +279,7 @@ fn main() {}
             runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved,
                        "check" if name == "check" else "build", *selected], env, project)
             reason = {"check": "does not yet execute check units", "external-include": "outside the immutable source snapshot",
-                      "native-link": "native link inputs",
-                      "unrepresentable-include": "cannot represent its complete input trace"}[name]
+                      "native-link": "native link inputs"}[name]
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name

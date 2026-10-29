@@ -3039,9 +3039,11 @@ and has explicit paths for unit/integration test executables. It refuses standal
 check/doctest/benchmark work, build scripts, proc macros, unsupported output types and incompatible
 per-unit debug settings before starting compilation. Expanded application native link inputs are
 refused until their complete closure can be bound. The existing `ExecPlatform.native_root` is still
-a proxy for the language runtime's native inputs, not a complete SDK/library closure. Source dep-info
-is checked against the snapshot before an executable is advertised or run; an unrepresentable trace
-is refused. This is an admission check after compilation, not a filesystem sandbox.
+a proxy for the language runtime's native inputs, not a complete SDK/library closure. A version-1
+deterministic CBOR trace (`[version, files, [[name, value-or-null], ...]]`, with message-sized text
+budgets) preserves application input paths and environment reads, including filenames that Cargo's
+line-oriented dep-info cannot represent. Replay checks that trace against the snapshot before an
+executable is advertised or run. This is admission after compilation, not a filesystem sandbox.
 
 `harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
 compiler tools blocked, including removal of the original tree and hostile worker configuration.

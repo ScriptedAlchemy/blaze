@@ -437,8 +437,7 @@ fn compile(
     command.arg(&project).args(["--crate", &program.crate_name]);
     command.arg("--out").arg(dir.join("compiled.o"));
     command.arg("--exe").arg(&program.executable);
-    command.arg("--dep-info").arg(dir.join("root.d"));
-    command.arg("--inputs").arg(dir.join("inputs.d"));
+    command.arg("--inputs").arg(dir.join("inputs.cbor"));
     if program.harness {
         command.arg("--cfg-test");
     }
@@ -477,9 +476,9 @@ fn admit_inputs(
         _ => unreachable!("prepared replay has a snapshot"),
     };
     let dir = program.executable.parent().context("artifact has no directory")?;
-    let trace = std::fs::read_to_string(dir.join("inputs.d"))
+    let trace = std::fs::read(dir.join("inputs.cbor"))
         .context("owned compiler did not report its complete source inputs")?;
-    let inputs = crate::dep_info::DepInfo::parse(&trace);
+    let inputs = crate::dep_info::DepInfo::decode_replay(&trace)?;
     ensure!(!inputs.files.is_empty(), "owned compiler reported an empty source trace");
     for path in &inputs.files {
         let path = dir.join(path).canonicalize()?;

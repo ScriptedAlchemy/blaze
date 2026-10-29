@@ -44,13 +44,27 @@ Flag refusals print `refused.what` and `refused.why` and return status 2.
 The CLI reads blaze's own answer table and installed toolchain records for host facts.
 It does not execute rustc to discover them.
 
-**Incomplete:** `--run` validates reproduction candidates against the current checkout.
-It reports a mismatch with status 2. A matching spec currently fails with a message
-that the owned unit executor is not connected. It never dispatches to the existing
-cargo/rustc fallback. Connecting an executor for libraries, tests, build scripts, proc
-macros and doctests, and passing the real local-run harness, remain C2 acceptance work.
-Config values now preserve literal/workspace-relative tags in CBOR. Original
-CLI configuration/profile overrides still need complete reconstruction without guessing.
+`--out FILE` captures actual source bytes, including dirty and untracked inputs,
+selected dependency trees and structural configuration reads, in `FILE.inputs/`.
+The snapshot authenticates the source mapping; a separate CBOR recipe preserves
+the original invocation and configuration/profile overrides without changing build identity.
+Copy both `FILE` and `FILE.inputs/` to replay after deleting the original checkout.
+Replay materializes the snapshot, reproduces the request offline, compares the complete
+BuildSpec and verifies the execution platform before invoking the owned compiler.
+Config values preserve literal/workspace-relative tags through this process.
+
+The connected executor builds binaries/examples from source dependencies and supports
+unit/integration test executables. It retains successful artifacts and `result.json`
+under `FILE.outputs/`; failed compilation or input admission publishes no result.
+A version-1 CBOR input trace preserves filenames that Cargo dep-info cannot represent,
+and every traced application source read is checked against the snapshot before execution.
+This is admission after compilation, not a filesystem sandbox.
+
+**Incomplete:** check/doctest/benchmark units, standalone library artifacts, build scripts,
+proc macros, other output types and incompatible per-unit debug settings still need their
+owned execution paths. Application native linking is refused until the native input closure
+is bound. The platform's SDK/sysroot proxy is not complete native closure. Broader C2
+differential acceptance and LLVM/macOS execution remain separate from source replay.
 
 ## Tests
 
@@ -59,10 +73,15 @@ cargo +1.99.0 test -p blaze-wire -p blaze-spec -p blaze-metadata
 python3 -I harness/dist/buildspec.py --bin /path/to/ra-jit
 ```
 
-Run builds and the real harness through the project's heavy lock and shared target.
+Run heavy builds and harness sweeps on a claimed dev host with a lane-specific target.
 The harness has its own memory watchdog. `--no-local` is useful to isolate generation
 and unit-graph failures, but is not the acceptance gate.
 
 `blaze-metadata/tests/units` has recorded cargo oracle graphs for eight workspaces.
 Library tests do not invoke cargo or rustc. `units_expected` is the explicit oracle
 regenerator; its cargo calls are test tooling, not a product fallback.
+
+`harness/dist/saved_spec.py --blaze /path/to/ra-jit --work /fresh/lane/directory`
+compares saved execution with Cargo after origin deletion, with compiler subprocesses
+blocked. It also checks body-only identity changes, escaped input filenames and failed
+admission. This focused test does not replace the broader `buildspec.py` gate.

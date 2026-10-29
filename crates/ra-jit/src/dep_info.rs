@@ -20,6 +20,34 @@ pub(crate) struct DepInfo {
 }
 
 impl DepInfo {
+    /// Replay input trace version 1: `[version, files, [[name, value-or-null], ...]]`.
+    /// Unlike Cargo's dep-info, deterministic CBOR preserves newlines, carriage returns
+    /// and trailing backslashes in filenames. Free-form values use the message budget.
+    pub(crate) fn encode_replay(&self) -> Vec<u8> {
+        use blaze_wire::InputText;
+        let files: Vec<_> = self.files.iter().cloned().map(InputText).collect();
+        let env: Vec<_> = self
+            .env
+            .iter()
+            .map(|(name, value)| (InputText(name.clone()), value.clone().map(InputText)))
+            .collect();
+        blaze_wire::encode(&(1_u32, files, env))
+    }
+
+    pub(crate) fn decode_replay(bytes: &[u8]) -> anyhow::Result<Self> {
+        use blaze_wire::InputText;
+        let (version, files, env): (u32, Vec<InputText>, Vec<(InputText, Option<InputText>)>) =
+            blaze_wire::decode(bytes, &blaze_wire::Limits::DOCUMENTED)?;
+        anyhow::ensure!(version == 1, "unknown replay input trace version {version}");
+        Ok(Self {
+            files: files.into_iter().map(|file| file.0).collect(),
+            env: env
+                .into_iter()
+                .map(|(name, value)| (name.0, value.map(|value| value.0)))
+                .collect(),
+        })
+    }
+
     /// Reads the text of a dep-info file. What a file cut short has of its last path is not a
     /// path.
     pub(crate) fn parse(text: &str) -> DepInfo {
@@ -105,6 +133,26 @@ fn unescaped_variable(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_preserves_inputs_that_cargo_dep_info_cannot_represent() {
+        let trace = DepInfo {
+            files: vec![
+                "/source/line\nbreak.rs".into(),
+                "/source/carriage\rreturn".into(),
+                "/source/trailing\\".into(),
+                format!("/source/{}", "long/".repeat(1000)),
+            ],
+            env: vec![("VALUE".into(), Some("line\nbreak\\\r".into())), ("ABSENT".into(), None)],
+        };
+        let encoded = trace.encode_replay();
+        assert_eq!(DepInfo::decode_replay(&encoded).unwrap(), trace);
+        assert!(DepInfo::decode_replay(&encoded[..encoded.len() - 1]).is_err());
+        let mut newer = encoded;
+        newer[1] = 2;
+        assert!(DepInfo::decode_replay(&newer).unwrap_err().to_string().contains("version 2"));
+        assert!(DepInfo::decode_replay(b"target: /source/file.rs\n").is_err());
+    }
 
     #[test]
     fn spaces_are_escaped_and_nothing_else() {
