@@ -131,7 +131,7 @@ fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
         let cwd = std::env::current_dir()?;
         let key = asked.key(&cwd);
         eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
-        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default(), None)? {
+        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default(), None, &[])? {
             state.write()?;
         }
         anyhow::Ok(())
@@ -263,7 +263,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             say::cargo_builds(&reason, "building with cargo", say::EDIT);
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
-            match by_cargo(asked, &cwd, &key, counts, None)? {
+            match by_cargo(asked, &cwd, &key, counts, None, &state.completed)? {
                 Ok(state) => state,
                 Err(code) => return Ok(code),
             }
@@ -288,7 +288,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                     if let Some(why) = why {
                         say::cargo_builds(&why, "building with cargo", say::COLD);
                     }
-                    let state = match by_cargo(asked, &cwd, &key, Counts::default(), ahead)? {
+                    let state = match by_cargo(asked, &cwd, &key, Counts::default(), ahead, &[])? {
                         Ok(state) => state,
                         Err(code) => return Ok(code),
                     };
@@ -632,13 +632,14 @@ fn by_cargo(
     key: &str,
     counts: Counts,
     ahead: Option<daemon::Ahead>,
+    completed: &[script::Completed],
 ) -> anyhow::Result<Result<State, i32>> {
     State::give_back(key);
     if let Some(ahead) = &ahead {
         // Without an answer the daemon loads the workspace once cargo is done.
         let _ = client::ask(Request::Ahead(ahead.clone()), Start::IfMissing);
     }
-    let built = loaded_by_cargo(asked, cwd, key, counts, ahead.as_ref());
+    let built = loaded_by_cargo(asked, cwd, key, counts, ahead.as_ref(), completed);
     // The worker that loaded ahead is the one the build was given to, unless there is none.
     if let Some(ahead) = ahead {
         let _ = client::ask(Request::Forget(ahead.config.id()), Start::Never);
@@ -652,8 +653,9 @@ fn loaded_by_cargo(
     key: &str,
     counts: Counts,
     ahead: Option<&daemon::Ahead>,
+    completed: &[script::Completed],
 ) -> anyhow::Result<Result<State, i32>> {
-    let built = match Built::by_cargo(asked, ahead)? {
+    let built = match Built::by_cargo(asked, ahead, completed)? {
         Ok(built) => built,
         Err(code) => return Ok(Err(code)),
     };

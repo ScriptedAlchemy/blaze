@@ -34,6 +34,9 @@ use super::{
 /// The state of one build of a checkout: one command with one set of flags.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct State {
+    /// Executions of this request, not persisted freshness for another invocation.
+    #[serde(skip)]
+    pub(crate) completed: Vec<script::Completed>,
     /// The version of the ra-jit that wrote it. Another one reads nothing of it.
     version: String,
     pub(crate) key: String,
@@ -197,13 +200,14 @@ impl Guard {
         &mut self,
         built_at: u128,
         configured: &[Configured],
+        completed: &mut Vec<script::Completed>,
     ) -> Result<Option<String>, String> {
         Ok(match self {
             Guard::Script { package, out_dir, reruns_for, checked_at, built, targets } => {
                 let since = built_at.max(*checked_at);
                 let mut changed = false;
                 for guard in reruns_for {
-                    if guard.broken(since, configured)?.is_some() {
+                    if guard.broken(since, configured, completed)?.is_some() {
                         changed = true;
                         break;
                     }
@@ -218,7 +222,7 @@ impl Guard {
                     .chain(configured.iter().map(|it| it.name.clone()))
                     .collect();
                 let cargo = script::Cargo { env: &env, env_names: &env_names, targets };
-                let run = match script::judge(out_dir, &cargo) {
+                let run = match script::judge_for(out_dir, &cargo, completed) {
                     Ok(run) => Ok(run),
                     Err(script::JudgementError::Unavailable(what)) => Err(what),
                     Err(script::JudgementError::Failed(what)) => {
@@ -502,8 +506,9 @@ impl Built {
     pub(crate) fn by_cargo(
         asked: &Invocation,
         ahead: Option<&daemon::Ahead>,
+        completed: &[script::Completed],
     ) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, None, ahead)
+        Built::by(asked, None, ahead, completed)
     }
 
     /// The same, with rustc building of the crates rooted at `staged` only what stands in
@@ -512,13 +517,14 @@ impl Built {
         asked: &Invocation,
         staged: &Staged,
     ) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, Some(staged), staged.ahead.as_ref())
+        Built::by(asked, Some(staged), staged.ahead.as_ref(), &[])
     }
 
     fn by(
         asked: &Invocation,
         staged: Option<&Staged>,
         ahead: Option<&daemon::Ahead>,
+        completed: &[script::Completed],
     ) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
@@ -528,6 +534,7 @@ impl Built {
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
         as_built(&mut cargo)?;
+        let _continuation = script::Continuation::for_command(&mut cargo, completed)?;
         if let Some(staged) = staged {
             cargo.env(switch::VARIABLE, switch::first_wrapper_path()?);
             cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
@@ -579,6 +586,9 @@ impl Built {
         drop(tell);
         let _ = telling.join();
         let status = cargo.wait()?;
+        if let Some(continuation) = &_continuation {
+            continuation.finish(completed)?;
+        }
         if !status.success() {
             super::toolchain::note_failed();
         }
@@ -693,7 +703,7 @@ impl State {
         let (scripts, others): (Vec<_>, Vec<_>) =
             self.guards.iter_mut().partition(|it| matches!(it, Guard::Script { .. }));
         for guard in others.into_iter().chain(scripts) {
-            if let Some(why) = guard.broken(built_at, configured)? {
+            if let Some(why) = guard.broken(built_at, configured, &mut self.completed)? {
                 return Ok(Some(why));
             }
         }
@@ -876,6 +886,7 @@ impl State {
         let used = used_by(&artifacts, &records);
 
         let mut state = State {
+            completed: Vec::new(),
             version: daemon::version(),
             key: key.to_owned(),
             root: root.clone(),

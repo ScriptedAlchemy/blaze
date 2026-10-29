@@ -259,6 +259,23 @@ fn main() {
     "src/main.rs": COUNTER["src/main.rs"],
 }
 
+DROPPER = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "dropper").replace(
+        'build = "build.rs"\n', 'build = "build.rs"\nexclude = ["target-ref"]\n',
+    ),
+    "build.rs": r"""use std::{env, fs, path::PathBuf};
+fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let log = out.join("../runs");
+    let runs = fs::read_to_string(&log).ok().and_then(|it| it.parse::<u32>().ok()).unwrap_or(0) + 1;
+    fs::write(&log, runs.to_string()).unwrap();
+    if runs == 1 { println!("cargo::rerun-if-changed=src/main.rs"); }
+    fs::write(out.join("generated.rs"), format!("pub const RUNS: u32 = {runs};\n")).unwrap();
+}
+""",
+    "src/main.rs": COUNTER["src/main.rs"],
+}
+
 
 def failing_script(bin_dir):
     """A failed second run ends that build. A later explicit request may retry."""
@@ -479,7 +496,8 @@ def main():
         print(f"under {root}{tails(home)}")
     else:
         shutil.rmtree(root, ignore_errors=True)
-    for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True), ("quiet", QUIET, True)]:
+    for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True), ("quiet", QUIET, True),
+                                ("dropper", DROPPER, False)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
     wrong += failing_script(bin_dir)

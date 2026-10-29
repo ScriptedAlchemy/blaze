@@ -21,6 +21,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::records;
 
+mod continuation;
+pub(crate) use continuation::{Completed, Continuation};
+
 /// The variable that names the script itself to `ra-jit build-script`.
 const REAL: &str = "RA_JIT_BUILD_SCRIPT";
 
@@ -108,6 +111,12 @@ pub(crate) fn run_as_cargo_does(
         env.iter().find(|(name, _)| name == "OUT_DIR").map(|(_, value)| PathBuf::from(value));
     let args: Vec<OsString> = args.collect();
     let cwd = std::env::current_dir()?;
+    if let Some(out_dir) = &out_dir {
+        let ran = Ran { real: real.clone(), cwd: cwd.clone(), env: env.clone() };
+        if continuation::consume(&ran, out_dir)? {
+            return Ok(());
+        }
+    }
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
         let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
         // Without it the script is not run again by the daemon, and cargo builds.
@@ -325,6 +334,14 @@ impl std::fmt::Display for JudgementError {
 }
 
 pub(crate) fn judge(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, JudgementError> {
+    judge_for(out_dir, cargo, &mut Vec::new())
+}
+
+pub(crate) fn judge_for(
+    out_dir: &Path,
+    cargo: &Cargo<'_>,
+    completed: &mut Vec<Completed>,
+) -> Result<Run, JudgementError> {
     let unit = records::Unit::of(out_dir)?;
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
@@ -421,8 +438,11 @@ pub(crate) fn judge(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, JudgementE
         named
     };
     // A run that says nothing of what it reads leaves what cargo reckoned before it.
-    unit.record(&recorded.with_local(reckoned(&said, &named).unwrap_or(now)))?;
-    Ok(Run::left(&again.stdout, out_dir)?)
+    let fingerprint = recorded.with_local(reckoned(&said, &named).unwrap_or(now));
+    unit.record(&fingerprint)?;
+    let run = Run::left(&again.stdout, out_dir)?;
+    completed.push(Completed::new(&ran, out_dir, run.clone(), again, fingerprint, began));
+    Ok(run)
 }
 
 fn cargo_sets(name: &str) -> bool {
@@ -1511,6 +1531,32 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(failure.to_string().contains("second run fails"));
         assert_eq!(runs(&out_dir), 2);
         assert_eq!(std::fs::read(hash_of(&out_dir)).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_run_that_drops_watches_keeps_the_before_run_fingerprint_and_a_build_result() {
+        let out_dir = ran_script(
+            "dropper",
+            "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nprintf 'pub const RUNS: u32 = 2;\\n' > \"$OUT_DIR/generated.rs\"\n",
+            "",
+        );
+        let mut ran = ran_of(&out_dir);
+        ran.real = ran.real.with_extension("inner");
+        std::fs::write(out_dir.parent().unwrap().join(RAN), serde_json::to_vec(&ran).unwrap())
+            .unwrap();
+        let before = records::Unit::of(&out_dir).unwrap().recorded().unwrap();
+        changed(&out_dir);
+        let mut completed = Vec::new();
+        judge_for(&out_dir, &CARGO, &mut completed).unwrap();
+        assert_eq!(runs(&out_dir), 1);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(records::Unit::of(&out_dir).unwrap().recorded().unwrap(), before);
+        let mut command = Command::new("sh");
+        let continuation = Continuation::for_command(&mut command, &completed).unwrap().unwrap();
+        let path = continuation.path();
+        assert!(path.join("runs").exists());
+        drop(continuation);
+        assert!(!path.exists(), "a subsequent build cannot consume this run");
     }
 
     #[test]
