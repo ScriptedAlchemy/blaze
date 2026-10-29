@@ -3,8 +3,9 @@
 
 The reference Cargo invocation belongs to this harness. Product compiler, Cargo,
 rustdoc and rustup paths are fail/count stand-ins. A source-only fixture is saved,
-its original tree is removed, and its result must still match the reference from
-an unrelated directory with hostile ambient compiler configuration. Corrupt
+its original tree is removed and the whole bundle moved, and its result must still match the
+reference from an unrelated directory with hostile ambient compiler configuration, including a
+config file in a directory above the replay's own. Corrupt
 inputs and unsupported input closures must produce no advertised executable.
 """
 import argparse
@@ -59,6 +60,8 @@ renamed={package="saved-words",path="../words",default-features=false,features=[
 ''')
     write(root, "app/src/main.rs", '''#[cfg(rust_analyzer)]
 compile_error!("analyzer cfg entered the saved compiler request");
+#[cfg(ancestor_hostile)]
+compile_error!("a config file above the replay directory entered the saved compile");
 fn main() {
     println!("{}|{}|{}", renamed::word(), env!("SAVED_SPEC_LABEL"),
              std::env::args().nth(1).unwrap_or_default());
@@ -221,14 +224,25 @@ def main():
         # mutable checkout: change it, then remove that entire original tree.
         write(original, "words/message.txt", "mutated after capture")
         shutil.rmtree(original)
+        # The bundle moves as a unit: nothing in it may name where it was made.
+        moved = work / "moved-bundle"
+        shutil.move(bundle, moved)
+        bundle.mkdir()
+        spec = moved / "saved.cbor"
         hostile = work / "unrelated"
         write(hostile, ".cargo/config.toml", '[build]\nrustflags=["--cfg", "hostile"]\n')
+        # Worker-side configuration above where each replay materializes its copy: the
+        # bundle directory (the moved one for this replay, the fresh one for the later
+        # cases) and, farther up, the work directory.
         write(bundle, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
+        write(moved, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
+        ancestor = write(work, ".cargo/config.toml", '[env]\nANCESTOR_ONLY="leaked"\n[build]\nrustflags=["--cfg", "ancestor_hostile"]\n')
         hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
                            CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value")
         actual, _ = runner.run("replay-after-removal", [blaze, "cargo", "spec", "--run", spec],
                                hostile_env, hostile)
         assert actual == expected, (actual, expected)
+        ancestor.unlink()
         observed = runner.rows[-1]
         assert observed["watchdog_samples"] > 0 and observed["rajit_footprint_peak_mb"] > 0, observed
         results = list(Path(str(spec) + ".outputs").glob("replay-*/result.json"))
