@@ -8,6 +8,7 @@ mod affected;
 mod ancestor;
 mod cli;
 pub(crate) mod client;
+pub(crate) mod loader;
 mod messages;
 pub(crate) mod metadata;
 pub(crate) mod own_macro;
@@ -17,6 +18,7 @@ pub(crate) mod plan;
 pub(crate) mod producer_image;
 pub(crate) mod producer_plan;
 pub(crate) mod run;
+pub(crate) mod runtime_context;
 mod sandboxed;
 pub(crate) mod say;
 pub(crate) mod script;
@@ -65,14 +67,12 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     let code = match asked {
         Asked::Build(asked) => match asked.only_cargo() {
-            None if asked.flags.doc => run::only_doc_tests(&asked, &asked.typed)?,
-            Some(reason) => {
-                let then = format!("this is `cargo {}`", asked.subcommand.name());
-                say::cargo_builds(&reason, &then, say::EDIT);
-                let typed = std::iter::once(asked.subcommand.name().to_owned()).chain(asked.typed);
-                plain_cargo(typed.collect())?
+            _ if matches!(asked.subcommand, Subcommand::Test | Subcommand::Check)
+                || !whole::asked_for(&asked) =>
+            {
+                spec::direct::command(&asked)?
             }
-            None if asked.subcommand == Subcommand::Check => check(&asked)?,
+            Some(_) => spec::direct::command(&asked)?,
             None => build(&asked)?,
         },
         Asked::Cargo(args) => plain_cargo(args)?,
@@ -95,10 +95,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
             println!("{HELP}");
             0
         }
-        Asked::Version => {
-            println!("{}", crate::version());
-            0
-        }
+        Asked::Version => plain_cargo(vec!["--version".to_owned()])?,
     };
     std::process::exit(code)
 }
@@ -221,12 +218,21 @@ fn fn_cache_dir() -> anyhow::Result<std::path::PathBuf> {
     })
 }
 
-/// Runs cargo with `args` and nothing of ra-jit's but its answers to what cargo asks rustc.
+/// Answer Cargo queries in-process even when CARGO names this owned front door.
 fn plain_cargo(args: Vec<String>) -> anyhow::Result<i32> {
+    use std::io::Write as _;
     let mut cargo = Command::new(state::cargo_path());
-    crate::answers::ready_cargo(&mut cargo);
-    let status = cargo.args(args).status().context("running cargo")?;
-    Ok(run::exit_code(status))
+    cargo.args(args);
+    let answer = match crate::answers::cargo_query(&mut cargo, &state::rustc_path()) {
+        Ok(answer) => answer,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(FAILED);
+        }
+    };
+    std::io::stdout().write_all(&answer.stdout)?;
+    std::io::stderr().write_all(&answer.stderr)?;
+    Ok(run::exit_code(answer.status))
 }
 
 /// Builds what `asked` names and then runs what the subcommand runs. Cargo builds what
@@ -240,6 +246,9 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     if let Some(code) = state::owned(asked)? {
         return Ok(code);
+    }
+    if matches!(asked.subcommand, Subcommand::Build | Subcommand::Run) {
+        return spec::direct::command(asked);
     }
     let key = asked.key(&cwd);
     let finished = |state: &State| {
@@ -334,72 +343,6 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
 
 /// The status of a build that failed, as cargo's of one rustc turned down.
 const FAILED: i32 = 101;
-
-/// `cargo ra-jit check`: what the daemon says of the source as it builds the programs of
-/// the build with the same flags, when it has that build loaded. Any other check is the
-/// daemon's checker's, which loads the workspace as that build would and builds nothing,
-/// once for each target asked for. Neither runs rustc on the source. The verdict is written
-/// as `--message-format` asks: in cargo's JSON, it is what an editor shows.
-fn check(asked: &Invocation) -> anyhow::Result<i32> {
-    let format = match messages::Format::of(&asked.flags.message_format) {
-        Ok(format) => format,
-        Err(why) => {
-            eprintln!("error: {why}");
-            return Ok(1);
-        }
-    };
-    let started = Instant::now();
-    let cwd = std::env::current_dir()?;
-    let finished = |profile: &str| {
-        let took = started.elapsed().as_secs_f64();
-        let finished = format!("`{profile}` profile [ra-jit] target(s) in {took:.2}s");
-        say::status(asked.flags.quiet, "Finished", &finished);
-        messages::passed(format);
-    };
-    let turned_down = |said: &[crate::errors::Said]| -> anyhow::Result<i32> {
-        messages::turned_down(format, said, &state::metadata(asked));
-        toolchain::note_failed();
-        Ok(FAILED)
-    };
-    if let Ok(state) = State::read(&asked.key(&cwd))
-        && !state.programs.is_empty()
-    {
-        match by_daemon(state) {
-            Ok((state, _held)) => {
-                finished(&state.profile);
-                state.write()?;
-                return Ok(0);
-            }
-            Err(NotServed::Error(said, _)) => return turned_down(&[said]),
-            Err(NotServed::Cargo(_)) => {}
-        }
-    }
-    let ahead = state::checked(asked)?;
-    let profile = ahead.config.selection.profile.clone();
-    let targets = match &asked.flags.targets[..] {
-        [_, _, ..] => asked.flags.targets.iter().cloned().map(Some).collect(),
-        _ => vec![ahead.config.selection.target.clone()],
-    };
-    let mut said = Vec::new();
-    for target in targets {
-        let mut ahead = ahead.clone();
-        ahead.config.selection.target = target;
-        match client::ask(Request::Check(ahead), Start::IfMissing)? {
-            Some(daemon::Reply::Checked { errors: None }) => {}
-            Some(daemon::Reply::Checked { errors: Some(errors) }) => said.push(errors),
-            Some(daemon::Reply::Cold { reason }) => {
-                eprintln!("error: ra-jit could not check the workspace: {reason}");
-                return Ok(FAILED);
-            }
-            reply => anyhow::bail!("the daemon answered a check with {reply:?}"),
-        }
-    }
-    if said.is_empty() {
-        finished(&profile);
-        return Ok(0);
-    }
-    turned_down(&said)
-}
 
 /// Why the first build of a workspace is not rustc's of what the workspace depends on and
 /// the daemon's of the workspace.
@@ -563,7 +506,7 @@ pub(super) fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotB
         .map_err(|it| NotBuilt::Failed(format!("{it:#}")))?;
     crate::trace::note("client↔daemon", crate::trace::CLIENT, asking_at);
     let programs = match reply {
-        Some(Reply::Synced { programs, spans }) => {
+        Some(Reply::Synced { programs, spans, .. }) => {
             crate::trace::note_all(spans);
             for line in programs.iter().flatten() {
                 crate::trace::note_all(crate::trace::split(line).1);

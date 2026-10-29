@@ -530,6 +530,7 @@ fn configured_producers_leave_only_owned_macro_images_in_the_final_source_graph(
                 },
                 proc_macro: (unit.target.kind == TargetKind::ProcMacro)
                     .then(|| worker.path().join("owned-macro-image.so")),
+                rustc_env: BTreeMap::new(),
             },
         );
     }
@@ -599,6 +600,52 @@ fn integration_test_auxiliary_binaries_are_artifacts_not_rust_library_dependenci
         serde_json::json!(auxiliary.executable)
     );
     assert!(test.project["crates"][0]["deps"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn binary_environment_is_for_integration_targets_including_custom_harnesses() {
+    let f = fixture();
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[[test]]\nname='custom'\nharness=false\n");
+    f.write("src/lib.rs", "pub fn answer() -> u8 { 42 }\n");
+    f.write("tests/custom.rs", "fn main() { let _ = env!(\"CARGO_BIN_EXE_saved\"); }\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Test, &["--all-targets", "--no-run"], store.path());
+    let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+    let plans = blaze_spec::execution::programs(
+        &prepared,
+        Path::new("/owned/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    let canonical = blaze_spec::assemble::canonical_units(
+        &prepared.resolved.spec.build,
+        &prepared.resolved.graph,
+    )
+    .unwrap();
+    let mut library_test = false;
+    let mut binary_test = false;
+    let mut custom = false;
+    for plan in plans {
+        let unit = canonical[plan.unit as usize];
+        let environment = &plan.project["crates"][0]["env"];
+        match unit.target.kind {
+            blaze_metadata::units::TargetKind::Test => {
+                assert!(environment.get("CARGO_BIN_EXE_saved").is_some());
+                assert!(!plan.harness);
+                custom = true;
+            }
+            blaze_metadata::units::TargetKind::Lib | blaze_metadata::units::TargetKind::Bin
+                if unit.test =>
+            {
+                assert!(environment.get("CARGO_BIN_EXE_saved").is_none());
+                library_test |= unit.target.kind == blaze_metadata::units::TargetKind::Lib;
+                binary_test |= unit.target.kind == blaze_metadata::units::TargetKind::Bin;
+            }
+            _ => {}
+        }
+    }
+    assert!(library_test && binary_test && custom);
 }
 
 #[test]

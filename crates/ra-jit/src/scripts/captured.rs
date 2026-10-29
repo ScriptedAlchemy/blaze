@@ -84,9 +84,39 @@ pub(crate) struct Context<'a> {
     pub(crate) native: BTreeMap<usize, NativeUnit>,
     pub(crate) runtime: Option<&'a serde_json::Value>,
     pub(crate) bindings: Option<&'a dyn Fn(&Prepared) -> Result<serde_json::Value>>,
+    pub(crate) source_root: Option<&'a Path>,
+    pub(crate) workspace_members: BTreeSet<usize>,
 }
 
 impl Graph {
+    pub(crate) fn host_runs(&self, root: usize) -> Result<Vec<usize>> {
+        fn visit(
+            graph: &Graph,
+            at: usize,
+            seen: &mut BTreeSet<usize>,
+            runs: &mut Vec<usize>,
+        ) -> Result<()> {
+            if !seen.insert(at) {
+                return Ok(());
+            }
+            let unit =
+                graph.units.get(at).context("host library dependency is outside captured graph")?;
+            if unit.host
+                && let Some(run) = unit.run
+                && !runs.contains(&run)
+            {
+                runs.push(run);
+            }
+            for (_, dependency) in &unit.source.deps {
+                visit(graph, *dependency, seen, runs)?;
+            }
+            Ok(())
+        }
+        let mut runs = Vec::new();
+        visit(self, root, &mut BTreeSet::new(), &mut runs)?;
+        Ok(runs)
+    }
+
     fn order(&self) -> Result<Vec<usize>> {
         let n = self.units.len();
         let mut edges = vec![Vec::new(); n + self.runs.len()];
@@ -274,6 +304,36 @@ fn configure(
     }
 }
 
+fn host_environment(
+    graph: &Graph,
+    root: usize,
+    prepared: &Prepared,
+    inherited: &BTreeMap<OsString, OsString>,
+    profile: &Path,
+    sysroot: &Path,
+) -> Result<BTreeMap<OsString, OsString>> {
+    let mut libraries = Vec::new();
+    for run in graph.host_runs(root)? {
+        let (_, output) =
+            prepared.outputs.get(&run).context("host library producer has not completed")?;
+        libraries.extend(crate::cargo::loader::artifact_directories(output));
+    }
+    let mut environment = inherited.clone();
+    if !libraries.is_empty() {
+        let host = crate::answers::host_tuple(&sysroot.join("bin/rustc"))
+            .context("owned host producer has no toolchain facts")?;
+        let path = crate::cargo::loader::path(
+            &libraries,
+            profile,
+            &sysroot.join("lib/rustlib").join(&host).join("lib"),
+            &host,
+            |name| inherited.get(std::ffi::OsStr::new(name)).map(OsString::as_os_str),
+        )?;
+        environment.insert(crate::cargo::loader::variable(&host).into(), path);
+    }
+    Ok(environment)
+}
+
 fn read_inputs(path: &Path) -> Result<BTreeSet<PathBuf>> {
     let read = crate::dep_info::ReplayTrace::decode(&std::fs::read(path)?)?;
     let directory = path.parent().context("input directory")?;
@@ -318,7 +378,7 @@ pub(crate) fn run_with_context(
     environment: crate::process::Native,
     context: Context<'_>,
 ) -> Result<Prepared> {
-    let Context { native, runtime, bindings } = context;
+    let Context { native, runtime, bindings, source_root, workspace_members } = context;
     ensure!(
         native.keys().all(|&at| at < graph.units.len()),
         "native context is outside captured graph"
@@ -359,7 +419,8 @@ pub(crate) fn run_with_context(
     env.insert("BLAZE_PRODUCER_PROBE_FAILURE".into(), failure.as_os_str().to_owned());
     env.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
     env.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
-    let env: Vec<_> = env.into_iter().collect();
+    let env_map = env;
+    let env: Vec<_> = env_map.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
     let mut prepared = Prepared {
         units: graph.units.iter().map(|unit| unit.source.clone()).collect(),
         native: graph
@@ -408,17 +469,27 @@ pub(crate) fn run_with_context(
                 let before = producer_image::snapshot(sysroot, &crates)?;
                 prepared.observe(before.paths().cloned(), &runtime_paths, &generation);
                 let native = graph.native_closure(action, &prepared)?;
+                let members: Vec<_> = graph
+                    .closure_indices(action, &prepared.units)?
+                    .iter()
+                    .map(|at| workspace_members.contains(at))
+                    .collect();
+                let naming =
+                    source_root.map(|root| own_script::SourceNaming { root, members: &members });
                 let bound = bindings.map(|make| make(&prepared)).transpose()?;
+                let compiler_env =
+                    host_environment(&graph, action, &prepared, &env_map, &generation, sysroot)?;
                 let image = producer_image::link(
                     sysroot,
                     crates,
                     &generation.join(format!("macro-{action}")),
-                    &env,
+                    &compiler_env.into_iter().collect::<Vec<_>>(),
                     own_script::SourceMode::Captured {
                         profile: node.profile.as_ref(),
                         units: Some(&native),
                         runtime,
                         bindings: bound.as_ref(),
+                        naming: naming.as_ref(),
                     },
                 )?;
                 ensure!(
@@ -451,6 +522,12 @@ pub(crate) fn run_with_context(
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
         let inputs = dir.join("producer.inputs");
         let native = graph.native_closure(run.compiler, &prepared)?;
+        let members: Vec<_> = graph
+            .closure_indices(run.compiler, &prepared.units)?
+            .iter()
+            .map(|at| workspace_members.contains(at))
+            .collect();
+        let naming = source_root.map(|root| own_script::SourceNaming { root, members: &members });
         let bound = bindings.map(|make| make(&prepared)).transpose()?;
         let described = own_script::with_mode(
             own_script::planned_description(sysroot, crates.clone()),
@@ -459,11 +536,20 @@ pub(crate) fn run_with_context(
                 units: Some(&native),
                 runtime,
                 bindings: bound.as_ref(),
+                naming: naming.as_ref(),
             },
         )
         .map_err(anyhow::Error::msg)?;
-        own_script::link_planned(&described, &dir, &exe, &inputs, &env)
-            .map_err(anyhow::Error::msg)?;
+        let compiler_env =
+            host_environment(&graph, run.compiler, &prepared, &env_map, &generation, sysroot)?;
+        own_script::link_planned(
+            &described,
+            &dir,
+            &exe,
+            &inputs,
+            &compiler_env.into_iter().collect::<Vec<_>>(),
+        )
+        .map_err(anyhow::Error::msg)?;
         ensure!(
             producer_image::snapshot(sysroot, &crates)? == before,
             "captured script source changed during compilation"
@@ -490,7 +576,17 @@ pub(crate) fn run_with_context(
                 metadata: prepared.outputs[dep].1.metadata.clone(),
             })
             .collect();
-        let child_env = blaze_build_script::env(&unit, &env).map_err(|it| anyhow::anyhow!(it.0))?;
+        let mut child_env =
+            blaze_build_script::env(&unit, &env).map_err(|it| anyhow::anyhow!(it.0))?;
+        let host_env =
+            host_environment(&graph, run.compiler, &prepared, &env_map, &generation, sysroot)?;
+        let variable = crate::cargo::loader::variable(&unit.host);
+        if host_env.get(std::ffi::OsStr::new(variable))
+            != env_map.get(std::ffi::OsStr::new(variable))
+            && let Some(path) = host_env.get(std::ffi::OsStr::new(variable))
+        {
+            child_env.vars.insert(variable.into(), path.clone());
+        }
         let ran = blaze_build_script::run::run(
             &unit,
             blaze_build_script::run::Invocation::of(&unit, child_env).command(),
@@ -522,9 +618,24 @@ pub(crate) fn run_with_context(
 mod tests {
     use super::*;
 
+    #[test]
+    fn compiler_library_runs_follow_host_macro_dependencies_without_target_libraries() {
+        let mut app = node("app", Kind::Rust, false, &[("mac", 1), ("target", 2)]);
+        app.run = Some(0);
+        let mac = node("mac", Kind::ProcMacro, true, &[("host", 3)]);
+        let mut target = node("target", Kind::Rust, false, &[]);
+        target.run = Some(1);
+        let mut host = node("host", Kind::Rust, true, &[]);
+        host.run = Some(2);
+        let graph = Graph { units: vec![app, mac, target, host], runs: Vec::new() };
+        assert_eq!(graph.host_runs(0).unwrap(), [2]);
+        assert_eq!(graph.host_runs(1).unwrap(), [2]);
+    }
+
     fn node(name: &str, kind: Kind, host: bool, deps: &[(&str, usize)]) -> Unit {
         Unit {
             source: Planned {
+                workspace_member: false,
                 name: name.into(),
                 root: std::env::temp_dir().join(format!("{name}.rs")),
                 edition: "2021".into(),

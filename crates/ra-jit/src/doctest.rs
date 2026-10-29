@@ -133,6 +133,25 @@ impl Wanted {
     }
 }
 
+fn documented_root(project: &serde_json::Value) -> anyhow::Result<&serde_json::Value> {
+    let crates = project["crates"].as_array().context("no doctest crates")?;
+    if let Some(naming) = project.get("blaze_compiler_source_root") {
+        crate::compiler_json::source_root(project)?;
+        let unit =
+            u32::try_from(naming["unit"].as_u64().context("source naming has no root unit")?)?;
+        let mut roots =
+            crates.iter().filter(|krate| krate["blaze_native_unit"] == serde_json::json!(unit));
+        let root = roots.next().context("documented root unit is absent")?;
+        anyhow::ensure!(roots.next().is_none(), "documented root unit is ambiguous");
+        Ok(root)
+    } else {
+        crates
+            .iter()
+            .find(|krate| krate["is_workspace_member"] == true)
+            .context("no documented library")
+    }
+}
+
 /// Run examples from a validated compiler description. This path never invokes
 /// Cargo, rustc or rustdoc, including on invalid examples or compilation failures.
 pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
@@ -140,19 +159,21 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
     let bytes: Vec<u8> = serde_json::from_value(json["blaze_spec_doctest"].clone())?;
     let requested: blaze_wire::RunSpec =
         blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?;
-    let root = json["crates"]
-        .as_array()
-        .context("no doctest crates")?
-        .iter()
-        .find(|krate| krate["is_workspace_member"] == true)
-        .context("no documented library")?;
+    let root = documented_root(&json)?;
     let source = PathBuf::from(root["root_module"].as_str().context("no documented source")?);
     let manifest = Path::new(root["build"]["build_file"].as_str().context("no doctest manifest")?);
     let run_in = manifest.parent().context("no doctest package")?.to_owned();
-    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-    let crate_env: std::collections::BTreeMap<String, String> =
-        serde_json::from_value(root["env"].clone())?;
-    env.extend(crate_env.into_iter().map(|(name, value)| (name.into(), value.into())));
+    let env = match crate::cargo::spec::runtime_environment(&json)? {
+        Some(env) => env,
+        None => {
+            let mut env: std::collections::BTreeMap<OsString, OsString> =
+                std::env::vars_os().collect();
+            let crate_env: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(root["env"].clone())?;
+            env.extend(crate_env.into_iter().map(|(name, value)| (name.into(), value.into())));
+            env
+        }
+    };
     let mut wanted = Wanted::parse(&requested.harness_args).map_err(anyhow::Error::msg)?;
     wanted.filters.extend(requested.filters);
     wanted.exact = requested.exact;
@@ -697,6 +718,23 @@ mod recording_tests {
         },
         process::Native,
     };
+
+    #[test]
+    fn documented_root_uses_explicit_unit_not_first_workspace_member() {
+        let mut project = serde_json::json!({"compiler_mode":true,
+            "blaze_compiler_source_root":{"version":1,"path":"/workspace","unit":7},
+            "crates":[{"display_name":"binary","blaze_native_unit":2,"is_workspace_member":true},
+                {"display_name":"library","blaze_native_unit":7,"is_workspace_member":true}]});
+        assert_eq!(documented_root(&project).unwrap()["display_name"], "library");
+        project["blaze_compiler_source_root"]["unit"] = serde_json::json!(99);
+        assert!(documented_root(&project).is_err());
+        project["blaze_compiler_source_root"]["unit"] = serde_json::json!(u64::MAX);
+        assert!(documented_root(&project).is_err());
+        project["blaze_compiler_source_root"].as_object_mut().unwrap().remove("unit");
+        assert!(documented_root(&project).is_err());
+        project.as_object_mut().unwrap().remove("blaze_compiler_source_root");
+        assert_eq!(documented_root(&project).unwrap()["display_name"], "binary");
+    }
 
     #[cfg(unix)]
     fn non_unicode() -> OsString {

@@ -102,6 +102,14 @@ pub(crate) fn operation(build: u64) -> Operation {
 /// the run it was loaded from ([`generation_of`]).
 pub(crate) type World = Vec<(PathBuf, u64)>;
 
+/// The immutable typed directives of the generations this database was loaded from.
+/// The caller keeps its World pin while collecting and using them.
+pub(crate) fn runtime_outputs(
+    world: &World,
+) -> anyhow::Result<Vec<(PathBuf, blaze_build_script::Output)>> {
+    LEASES.runtime_outputs(world)
+}
+
 /// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
 /// stays as cargo has it.
 const GENERATION: &str = "blaze-generation";
@@ -1136,7 +1144,16 @@ impl<'a> Runner<'a> {
             .join(self.profiles.get_dir_name())
             .join("build")
             .join(format!("{}-{hash:016x}", data.name));
-        let described = crate::cargo::own_script::planned_description(&self.sysroot, crates);
+        let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
+        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
+        let described = crate::cargo::own_script::with_mode(
+            crate::cargo::own_script::planned_description(&self.sysroot, crates),
+            crate::cargo::own_script::SourceMode::Cargo {
+                root: self.cargo.workspace_root().as_ref(),
+                members: &members,
+                env: &env,
+            },
+        )?;
         let fingerprint = fresh::hash_bytes(
             json!([described, self.host_flags, self.rustc]).to_string().as_bytes(),
         );
@@ -1149,7 +1166,6 @@ impl<'a> Runner<'a> {
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         let began = SystemTime::now();
-        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         crate::cargo::own_script::link_planned(&described, &dir, &exe, &inputs, &env)?;
         // What was read is dated when the compile began, as cargo dates its dep-info: a file
         // written while it compiled is a change for the next build.
@@ -1246,12 +1262,17 @@ impl<'a> Runner<'a> {
             self.add_source(package, &mut crates, &mut FxHashMap::default())?;
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
+            let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
             crate::cargo::producer_image::link(
                 &self.sysroot,
                 crates,
                 &dir,
                 &env,
-                crate::cargo::own_script::SourceMode::Legacy,
+                crate::cargo::own_script::SourceMode::Cargo {
+                    root: self.cargo.workspace_root().as_ref(),
+                    members: &members,
+                    env: &env,
+                },
             )
             .map_err(|it| format!("{it:#}"))
         })();
@@ -1346,9 +1367,6 @@ impl<'a> Runner<'a> {
         ran: Option<&Done>,
     ) -> Result<crate::cargo::own_script::Planned, String> {
         let data = &self.cargo[package];
-        let mut cfg: Vec<String> =
-            data.active_features.iter().map(|it| format!("feature={it:?}")).collect();
-        cfg.sort();
         // Host flags follow the profile's arguments, just as they do on rustc's command
         // line. Overflow and panic settings must reach MIR/codegen, not only fingerprints.
         let applied = apply_flags(&self.host_flags);
@@ -1357,18 +1375,12 @@ impl<'a> Runner<'a> {
         }
         let effective = crate::plan::Profile::for_script(profile, &self.host_flags)
             .map_err(|error| format!("the profile of {name}: {error:#}"))?;
-        if effective.debug_assertions {
-            cfg.push("debug_assertions".to_owned());
-        }
-        if effective.overflow_checks {
-            cfg.push("overflow_checks".to_owned());
-        }
-        cfg.push(format!("panic={:?}", effective.panic.name()));
-        for extra in applied.cfgs {
-            if !cfg.contains(&extra) {
-                cfg.push(extra);
-            }
-        }
+        let host_cfgs = self.host_cfgs.as_deref().ok_or_else(|| {
+            format!("blaze has no built-in cfg answer for build-script host `{}`", self.asked.host)
+        })?;
+        let features =
+            data.active_features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
+        let mut cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
         let package_dir: &Path = data.manifest.parent().as_ref();
         let manifest: &Path = data.manifest.as_ref();
         let version = &data.version;
@@ -1408,6 +1420,7 @@ impl<'a> Runner<'a> {
             cfg.extend(ran.output.cfgs.iter().cloned());
         }
         Ok(crate::cargo::own_script::Planned {
+            workspace_member: data.is_member,
             name: name.to_owned(),
             root: root.to_owned(),
             edition: data.edition.to_string(),
@@ -1420,6 +1433,34 @@ impl<'a> Runner<'a> {
             proc_macro: None,
         })
     }
+}
+
+fn source_cfgs(
+    host: &[String],
+    features: &[String],
+    profile: &crate::plan::Profile,
+    user: &[String],
+) -> Vec<String> {
+    let mut cfg: Vec<_> = host
+        .iter()
+        .filter(|cfg| {
+            let key = cfg.split_once('=').map_or(cfg.as_str(), |(key, _)| key).trim();
+            !matches!(key, "debug_assertions" | "overflow_checks" | "panic")
+        })
+        .cloned()
+        .collect();
+    cfg.extend_from_slice(features);
+    if profile.debug_assertions {
+        cfg.push("debug_assertions".into());
+    }
+    if profile.overflow_checks {
+        cfg.push("overflow_checks".into());
+    }
+    cfg.push(format!("panic={:?}", profile.panic.name()));
+    cfg.extend_from_slice(user);
+    cfg.sort();
+    cfg.dedup();
+    cfg
 }
 
 /// What the flags for rustc a crate is compiled with say that blaze's compile applies.

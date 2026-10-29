@@ -240,10 +240,24 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
 
 /// Cargo's query-only front door. Answer with the owned configuration reader and
 /// toolchain records; never start Cargo merely to have it ask our rustc stand-in.
+pub(crate) fn cargo_query(command: &mut Command, rustc: &OsStr) -> io::Result<Output> {
+    cargo_question_in(command, Some(rustc)).unwrap_or_else(|| {
+        Err(io::Error::other("unsupported owned Cargo command; Cargo was not executed"))
+    })
+}
+
 fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
+    cargo_question_in(command, None)
+}
+
+fn cargo_question_in(
+    command: &mut Command,
+    compiler: Option<&OsStr>,
+) -> Option<io::Result<Output>> {
     let args: Vec<String> =
         command.get_args().map(|arg| arg.to_str().map(str::to_owned)).collect::<Option<_>>()?;
-    let var = |name: &str| var_of(command, name);
+    let native = cargo_environment(command);
+    let var = |name: &str| native.get(OsStr::new(name)).cloned();
     let output = |stdout: Vec<u8>, stderr: Vec<u8>, code: u8| {
         #[cfg(unix)]
         let status = {
@@ -257,25 +271,30 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         };
         Output { status, stdout, stderr }
     };
-    if args == ["--version"] {
-        let version = toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
-            .and_then(|rustc| {
-                own::cargo_version(
-                    &rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
-                )
-            });
+    let compiler = || match compiler {
+        Some(compiler) => {
+            let found = toolchain_rustc(compiler, command.get_current_dir(), &var);
+            found.filter(|rustc| own::host_tuple(rustc).is_some()).or_else(|| {
+                // Producers name an owned probe launcher in RUSTC. Its installed source
+                // toolchain remains explicit, and contains the facts rather than the launcher.
+                let selected = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
+                selected.is_absolute().then(|| {
+                    selected.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+                })
+            })
+        }
+        None => toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
+            .map(|path| path.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX))),
+    };
+    if args == ["--version"] || args == ["-V"] {
+        let version = compiler().and_then(|rustc| own::cargo_version(&rustc));
         return Some(version.map(|stdout| output(stdout, Vec::new(), 0)).ok_or_else(|| {
             io::Error::other("owned Cargo version facts unavailable; Cargo was not executed")
         }));
     }
-    let mut env: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
-    for (name, value) in command.get_envs() {
-        let name = name.to_str()?.to_owned();
-        match value {
-            Some(value) => env.insert(name, value.to_str()?.to_owned()),
-            None => env.remove(&name),
-        };
-    }
+    let env: std::collections::BTreeMap<String, String> =
+        crate::process::unicode(native.iter().map(|(key, value)| (key.clone(), value.clone())))
+            .collect();
     let cwd =
         command.get_current_dir().map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
     if args.windows(2).any(|args| args == ["config", "get"]) {
@@ -293,14 +312,17 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
         return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
     }
-    let Some(rustc) = toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
-    else {
+    if args.first().is_some_and(|it| it == "metadata") {
+        return Some(
+            cargo_metadata(&args[1..], &cwd, env, &compiler, &var)
+                .map(|stdout| output(stdout, Vec::new(), 0)),
+        );
+    }
+    let Some(rustc) = compiler() else {
         return Some(Err(io::Error::other(format!(
             "owned Cargo query has no toolchain model: {args:?}; Cargo was not executed"
         ))));
     };
-    // A resolved Cargo path points into the same installation, but it is not rustc.
-    let rustc = rustc.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     if args.first().is_some_and(|it| it == "rustc")
         && args.iter().any(|it| it == "--print" || it.starts_with("--print="))
     {
@@ -383,6 +405,125 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         });
     }
     None
+}
+
+fn cargo_environment(command: &Command) -> std::collections::BTreeMap<OsString, OsString> {
+    let mut env: std::collections::BTreeMap<_, _> = crate::process::native().vars().collect();
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => env.insert(name.to_owned(), value.to_owned()),
+            None => env.remove(name),
+        };
+    }
+    env
+}
+
+fn cargo_metadata(
+    args: &[String],
+    cwd: &Path,
+    env: std::collections::BTreeMap<String, String>,
+    compiler: &dyn Fn() -> Option<PathBuf>,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> io::Result<Vec<u8>> {
+    let query = || -> anyhow::Result<Vec<u8>> {
+        let target =
+            var("CARGO_TARGET_DIR").map(|value| ("CARGO_TARGET_DIR", value)).or_else(|| {
+                var("CARGO_BUILD_TARGET_DIR").map(|value| ("CARGO_BUILD_TARGET_DIR", value))
+            });
+        if let Some((name, value)) = target {
+            anyhow::ensure!(
+                value.to_str().is_some(),
+                "path contains invalid UTF-8 characters in {name}"
+            );
+        }
+        let (mut manifest, mut platform) = (None, None);
+        let (mut no_deps, mut all_features, mut no_default_features) = (false, false, false);
+        let (mut offline, mut locked) = (false, false);
+        let (mut config, mut features) = (Vec::new(), Vec::new());
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            let (flag, joined) = word.split_once('=').unwrap_or((word, ""));
+            let mut value = || -> anyhow::Result<String> {
+                if word.contains('=') {
+                    Ok(joined.to_owned())
+                } else {
+                    words.next().cloned().ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
+                }
+            };
+            match flag {
+                "--manifest-path" => manifest = Some(cwd.join(value()?)),
+                "--filter-platform" => platform = Some(value()?),
+                "--features" | "-F" => features.push(value()?),
+                "--config" => config.push(value()?),
+                "--format-version" => {
+                    anyhow::ensure!(value()? == "1", "unsupported metadata format version")
+                }
+                "--no-deps" => no_deps = true,
+                "--all-features" => all_features = true,
+                "--no-default-features" => no_default_features = true,
+                "--offline" => offline = true,
+                "--locked" => locked = true,
+                "--frozen" => {
+                    locked = true;
+                    offline = true;
+                }
+                "-v" | "-vv" | "--verbose" | "-q" | "--quiet" => {}
+                "--color" => {
+                    value()?;
+                }
+                _ => anyhow::bail!("unsupported owned Cargo metadata option {flag}"),
+            }
+        }
+        let json = if no_deps {
+            let mut config_reader = match var("CARGO_HOME").filter(|path| !path.is_empty()) {
+                Some(home) => {
+                    blaze_manifest::Config::load_with_home(cwd, env, &[], cwd.join(home))?
+                }
+                None => blaze_manifest::Config::load(cwd, env, &[])?,
+            };
+            config_reader.start("metadata", &config)?;
+            let ctx = blaze_manifest::Context::new(config_reader);
+            let root = blaze_manifest::metadata::root_manifest(manifest.as_deref(), &ctx)?;
+            let workspace = blaze_manifest::Workspace::new(&root, &ctx)?;
+            serde_json::to_string(&blaze_manifest::metadata::export_no_deps(&workspace))?
+        } else {
+            let cfg = platform
+                .as_deref()
+                .map(|target| -> anyhow::Result<Vec<cargo_platform::Cfg>> {
+                    let rustc = compiler().ok_or_else(|| {
+                        anyhow::anyhow!("owned Cargo metadata target facts unavailable")
+                    })?;
+                    let sysroot = rustc.parent().and_then(Path::parent).ok_or_else(|| {
+                        anyhow::anyhow!("owned Cargo metadata sysroot unavailable")
+                    })?;
+                    let cfg = own::target_cfg(sysroot, target, &env).ok_or_else(|| {
+                        anyhow::anyhow!("owned Cargo metadata target facts unavailable")
+                    })?;
+                    cfg.iter().map(|atom| atom.parse().map_err(anyhow::Error::from)).collect()
+                })
+                .transpose()?;
+            blaze_metadata::metadata(&blaze_metadata::Asked {
+                cargo_home: var("CARGO_HOME").map(PathBuf::from),
+                cwd,
+                env: env.into_iter().collect(),
+                manifest_path: manifest.as_deref(),
+                config: &config,
+                features: &features,
+                all_features,
+                no_default_features,
+                build: None,
+                platform: platform
+                    .as_deref()
+                    .zip(cfg.as_deref())
+                    .map(|(triple, cfg)| blaze_metadata::TargetPlatform { triple, cfg }),
+                offline,
+                locked,
+                store: None,
+            })?
+        };
+        Ok(format!("{json}\n").into_bytes())
+    };
+    query().map_err(|error| io::Error::other(format!("{error:#}; Cargo was not executed")))
 }
 
 /// Has a cargo ask rustc through ra-jit, unless the user named a wrapper of their own: one
@@ -880,9 +1021,171 @@ mod tests {
         let version = query().unwrap();
         assert!(version.status.success());
         assert_eq!(version.stdout, b"cargo 1.99.0 (123456789 2026-10-01)\n");
+        std::fs::write(
+            &manifest,
+            format!("{rustc}\n[pkg.cargo]\nversion = \"0.99.2 (123456789 2026-10-01)\"\n"),
+        )
+        .unwrap();
+        assert_eq!(query().unwrap().stdout, b"cargo 1.98.2 (123456789 2026-10-01)\n");
         std::fs::write(&manifest, format!("{rustc}\n[pkg.cargo]\nversion = \"malformed\"\n"))
             .unwrap();
         assert!(query().unwrap_err().to_string().contains("Cargo was not executed"));
+        for malformed in [
+            "0.0.0 (123456789 2026-10-01)",
+            "1.99.0 (123456789 2026-10-01)",
+            "0.100.0 arbitrary",
+            "0.100.0 (123456789 2026-13-01)",
+        ] {
+            std::fs::write(&manifest, format!("{rustc}\n[pkg.cargo]\nversion = {malformed:?}\n"))
+                .unwrap();
+            assert!(query().unwrap_err().to_string().contains("Cargo was not executed"));
+        }
+    }
+
+    #[test]
+    fn owned_cargo_frontdoor_metadata_resolves_without_executing_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("dependency/src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("dependency/src/lib.rs"), "").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='query_root'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nquery_dep={path='dependency'}\n",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("dependency/Cargo.toml"),
+            "[package]\nname='query_dep'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .current_dir(dir.path())
+            .env("CARGO_HOME", dir.path().join("cargo-home"))
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .args(["metadata", "--format-version=1", "--offline"]);
+        let rustc = dir.path().join("missing-compiler");
+        let full = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        assert!(full.status.success());
+        let full: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+        assert_eq!(full["packages"].as_array().unwrap().len(), 2);
+        assert_eq!(full["resolve"]["nodes"].as_array().unwrap().len(), 2);
+        assert!(dir.path().join("Cargo.lock").is_file());
+        command.arg("--locked");
+        let locked = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&locked.stdout).unwrap(), full);
+        command.arg("--no-deps");
+        let shallow = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        let shallow: serde_json::Value = serde_json::from_slice(&shallow.stdout).unwrap();
+        assert!(shallow["resolve"].is_null());
+        assert!(shallow["packages"].as_array().unwrap().iter().any(|p| p["name"] == "query_root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_cargo_frontdoor_metadata_projects_opaque_environment_overrides() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='opaque_query'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let inherited = dir.path().join("inherited-target");
+        let vars = crate::process::Native::of([
+            ("HOME".into(), dir.path().as_os_str().to_owned()),
+            ("CARGO_TARGET_DIR".into(), inherited.clone().into_os_string()),
+            ("UNREAD_QUERY_OVERRIDE".into(), "inherited-text".into()),
+        ]);
+        let _scope = crate::process::enter_native(vars);
+        let rustc = dir.path().join("missing-rustc");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.current_dir(dir.path()).env("CARGO_HOME", dir.path().join("cargo-home")).args([
+            "metadata",
+            "--format-version=1",
+            "--offline",
+        ]);
+        let inherited_output = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        let inherited_metadata: serde_json::Value =
+            serde_json::from_slice(&inherited_output.stdout).unwrap();
+        assert_eq!(inherited_metadata["target_directory"], inherited.to_str().unwrap());
+        let opaque = OsString::from_vec(vec![0xff]);
+        command
+            .env("UNREAD_OPAQUE_QUERY_VALUE", &opaque)
+            .env(opaque.clone(), "unused")
+            .env("UNREAD_QUERY_OVERRIDE", &opaque);
+        let effective = cargo_environment(&command);
+        let projected: std::collections::BTreeMap<_, _> =
+            crate::process::unicode(effective).collect();
+        assert!(!projected.contains_key("UNREAD_QUERY_OVERRIDE"));
+        let output = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(metadata["target_directory"], inherited.to_str().unwrap());
+        command.env("CARGO_TARGET_DIR", &opaque);
+        let error = cargo_query(&mut command, rustc.as_os_str()).unwrap_err().to_string();
+        assert!(
+            error.contains("path contains invalid UTF-8 characters in CARGO_TARGET_DIR"),
+            "{error}"
+        );
+        assert!(error.contains("Cargo was not executed"));
+        command.args(["--no-deps"]);
+        assert!(
+            cargo_query(&mut command, rustc.as_os_str())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid UTF-8")
+        );
+        command.env_remove("CARGO_TARGET_DIR").env("CARGO_BUILD_TARGET_DIR", opaque);
+        assert!(
+            cargo_query(&mut command, rustc.as_os_str())
+                .unwrap_err()
+                .to_string()
+                .contains("CARGO_BUILD_TARGET_DIR")
+        );
+    }
+
+    #[test]
+    fn owned_cargo_frontdoor_uses_explicit_compiler_facts_away_from_its_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = dir.path().join("toolchain");
+        let rustc = synthetic_toolchain(&toolchain);
+        let manifest = toolchain.join("lib/rustlib/multirust-channel-manifest.toml");
+        let facts = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            format!("{facts}\n[pkg.cargo]\nversion = \"0.100.0 (123456789 2026-10-01)\"\n"),
+        )
+        .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.current_dir(dir.path()).arg("--version");
+        let version = cargo_query(&mut command, rustc.as_os_str()).unwrap();
+        assert_eq!(version.stdout, b"cargo 1.99.0 (123456789 2026-10-01)\n");
+        // A producer's RUSTC is an owned probe launcher; source-toolchain facts
+        // remain in the explicitly selected installation, not beside CARGO.
+        command.env("RUSTUP_TOOLCHAIN", &toolchain);
+        let launcher = dir.path().join("owned-probe-launcher");
+        std::fs::write(&launcher, "must not execute").unwrap();
+        assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
+    }
+
+    #[test]
+    fn owned_cargo_frontdoor_missing_facts_and_unknown_commands_never_recurse() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = dir.path().join("missing-rustc");
+        let mut version = Command::new(std::env::current_exe().unwrap());
+        version.arg("--version").env_remove("RUSTUP_TOOLCHAIN");
+        let error = cargo_query(&mut version, rustc.as_os_str()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owned Cargo version facts unavailable; Cargo was not executed"
+        );
+        let compiler = synthetic_toolchain(&dir.path().join("toolchain"));
+        let mut unknown = Command::new(std::env::current_exe().unwrap());
+        unknown.arg("unknown-command");
+        let error = cargo_query(&mut unknown, compiler.as_os_str()).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported owned Cargo command; Cargo was not executed");
     }
 
     #[test]

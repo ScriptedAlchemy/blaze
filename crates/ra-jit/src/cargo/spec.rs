@@ -17,6 +17,7 @@ use blaze_spec::{
 use blaze_wire::{BuildSpec, Namespace, ProfileSpec, RootRef, SourceRef, StoreIdentity};
 use sha2::{Digest as _, Sha256};
 
+pub(super) mod direct;
 mod producers;
 mod runtime;
 
@@ -35,6 +36,12 @@ pub(crate) fn install_bindings(project: Option<&serde_json::Value>) -> anyhow::R
 /// Validate the explicitly pinned runtime carried only in the private descriptor.
 pub(crate) fn runtime_server(project: &serde_json::Value) -> anyhow::Result<Option<PathBuf>> {
     runtime::server(project)
+}
+
+pub(crate) fn runtime_environment(
+    project: &serde_json::Value,
+) -> anyhow::Result<Option<BTreeMap<OsString, OsString>>> {
+    runtime::described_environment(project)
 }
 
 /// The owned JSON compiler's global debug/link decisions, explicitly supplied by a
@@ -107,7 +114,17 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
             [project.clone(), "--crate".into(), root.clone(), "--out".into(), output.clone()]
                 .into_iter(),
         )?;
-        crate::check::once(args, Path::new(trace))?;
+        if let Err(error) = crate::check::once(args, Path::new(trace)) {
+            let directory = Path::new(output)
+                .parent()
+                .context("check output has no directory")?
+                .join("diagnostics");
+            std::fs::create_dir_all(&directory)?;
+            let said = crate::errors::Said::of_reply(&error.to_string());
+            std::fs::write(directory.join("diagnostics.json"), serde_json::to_vec(&said)?)?;
+            eprintln!("{error:#}");
+            return Ok(101);
+        }
         return Ok(0);
     }
     if let [mode, project, root] = words
@@ -255,19 +272,9 @@ fn companion(file: &Path, suffix: &str) -> PathBuf {
 
 /// The shipped answer table reads toolchain records, never executes its rustc.
 fn host() -> anyhow::Result<(Host, StoreIdentity, PathBuf)> {
-    let home = std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|it| PathBuf::from(it).join(".rustup")))
-        .context("cannot find the toolchain records")?;
-    let mut dirs: Vec<_> = std::fs::read_dir(home.join("toolchains"))?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with(super::toolchain::OURS.trim())
-        })
-        .map(|entry| entry.path())
-        .collect();
-    dirs.sort();
-    let sysroot = dirs.first().context("blaze's release is not installed in rustup")?;
+    use super::toolchain::Chosen;
+    let (Chosen::Given(sysroot) | Chosen::Rustup(sysroot) | Chosen::Own(sysroot)) =
+        super::toolchain::settle().map_err(anyhow::Error::msg)?;
     let rustc = sysroot.join("bin/rustc");
     let answer = |args: &[&str]| -> anyhow::Result<String> {
         let words: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -294,7 +301,7 @@ fn host() -> anyhow::Result<(Host, StoreIdentity, PathBuf)> {
     Ok((
         Host { triple, cfg, cpu: cpu.to_owned(), llvm: cfg!(feature = "llvm") },
         StoreIdentity::from_store(ra_jit_store::FORMAT, &build, commit),
-        sysroot.clone(),
+        sysroot,
     ))
 }
 
@@ -428,6 +435,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     let SourceRef::Root(source) = &given.source else { bail!("replay requires a source snapshot") };
     for program in &mut programs {
         crate::dep_info::ensure_replay_key(&mut program.project)?;
+        source_naming(program, &prepared)?;
         program.project[blaze_wire::native::BINDINGS_FIELD] =
             serde_json::json!(producers.bindings.encode_bindings());
         program.project["blaze_spec_generated_bindings"] =
@@ -441,7 +449,8 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     }
     // All command and unit support checks happen before the first compiler starts.
     for program in &mut programs {
-        compile(program, &compiler_env)?;
+        let environment = compiler_for(program, &prepared, &producers, &compiler_env, &sysroot)?;
+        compile(program, &environment)?;
         admit_inputs(program)?;
     }
     prepared.validate_sources(&store)?;
@@ -479,9 +488,88 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         println!("{result}");
         return Ok(0);
     }
-    let env = prepared.execution_environment()?;
+    execute(
+        &programs,
+        &prepared,
+        &compiler_env,
+        &prepared.execution_environment()?,
+        &producers,
+        &sysroot,
+    )
+}
+
+fn source_naming(
+    program: &mut blaze_spec::execution::Program,
+    prepared: &blaze_spec::replay::Prepared,
+) -> anyhow::Result<()> {
+    let native = blaze_spec::assemble::canonical_units(
+        &prepared.resolved.spec.build,
+        &prepared.resolved.graph,
+    )?;
+    let project = &mut program.project;
+    project["blaze_compiler_source_root"] = serde_json::json!({"version":1, "unit":program.unit,
+        "path":crate::compiler_json::path(&prepared.resolved.graph.root)});
+    for krate in project["crates"].as_array_mut().context("no owned source crates")? {
+        let at =
+            krate["blaze_native_unit"].as_u64().context("source crate has no canonical unit")?;
+        let at = usize::try_from(at)?;
+        krate["is_workspace_member"] = native
+            .get(at)
+            .context("source crate unit is outside canonical graph")?
+            .package
+            .member
+            .into();
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RuntimeFailure(anyhow::Error);
+
+impl std::fmt::Display for RuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RuntimeFailure {}
+
+fn execute(
+    programs: &[blaze_spec::execution::Program],
+    prepared: &blaze_spec::replay::Prepared,
+    compiler_env: &BTreeMap<String, OsString>,
+    env: &BTreeMap<String, OsString>,
+    producers: &producers::Producers,
+    sysroot: &Path,
+) -> anyhow::Result<i32> {
+    execute_inner(programs, prepared, compiler_env, env, producers, sysroot)
+        .map_err(|error| RuntimeFailure(error).into())
+}
+
+fn execute_inner(
+    programs: &[blaze_spec::execution::Program],
+    prepared: &blaze_spec::replay::Prepared,
+    compiler_env: &BTreeMap<String, OsString>,
+    env: &BTreeMap<String, OsString>,
+    producers: &producers::Producers,
+    sysroot: &Path,
+) -> anyhow::Result<i32> {
+    let given = &prepared.resolved.spec.build;
+    let native = blaze_spec::assemble::canonical_units(given, &prepared.resolved.graph)?;
     let mut failed = 0;
-    for program in programs.iter().filter(|program| program.run) {
+    let mut running: Vec<_> = programs.iter().filter(|program| program.run).collect();
+    if matches!(given.command, blaze_wire::Command::Test(_)) {
+        running.sort_by_key(|program| {
+            let unit = native[program.unit as usize];
+            (
+                program.output == blaze_spec::execution::Output::Doctest,
+                &unit.package.name,
+                unit.target.kind,
+                &unit.target.name,
+            )
+        });
+    }
+    for program in running {
         let run = match &given.command {
             blaze_wire::Command::Run(run) | blaze_wire::Command::Test(run) => run,
             _ => unreachable!("the execution plan runs only run/test commands"),
@@ -503,16 +591,62 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
                 super::say::status(false, "Running", &format!("{prefix}{}", relative.display()));
             }
         }
+        let root = native[program.unit as usize];
+        let mut runtime_unit = producers
+            .runtime
+            .get(&program.unit)
+            .context("root has no runtime environment")?
+            .clone();
+        if matches!(
+            root.target.kind,
+            blaze_metadata::units::TargetKind::Test | blaze_metadata::units::TargetKind::Bench
+        ) {
+            for binary in programs.iter().filter(|binary| {
+                let unit = native[binary.unit as usize];
+                !unit.test
+                    && unit.target.kind == blaze_metadata::units::TargetKind::Bin
+                    && unit.package.id == root.package.id
+            }) {
+                runtime_unit.env.insert(
+                    format!("CARGO_BIN_EXE_{}", native[binary.unit as usize].target.name),
+                    binary.executable.as_os_str().to_owned(),
+                );
+            }
+        }
+        let directory = program.executable.parent().context("runtime artifact has no parent")?;
+        let internal = directory.file_name().is_some_and(|name| {
+            name == "deps"
+                || name == "examples"
+                || name.to_string_lossy().starts_with("unit-")
+                || name.to_string_lossy().starts_with("doctest-")
+        });
+        let profile = if internal {
+            directory.parent().context("runtime profile has no parent")?
+        } else {
+            directory
+        };
+        let mut inherited = env.clone();
+        inherited.extend(run.env.iter().map(|(name, value)| (name.clone(), value.into())));
+        let runtime_env = runtime::environment(
+            &runtime_unit,
+            &inherited,
+            profile,
+            &sysroot.join("lib/rustlib").join(&prepared.host.triple).join("lib"),
+            &prepared.host.triple,
+        )?;
         let mut command = if program.output == blaze_spec::execution::Output::Doctest {
             let mut command = Command::new(std::env::current_exe()?);
-            command.env_clear().envs(&compiler_env);
+            let environment = compiler_for(program, prepared, producers, compiler_env, sysroot)?;
+            command.env_clear().envs(&environment);
+            let variable = super::loader::variable(&prepared.host.triple);
+            command.env(variable, &runtime_env[variable]);
             command.args(["cargo", "spec", "--compiler-doctest"]);
             command.arg(program.executable.parent().unwrap().join("rust-project.json"));
             command.arg(&program.crate_name);
             command
         } else {
             let mut command = Command::new(&program.executable);
-            command.env_clear().envs(&env).envs(run.env.iter().map(|(k, v)| (k, v)));
+            command.env_clear().envs(&runtime_env);
             command
         };
         if let blaze_wire::Command::Test(_) = &given.command {
@@ -528,7 +662,9 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         }
         let code = if program.output == blaze_spec::execution::Output::Doctest {
             let project = program.executable.parent().unwrap().join("rust-project.json");
-            let described = crate::compiler_json::write(&project, &program.project)?;
+            let mut description = program.project.clone();
+            runtime::install_environment(&mut description, &runtime_env);
+            let described = crate::compiler_json::write(&project, &description)?;
             command.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped());
             let mut child = command.spawn()?;
             if let Err(error) =
@@ -543,7 +679,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
             command.status()?.code().unwrap_or(1)
         };
         if code != 0 {
-            failed = code;
+            failed = if matches!(given.command, blaze_wire::Command::Test(_)) { 101 } else { code };
             if !run.no_fail_fast {
                 break;
             }
@@ -613,9 +749,68 @@ fn compiler_environment(
     Ok(env)
 }
 
+fn compiler_for(
+    program: &blaze_spec::execution::Program,
+    prepared: &blaze_spec::replay::Prepared,
+    producers: &producers::Producers,
+    inherited: &BTreeMap<String, OsString>,
+    sysroot: &Path,
+) -> anyhow::Result<BTreeMap<String, OsString>> {
+    let libraries = producers
+        .compiler_libraries
+        .get(&program.unit)
+        .context("root has no host library context")?;
+    let mut inherited = inherited.clone();
+    inherited.insert("CARGO".into(), producers.cargo.as_os_str().to_owned());
+    if libraries.is_empty() {
+        return Ok(inherited);
+    }
+    let profile = program.executable.parent().context("compiler artifact has no directory")?;
+    runtime::environment(
+        &runtime::Unit { env: BTreeMap::new(), libraries: libraries.clone() },
+        &inherited,
+        profile,
+        &sysroot.join("lib/rustlib").join(&prepared.host.triple).join("lib"),
+        &prepared.host.triple,
+    )
+}
+
 fn compile(
     program: &mut blaze_spec::execution::Program,
     env: &BTreeMap<String, OsString>,
+) -> anyhow::Result<()> {
+    compile_at(program, env, None)
+}
+
+#[derive(Debug)]
+struct CompilerFailure(crate::errors::Said);
+
+impl std::fmt::Display for CompilerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CompilerFailure {}
+
+fn compiler_diagnostics(directory: &Path, stderr: &str) -> anyhow::Result<crate::errors::Said> {
+    match std::fs::read(directory.join("diagnostics.json")) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).context("invalid owned compiler diagnostic receipt")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let message =
+                stderr.rsplit_once("Error: ").map_or(stderr, |(_, message)| message).trim();
+            Ok(crate::errors::Said::one(crate::errors::of_none(message)))
+        }
+        Err(error) => Err(error).context("reading owned compiler diagnostic receipt"),
+    }
+}
+
+fn compile_at(
+    program: &mut blaze_spec::execution::Program,
+    env: &BTreeMap<String, OsString>,
+    cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
     let dir = program.executable.parent().context("artifact has no directory")?;
     std::fs::create_dir_all(dir)?;
@@ -626,7 +821,7 @@ fn compile(
     command
         .env_clear()
         .envs(env)
-        .current_dir(dir)
+        .current_dir(cwd.unwrap_or(dir))
         .env("RA_JIT_PROJECT_STDIN", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -647,6 +842,7 @@ fn compile(
                 command.arg("--exe").arg(&program.executable);
             }
             command.arg("--inputs").arg(dir.join("inputs.cbor"));
+            command.arg("--report").arg(dir.join("diagnostics"));
         }
     }
     if program.harness && program.output == blaze_spec::execution::Output::Executable {
@@ -667,11 +863,9 @@ fn compile(
     let output = child.wait_with_output()?;
     std::fs::write(dir.join("compiler.log"), &output.stderr)?;
     let said = String::from_utf8_lossy(&output.stderr);
-    ensure!(
-        output.status.success(),
-        "owned replay compiler failed for {}: {said}",
-        program.crate_name
-    );
+    if !output.status.success() {
+        return Err(CompilerFailure(compiler_diagnostics(&dir.join("diagnostics"), &said)?).into());
+    }
     ensure!(
         !said.lines().any(|line| line.contains(" functions in it ra-jit could not compile")
             && !line.ends_with(", 0 functions in it ra-jit could not compile")),
@@ -701,6 +895,9 @@ pub(crate) fn admit_trace(
     inputs: &crate::dep_info::ReplayTrace,
     project: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    if project.get("blaze_direct_execution").is_some() {
+        return direct::admit_trace(inputs, project);
+    }
     let bound = &project["blaze_spec_inputs"];
     let root = Path::new(bound["root"].as_str().context("no admitted source root")?);
     let store = Path::new(bound["store"].as_str().context("no admitted source store")?);
@@ -776,6 +973,28 @@ pub(crate) fn admit_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_failure_receipts_preserve_diagnostics_and_reject_corruption() {
+        let work = tempfile::tempdir().unwrap();
+        let diagnostic = crate::errors::Diagnostic {
+            code: Some("E0308".into()),
+            message: "expected u32, found bool".into(),
+            span: None,
+        };
+        let said = crate::errors::Said::one(diagnostic);
+        std::fs::write(work.path().join("diagnostics.json"), serde_json::to_vec(&said).unwrap())
+            .unwrap();
+        assert_eq!(compiler_diagnostics(work.path(), "unrelated compiler progress").unwrap(), said);
+        std::fs::write(work.path().join("diagnostics.json"), b"{truncated").unwrap();
+        assert!(compiler_diagnostics(work.path(), "error: replacement text").is_err());
+        std::fs::remove_file(work.path().join("diagnostics.json")).unwrap();
+        let failure =
+            compiler_diagnostics(work.path(), "progress\nError: native linker could not start\n")
+                .unwrap();
+        assert_eq!(failure.0[0].code, None);
+        assert_eq!(failure.0[0].message, "native linker could not start");
+    }
 
     fn profile() -> ProfileSpec {
         ProfileSpec {

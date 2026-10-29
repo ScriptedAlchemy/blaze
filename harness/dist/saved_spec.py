@@ -131,6 +131,59 @@ def native_fixture(root):
     write(root, "src/main.rs", 'unsafe extern "C" { fn native_answer() -> u32; }\nfn main() { println!("{}", unsafe { native_answer() }); }\n')
 
 
+def dynamic_producer_fixture(root):
+    write(root, "Cargo.toml", '[workspace]\nmembers=["app","native","mac"]\nresolver="2"\n')
+    write(root, "Cargo.lock", '''version=4
+[[package]]
+name="saved-dynamic-app"
+version="0.1.0"
+dependencies=["saved-dynamic-macro","saved-dynamic-native"]
+[[package]]
+name="saved-dynamic-macro"
+version="0.1.0"
+dependencies=["saved-dynamic-native"]
+[[package]]
+name="saved-dynamic-native"
+version="0.1.0"
+''')
+    write(root, "native/Cargo.toml", '[package]\nname="saved-dynamic-native"\nversion="0.1.0"\nedition="2021"\n')
+    write(root, "native/answer.c", "unsigned saved_dynamic_answer(void) { return 42; }\n")
+    write(root, "native/build.rs", r'''fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = std::process::Command::new(cc);
+    if cfg!(target_os="macos") {
+        command.args(["-dynamiclib", "-Wl,-install_name,libsaved_dynamic.dylib"])
+            .arg("answer.c").arg("-o").arg(out.join("libsaved_dynamic.dylib"));
+    } else {
+        command.args(["-shared", "-fPIC", "answer.c", "-o"]).arg(out.join("libsaved_dynamic.so"));
+    }
+    assert!(command.status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=dylib=saved_dynamic");
+    println!("cargo:rerun-if-changed=answer.c");
+}
+''')
+    write(root, "native/src/lib.rs", 'unsafe extern "C" { fn saved_dynamic_answer() -> u32; }\npub fn answer() -> u32 { unsafe { saved_dynamic_answer() } }\n')
+    write(root, "mac/Cargo.toml", '[package]\nname="saved-dynamic-macro"\nversion="0.1.0"\nedition="2021"\n[lib]\nproc-macro=true\n[dependencies]\nnative={package="saved-dynamic-native",path="../native"}\n')
+    write(root, "mac/src/lib.rs", 'extern crate proc_macro;\n#[proc_macro] pub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { format!("{}u32", native::answer()).parse().unwrap() }\n')
+    write(root, "app/Cargo.toml", '[package]\nname="saved-dynamic-app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nnative={package="saved-dynamic-native",path="../native"}\nmac={package="saved-dynamic-macro",path="../mac"}\n[build-dependencies]\nnative={package="saved-dynamic-native",path="../native"}\n')
+    write(root, "app/build.rs", 'fn main() { let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()); std::fs::write(out.join("generated.rs"), format!("const GENERATED: u32 = {};", native::answer())).unwrap(); println!("cargo:rustc-env=CARGO_BIN_EXE_saved-dynamic-app=source-value"); }\n')
+    write(root, "app/src/main.rs", 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\nfn main() { let cargo=std::path::Path::new(env!("CARGO")); println!("{}|{}|{}|{}", native::answer(), mac::answer!(), GENERATED, cargo.is_absolute() && cargo.is_file()); }\n')
+    write(root, "app/tests/runtime.rs", '#[test] fn binary_environment() { assert_eq!(env!("CARGO_BIN_EXE_saved-dynamic-app"), "source-value"); let runtime=std::env::var_os("CARGO_BIN_EXE_saved-dynamic-app").unwrap(); assert!(std::path::Path::new(&runtime).is_file()); assert_ne!(runtime, std::ffi::OsString::from("source-value")); }\n')
+
+
+def no_rpath_control(runner, name, files, env, cwd):
+    files = sorted(set(map(Path, files)))
+    assert files, "native loader control has no linked artifacts"
+    tool = shutil.which("readelf" if sys.platform.startswith("linux") else "otool", path=env["PATH"])
+    assert tool, "native loader control tool is unavailable"
+    for index, file in enumerate(files):
+        command = [tool, "-d" if sys.platform.startswith("linux") else "-l", file]
+        text, _ = runner.run(f"{name}-rpath-control-{index}", command, env, cwd, guarded=False)
+        assert not any(marker in text for marker in ("(RPATH)", "(RUNPATH)", "LC_RPATH")), (file, text)
+
+
 def workspace_libraries(root):
     write(root, "Cargo.toml", '[workspace]\nmembers=["a","b"]\nresolver="2"\n')
     for name, value in (("a", 41), ("b", 1)):
@@ -218,6 +271,44 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     runner.run("native-compiler-bytes-changed", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile,
                expected=None, contains="platform")
     assert list(Path(str(saved) + ".outputs").glob("replay-*/result.json")) == results
+
+    project = work / "dynamic-producers"
+    dynamic_producer_fixture(project)
+    dynamic_env = dict(env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-product-target"))
+    dynamic_oracle = dict(oracle_env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-oracle-target"))
+    command = ["run", "-p", "saved-dynamic-app", *profile]
+    expected, _ = runner.run("dynamic-reference", [real / "bin/cargo", *command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
+    assert expected == "42|42|42|true\n", expected
+    extension = ".so" if sys.platform.startswith("linux") else ".dylib"
+    reference_target = Path(dynamic_oracle["CARGO_TARGET_DIR"])
+    controls = [reference_target / "debug/saved-dynamic-app", *reference_target.rglob("libsaved_dynamic" + extension), *reference_target.rglob("libsaved_dynamic_macro*" + extension), *reference_target.rglob("build-script-build")]
+    no_rpath_control(runner, "dynamic-reference", controls, dynamic_oracle, project)
+    actual, _ = runner.run("dynamic-direct", [blaze, "cargo", *command, "--locked", "--offline"], dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+    assert actual == expected, (actual, expected)
+    test_command = ["test", "-p", "saved-dynamic-app", "--test", "runtime", *profile]
+    test_reference, _ = runner.run("dynamic-test-reference", [real / "bin/cargo", *test_command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
+    test_direct, _ = runner.run("dynamic-test-direct", [blaze, "cargo", *test_command, "--locked", "--offline"], dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+    from buildspec import parse_run
+    assert parse_run(test_direct) == parse_run(test_reference), (test_direct, test_reference)
+    test_spec = bundle / "dynamic-producer-tests.cbor"
+    runner.run("dynamic-test-save", [blaze, "cargo", "spec", "--out", test_spec, *test_command], dynamic_env, project)
+    saved = bundle / "dynamic-producers.cbor"
+    runner.run("dynamic-save", [blaze, "cargo", "spec", "--out", saved, *command], dynamic_env, project)
+    shutil.rmtree(project)
+    actual, _ = runner.run("dynamic-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile)
+    assert actual == expected, (actual, expected)
+    test_replay, _ = runner.run("dynamic-test-replay", [blaze, "cargo", "spec", "--run", test_spec], hostile_env, hostile)
+    assert parse_run(test_replay) == parse_run(test_reference), (test_replay, test_reference)
+    outputs = Path(str(saved) + ".outputs")
+    controls = [*outputs.rglob("libsaved_dynamic" + extension), *outputs.rglob("libsaved_dynamic_macro" + extension), *outputs.rglob("build-script-build")]
+    for receipt in outputs.glob("replay-*/result.json"):
+        controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
+    no_rpath_control(runner, "dynamic-product", controls, env, hostile)
+    test_outputs = Path(str(test_spec) + ".outputs")
+    controls = [*test_outputs.rglob("libsaved_dynamic" + extension), *test_outputs.rglob("libsaved_dynamic_macro" + extension), *test_outputs.rglob("build-script-build")]
+    for receipt in test_outputs.glob("replay-*/result.json"):
+        controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
+    no_rpath_control(runner, "dynamic-test-product", controls, env, hostile)
 
     project = work / "workspace-libraries"
     workspace_libraries(project)

@@ -31,6 +31,8 @@ renamed_build = { package = "build_helper", path = "../build-helper" }
     text = (root / "shared/Cargo.toml").read_text()
     (root / "shared/Cargo.toml").write_text(text.replace('edition = "2021"', 'edition = "2021"\nlinks = "host_bits"'))
     (root / "shared/build.rs").write_text('''fn main() {
+    assert!(cfg!(any(unix, windows)));
+    assert_eq!(file!(), "shared/build.rs");
     let domain = if std::env::var_os("CARGO_FEATURE_HOST").is_some() {
         assert!(std::env::var_os("CARGO_FEATURE_TARGET").is_none());
         "host-only"
@@ -46,8 +48,10 @@ name = "build_helper"
 version = "0.1.0"
 edition = "2021"
 ''')
-    (helper / "lib.rs").write_text('pub fn label() -> &' + "'static str { \"host-only\" }\n")
+    (helper / "lib.rs").write_text('pub fn label() -> &' + "'static str { assert_eq!(file!(), \"build-helper/src/lib.rs\"); \"host-only\" }\n")
     (derive / "build.rs").write_text('''fn main() {
+    assert!(cfg!(any(unix, windows)));
+    assert_eq!(file!(), "derive/build.rs");
     assert!(std::env::var_os("CARGO_FEATURE_SCRIPT_FEATURE").is_some());
     let label = renamed_build::label();
     assert_eq!(std::env::var("DEP_HOST_BITS_DOMAIN").unwrap(), label);
@@ -63,6 +67,7 @@ edition = "2021"
 }
 ''')
     text = (derive / "src/lib.rs").read_text().replace(
+        "shared::label()", '{ assert_eq!(file!(), "derive/src/lib.rs"); shared::label() }').replace(
         "shared::label()", '{ assert_eq!(generated::LABEL, env!("PRODUCER_SCRIPT_LABEL")); shared::label() }')
     (derive / "src/lib.rs").write_text('''#[cfg(not(producer_generated))]
 compile_error!("missing producer script cfg");
@@ -115,6 +120,8 @@ pub fn label(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         text = (root / "Cargo.toml").read_text().replace(
             '"build-helper"]', '"build-helper", "inner", "seed", "script-helper"]')
         (root / "Cargo.toml").write_text(text)
+    for source in (root / "shared/build.rs", derive / "build.rs", helper / "lib.rs", derive / "src/lib.rs"):
+        source.write_text('#[cfg(rust_analyzer)]\ncompile_error!("producer compiler inherited analyzer cfg");\n' + source.read_text())
     return root
 
 

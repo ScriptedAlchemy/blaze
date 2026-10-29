@@ -23,9 +23,7 @@ use super::{
     daemon::{Checkout, Reply, Request, WorkerConfig},
     plan::Plan as Linked,
     run, say,
-    state::{
-        as_built, configured_env, library_path, place, repository, run_env, sysroot_libraries,
-    },
+    state::{as_built, configured_env, place, repository},
 };
 
 /// How many of the functions blaze could not compile a failed build names.
@@ -81,10 +79,13 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
             &format!("{} v{} ({})", package.name, package.version, at.display()),
         );
     }
-    if let Err(why) = whole(asked, &cwd, &metadata, &config, &programs, &dir) {
-        say::error(&why);
-        return Ok(Some(FAILED));
-    }
+    let runtime = match whole(asked, &cwd, &metadata, &config, &programs, &dir) {
+        Ok(runtime) => runtime,
+        Err(why) => {
+            say::error(&why);
+            return Ok(Some(FAILED));
+        }
+    };
     let took = started.elapsed().as_secs_f64();
     let profile = asked.profile();
     let finished = format!("`{profile}` profile [ra-jit] target(s) in {took:.2}s");
@@ -92,7 +93,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     if asked.subcommand != Subcommand::Run {
         return Ok(Some(0));
     }
-    ran(asked, &cwd, &programs).map(Some)
+    ran(asked, &cwd, &programs, &runtime).map(Some)
 }
 
 /// Has the daemon build `programs` whole into `dir`, and puts each where cargo would. A
@@ -105,20 +106,41 @@ fn whole(
     config: &WorkerConfig,
     programs: &[Program],
     dir: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<super::runtime_context::Context>, String> {
     let checkout = checkout(asked, cwd, metadata, config, programs, dir);
-    let reply = client::ask(Request::Build(super::asking(&checkout)), Start::IfMissing)
+    let compiler = std::env::current_exe().map_err(|it| format!("finding owned compiler: {it}"))?;
+    let cargo = super::runtime_context::cargo_frontend(&compiler, &dir.join("cargo-frontend"))
         .map_err(|it| format!("{it:#}"))?;
-    let built = match reply {
-        Some(Reply::Synced { programs, .. }) => programs,
+    let mut request = super::asking(&checkout);
+    request.env.remove("CARGO");
+    let env = request
+        .native_env
+        .take()
+        .unwrap_or_default()
+        .over([("CARGO".into(), cargo.into_os_string())]);
+    request.env =
+        env.unicode().iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+    request.native_env = Some(env);
+    let reply =
+        client::ask(Request::Build(request), Start::IfMissing).map_err(|it| format!("{it:#}"))?;
+    let (built, runtime) = match reply {
+        Some(Reply::Synced { programs, runtime, .. }) => (programs, runtime),
         Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, &checkout, &reason)),
         None => return Err(client::why_none()),
         Some(other) => return Err(format!("the daemon answered {other:?}")),
     };
-    for ((program, plan), built) in std::iter::zip(programs, &checkout.programs).zip(built) {
+    if built.len() != programs.len() {
+        return Err("the whole-build reply has no matching program results".into());
+    }
+    for (program, built) in programs.iter().zip(&built) {
         if let Err(why) = built {
-            return Err(format!("could not build `{}`: {}", program.name, why.why()));
+            return Err(format!("could not build `{}`: {}", program.name, why.clone().why()));
         }
+    }
+    if runtime.len() != programs.len() || runtime.iter().any(Option::is_none) {
+        return Err("the whole-build reply has no matching runtime contexts".into());
+    }
+    for (program, plan) in programs.iter().zip(&checkout.programs) {
         let _unwritten = crate::splice::unwritten(&plan.binary);
         let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
         if !stand_ins.is_empty() {
@@ -144,7 +166,10 @@ fn whole(
         place(&plan.binary, &program.executable)
             .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
     }
-    Ok(())
+    runtime
+        .into_iter()
+        .map(|context| context.ok_or_else(|| "whole build omitted its runtime context".into()))
+        .collect()
 }
 
 /// The worker configuration of a whole build asked in `cwd`, of the workspace at `root` whose
@@ -309,7 +334,12 @@ fn without_hashes(name: &str) -> String {
 }
 
 /// Runs the program `asked` names, as `cargo run` does.
-fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i32> {
+fn ran(
+    asked: &Invocation,
+    cwd: &Path,
+    programs: &[Program],
+    runtime: &[super::runtime_context::Context],
+) -> anyhow::Result<i32> {
     let named = asked.flags.bin.as_ref().or(asked.flags.example.as_ref());
     let mut chosen: Vec<&Program> =
         programs.iter().filter(|it| named.is_none_or(|name| it.name == *name)).collect();
@@ -330,14 +360,23 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
         program.executable.strip_prefix(cwd).unwrap_or(&program.executable).display().to_string();
     let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
     say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
+    let at = programs.iter().position(|candidate| std::ptr::eq(candidate, program)).unwrap();
+    let mut inherited: BTreeMap<_, _> = std::env::vars_os().collect();
     for it in configured_env(cwd) {
-        if it.force || std::env::var_os(&it.name).is_none() {
-            command.env(&it.name, &it.value);
+        if it.force || !inherited.contains_key(std::ffi::OsStr::new(&it.name)) {
+            inherited.insert(it.name.into(), it.value.into());
         }
     }
-    command.args(asked.program_args()).envs(run_env(&program.package, &[]));
-    command.envs(library_path(&program.executable, sysroot_libraries().as_deref()));
+    let directory = program.executable.parent().context("program has no profile directory")?;
+    let profile = if directory.file_name().is_some_and(|name| name == "examples" || name == "deps")
+    {
+        directory.parent().context("program has no profile directory")?
+    } else {
+        directory
+    };
+    let environment = runtime[at].environment(profile, &crate::process::Native::of(inherited))?;
+    let mut command = Command::new(&program.executable);
+    command.env_clear().envs(environment.vars()).args(asked.program_args());
     as_built(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
     Ok(run::exit_code(status))

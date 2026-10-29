@@ -67,6 +67,8 @@ pub struct ProducedUnit {
     pub native: blaze_wire::native::Unit,
     /// An immutable, leased macro image, when this unit is an expansion leaf.
     pub proc_macro: Option<PathBuf>,
+    /// Explicit build-script environment directives, applied after Cargo-derived values.
+    pub rustc_env: BTreeMap<String, String>,
 }
 
 /// Complete target/profile/features cfg before a producer adds its output.
@@ -355,7 +357,7 @@ pub fn programs_with(
                     .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.clone())))
                     .collect();
             }
-            if unit.test {
+            if matches!(unit.target.kind, TargetKind::Test | TargetKind::Bench) {
                 for &binary in &roots {
                     let other = native[binary as usize];
                     if !other.test
@@ -368,6 +370,11 @@ pub fn programs_with(
                         );
                     }
                 }
+            }
+            if let Some(configured) = configured {
+                crate_env.extend(
+                    configured.rustc_env.iter().map(|(name, value)| (name.clone(), value.into())),
+                );
             }
             let kind = if spec.test {
                 "test"

@@ -624,11 +624,13 @@ fn source_path(
     let source_root = db.source_root(source_root).source_root(db);
     let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
     let path = paths::native::resolve(Path::new(&logical)).ok()?;
-    let base = base.and_then(|base| path.strip_prefix(base).ok());
+    let root = paths::native::resolve(root).ok()?;
+    let base = base.and_then(|base| paths::native::resolve(base).ok());
+    let base = base.as_deref().and_then(|base| path.strip_prefix(base).ok());
     // Cargo names source-replaced registry files absolutely even when vendor/
     // happens to live below the workspace. Only workspace files are relative.
     let relative =
-        (!source_root.is_library).then(|| path.strip_prefix(root).ok().or(base)).flatten();
+        (!source_root.is_library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
     Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
@@ -2137,6 +2139,16 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
     let mut found = crates_called(db, krate, args);
+    if !args.library
+        && krate == args.krate
+        && std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && let Some(unit) =
+            crate::compiler_json::source_unit(&crate::compiler_json::read(&args.project)?)?
+    {
+        found.retain(|krate| {
+            ide_db::base_db::Crate::from(*krate).extra_data(db).blaze_native_unit == Some(unit)
+        });
+    }
     if args.library {
         found.retain(|it| ide_db::base_db::Crate::from(*it).data(db).origin.is_lang());
     }
@@ -2816,6 +2828,76 @@ impl Checkouts {
         self.inputs.world_of(&roots)
     }
 
+    fn runtime_context(
+        &self,
+        db: &RootDatabase,
+        args: &Args,
+        triple: &str,
+    ) -> anyhow::Result<cargo::runtime_context::Context> {
+        use std::ffi::OsString;
+        let roots = crates_named(db, &args.krate, args)?;
+        let [root] = roots.as_slice() else {
+            anyhow::bail!("runtime context requires one selected program crate");
+        };
+        let root = ide_db::base_db::Crate::from(*root);
+        let mut places = vec![args.checkout.clone()];
+        places.extend(args.base.clone());
+        let outputs = scripts::runtime_outputs(&self.inputs.world_of(&places))?;
+        let native_env =
+            |krate: ide_db::base_db::Crate| -> anyhow::Result<BTreeMap<OsString, OsString>> {
+                let mut env: BTreeMap<_, _> =
+                    krate.env(db).iter().map(|(key, value)| (key.into(), value.into())).collect();
+                if let Some(unit) = native_inputs::native_unit_for_crate(db, krate)? {
+                    env.extend(unit.env.clone());
+                }
+                Ok(env)
+            };
+        let root_env = native_env(root)?;
+        let mut environment: BTreeMap<OsString, OsString> = root_env
+            .iter()
+            .filter(|(name, _)| name.to_str().is_some_and(cargo::runtime_context::package_variable))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let output_of = |env: &BTreeMap<OsString, OsString>| {
+            env.get(std::ffi::OsStr::new("OUT_DIR"))
+                .and_then(|out| outputs.iter().find(|(path, _)| path.as_os_str() == out))
+        };
+        if let Some((out, output)) = output_of(&root_env) {
+            environment.insert("OUT_DIR".into(), out.as_os_str().to_owned());
+            environment.extend(output.env.iter().map(|(name, value)| (name.into(), value.into())));
+        }
+        let cargo = process::native()
+            .vars()
+            .find(|(name, _)| name == "CARGO")
+            .map(|(_, value)| value)
+            .context("whole build has no owned Cargo frontend")?;
+        environment.insert("CARGO".into(), cargo);
+        let mut libraries = Vec::new();
+        let mut seen = FxHashSet::default();
+        let mut pending = vec![root];
+        while let Some(krate) = pending.pop() {
+            if !seen.insert(krate)
+                || krate.data(db).origin.is_lang()
+                || krate.data(db).target_kind.is_proc_macro()
+            {
+                continue;
+            }
+            if let Some((_, output)) = output_of(&native_env(krate)?) {
+                libraries.extend(cargo::loader::artifact_directories(output));
+            }
+            pending
+                .extend(krate.data(db).dependencies.iter().map(|dependency| dependency.crate_id));
+        }
+        let sysroot =
+            SYSROOT.get().and_then(Option::as_ref).context("whole build has no loaded sysroot")?;
+        Ok(cargo::runtime_context::Context {
+            env: process::Native::of(environment),
+            libraries,
+            sysroot_lib: sysroot.join("lib/rustlib").join(triple).join("lib"),
+            triple: triple.to_owned(),
+        })
+    }
+
     /// The checkouts that are no longer what they were loaded from, for a build of
     /// `project` by a process with the variables `env`. A checkout loaded in full is one
     /// when its manifests, cargo's configuration or what its build scripts say changed, and
@@ -3336,11 +3418,12 @@ fn workspace_at(
     {
         let private = crate::compiler_json::read(project)?;
         crate::compiler_json::install_native(&private)?;
+        let source_root = crate::compiler_json::source_root(&private)?;
         let data: project_model::ProjectJsonData = serde_json::from_value(private)
             .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
         let json = project_model::ProjectJson::new(
             Some(manifest.manifest_path().to_owned()),
-            manifest.manifest_path().parent(),
+            source_root.as_deref().unwrap_or_else(|| manifest.manifest_path().parent()),
             data,
         );
         ProjectWorkspace::load_inline(json, &config, &|_| {})?
@@ -6727,6 +6810,10 @@ fn errors_for_the_daemon(args: &Args, said: &errors::Said) -> anyhow::Result<()>
     if let Some(socket) = &args.socket {
         std::fs::write(cargo::daemon::errors_beside(socket), serde_json::to_string(said)?)?;
     }
+    if let Some(report) = &args.report {
+        std::fs::create_dir_all(report)?;
+        std::fs::write(report.join("diagnostics.json"), serde_json::to_vec(said)?)?;
+    }
     Ok(())
 }
 
@@ -6746,7 +6833,7 @@ enum Request {
 impl Request {
     fn parse(line: &str) -> Option<Request> {
         match line {
-            "sync" => Some(Request::Sync),
+            "sync" | "sync-runtime-v1" => Some(Request::Sync),
             "patch" => Some(Request::Patch),
             _ => None,
         }
@@ -6950,6 +7037,7 @@ impl Target {
 /// for the others: only the objects and what went into them are its own.
 struct Program {
     args: Args,
+    runtime: Option<Result<cargo::runtime_context::Context, String>>,
     table: Arc<SymbolTable>,
     known: Rejections,
     unbuilt: Unbuilt,
@@ -7045,6 +7133,8 @@ struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
     native_env: process::Native,
+    /// Requests the versioned private runtime context in this successful build reply.
+    runtime: bool,
     /// The build of the daemon's the request is for: a build is one request to the daemon and
     /// may be several to a worker. A request that names none has a number of its own
     /// ([`Client::of`]), which it holds the output of the scripts under until it is dropped.
@@ -7069,6 +7159,7 @@ impl Client {
                 stream,
                 env,
                 native_env: process::native(),
+                runtime: false,
                 build: scripts::anonymous(),
                 own_build: true,
                 pin: None,
@@ -7079,6 +7170,7 @@ impl Client {
                 stream,
                 env,
                 native_env: process::native(),
+                runtime: false,
                 build,
                 own_build: false,
                 pin: None,
@@ -7602,7 +7694,7 @@ impl Builds {
         for (_, _, client) in clients {
             // A client that hangs up before the answer is not the daemon's problem.
             let _ = match &answer {
-                Ok(built) => writeln!(&client, "ok {built}"),
+                Ok(built) => writeln!(&client, "{}", program.worker_reply(built, client.runtime)),
                 Err(why) => writeln!(&client, "{}", why.reply()),
             };
         }
@@ -7803,7 +7895,8 @@ fn requested(stream: UnixStream) -> Option<Event> {
         && (fields.len() == 1 || target.is_some())
     {
         let env = native_env.unicode();
-        let client = Client::of(stream, env, build);
+        let mut client = Client::of(stream, env, build);
+        client.runtime = fields[0] == "sync-runtime-v1";
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -9205,6 +9298,7 @@ fn run_holding(
         tests,
         tests_now,
         args,
+        runtime: None,
         table: Arc::new(table),
         known,
         unbuilt: Unbuilt::default(),
@@ -9510,7 +9604,7 @@ fn run_holding(
                             && lock(&as_built)
                                 .get(&target.out)
                                 .is_some_and(|it| it.still(&files, &db, view, target, request));
-                        if unchanged && !reach_owed(&target.out) {
+                        if unchanged && !stream.runtime && !reach_owed(&target.out) {
                             let _ = writeln!(&stream, "ok unchanged");
                             continue;
                         }
@@ -9666,6 +9760,7 @@ fn run_holding(
                                 tests: None,
                                 tests_now: None,
                                 args,
+                                runtime: None,
                                 table,
                                 known,
                                 unbuilt,
@@ -10043,6 +10138,15 @@ fn run_holding(
         for &at in &building {
             programs[at].unbuilt.stale |= reach_owed(&programs[at].args.out);
         }
+        for &at in &building {
+            if clients.iter().any(|(index, (_, _, client))| *index == at && client.runtime) {
+                programs[at].runtime = Some(
+                    checkouts
+                        .runtime_context(&db, &programs[at].args, emits.triple())
+                        .map_err(|why| format!("{why:#}")),
+                );
+            }
+        }
         // A program of tests asked for the first time is built with ra-jit's harness then, while
         // nobody edits: the first edit is a patch of it.
         let unharnessed = |at: &usize| {
@@ -10055,8 +10159,12 @@ fn run_holding(
             Some(noticed) => noticed,
             None if stale => (Instant::now(), Duration::ZERO),
             None => {
-                for (_, (_, _, client)) in clients {
-                    let _ = writeln!(&client, "ok unchanged");
+                for (at, (_, _, client)) in clients {
+                    let _ = writeln!(
+                        &client,
+                        "{}",
+                        programs[at].worker_reply("unchanged", client.runtime)
+                    );
                 }
                 continue;
             }
@@ -10262,7 +10370,11 @@ fn run_holding(
                 let program = &mut programs[at];
                 if !program.unbuilt.stale {
                     for (_, _, client) in clients {
-                        let _ = writeln!(&client, "ok unchanged");
+                        let _ = writeln!(
+                            &client,
+                            "{}",
+                            program.worker_reply("unchanged", client.runtime)
+                        );
                     }
                     continue;
                 }
@@ -10275,6 +10387,7 @@ fn run_holding(
                 // What stands in for the program while it is built says what program it is.
                 let away = Program {
                     args: program.args.clone(),
+                    runtime: program.runtime.clone(),
                     table: program.table.clone(),
                     known: Rejections::default(),
                     unbuilt: Unbuilt::default(),
@@ -10450,9 +10563,13 @@ fn run_holding(
                     linking.entry(at).or_default().push(asked);
                     continue;
                 }
-                Some(Ok(built)) => writeln!(client, "ok {built}"),
+                Some(Ok(built)) => {
+                    writeln!(client, "{}", programs[at].worker_reply(built, client.runtime))
+                }
                 Some(Err(why)) => writeln!(client, "{}", why.reply()),
-                None => writeln!(client, "ok unchanged"),
+                None => {
+                    writeln!(client, "{}", programs[at].worker_reply("unchanged", client.runtime))
+                }
             };
         }
         for (at, clients) in linking {
@@ -10474,6 +10591,13 @@ fn run_holding(
             let packs = packs_whole(&programs[at].args);
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
             let link_env = link::Environment::of(&db);
+            let clients: Vec<_> = clients
+                .into_iter()
+                .map(|(_, _, client)| {
+                    let reply = programs[at].worker_reply(&built, client.runtime);
+                    (client, reply)
+                })
+                .collect();
             let linked = std::thread::spawn(move || {
                 let failed = link(
                     link_cmd.as_deref(),
@@ -10499,9 +10623,9 @@ fn run_holding(
                         lock(&as_built).insert(object, from);
                     }
                 }
-                for (_, _, client) in clients {
+                for (client, success_reply) in clients {
                     let _ = match &failed {
-                        None => writeln!(&client, "ok {built}"),
+                        None => writeln!(&client, "{success_reply}"),
                         Some(why) => writeln!(&client, "{}", failed_reply(&why.to_string())),
                     };
                 }
@@ -10639,6 +10763,17 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 }
 
 impl Program {
+    fn worker_reply(&self, built: &str, runtime: bool) -> String {
+        if !runtime {
+            return format!("ok {built}");
+        }
+        match &self.runtime {
+            Some(Ok(context)) => context.reply(built),
+            Some(Err(why)) => failed_reply(why),
+            None => failed_reply("requested runtime context was not captured"),
+        }
+    }
+
     /// Drop this program's link/patch baseline, not its compiled queries or other
     /// programs. A shared output can have been replaced by another worker.
     fn forget_link_baseline(&mut self, binary: Option<&Path>) {
@@ -11275,6 +11410,46 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_diagnostics_report_preserves_the_daemon_error_record() {
+        let work = tempfile::tempdir().unwrap();
+        let report = work.path().join("report");
+        let socket = work.path().join("worker.sock");
+        let args = Args::parse(
+            [
+                "project".to_owned(),
+                "--crate".to_owned(),
+                "app".to_owned(),
+                "--out".to_owned(),
+                work.path().join("app.o").to_str().unwrap().to_owned(),
+                "--report".to_owned(),
+                report.to_str().unwrap().to_owned(),
+                "--socket".to_owned(),
+                socket.to_str().unwrap().to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let source = "let value: u8 = \"text\";";
+        let start = source.find('"').unwrap() as u32;
+        let said = errors::Said::one(errors::at(
+            Some("E0308"),
+            "mismatched types",
+            "src/main.rs",
+            source,
+            syntax::TextRange::new(start.into(), (start + 6).into()),
+        ));
+        errors_for_the_daemon(&args, &said).unwrap();
+        let reported: errors::Said =
+            serde_json::from_slice(&std::fs::read(report.join("diagnostics.json")).unwrap())
+                .unwrap();
+        let daemon: errors::Said =
+            serde_json::from_slice(&std::fs::read(cargo::daemon::errors_beside(&socket)).unwrap())
+                .unwrap();
+        assert_eq!(reported, said);
+        assert_eq!(daemon, said);
+    }
+
     #[test]
     fn direct_builds_preserve_lockfile_policy_for_owned_loads() {
         for (flag, locked, offline) in

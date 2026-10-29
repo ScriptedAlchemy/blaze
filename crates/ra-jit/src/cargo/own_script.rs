@@ -398,6 +398,8 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
 #[derive(Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Planned {
+    #[serde(default)]
+    pub(crate) workspace_member: bool,
     pub(crate) name: String,
     pub(crate) root: PathBuf,
     pub(crate) edition: String,
@@ -418,26 +420,91 @@ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> Strin
     planned_source_description(sysroot, crates, false)
 }
 
+pub(crate) struct SourceNaming<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) members: &'a [bool],
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SourceMode<'a> {
     Legacy,
+    Cargo {
+        root: &'a Path,
+        members: &'a [bool],
+        env: &'a [(OsString, OsString)],
+    },
     Captured {
         profile: Option<&'a Value>,
         units: Option<&'a BTreeMap<u32, blaze_wire::native::Unit>>,
         runtime: Option<&'a Value>,
         bindings: Option<&'a Value>,
+        naming: Option<&'a SourceNaming<'a>>,
     },
 }
 
 pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<String, String> {
-    let (profile, native, runtime, bindings) = match mode {
+    let (profile, native, runtime, bindings, naming) = match mode {
         SourceMode::Legacy => return Ok(described),
-        SourceMode::Captured { profile, units, runtime, bindings } => {
-            (profile, units, runtime, bindings)
+        SourceMode::Cargo { root, members, env } => {
+            if !root.is_absolute() {
+                return Err("compiler source naming root is not absolute".into());
+            }
+            let mut project: Value =
+                serde_json::from_str(&described).map_err(|it| it.to_string())?;
+            let sources = project["crates"].as_array_mut().ok_or("owned source crates")?;
+            if sources.len() != members.len() {
+                return Err("owned compiler source membership does not match its graph".into());
+            }
+            let mut units = BTreeMap::new();
+            for (at, source) in sources.iter_mut().enumerate() {
+                let id = u32::try_from(at).map_err(|_| "too many owned compiler units")?;
+                let mut native: BTreeMap<OsString, OsString> = env.iter().cloned().collect();
+                let overlay: BTreeMap<String, String> =
+                    serde_json::from_value(source["env"].clone())
+                        .map_err(|_| "invalid owned source environment")?;
+                native.extend(overlay.into_iter().map(|(key, value)| (key.into(), value.into())));
+                let flags: Vec<String> = serde_json::from_value(source["codegen_flags"].clone())
+                    .map_err(|_| "invalid owned source flags")?;
+                units.insert(
+                    id,
+                    blaze_wire::native::Unit {
+                        env: native,
+                        flags: flags.into_iter().map(Into::into).collect(),
+                    },
+                );
+                source["is_workspace_member"] = json!(members[at]);
+            }
+            compiler_context(&mut project, None, Some(&units), None, None, None)?;
+            project["blaze_compiler_source_root"] =
+                json!({"version": 1, "unit": 0, "path": crate::compiler_json::path(root)});
+            return serde_json::to_string(&project).map_err(|it| it.to_string());
+        }
+        SourceMode::Captured { profile, units, runtime, bindings, naming } => {
+            (profile, units, runtime, bindings, naming)
         }
     };
     let mut project: Value = serde_json::from_str(&described).map_err(|it| it.to_string())?;
+    compiler_context(&mut project, profile, native, runtime, bindings, naming)?;
+    crate::dep_info::ensure_replay_key(&mut project).map_err(|error| error.to_string())?;
+    serde_json::to_string(&project).map_err(|it| it.to_string())
+}
+
+fn compiler_context(
+    project: &mut Value,
+    profile: Option<&Value>,
+    native: Option<&BTreeMap<u32, blaze_wire::native::Unit>>,
+    runtime: Option<&Value>,
+    bindings: Option<&Value>,
+    naming: Option<&SourceNaming<'_>>,
+) -> Result<(), String> {
     project["compiler_mode"] = Value::Bool(true);
+    if let Some(naming) = naming {
+        if !naming.root.is_absolute() {
+            return Err("compiler source naming root is not absolute".into());
+        }
+        project["blaze_compiler_source_root"] =
+            json!({"version": 1, "unit":0, "path": crate::compiler_json::path(naming.root)});
+    }
     if let Some(runtime) = runtime {
         project["blaze_owned_proc_macro_server"] = runtime.clone();
     }
@@ -451,6 +518,10 @@ pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<Strin
         project["crates"].as_array_mut().ok_or("captured source crates")?.iter_mut().enumerate()
     {
         let kind = if at == 0 && source["is_proc_macro"] != true { "bin" } else { "lib" };
+        if let Some(naming) = naming {
+            source["is_workspace_member"] =
+                (*naming.members.get(at).ok_or("missing compiler source membership")?).into();
+        }
         if let Some(native) = native {
             let id = u32::try_from(at).map_err(|_| "too many captured compiler units")?;
             let unit = native.get(&id).ok_or("missing captured compiler context")?;
@@ -475,8 +546,7 @@ pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<Strin
     if let Some(native) = native {
         project[blaze_wire::native::UNIT_FIELD] = json!(blaze_wire::native::encode_units(native));
     }
-    crate::dep_info::ensure_replay_key(&mut project).map_err(|error| error.to_string())?;
-    serde_json::to_string(&project).map_err(|it| it.to_string())
+    Ok(())
 }
 
 /// The source graph of an owned proc-macro producer. No rustc artifact or unit record
@@ -674,6 +744,53 @@ fn described(krate: &Described, member: bool, native: bool) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cargo_source_naming_keeps_membership_native_context_and_text_trace() {
+        let crates = json!({"crates": [
+            {"display_name":"build_script_build", "root_module":"/workspace/app/build.rs",
+             "is_proc_macro":false, "env":{"CARGO_PKG_NAME":"app"}, "codegen_flags":["-Copt-level=1"]},
+            {"display_name":"helper", "root_module":"/registry/helper/src/lib.rs",
+             "is_proc_macro":false, "env":{"CARGO_PKG_NAME":"helper"}, "codegen_flags":[]},
+        ]});
+        let env =
+            vec![("PATH".into(), "/native/bin".into()), ("CARGO_PKG_NAME".into(), "caller".into())];
+        let project: Value = serde_json::from_str(
+            &with_mode(
+                crates.to_string(),
+                SourceMode::Cargo {
+                    root: Path::new("/workspace"),
+                    members: &[true, false],
+                    env: &env,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(project["compiler_mode"], true);
+        assert_eq!(
+            project["blaze_compiler_source_root"],
+            json!({"version":1,"unit":0,"path":"/workspace"})
+        );
+        assert_eq!(project["crates"][0]["is_workspace_member"], true);
+        assert_eq!(project["crates"][1]["is_workspace_member"], false);
+        assert_eq!(project["crates"][1]["blaze_native_unit"], 1);
+        assert!(project.get(crate::dep_info::TRACE_KEY_FIELD).is_none());
+        let encoded: Vec<u8> =
+            serde_json::from_value(project[blaze_wire::native::UNIT_FIELD].clone()).unwrap();
+        let units = blaze_wire::native::decode_units(&encoded).unwrap();
+        assert_eq!(units[&0].env[std::ffi::OsStr::new("PATH")], "/native/bin");
+        assert_eq!(units[&0].env[std::ffi::OsStr::new("CARGO_PKG_NAME")], "app");
+        assert_eq!(units[&1].env[std::ffi::OsStr::new("CARGO_PKG_NAME")], "helper");
+        assert_eq!(units[&0].flags, vec![OsString::from("-Copt-level=1")]);
+        assert!(
+            with_mode(
+                crates.to_string(),
+                SourceMode::Cargo { root: Path::new("/workspace"), members: &[true], env: &env }
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn captured_private_contexts_keep_instances_and_non_unicode_presence() {
@@ -706,6 +823,7 @@ mod tests {
                 units: Some(&native),
                 runtime: None,
                 bindings: None,
+                naming: None,
             },
         )
         .unwrap();
@@ -745,6 +863,7 @@ mod tests {
     #[test]
     fn captured_descriptions_preserve_authoritative_cfg_and_target_kinds() {
         let source = |name: &str, deps| Planned {
+            workspace_member: false,
             name: name.into(),
             root: std::env::temp_dir().join(format!("{name}.rs")),
             edition: "2021".into(),
@@ -766,6 +885,7 @@ mod tests {
                     units: None,
                     runtime: None,
                     bindings: None,
+                    naming: None,
                 },
             )
             .unwrap(),
@@ -780,7 +900,13 @@ mod tests {
         let captured: Value = serde_json::from_str(
             &with_mode(
                 macro_graph,
-                SourceMode::Captured { profile: None, units: None, runtime: None, bindings: None },
+                SourceMode::Captured {
+                    profile: None,
+                    units: None,
+                    runtime: None,
+                    bindings: None,
+                    naming: None,
+                },
             )
             .unwrap(),
         )
@@ -790,10 +916,41 @@ mod tests {
     }
 
     #[test]
+    fn captured_source_naming_preserves_workspace_and_external_producer_paths() {
+        let naming =
+            SourceNaming { root: Path::new("/original/workspace"), members: &[true, false] };
+        let project = json!({"crates": [
+            {"display_name": "build_script_build", "root_module": "/original/workspace/app/build.rs", "is_proc_macro": false},
+            {"display_name": "helper", "root_module": "/registry/helper/src/lib.rs", "is_proc_macro": false},
+        ]});
+        let described = with_mode(
+            project.to_string(),
+            SourceMode::Captured {
+                profile: None,
+                units: None,
+                runtime: None,
+                bindings: None,
+                naming: Some(&naming),
+            },
+        )
+        .unwrap();
+        let project: Value = serde_json::from_str(&described).unwrap();
+        assert_eq!(
+            project["blaze_compiler_source_root"],
+            json!({"version":1,"unit":0,"path":"/original/workspace"})
+        );
+        assert_eq!(project["crates"][0]["root_module"], "/original/workspace/app/build.rs");
+        assert_eq!(project["crates"][0]["is_workspace_member"], true);
+        assert_eq!(project["crates"][1]["is_workspace_member"], false);
+        assert_eq!(project["crates"][1]["root_module"], "/registry/helper/src/lib.rs");
+    }
+
+    #[test]
     fn planned_macro_root_is_source_only_and_preserves_host_graph() {
         let crates = || {
             vec![
                 Planned {
+                    workspace_member: false,
                     name: "derive".into(),
                     root: "/sources/derive/src/lib.rs".into(),
                     edition: "2021".into(),
@@ -804,6 +961,7 @@ mod tests {
                     proc_macro: None,
                 },
                 Planned {
+                    workspace_member: false,
                     name: "dependency".into(),
                     root: "/sources/dependency/src/lib.rs".into(),
                     edition: "2021".into(),
@@ -835,6 +993,7 @@ mod tests {
 
     fn source_crate(name: &str, deps: Vec<(String, usize)>) -> Planned {
         Planned {
+            workspace_member: false,
             name: name.into(),
             root: format!("/sources/{name}/src/lib.rs").into(),
             edition: "2021".into(),

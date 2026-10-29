@@ -163,7 +163,19 @@ pub struct Resolved {
 
 /// Resolve without discarding the native graph an owned executor needs.
 pub fn resolve(request: &Request, ctx: &Context<'_>) -> Result<Resolved, Refusal> {
-    resolve_with_platform(request, ctx, None, None)
+    resolve_with_platform(request, ctx, Platform::Bound, None)
+}
+
+/// Plan an ordinary command over live inputs without claiming portable native bindings.
+pub fn resolve_live(request: &Request, ctx: &Context<'_>) -> Result<Resolved, Refusal> {
+    resolve_with_platform(request, ctx, Platform::Live, None)
+}
+
+#[derive(Clone, Copy)]
+enum Platform<'a> {
+    Bound,
+    Live,
+    Recorded(&'a ExecPlatform),
 }
 
 /// Reproduce a spec against an already authenticated platform description without
@@ -174,7 +186,7 @@ pub fn resolve_recorded(
     ctx: &Context<'_>,
     platform: &ExecPlatform,
 ) -> Result<Resolved, Refusal> {
-    resolve_with_platform(request, ctx, Some(platform), None)
+    resolve_with_platform(request, ctx, Platform::Recorded(platform), None)
 }
 
 /// Reproduce from authenticated locked source roots without invoking Git or registry
@@ -189,7 +201,7 @@ pub fn resolve_captured(
     resolve_with_platform(
         request,
         ctx,
-        Some(platform),
+        Platform::Recorded(platform),
         Some(blaze_metadata::CapturedResolution { sources, facts }),
     )
 }
@@ -197,7 +209,7 @@ pub fn resolve_captured(
 fn resolve_with_platform(
     request: &Request,
     ctx: &Context<'_>,
-    platform: Option<&ExecPlatform>,
+    platform: Platform<'_>,
     sources: Option<blaze_metadata::CapturedResolution<'_>>,
 ) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
@@ -355,14 +367,14 @@ impl Opened<'_> {
 /// This is [`build_spec`] with the graph given, so that a spec is made without resolving
 /// anything: tests hand it graphs they build.
 pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Result<Spec, Refusal> {
-    Ok(assemble_with_inputs(request, ctx, graph, None)?.0)
+    Ok(assemble_with_inputs(request, ctx, graph, Platform::Bound)?.0)
 }
 
 fn assemble_with_inputs(
     request: &Request,
     ctx: &Context<'_>,
     graph: &UnitGraph,
-    recorded: Option<&ExecPlatform>,
+    platform: Platform<'_>,
 ) -> Result<(Spec, Vec<(PathBuf, Vec<u8>)>), Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let host = ctx.host;
@@ -424,9 +436,10 @@ fn assemble_with_inputs(
             env: &machine_env,
             linker: None,
         };
-        let platform = match recorded {
-            Some(platform) => platform.clone(),
-            None => platform::exec_platform(&machine, ctx.probe)?,
+        let platform = match platform {
+            Platform::Recorded(platform) => platform.clone(),
+            Platform::Bound => platform::exec_platform(&machine, ctx.probe)?,
+            Platform::Live => platform::facts(&machine, ctx.probe)?,
         };
         let platform_digest = digest_of(&platform);
 

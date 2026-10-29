@@ -437,6 +437,7 @@ pub(crate) fn of(
         );
         set("CARGO_CRATE_NAME", target_data.name.replace('-', "_"));
         crates.push(Planned {
+            workspace_member: data.is_member,
             proc_macro: None,
             name: target_data.name.replace('-', "_"),
             root: AsRef::<Path>::as_ref(&target_data.root).to_owned(),
@@ -563,6 +564,7 @@ mod tests {
         let crates = ["dep", "derive"]
             .into_iter()
             .map(|name| Planned {
+                workspace_member: false,
                 proc_macro: None,
                 name: name.into(),
                 root: format!("/source/{name}/lib.rs").into(),

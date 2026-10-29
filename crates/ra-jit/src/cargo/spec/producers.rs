@@ -19,6 +19,9 @@ pub(super) struct Producers {
     pub(super) prepared: captured::Prepared,
     pub(super) bindings: blaze_spec::native::Closure,
     pub(super) generated: blaze_spec::native::Closure,
+    pub(super) runtime: BTreeMap<u32, super::runtime::Unit>,
+    pub(super) cargo: std::path::PathBuf,
+    pub(super) compiler_libraries: BTreeMap<u32, Vec<std::path::PathBuf>>,
 }
 
 impl Producers {
@@ -120,6 +123,29 @@ pub(super) fn prepare(
     runtime: Option<&serde_json::Value>,
     bindings: &blaze_spec::native::Closure,
 ) -> anyhow::Result<Producers> {
+    prepare_with(replay, sysroot, work, process_environment, runtime, Some(bindings), None)
+}
+
+pub(super) fn prepare_live(
+    replay: &Prepared,
+    sysroot: &Path,
+    work: &Path,
+    process_environment: crate::process::Native,
+    runtime: Option<&serde_json::Value>,
+    environment: &BTreeMap<String, OsString>,
+) -> anyhow::Result<Producers> {
+    prepare_with(replay, sysroot, work, process_environment, runtime, None, Some(environment))
+}
+
+fn prepare_with(
+    replay: &Prepared,
+    sysroot: &Path,
+    work: &Path,
+    process_environment: crate::process::Native,
+    runtime: Option<&serde_json::Value>,
+    bindings: Option<&blaze_spec::native::Closure>,
+    environment: Option<&BTreeMap<String, OsString>>,
+) -> anyhow::Result<Producers> {
     let build = &replay.resolved.spec.build;
     let canonical = blaze_spec::assemble::canonical_units(build, &replay.resolved.graph)?;
     let manifests = replay.manifests()?;
@@ -142,7 +168,9 @@ pub(super) fn prepare(
         .enumerate()
         .map(|(run, (at, _))| (at, run))
         .collect();
-    let effective = replay.execution_environment()?;
+    let effective = environment.cloned().unwrap_or(replay.execution_environment()?);
+    let cargo =
+        super::runtime::cargo_frontend(&std::env::current_exe()?, &work.join("cargo-runtime"))?;
     let path = process_environment.vars().find(|(key, _)| key == "PATH").map(|(_, value)| value);
     let mut graph = captured::Graph { units: Vec::new(), runs: Vec::new() };
     let mut native = BTreeMap::new();
@@ -179,6 +207,7 @@ pub(super) fn prepare(
             env.insert("PATH".into(), path.clone());
         }
         env.extend(package_env(unit, &manifests, primary)?);
+        env.insert("CARGO".into(), cargo.as_os_str().to_owned());
         let native_env =
             env.iter().map(|(name, value)| (OsString::from(name), value.clone())).collect();
         let text_env = env
@@ -215,7 +244,7 @@ pub(super) fn prepare(
             })
             .collect();
         graph.units.push(captured::Unit {
-            source: Planned { name: unit.target.name.replace('-', "_"), root: unit.target.src_path.clone(), edition: unit.target.edition.to_string(), cfg: unit_cfg(replay, at), codegen_flags, env: text_env, deps, proc_macro: None },
+            source: Planned { workspace_member: false, name: unit.target.name.replace('-', "_"), root: unit.target.src_path.clone(), edition: unit.target.edition.to_string(), cfg: unit_cfg(replay, at), codegen_flags, env: text_env, deps, proc_macro: None },
             kind: match unit.target.kind { TargetKind::CustomBuild => captured::Kind::BuildScript, TargetKind::ProcMacro => captured::Kind::ProcMacro, _ => captured::Kind::Rust },
             host: graph_units.iter().enumerate().any(|(original, other)| std::ptr::eq(other, unit) && host_closure.contains(&original)), target: target(unit), run: runs.first().copied(),
             profile: Some(serde_json::json!({"version": 1, "profile": blaze_wire::encode(&spec.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()})),
@@ -259,7 +288,7 @@ pub(super) fn prepare(
                 rustflags: build.rustflags.iter().map(|flag| flag.0.clone()).collect(),
                 jobs: std::thread::available_parallelism().map_or(1, |jobs| jobs.get() as u32),
                 tools: script::Tools {
-                    cargo: std::env::current_exe()?,
+                    cargo: cargo.clone(),
                     linker: manifests.config.target_linker(
                         &blaze_manifest::config::CompileKind::Host,
                         &replay.host.triple,
@@ -279,18 +308,62 @@ pub(super) fn prepare(
             },
         });
     }
+    let own_runs: Vec<_> = graph.units.iter().map(|unit| unit.run).collect();
+    fn linked_runs(
+        graph: &captured::Graph,
+        at: usize,
+        seen: &mut BTreeSet<usize>,
+        runs: &mut Vec<usize>,
+    ) {
+        if !seen.insert(at) || graph.units[at].kind != captured::Kind::Rust {
+            return;
+        }
+        if let Some(run) = graph.units[at].run {
+            if !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+        for (_, dep) in &graph.units[at].source.deps {
+            linked_runs(graph, *dep, seen, runs);
+        }
+    }
+    let runtime_runs: Vec<_> = (0..graph.units.len())
+        .map(|at| {
+            let mut runs = Vec::new();
+            linked_runs(&graph, at, &mut BTreeSet::new(), &mut runs);
+            runs
+        })
+        .collect();
+    let compiler_runs =
+        (0..graph.units.len()).map(|at| graph.host_runs(at)).collect::<anyhow::Result<Vec<_>>>()?;
     let make_bindings = |prepared: &captured::Prepared| -> anyhow::Result<serde_json::Value> {
+        let bindings = bindings.context("replay producer bindings disappeared")?;
         bindings.validate()?;
         let mut full = bindings.clone();
         full.roots.extend(generated(prepared)?.roots);
         Ok(serde_json::json!(full.encode_bindings()))
     };
+    let mut producer_environment: BTreeMap<OsString, OsString> =
+        process_environment.vars().collect();
+    producer_environment.insert("CARGO".into(), cargo.as_os_str().to_owned());
     let prepared = captured::run_with_context(
         graph,
         sysroot,
         work,
-        process_environment,
-        captured::Context { native, runtime, bindings: Some(&make_bindings) },
+        crate::process::Native::of(producer_environment),
+        captured::Context {
+            native,
+            runtime,
+            source_root: Some(&replay.resolved.graph.root),
+            workspace_members: canonical
+                .iter()
+                .enumerate()
+                .filter_map(|(at, unit)| unit.package.member.then_some(at))
+                .collect(),
+            bindings: bindings.map(|_| {
+                &make_bindings as &dyn Fn(&captured::Prepared) -> anyhow::Result<serde_json::Value>
+            }),
+        },
     )?;
     let units = prepared
         .units
@@ -305,14 +378,65 @@ pub(super) fn prepare(
                     codegen_flags: unit.codegen_flags.clone(),
                     native: prepared.native[&source].clone(),
                     proc_macro: unit.proc_macro.clone(),
+                    rustc_env: own_runs[at]
+                        .map(|run| prepared.outputs[&run].1.env.iter().cloned().collect())
+                        .unwrap_or_default(),
                 },
             ))
         })
         .collect::<anyhow::Result<_>>()?;
     let generated = generated(&prepared)?;
-    let mut bindings = bindings.clone();
+    let runtime = canonical
+        .iter()
+        .enumerate()
+        .map(|(at, unit)| {
+            let env = runtime_values(
+                package_env(unit, &manifests, false)?,
+                own_runs[at].map(|run| &prepared.outputs[&run]),
+                &cargo,
+            );
+            let libraries = runtime_runs[at]
+                .iter()
+                .flat_map(|run| {
+                    crate::cargo::loader::artifact_directories(&prepared.outputs[run].1)
+                })
+                .collect();
+            Ok((u32::try_from(at)?, super::runtime::Unit { env, libraries }))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let mut bindings = bindings.cloned().unwrap_or_default();
     bindings.roots.extend(generated.roots.clone());
-    Ok(Producers { units, prepared, bindings, generated })
+    let compiler_libraries = compiler_runs
+        .iter()
+        .enumerate()
+        .map(|(at, runs)| {
+            Ok((
+                u32::try_from(at)?,
+                runs.iter()
+                    .flat_map(|run| {
+                        crate::cargo::loader::artifact_directories(&prepared.outputs[run].1)
+                    })
+                    .collect(),
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(Producers { units, prepared, bindings, generated, runtime, cargo, compiler_libraries })
+}
+
+fn runtime_values(
+    mut package: BTreeMap<String, OsString>,
+    script: Option<&(std::path::PathBuf, blaze_build_script::output::Output)>,
+    cargo: &Path,
+) -> BTreeMap<String, OsString> {
+    package.retain(|name, _| {
+        !matches!(name.as_str(), "CARGO_CRATE_NAME" | "CARGO_BIN_NAME" | "CARGO_PRIMARY_PACKAGE")
+    });
+    if let Some((out, output)) = script {
+        package.insert("OUT_DIR".into(), out.as_os_str().to_owned());
+        package.extend(output.env.iter().map(|(name, value)| (name.clone(), value.into())));
+    }
+    package.insert("CARGO".into(), cargo.as_os_str().to_owned());
+    package
 }
 
 fn generated(prepared: &captured::Prepared) -> anyhow::Result<blaze_spec::native::Closure> {
@@ -337,4 +461,51 @@ fn generated(prepared: &captured::Prepared) -> anyhow::Result<blaze_spec::native
             .map(|((name, _), tree)| blaze_spec::native::Root { name, tree })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn runtime_overlays_match_cargo_ambient_and_script_precedence() {
+        let package = BTreeMap::from([
+            ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ("CARGO_BIN_NAME".into(), "derived-bin".into()),
+            ("CARGO_CRATE_NAME".into(), "derived_crate".into()),
+            ("CARGO_MANIFEST_DIR".into(), "/original/package".into()),
+        ]);
+        let values = runtime_values(package.clone(), None, Path::new("/owned/blaze"));
+        for key in ["CARGO_PRIMARY_PACKAGE", "CARGO_BIN_NAME", "CARGO_CRATE_NAME"] {
+            assert!(!values.contains_key(key));
+        }
+        let inherited = BTreeMap::from([
+            ("CARGO_BIN_NAME".into(), "ambient-bin".into()),
+            ("CARGO".into(), "external-cargo".into()),
+        ]);
+        let mut env = inherited.clone();
+        env.extend(values);
+        assert_eq!(env["CARGO_BIN_NAME"], "ambient-bin");
+        assert_eq!(env["CARGO"], "/owned/blaze");
+        let output = (
+            PathBuf::from("/generated/out"),
+            blaze_build_script::output::Output {
+                env: vec![
+                    ("CARGO_BIN_NAME".into(), "script-bin".into()),
+                    ("CUSTOM".into(), "script-value".into()),
+                    ("CARGO".into(), "script-cargo".into()),
+                ],
+                ..Default::default()
+            },
+        );
+        let values = runtime_values(package, Some(&output), Path::new("/owned/blaze"));
+        let mut env = inherited;
+        env.extend(values);
+        assert_eq!(env["CARGO_BIN_NAME"], "script-bin");
+        assert_eq!(env["CUSTOM"], "script-value");
+        assert_eq!(env["CARGO"], "/owned/blaze");
+        assert_eq!(env["OUT_DIR"], "/generated/out");
+        assert_eq!(env["CARGO_MANIFEST_DIR"], "/original/package");
+    }
 }

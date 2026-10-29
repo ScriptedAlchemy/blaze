@@ -323,7 +323,7 @@ pub(crate) fn link(
     let inputs = attempt.join("producer.inputs");
     let bytes = std::fs::read(&inputs)?;
     let files = match mode {
-        own_script::SourceMode::Legacy => {
+        own_script::SourceMode::Legacy | own_script::SourceMode::Cargo { .. } => {
             crate::dep_info::DepInfo::parse(std::str::from_utf8(&bytes)?).files
         }
         own_script::SourceMode::Captured { .. } => {
@@ -370,6 +370,7 @@ mod tests {
             units: None,
             runtime: None,
             bindings: None,
+            naming: None,
         };
         let described = serde_json::json!({"crates": [{"env": {"INPUT": "one"}}]}).to_string();
         let first = own_script::with_mode(described.clone(), mode).unwrap();

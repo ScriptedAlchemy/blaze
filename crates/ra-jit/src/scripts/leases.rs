@@ -328,6 +328,33 @@ impl Leases {
         self.state.lock().unwrap_or_else(|it| it.into_inner())
     }
 
+    pub(super) fn runtime_outputs(
+        &self,
+        world: &super::World,
+    ) -> anyhow::Result<Vec<(PathBuf, blaze_build_script::Output)>> {
+        let state = self.state();
+        world
+            .iter()
+            .map(|(directory, generation)| {
+                let done = state
+                    .judged
+                    .iter()
+                    .find_map(|((_, dir), result)| {
+                        if dir != directory {
+                            return None;
+                        }
+                        result.as_ref().ok().filter(|done| done.generation == *generation)
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "runtime directives are not held for the loaded build-script generation"
+                        )
+                    })?;
+                Ok((done.out_dir.clone(), done.output.clone()))
+            })
+            .collect()
+    }
+
     /// What `build` judged of `run_dir` already.
     pub(super) fn judged(&self, build: u64, run_dir: &Path) -> Option<Result<Arc<Done>, String>> {
         if build == 0 {
@@ -801,6 +828,24 @@ mod tests {
             made: None,
             links: None,
         })
+    }
+
+    #[test]
+    fn runtime_directives_select_the_loaded_generation_without_values_from_other_builds() {
+        let leases = Leases::default();
+        let directory = PathBuf::from("/runtime-script");
+        let mut before = done(&directory.join("out"), 11);
+        Arc::get_mut(&mut before).unwrap().output.env.push(("VALUE".into(), "old".into()));
+        let mut after = done(&directory.join("out"), 12);
+        Arc::get_mut(&mut after).unwrap().output.env.push(("VALUE".into(), "new".into()));
+        leases.record(1, &directory, Ok(before));
+        leases.record(2, &directory, Ok(after));
+        let outputs = leases.runtime_outputs(&vec![(directory.clone(), 11)]).unwrap();
+        assert_eq!(outputs[0].1.env, [("VALUE".into(), "old".into())]);
+        let outputs = leases.runtime_outputs(&vec![(directory.clone(), 12)]).unwrap();
+        assert_eq!(outputs[0].1.env, [("VALUE".into(), "new".into())]);
+        assert!(leases.runtime_outputs(&vec![(directory, 13)]).is_err());
+        assert!(leases.runtime_outputs(&Vec::new()).unwrap().is_empty());
     }
 
     /// The output of an earlier run, found fresh by `build`, which holds it and ran nothing.
