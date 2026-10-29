@@ -54,7 +54,8 @@ BuildSpec and verifies the execution platform before invoking the owned compiler
 Config values preserve literal/workspace-relative tags through this process.
 
 The connected executor builds binaries/examples from source dependencies and supports
-unit/integration test executables. It retains successful artifacts and `result.json`
+unit/integration test executables. `test --no-run` builds those executables and skips
+implicit doctests, as Cargo does. It retains successful artifacts and `result.json`
 under `FILE.outputs/`; failed compilation or input admission publishes no result.
 A version-1 CBOR input trace preserves filenames that Cargo dep-info cannot represent,
 and every traced application source read is checked against the snapshot before execution.

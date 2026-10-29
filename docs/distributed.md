@@ -3035,7 +3035,8 @@ or substitute ambient compiler settings. Replay starts the owned compiler direct
 query fallback, Cargo producer loading, external proc-macro servers and shared publication disabled.
 
 The connected executor admits host Rust libraries as source dependencies of binaries and examples,
-and has explicit paths for unit/integration test executables. It refuses standalone library artifacts,
+and has explicit paths for unit/integration test executables. `test --no-run` builds the test
+executables without running implicit doctests. It refuses standalone library artifacts,
 check/doctest/benchmark work, build scripts, proc macros, unsupported output types and incompatible
 per-unit debug settings before starting compilation. Expanded application native link inputs are
 refused until their complete closure can be bound. The existing `ExecPlatform.native_root` is still
