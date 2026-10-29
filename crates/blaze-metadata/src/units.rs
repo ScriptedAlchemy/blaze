@@ -355,7 +355,7 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
 pub fn unit_graph_with_inputs(
     asked: &UnitsAsked<'_>,
 ) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>)> {
-    let (graph, inputs, _) = unit_graph_captured(asked, None)?;
+    let (graph, inputs, _) = unit_graph_captured(asked, None, None)?;
     Ok((graph, inputs))
 }
 
@@ -366,9 +366,13 @@ pub fn unit_graph_with_inputs(
 /// The caller must authenticate the captured roots and their content. Their original
 /// registry/Git identities are retained in the graph, and every manifest read remains
 /// in the returned structural trace for the caller to check against its snapshot.
+///
+/// With a `config` image, exactly those configuration files are read; none is discovered
+/// from the working directory or the Cargo home.
 pub fn unit_graph_captured(
     asked: &UnitsAsked<'_>,
     captured: Option<&[CapturedSource]>,
+    config: Option<&blaze_manifest::config::ConfigImage>,
 ) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>, Vec<CapturedSource>)> {
     let a = asked.asked;
     let Some(build) = &a.build else {
@@ -382,7 +386,7 @@ pub fn unit_graph_captured(
         Command::Check => ("check", "dev", Intent::Check { test: asked.profile == Some("test") }),
         Command::Test => ("test", "test", Intent::Test),
     };
-    let (ctx, offline) = crate::open(a, command)?;
+    let (ctx, offline) = crate::open(a, command, config)?;
     refuse_what_is_not_read(&ctx.config, platform.triple)?;
     let ws = Workspace::new(&root_manifest(a.manifest_path, &ctx)?, &ctx)?;
     let locked = Locked::read_captured(&ws, &ctx, offline, a.store.clone(), captured)?;

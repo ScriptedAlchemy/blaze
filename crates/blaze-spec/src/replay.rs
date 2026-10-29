@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail, ensure};
+use blaze_manifest::config::ConfigImage;
 use blaze_wire::{
     BuildSpec, ConfigEnvValue, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity, Wire,
 };
@@ -42,6 +43,9 @@ pub struct Prepared {
     pub environment: BTreeMap<String, OsString>,
     /// Toolchain-derived target cfg facts, verified against the saved platform.
     pub host: Host,
+    /// The captured configuration files, at their places in the materialized root. Nothing
+    /// else is read: not the worker's ancestors of `root`, and not its Cargo home.
+    pub config: ConfigImage,
 }
 
 impl Prepared {
@@ -68,24 +72,30 @@ struct Record {
     manifest: SourcePath,
     cargo_home: Option<SourcePath>,
     platform: ExecPlatform,
+    /// The top-level configuration files, nearest first, as the original invocation read
+    /// them. Each is also in `config_files`, with every include and `--config` file.
+    config_layers: Vec<SourcePath>,
+    config_files: Vec<SourcePath>,
 }
 
 impl Wire for Record {
     fn encode(&self, e: &mut blaze_wire::Encoder) {
-        e.array(5);
-        1_u32.encode(e);
+        e.array(7);
+        2_u32.encode(e);
         self.recipe.encode(e);
         self.manifest.encode(e);
         self.cargo_home.encode(e);
         self.platform.encode(e);
+        self.config_layers.encode(e);
+        self.config_files.encode(e);
     }
 
     fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
-        r.array_start(5)?;
+        r.array_start(7)?;
         let at = r.position();
-        if u32::decode(r)? != 1 {
+        if u32::decode(r)? != 2 {
             return Err(blaze_wire::Error {
-                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 1" },
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 2" },
                 at,
             });
         }
@@ -94,6 +104,8 @@ impl Wire for Record {
             manifest: SourcePath::decode(r)?,
             cargo_home: Option::decode(r)?,
             platform: ExecPlatform::decode(r)?,
+            config_layers: Vec::decode(r)?,
+            config_files: Vec::decode(r)?,
         };
         r.array_end()?;
         Ok(record)
@@ -246,6 +258,7 @@ pub fn capture(
         offline: ctx.offline,
         store: ctx.store.clone(),
         probe: ctx.probe,
+        config_image: ctx.config_image,
     };
     // This pass also resolves workspace-relative configuration paths against the
     // final layout, rather than the provisional workspace root.
@@ -304,6 +317,18 @@ pub fn capture(
             .then(|| relative(&root, &home))
             .transpose()?,
         platform: made.platform.clone(),
+        config_layers: resolved
+            .config
+            .layers
+            .iter()
+            .map(|path| relative(&root, path))
+            .collect::<anyhow::Result<_>>()?,
+        config_files: resolved
+            .config
+            .files
+            .keys()
+            .map(|path| relative(&root, path))
+            .collect::<anyhow::Result<_>>()?,
     };
     let relocated = tempfile::tempdir()?;
     prepare_record(
@@ -419,6 +444,20 @@ fn prepare_record(
     };
     native.insert("CARGO_HOME".to_owned(), cargo_home.into());
     let env = environment::text_view(&native)?;
+    let config = ConfigImage {
+        layers: record
+            .config_layers
+            .iter()
+            .map(|path| Ok(root.join(path.to_native()?)))
+            .collect::<anyhow::Result<_>>()?,
+        files: record
+            .config_files
+            .iter()
+            .map(|path| {
+                Ok((root.join(path.to_native()?), Snapshot::read_file(source.root, store, path)?))
+            })
+            .collect::<anyhow::Result<_>>()?,
+    };
     let ctx = Context {
         source_root: Some(&root),
         cwd: &cwd,
@@ -430,6 +469,7 @@ fn prepare_record(
         offline: true,
         store: None,
         probe,
+        config_image: Some(&config),
     };
     let sources = captured
         .iter()
@@ -480,7 +520,7 @@ fn prepare_record(
     if let Some(difference) = crate::run::first_difference(given, &verified.build) {
         bail!("execution machine does not match the BuildSpec: {difference}");
     }
-    Ok(Prepared { resolved, root, cwd, request, environment: native, host: host.clone() })
+    Ok(Prepared { resolved, root, cwd, request, environment: native, host: host.clone(), config })
 }
 
 fn source_root(build: &BuildSpec) -> anyhow::Result<blaze_wire::Digest> {

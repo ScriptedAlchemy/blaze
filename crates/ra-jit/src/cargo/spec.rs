@@ -130,6 +130,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         offline: false,
         store: None,
         probe: &blaze_spec::platform::System,
+        config_image: None,
     };
     if graph {
         println!("{}", unit_graph(&request, &ctx)?);
@@ -388,6 +389,12 @@ fn compiler_environment(
     });
     let profile = &prepared.resolved.spec.build.profile;
     env.insert("CARGO_HOME".to_owned(), home.join("cargo").into());
+    // The compiler resolves the standard library's own sources with Cargo's configuration
+    // discovery. Stop it at this job's directory, so no config file above the job, on
+    // whatever worker it runs, reaches the compile.
+    if let Some(job) = home.parent() {
+        env.insert("__CARGO_TEST_ROOT".to_owned(), job.into());
+    }
     env.insert("HOME".to_owned(), home.into());
     for (name, value) in [
         ("RA_JIT_OWN_RESOLVE", "1".to_owned()),

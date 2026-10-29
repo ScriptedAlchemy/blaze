@@ -93,6 +93,9 @@ pub struct Context<'a> {
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
     /// What the platform is read through: the real machine, or a fake of one.
     pub probe: &'a dyn Probe,
+    /// The captured configuration files to read instead of discovering them from `cwd` and
+    /// the Cargo home. A replay always sets this; a fresh request leaves it None.
+    pub config_image: Option<&'a blaze_manifest::config::ConfigImage>,
 }
 
 /// A spec, its platform and its keys.
@@ -154,6 +157,8 @@ pub struct Resolved {
     pub outputs: Vec<PathBuf>,
     /// The complete locked external package closure, including unselected packages.
     pub sources: Vec<blaze_metadata::CapturedSource>,
+    /// The configuration files this resolution read, in the layout it ran in.
+    pub config: blaze_manifest::config::ConfigImage,
 }
 
 /// Resolve without discarding the native graph an owned executor needs.
@@ -190,12 +195,15 @@ fn resolve_with_platform(
     sources: Option<&[blaze_metadata::CapturedSource]>,
 ) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
-    let (offline, mut initial, manifest, outputs) = Opened::with(request, ctx, |opened| {
+    let (offline, mut initial, manifest, outputs, config) = Opened::with(request, ctx, |opened| {
         Ok((
             opened.resolved.offline,
             opened.manifests.sources(),
             opened.workspace.current_manifest().to_owned(),
             vec![opened.workspace.target_dir(), opened.workspace.build_dir()],
+            opened.manifests.config.image().map_err(|error| {
+                Refusal::with(Reason::ConfigRejected, "the configuration", format!("{error:#}"))
+            })?,
         ))
     })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
@@ -229,13 +237,13 @@ fn resolve_with_platform(
         profile: request.profile.as_deref(),
     };
     let (graph, mut inputs, sources) =
-        units::unit_graph_captured(&wanted, sources).map_err(|error| {
+        units::unit_graph_captured(&wanted, sources, ctx.config_image).map_err(|error| {
             Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
         })?;
     let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
     inputs.extend(assembly_inputs);
-    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources })
+    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, config })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -305,9 +313,16 @@ impl Opened<'_> {
         };
         let native_home =
             ctx.native_env.and_then(|native| environment::cargo_home(native, ctx.cwd));
-        let mut config = match native_home {
-            Some(home) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
-            None => Config::load(ctx.cwd, ctx.env.clone(), &[]),
+        let mut config = match (ctx.config_image, native_home) {
+            (Some(image), home) => Config::from_image(
+                ctx.cwd,
+                home.unwrap_or_else(|| ctx.cwd.join(".blaze-cargo-home")),
+                ctx.env.clone(),
+                &[],
+                image.clone(),
+            ),
+            (None, Some(home)) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
+            (None, None) => Config::load(ctx.cwd, ctx.env.clone(), &[]),
         }
         .map_err(|error| rejected("the configuration", error))?;
         config

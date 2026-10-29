@@ -303,6 +303,8 @@ pub struct Config {
     target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     warnings: RefCell<Vec<String>>,
     sources: RefCell<Vec<(PathBuf, Vec<u8>)>>,
+    /// The top-level files [`Config::walk_tree`] visited, nearest first.
+    layers: RefCell<Vec<PathBuf>>,
 }
 
 impl Config {
@@ -381,6 +383,7 @@ impl Config {
             target_cfgs: OnceCell::new(),
             warnings: RefCell::new(Vec::new()),
             sources: RefCell::new(Vec::new()),
+            layers: RefCell::new(Vec::new()),
         };
         config.merge_cli_args(cli)?;
         Ok(config)
@@ -389,6 +392,22 @@ impl Config {
     /// Configuration source bytes used by this invocation, including included files.
     pub fn sources(&self) -> Vec<(PathBuf, Vec<u8>)> {
         self.sources.borrow().clone()
+    }
+
+    /// The configuration this invocation read, as an image that [`Config::from_image`] replays:
+    /// the top-level files in precedence order and the bytes of every file read, including
+    /// includes and `--config` files. Reads the files first if nothing has asked for a value.
+    pub fn image(&self) -> anyhow::Result<ConfigImage> {
+        match &self.source {
+            ConfigSource::Image(image) => return Ok(image.clone()),
+            ConfigSource::Live => {}
+        }
+        self.values()?;
+        let mut files = BTreeMap::new();
+        for (path, bytes) in self.sources.borrow().iter() {
+            files.insert(paths::normalize_path(path), bytes.clone());
+        }
+        Ok(ConfigImage { layers: self.layers.borrow().clone(), files })
     }
 
     /// What `cargo <command>` does with its configuration on start, with `--config` arguments
@@ -472,6 +491,14 @@ impl Config {
         }
         let mut seen_dir = FxHashSet::default();
         let stop = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
+        let mut walk = |path: &Path| {
+            let mut layers = self.layers.borrow_mut();
+            if !layers.iter().any(|seen| seen == path) {
+                layers.push(path.to_owned());
+            }
+            drop(layers);
+            walk(path)
+        };
         for current in paths::ancestors(pwd, stop.as_deref()) {
             let config_root = current.join(".cargo");
             if let Some(path) = self.get_file_path(&config_root, "config") {

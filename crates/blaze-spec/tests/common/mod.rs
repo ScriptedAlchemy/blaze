@@ -142,6 +142,7 @@ pub fn context<'a>(
         offline: true,
         store: None,
         probe: &FakeMachine,
+        config_image: None,
     }
 }
 

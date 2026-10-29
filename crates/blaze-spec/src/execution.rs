@@ -200,8 +200,13 @@ pub fn programs(
     let execution_env = prepared.execution_environment()?;
     let cargo_home = crate::environment::cargo_home(&prepared.environment, &prepared.cwd)
         .context("replay has no Cargo home")?;
-    let mut config =
-        blaze_manifest::Config::load_with_home(&prepared.cwd, env.clone(), &[], cargo_home)?;
+    let mut config = blaze_manifest::Config::from_image(
+        &prepared.cwd,
+        cargo_home,
+        env.clone(),
+        &[],
+        prepared.config.clone(),
+    )?;
     config.start(
         prepared.request.command.unwrap_or(crate::flags::Subcommand::Build).name(),
         &prepared.request.config,

@@ -400,3 +400,57 @@ fn another_name_for_a_directory_above_the_inputs_does_not_widen_the_layout() {
         "the layout root is the real parent directory, not the unrelated one the alias lives in"
     );
 }
+
+#[test]
+fn configuration_above_the_worker_root_is_not_read() {
+    let f = fixture();
+    f.write(".cargo/config.toml", "[env]\nMESSAGE='captured'\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "MESSAGE"));
+    let worker = tempfile::tempdir().unwrap();
+    // A worker's own config files above the place the snapshot is materialized.
+    std::fs::create_dir_all(worker.path().join(".cargo")).unwrap();
+    std::fs::write(
+        worker.path().join(".cargo/config.toml"),
+        "[env]\nAMBIENT='worker'\n[build]\nrustflags=['--cfg','ambient']\n",
+    )
+    .unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert!(replay.config.files.keys().all(|path| path.starts_with(&replay.root)));
+    assert!(!replay.execution_environment().unwrap().contains_key("AMBIENT"));
+}
+
+#[test]
+fn configuration_above_the_original_root_is_captured_and_replayed() {
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base_root.join(".cargo")).unwrap();
+    std::fs::write(base_root.join(".cargo/config.toml"), "[env]\nFROM_ABOVE='parent'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&base_root).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    // The requester's own config walk reaches the file above the workspace.
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_ABOVE"));
+    drop(f);
+    drop(base);
+    assert!(!base_root.exists());
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    let effective = replay.execution_environment().unwrap();
+    assert_eq!(effective["FROM_ABOVE"], "parent");
+    assert_eq!(replay.config.layers.len(), 1);
+}

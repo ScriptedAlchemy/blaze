@@ -61,6 +61,7 @@ fn graph(
             profile: None,
         },
         captured,
+        None,
     )
 }
 

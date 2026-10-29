@@ -66,6 +66,7 @@ impl Project {
             offline: true,
             store: None,
             probe: &common::FakeMachine,
+            config_image: None,
         };
         replay::capture(&request, &words, &context, &self.store, &[]).unwrap()
     }
