@@ -47,7 +47,7 @@ concurrency:
 jobs:
   server:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
@@ -59,6 +59,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt
+          llvm: build
       - name: Check server formatting
         run: cargo fmt -p blaze-serve -- --check
       - name: Test the actual server, HTTP routes, and publication races
@@ -74,22 +75,52 @@ jobs:
           cargo test --locked -p project-model --lib -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit cargo::spec:: -- --test-threads=2
           python3 -I harness/tracedecay_test.py
-      - name: Execute saved source with compiler subprocesses blocked
+      - name: Build the owned replay CLI in the pinned native environment
+        id: replay_cli
         if: ${{ !cancelled() }}
         run: |
-          cargo build --locked -p ra-jit --bin ra-jit
-          # Cargo walks parent directories for config; the fixture must not inherit
-          # this checkout's workspace-relative environment settings.
-          python3 -I harness/dist/saved_spec.py --blaze target/debug/ra-jit --work "$RUNNER_TEMP/saved-spec-review"
+          mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            nix develop .#bench --command rustc -vV
+            nix develop .#bench --command cargo -V
+          } > "$RUNNER_TEMP/saved-spec-evidence/identity.txt"
+          nix develop .#bench --command cargo build --locked --release -p ra-jit --bins
+          git rev-parse HEAD > target/release/BUILT_FROM
+      - name: Bootstrap a fresh complete owned replay runtime
+        id: owned_runtime
+        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/saved-spec-owned-server" --memory-mib 8192 --timeout 1800 \
+            > "$RUNNER_TEMP/saved-spec-evidence/bootstrap.log" 2>&1
+      - name: Execute saved source with compiler subprocesses blocked
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/saved-spec-review" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/saved-spec-owned-server/blaze-proc-macro-srv" \
+            --backend cranelift > "$RUNNER_TEMP/saved-spec-evidence/replay.log" 2>&1
       - name: Save immutable replay evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
           name: saved-buildspec-execution
           path: |
+            ${{ runner.temp }}/saved-spec-evidence
             ${{ runner.temp }}/saved-spec-review/results.json
             ${{ runner.temp }}/saved-spec-review/*.log
-          if-no-files-found: ignore
+            ${{ runner.temp }}/saved-spec-review/*.exec
+            ${{ runner.temp }}/saved-spec-owned-server/image-pins.json
+            ${{ runner.temp }}/saved-spec-owned-server/tool-controls.json
+            ${{ runner.temp }}/saved-spec-owned-server/*.watchdog.json
+            ${{ runner.temp }}/saved-spec-owned-server/*audit.json
+            ${{ runner.temp }}/saved-spec-owned-server/*external-execs.json
+            ${{ runner.temp }}/saved-spec-owned-server/*.exec
+          if-no-files-found: warn
       - name: Test owned dependency resolution and Cargo lock parity
         if: ${{ !cancelled() }}
         run: |
