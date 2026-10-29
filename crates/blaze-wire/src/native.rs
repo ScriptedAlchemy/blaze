@@ -1,4 +1,5 @@
 //! Private native compiler descriptor transport. Environment values travel only over stdin.
+//! Native strings use Unix bytes or Windows UTF-16LE, without Unicode normalization.
 
 use std::{collections::BTreeMap, ffi::OsString, io};
 
@@ -27,11 +28,9 @@ pub fn encode_units(units: &BTreeMap<u32, Unit>) -> Vec<u8> {
                 *path,
                 unit.env
                     .iter()
-                    .map(|(key, value)| {
-                        (key.as_encoded_bytes().to_vec(), value.as_encoded_bytes().to_vec())
-                    })
+                    .map(|(key, value)| (encoded_value(key), encoded_value(value)))
                     .collect(),
-                unit.flags.iter().map(|flag| flag.as_encoded_bytes().to_vec()).collect(),
+                unit.flags.iter().map(|flag| encoded_value(flag)).collect(),
             )
         })
         .collect();
@@ -49,10 +48,10 @@ pub fn decode_units(bytes: &[u8]) -> io::Result<BTreeMap<u32, Unit>> {
     for (path, env, flags) in units {
         let mut values = BTreeMap::new();
         for (key, value) in env {
-            if key.is_empty() || key.contains(&b'=') {
+            let key = native_value(key)?;
+            if key.is_empty() || key.as_encoded_bytes().contains(&b'=') {
                 return Err(invalid("invalid native environment name"));
             }
-            let key = native_value(key)?;
             if values.insert(key, native_value(value)?).is_some() {
                 return Err(invalid("duplicate native environment name"));
             }
@@ -75,21 +74,42 @@ pub fn redact_transport(project: &mut serde_json::Value) -> io::Result<()> {
     Ok(())
 }
 
+fn encoded_value(value: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        value.as_encoded_bytes().to_vec()
+    }
+}
+
 fn native_value(bytes: Vec<u8>) -> io::Result<OsString> {
-    if bytes.contains(&0) {
+    #[cfg(windows)]
+    let value = {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(invalid("native Windows value is not UTF-16LE"));
+        }
+        let wide: Vec<_> =
+            bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        OsString::from_wide(&wide)
+    };
+    #[cfg(unix)]
+    let value = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let value = String::from_utf8(bytes)
+        .map_err(|_| invalid("native bytes cannot be represented on this host"))?
+        .into();
+    if value.as_encoded_bytes().contains(&0) {
         return Err(invalid("native process value contains a NUL"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        Ok(OsString::from_vec(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(String::from_utf8(bytes)
-            .map_err(|_| invalid("native bytes cannot be represented on this host"))?
-            .into())
-    }
+    Ok(value)
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -145,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_native_units_fail_decoding() {
         let record = |id: u32, env: Vec<(Vec<u8>, Vec<u8>)>, flags: Vec<Vec<u8>>| (id, env, flags);
         for (version, units) in [
@@ -158,5 +179,19 @@ mod tests {
         ] {
             assert!(decode_units(&crate::encode(&(version, units))).is_err());
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn windows_surrogates_and_non_ascii_environment_names_use_utf16le() {
+        use std::os::windows::ffi::OsStringExt;
+        let name = OsString::from_wide(&[0x013d, 0xd800]);
+        let value = OsString::from_wide(&[0xdc00, 0x0061]);
+        let units =
+            BTreeMap::from([(0, Unit { env: [(name, value.clone())].into(), flags: vec![value] })]);
+        assert_eq!(decode_units(&encode_units(&units)).unwrap(), units);
+        assert!(native_value(vec![0x41]).is_err());
+        assert!(native_value(vec![0x00, 0x00]).is_err());
+        let bad = Unit { env: [(OsString::from("="), OsString::new())].into(), flags: Vec::new() };
+        assert!(decode_units(&encode_units(&BTreeMap::from([(0, bad)]))).is_err());
     }
 }
