@@ -9,6 +9,7 @@ on:
       - crates/blaze-metadata/**
       - crates/blaze-manifest/**
       - crates/blaze-resolve/**
+      - crates/hir-ty-codegen/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
       - vendor/rust-analyzer/crates/syntax/**
@@ -52,6 +53,9 @@ jobs:
       - name: Test locked native dependency resolution
         if: ${{ !cancelled() }}
         run: cargo test --locked -p blaze-metadata -- --test-threads=2
+      - name: Test cleanup control flow with debug assertions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
       - name: Test owned compiler answers and empty-crate proofs
         if: ${{ !cancelled() }}
         run: |
