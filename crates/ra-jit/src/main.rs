@@ -3412,6 +3412,7 @@ fn workspace_at(
                     .collect(),
                 host_cargo: plan.host_cargo().cloned(),
                 world: Vec::new(),
+                images: Vec::new(),
             });
         }
         if let Some(beside) = beside {
@@ -3463,9 +3464,12 @@ fn workspace_at(
             (None, _, _) if own.is_some() => {
                 let ask = own.as_ref().expect("the whole build's ask");
                 let build = asked.map_or(0, |it| it.1);
-                let (said, world) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
+                let (said, world, images) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
                 if let Some(own) = own.as_mut() {
                     own.world = world;
+                    // The images are loaded after this pass, by the database's proc-macro
+                    // client: the load holds them until it has, and while it serves them.
+                    own.images = images;
                 }
                 said
             }

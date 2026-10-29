@@ -102,6 +102,12 @@ pub(crate) fn operation(build: u64) -> Operation {
 /// the run it was loaded from ([`generation_of`]).
 pub(crate) type World = Vec<(PathBuf, u64)>;
 
+/// The leases on the producer images a load admitted, held by the value the load keeps
+/// ([`Own`]) for as long as the database loaded from it serves their macros: a request that
+/// names no build is retired by nothing, and its images are loaded by the proc-macro client
+/// of the database, after the pass that admitted them.
+pub(crate) type Images = Vec<Arc<std::fs::File>>;
+
 /// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
 /// stays as cargo has it.
 const GENERATION: &str = "blaze-generation";
@@ -265,6 +271,10 @@ pub(crate) struct Own {
     pub(crate) host_cargo: Option<CargoWorkspace>,
     /// The scripts the workspace was loaded from, with the token of each run: set when it is.
     pub(crate) world: World,
+    /// The leases on the producer images the load admitted, held for as long as the database
+    /// loaded from it serves their macros: a request that names no build is retired by nothing,
+    /// and its proc-macro client loads them after the pass that admitted them.
+    pub(crate) images: Images,
 }
 
 impl Own {
@@ -293,7 +303,7 @@ impl Own {
 pub(crate) fn run(
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World, Images)> {
     run_with(&LEASES, workspace, asked)
 }
 
@@ -310,6 +320,7 @@ pub(crate) fn run_producers(
     BTreeMap<String, (PathBuf, blaze_build_script::Output)>,
     BTreeMap<String, PathBuf>,
     World,
+    Images,
 )> {
     retrying(asked.build, false, || {
         let result = (|| {
@@ -342,7 +353,8 @@ pub(crate) fn run_producers(
                 .iter()
                 .map(|(&package, path)| (cargo[package].id.repr.clone(), path.clone()))
                 .collect();
-            Ok((outputs, images, runner.judged))
+            let leases = std::mem::take(&mut runner.image_leases);
+            Ok((outputs, images, runner.judged, leases))
         })();
         if matches!(result, Err(Attempt::Busy(_))) {
             LEASES.yield_world(asked.build);
@@ -357,7 +369,7 @@ fn run_with(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World, Images)> {
     let deferrable = DEFERRABLE.load(std::sync::atomic::Ordering::SeqCst);
     retrying(asked.build, deferrable, || attempt(leases, workspace, asked))
 }
@@ -421,7 +433,7 @@ fn attempt(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World, Images), Attempt> {
     let said = pass(leases, workspace, asked);
     if matches!(said, Err(Attempt::Busy(_))) {
         // A build that waits holds nothing that is not read: what it holds, a build that has
@@ -438,9 +450,9 @@ fn pass(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World, Images), Attempt> {
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
-        return Ok((project_model::WorkspaceBuildScripts::default(), World::new()));
+        return Ok((project_model::WorkspaceBuildScripts::default(), World::new(), Images::new()));
     };
     let target: &Path = cargo.target_directory().as_ref();
     // A request that names no build judges and runs inside one critical section, as one that
@@ -464,7 +476,7 @@ fn pass(
     let mut lines = Vec::new();
     if let Some(host_cargo) = asked.host_cargo {
         let host_ask = Asked { host_cargo: None, target: asked.host, ..*asked };
-        let (outputs, images, world) = run_producers(
+        let (outputs, images, world, leases) = run_producers(
             host_cargo,
             &host_ask,
             runner.sysroot.clone(),
@@ -473,6 +485,7 @@ fn pass(
             &runner.child_env(),
         )?;
         runner.judged.extend(world);
+        runner.image_leases.extend(leases);
         for (package, (out_dir, output)) in outputs {
             // Host-only packages, including proc macros, use these host outputs.
             if asked.packages.is_some_and(|it| it.get(&package) == Some(&false)) {
@@ -540,7 +553,7 @@ fn pass(
     }
     let said =
         project_model::WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
-    Ok((said, runner.judged.clone()))
+    Ok((said, runner.judged.clone(), std::mem::take(&mut runner.image_leases)))
 }
 
 /// A script that ran, or whose last run stands.
@@ -590,8 +603,10 @@ struct Runner<'a> {
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
     images: FxHashMap<Package, PathBuf>,
-    /// The leases on images of a request that names no build, which it holds while it runs.
-    image_leases: Vec<std::fs::File>,
+    /// The leases on the images of a request that names no build: it is retired by nothing, so
+    /// the load that asked keeps them, through [`Own::images`], until its proc-macro client
+    /// has loaded them and while it serves them.
+    image_leases: Images,
     making_images: Vec<Package>,
 }
 
@@ -1273,11 +1288,12 @@ impl<'a> Runner<'a> {
         })();
         self.making_images.pop();
         let image = result?;
-        // The image is loaded after this pass, by the build that asked for it.
-        match self.asked.build {
-            0 => self.image_leases.extend(image.leases),
-            build => self.leases.keep_images(build, image.leases),
-        }
+        // The image is loaded after this pass, by the build that asked for it, or by the load
+        // of a request that names no build: there is no build to retire then, and the load
+        // holds the lease until its proc-macro client has loaded the image, and while it
+        // serves it.
+        let leases: Images = image.leases.into_iter().map(Arc::new).collect();
+        self.image_leases.extend(self.leases.image_leases(self.asked.build, leases));
         self.images.insert(package, image.library.clone());
         Ok(image.library)
     }

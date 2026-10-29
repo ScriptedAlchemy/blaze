@@ -784,7 +784,8 @@ impl Scripts {
             }
             asked.remove("RUSTC_WRAPPER");
             asked.remove("RUSTC_WORKSPACE_WRAPPER");
-            let (said, world) = crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
+            let (said, world, images) =
+                crate::scripts::run(&self.workspace, &own.asked(&asked, build))?;
             let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind
             else {
                 return Ok(false);
@@ -795,6 +796,11 @@ impl Scripts {
                 self.ready_world = Some(world);
             } else {
                 self.world = world;
+            }
+            if let Some(own) = self.own.as_mut() {
+                // The images are loaded by the database's proc-macro client after this pass:
+                // the load holds them until it has, and while it serves them.
+                own.images.extend(images);
             }
             return Ok(other);
         }
