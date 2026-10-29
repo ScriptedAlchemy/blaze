@@ -207,7 +207,8 @@ fn compiled(
     let defined: Vec<Defined<'_>> = std::iter::zip(&names, defined)
         .map(|(&name, defined)| Defined { name, ..defined })
         .collect();
-    Machine::with_options(optimization, &recorder.machine, |context, machine| {
+    let options = recorder.machine.clone();
+    Machine::with_options(optimization, &options, |context, machine| {
         let module = context.create_module("ra-jit");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
