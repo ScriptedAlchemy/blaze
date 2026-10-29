@@ -3,6 +3,8 @@
 #![feature(allocator_api)]
 
 mod cfg_expr;
+#[cfg(feature = "syntax")]
+pub mod check_cfg;
 mod dnf;
 #[cfg(test)]
 mod tests;
