@@ -330,6 +330,31 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
 
 
+def standalone(work, name, files):
+    """A one-package project below `work`, with the lock file Cargo would write for it."""
+    project = work / name
+    package = files["Cargo.toml"].split('name="')[1].split('"')[0]
+    write(project, "Cargo.lock", 'version = 4\n[[package]]\nname = "' + package
+          + '"\nversion = "0.1.0"\n')
+    for path, text in files.items():
+        write(project, path, text)
+    return project
+
+
+def saved_equals_cargo(runner, blaze, real, name, project, env, oracle_env, replay_env, hostile,
+                       bundle, words=("run",)):
+    """Save `project`, delete it, replay from `hostile`; the output must be Cargo's."""
+    expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *words, "--locked",
+        "--offline"], oracle_env, project, guarded=False)
+    saved = bundle / (name + ".cbor")
+    runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved, *words], env, project)
+    shutil.rmtree(project)
+    actual, _ = runner.run(name + "-replay", [blaze, "cargo", "spec", "--run", saved],
+                           replay_env, hostile)
+    assert actual == expected, (name, actual, expected)
+    return expected
+
+
 class Runner:
     def __init__(self, binary, work, memory_mib, timeout):
         self.binary, self.work = binary, work
@@ -665,7 +690,72 @@ def main():
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name
-        print("saved source execution matches Cargo after origin removal; corrupt and unbound inputs refused", flush=True)
+        # A program sees the environment Cargo gives it, not an empty one: the package's own
+        # variables, an owned CARGO frontend, and the worker's PATH and HOME.
+        names = ["CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO", "PATH", "HOME"]
+        project = standalone(work, "runtime-env", {
+            "Cargo.toml": '[package]\nname="runtime-env"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { for k in ' + json.dumps(names)
+                           + ' { println!("{}={}", k, std::env::var_os(k).is_some()); } }\n'})
+        expected = saved_equals_cargo(runner, blaze, real, "runtime-env", project, env,
+                                      oracle_env, hostile_env, hostile, bundle)
+        assert expected == "".join(name + "=true\n" for name in names), expected
+        # option_env! of a variable the requester did not have is None for Cargo and in the
+        # replay, whatever the worker has; one the requester had cannot be reproduced and is
+        # refused rather than answered with a different value.
+        main_rs = 'fn main() { println!("{:?}|{:?}", option_env!("SAVED_SPEC_UNSET"), option_env!("SAVED_SPEC_SET")); }\n'
+        files = {"Cargo.toml": '[package]\nname="optional"\nversion="0.1.0"\nedition="2021"\n',
+                 "src/main.rs": main_rs}
+        project = standalone(work, "option-env-unset", files)
+        expected = saved_equals_cargo(runner, blaze, real, "option-env-unset", project, env,
+            oracle_env, dict(hostile_env, SAVED_SPEC_UNSET="worker-value", SAVED_SPEC_SET="worker-value"),
+            hostile, bundle)
+        assert expected == "None|None\n", expected
+        project = standalone(work, "option-env-set", files)
+        requester = dict(env, SAVED_SPEC_SET="requester-secret")
+        saved = bundle / "option-env-set.cbor"
+        runner.run("option-env-set-save", [blaze, "cargo", "spec", "--out", saved, "run"],
+                   requester, project)
+        shutil.rmtree(project)
+        runner.run("option-env-set-refusal", [blaze, "cargo", "spec", "--run", saved],
+                   dict(hostile_env, SAVED_SPEC_SET="worker-value"), hostile, expected=None,
+                   contains="undeclared environment value SAVED_SPEC_SET")
+        # A tool the requester shipped is never run by the worker: CC names a script in the
+        # tree, and the platform names it by its bytes.
+        marker = work / "requester-tool-ran"
+        project = standalone(work, "requester-tool", {
+            "Cargo.toml": '[package]\nname="requester-tool"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { println!("built"); }\n',
+            "tools/cc": "#!/bin/sh\necho ran >> " + shlex.quote(str(marker)) + "\necho cc\n"})
+        (project / "tools/cc").chmod(0o755)
+        expected, _ = runner.run("requester-tool-reference", [real / "bin/cargo", "run",
+            "--locked", "--offline"], oracle_env, project, guarded=False)
+        saved = bundle / "requester-tool.cbor"
+        requester = dict(env, CC="./tools/cc")
+        runner.run("requester-tool-save", [blaze, "cargo", "spec", "--out", saved, "run"],
+                   requester, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("requester-tool-replay", [blaze, "cargo", "spec", "--run", saved],
+                               dict(hostile_env, CC="./tools/cc"), hostile)
+        assert actual == expected, (actual, expected)
+        assert not marker.exists(), "a tool from the requester's tree was run"
+        # A Cargo home that is an ancestor's .cargo (here $HOME/.cargo, with no CARGO_HOME) is
+        # nearer than the files above it, and stays so in the replay.
+        layers = work / "layers"
+        write(layers, ".cargo/config.toml", '[env]\nLAYER_VALUE="from-above"\n')
+        write(layers, "home/.cargo/config.toml", '[env]\nLAYER_VALUE="from-home"\n')
+        project = standalone(layers / "home", "proj", {
+            "Cargo.toml": '[package]\nname="layered"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": 'fn main() { println!("{}", env!("LAYER_VALUE")); }\n'})
+        homed = {key: value for key, value in env.items() if key != "CARGO_HOME"}
+        homed.update(HOME=str(layers / "home"))
+        homed_oracle = {key: value for key, value in oracle_env.items() if key != "CARGO_HOME"}
+        homed_oracle.update(HOME=str(layers / "home"))
+        expected = saved_equals_cargo(runner, blaze, real, "home-layers", project, homed,
+            homed_oracle, {key: value for key, value in hostile_env.items() if key != "CARGO_HOME"},
+            hostile, bundle)
+        assert expected == "from-home\n", expected
+        print("saved source execution matches Cargo after origin removal; corrupt/external/native/unsupported inputs refused", flush=True)
     finally:
         calls = audit.read_text().splitlines()
         write(work, "results.json", json.dumps({"backend": args.backend, "rows": runner.rows,

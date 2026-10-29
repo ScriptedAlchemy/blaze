@@ -17,6 +17,7 @@ use blaze_spec::{
     run,
 };
 use blaze_wire::BuildSpec;
+use sha2::{Digest as _, Sha256};
 
 fn fixture() -> common::Fixture {
     let f = common::Fixture::with_root(
@@ -86,16 +87,27 @@ fn system_child_probes_receive_exactly_the_request_environment() {
     }
 }
 
+/// A compiler that records every run in `marker` and prints `version`.
+fn compiler(path: &Path, marker: &Path, version: &str) {
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\necho ran >> '{}'\nprintf '%s\\n' '{version}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
-fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
+fn a_tool_of_the_requests_tree_is_named_by_its_bytes_and_never_run() {
     let f = fixture();
     let root = f.root();
+    let ran = tempfile::tempdir().unwrap();
+    let marker = ran.path().join("ran");
     // A colon in cwd cannot be prefixed to PATH and then split again.
     let cwd = root.join("nested:directory/deep");
     let process_cwd = std::env::current_dir().unwrap();
     assert_ne!(process_cwd, cwd);
     std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::write(cwd.join("probe-version"), "request compiler 1\n").unwrap();
     let raw_bin = OsString::from_vec(b"tools-\xff".to_vec());
     let mut bins = vec![PathBuf::new(), PathBuf::from("tools")];
     // Linux accepts arbitrary non-NUL bytes in filenames. APFS rejects this
@@ -105,14 +117,10 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
     bins.push(PathBuf::from(&raw_bin));
     for bin in bins {
         std::fs::create_dir_all(cwd.join(&bin)).unwrap();
-        let tool = cwd.join(bin).join("review-cc");
-        std::fs::write(
-            &tool,
-            "#!/bin/sh\nread -r version < probe-version || exit 1\nprintf '%s\\n' \"$version\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        compiler(&cwd.join(bin).join("review-cc"), &marker, "request compiler 1");
     }
+    let bytes = std::fs::read(cwd.join("review-cc")).unwrap();
+    let digest: blaze_wire::Digest = Sha256::digest(&bytes).into();
     let system_path = std::env::var_os("PATH").unwrap();
     let prefixed = |prefix: &OsStr| {
         let mut path = prefix.to_owned();
@@ -139,9 +147,12 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
         ctx.native_env = Some(&native);
         ctx.probe = &System;
         let made = build_spec(&Request::parse(Subcommand::Build, &[]).unwrap(), &ctx).unwrap();
+        // Resolution is cargo's: relative to the request's directory. Identity is the bytes.
         let compiler = made.platform.cc.as_ref().expect("CC resolves relative to request cwd");
         assert_eq!(compiler.0, "review-cc");
-        assert_eq!(compiler.1, "request compiler 1", "--version runs in request cwd");
+        assert_eq!(compiler.1, "", "a tool of the request's tree has no version: it is not run");
+        assert_eq!(compiler.2, digest);
+        assert!(!marker.exists(), "the platform ran a program the requester shipped: {cc:?}");
         let saved: BuildSpec =
             blaze_wire::decode(&blaze_wire::encode(&made.build), &blaze_wire::Limits::DOCUMENTED)
                 .unwrap();
@@ -170,8 +181,46 @@ fn system_probes_and_saved_replay_use_nested_request_cwd_for_tools_and_path() {
             }
         }
         assert!(matched, "saved spec must replay from the serving process's different cwd");
+        assert!(!marker.exists(), "a replay ran a program the requester shipped: {cc:?}");
     }
     assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+}
+
+#[test]
+fn a_tool_outside_the_requests_tree_still_names_its_version() {
+    let f = fixture();
+    let root = f.root();
+    let parent = root.parent().unwrap();
+    let outside = tempfile::tempdir_in(parent).unwrap();
+    let ran = tempfile::tempdir().unwrap();
+    let marker = ran.path().join("ran");
+    let tool = outside.path().join("outside-cc");
+    compiler(&tool, &marker, "outside compiler 2");
+    let cwd = root.join("nested/deep");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let up = Path::new("../../..").join(outside.path().file_name().unwrap());
+    let host = native_host();
+    let system_path = std::env::var_os("PATH").unwrap();
+    for (cc, path) in [
+        (tool.clone().into_os_string(), system_path.clone()),
+        // The same directory through the request's directory: `..` does not hide it from the
+        // tree test, and it is outside the tree.
+        (up.join("outside-cc").into_os_string(), system_path.clone()),
+    ] {
+        let mut native: BTreeMap<_, _> =
+            f.env().into_iter().map(|(name, value)| (name, OsString::from(value))).collect();
+        native.insert("CC".into(), cc);
+        native.insert("PATH".into(), path);
+        let env = environment::text_view(&native).unwrap();
+        let mut ctx = common::context(&f, &env, &host, &cwd);
+        ctx.native_env = Some(&native);
+        ctx.probe = &System;
+        let made = build_spec(&Request::parse(Subcommand::Build, &[]).unwrap(), &ctx).unwrap();
+        let compiler = made.platform.cc.as_ref().unwrap();
+        assert_eq!(compiler.1, "outside compiler 2");
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+    }
 }
 
 struct SdkFiles;

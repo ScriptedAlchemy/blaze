@@ -6,16 +6,19 @@
 //! compares the entire BuildSpec. Only then is the execution platform probed.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, bail, ensure};
+use blaze_manifest::config::ConfigImage;
 use blaze_wire::{
-    BuildSpec, ConfigEnvValue, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity, Wire,
+    BuildSpec, ConfigEnvValue, Digest, ExecPlatform, RootRef, SourcePath, SourceRef, StoreIdentity,
+    Wire,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     assemble::{self, Context, Host, Resolved, Spec},
@@ -44,16 +47,54 @@ pub struct Prepared {
     pub environment: BTreeMap<String, OsString>,
     /// Toolchain-derived target cfg facts, verified against the saved platform.
     pub host: Host,
+    /// The configuration files the capture read, at their places in the snapshot: what every
+    /// later reading of the configuration (the executor's too) is made from.
+    pub config_image: ConfigImage,
+    /// The names of the variables the requester's process had, as digests: the record never
+    /// holds a name or a value. See [`Prepared::requester_had`].
+    requester_names: BTreeSet<Digest>,
+}
+
+/// What a variable name is recorded as.
+fn name_digest(name: &str) -> Digest {
+    Sha256::digest(name.as_bytes()).into()
 }
 
 impl Prepared {
+    /// Keep a live request's resolution, configuration layers and effective environment
+    /// together for the owned executor.
+    pub fn from_live(
+        resolved: Resolved,
+        root: PathBuf,
+        cwd: PathBuf,
+        request: Request,
+        environment: BTreeMap<String, OsString>,
+        host: Host,
+    ) -> anyhow::Result<Self> {
+        let mut files = BTreeMap::new();
+        for path in &resolved.config.files {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("configuration {} is unreadable", path.display()))?;
+            files.insert(path.clone(), bytes);
+        }
+        let config_image = ConfigImage { layers: resolved.config.layers.clone(), files };
+        let requester_names = environment.keys().map(|name| name_digest(name)).collect();
+        Ok(Self { resolved, root, cwd, request, environment, host, config_image, requester_names })
+    }
+
     /// Manifest/configuration context scoped to the authenticated materialized replay.
     pub fn manifests(&self) -> anyhow::Result<blaze_manifest::Context> {
         let env = environment::text_view(&self.environment)?;
         let home = environment::cargo_home(&self.environment, &self.cwd)
             .context("replay has no Cargo home")?;
-        let mut config = blaze_manifest::Config::load_with_home(&self.cwd, env, &[], home)?
-            .with_discovery_root(&self.root)?;
+        let mut config = blaze_manifest::Config::from_image(
+            &self.cwd,
+            home,
+            env,
+            &[],
+            self.config_image.clone(),
+        )?
+        .with_discovery_root(&self.root)?;
         config.start(
             self.request.command.unwrap_or(Subcommand::Build).name(),
             &self.request.config,
@@ -73,7 +114,7 @@ impl Prepared {
             env: &env,
             linker: None,
         };
-        let described = crate::platform::describe(&machine, probe)?;
+        let described = crate::platform::describe_of(&machine, probe, Some(&self.root))?;
         ensure!(
             described.platform == self.resolved.spec.platform,
             "native execution platform changed after replay validation"
@@ -84,6 +125,19 @@ impl Prepared {
     /// Revalidate all materialized source bytes, kinds, native names and membership.
     pub fn validate_sources(&self, store: &Path) -> anyhow::Result<()> {
         Snapshot::verify_materialized(source_root(&self.resolved.spec.build)?, store, &self.root)
+    }
+
+    /// Whether the requester's process had a variable called `name`, whether or not the spec
+    /// carries it. A program that reads one it did not have (`option_env!`) is given the same
+    /// answer by a replay, which never passes it the worker's value; one it did have, and
+    /// the spec does not carry, cannot be answered.
+    pub fn requester_had(&self, name: &str) -> bool {
+        self.requester_names.contains(&name_digest(name))
+    }
+
+    /// Authenticated requester variable-name digests for the private compiler context.
+    pub fn requester_names(&self) -> &BTreeSet<Digest> {
+        &self.requester_names
     }
 
     /// The effective compiler/run environment, after applying the spec's configuration
@@ -103,6 +157,54 @@ impl Prepared {
     }
 }
 
+/// The version of the replay record's encoding.
+const RECORD_VERSION: u32 = 4;
+
+/// The configuration files resolution read, placed in the snapshot. Replay reads these and no
+/// others, in this order: discovery from the worker's tree could fold a file in at another
+/// precedence (a Cargo home that lay above the workspace was an ancestor's `.cargo`, and is a
+/// mount in the snapshot) or find one the capture never saw.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ConfigLayers {
+    /// The top-level files, highest precedence first.
+    layers: Vec<SourcePath>,
+    /// Every file read: the layers, what they include, and the `--config` files.
+    files: Vec<SourcePath>,
+}
+
+impl ConfigLayers {
+    fn image(&self, root: &Path) -> anyhow::Result<ConfigImage> {
+        let native =
+            |path: &SourcePath| -> anyhow::Result<PathBuf> { Ok(root.join(path.to_native()?)) };
+        let mut files = BTreeMap::new();
+        for file in &self.files {
+            let path = native(file)?;
+            let bytes = std::fs::read(&path).with_context(|| {
+                format!("captured configuration {} is unreadable", path.display())
+            })?;
+            files.insert(path, bytes);
+        }
+        let layers = self.layers.iter().map(native).collect::<anyhow::Result<_>>()?;
+        Ok(ConfigImage { layers, files })
+    }
+}
+
+impl Wire for ConfigLayers {
+    fn encode(&self, e: &mut blaze_wire::Encoder) {
+        e.array(2);
+        self.layers.encode(e);
+        self.files.encode(e);
+    }
+
+    fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
+        r.array_start(2)?;
+        let layers = Vec::decode(r)?;
+        let files = Vec::decode(r)?;
+        r.array_end()?;
+        Ok(Self { layers, files })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Record {
     recipe: ReplayRecipe,
@@ -111,26 +213,31 @@ struct Record {
     platform: ExecPlatform,
     sources: SourcePath,
     facts: SourcePath,
+    config: ConfigLayers,
+    /// The digests of the names of the requester's variables, in order.
+    requester: Vec<Digest>,
 }
 
 impl Wire for Record {
     fn encode(&self, e: &mut blaze_wire::Encoder) {
-        e.array(7);
-        2_u32.encode(e);
+        e.array(9);
+        RECORD_VERSION.encode(e);
         self.recipe.encode(e);
         self.manifest.encode(e);
         self.cargo_home.encode(e);
         self.platform.encode(e);
         self.sources.encode(e);
         self.facts.encode(e);
+        self.config.encode(e);
+        self.requester.encode(e);
     }
 
     fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
-        r.array_start(7)?;
+        r.array_start(9)?;
         let at = r.position();
-        if u32::decode(r)? != 2 {
+        if u32::decode(r)? != RECORD_VERSION {
             return Err(blaze_wire::Error {
-                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 2" },
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "replay record version 4" },
                 at,
             });
         }
@@ -141,6 +248,8 @@ impl Wire for Record {
             platform: ExecPlatform::decode(r)?,
             sources: SourcePath::decode(r)?,
             facts: SourcePath::decode(r)?,
+            config: ConfigLayers::decode(r)?,
+            requester: Vec::decode(r)?,
         };
         r.array_end()?;
         Ok(record)
@@ -288,6 +397,7 @@ pub fn capture(
     let captured_ctx = Context {
         source_root: Some(&root),
         config_root: ctx.config_root,
+        config_image: ctx.config_image,
         source: SourceRef::Root(RootRef { root: [0; 32] }),
         cwd: ctx.cwd,
         env: ctx.env,
@@ -300,13 +410,9 @@ pub fn capture(
     };
     // This pass also resolves workspace-relative configuration paths against the
     // final layout, rather than the provisional workspace root.
-    let mut resolved = assemble::resolve_captured(
-        request,
-        &captured_ctx,
-        &first.spec.platform,
-        &first.sources,
-        &first.facts,
-    )?;
+    // Probe with the final requester root so tools within it are named by their bytes.
+    let mut resolved =
+        assemble::resolve_captured(request, &captured_ctx, None, &first.sources, &first.facts)?;
     resolved.inputs.extend(first.inputs);
     let mut excluded = resolved.outputs;
     excluded.extend_from_slice(outputs);
@@ -372,8 +478,21 @@ pub fn capture(
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    let configuration = |paths: &[PathBuf]| -> anyhow::Result<Vec<SourcePath>> {
+        paths.iter().map(|path| place(path)).collect()
+    };
     let record = Record {
         recipe: ReplayRecipe::capture(&made.build, subcommand, words, &recipe_env, &config_files)?,
+        requester: native
+            .keys()
+            .map(|name| name_digest(name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        config: ConfigLayers {
+            layers: configuration(&resolved.config.layers)?,
+            files: configuration(&resolved.config.files)?,
+        },
         manifest: place(&resolved.manifest)?,
         // An empty external Cargo home is not a source input and must not make the
         // source root depend on the absolute spelling of a checkout's location.
@@ -489,6 +608,15 @@ fn prepare_record(
     let workspace = root.join(given.workspace_manifest.to_native()?);
     let workspace = workspace.parent().context("workspace manifest has no directory")?;
     let mut native = invocation.env;
+    // The executor's PATH is the worker's: a relative or empty entry in it is relative to the
+    // worker's process, never to the replayed request's directory, where the requester's tree
+    // would answer for it. The requester's own PATH, below, is relative to its directory.
+    if let Some(path) = native.get("PATH") {
+        let process = std::env::current_dir().context("the worker's directory is unknown")?;
+        let entries = std::env::split_paths(path).map(|entry| process.join(entry));
+        let path = std::env::join_paths(entries).context("the executor's PATH cannot be rooted")?;
+        native.insert("PATH".to_owned(), path);
+    }
     for (name, value) in given.script_env.iter() {
         native.insert(name.clone(), value.materialize(workspace)?);
     }
@@ -501,6 +629,7 @@ fn prepare_record(
             native.insert(name.clone(), value.materialize(workspace)?);
         }
     }
+    let config_image = record.config.image(&root)?;
     let cargo_home = match &record.cargo_home {
         Some(home) => root.join(home.to_native()?),
         None => {
@@ -512,6 +641,7 @@ fn prepare_record(
     let ctx = Context {
         source_root: Some(&root),
         config_root: Some(&root),
+        config_image: Some(&config_image),
         cwd: &cwd,
         env: &env,
         native_env: Some(&native),
@@ -543,7 +673,8 @@ fn prepare_record(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let facts =
         crate::resolver_facts::decode(&Snapshot::read_file(source.root, store, &record.facts)?)?;
-    let resolved = assemble::resolve_captured(&request, &ctx, &record.platform, &sources, &facts)?;
+    let resolved =
+        assemble::resolve_captured(&request, &ctx, Some(&record.platform), &sources, &facts)?;
     if let Some(difference) = crate::run::first_difference(given, &resolved.spec.build) {
         bail!("captured request does not match the BuildSpec: {difference}");
     }
@@ -573,7 +704,16 @@ fn prepare_record(
     if let Some(difference) = crate::run::first_difference(given, &verified.build) {
         bail!("execution machine does not match the BuildSpec: {difference}");
     }
-    Ok(Prepared { resolved, root, cwd, request, environment: native, host: host.clone() })
+    Ok(Prepared {
+        resolved,
+        root,
+        cwd,
+        request,
+        environment: native,
+        host: host.clone(),
+        config_image,
+        requester_names: record.requester.iter().copied().collect(),
+    })
 }
 
 fn source_root(build: &BuildSpec) -> anyhow::Result<blaze_wire::Digest> {

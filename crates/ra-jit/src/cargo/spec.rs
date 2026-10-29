@@ -175,6 +175,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         native_env: Some(&native_env),
         source_root: None,
         config_root: None,
+        config_image: None,
         cwd: &cwd,
         env: &env,
         host: &host,
@@ -443,6 +444,8 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         if let Some(runtime) = &runtime {
             program.project[runtime::FIELD] = runtime.clone();
         }
+        program.project["blaze_spec_requester_names"] =
+            serde_json::json!(prepared.requester_names());
         program.project["blaze_spec_inputs"] = serde_json::json!({
             "root": prepared.root, "store": store, "source": source.root,
         });
@@ -488,14 +491,9 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         println!("{result}");
         return Ok(0);
     }
-    execute(
-        &programs,
-        &prepared,
-        &compiler_env,
-        &prepared.execution_environment()?,
-        &producers,
-        &sysroot,
-    )
+    let mut runtime_env = blaze_spec::execution::worker_base_environment(&executor, &compiler_home);
+    runtime_env.extend(prepared.execution_environment()?);
+    execute(&programs, &prepared, &compiler_env, &runtime_env, &producers, &sysroot)
 }
 
 fn source_naming(
@@ -880,6 +878,18 @@ fn compile_at(
     Ok(())
 }
 
+/// Whether a variable the compiler found unset is unset as the requester had it. The compiler
+/// runs with the spec's environment alone, so an `option_env!` of a name the spec does not
+/// carry reads absent whatever the worker has; that is Cargo's answer exactly when the
+/// requester's process lacked the name too. One it had, which the spec does not carry (a
+/// secret, say), would be answered `None` where Cargo answered the requester's value.
+/// Cargo derives the three names of its own per crate.
+fn absent_as_saved(name: &str, present: bool, requester_had: impl Fn(&str) -> bool) -> bool {
+    !present
+        && (matches!(name, "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR")
+            || !requester_had(name))
+}
+
 /// The complete non-language dependency trace includes modules and all include macros.
 /// Admission happens before any executable is run or advertised. This is a correctness
 /// check after compilation, not a filesystem sandbox or a claim of pre-read confinement.
@@ -950,6 +960,11 @@ pub(crate) fn admit_trace(
     let crates =
         project["crates"].as_array().context("no source crates in compiler description")?;
     let trace_key = crate::dep_info::replay_key(project)?;
+    let requester: Option<std::collections::BTreeSet<blaze_wire::Digest>> = project
+        .get("blaze_spec_requester_names")
+        .map(|names| serde_json::from_value(names.clone()))
+        .transpose()
+        .context("invalid saved requester environment names")?;
     for (name, value) in &inputs.env {
         let declared = value.is_some()
             && crates.iter().any(|krate| {
@@ -961,11 +976,15 @@ pub(crate) fn admit_trace(
                     )
                 })
             });
-        // Cargo derives these absences per crate. An arbitrary option_env! read is
-        // not proof of a captured absence: the requester may have had a secret value.
-        let derived_absence = value.is_none()
-            && matches!(name.as_str(), "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR");
-        ensure!(declared || derived_absence, "compiler read undeclared environment value {name}");
+        let absent =
+            absent_as_saved(name, value.is_some(), |name| {
+                // A descriptor without authenticated requester presence cannot prove
+                // arbitrary absence. Keep legacy/test descriptors conservative.
+                let identity: blaze_wire::Digest = Sha256::digest(name.as_bytes()).into();
+                requester.as_ref().is_none_or(|names| names.contains(&identity))
+            }) && (matches!(name.as_str(), "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR")
+                || crates.iter().any(|krate| krate["env"].get(name).is_none()));
+        ensure!(declared || absent, "compiler read undeclared environment value {name}");
     }
     Ok(())
 }
@@ -1064,6 +1083,70 @@ mod tests {
         std::fs::remove_file(generated.join("later.rs")).unwrap();
         std::fs::write(&file, "pub const VALUE: u8 = 43;").unwrap();
         assert!(admit_trace(&trace, &project).is_err());
+    }
+
+    #[test]
+    fn requester_absence_and_keyed_values_share_saved_admission() {
+        use blaze_spec::{
+            native::{Closure, Root},
+            native_tree::Tree,
+        };
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        let generated = work.path().join("generated.rs");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(&generated, "const VALUE: u8 = 42;").unwrap();
+        let closure = Closure {
+            roots: vec![Root {
+                name: "producer/out/0".into(),
+                tree: Tree::capture(&generated).unwrap(),
+            }],
+        };
+        let secret: blaze_wire::Digest = Sha256::digest(b"SECRET").into();
+        let mut project = serde_json::json!({
+            "blaze_spec_inputs": {"root": source, "store": work.path(), "source": vec![0_u8; 32]},
+            "blaze_spec_generated_bindings": closure.encode_bindings(),
+            "blaze_spec_requester_names": [secret],
+            "crates": [{"env": {"CAPTURED": "saved-value"}}],
+        });
+        crate::dep_info::ensure_replay_key(&mut project).unwrap();
+        let inputs = |name: &str, value: Option<&str>| {
+            crate::dep_info::ReplayTrace::from_inputs(
+                &crate::dep_info::DepInfo {
+                    files: vec![generated.to_str().unwrap().into()],
+                    env: vec![(name.into(), value.map(str::to_owned))],
+                },
+                crate::dep_info::replay_key(&project).unwrap(),
+            )
+        };
+        let absent = inputs("NEVER_SET", None);
+        let present = inputs("CAPTURED", Some("saved-value"));
+        admit_trace(&absent, &project).unwrap();
+        admit_trace(&present, &project).unwrap();
+        assert!(admit_trace(&inputs("SECRET", None), &project).is_err());
+        assert!(admit_trace(&inputs("CAPTURED", None), &project).is_err());
+        assert!(admit_trace(&inputs("CAPTURED", Some("worker-value")), &project).is_err());
+        assert!(admit_trace(&inputs("NEVER_SET", Some("worker-value")), &project).is_err());
+        // A captured value remains tied to the descriptor's private trace key.
+        let mut altered = project.clone();
+        altered[crate::dep_info::TRACE_KEY_FIELD] = serde_json::json!([9_u8; 32].to_vec());
+        assert!(admit_trace(&present, &altered).is_err());
+        altered["blaze_spec_requester_names"] = serde_json::json!([[0, 1]]);
+        assert!(admit_trace(&absent, &altered).is_err());
+        altered.as_object_mut().unwrap().remove("blaze_spec_requester_names");
+        assert!(admit_trace(&absent, &altered).is_err());
+    }
+
+    #[test]
+    fn an_unset_variable_reads_as_the_requester_had_it() {
+        let had = |name: &str| name == "SECRET";
+        // Unset for the requester and for the compiler: Cargo's answer, whatever the worker has.
+        assert!(absent_as_saved("NEVER_SET", false, had));
+        assert!(absent_as_saved("OUT_DIR", false, |_| true));
+        // The requester had it and the spec does not carry it: not reproducible.
+        assert!(!absent_as_saved("SECRET", false, had));
+        // A value the compiler found is declared by the spec or refused, never absent.
+        assert!(!absent_as_saved("NEVER_SET", true, had));
     }
 
     #[test]

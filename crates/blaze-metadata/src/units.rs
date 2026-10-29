@@ -361,7 +361,7 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
 pub fn unit_graph_with_inputs(
     asked: &UnitsAsked<'_>,
 ) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>)> {
-    let resolution = unit_graph_captured(asked, None, None)?;
+    let resolution = unit_graph_captured(asked, None, None, None)?;
     Ok((resolution.graph, resolution.inputs))
 }
 
@@ -377,11 +377,13 @@ pub struct GraphResolution {
 /// Resolve using owned source indexes, or only authenticated facts and selected roots.
 /// Unselected packages contribute resolver facts without requiring their source archives.
 /// The caller authenticates facts and source contents; original registry/Git identities
-/// remain authoritative. `discovery_root` bounds configuration reads during replay.
+/// remain authoritative. `discovery_root` bounds configuration reads during replay; `image`
+/// replaces discovery with exactly the configuration layers and included files captured.
 pub fn unit_graph_captured(
     asked: &UnitsAsked<'_>,
     captured: Option<CapturedResolution<'_>>,
     discovery_root: Option<&Path>,
+    image: Option<&blaze_manifest::config::ConfigImage>,
 ) -> Result<GraphResolution> {
     let a = asked.asked;
     let Some(build) = &a.build else {
@@ -395,7 +397,7 @@ pub fn unit_graph_captured(
         Command::Check => ("check", "dev", Intent::Check { test: asked.profile == Some("test") }),
         Command::Test => ("test", "test", Intent::Test),
     };
-    let (ctx, offline) = crate::open(a, command, discovery_root)?;
+    let (ctx, offline) = crate::open(a, command, discovery_root, image)?;
     refuse_what_is_not_read(&ctx.config, platform.triple)?;
     let ws = Workspace::new(&root_manifest(a.manifest_path, &ctx)?, &ctx)?;
     let mut warnings: Vec<String> = Vec::new();

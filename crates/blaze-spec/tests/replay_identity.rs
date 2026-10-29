@@ -59,6 +59,7 @@ impl Project {
             native_env: None,
             source_root: None,
             config_root: None,
+            config_image: None,
             cwd: &self.root,
             env: &env,
             host: &host,

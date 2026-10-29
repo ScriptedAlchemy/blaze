@@ -241,7 +241,7 @@ fn made(
     host: Option<&TargetPlatform<'_>>,
     units: Option<&mut Vec<ResolvedUnit>>,
 ) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
-    let (ctx, offline) = open(asked, "metadata", None)?;
+    let (ctx, offline) = open(asked, "metadata", None, None)?;
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let member_ids = member_ids(&ws)?;
     let specs: Vec<PackageIdSpec> = match &asked.build {
@@ -340,10 +340,17 @@ fn open(
     asked: &Asked<'_>,
     command: &str,
     discovery_root: Option<&Path>,
+    image: Option<&blaze_manifest::config::ConfigImage>,
 ) -> Result<(Context, bool)> {
-    let mut config = match &asked.cargo_home {
-        Some(home) => Config::load_with_home(asked.cwd, asked.env.clone(), &[], home.clone())?,
-        None => Config::load(asked.cwd, asked.env.clone(), &[])?,
+    let mut config = match (image, &asked.cargo_home) {
+        (Some(image), Some(home)) => {
+            Config::from_image(asked.cwd, home.clone(), asked.env.clone(), &[], image.clone())?
+        }
+        (Some(_), None) => bail!("a captured configuration needs the Cargo home it was read with"),
+        (None, Some(home)) => {
+            Config::load_with_home(asked.cwd, asked.env.clone(), &[], home.clone())?
+        }
+        (None, None) => Config::load(asked.cwd, asked.env.clone(), &[])?,
     };
     if let Some(root) = discovery_root {
         config = config.with_discovery_root(root)?;

@@ -6,6 +6,7 @@
 //! by complete trees. SDK identities do not contain the SDK's physical root location.
 //! Every filesystem read and process query goes through `Probe`; `System` uses the requested
 //! cwd and explicit environment. `describe` retains the trees for saved-input admission.
+//! Requester-supplied executables are bound by bytes and never run while probing a saved job.
 
 use std::{
     collections::BTreeMap,
@@ -167,6 +168,21 @@ struct InDirectory<'a> {
     probe: &'a dyn Probe,
     cwd: &'a Path,
     env: &'a BTreeMap<String, std::ffi::OsString>,
+    /// The requester's tree by its canonical name, when the machine has one.
+    requester: Option<PathBuf>,
+}
+
+impl InDirectory<'_> {
+    /// Whether `program` is a file of the requester's tree. Such a file is named by its bytes
+    /// and never run: the platform is read before the inputs are compiled or admitted, and a
+    /// program the requester shipped is job code, not the machine's toolchain.
+    fn supplied(&self, program: &Path) -> bool {
+        let Some(root) = &self.requester else {
+            return false;
+        };
+        let path = blaze_manifest::paths::normalize_path(&self.cwd.join(program));
+        path.starts_with(root) || path.canonicalize().is_ok_and(|path| path.starts_with(root))
+    }
 }
 
 impl Probe for InDirectory<'_> {
@@ -183,6 +199,9 @@ impl Probe for InDirectory<'_> {
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_output_in(self.cwd, env, &self.cwd.join(program), args)
     }
     fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
@@ -192,6 +211,9 @@ impl Probe for InDirectory<'_> {
         self.probe.which_in(self.cwd, name, path).map(|path| self.cwd.join(path))
     }
     fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        if self.supplied(program) {
+            return None;
+        }
         if args == ["--version"] {
             self.probe.run_in(
                 self.cwd,
@@ -204,9 +226,15 @@ impl Probe for InDirectory<'_> {
         }
     }
     fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_native_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_path_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -374,7 +402,16 @@ pub struct Machine<'a> {
 /// The `ExecPlatform` of `machine`, read through `probe`, or a [`Refusal`] naming the field
 /// blaze cannot name.
 pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
-    Ok(describe(machine, probe)?.platform)
+    exec_platform_of(machine, probe, None)
+}
+
+/// Bound native identity without executing tools supplied in the requester's tree.
+pub fn exec_platform_of(
+    machine: &Machine<'_>,
+    probe: &dyn Probe,
+    requester: Option<&Path>,
+) -> Result<ExecPlatform, Refusal> {
+    Ok(describe_of(machine, probe, requester)?.platform)
 }
 
 /// Native platform identity together with the complete trees that justify it.
@@ -387,20 +424,34 @@ pub struct Description {
 
 /// Discover the platform and retain its native closure in one observation.
 pub fn describe(machine: &Machine<'_>, probe: &dyn Probe) -> Result<Description, Refusal> {
-    discover(machine, probe, true)
+    describe_of(machine, probe, None)
+}
+
+/// Retain the complete native closure while keeping requester tools inert during discovery.
+pub fn describe_of(
+    machine: &Machine<'_>,
+    probe: &dyn Probe,
+    requester: Option<&Path>,
+) -> Result<Description, Refusal> {
+    discover(machine, probe, true, requester)
 }
 
 /// Native tool facts for live planning, without claiming a bound input closure.
 pub fn facts(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
-    Ok(discover(machine, probe, false)?.platform)
+    Ok(discover(machine, probe, false, None)?.platform)
 }
 
 fn discover(
     machine: &Machine<'_>,
     probe: &dyn Probe,
     bind_native: bool,
+    requester: Option<&Path>,
 ) -> Result<Description, Refusal> {
-    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env };
+    let requester = requester.map(|root| {
+        let root = blaze_manifest::paths::normalize_path(root);
+        root.canonicalize().unwrap_or(root)
+    });
+    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env, requester };
     let probe: &dyn Probe = &scoped;
     let os = probe
         .os()
@@ -1511,7 +1562,7 @@ fn is_shim(path: &Path) -> bool {
 }
 
 /// The first line of what `path` prints for `--version`, trimmed, or an empty string when it
-/// cannot be run.
+/// cannot be run, or must not be: a tool of the requester's tree is named by its digest alone.
 fn version(probe: &dyn Probe, path: &Path) -> String {
     probe
         .run(path, &["--version"])

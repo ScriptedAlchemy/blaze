@@ -65,6 +65,7 @@ fn graph(
         },
         captured.map(|(sources, facts)| CapturedResolution { sources, facts }),
         None,
+        None,
     )?;
     Ok((resolved.graph, resolved.inputs, resolved.sources, resolved.facts))
 }

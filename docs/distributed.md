@@ -3019,13 +3019,17 @@ so equivalent command spellings retain the same `BuildSpec` and `JobContent`. Th
 config-file operands, native values and source-relative working directory survive relocation.
 Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
 complete spec, and verifies the execution platform before creating compiler descriptions.
+The snapshot manifest has its own budget, 4,194,304 entries in 256 MiB (the wire's message and batch
+budgets would refuse a tree of 70,000 files); a larger tree is refused at capture by name.
 An empty external Cargo home does not affect source identity. A Cargo home beside or above the
 workspace (its configuration, registry and Git trees) is kept in the snapshot under
 `.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:
 the same project with its home in another place, or below other directories, has the same spec.
-The configuration files resolution read are part of the replay record, in precedence order, and
-replay reads exactly those; no file above the directory a worker materializes the snapshot in is
-read. Path dependencies outside the workspace still keep their relative topology below the common
+The configuration files resolution read are part of the replay record (version 2), in precedence
+order, and every reading of the configuration during replay, the executor's included, is made from
+exactly those through `Config::from_image`, with no discovery: a Cargo home that was an ancestor's
+`.cargo` to the requester keeps its place, though the snapshot mounts it, and no file above the
+directory a worker materializes the snapshot in is read. Path dependencies outside the workspace still keep their relative topology below the common
 source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
 Linux unit tests; the layout independence of path dependencies is not normalized.)
 
@@ -3048,6 +3052,19 @@ deterministic CBOR trace (`[version, files, [[name, value-or-null], ...]]`, with
 budgets) preserves application input paths and environment reads, including filenames that Cargo's
 line-oriented dep-info cannot represent. Replay checks that trace against the snapshot before an
 executable is advertised or run. This is admission after compilation, not a filesystem sandbox.
+The compiler runs with the spec's environment alone, so a variable the program reads with
+`option_env!` reads unset in the replay, never as the worker has it. That is Cargo's answer when the
+requester's process lacked the variable too, and the replay record holds the digests of the names the
+requester's process had (not the names, not the values) to tell: a read of an unset variable the
+requester lacked is admitted, and one it had, which the spec does not carry, is refused as
+undeclared because its value was not kept.
+
+A program that `run` or `test` starts gets the environment Cargo gives one, not an empty one: the
+worker's `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG` and `LC_*`; the
+spec's configuration and script values; Cargo's package variables (`CARGO_MANIFEST_DIR`,
+`CARGO_MANIFEST_PATH`, `CARGO_PKG_*`), whose paths are in the replayed tree; and `CARGO`, naming the
+toolchain's cargo. The worker's other variables do not reach it, and the dynamic-library search path
+Cargo extends is not set (programs are linked statically).
 
 `harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
 compiler tools blocked, including removal of the original tree and hostile worker configuration.

@@ -61,7 +61,7 @@ fn inactive_archive_and_manifest_are_unneeded_for_capture_profile_validation_and
         targets: &TargetFilter::default(),
         profile: None,
     };
-    let original = unit_graph_captured(&units, None, None).unwrap();
+    let original = unit_graph_captured(&units, None, None, None).unwrap();
     assert_eq!(original.graph.units.len(), 1);
     assert!(original.sources.is_empty());
     assert_eq!(original.facts.packages.len(), 1);
@@ -76,6 +76,7 @@ fn inactive_archive_and_manifest_are_unneeded_for_capture_profile_validation_and
     let replay = unit_graph_captured(
         &units,
         Some(CapturedResolution { sources: &[], facts: &original.facts }),
+        None,
         None,
     )
     .unwrap();

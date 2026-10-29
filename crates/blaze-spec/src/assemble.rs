@@ -77,6 +77,9 @@ pub struct Context<'a> {
     /// Ancestor configuration boundary for authenticated replay. None preserves
     /// normal Cargo discovery while capturing an original request.
     pub config_root: Option<&'a Path>,
+    /// Exactly the configuration files a capture read, for an authenticated replay. None
+    /// discovers them from `cwd`, as Cargo does.
+    pub config_image: Option<&'a blaze_manifest::config::ConfigImage>,
     /// The directory the command was run in, absolute.
     pub cwd: &'a Path,
     /// The requester's environment, all of it: what is refused, carried or ignored is decided
@@ -159,6 +162,18 @@ pub struct Resolved {
     pub sources: Vec<blaze_metadata::CapturedSource>,
     /// Normalized whole-lock summaries, independent of selected source archives.
     pub facts: blaze_metadata::ResolverFacts,
+    /// The configuration files the resolution read.
+    pub config: ConfigRead,
+}
+
+/// The configuration files a resolution read: the layers in precedence order, and every file
+/// any of them (or a `--config` argument) brought in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigRead {
+    /// Top-level files, highest precedence first.
+    pub layers: Vec<PathBuf>,
+    /// Every file read, layers and includes and `--config` files alike, once each.
+    pub files: Vec<PathBuf>,
 }
 
 /// Resolve without discarding the native graph an owned executor needs.
@@ -190,18 +205,20 @@ pub fn resolve_recorded(
 }
 
 /// Reproduce from authenticated locked source roots without invoking Git or registry
-/// transport. The complete locked set is checked before any external manifest is read.
+/// transport. Whole-lock facts are checked before any selected external manifest is read.
+/// `platform` is the authenticated platform to reproduce against, or `None` to read it from
+/// the machine with `ctx.source_root` as the requester's tree.
 pub fn resolve_captured(
     request: &Request,
     ctx: &Context<'_>,
-    platform: &ExecPlatform,
+    platform: Option<&ExecPlatform>,
     sources: &[blaze_metadata::CapturedSource],
     facts: &blaze_metadata::ResolverFacts,
 ) -> Result<Resolved, Refusal> {
     resolve_with_platform(
         request,
         ctx,
-        Platform::Recorded(platform),
+        platform.map_or(Platform::Bound, Platform::Recorded),
         Some(blaze_metadata::CapturedResolution { sources, facts }),
     )
 }
@@ -213,12 +230,20 @@ fn resolve_with_platform(
     sources: Option<blaze_metadata::CapturedResolution<'_>>,
 ) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
-    let (offline, mut initial, manifest, outputs) = Opened::with(request, ctx, |opened| {
+    let (offline, mut initial, manifest, outputs, config) = Opened::with(request, ctx, |opened| {
+        let config = &opened.manifests.config;
+        let layers = config.layers().map_err(|error| {
+            Refusal::with(Reason::ConfigRejected, "the configuration layers", format!("{error:#}"))
+        })?;
+        let mut files: Vec<_> = config.sources().into_iter().map(|(path, _)| path).collect();
+        files.sort();
+        files.dedup();
         Ok((
             opened.resolved.offline,
             opened.manifests.sources(),
             opened.workspace.current_manifest().to_owned(),
             vec![opened.workspace.target_dir(), opened.workspace.build_dir()],
+            ConfigRead { layers, files },
         ))
     })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
@@ -253,13 +278,13 @@ fn resolve_with_platform(
         profile: request.profile.as_deref(),
     };
     let units::GraphResolution { graph, mut inputs, sources, facts } =
-        units::unit_graph_captured(&wanted, sources, ctx.config_root).map_err(|error| {
-            Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
-        })?;
+        units::unit_graph_captured(&wanted, sources, ctx.config_root, ctx.config_image).map_err(
+            |error| Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}")),
+        )?;
     let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
     inputs.extend(assembly_inputs);
-    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, facts })
+    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, facts, config })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -329,9 +354,15 @@ impl Opened<'_> {
         };
         let native_home =
             ctx.native_env.and_then(|native| environment::cargo_home(native, ctx.cwd));
-        let mut config = match native_home {
-            Some(home) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
-            None => Config::load(ctx.cwd, ctx.env.clone(), &[]),
+        let mut config = match (ctx.config_image, native_home) {
+            (Some(image), Some(home)) => {
+                Config::from_image(ctx.cwd, home, ctx.env.clone(), &[], image.clone())
+            }
+            (Some(_), None) => Err(anyhow::anyhow!(
+                "a captured configuration needs the Cargo home it was read with"
+            )),
+            (None, Some(home)) => Config::load_with_home(ctx.cwd, ctx.env.clone(), &[], home),
+            (None, None) => Config::load(ctx.cwd, ctx.env.clone(), &[]),
         }
         .map_err(|error| rejected("the configuration", error))?;
         if let Some(root) = ctx.config_root {
@@ -436,9 +467,11 @@ fn assemble_with_inputs(
             env: &machine_env,
             linker: None,
         };
+        // The requester tree is the replayed snapshot, or the live workspace.
+        let requester = ctx.source_root.unwrap_or_else(|| opened.workspace.root());
         let platform = match platform {
             Platform::Recorded(platform) => platform.clone(),
-            Platform::Bound => platform::exec_platform(&machine, ctx.probe)?,
+            Platform::Bound => platform::exec_platform_of(&machine, ctx.probe, Some(requester))?,
             Platform::Live => platform::facts(&machine, ctx.probe)?,
         };
         let platform_digest = digest_of(&platform);

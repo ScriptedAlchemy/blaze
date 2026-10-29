@@ -169,6 +169,7 @@ pub(crate) fn write(file: &Path, project: &Value) -> anyhow::Result<Vec<u8>> {
     if let Some(object) = project.as_object_mut() {
         object.remove("blaze_owned_proc_macro_server");
         object.remove(crate::dep_info::TRACE_KEY_FIELD);
+        object.remove("blaze_spec_requester_names");
     }
     if let Some(crates) = project["crates"].as_array_mut() {
         for krate in crates {
@@ -398,6 +399,7 @@ mod tests {
         let file = work.path().join("rust-project.json");
         let mut private = json!({"crates": [{"env": {"TOKEN": "private"}}], "blaze_native_units": [1, 2], "blaze_native_bindings": [3, 4], "blaze_owned_proc_macro_server": [5, 6]});
         private[crate::dep_info::TRACE_KEY_FIELD] = json!(vec![7_u8; 32]);
+        private["blaze_spec_requester_names"] = json!([vec![8_u8; 32]]);
         let sent: Value = serde_json::from_slice(&write(&file, &private).unwrap()).unwrap();
         let public = read(&file).unwrap();
         assert_eq!(sent["crates"][0]["env"], private["crates"][0]["env"]);
@@ -405,6 +407,8 @@ mod tests {
         assert!(public.get("blaze_native_units").is_none());
         assert!(public.get("blaze_owned_proc_macro_server").is_none());
         assert!(public.get(crate::dep_info::TRACE_KEY_FIELD).is_none());
+        assert!(public.get("blaze_spec_requester_names").is_none());
+        assert_eq!(sent["blaze_spec_requester_names"], private["blaze_spec_requester_names"]);
         assert_eq!(
             sent[crate::dep_info::TRACE_KEY_FIELD],
             private[crate::dep_info::TRACE_KEY_FIELD]

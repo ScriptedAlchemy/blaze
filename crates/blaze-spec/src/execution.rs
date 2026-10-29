@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -52,6 +53,29 @@ pub struct Program {
     pub executable: PathBuf,
     /// A complete source description. No Cargo project is passed to the compiler.
     pub project: Value,
+}
+
+/// The variables of the worker that a replayed program is given, as Cargo gives a program the
+/// variables of the process that ran it: where to find programs, who runs it, where it may
+/// write, and how it is to speak. Nothing else of the worker's environment reaches it, and
+/// nothing of the requester's that was not in the spec.
+const WORKER_BASE: &[&str] =
+    &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "TERM", "LANG"];
+
+/// The worker's process base for a saved replay. Captured values and typed
+/// per-package producer settings are overlaid by the executor. Ordinary direct
+/// commands retain their full caller environment instead.
+pub fn worker_base_environment(
+    worker: &BTreeMap<String, OsString>,
+    home: &Path,
+) -> BTreeMap<String, OsString> {
+    let mut env: BTreeMap<String, OsString> = worker
+        .iter()
+        .filter(|(name, _)| WORKER_BASE.contains(&name.as_str()) || name.starts_with("LC_"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    env.entry("HOME".to_owned()).or_insert_with(|| home.as_os_str().to_owned());
+    env
 }
 
 /// The source and native settings after the owned producer scheduler has completed.
@@ -529,4 +553,37 @@ pub fn programs_with(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_worker_base_preserves_native_values_and_excludes_ambient_policy() {
+        let worker = BTreeMap::from([
+            ("PATH".into(), OsString::from("/worker/bin")),
+            ("HOME".into(), OsString::from("/worker/home")),
+            ("LC_MESSAGES".into(), OsString::from("C")),
+            ("RUSTFLAGS".into(), OsString::from("hostile")),
+            ("CARGO".into(), OsString::from("external-cargo")),
+            ("SECRET".into(), OsString::from("unrelated")),
+        ]);
+        let env = worker_base_environment(&worker, Path::new("/fallback"));
+        assert_eq!(env.len(), 3);
+        assert_eq!(env["PATH"], "/worker/bin");
+        assert_eq!(env["HOME"], "/worker/home");
+        assert_eq!(env["LC_MESSAGES"], "C");
+        assert_eq!(
+            worker_base_environment(&BTreeMap::new(), Path::new("/fallback"))["HOME"],
+            "/fallback"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let native = OsString::from_vec(b"/worker-\xff".to_vec());
+            let worker = BTreeMap::from([("HOME".into(), native.clone())]);
+            assert_eq!(worker_base_environment(&worker, Path::new("/fallback"))["HOME"], native);
+        }
+    }
 }

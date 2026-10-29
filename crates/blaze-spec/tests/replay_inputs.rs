@@ -862,3 +862,118 @@ fn unrecorded_worker_cargo_home_configuration_cannot_enter_replay() {
     let replay = prepared(&made, store.path(), &worker.path().join("source"));
     assert_eq!(replay.resolved.spec.build, made.build);
 }
+
+#[test]
+fn a_cargo_home_above_the_workspace_keeps_its_precedence_in_replay() {
+    // The home is an ancestor's `.cargo` to the requester's configuration walk, and nearer than
+    // the file above it. In the snapshot it is a mount no ancestor walk reaches: re-discovering
+    // the configuration would put it last, below the file it overrides.
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = base_root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(".cargo/config.toml", "[env]\nSHARED='from-base'\nONLY_BASE='base'\n");
+    write("user/.cargo/config.toml", "[env]\nSHARED='from-home'\n");
+    std::fs::create_dir_all(base_root.join("user/work")).unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(base_root.join("user/work")).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert("CARGO_HOME".to_owned(), base_root.join("user/.cargo").display().to_string());
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    let value = |name: &str| {
+        made.build
+            .config_env
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert!(value("SHARED").is_some() && value("ONLY_BASE").is_some());
+    drop(f);
+    drop(base);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    let effective = replay.execution_environment().unwrap();
+    assert_eq!(effective["SHARED"], "from-home");
+    assert_eq!(effective["ONLY_BASE"], "base");
+    // The replay reads the layers the capture read, in the capture's order: the home first,
+    // as an ancestor's `.cargo` nearer than the file above it. Walking the snapshot would
+    // visit the file above and then the mounted home last.
+    assert_eq!(
+        replay.config_image.layers,
+        [replay.root.join(".blaze-cargo-home/config.toml"), replay.root.join(".cargo/config.toml")]
+    );
+}
+
+#[test]
+fn a_replayed_program_gets_only_the_workers_base_environment() {
+    let executor: std::collections::BTreeMap<String, OsString> = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", "/home/worker"),
+        ("LC_ALL", "C"),
+        ("RA_JIT_BACKEND", "llvm"),
+        ("AWS_SECRET_ACCESS_KEY", "worker-secret"),
+        ("CARGO_PKG_NAME", "worker-package"),
+    ]
+    .map(|(name, value)| (name.to_owned(), OsString::from(value)))
+    .into_iter()
+    .collect();
+    let run = |executor: &_| {
+        blaze_spec::execution::worker_base_environment(executor, Path::new("/job/home"))
+    };
+    let env = run(&executor);
+    assert_eq!(env["PATH"], "/usr/bin:/bin");
+    assert_eq!(env["HOME"], "/home/worker");
+    assert_eq!(env["LC_ALL"], "C");
+    for absent in [
+        "RA_JIT_BACKEND",
+        "AWS_SECRET_ACCESS_KEY",
+        "CARGO_PKG_NAME",
+        "CARGO_CRATE_NAME",
+        "CARGO_BIN_NAME",
+        "CARGO_PRIMARY_PACKAGE",
+    ] {
+        assert!(!env.contains_key(absent), "{absent} reached the program");
+    }
+    let bare = executor.into_iter().filter(|(name, _)| name != "HOME").collect();
+    assert_eq!(run(&bare)["HOME"], "/job/home");
+}
+
+#[test]
+fn a_replay_knows_which_variables_the_requester_had_without_holding_their_names() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let mut env = f.env();
+    env.insert("PRIVATE_API_TOKEN".into(), "secret-that-must-not-persist".into());
+    let args: Vec<String> = Vec::new();
+    let request = Request::parse(Subcommand::Build, &args).unwrap();
+    let root = f.root();
+    let host = host(false);
+    let made =
+        capture(&request, &args, &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    // Unset for the requester: a program reading it with option_env! was answered None.
+    assert!(!replay.requester_had("SAVED_SPEC_NEVER_SET"));
+    // Set for the requester, though no spec carries it: the answer cannot be reproduced.
+    assert!(replay.requester_had("PRIVATE_API_TOKEN"));
+    assert!(replay.requester_had("PATH"));
+    let digest: String = made.digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let record = std::fs::read(store.path().join(format!("replay-{digest}.cbor"))).unwrap();
+    for held in [&b"PRIVATE_API_TOKEN"[..], b"secret-that-must-not-persist"] {
+        assert!(!record.windows(held.len()).any(|window| window == held));
+    }
+}

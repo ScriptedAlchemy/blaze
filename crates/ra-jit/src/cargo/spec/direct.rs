@@ -94,6 +94,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         &Context {
             source_root: Some(root),
             config_root: None,
+            config_image: None,
             cwd: &cwd,
             env: &text,
             native_env: Some(&planning),
@@ -106,14 +107,8 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         },
     )?;
     let target = resolved.outputs.first().context("resolution has no target directory")?.clone();
-    let prepared = Prepared {
-        resolved,
-        root: root.to_owned(),
-        cwd: cwd.clone(),
-        request,
-        environment: planning,
-        host,
-    };
+    let prepared =
+        Prepared::from_live(resolved, root.to_owned(), cwd.clone(), request, planning, host)?;
     // These values are live request inputs, not a portable spec's fixed environment list.
     // Producer and per-crate overlays remain authoritative over the caller's values.
     let mut effective = original.clone();
