@@ -220,3 +220,45 @@ fn source_acceptance_rejects_a_name_bound_twice_in_one_namespace() {
         );
     }
 }
+
+#[test]
+fn source_acceptance_normalizes_raw_imports_and_aliases_in_each_namespace() {
+    let library = "//- /lib.rs crate:library\npub struct Value { pub field: u32 }\npub struct Unit;\n#[macro_export] macro_rules! make { () => {} }\n";
+    let probe =
+        |main: &str| checked(&format!("//- /main.rs crate:main deps:library\n{main}\n{library}"));
+    for twice in [
+        "struct Value { x: u8 } use self::r#Value;",
+        "struct r#Value { x: u8 } use self::Value;",
+        "struct r#Value { x: u8 } use self::r#Value;",
+        "use library::{Value, r#Value};",
+        "use library::{r#Value, Value};",
+        "use library::Value as r#Alias; use library::Value as Alias;",
+        "use library::r#Value as Alias; use library::Value as r#Alias;",
+        "use library::Value as r#Alias; struct Alias { x: u8 }",
+        "mod value {} use self::r#value::{self};",
+        "mod value {} use self::value::{self as r#value};",
+        "mod r#value {} use self::r#value::{self as value};",
+        "use library::{Unit, r#Unit};",
+        "use library::r#Unit; fn Unit() {}",
+        "use library::{make, r#make};",
+    ] {
+        let result = probe(twice);
+        assert!(
+            result.errors.iter().any(|error| error.contains("defined multiple times")),
+            "{twice}: {result:?}"
+        );
+    }
+    for once in [
+        "use library::r#Value; fn Value() {}",
+        "use library::Value as r#Alias; fn Alias() {}",
+        "use library::Value as r#Alias; use library::Value as Other;",
+        "use library::r#Value as _; use library::Value as _;",
+        "use library::*; struct r#Value;",
+        "use library::make; use library::Value as r#make;",
+        "macro_rules! r#make { () => {} } macro_rules! make { () => {} }",
+        "use library::{self as r#lib, r#Value};",
+    ] {
+        let result = probe(once);
+        assert_eq!(result, Default::default(), "{once}: {result:?}");
+    }
+}
