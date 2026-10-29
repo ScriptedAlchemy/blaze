@@ -362,16 +362,29 @@ impl Fingerprint {
         Fingerprint { local, ..self.clone() }
     }
 
+    /// Cargo's id of a dependency on the package named `package`, as its fingerprint has it.
+    fn pkg_id(package: &str) -> u64 {
+        let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+        package.hash(&mut hasher);
+        Hasher::finish(&hasher)
+    }
+
+    /// Whether cargo's run of the script has a run-unit dependency on the package named
+    /// `package`: one a package declares as optional and leaves off, or for another target, has
+    /// no edge, however it is declared.
+    pub(crate) fn has_dependency(&self, package: &str) -> bool {
+        let id = Self::pkg_id(package);
+        self.deps.iter().any(|it| it.pkg_id == id)
+    }
+
     pub(crate) fn with_dependencies(
         &self,
         dependencies: &[(&str, u64, PathBuf)],
     ) -> Result<Fingerprint, String> {
         let mut now = self.clone();
         for (package, hash, _) in dependencies {
-            let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
-            package.hash(&mut hasher);
-            let pkg_id = Hasher::finish(&hasher);
-            let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == pkg_id) else {
+            let id = Self::pkg_id(package);
+            let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == id) else {
                 return Err(format!("no cargo run-unit dependency for {package}"));
             };
             dep.fingerprint = *hash;

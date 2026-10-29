@@ -401,7 +401,17 @@ fn judge_locked_inner(
 ) -> Result<Run, JudgementError> {
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
-    for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
+    // The dependencies cargo runs this script after. A package declared as a dependency may be
+    // none of them (optional and off, or for another target), which cargo's record of the run
+    // tells.
+    let recorded = records::Unit::of(out_dir).ok().and_then(|it| it.recorded().ok());
+    let edges: Vec<&Dependency> = cargo
+        .dependencies
+        .iter()
+        .filter(|it| it.parents.iter().any(|it| it == out_dir))
+        .filter(|it| recorded.as_ref().is_none_or(|run| run.has_dependency(&it.package)))
+        .collect();
+    for dep in &edges {
         let context = Cargo { targets: &dep.targets, ..*cargo };
         judge_locked(&dep.out_dir, &context, completed, parents)?;
         let unit = records::Unit::of(&dep.out_dir)?;
@@ -499,7 +509,7 @@ fn judge_locked_inner(
     // Cargo builds a script's `DEP_*` from its dependencies' current runs alone, so a key a
     // dependency we judged stopped printing is not there, whatever the last run of this script
     // had. (Those of a dependency we did not judge stay as that run had them.)
-    for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
+    for dep in &edges {
         let prefix = format!("DEP_{}_", blaze_build_script::envify(&dep.links));
         env.retain(|name, _| !name.starts_with(&prefix));
     }
@@ -953,6 +963,27 @@ mod tests {
         changed(&native);
         assert_eq!(current(&parent, &cargo), Ok(built));
         assert_eq!((runs(&native), runs(&parent)), (2, 2));
+    }
+
+    #[test]
+    fn a_dependency_cargo_gave_no_edge_is_not_run() {
+        // A package that declares an optional dependency on a `links` package, left off, has no
+        // run-unit edge to it in cargo's record. The daemon neither runs that package's script
+        // for it nor fails for the missing edge, which handed every build of it to cargo.
+        let native = ran_script("native-off", COUNTS, "");
+        let parent = ran_script("parent-off", COUNTS, "");
+        let dependencies = [Dependency {
+            package: "native-off".to_owned(),
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: vec![parent.clone()],
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let built = Run::of(&parent).unwrap();
+        changed(&native);
+        assert_eq!(current(&parent, &cargo), Ok(built));
+        assert_eq!((runs(&native), runs(&parent)), (0, 0));
     }
 
     #[test]
