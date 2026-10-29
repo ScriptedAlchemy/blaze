@@ -5,36 +5,41 @@ use std::{
     io::{Read as _, Write as _},
 };
 
-fn key() -> anyhow::Result<[u8; 32]> {
-    let home = crate::cargo::daemon::home()?;
-    crate::socket::private_dir(&home)?;
-    let path = home.join("env-identity-key");
-    let mut file = crate::socket::private_file(
-        OpenOptions::new().read(true).write(true).create(true).truncate(false),
-        &path,
-    )?;
-    file.lock()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    if bytes.is_empty() {
-        let mut key = [0; 32];
-        getrandom::fill(&mut key).map_err(|_| anyhow::anyhow!("environment identity entropy"))?;
-        file.write_all(&key)?;
-        file.sync_all()?;
-        return Ok(key);
-    }
-    bytes.try_into().map_err(|_| anyhow::anyhow!("invalid environment identity key"))
-}
+pub(crate) struct Identity([u8; 32]);
 
-pub(crate) fn value(value: Option<&str>) -> anyhow::Result<Option<String>> {
-    value
-        .map(|value| {
-            let key = key()?;
-            // HMAC-SHA256, with a per-home random key. A shared record reveals no
-            // offline dictionary oracle for a low-entropy credential.
+impl Identity {
+    pub(crate) fn load() -> anyhow::Result<Self> {
+        let home = crate::cargo::daemon::home()?;
+        crate::socket::private_dir(&home)?;
+        Self::at(&home.join("env-identity-key"))
+    }
+
+    fn at(path: &std::path::Path) -> anyhow::Result<Self> {
+        let mut file = crate::socket::private_file(
+            OpenOptions::new().read(true).write(true).create(true).truncate(false),
+            path,
+        )?;
+        file.lock()?;
+        let mut bytes = Vec::new();
+        (&mut file).take(33).read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            let mut key = [0; 32];
+            getrandom::fill(&mut key)
+                .map_err(|_| anyhow::anyhow!("environment identity entropy"))?;
+            file.write_all(&key)?;
+            file.sync_all()?;
+            return Ok(Self(key));
+        }
+        bytes.try_into().map(Self).map_err(|_| anyhow::anyhow!("invalid environment identity key"))
+    }
+
+    pub(crate) fn value(&self, value: Option<&str>) -> Option<String> {
+        value.map(|value| {
+            // HMAC-SHA256 with one private per-home key for the whole freshness
+            // judgment. No file I/O or fallible lookup inside freshness callbacks.
             let mut inner = Sha256::new();
             let mut pad = [0x36; 64];
-            for (to, from) in pad.iter_mut().zip(key) {
+            for (to, from) in pad.iter_mut().zip(self.0) {
                 *to ^= from;
             }
             inner.update(pad);
@@ -42,14 +47,21 @@ pub(crate) fn value(value: Option<&str>) -> anyhow::Result<Option<String>> {
             inner.update(value.as_bytes());
             let mut outer = Sha256::new();
             let mut pad = [0x5c; 64];
-            for (to, from) in pad.iter_mut().zip(key) {
+            for (to, from) in pad.iter_mut().zip(self.0) {
                 *to ^= from;
             }
             outer.update(pad);
             outer.update(inner.finalize());
-            Ok(format!("hmac-sha256-v1:{:x}", outer.finalize()))
+            format!("hmac-sha256-v1:{:x}", outer.finalize())
         })
-        .transpose()
+    }
+}
+
+pub(crate) fn value(value: Option<&str>) -> anyhow::Result<Option<String>> {
+    match value {
+        Some(value) => Ok(Identity::load()?.value(Some(value))),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn name(name: &std::ffi::OsStr) -> String {
@@ -135,6 +147,30 @@ pub(crate) fn read_json(path: &std::path::Path) -> anyhow::Result<serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_identities_keep_the_existing_hmac_format() {
+        assert_eq!(
+            super::Identity([11; 32]).value(Some("hello")).as_deref(),
+            Some("hmac-sha256-v1:fca1cee17e4f97d87ff30c25c67828ca4cda8b5ce316bdd86509eac5d35db876")
+        );
+    }
+
+    #[test]
+    fn a_corrupt_key_is_an_error_and_an_active_judgment_keeps_its_key() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("key");
+        let identity = super::Identity::at(&path).unwrap();
+        let before = identity.value(Some("credential"));
+        assert_eq!(before, super::Identity::at(&path).unwrap().value(Some("credential")));
+        for bytes in [vec![1], vec![2; 33], vec![3; 4096]] {
+            std::fs::write(&path, &bytes).unwrap();
+            let error = super::Identity::at(&path).err().unwrap();
+            assert!(error.to_string().contains("invalid environment identity key"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(identity.value(Some("credential")), before);
+        }
+    }
+
     #[test]
     fn nested_record_fields_are_kept_only_in_memory() {
         let root = tempfile::tempdir().unwrap();

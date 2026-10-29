@@ -578,6 +578,7 @@ struct Runner<'a> {
     /// Byte-valued environment supplied by the source-producer caller. Unicode
     /// projection is for source/configuration only, never a child process boundary.
     raw_env: BTreeMap<OsString, OsString>,
+    env_identity: crate::env_identity::Identity,
     target_cfgs: Vec<String>,
     host_cfgs: Option<Vec<String>>,
     /// What `rustc -vV` says, which every fingerprint has.
@@ -663,6 +664,7 @@ impl<'a> Runner<'a> {
             cross,
             config_env,
             raw_env: crate::process::native().vars().collect(),
+            env_identity: crate::env_identity::Identity::load()?,
             profiles,
             rustc,
             done: FxHashMap::default(),
@@ -1171,11 +1173,7 @@ impl<'a> Runner<'a> {
             .iter()
             .filter(|(name, _)| !set_for_crates(name))
             .map(|(name, _)| {
-                (
-                    name.clone(),
-                    crate::env_identity::value(self.compiled_with(name).as_deref())
-                        .expect("environment freshness identity"),
-                )
+                (name.clone(), self.env_identity.value(self.compiled_with(name).as_deref()))
             })
             .collect();
         let record_json = json!({ "fingerprint": fingerprint, "env": env });
@@ -1211,10 +1209,10 @@ impl<'a> Runner<'a> {
         }
         let env: Vec<(String, Option<String>)> =
             serde_json::from_value(record["env"].clone()).ok()?;
-        if env.iter().any(|(name, was)| {
-            crate::env_identity::value(self.compiled_with(name).as_deref()).ok().as_ref()
-                != Some(was)
-        }) {
+        if env
+            .iter()
+            .any(|(name, was)| self.env_identity.value(self.compiled_with(name).as_deref()) != *was)
+        {
             return None;
         }
         Some(made)
@@ -1230,8 +1228,7 @@ impl<'a> Runner<'a> {
     }
 
     fn value_identity(&self, name: &str) -> Option<String> {
-        crate::env_identity::value(self.value(name).as_deref())
-            .expect("environment freshness identity")
+        self.env_identity.value(self.value(name).as_deref())
     }
 
     /// Adds the library of `package` and what it links to `crates`, as a build script's

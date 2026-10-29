@@ -423,6 +423,7 @@ impl Remembered {
     fn write(dir: &Path, compiled: &Compiled) {
         let Ok(text) = std::fs::read_to_string(dir.join("rust_out.d")) else { return };
         let read = crate::dep_info::DepInfo::parse(&text);
+        let Ok(identity) = crate::env_identity::Identity::load() else { return };
         // The source is given on standard input, which dep-info names `-`.
         let files = read.files.iter().filter(|it| *it != "-").map(PathBuf::from);
         let files = files.map(|file| (stamp(&file), file)).map(|(was, file)| (file, was));
@@ -432,13 +433,7 @@ impl Remembered {
             env: read
                 .env
                 .into_iter()
-                .map(|(name, value)| {
-                    (
-                        name,
-                        crate::env_identity::value(value.as_deref())
-                            .expect("doctest freshness identity"),
-                    )
-                })
+                .map(|(name, value)| (name, identity.value(value.as_deref())))
                 .collect(),
         };
         let Ok(text) = serde_json::to_vec(&it) else { return };

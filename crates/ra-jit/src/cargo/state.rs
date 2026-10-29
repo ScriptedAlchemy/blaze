@@ -1014,7 +1014,7 @@ impl State {
         let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts)?;
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -1436,7 +1436,8 @@ fn guards(
     used: &[Record],
     scripts: &[BuildScript],
     checkouts: &[Checkout],
-) -> Vec<Guard> {
+) -> anyhow::Result<Vec<Guard>> {
+    let identity = crate::env_identity::Identity::load()?;
     let root = metadata.workspace_root.as_std_path();
     let manifests = metadata
         .workspace_packages()
@@ -1478,16 +1479,14 @@ fn guards(
     };
     for unit in used {
         let env = unit.inputs().env.into_iter().filter(|(name, _)| !set_for_rustc(name));
-        guards.extend(env.map(|(name, value)| Guard::Env {
-            name,
-            value:
-                crate::env_identity::value(value.as_deref()).expect("environment guard identity"),
-        }));
+        guards.extend(
+            env.map(|(name, value)| Guard::Env { name, value: identity.value(value.as_deref()) }),
+        );
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
-        guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
+        guards.extend(package.map(|it| rerun_guards(it, script, &identity)).into_iter().flatten());
     }
     let linked = checkouts.iter().flat_map(|it| &it.programs);
     let mut linked: Vec<PathBuf> = linked.flat_map(|it| it.linked_as_built.clone()).collect();
@@ -1497,7 +1496,7 @@ fn guards(
     let built = built.filter(|it| it.inputs().files.iter().any(|file| linked.contains(file)));
     let cargo = built.flat_map(Record::cargo_dep_info).collect();
     guards.push(Guard::beside_tests(linked, cargo));
-    guards
+    Ok(guards)
 }
 
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
@@ -1531,7 +1530,11 @@ fn reached_from<'a>(mut found: Vec<&'a Record>, used: &'a [Record]) -> Vec<&'a R
 /// What the build script of `package` said it reruns for. One that said nothing reruns for
 /// any change to the package. A variable is the user's to change, and then cargo builds; for
 /// a file the daemon runs the script again, when it knows how cargo ran it.
-fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
+fn rerun_guards(
+    package: &Package,
+    script: &BuildScript,
+    identity: &crate::env_identity::Identity,
+) -> Vec<Guard> {
     let dir = package_dir(package);
     let what = format!("the build script of `{}` reruns for", package.name);
     let said = script::printed(script.out_dir.as_std_path());
@@ -1550,8 +1553,7 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
             });
         }
         if let Some(name) = directive(line, "rerun-if-env-changed") {
-            let value = crate::env_identity::value(std::env::var(&name).ok().as_deref())
-                .expect("environment guard identity");
+            let value = identity.value(std::env::var(&name).ok().as_deref());
             variables.push(Guard::Env { name, value });
         }
     }
