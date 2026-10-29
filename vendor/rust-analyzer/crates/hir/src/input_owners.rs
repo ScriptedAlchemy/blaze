@@ -14,12 +14,18 @@ use crate::db::HirDatabase;
 
 #[salsa::tracked]
 pub fn discover_current_inputs(db: &dyn HirDatabase, krate: Crate) {
+    expression_owners(db, krate);
+}
+
+pub(crate) fn expression_owners(db: &dyn HirDatabase, krate: Crate) -> Vec<ExpressionStoreOwnerId> {
     let mut walk = Owners { seen: FxHashSet::default(), pending: Vec::new() };
     for module in crate::Crate::from(krate).modules(db) {
         let id = hir_def::ModuleId::from(module);
         walk.scope(db, id.def_map(db).module(db, id).scope(db));
     }
+    let mut owners = Vec::new();
     while let Some(owner) = walk.pending.pop() {
+        owners.push(owner);
         let store = ExpressionStore::of(db, owner);
         for (_, map) in store.blocks(db) {
             for (_, module) in map.modules(db) {
@@ -27,6 +33,7 @@ pub fn discover_current_inputs(db: &dyn HirDatabase, krate: Crate) {
             }
         }
     }
+    owners
 }
 
 pub fn current_input_paths(db: &dyn HirDatabase, krate: Crate) -> Vec<AbsPathBuf> {

@@ -34,7 +34,7 @@ struct Check {
     span: MirSpan,
 }
 
-pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
+pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, const_eval: bool) {
     // rustc builds overflow checks into the MIR of a crate that checks overflow, of a function
     // that inherits the check from the crate it is compiled in, and of every constant and
     // static; the standard library is built without.
@@ -42,7 +42,7 @@ pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
         body.owner,
         crate::InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(_))
     );
-    let checks_overflow = constant || body.inherits_overflow_checks || {
+    let checks_overflow = const_eval || constant || body.inherits_overflow_checks || {
         let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
         !ctx.krate.data(ctx.db).origin.is_lang() && ctx.krate.cfg_options(ctx.db).check_atom(&flag)
     };

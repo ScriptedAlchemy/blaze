@@ -29,6 +29,7 @@ mod has_source;
 mod semantics;
 mod source_analyzer;
 
+pub mod compiler_acceptance;
 pub mod db;
 pub mod diagnostics;
 pub mod input_owners;

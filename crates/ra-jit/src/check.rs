@@ -151,15 +151,19 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         eprintln!("{refused}");
         return Ok(false);
     }
-    // IDE diagnostics and MIR refusals are not a compiler acceptance proof.
-    // Stability, privacy, const validity, dyn compatibility and unresolved
-    // signatures are not all checked here. A script may swallow a negative
-    // status, so an undecided probe must mark the *producer build* unsupported
-    // rather than silently select an implementation from a wrong feature cfg.
-    anyhow::bail!(
-        "owned compiler probe acceptance is not proven: stability, privacy, \
-         const validity, dyn compatibility and name/type resolution need complete compiler checks"
-    )
+    let acceptance = hir::attach_db(&db, || hir::compiler_acceptance::check(&db, id));
+    if !acceptance.errors.is_empty() {
+        for error in &acceptance.errors {
+            eprintln!("error: {error}");
+        }
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        acceptance.unsupported.is_empty(),
+        "owned compiler probe acceptance is not proven: {}",
+        acceptance.unsupported.join("; ")
+    );
+    Ok(true)
 }
 
 /// What a checker answers when the workspace changed in a way only loading it again takes
