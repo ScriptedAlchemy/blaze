@@ -496,6 +496,13 @@ fn judge_locked_inner(
             env.insert(name.clone(), value.clone());
         }
     }
+    // Cargo builds a script's `DEP_*` from its dependencies' current runs alone, so a key a
+    // dependency we judged stopped printing is not there, whatever the last run of this script
+    // had. (Those of a dependency we did not judge stay as that run had them.)
+    for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
+        let prefix = format!("DEP_{}_", blaze_build_script::envify(&dep.links));
+        env.retain(|name, _| !name.starts_with(&prefix));
+    }
     env.extend(metadata);
     let mut script = Command::new(&ran.real);
     script.env_clear().envs(&env);
@@ -898,17 +905,16 @@ mod tests {
         runs.unwrap_or_default().lines().count()
     }
 
-    #[test]
-    fn a_native_dependency_rerun_invalidates_its_parent_even_with_identical_metadata() {
+    /// Has cargo's record of `parent`'s run be of one that came after `native`'s, `name`, as it
+    /// is when `parent` depends on a package with that `links`, and returns the edge.
+    fn depends_on(parent: &Path, native: &Path, name: &str) -> Dependency {
         use std::hash::{Hash as _, Hasher};
 
-        let native = ran_script("native-edge", COUNTS, "");
-        let parent = ran_script("parent-edge", COUNTS, "");
-        let unit = records::Unit::of(&parent).unwrap();
+        let unit = records::Unit::of(parent).unwrap();
         let recorded = unit.recorded().unwrap();
-        let native_hash = records::Unit::of(&native).unwrap().recorded().unwrap().hash_u64();
+        let native_hash = records::Unit::of(native).unwrap().recorded().unwrap().hash_u64();
         let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
-        "native-edge".hash(&mut hasher);
+        name.hash(&mut hasher);
         let mut json = serde_json::to_value(&recorded).unwrap();
         json["deps"].as_array_mut().unwrap().push(serde_json::json!([
             Hasher::finish(&hasher),
@@ -917,13 +923,20 @@ mod tests {
             native_hash
         ]));
         unit.record(&serde_json::from_value(json).unwrap()).unwrap();
-        let dependencies = [Dependency {
-            package: "native-edge".to_owned(),
+        Dependency {
+            package: name.to_owned(),
             links: "probe".to_owned(),
-            out_dir: native.clone(),
-            parents: vec![parent.clone()],
+            out_dir: native.to_owned(),
+            parents: vec![parent.to_owned()],
             targets: Vec::new(),
-        }];
+        }
+    }
+
+    #[test]
+    fn a_native_dependency_rerun_invalidates_its_parent_even_with_identical_metadata() {
+        let native = ran_script("native-edge", COUNTS, "");
+        let parent = ran_script("parent-edge", COUNTS, "");
+        let dependencies = [depends_on(&parent, &native, "native-edge")];
         let cargo = Cargo { dependencies: &dependencies, ..CARGO };
         let built = Run::of(&parent).unwrap();
         // Native's first output is older than the parent's. Only native's watched input
@@ -940,6 +953,35 @@ mod tests {
         changed(&native);
         assert_eq!(current(&parent, &cargo), Ok(built));
         assert_eq!((runs(&native), runs(&parent)), (2, 2));
+    }
+
+    #[test]
+    fn a_dependency_that_stops_printing_a_metadata_key_leaves_its_parent_without_it() {
+        // Cargo gives a script `DEP_<LINKS>_<KEY>` from the dependency's last run alone. The
+        // parent last ran with a key the dependency printed then; the dependency, run again,
+        // does not print it, so the parent's run must not see it, or the daemon keeps a program
+        // cargo does not build.
+        let native_script = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\n\
+                             [ -f \"$OUT_DIR/../avx\" ] && echo cargo::metadata=features=avx\nexit 0\n";
+        let parent_script = "#!/bin/sh\necho \"${DEP_PROBE_FEATURES-unset}\" >> \"$OUT_DIR/../saw\"\n\
+                             echo \"cargo:saw=${DEP_PROBE_FEATURES-unset}\"\n";
+        let native = ran_script("native-meta", native_script, "");
+        let parent = ran_script("parent-meta", parent_script, "");
+        let dependencies = [depends_on(&parent, &native, "native-meta")];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let mut ran = ran_of(&parent);
+        ran.env.push(("DEP_PROBE_FEATURES".to_owned(), "avx".to_owned()));
+        let json = serde_json::to_vec(&ran).unwrap();
+        std::fs::write(parent.parent().unwrap().join(RAN), json).unwrap();
+        // Native's watched input changed; its rerun prints no `features`.
+        set_written(
+            &native.parent().unwrap().join("output"),
+            SystemTime::now() - Duration::from_secs(4000),
+        );
+        changed(&native);
+        current(&parent, &cargo).unwrap();
+        let saw = std::fs::read_to_string(parent.parent().unwrap().join("saw")).unwrap();
+        assert_eq!(saw.trim(), "unset");
     }
 
     #[test]

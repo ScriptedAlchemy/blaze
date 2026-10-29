@@ -486,6 +486,62 @@ def links_only(bin_dir):
     return wrong
 
 
+def depmeta(bin_dir):
+    """A native dependency whose rerun stops printing a `cargo::metadata` key: its parent reruns
+    without the `DEP_*` variable it had, as cargo runs it, and the program is the one cargo builds."""
+    files = {
+        "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+                      '[dependencies]\nnative-sys = { path = "native-sys" }\n\n[workspace]\nexclude = ["target-ref"]\n',
+        "build.rs": 'use std::env;\nfn main() {\n'
+                    '    println!("cargo::rerun-if-changed=src/main.rs");\n'
+                    '    let features = env::var("DEP_PROBE_FEATURES").unwrap_or_else(|_| "unset".to_owned());\n'
+                    '    println!("cargo::rustc-env=FEATURES={features}");\n}\n',
+        "src/main.rs": 'fn main() {\n    println!("{}", env!("FEATURES"));\n}\n',
+        "native-sys/Cargo.toml": '[package]\nname = "native-sys"\nversion = "0.1.0"\nedition = "2021"\n'
+                                 'links = "probe"\nbuild = "build.rs"\n',
+        "native-sys/src/lib.rs": "",
+        "native-sys/build.rs": 'fn main() {\n    println!("cargo::rerun-if-changed=data.txt");\n'
+                               '    let data = std::fs::read_to_string("data.txt").unwrap();\n'
+                               '    if data.trim() == "avx" { println!("cargo::metadata=features=avx"); }\n}\n',
+        "native-sys/data.txt": "avx\n",
+    }
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-sd-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env["RA_JIT_CACHE"] = "off"
+    for variable in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
+        env.pop(variable, None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+    try:
+        build(side, "depmeta: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode:
+            raise SystemExit(built.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"depmeta: not ready: {states}{tails(home)}")
+        for step, old, new in [("the dependency drops its key", "avx\n", "none\n"),
+                               ("the dependency prints it again", "none\n", "avx\n")]:
+            cargo_ra_jit.rewrite(os.path.join(ws, "native-sys/data.txt"), old, new)
+            how = how_built(build(side, f"depmeta: {step}", home))
+            _, built = reference.cargo("build", "-q")
+            ours = subprocess.run([os.path.join(ws, "target/debug/app")], capture_output=True)
+            theirs = subprocess.run([os.path.join(ws, "target-ref/debug/app")], capture_output=True)
+            problems = differences(ours, theirs, built)
+            wrong.extend(f"depmeta: {step}: {why}" for why in problems)
+            print(f"depmeta: {step}: {ours.stdout!r}/{theirs.stdout!r}, {how}")
+    finally:
+        side.cargo("stop")
+        shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
+
 def main():
     selftest()
     if sys.argv[1:] == ["--selftest"]:
@@ -554,6 +610,7 @@ def main():
     wrong += newly_watched_env(bin_dir)
     wrong += failing_script(bin_dir)
     wrong += links_only(bin_dir)
+    wrong += depmeta(bin_dir)
     for why in wrong:
         print(f"  {why}")
     if wrong:
