@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P8 review's 22 compiler probes: oracle parity or loud refusal, never fail open.
+"""P8 review's 22 compiler probes: real oracle parity, including accepted probes.
 
 The cases are unchanged from Claude Opus 5.5's premerge-pr15-62f2fb91
 review. The harness owns its Python rustc oracle. A refusal is an explicit
@@ -52,7 +52,7 @@ def main():
     work.mkdir(parents=True, exist_ok=False)
     real = Path(norustc.real_toolchain())
     audit_log = work / "product-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log)))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log), block=True))
     env = dict(os.environ)
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_BOOTSTRAP",
                  "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "SDKROOT"):
@@ -101,11 +101,11 @@ def main():
     calls = norustc.runs(str(audit_log))
     (work / "rows.json").write_text(json.dumps(dict(rows=rows, audit=calls), indent=2))
     assert len(rows) == 22 and all(row["safe"] for row in rows), rows
-    assert all(row["ours"] != 0 for row in rows), "partial checker cannot certify success"
+    assert all(row["verdict"] == "equal" for row in rows), "refusals do not establish acceptance parity"
     assert not calls, calls
     print(f"22 review probes: {sum(row['verdict'] == 'equal' for row in rows)} parity, "
           f"{sum(row['verdict'] == 'undecided-refused' for row in rows)} undecided refusals; "
-          "no accepted probes, zero product calls")
+          f"{sum(row['ours'] == 0 for row in rows)} accepted probes, zero product calls")
     swallowed_probe_build(work / "e2e", args.blaze.resolve(), real, env, product, audit_log)
 
 
@@ -176,11 +176,17 @@ pub fn label(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
     (work / "oracle.log").write_text(reference.stdout + reference.stderr)
     assert reference.returncode == 0, reference.stderr
     assert reference.stdout.strip() == "api=true nope=false nope_type=false def_site=false"
-    assert run.returncode != 0, "a swallowed undecided probe must refuse the producer build"
-    assert "owned compiler probe acceptance is not proven" in run.stderr, run.stderr
-    assert not list((work / "producer").glob("*/libprobe_derive.*"))
+    assert run.returncode == 0, run.stderr
+    images = json.loads(run.stdout)
+    assert len(images) == 1 and Path(images[0]["library"]).is_file(), images
+    def cfgs(top):
+        outputs = [path for path in top.rglob("output") if path.parent.name.startswith("probe_derive-")]
+        assert len(outputs) == 1, outputs
+        return sorted(line for line in outputs[0].read_text().splitlines()
+                      if line.startswith(("cargo::rustc-cfg=", "cargo:rustc-cfg=")))
+    assert cfgs(work / "producer/scripts") == cfgs(work / "oracle-target/debug/build") == ["cargo::rustc-cfg=has_api"]
     assert not norustc.runs(str(audit_log))
-    print("swallowed probe build refuses loudly; Cargo's negative cfgs verified; zero product calls")
+    print("swallowed probe build publishes only Cargo's proven cfgs; zero product calls; expansion is a separate server gate")
 
 
 if __name__ == "__main__":

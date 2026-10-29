@@ -50,6 +50,8 @@ fn parse(args: &[OsString]) -> Result<Probe> {
     let mut it = words.into_iter();
     let mut seen = BTreeSet::new();
     let mut emission = None;
+    let mut warning_flags = false;
+    let mut check_cfgs = Vec::new();
     while let Some(word) = it.next() {
         let (flag, joined) = word.split_once('=').map_or((word, None), |(a, b)| (a, Some(b)));
         let mut value = || joined.or_else(|| it.next()).context("probe flag has no value");
@@ -69,6 +71,10 @@ fn parse(args: &[OsString]) -> Result<Probe> {
             "--crate-name" => probe.name = value()?.into(),
             "--edition" => probe.edition = value()?.parse()?,
             "--cfg" => probe.cfg.push(value()?.into()),
+            "--check-cfg" => {
+                check_cfgs.push(value()?.to_owned());
+                warning_flags = true;
+            }
             "--target" => probe.target = Some(value()?.into()),
             "--out-dir" => probe.out = std::path::absolute(value()?)?,
             "--crate-type" => {
@@ -88,6 +94,15 @@ fn parse(args: &[OsString]) -> Result<Probe> {
                 });
             }
             "--cap-lints" => anyhow::ensure!(value()? == "allow", "unsupported probe lint policy"),
+            "-Dwarnings" | "-Awarnings" | "-Wwarnings" | "-Fwarnings" => {
+                anyhow::ensure!(joined.is_none(), "invalid compiler probe lint option");
+                warning_flags = true;
+            }
+            "-D" | "-A" | "-W" | "-F" => {
+                anyhow::ensure!(joined.is_none(), "invalid compiler probe lint option");
+                anyhow::ensure!(value()? == "warnings", "unsupported compiler probe lint");
+                warning_flags = true;
+            }
             "-C" => probe.flags.push(format!("-C{}", value()?)),
             "-O" => probe.flags.push("-Copt-level=2".into()),
             _ if word.starts_with("-C") => probe.flags.push(word.into()),
@@ -99,6 +114,14 @@ fn parse(args: &[OsString]) -> Result<Probe> {
         }
     }
     anyhow::ensure!(!probe.source.is_empty(), "the source probe requires one input");
+    anyhow::ensure!(
+        check_cfgs.iter().all(|text| cfg::check_cfg::valid(text, probe.edition)),
+        "invalid check-cfg specification"
+    );
+    anyhow::ensure!(
+        !warning_flags || seen.contains("--cap-lints"),
+        "warning options require --cap-lints=allow for owned compiler probes"
+    );
     anyhow::ensure!(syntax::empty_crate::valid_crate_name(&probe.name), "invalid probe crate name");
     probe.emission = emission.context("the source probe requires an explicit emission request")?;
     if probe.emission == Emission::LlvmIr {
@@ -327,6 +350,34 @@ mod tests {
             args.push(extra.into());
             assert!(parse(&args).is_err(), "{extra}");
         }
+    }
+
+    #[test]
+    fn capped_warning_options_require_valid_specifications() {
+        let base =
+            ["--crate-type=lib", "--emit=metadata", "--cap-lints=allow", "-"].map(OsString::from);
+        for flags in [
+            vec!["-Dwarnings"],
+            vec!["-D", "warnings"],
+            vec!["--check-cfg=cfg(foo,values(\"bar\"))"],
+        ] {
+            let args: Vec<_> =
+                base.iter().cloned().chain(flags.iter().map(OsString::from)).collect();
+            assert!(parse(&args).is_ok(), "{flags:?}");
+        }
+        for flag in [
+            "-D=warnings",
+            "-Dwarnings=bad",
+            "-Dunknown",
+            "--check-cfg=cfg(foo",
+            "--check-cfg=cfg(foo,values(any(),none()))",
+        ] {
+            let mut args = base.to_vec();
+            args.push(flag.into());
+            assert!(parse(&args).is_err(), "{flag}");
+        }
+        let args = ["--crate-type=lib", "--emit=metadata", "-Dwarnings", "-"].map(OsString::from);
+        assert!(parse(&args).is_err(), "uncapped warning validation is still required");
     }
 
     #[test]
