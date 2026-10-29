@@ -25,6 +25,7 @@
             target_kind: Lib {
                 is_proc_macro: false,
             },
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
             ),
@@ -111,6 +112,7 @@
             },
             crate_attrs: [],
             target_kind: Bin,
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
             ),
@@ -198,6 +200,7 @@
             },
             crate_attrs: [],
             target_kind: Example,
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
             ),
@@ -285,6 +288,7 @@
             },
             crate_attrs: [],
             target_kind: Test,
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
             ),
@@ -356,6 +360,7 @@
             target_kind: Lib {
                 is_proc_macro: false,
             },
+            codegen_flags: [],
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
             ),
