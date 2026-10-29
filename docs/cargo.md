@@ -38,10 +38,11 @@ pins ([which LLVM](contributing.md#llvm-for---features-llvm)); with it the crate
 so. `cargo build -p ra-jit --release` is the quicker build the harnesses and CI use while
 working on blaze; it is not what ships.
 
-`cargo blaze` builds with Rust 1.99.0, the release blaze compiles, whatever toolchain the
+`cargo blaze` builds against Rust 1.99.0, the release blaze compiles, whatever toolchain the
 project names (a `rust-toolchain.toml`, `rustup override`, `+toolchain`, `RUSTUP_TOOLCHAIN` or
-rustup's default): it runs cargo, rustc and the daemon under 1.99.0 by naming it in
-`RUSTUP_TOOLCHAIN` and `CARGO`. Rust 1.99.0 builds what older releases built, so a project on
+rustup's default). Eligible Build/Run requests use the default owned compiler route described
+below, reading the installed sysroot and source without executing compiler tools. Remaining
+wrapper paths select 1.99.0 through `RUSTUP_TOOLCHAIN` and `CARGO`. Rust 1.99.0 builds what older releases built, so a project on
 an older stable builds as it is. Code only the project's own toolchain builds (a nightly's
 `#![feature]`, a newer release's library) fails with rustc's error and a note naming both
 releases. Plain `cargo` still builds with the project's toolchain, in the same target
