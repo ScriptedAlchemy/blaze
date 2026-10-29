@@ -431,6 +431,26 @@ pub(crate) fn package_hash(package: &str) -> u64 {
     Hasher::finish(&hasher)
 }
 
+/// The ids ([`package_id_hash`]) of the units cargo compiled the script `real` it runs from
+/// with, by its fingerprint of that compile (`build-script-build-script-build.json` in
+/// `.fingerprint/<package>-<hash>`, the directory `real` is in having that name): a
+/// build-dependency for another platform, or one optional and off, is not one of them.
+pub(crate) fn compiled_with(real: &Path) -> Result<Vec<u64>, String> {
+    #[derive(Deserialize)]
+    struct Compiled {
+        deps: Vec<Dep>,
+    }
+    let not_cargos = || format!("{}: not where a stable cargo compiles a script", real.display());
+    let dir = real.parent().ok_or_else(not_cargos)?;
+    let build = dir.parent().filter(|it| it.ends_with("build")).ok_or_else(not_cargos)?;
+    let dest = build.parent().ok_or_else(not_cargos)?;
+    let fingerprints = dest.join(".fingerprint").join(dir.file_name().ok_or_else(not_cargos)?);
+    let json = fingerprints.join("build-script-build-script-build.json");
+    let json = std::fs::read(&json).map_err(at(&json))?;
+    let compiled: Compiled = serde_json::from_slice(&json).map_err(|it| it.to_string())?;
+    Ok(compiled.deps.iter().map(|it| it.pkg_id).collect())
+}
+
 /// Cargo's `impl Hash for Fingerprint`, field for field.
 impl Hash for Fingerprint {
     fn hash<H: Hasher>(&self, h: &mut H) {

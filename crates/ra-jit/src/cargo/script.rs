@@ -489,9 +489,21 @@ fn edges<'a>(
     Ok(edges)
 }
 
-/// The scripts of the packages that have the script that ran in `out_dir` as a build-dependency.
+/// The scripts of the build-dependencies the script that ran in `out_dir` was compiled with, by
+/// cargo's record of that compile ([`records::compiled_with`]); every declared one when it
+/// cannot be read.
 fn built_with<'a>(out_dir: &Path, cargo: &Cargo<'a>) -> Vec<&'a Dependency> {
-    cargo.dependencies.iter().filter(|it| it.build_parents.iter().any(|it| it == out_dir)).collect()
+    let compiled = out_dir
+        .parent()
+        .and_then(|it| std::fs::read(it.join(RAN)).ok())
+        .and_then(|it| serde_json::from_slice::<Ran>(&it).ok())
+        .and_then(|it| records::compiled_with(&it.real).ok());
+    cargo
+        .dependencies
+        .iter()
+        .filter(|it| it.build_parents.iter().any(|it| it == out_dir))
+        .filter(|it| compiled.as_ref().is_none_or(|ids| ids.contains(&it.pkg_id())))
+        .collect()
 }
 
 fn judge_locked(
@@ -1305,6 +1317,36 @@ mod tests {
         assert_ne!(run, built);
         assert!(records::Unit::of(&out_dir).unwrap().recorded().is_err(), "cargo runs it again");
         std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_build_dependency_the_script_was_not_compiled_with_is_not_followed() {
+        // `[target.'cfg(windows)'.build-dependencies]`, of a package another member depends on:
+        // cargo's record of the script's compile has no unit of it.
+        let native = ran_script("native-unused", COUNTS, "");
+        let parent = ran_script("parent-unused", COUNTS, "");
+        let fingerprints =
+            parent.ancestors().nth(3).unwrap().join(".fingerprint/parent-unused-0123");
+        std::fs::write(fingerprints.join("build-script-build-script-build.json"), r#"{"deps":[]}"#)
+            .unwrap();
+        let dependencies = [Dependency {
+            package: "native-unused".to_owned(),
+            id: None,
+            outside: false,
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: Vec::new(),
+            build_parents: vec![parent.clone()],
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let built = Run::of(&parent).unwrap();
+        changed(&native);
+        assert_eq!(judge_for(&parent, &cargo, &mut Vec::new()).unwrap(), built);
+        assert_eq!((runs(&native), runs(&parent)), (0, 0));
+        for out_dir in [&native, &parent] {
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
     }
 
     #[test]
