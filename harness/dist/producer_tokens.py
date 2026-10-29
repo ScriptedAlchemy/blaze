@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import shutil
 import subprocess
@@ -23,11 +22,6 @@ sys.path[:0] = [str(HERE), str(HERE.parent)]
 import crossmachine
 import norustc
 from tracedecay import Watchdog
-
-
-def external_execs(text):
-    return [path for path in re.findall(r'execve\("([^"\n]+)".*?= 0$', text, re.M)
-            if Path(path).name.removesuffix(".real") in norustc.COUNTED]
 
 
 def fixture(work):
@@ -92,13 +86,11 @@ def main():
         for step, command in [("build", ["build", "--locked", "-p", "app"]),
                               ("run", ["run", "--locked", "-p", "app"])]:
             argv = [str(bins / "cargo-ra-jit"), "ra-jit", *command]
-            if sys.platform == "linux":
-                argv = ["strace", "-f", "-e", "trace=execve", "-o", str(work / (step + ".exec")), *argv]
             began = time.monotonic()
-            ran = subprocess.run(argv, cwd=root, env=product, capture_output=True, text=True)
+            ran = norustc.traced_run(argv, work / (step + ".exec"), cwd=root, env=product)
             (work / (step + ".log")).write_text(ran.stdout + ran.stderr)
             scan = crossmachine.token_scan(roots, token)
-            executed = external_execs((work / (step + ".exec")).read_text()) if sys.platform == "linux" else []
+            executed = norustc.external_execs((work / (step + ".exec")).read_text()) if sys.platform == "linux" else []
             row = dict(step=step, returncode=ran.returncode, seconds=time.monotonic() - began,
                        token_scan=scan, calls=norustc.runs(str(audit_log)), external_execs=executed)
             row["right"] = (ran.returncode == 0 and not row["calls"]
@@ -113,8 +105,11 @@ def main():
                 break
     finally:
         result["before_stop"] = crossmachine.token_scan(roots, token)
-        subprocess.run([str(bins / "ra-jit"), "cargo", "stop"], cwd=root, env=product,
-                       capture_output=True)
+        norustc.traced_run([str(bins / "ra-jit"), "cargo", "stop"], work / "stop.exec",
+                          cwd=root, env=product)
+        result["external_execs"] = [tool for trace in work.glob("*.exec")
+                                    for tool in norustc.external_execs(trace.read_text())]
+        result["calls"] = norustc.runs(str(audit_log))
         result["after_stop"] = crossmachine.token_scan(roots, token)
         watchdog.stop.set()
         watchdog.join(timeout=10)
@@ -123,7 +118,8 @@ def main():
         shutil.rmtree(home)
     scans = [result["before_stop"], result["after_stop"]]
     passed = (len(result["rows"]) == 2 and all(row["right"] for row in result["rows"])
-              and not result["watchdog"] and all(not s["hits"] and not s["errors"] for s in scans))
+              and not result["watchdog"] and not result["external_execs"] and not result["calls"]
+              and all(not s["hits"] and not s["errors"] for s in scans))
     print(json.dumps(dict(passed=passed, result=str(work / "result.json"))))
     return 0 if passed else 1
 

@@ -47,11 +47,14 @@ def main():
     command = [str(args.blaze.resolve()), str(SERVER), "--crate",
                "rust_analyzer_proc_macro_srv", "--crate", "proc_macro",
                "--out", str(work / "server.o"), "--exe", str(executable)]
-    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    result = norustc.traced_run(command, work / "bootstrap.exec", cwd=Path.cwd(), env=env)
     (work / "build.log").write_text("$ " + " ".join(command) + "\n" +
                                     result.stdout + result.stderr)
     calls = norustc.runs(str(log))
     (work / "bootstrap-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
+    execs = norustc.external_execs((work / "bootstrap.exec").read_text()) if sys.platform == "linux" else []
+    (work / "bootstrap-external-execs.json").write_text(json.dumps(execs, indent=2) + "\n")
+    assert not execs, f"bootstrap attempted external compiler/Cargo execs: {execs}"
     assert result.returncode == 0, f"server build exit {result.returncode}; see {work / 'build.log'}"
     assert executable.is_file(), "blaze did not link its server"
     assert "0 functions in it ra-jit could not compile" in result.stderr

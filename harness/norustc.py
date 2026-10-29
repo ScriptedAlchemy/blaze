@@ -25,7 +25,7 @@ lowered them. Where a count differs from run to run (cargo's own cache of what r
 is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
 """
-import json, os, platform, shlex, shutil, subprocess, sys, tempfile, time
+import json, os, platform, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -89,9 +89,42 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kwargs)
 
 
+def external_execs(text):
+    """Every external compiler/Cargo exec attempt, including split trace records."""
+    return [path for path in re.findall(r'execve\("([^"\n]+)"', text)
+            if os.path.basename(path).removesuffix(".real") in COUNTED]
+
+
+def traced_run(argv, trace, *, cwd, env, timeout=7200):
+    """Trace product children without waiting for a long-lived daemon to exit.
+
+    Detached strace keeps inherited stdio open. Use files rather than pipes so
+    request completion, not daemon exit, determines when the client returns.
+    The caller stops its daemon before the final trace census and cleanup.
+    """
+    if sys.platform != "linux":
+        return subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, capture_output=True,
+                              text=True, errors="replace", stdin=subprocess.DEVNULL)
+    stdout, stderr = str(trace) + ".stdout", str(trace) + ".stderr"
+    with open(stdout, "w") as out, open(stderr, "w") as err:
+        ran = subprocess.run(["strace", "-f", "-D", "-e", "trace=execve", "-o", str(trace), *argv],
+                             cwd=cwd, env=env, timeout=timeout, stdout=out, stderr=err,
+                             stdin=subprocess.DEVNULL)
+    with open(stdout, errors="replace") as out, open(stderr, errors="replace") as err:
+        return subprocess.CompletedProcess(argv, ran.returncode, out.read(), err.read())
+
+
 def real_toolchain():
-    """The sysroot of the pinned toolchain, from the rustup proxy on PATH."""
-    return run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
+    """Reference-only sysroot query, with rustup or the flake's direct pinned rustc."""
+    selected = run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"])
+    if selected.returncode == 0:
+        return selected.stdout.strip()
+    # A Nix compiler is not a rustup proxy and does not understand +toolchain.
+    # Verify its release before using it for the independent oracle.
+    version = run(["rustc", "--version"], check=True).stdout
+    if not version.startswith(f"rustc {TOOLCHAIN} "):
+        raise RuntimeError(f"the reference compiler must be Rust {TOOLCHAIN}")
+    return run(["rustc", "--print", "sysroot"], check=True).stdout.strip()
 
 
 def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):

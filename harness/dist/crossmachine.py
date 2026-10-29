@@ -49,7 +49,7 @@ run's whole process tree. Heavy work: run it as
 
 Python 3 standard library only. macOS and Linux.
 """
-import argparse, base64, hashlib, json, os, re, secrets, shutil, subprocess, sys, tempfile, time
+import argparse, base64, hashlib, json, os, re, secrets, shutil, stat, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.dirname(HERE)
@@ -568,15 +568,27 @@ def token_scan(roots, token):
     for index in range(3):
         encoded = base64.b64encode(b"\0" * index + raw)
         forms[f"base64-{index}"] = encoded[4 if index else 0:][:(len(raw) * 4) // 3 - 4]
-    hits, errors, seen = [], [], set()
+    hits, errors, seen, directories = [], [], set(), set()
     for root in roots:
         if not os.path.isdir(root):
             errors.append(root)
             continue
-        for directory, _, names in os.walk(root, onerror=lambda error: errors.append(error.filename)):
+        for directory, children, names in os.walk(root, followlinks=True,
+                onerror=lambda error: errors.append(error.filename)):
+            resolved = os.path.realpath(directory)
+            if resolved in directories:
+                children[:] = []
+                continue
+            directories.add(resolved)
             for name in names:
                 path = os.path.realpath(os.path.join(directory, name))
-                if path in seen or not os.path.isfile(path):
+                if path in seen:
+                    continue
+                try:
+                    if not stat.S_ISREG(os.stat(path).st_mode):
+                        continue
+                except OSError:
+                    errors.append(path)
                     continue
                 seen.add(path)
                 try:
@@ -617,7 +629,11 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
         env[variable] = os.path.join(audit_bin, "bin", tool)
     # The subject is the product CLI, not Cargo's subcommand launcher. The audit
     # remains around the entire request, including every process the product starts.
-    side = Side(ws, env, True, product_cli=os.path.join(bin_dir, "ra-jit"))
+    traces = os.path.join(work, "product-execs")
+    side = Side(ws, env, True, product_cli=os.path.join(bin_dir, "ra-jit"), exec_trace_dir=traces)
+    def exec_calls():
+        return [tool for name in os.listdir(traces) if name.endswith(".log")
+                for tool in norustc.external_execs(open(os.path.join(traces, name)).read())]
     rows = []
     previous_pids, previous_builds = None, -1
     previous_dylibs = None
@@ -697,6 +713,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
                              same_size=same_size, same_mtime=same_mtime, mutation_valid=mutation_valid,
                              retention=retention,
                              product_tool_calls=norustc.runs(audit_log)[audit_before:],
+                             external_execs=exec_calls(),
                              dylibs=dylibs))
             # This must precede stop/cleanup, especially DAEMON_ROOT removal in main.
             scan = token_scan([work, env["RA_JIT_HOME"], env["RA_JIT_CACHE"]], token)
@@ -707,6 +724,9 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
         with open(os.path.join(work, "token-scan-before-stop.json"), "w") as output:
             json.dump(scan, output, indent=1)
         side.cargo("stop")
+        if rows:
+            rows[-1]["product_tool_calls"] = norustc.runs(audit_log)
+            rows[-1]["external_execs"] = exec_calls()
         scan = token_scan([work, env["RA_JIT_HOME"], env["RA_JIT_CACHE"]], token)
         with open(os.path.join(work, "token-scan-after-stop.json"), "w") as output:
             json.dump(scan, output, indent=1)
@@ -1237,7 +1257,8 @@ def failing(results):
 
 def strict_macro_rows(rows):
     """Every row must be right and have no product tool calls. Queries count too."""
-    return bool(rows) and all(row["right"] and not row["product_tool_calls"] for row in rows)
+    return bool(rows) and all(row["right"] and not row["product_tool_calls"]
+                              and not row.get("external_execs") for row in rows)
 
 
 # --- self test -----------------------------------------------------------------------------------------
@@ -1279,6 +1300,8 @@ def self_test():
                   dict(tool=tool, argv="--version")])]))
     check("zero-call wrong output still fails strict rows",
           not strict_macro_rows([dict(right=False, product_tool_calls=[])]))
+    check("absolute external execs fail strict rows without a proxy call",
+          not strict_macro_rows([dict(right=True, product_tool_calls=[], external_execs=["/real/rustc"])]))
     check("missing witness fails strict rows", not strict_macro_rows([]))
     with tempfile.TemporaryDirectory() as root:
         token = "synthetic-scanner-credential"
@@ -1292,12 +1315,20 @@ def self_test():
         missing = os.path.join(root, "missing-root")
         check("missing scan root fails coverage", token_scan([missing], token)["errors"] == [missing])
         unreadable = os.path.join(root, "unreadable")
-        def failed_walk(path, onerror):
+        def failed_walk(path, onerror, followlinks):
             onerror(PermissionError(13, "permission denied", unreadable))
             return iter(())
         with mock.patch("os.walk", side_effect=failed_walk):
             check("directory read errors fail scan coverage",
                   token_scan([root], token)["errors"] == [unreadable])
+        with tempfile.TemporaryDirectory() as external:
+            with open(os.path.join(external, "secret"), "w") as output:
+                output.write(token)
+            os.symlink(external, os.path.join(root, "linked-output"))
+            os.symlink(root, os.path.join(external, "cycle"))
+            scan = token_scan([root, external], token)
+            check("linked outputs are scanned once even through directory cycles",
+                  scan["scanned"] == 1 and bool(scan["hits"]) and not scan["errors"])
 
     h = lambda s: hashlib.sha256(s.encode()).hexdigest()
     id_a, id_b = h("crate a")[:16], h("crate b")[:16]

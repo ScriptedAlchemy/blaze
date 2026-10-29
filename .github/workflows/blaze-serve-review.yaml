@@ -13,6 +13,14 @@ on:
       - crates/ra-jit-store/**
       - crates/ra-jit/**
       - vendor/rust-analyzer/crates/syntax/**
+      - vendor/rust-analyzer/crates/cfg/**
+      - vendor/rust-analyzer/crates/hir/**
+      - vendor/rust-analyzer/crates/hir-ty/**
+      - vendor/rust-analyzer/crates/hir-ty-borrowck/**
+      - vendor/rust-analyzer/crates/ide-db/**
+      - vendor/rust-analyzer/crates/ide-diagnostics/**
+      - vendor/rust-analyzer/crates/load-cargo/**
+      - vendor/rust-analyzer/crates/proc-macro-api/**
       - harness/**
       - Cargo.toml
       - Cargo.lock
@@ -66,6 +74,18 @@ jobs:
         run: |
           cargo build --locked -p ra-jit --bin ra-jit
           python3 -I harness/dist/empty_probe.py --blaze target/debug/ra-jit --work target/empty-probe-review
+      - name: Test compiler acceptance and constant evaluation
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ide-diagnostics --lib compiler_acceptance_tests -- --test-threads=2
+          cargo test --locked -p hir-ide --lib tests::consteval -- --test-threads=2
+      - name: Test producer identities and lifetime boundaries
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p proc-macro-api --features span/salsa --lib -- generation_tests producer_lifetime --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
+          cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
+          python3 -I harness/dist/crossmachine.py --self-test
       - name: Save owned probe evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

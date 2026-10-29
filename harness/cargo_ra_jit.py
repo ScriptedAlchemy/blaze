@@ -253,11 +253,12 @@ class Side:
     enable` was run (`"plain"`), or cargo alone into `target-ref` (`False`).
     `product_cli` runs the same product request directly, without Cargo's launcher."""
 
-    def __init__(self, ws, env, ra_jit, *, product_cli=None):
+    def __init__(self, ws, env, ra_jit, *, product_cli=None, exec_trace_dir=None):
         self.ws, self.ra_jit, self.plain = ws, bool(ra_jit), ra_jit == "plain"
         if product_cli is not None and (not self.ra_jit or self.plain):
             raise ValueError("direct product dispatch needs the ra-jit side")
         self.product_cli = product_cli
+        self.exec_trace_dir, self.trace_sequence = exec_trace_dir, 0
         self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
         self.tally = os.path.join(env["RA_JIT_HOME"], "plain-cargo.log")
         self.read = 0
@@ -270,6 +271,15 @@ class Side:
         return ["cargo", *(["ra-jit"] if self.ra_jit else []), command, *args]
 
     def cargo(self, command, *args, env=None, timeout=7200):
+        if self.exec_trace_dir is not None:
+            import norustc
+            os.makedirs(self.exec_trace_dir, exist_ok=True)
+            self.trace_sequence += 1
+            trace = os.path.join(self.exec_trace_dir, f"{self.trace_sequence:04}-{command}.log")
+            began = time.time()
+            ran = norustc.traced_run(self.argv(command, *args), trace, cwd=self.ws,
+                                    env=dict(self.env, **(env or {})), timeout=timeout)
+            return time.time() - began, ran
         return timed(self.argv(command, *args), self.ws, dict(self.env, **(env or {})), timeout)
 
     def how_built(self, stderr):
