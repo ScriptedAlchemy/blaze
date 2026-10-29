@@ -20,6 +20,57 @@ pub(crate) struct DepInfo {
 }
 
 impl DepInfo {
+    /// Collect inputs through source roots rather than VFS allocation indexes, so
+    /// generated doctest crates share the ordinary compiler's trace contract.
+    pub(crate) fn from_crates(
+        db: &crate::RootDatabase,
+        krates: &[hir::Crate],
+        asked: &str,
+    ) -> anyhow::Result<Self> {
+        use hir_ty::db::HirDatabase as _;
+        use ide_db::base_db::SourceDatabase as _;
+
+        let mut files = Vec::new();
+        for &krate in krates {
+            let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
+            files.extend(modules.map(|it| it.original_file(db).file_id(db)));
+            files.extend(
+                hir_def::include_macro_invoc(db, krate.into())
+                    .iter()
+                    .map(|(_, file)| file.file_id(db)),
+            );
+        }
+        let named = |id: &vfs::FileId| {
+            let root = db.file_source_root(*id).source_root_id(db);
+            let root = db.source_root(root).source_root(db);
+            Some(root.path_for_file(id)?.as_path()?.to_string())
+        };
+        let mut paths = Vec::new();
+        let included = krates.iter().flat_map(|it| db.included_by((*it).into()));
+        for path in files.iter().filter_map(named).chain(included.map(|(path, _)| path.to_string()))
+        {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
+        let mut env: Vec<_> = db
+            .env_read()
+            .into_iter()
+            .filter(|(krate, _)| {
+                krates.iter().any(|it| ide_db::base_db::Crate::from(*it) == *krate)
+            })
+            .map(|(krate, key)| {
+                let value =
+                    krate.env(db).get(&key).or_else(|| ide_db::base_db::process_env_var(db, &key));
+                (key, value)
+            })
+            .collect();
+        env.sort_unstable();
+        env.dedup();
+        Ok(Self { files: paths, env })
+    }
+
     /// Replay input trace version 1: `[version, files, [[name, value-or-null], ...]]`.
     /// Unlike Cargo's dep-info, deterministic CBOR preserves newlines, carriage returns
     /// and trailing backslashes in filenames. Free-form values use the message budget.

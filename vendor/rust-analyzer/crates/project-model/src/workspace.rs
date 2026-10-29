@@ -1191,6 +1191,7 @@ fn project_json_to_crate_graph(
                     target,
                     codegen_flags,
                     env,
+                    invalid_env,
                     crate_attrs,
                     proc_macro_dylib_path,
                     is_proc_macro,
@@ -1203,6 +1204,11 @@ fn project_json_to_crate_graph(
                 file_id,
             )| {
                 let mut env = env.clone().into_iter().collect::<Env>();
+                if project.compiler_mode {
+                    for name in invalid_env {
+                        env.set_non_unicode(name);
+                    }
+                }
                 if !project.compiler_mode {
                     // Editor configuration can override the crate's environment.
                     // A compiler description has already bound its source env;

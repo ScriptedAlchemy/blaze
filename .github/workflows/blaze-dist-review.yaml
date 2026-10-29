@@ -2,7 +2,7 @@ name: distributed protocol regressions
 
 on:
   pull_request:
-    branches: [dist/main]
+    branches: [dist/main, dist/c4-keys]
     paths:
       - crates/blaze-dist/**
       - crates/blaze-dist-local/**
@@ -12,6 +12,15 @@ on:
       - crates/blaze-metadata/**
       - crates/blaze-resolve/**
       - crates/ra-jit/src/cargo/spec.rs
+      - crates/ra-jit/src/compiler_json.rs
+      - crates/ra-jit/src/check.rs
+      - crates/ra-jit/src/doctest.rs
+      - crates/ra-jit/src/dep_info.rs
+      - vendor/rust-analyzer/crates/base-db/**
+      - vendor/rust-analyzer/crates/project-model/**
+      - vendor/rust-analyzer/crates/hir-expand/**
+      - harness/dist/**
+      - harness/norustc.py
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/blaze-dist-review.yaml
@@ -40,7 +49,82 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt
+          llvm: build
       - name: Check protocol and build-spec formatting
         run: cargo fmt -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --check
       - name: Test protocol, wire, and immutable build specifications
-        run: cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --test-threads=2
+        run: nix develop .#bench --command cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --test-threads=2
+
+  c2-runtime:
+    name: C2 runtime (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Record exact source, host, and pinned compilers
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/c2-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            rustc -vV
+            cargo -V
+            nix develop .#bench --command llvm-config --version
+          } > "$RUNNER_TEMP/c2-evidence/identity.txt"
+      - name: Validate complete native platform and immutable input contracts
+        run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
+      - name: Build the actual CLI with both owned backends
+        run: nix develop .#bench --command cargo build --locked -p ra-jit --bins --features llvm
+      - name: Original C2 generation and local command differential
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/buildspec.py \
+            --bin "$GITHUB_WORKSPACE/target/debug/ra-jit" \
+            --work "$RUNNER_TEMP/c2-local" --memory-mib 6144 --timeout 1200 --shared-store \
+            --json "$RUNNER_TEMP/c2-evidence/local.json" \
+            > "$RUNNER_TEMP/c2-evidence/local.log" 2>&1
+      - name: Saved execution with compiler subprocesses blocked (Cranelift)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/debug/ra-jit" \
+            --work "$RUNNER_TEMP/c2-cranelift" --memory-mib 6144 --timeout 1200 \
+            --backend cranelift > "$RUNNER_TEMP/c2-evidence/cranelift.log" 2>&1
+      - name: Saved execution with compiler subprocesses blocked (LLVM)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/debug/ra-jit" \
+            --work "$RUNNER_TEMP/c2-llvm" --memory-mib 6144 --timeout 1200 \
+            --backend llvm > "$RUNNER_TEMP/c2-evidence/llvm.log" 2>&1
+      - name: Keep C2 runtime and tool audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: c2-runtime-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/c2-evidence
+            ${{ runner.temp }}/c2-cranelift/results.json
+            ${{ runner.temp }}/c2-cranelift/*.log
+            ${{ runner.temp }}/c2-llvm/results.json
+            ${{ runner.temp }}/c2-llvm/*.log
+          if-no-files-found: warn

@@ -30,7 +30,7 @@ pub(crate) fn project_profile(project: &Path) -> anyhow::Result<Option<crate::pl
     if project.extension().is_none_or(|ext| ext != "json") {
         return Ok(None);
     }
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(project)?)?;
+    let json = crate::compiler_json::read(project)?;
     let Some(value) = json.get("blaze_spec_profile") else { return Ok(None) };
     let bound: Bound = serde_json::from_value(value.clone())?;
     ensure!(bound.version == 1, "unknown owned replay profile version");
@@ -80,6 +80,21 @@ pub(crate) fn project_profile(project: &Path) -> anyhow::Result<Option<crate::pl
 }
 
 pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
+    if let [mode, project, root, output, trace] = words
+        && mode == "--compiler-check"
+    {
+        let args = crate::Args::parse(
+            [project.clone(), "--crate".into(), root.clone(), "--out".into(), output.clone()]
+                .into_iter(),
+        )?;
+        crate::check::once(args, Path::new(trace))?;
+        return Ok(0);
+    }
+    if let [mode, project, root] = words
+        && mode == "--compiler-doctest"
+    {
+        return crate::doctest::saved(Path::new(project), root);
+    }
     if let [run, file] = words
         && run == "--run"
     {
@@ -314,7 +329,12 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     let store = companion(&file, "inputs");
     let outputs = companion(&file, "outputs");
     std::fs::create_dir_all(&outputs)?;
-    let job = tempfile::Builder::new().prefix("replay-").tempdir_in(&outputs)?;
+    let native_outputs = outputs.to_str().is_none();
+    let job = tempfile::Builder::new().prefix("replay-").tempdir_in(if native_outputs {
+        Path::new("/tmp")
+    } else {
+        &outputs
+    })?;
     let executor = blaze_spec::environment::native_process();
     let prepared = blaze_spec::replay::prepare(
         &given,
@@ -325,49 +345,118 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         &blaze_spec::platform::System,
         &executor,
     )?;
-    let programs =
+    let mut programs =
         blaze_spec::execution::programs(&prepared, &sysroot, &job.path().join("artifacts"))?;
+    let SourceRef::Root(source) = &given.source else { bail!("replay requires a source snapshot") };
+    for program in &mut programs {
+        program.project["blaze_spec_inputs"] = serde_json::json!({
+            "root": prepared.root, "store": store, "source": source.root,
+        });
+    }
     // All command and unit support checks happen before the first compiler starts.
     let compiler_home = job.path().join("compiler-home");
     std::fs::create_dir(&compiler_home)?;
     let compiler_env = compiler_environment(&prepared, &compiler_home, &executor)?;
     for program in &programs {
         compile(program, &compiler_env)?;
-        admit_inputs(program, &prepared, &store)?;
+        admit_inputs(program)?;
     }
+    let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
     let result = serde_json::json!({
         "spec": hex(&blaze_wire::digest_of(&given)),
         "artifacts": programs.iter().map(|program| serde_json::json!({
             "unit": program.unit, "crate": program.crate_name,
-            "executable": program.executable,
+            "executable": (program.output == blaze_spec::execution::Output::Executable).then_some(&program.executable),
+            "artifact": program.executable,
+            "runtime": (program.output == blaze_spec::execution::Output::Object)
+                .then(|| program.executable.with_extension("std.a"))
+                .filter(|path| path.is_file()),
+            "target": given.units[program.unit as usize].target.1,
+            "target_kind": given.units[program.unit as usize].target.0,
+            "test": native[program.unit as usize].test,
+            "kind": match program.output {
+                blaze_spec::execution::Output::Executable => "executable",
+                blaze_spec::execution::Output::Object => "object",
+                blaze_spec::execution::Output::Check => "check",
+                blaze_spec::execution::Output::Doctest => "doctest",
+            },
         })).collect::<Vec<_>>(),
     });
     std::fs::write(job.path().join("result.json"), serde_json::to_vec_pretty(&result)?)?;
     // The source copy and paths embedded for CARGO_BIN_EXE_* stay at the same names.
     // Failed compiles/admissions drop this temporary directory and all their artifacts.
+    if native_outputs {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(job.path(), outputs.join(job.path().file_name().unwrap()))?;
+    }
     let _kept = job.keep();
     if !programs.iter().any(|program| program.run) {
         println!("{result}");
         return Ok(0);
     }
     let env = prepared.execution_environment()?;
-    let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
     let mut failed = 0;
     for program in programs.iter().filter(|program| program.run) {
         let run = match &given.command {
             blaze_wire::Command::Run(run) | blaze_wire::Command::Test(run) => run,
             _ => unreachable!("the execution plan runs only run/test commands"),
         };
-        let mut command = Command::new(&program.executable);
-        command.env_clear().envs(&env).envs(run.env.iter().map(|(k, v)| (k, v)));
+        if matches!(given.command, blaze_wire::Command::Test(_)) {
+            let unit = native[program.unit as usize];
+            if program.output == blaze_spec::execution::Output::Doctest {
+                super::say::status(false, "Doc-tests", &program.crate_name);
+            } else {
+                let relative = unit.target.src_path.strip_prefix(&unit.package.manifest_dir)?;
+                let prefix = if matches!(
+                    unit.target.kind,
+                    blaze_metadata::units::TargetKind::Lib | blaze_metadata::units::TargetKind::Bin
+                ) {
+                    "unittests "
+                } else {
+                    ""
+                };
+                super::say::status(false, "Running", &format!("{prefix}{}", relative.display()));
+            }
+        }
+        let mut command = if program.output == blaze_spec::execution::Output::Doctest {
+            let mut command = Command::new(std::env::current_exe()?);
+            command.env_clear().envs(&compiler_env);
+            command.args(["cargo", "spec", "--compiler-doctest"]);
+            command.arg(program.executable.parent().unwrap().join("rust-project.json"));
+            command.arg(&program.crate_name);
+            command
+        } else {
+            let mut command = Command::new(&program.executable);
+            command.env_clear().envs(&env).envs(run.env.iter().map(|(k, v)| (k, v)));
+            command
+        };
         if let blaze_wire::Command::Test(_) = &given.command {
-            command.args(&run.filters);
+            if program.output != blaze_spec::execution::Output::Doctest {
+                command.args(&run.filters);
+            }
             command.current_dir(&native[program.unit as usize].package.manifest_dir);
         } else {
             command.current_dir(&prepared.cwd);
         }
-        command.args(&run.harness_args);
-        let code = command.status()?.code().unwrap_or(1);
+        if program.output != blaze_spec::execution::Output::Doctest {
+            command.args(&run.harness_args);
+        }
+        let code = if program.output == blaze_spec::execution::Output::Doctest {
+            let project = program.executable.parent().unwrap().join("rust-project.json");
+            let described = crate::compiler_json::write(&project, &program.project)?;
+            command.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped());
+            let mut child = command.spawn()?;
+            if let Err(error) =
+                child.stdin.take().context("doctest project pipe")?.write_all(&described)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("sending owned doctest project");
+            }
+            child.wait()?.code().unwrap_or(1)
+        } else {
+            command.status()?.code().unwrap_or(1)
+        };
         if code != 0 {
             failed = code;
             if !run.no_fail_fast {
@@ -423,6 +512,7 @@ fn compiler_environment(
     // Memory budgets and the watchdog label are service policy, not compiler inputs.
     // They never enter per-crate env and cannot select a different code generator.
     for name in [
+        "RA_JIT_CACHE",
         "RA_JIT_MEMORY_MAX",
         "RA_JIT_WORKER_MEMORY",
         "RA_JIT_MEMORY_RESERVE",
@@ -445,22 +535,50 @@ fn compile(
     let dir = program.executable.parent().context("artifact has no directory")?;
     std::fs::create_dir_all(dir)?;
     let project = dir.join("rust-project.json");
-    std::fs::write(&project, serde_json::to_vec(&program.project)?)?;
+    let described = crate::compiler_json::write(&project, &program.project)?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.env_clear().envs(env).current_dir(dir).stdin(Stdio::null());
-    command.arg(&project).args(["--crate", &program.crate_name]);
-    command.arg("--out").arg(dir.join("compiled.o"));
-    command.arg("--exe").arg(&program.executable);
-    command.arg("--inputs").arg(dir.join("inputs.cbor"));
-    if program.harness {
+    command
+        .env_clear()
+        .envs(env)
+        .current_dir(dir)
+        .env("RA_JIT_PROJECT_STDIN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match program.output {
+        blaze_spec::execution::Output::Check | blaze_spec::execution::Output::Doctest => {
+            command.args(["cargo", "spec", "--compiler-check"]).arg(&project);
+            command.arg(&program.crate_name).arg(&program.executable).arg(dir.join("inputs.cbor"));
+        }
+        output => {
+            command.arg(&project).args(["--crate", &program.crate_name]);
+            command.arg("--out").arg(if output == blaze_spec::execution::Output::Object {
+                program.executable.clone()
+            } else {
+                dir.join("compiled.o")
+            });
+            if output == blaze_spec::execution::Output::Executable {
+                command.arg("--exe").arg(&program.executable);
+            }
+            command.arg("--inputs").arg(dir.join("inputs.cbor"));
+        }
+    }
+    if program.harness && program.output == blaze_spec::execution::Output::Executable {
         // The prebuilt std unit excludes libtest. Compile that runtime with the
         // harness, selecting its source even when the application is named `test`.
-        let library = program.project["sysroot_src"]
+        let rendered: serde_json::Value = serde_json::from_slice(&described)?;
+        let library = rendered["sysroot_src"]
             .as_str()
             .context("test compiler description has no sysroot sources")?;
         command.args(["--cfg-test", "--crate"]).arg(Path::new(library).join("test/src/lib.rs"));
     }
-    let output = command.output().context("starting the owned replay compiler")?;
+    let mut child = command.spawn().context("starting the owned replay compiler")?;
+    if let Err(error) = child.stdin.take().context("owned project pipe")?.write_all(&described) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("sending owned project");
+    }
+    let output = child.wait_with_output()?;
     std::fs::write(dir.join("compiler.log"), &output.stderr)?;
     let said = String::from_utf8_lossy(&output.stderr);
     ensure!(
@@ -476,7 +594,7 @@ fn compile(
     );
     ensure!(
         program.executable.is_file(),
-        "owned compiler did not link {}",
+        "owned compiler did not write {}",
         program.executable.display()
     );
     Ok(())
@@ -485,23 +603,26 @@ fn compile(
 /// The complete non-language dependency trace includes modules and all include macros.
 /// Admission happens before any executable is run or advertised. This is a correctness
 /// check after compilation, not a filesystem sandbox or a claim of pre-read confinement.
-fn admit_inputs(
-    program: &blaze_spec::execution::Program,
-    prepared: &blaze_spec::replay::Prepared,
-    store: &Path,
-) -> anyhow::Result<()> {
-    let source = match &prepared.resolved.spec.build.source {
-        SourceRef::Root(source) => source.root,
-        _ => unreachable!("prepared replay has a snapshot"),
-    };
+fn admit_inputs(program: &blaze_spec::execution::Program) -> anyhow::Result<()> {
     let dir = program.executable.parent().context("artifact has no directory")?;
     let trace = std::fs::read(dir.join("inputs.cbor"))
         .context("owned compiler did not report its complete source inputs")?;
     let inputs = crate::dep_info::DepInfo::decode_replay(&trace)?;
+    admit_trace(&inputs, &program.project)
+}
+
+pub(crate) fn admit_trace(
+    inputs: &crate::dep_info::DepInfo,
+    project: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let bound = &project["blaze_spec_inputs"];
+    let root = Path::new(bound["root"].as_str().context("no admitted source root")?);
+    let store = Path::new(bound["store"].as_str().context("no admitted source store")?);
+    let source: [u8; 32] = serde_json::from_value(bound["source"].clone())?;
     ensure!(!inputs.files.is_empty(), "owned compiler reported an empty source trace");
     for path in &inputs.files {
-        let path = dir.join(path).canonicalize()?;
-        let relative = path.strip_prefix(&prepared.root).with_context(|| {
+        let path = Path::new(path).canonicalize()?;
+        let relative = path.strip_prefix(root).with_context(|| {
             format!("compiler read {} outside the immutable source snapshot", path.display())
         })?;
         let logical = blaze_wire::SourcePath::from_native(relative)?;
@@ -513,7 +634,7 @@ fn admit_inputs(
         );
     }
     let crates =
-        program.project["crates"].as_array().context("no source crates in compiler description")?;
+        project["crates"].as_array().context("no source crates in compiler description")?;
     for (name, value) in &inputs.env {
         let declared = value.as_deref().is_some_and(|value| {
             crates.iter().any(|krate| {

@@ -33,17 +33,20 @@ def write(root, name, contents):
 
 
 def blocked_toolchain(real, root, audit):
-    toolchain = root / "toolchains" / real.name
+    facts = subprocess.check_output([real / "bin/rustc", "-vV"], text=True)
+    host = next(line.removeprefix("host: ") for line in facts.splitlines() if line.startswith("host: "))
+    name = norustc.TOOLCHAIN + "-" + host
+    toolchain = root / "toolchains" / name
     (toolchain / "bin").mkdir(parents=True)
     for entry in real.iterdir():
         if entry.name != "bin":
             (toolchain / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
     for name in ("rustc", "rustdoc", "cargo", "rustup"):
         path = toolchain / "bin" / name
-        path.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(name)
+        path.write_text("#!" + (shutil.which("sh") or "/bin/sh") + "\nprintf '%s\\n' " + shlex.quote(name)
                         + " >> " + shlex.quote(str(audit)) + "\nexit 97\n")
         path.chmod(0o755)
-    write(root, "settings.toml", 'version = "12"\ndefault_toolchain = ' + json.dumps(real.name) + "\n")
+    write(root, "settings.toml", 'version = "12"\ndefault_toolchain = ' + json.dumps(name) + "\n")
     return toolchain
 
 
@@ -164,6 +167,7 @@ def main():
     parser.add_argument("--memory-mib", type=int, default=8192)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--backend", choices=("cranelift", "llvm"), default="cranelift")
+    parser.add_argument("--linker-library-path", help="explicit captured loader path for an externally packaged native linker")
     args = parser.parse_args()
     assert 0 < args.memory_mib <= tracedecay.WATCHDOG_MB
     assert args.timeout > 0
@@ -176,8 +180,19 @@ def main():
     real = Path(norustc.real_toolchain())
     audit = work / "product-tools.log"
     blocked = blocked_toolchain(real, work / "rustup", audit)
+    controls = []
+    for name in ("rustc", "rustdoc", "cargo", "rustup"):
+        control = subprocess.run([blocked / "bin" / name, "--version"], capture_output=True)
+        controls.append({"tool": name, "path": str(blocked / "bin" / name), "code": control.returncode})
+        assert control.returncode == 97, controls
+    assert audit.read_text().splitlines() == [row["tool"] for row in controls], controls
+    write(work, "tool-controls.json", json.dumps(controls, indent=2) + "\n")
+    audit.unlink()
     original = work / "original"
     fixture(original)
+    if args.linker_library_path:
+        with (original / ".cargo/config.toml").open("a") as config:
+            config.write("LD_LIBRARY_PATH={value=" + json.dumps(args.linker_library_path) + ",force=true}\n")
     template = work / "fixture-template"
     shutil.copytree(original, template)
     env = {key: value for key, value in os.environ.items()
@@ -301,10 +316,79 @@ def main():
                    hostile, expected=101, contains="test result: FAILED")
         # Each negative owns a fresh bundle; failed compilation/admission may not
         # leave a result that a caller could treat as a completed executable.
-        for name in ("check", "external-include", "native-link"):
+        project = work / "checked"
+        shutil.copytree(template, project)
+        runner.run("check-reference", [real / "bin/cargo", "check", "--locked", "--offline",
+                   *selected], oracle_env, project, guarded=False)
+        checked = bundle / "checked.cbor"
+        runner.run("check-save", [blaze, "cargo", "spec", "--out", checked, "check",
+                   *selected], env, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("check-replay", [blaze, "cargo", "spec", "--run", checked],
+                               hostile_env, hostile)
+        checks = json.loads(actual)["artifacts"]
+        assert checks and all(artifact["kind"] == "check" and artifact["executable"] is None
+                              for artifact in checks), checks
+        assert all(json.loads(Path(artifact["artifact"]).read_text()) == {"checked": True}
+                   for artifact in checks), checks
+
+        project = work / "library"
+        write(project, "Cargo.toml", '[package]\nname="saved-library"\nversion="0.1.0"\nedition="2021"\n')
+        write(project, "Cargo.lock", 'version=4\n[[package]]\nname="saved-library"\nversion="0.1.0"\n')
+        write(project, "src/lib.rs", '#[no_mangle]\npub extern "C" fn saved_answer() -> u32 { 42 }\n')
+        if args.linker_library_path:
+            write(project, ".cargo/config.toml", "[env]\nLD_LIBRARY_PATH={value="
+                  + json.dumps(args.linker_library_path) + ",force=true}\n")
+        library = bundle / "library.cbor"
+        runner.run("library-save", [blaze, "cargo", "spec", "--out", library, "build",
+                   "--config", "profile.dev.debug=0"], env, project)
+        shutil.rmtree(project)
+        actual, _ = runner.run("library-replay", [blaze, "cargo", "spec", "--run", library],
+                               hostile_env, hostile)
+        objects = json.loads(actual)["artifacts"]
+        assert len(objects) == 1 and objects[0]["kind"] == "object", objects
+        caller = write(work, "library-caller.c", "extern unsigned saved_answer(void);\nint main(void) { return saved_answer() == 42 ? 0 : 1; }\n")
+        native = work / "library-caller"
+        runtime = [objects[0]["runtime"]] if objects[0].get("runtime") else []
+        runner.run("library-native-link", ["cc", caller, objects[0]["artifact"], *runtime, "-o", native],
+                   env, hostile)
+        runner.run("library-native-run", [native], env, hostile)
+
+        if os.name == "posix":
+            project = work / "native-source"
+            shutil.copytree(template, project)
+            words = project / os.fsdecode(b"words-\xff")
+            (project / "words").rename(words)
+            (project / "words").symlink_to(words.name, target_is_directory=True)
+            native_env = dict(env, CFLAGS=os.fsdecode(b"unused-\xff"))
+            native_oracle = dict(oracle_env, CFLAGS=native_env["CFLAGS"])
+            expected, _ = runner.run("native-source-reference", [real / "bin/cargo", "run",
+                "--locked", "--offline", *selected, "--", "native"], native_oracle,
+                project, guarded=False)
+            saved_native = bundle / "native-source.cbor"
+            runner.run("native-source-save", [blaze, "cargo", "spec", "--out", saved_native,
+                       "run", *selected, "--", "native"], native_env, project)
+            write(project, "app/src/main.rs", 'fn main() { let _ = option_env!("CFLAGS"); }\n')
+            runner.run("native-env-invalid-reference", [real / "bin/cargo", "check",
+                "--locked", "--offline", *selected], native_oracle, project, expected=101,
+                contains="not a valid Unicode string", guarded=False)
+            invalid = bundle / "native-env-invalid.cbor"
+            runner.run("native-env-invalid-save", [blaze, "cargo", "spec", "--out", invalid,
+                       "check", *selected], native_env, project)
+            shutil.rmtree(project)
+            actual, _ = runner.run("native-source-replay", [blaze, "cargo", "spec", "--run", saved_native],
+                                   hostile_env, hostile)
+            assert actual == expected, (actual, expected)
+            runner.run("native-env-invalid-replay", [blaze, "cargo", "spec", "--run", invalid],
+                       hostile_env, hostile, expected=None, contains="not a valid Unicode string")
+            assert not list(Path(str(invalid) + ".outputs").glob("replay-*/result.json"))
+
+        for name in ("check-invalid", "external-include", "native-link"):
             project = work / name
             shutil.copytree(template, project)
-            if name == "external-include":
+            if name == "check-invalid":
+                write(project, "words/src/lib.rs", "pub fn word() -> u32 { false }\n")
+            elif name == "external-include":
                 external = write(work, "uncaptured\nexternal.txt", "outside source snapshot")
                 write(project, "app/src/main.rs", 'fn main() { println!("{}", include_str!('
                       + json.dumps(str(external)) + ')); }\n')
@@ -317,8 +401,8 @@ fn main() {}
 ''')
             saved = bundle / (name + ".cbor")
             runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved,
-                       "check" if name == "check" else "build", *selected], env, project)
-            reason = {"check": "does not yet execute check units", "external-include": "outside the immutable source snapshot",
+                       "check" if name == "check-invalid" else "build", *selected], env, project)
+            reason = {"check-invalid": "mismatched types", "external-include": "outside the immutable source snapshot",
                       "native-link": "native link inputs"}[name]
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
@@ -327,7 +411,7 @@ fn main() {}
     finally:
         calls = audit.read_text().splitlines() if audit.exists() else []
         write(work, "results.json", json.dumps({"backend": args.backend, "rows": runner.rows,
-              "product_tool_calls": calls}, indent=2) + "\n")
+              "tool_controls": controls, "product_tool_calls": calls}, indent=2) + "\n")
         assert not calls, f"the product invoked blocked compiler tools: {calls}"
 
 

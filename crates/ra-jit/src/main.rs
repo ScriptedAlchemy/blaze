@@ -7,6 +7,7 @@ mod answers;
 mod borrowck;
 mod cargo;
 mod check;
+mod compiler_json;
 mod content;
 mod dep_info;
 mod deps;
@@ -3222,7 +3223,19 @@ fn workspace_at(
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole, Option<scripts::Own>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
-    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && matches!(manifest, ProjectManifest::ProjectJson(_))
+    {
+        let data = serde_json::from_value(crate::compiler_json::read(project)?)?;
+        let json = project_model::ProjectJson::new(
+            Some(manifest.manifest_path().to_owned()),
+            manifest.manifest_path().parent(),
+            data,
+        );
+        ProjectWorkspace::load_inline(json, cargo_config, &|_| {})?
+    } else {
+        ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?
+    };
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
@@ -4781,43 +4794,13 @@ fn write_dep_info_of(
     db: &RootDatabase,
     krates: &[Crate],
     asked: &str,
-    vfs: &vfs::Vfs,
+    _vfs: &vfs::Vfs,
     exe: &Path,
     path: &Path,
     replay: bool,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    for &krate in krates {
-        let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
-        files.extend(modules.map(|it| it.original_file(db).file_id(db)));
-        let included = hir_def::include_macro_invoc(db, krate.into()).iter();
-        files.extend(included.map(|(_, file)| file.file_id(db)));
-    }
-    let named = |id: &vfs::FileId| Some(vfs.file_path(*id).as_path()?.to_string());
-    let mut paths: Vec<String> = Vec::new();
-    // What `include_str!` and `include_bytes!` read from outside the VFS, as rustc names it.
-    let read = krates.iter().flat_map(|it| db.included_by((*it).into()));
-    let read: Vec<String> = read.map(|(path, _)| path.to_string()).collect();
-    for path in files.iter().filter_map(named).chain(read) {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
-    // The variables `env!` and `option_env!` read, with what each was, so that cargo builds
-    // again when one changes.
-    let mut env: Vec<(String, Option<String>)> = db
-        .env_read()
-        .into_iter()
-        .filter(|(krate, _)| krates.iter().any(|it| ide_db::base_db::Crate::from(*it) == *krate))
-        .map(|(krate, key)| {
-            let value = krate.env(db).get(&key);
-            let value = value.or_else(|| ide_db::base_db::process_env_var(db, &key));
-            (key, value)
-        })
-        .collect();
-    env.sort_unstable();
-    env.dedup();
+    let dep_info::DepInfo { files: paths, env } =
+        dep_info::DepInfo::from_crates(db, krates, asked)?;
     if replay {
         let trace = dep_info::DepInfo { files: paths, env };
         return std::fs::write(path, trace.encode_replay())
@@ -8800,9 +8783,15 @@ fn run_holding(
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
-                if let Some(path) = &args.inputs {
-                    write_inputs(&db, &args, tree.vfs(), exe, path)?;
-                }
+            }
+            if let Some(path) = &args.inputs {
+                write_inputs(
+                    &db,
+                    &args,
+                    tree.vfs(),
+                    args.exe.as_deref().unwrap_or(&args.out),
+                    path,
+                )?;
             }
             // The first program is compiled and linked: a process no daemon's build started
             // holds the scripts' output no more.

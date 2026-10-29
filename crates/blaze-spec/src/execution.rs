@@ -14,7 +14,29 @@ use serde_json::{Value, json};
 
 use crate::{assemble::canonical_units, replay::Prepared};
 
-/// One executable, its complete source graph, and whether the command runs it.
+/// The artifact the owned compiler produces for a root unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// A linked executable.
+    Executable,
+    /// A native object of a standalone Rust library.
+    Object,
+    /// A successful frontend check, without code generation.
+    Check,
+    /// A documented library checked before its owned examples run.
+    Doctest,
+}
+
+/// A compiler description preserves native path bytes until its local filesystem
+/// renderer supplies the frontend's names. Ordinary UTF-8 paths keep their spelling.
+pub fn compiler_path(path: &Path) -> Value {
+    match path.to_str() {
+        Some(path) => json!(path),
+        None => json!({"blaze_native_path": path.as_os_str().as_encoded_bytes()}),
+    }
+}
+
+/// One root compilation, its complete source graph, and whether the command runs it.
 pub struct Program {
     /// Canonical index of the root unit in the BuildSpec.
     pub unit: u32,
@@ -24,6 +46,8 @@ pub struct Program {
     pub harness: bool,
     /// Whether this program is run after all artifacts have passed admission.
     pub run: bool,
+    /// Whether this root is linked, compiled to an object, or checked.
+    pub output: Output,
     /// Where the linked executable is written.
     pub executable: PathBuf,
     /// A complete source description. No Cargo project is passed to the compiler.
@@ -46,7 +70,8 @@ fn is_program(unit: &Unit) -> bool {
         || matches!(unit.target.kind, TargetKind::Bin | TargetKind::Example | TargetKind::Test)
 }
 
-fn flags(profile: &ProfileSpec, build: &BuildSpec) -> Vec<String> {
+/// The resolved code-generation flags for one canonical unit.
+pub fn flags(profile: &ProfileSpec, build: &BuildSpec) -> Vec<String> {
     // The effective profile already includes rustflags' overrides. Write it last so
     // no spelling of an original flag can undo that resolved per-unit decision.
     build
@@ -68,11 +93,12 @@ fn flags(profile: &ProfileSpec, build: &BuildSpec) -> Vec<String> {
         .collect()
 }
 
-fn package_env(
+/// Cargo's package and target variables, retaining native manifest directory bytes.
+pub fn package_env(
     unit: &Unit,
     manifests: &blaze_manifest::Context,
     primary: bool,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> anyhow::Result<BTreeMap<String, std::ffi::OsString>> {
     use blaze_manifest::manifest::{EitherManifest, read_manifest};
     let manifest = unit.package.manifest_dir.join("Cargo.toml");
     let source = blaze_manifest::source::SourceId::for_manifest_path(&manifest)?;
@@ -81,15 +107,15 @@ fn package_env(
     };
     let version = &package.package_id.version;
     let meta = &package.metadata;
-    let mut env = BTreeMap::new();
+    let mut env: BTreeMap<String, std::ffi::OsString> = [
+        ("CARGO_MANIFEST_DIR".to_owned(), unit.package.manifest_dir.as_os_str().to_owned()),
+        ("CARGO_MANIFEST_PATH".to_owned(), manifest.as_os_str().to_owned()),
+    ]
+    .into_iter()
+    .collect();
     let mut set = |name: &str, value: String| {
-        env.insert(name.to_owned(), value);
+        env.insert(name.to_owned(), value.into());
     };
-    let path = |path: &Path| -> anyhow::Result<String> {
-        Ok(path.to_str().context("the owned JSON compiler requires UTF-8 source paths")?.to_owned())
-    };
-    set("CARGO_MANIFEST_DIR", path(&unit.package.manifest_dir)?);
-    set("CARGO_MANIFEST_PATH", path(&manifest)?);
     set("CARGO_PKG_VERSION", version.to_string());
     set("CARGO_PKG_VERSION_MAJOR", version.major.to_string());
     set("CARGO_PKG_VERSION_MINOR", version.minor.to_string());
@@ -117,23 +143,15 @@ fn package_env(
     Ok(env)
 }
 
-/// Make every executable of a validated replay, or reject an unsupported unit before
-/// starting any compiler. Ordinary libraries are compiled from source as dependencies;
-/// standalone library artifacts, checks, doctests, build scripts and proc macros are
-/// explicit gaps until their owned producer/executor contracts are connected here.
+/// Plan every root of a validated replay before starting a compiler. Libraries
+/// produce native objects and check units use the frontend without code generation.
+/// Doctests, build scripts and proc macros need their owned execution contracts.
 pub fn programs(
     prepared: &Prepared,
     sysroot: &Path,
     artifacts: &Path,
 ) -> anyhow::Result<Vec<Program>> {
     let build = &prepared.resolved.spec.build;
-    match &build.command {
-        Command::Check => bail!("owned BuildSpec replay does not yet execute check units"),
-        Command::Test(run) if run.doc != 0 && !(run.doc == 1 && run.no_run) => bail!(
-            "owned BuildSpec replay does not yet execute doctests; select --lib, --bins or --tests for unit/integration tests"
-        ),
-        _ => {}
-    }
     let native = canonical_units(build, &prepared.resolved.graph)?;
     for (at, unit) in native.iter().enumerate() {
         let label = format!("{}:{}", unit.package.name, unit.target.name);
@@ -144,18 +162,11 @@ pub fn programs(
             TargetKind::ProcMacro => {
                 bail!("owned BuildSpec replay has no proc-macro producer for {label}")
             }
-            TargetKind::Bench => {
-                bail!("owned BuildSpec replay does not yet execute benchmark target {label}")
-            }
             _ => {}
         }
         ensure!(
             !unit.for_host,
             "owned BuildSpec replay cannot collapse host unit {label} into target units"
-        );
-        ensure!(
-            unit.mode != Mode::Check,
-            "owned BuildSpec replay does not yet execute check unit {label}"
         );
         ensure!(
             unit.target
@@ -174,23 +185,9 @@ pub fn programs(
             "owned BuildSpec replay does not yet strip native symbols for {label}"
         );
     }
-    let mut roots: Vec<_> =
-        build.asked.iter().copied().filter(|&at| is_program(native[at as usize])).collect();
+    let mut roots: Vec<_> = build.asked.iter().copied().collect();
     // Cargo builds auxiliary binaries before the tests that use CARGO_BIN_EXE_*.
     roots.sort_by_key(|&at| (native[at as usize].test, at));
-    ensure!(
-        !roots.is_empty(),
-        "owned BuildSpec replay has no standalone library artifact executor; select a binary or example"
-    );
-    let covered: BTreeSet<_> = roots.iter().flat_map(|&at| reachable(build, at)).collect();
-    for &at in build.asked.iter() {
-        ensure!(
-            covered.contains(&at),
-            "owned BuildSpec replay cannot emit standalone library {}:{}",
-            build.units[at as usize].package.0,
-            build.units[at as usize].target.1
-        );
-    }
     let executable = |at| {
         artifacts
             .join(format!("unit-{at}"))
@@ -216,6 +213,7 @@ pub fn programs(
         let indexes: BTreeMap<_, _> =
             order.iter().enumerate().map(|(at, &original)| (original, at)).collect();
         let mut crates = Vec::new();
+        let mut native_units = BTreeMap::new();
         for &at in &order {
             let spec = &build.units[at as usize];
             let unit = native[at as usize];
@@ -232,14 +230,7 @@ pub fn programs(
                 unit.package.name,
                 unit.target.name
             );
-            let mut crate_env: BTreeMap<_, _> = execution_env
-                .iter()
-                .map(|(name, value)| {
-                    Ok((name.clone(), value.to_str().with_context(|| format!(
-                    "owned JSON compiler cannot represent the native environment value {name}"
-                ))?.to_owned()))
-                })
-                .collect::<anyhow::Result<_>>()?;
+            let mut crate_env = execution_env.clone();
             let primary = build
                 .asked
                 .iter()
@@ -254,10 +245,7 @@ pub fn programs(
                     {
                         crate_env.insert(
                             format!("CARGO_BIN_EXE_{}", other.target.name),
-                            executable(binary)
-                                .to_str()
-                                .context("non-UTF-8 artifact path")?
-                                .to_owned(),
+                            executable(binary).into_os_string(),
                         );
                     }
                 }
@@ -280,25 +268,55 @@ pub fn programs(
                 })
                 .chain(spec.cfg.iter().map(|cfg| cfg.0.clone()))
                 .collect();
+            let invalid_env: Vec<_> = crate_env
+                .iter()
+                .filter(|(_, value)| value.to_str().is_none())
+                .map(|(name, _)| name.clone())
+                .collect();
+            let text_env: BTreeMap<_, _> = crate_env
+                .iter()
+                .filter_map(|(name, value)| Some((name, value.to_str()?)))
+                .collect();
+            native_units.insert(
+                at,
+                blaze_wire::native::Unit {
+                    env: crate_env
+                        .iter()
+                        .map(|(name, value)| (name.into(), value.clone()))
+                        .collect(),
+                    flags: flags(&spec.profile, build).into_iter().map(Into::into).collect(),
+                },
+            );
             crates.push(json!({
                 "display_name": unit.target.name.replace('-', "_"),
-                "root_module": unit.target.src_path.to_str().context("the owned JSON compiler requires UTF-8 source paths")?,
+                "root_module": compiler_path(&unit.target.src_path),
                 "edition": spec.edition.to_string(),
                 "version": unit.package.version,
                 "deps": spec.deps.iter().map(|(dep, name)| json!({"crate": indexes[dep], "name": name})).collect::<Vec<_>>(),
                 "cfg": cfg,
                 "codegen_flags": flags(&spec.profile, build),
-                "env": crate_env,
+                "env": text_env,
+                "blaze_invalid_env": invalid_env,
+                "blaze_native_unit": at,
                 "is_workspace_member": at == root,
                 "is_proc_macro": false,
-                "build": {"label": unit.target.name, "build_file": unit.package.manifest_dir.join("Cargo.toml"), "target_kind": kind},
+                "build": {"label": unit.target.name, "build_file": compiler_path(&unit.package.manifest_dir.join("Cargo.toml")), "target_kind": kind},
             }));
         }
         let unit = native[root as usize];
+        let output = if unit.mode == Mode::Check {
+            Output::Check
+        } else if is_program(unit) || unit.target.kind == TargetKind::Bench {
+            Output::Executable
+        } else {
+            Output::Object
+        };
         let project = json!({
             "compiler_mode": true,
-            "sysroot": sysroot,
-            "sysroot_src": sysroot.join("lib/rustlib/src/rust/library"),
+            "blaze_native_units": blaze_wire::native::encode_units(&native_units),
+            "blaze_spec_target": prepared.host.triple,
+            "sysroot": compiler_path(sysroot),
+            "sysroot_src": compiler_path(&sysroot.join("lib/rustlib/src/rust/library")),
             "crates": crates,
             "blaze_spec_profile": {"version": 1, "profile": blaze_wire::encode(&root_unit.profile), "rustflags": build.rustflags.iter().map(|flag| flag.0.clone()).collect::<Vec<_>>()},
         });
@@ -312,9 +330,64 @@ pub fn programs(
             crate_name: unit.target.name.replace('-', "_"),
             harness: root_unit.test,
             run,
-            executable: executable(root),
+            output,
+            executable: match output {
+                Output::Executable => executable(root),
+                Output::Object => artifacts.join(format!("unit-{root}/library.o")),
+                Output::Check => artifacts.join(format!("unit-{root}/checked.json")),
+                Output::Doctest => unreachable!(),
+            },
             project,
         });
+    }
+    if let Command::Test(run) = &build.command
+        && run.doc != 0
+        && !run.no_run
+    {
+        let selected: BTreeSet<_> =
+            roots.iter().map(|&at| &native[at as usize].package.id).collect();
+        let libraries: Vec<_> = native
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| {
+                matches!(unit.target.kind, TargetKind::Lib | TargetKind::ProcMacro)
+                    && unit.mode == Mode::Build
+                    && unit.target.doctest
+                    && selected.contains(&unit.package.id)
+            })
+            .collect();
+        for (at, unit) in libraries {
+            // The library's source-only description is already needed by a root
+            // executable or by --doc itself. Reuse its exact crate graph/profile.
+            let project = result
+                .iter()
+                .find_map(|program| {
+                    let mut project = program.project.clone();
+                    let crates = project["crates"].as_array_mut()?;
+                    let root = crates.iter().position(|krate| {
+                        krate["root_module"] == compiler_path(&unit.target.src_path)
+                            && krate["build"]["target_kind"] == "lib"
+                    })?;
+                    for krate in crates.iter_mut() {
+                        krate["is_workspace_member"] = false.into();
+                    }
+                    crates[root]["is_workspace_member"] = true.into();
+                    project["blaze_spec_doctest"] = json!(blaze_wire::encode(run));
+                    project["blaze_spec_profile"]["profile"] =
+                        json!(blaze_wire::encode(&build.units[at].profile));
+                    Some(project)
+                })
+                .context("doctest library has no source description")?;
+            result.push(Program {
+                unit: at as u32,
+                crate_name: unit.target.name.replace('-', "_"),
+                harness: false,
+                run: true,
+                output: Output::Doctest,
+                executable: artifacts.join(format!("doctest-{at}/checked.json")),
+                project,
+            });
+        }
     }
     Ok(result)
 }

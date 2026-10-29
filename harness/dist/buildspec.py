@@ -65,6 +65,7 @@ import argparse
 import collections
 import contextlib
 import hashlib
+import glob
 import json
 import os
 import re
@@ -89,6 +90,10 @@ import tracedecay  # noqa: E402
 
 TOOLCHAIN = open(os.path.join(HARNESS, "toolchain")).read().strip()
 DEFAULT_BIN = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target", "release", "ra-jit")
+
+
+def cargo_oracle():
+    return os.path.join(norustc.real_toolchain(), "bin", "cargo")
 
 # The five digests the contract prints, and what `spec` is made of (docs/distributed.md, "Data shapes").
 DIGESTS = ("spec", "platform", "front_end", "config", "job_content")
@@ -1090,14 +1095,19 @@ class Blaze:
     watchdog of tracedecay.py over the run's whole process tree, a fresh RA_JIT_HOME for the ones
     that start a daemon, and a timeout."""
 
-    def __init__(self, binary, run_id, timeout):
+    def __init__(self, binary, run_id, timeout, memory_mib=None):
         self.bin = os.path.abspath(binary)
         self.bindir = os.path.dirname(self.bin)
         self.run_id = run_id
         self.timeout = timeout
         self.guard = dict(tracedecay.GUARD_ENV)
+        if memory_mib is not None:
+            if not 0 < memory_mib <= 16384:
+                raise HarnessError("--memory-mib must be positive and at most 16384")
+            self.guard.update(RA_JIT_MEMORY_MAX=f"{memory_mib}M",
+                              RA_JIT_OWN_BASE_MEMORY=f"{memory_mib * 3 // 4}M")
         self.homes = []
-        self.watchdog = tracedecay.Watchdog(self.bindir, tracedecay.WATCHDOG_MB, tracedecay.SWAP_FREE_MIN_MB, 2.0,
+        self.watchdog = tracedecay.Watchdog(self.bindir, min(tracedecay.WATCHDOG_MB, memory_mib or tracedecay.WATCHDOG_MB), tracedecay.SWAP_FREE_MIN_MB, 2.0,
                                             run_id=run_id, homes=())
         self.watchdog.start()
 
@@ -1425,7 +1435,27 @@ def scan_programs(target):
                     examples.add(HASH.sub("", name))
                     continue
                 found[f"{kind}:{HASH.sub('', name) if kind == 'exe' else name}"] += 1
-    return sorted([f"{k} x{n}" if n > 1 else k for k, n in found.items()] + [f"example:{e}" for e in examples])
+    # Cargo exposes a binary both at the top level and in deps. They are the
+    # same program; a separate test executable with that name remains counted.
+    for key in list(found):
+        if key.startswith("bin:"):
+            duplicate = "exe:" + key.removeprefix("bin:")
+            if found[duplicate]:
+                found[duplicate] -= 1
+    return sorted([f"{k} x{n}" if n > 1 else k for k, n in found.items() if n] + [f"example:{e}" for e in examples])
+
+
+def saved_programs(results):
+    found = collections.Counter()
+    for result in results:
+        for artifact in json.load(open(result))["artifacts"]:
+            if not artifact.get("executable"):
+                continue
+            if not os.path.isfile(artifact["executable"]):
+                raise HarnessError(f"saved result names a missing executable: {artifact['executable']}")
+            kind = "exe" if artifact["test"] else "example" if artifact["target_kind"] == 3 else "bin"
+            found[f"{kind}:{artifact['target']}"] += 1
+    return sorted(f"{key} x{n}" if n > 1 else key for key, n in found.items())
 
 
 def summarize(output, target, code):
@@ -1508,7 +1538,7 @@ class Ctx:
         self.work = os.path.abspath(args.work) if args.work else tempfile.mkdtemp(prefix="rj-bs-work-", dir="/tmp")
         os.makedirs(self.work, exist_ok=True)
         self.run_id = "bs-%s-%d" % (time.strftime("%m%d%H%M%S"), os.getpid())
-        self.blaze = Blaze(args.bin, self.run_id, args.timeout)
+        self.blaze = Blaze(args.bin, self.run_id, args.timeout, getattr(args, "memory_mib", None))
         self.cargo_home = os.path.join(self.work, "cargo-home")
         os.makedirs(self.cargo_home, exist_ok=True)
         self.spec_home = self.blaze.new_home()
@@ -1692,7 +1722,7 @@ class Ctx:
             return {"status": "ERROR", "diffs": [f"blaze: stdout is not JSON ({e})"]}
         env = scrubbed_env(self.case_env(case))
         env.update(RUSTC_BOOTSTRAP="1", CARGO_HOME=self.cargo_home)
-        cargo = subprocess.run(["cargo", f"+{TOOLCHAIN}", case.command, "--unit-graph", "-Z", "unstable-options",
+        cargo = subprocess.run([cargo_oracle(), case.command, "--unit-graph", "-Z", "unstable-options",
                                 "--locked", "--offline", *case.words[1:]], cwd=tree, env=env, text=True,
                                stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
         if cargo.returncode != 0:
@@ -1719,6 +1749,9 @@ class Ctx:
             log = os.path.join(self.work, "audit.log")
             open(log, "w").close()
             standins = os.path.join(norustc.stand_ins(os.path.join(self.work, "standins"), log), "bin")
+            control = subprocess.run([os.path.join(standins, "cargo"), "--version"], capture_output=True)
+            if control.returncode != 0 or not norustc.runs(log):
+                raise HarnessError("the Cargo audit stand-in did not execute and record its control")
             self.audit = (log, standins)
         except Exception as e:  # no rustup toolchain, no rustc to copy: the audit is skipped, said so
             self.audit_why = f"the stand-ins could not be made: {clip(e, 160)}"
@@ -1732,12 +1765,20 @@ class Ctx:
         env = self.blaze.env(scrubbed_env(env_extra), home=home, target=target, store=store,
                              cargo_home=self.cargo_home, standins=self.audit[1] if self.audit else None)
         offset = self.audit_offset()
+        saved = len(args) == 4 and args[:3] == ["cargo", "spec", "--run"]
+        outputs = args[3] + ".outputs" if saved else None
+        before = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) if outputs else set()
         run = self.blaze.run(args, copy_root, env, merge=True)
         if self.audit and not run.watchdog:
             norustc.settle(self.audit[0], limit=60)
         self.blaze.stop(home, copy_root, env)
         dispatched = count_dispatched(self.audit, offset)
         summary = summarize(run.out, target, run.code)
+        if outputs:
+            results = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) - before
+            if run.code == 0 and not results:
+                raise HarnessError("saved replay succeeded without a completed result")
+            summary["programs"] = saved_programs(sorted(results))
         return summary, run, dispatched
 
     def run_local(self, case):
@@ -1785,26 +1826,25 @@ class Ctx:
         return out
 
     def run_mismatch(self, fixture):
-        """`spec run` of the base's spec in the checkout of another commit refuses, naming a field."""
+        """The saved source wins over an unrelated checkout's edited files."""
         base = self.results.get(f"{fixture.name}/base")
+        reference = self.locals.get(f"{fixture.name}/base")
         edited = [c for c in fixture.cases if c.edits and self.results.get(c.full) and self.results[c.full].made]
-        if not (base and base.cbor and os.path.exists(base.cbor) and edited):
+        if not (base and base.cbor and os.path.exists(base.cbor) and edited and reference):
             return None
         case = edited[0]
         copy = os.path.join(self.work, "local", f"{fixture.name}__mismatch")
         shutil.copytree(self.tree(case), copy, symlinks=True)
-        home = self.blaze.new_home()
-        env = self.blaze.env(scrubbed_env(), home=home, target=os.path.join(copy, "..", "target-mm"),
-                             cargo_home=self.cargo_home)
-        run = self.blaze.run(["cargo", "spec", "--run", base.cbor], copy, env, merge=True)
-        self.blaze.stop(home, copy, env)
+        shared = os.path.join(self.work, "store") if self.args.shared_store else None
+        summary, run, _ = self.local_run(fixture.by_name["base"], ["cargo", "spec", "--run", base.cbor],
+            (copy, os.path.join(copy, "..", "run-foreign")), {}, "foreign checkout", shared)
         shutil.rmtree(copy, ignore_errors=True)
         said = run.out.strip().splitlines()[-1] if run.out.strip() else ""
         fails = []
-        if run.code != 2:
-            fails.append(f"spec run of {fixture.name}/base's spec in the checkout of {case.name} exited {run.code}, wanted 2")
-        if not re.search(r"does not match the spec: \S+", run.out):
-            fails.append(f"it did not say `the tree does not match the spec: <field>`: {clip(said, 200)}")
+        for part, expected, actual in compare_summaries(reference["spec_run"], summary):
+            fails.append(f"foreign checkout changed {part}: saved {expected!r}, replayed {actual!r}")
+        if run.watchdog or run.timed_out:
+            fails.append("foreign-checkout replay exceeded its resource guard")
         return {"case": f"{fixture.name}/{case.name}", "exit": run.code, "said": said, "fails": fails}
 
 
@@ -1964,7 +2004,7 @@ def print_report(ctx, reported):
         for case, res in refusals:
             print(f"  {case.full}: {res.refused.get('what')} / {res.refused.get('why')}")
     if ctx.mismatch:
-        print("\nspec run in a checkout of another commit:")
+        print("\nsaved-source replay from an edited checkout:")
         for m in ctx.mismatch:
             print(f"  {m['case']}: exit {m['exit']}: {m['said']}{'' if not m['fails'] else '  <- FAIL'}")
     if ctx.audit is not None:
@@ -2048,6 +2088,7 @@ def parse_args(argv):
     ap.add_argument("--json", metavar="FILE", help="write every result there")
     ap.add_argument("--list", action="store_true", help="list the fixtures and cases")
     ap.add_argument("--timeout", type=int, default=900, help="seconds a ra-jit run may take (default 900)")
+    ap.add_argument("--memory-mib", type=int, help="lower the compiler and process-tree memory ceiling for hosted runners (at most 16384)")
     ap.add_argument("--shared-store", action="store_true", help="local runs share one RA_JIT_CACHE (faster, less independent)")
     ap.add_argument("--no-audit", action="store_true", help="do not put norustc.py's stand-ins on PATH for the local runs")
     ap.add_argument("--units-with-doctest", action="store_true", help="compare cargo's doctest units too")
@@ -2588,7 +2629,7 @@ def captured_env(env):
 
 def unit_graph(cwd, words, env):
     env = dict(env, RUSTC_BOOTSTRAP="1")
-    ran = subprocess.run(["cargo", "+1.99.0", words[0], "--unit-graph", "-Z", "unstable-options", "--locked", "--offline"] + words[1:],
+    ran = subprocess.run(@ORACLE_CARGO@ + [words[0], "--unit-graph", "-Z", "unstable-options", "--locked", "--offline"] + words[1:],
                          cwd=cwd, env=env, capture_output=True, text=True)
     if ran.returncode:
         sys.stderr.write(ran.stderr)
@@ -2625,7 +2666,9 @@ def simulate(res, words, env):
     for key, u in sorted(units.items(), key=lambda kv: (kv[1]["pkg"], kv[1]["kind"], kv[1]["name"])):
         h = hash16(repr(key))
         if u["kind"] == 5 and not u["test"]:
-            stub(os.path.join(deps, "build_script_build-" + h))
+            directory = os.path.join(target, prof, "build", h)
+            os.makedirs(directory, exist_ok=True)
+            stub(os.path.join(directory, "build-script-build"))
         elif u["kind"] == 1 and not u["test"]:
             stub(os.path.join(deps, u["name"] + "-" + h))
             stub(os.path.join(target, prof, u["name"]))
@@ -2759,7 +2802,7 @@ def main():
         words = list(saved["words"])
         if BUG == "spec-run-drops-no-run":
             words = [w for w in words if w != "--no-run"]
-        checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+        checkout = saved["checkout"]
         cwd = os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"])
         try:
             res = resolve(cwd, words, env)
@@ -2771,6 +2814,24 @@ def main():
                 sys.stderr.write("blaze: the tree does not match the spec: %s\n" % name)
                 return 2
         text, code = simulate(res, words, env)
+        directory = rest[2] + ".outputs/replay-" + str(os.getpid())
+        os.makedirs(directory)
+        target = env["CARGO_TARGET_DIR"]
+        prof = "release" if res["opts"]["release"] else "debug"
+        artifacts = []
+        for key, u in res["units"].items():
+            h = hash16(repr(key))
+            if u["kind"] == 1 and not u["test"]:
+                path = os.path.join(target, prof, u["name"])
+            elif u["test"] and u["kind"] in (0, 1, 2) or u["kind"] == 2:
+                path = os.path.join(target, prof, "deps", u["name"].replace("-", "_") + "-" + h)
+            elif u["kind"] == 3:
+                path = os.path.join(target, prof, "examples", u["name"])
+            else:
+                continue
+            artifacts.append({"executable": path, "target": u["name"], "target_kind": u["kind"], "test": u["test"] or u["kind"] == 2})
+        with open(os.path.join(directory, "result.json"), "w") as f:
+            json.dump({"artifacts": artifacts}, f)
         sys.stdout.write(text)
         return code
     if rest[:1] == ["spec"]:
@@ -2793,7 +2854,8 @@ def main():
             with open(out, "w") as f:
                 # As with saved words/environment, this auxiliary path models reproduction in
                 # the test double; it does not assert that the current wire has this information.
-                json.dump({"words": words, "env": captured_env(env), "cwd": res["checkout_cwd"], "spec": res["spec"]}, f)
+                checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=res["root"]).decode().strip()
+                json.dump({"words": words, "env": captured_env(env), "cwd": res["checkout_cwd"], "checkout": checkout, "spec": res["spec"]}, f)
         print(json.dumps({"refused": None, "digests": res["digests"], "summary": res["summary"], "spec": res["spec"], "platform": res["platform"]}))
         return 0
     try:
@@ -2961,7 +3023,7 @@ def self_test_parsing(t):
             os.chmod(path, 0o755)
         os.chmod(os.path.join(tmp, "debug/deps/it-bbbbbbbbbbbbbbbb"), 0o644)
         got = scan_programs(tmp)
-        t.check(got == ["bin:basic", "example:demo", "exe:basic x2"] or got == ["bin:basic", "exe:basic x2", "example:demo"],
+        t.check(got == ["bin:basic", "example:demo", "exe:basic"],
                 "programs are the executables of the profile directory, hashes dropped, libraries and metadata left out", str(got))
     s = {"tests": [("a", "tests::adds", "ok"), ("a", "tests::slow", "ignored")], "programs": ["bin:basic"], "markers": ["@@bin basic add=3"], "exit": 0}
     t.check(check_lexpect(s, [("test", "adds", "ok"), ("no-test", "slow"), ("program", "bin", "basic"), ("no-program", "bin", "c"),
@@ -3051,7 +3113,7 @@ def self_test_source_trees(t, tmp):
 
 def oracle_available():
     try:
-        ran = subprocess.run(["cargo", f"+{TOOLCHAIN}", "--version"], capture_output=True, text=True, timeout=30)
+        ran = subprocess.run([cargo_oracle(), "--version"], capture_output=True, text=True, timeout=30)
         return ran.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -3084,7 +3146,7 @@ def self_test_oracle(t, tmp):
             shutil.rmtree(target, ignore_errors=True)
             cenv = dict(env, CARGO_TARGET_DIR=target)
             cenv.update({k: (v or "").replace("@TOOLS@", os.path.join(tmp, "tools")) for k, v in case.env.items() if v is not None})
-            ran = subprocess.run(["cargo", f"+{TOOLCHAIN}", *case.words], cwd=os.path.join(copy, case.cwd), env=cenv, text=True,
+            ran = subprocess.run([cargo_oracle(), *case.words], cwd=os.path.join(copy, case.cwd), env=cenv, text=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
             got = check_lexpect(summarize(ran.stdout, target, ran.returncode), case.lexpect)
             t.check(not got, f"cargo {' '.join(case.words)} on {case.full} shows what the case expects", "; ".join(got) + " | " + clip(ran.stdout[-300:]))
@@ -3130,8 +3192,9 @@ def self_test(args):
             print(f"\nskip the oracle's check of the local expectations: no cargo +{TOOLCHAIN}")
         fake = os.path.join(tmp, "bin", "ra-jit")
         os.makedirs(os.path.dirname(fake))
+        oracle = [cargo_oracle()] if oracle_available() else ["cargo", f"+{TOOLCHAIN}"]
         with open(fake, "w") as f:
-            f.write(FAKE_RA_JIT.replace("@PYTHON@", sys.executable))
+            f.write(FAKE_RA_JIT.replace("@PYTHON@", sys.executable).replace("@ORACLE_CARGO@", repr(oracle)))
         os.chmod(fake, 0o755)
         log = os.path.join(tmp, "calls.jsonl")
         cargo = oracle_available()

@@ -45,7 +45,7 @@ RUN_ID_ENV = "RA_JIT_RUN_ID"
 
 # The stand-in for a tool: one line per run (the tool, its pid, its parent's command line, its
 # arguments, the run it belongs to), then the real tool, which keeps the pid.
-STAND_IN = """#!/bin/sh
+STAND_IN = """#!{shell}
 parent=$(ps -o args= -p $PPID 2>/dev/null | cut -c1-300 | tr '\\t\\n' '  ')
 printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {tool} $$ "$parent" "$(echo "$*" | cut -c1-1500 | tr '\\t\\n' '  ')" "${{{run_id_env}-}}" >> {log}
 exec {real} "$@"
@@ -90,7 +90,10 @@ def run(argv, **kwargs):
 
 
 def real_toolchain():
-    """The sysroot of the pinned toolchain, from the rustup proxy on PATH."""
+    """The pinned sysroot, including a direct Nix toolchain without rustup."""
+    version = run(["rustc", "--version"])
+    if version.returncode == 0 and version.stdout.split()[1:2] == [TOOLCHAIN]:
+        return run(["rustc", "--print", "sysroot"], check=True).stdout.strip()
     return run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
 
 
@@ -130,7 +133,7 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
             continue
         shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
-            out.write(STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+            out.write(STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
                                       run_id_env=run_id_env))
         os.chmod(copy, 0o755)
     with open(marker, "w") as f:

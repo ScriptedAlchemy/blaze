@@ -176,6 +176,7 @@ impl ProjectJson {
                         target: crate_data.target,
                         codegen_flags: crate_data.codegen_flags,
                         env: crate_data.env,
+                        invalid_env: crate_data.blaze_invalid_env,
                         crate_attrs: crate_data.crate_attrs,
                         proc_macro_dylib_path: crate_data
                             .proc_macro_dylib_path
@@ -271,6 +272,7 @@ pub struct Crate {
     pub(crate) target: Option<String>,
     pub(crate) codegen_flags: Vec<String>,
     pub(crate) env: FxHashMap<String, String>,
+    pub(crate) invalid_env: Vec<String>,
     // Extra crate-level attributes, without the surrounding `#![]`.
     pub(crate) crate_attrs: Vec<String>,
     pub(crate) proc_macro_dylib_path: Option<AbsPathBuf>,
@@ -475,6 +477,8 @@ struct CrateData {
     codegen_flags: Vec<String>,
     #[serde(default)]
     env: FxHashMap<String, String>,
+    #[serde(default)]
+    blaze_invalid_env: Vec<String>,
     #[serde(default)]
     crate_attrs: Vec<String>,
     proc_macro_dylib_path: Option<Utf8PathBuf>,

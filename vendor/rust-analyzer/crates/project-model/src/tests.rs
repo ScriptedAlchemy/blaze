@@ -291,6 +291,32 @@ fn compiler_project_preserves_exact_cfg_env_and_target_kinds() {
 }
 
 #[test]
+fn compiler_project_preserves_non_unicode_environment_as_present_but_not_text() {
+    let mut json = compiler_project();
+    json["crates"][0]["blaze_invalid_env"] = serde_json::json!(["NATIVE_VALUE"]);
+    let (graph, _) = to_crate_graph(
+        rust_project_workspace(serde_json::from_value(json).unwrap()),
+        &mut Default::default(),
+    );
+    let root = graph
+        .iter()
+        .find(|&id| {
+            graph[id].extra.display_name.as_ref().unwrap().canonical_name().as_str() == "program"
+        })
+        .unwrap();
+    let env = &graph[root].env;
+    assert!(env.contains_key("NATIVE_VALUE"));
+    assert!(env.is_non_unicode("NATIVE_VALUE"));
+    assert_eq!(env.get("NATIVE_VALUE"), None);
+    assert!(!env.is_non_unicode("ABSENT"));
+    let mut overlaid = env.clone();
+    overlaid.set("NATIVE_VALUE", "text override");
+    assert!(!overlaid.is_non_unicode("NATIVE_VALUE"));
+    assert_eq!(overlaid.get("NATIVE_VALUE").as_deref(), Some("text override"));
+    assert_ne!(format!("{env:?}"), format!("{:?}", base_db::Env::default()));
+}
+
+#[test]
 fn compiler_project_accepts_cargo_cfg_whitespace() {
     let mut json = compiler_project();
     json["crates"][0]["cfg"] = serde_json::json!([

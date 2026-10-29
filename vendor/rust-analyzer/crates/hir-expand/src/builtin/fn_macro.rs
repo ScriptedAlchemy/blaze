@@ -994,6 +994,23 @@ fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> 
     krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
 }
 
+fn non_unicode_env(
+    db: &dyn SourceDatabase,
+    arg_id: MacroCallId,
+    key: &Symbol,
+    span: Span,
+) -> Option<ExpandError> {
+    let krate = arg_id.loc(db).krate;
+    if !krate.env(db).is_non_unicode(key.as_str()) {
+        return None;
+    }
+    db.env_is_read(krate, key.as_str());
+    Some(ExpandError::other(
+        span,
+        format!("environment variable `{key}` is not a valid Unicode string"),
+    ))
+}
+
 fn env_expand(
     db: &dyn SourceDatabase,
     arg_id: MacroCallId,
@@ -1010,6 +1027,12 @@ fn env_expand(
         }
     };
 
+    if let Some(error) = non_unicode_env(db, arg_id, &key, span) {
+        return ExpandResult::new(
+            tt::TopSubtree::empty(DelimSpan { open: span, close: span }),
+            error,
+        );
+    }
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
         db.env_is_unset(arg_id.loc(db).krate, key.as_str());
@@ -1048,6 +1071,12 @@ fn option_env_expand(
             );
         }
     };
+    if let Some(error) = non_unicode_env(db, arg_id, &key, span) {
+        return ExpandResult::new(
+            tt::TopSubtree::empty(DelimSpan { open: call_site, close: call_site }),
+            error,
+        );
+    }
     let dollar_crate = dollar_crate(call_site);
     let expanded = match get_env_inner(db, arg_id, &key) {
         None => quote! {call_site => #dollar_crate::option::Option::None::<&str> },

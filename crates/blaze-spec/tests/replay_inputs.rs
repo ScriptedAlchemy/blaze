@@ -329,7 +329,7 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
 }
 
 #[test]
-fn no_run_builds_the_test_executables_without_a_doctest_producer() {
+fn no_run_skips_doctests_and_ordinary_test_plans_them_after_executables() {
     let f = fixture();
     f.write("src/lib.rs", "/// ```\n/// assert!(true);\n/// ```\npub fn library() {}\n");
     for args in [vec!["--no-run"], vec![]] {
@@ -342,10 +342,17 @@ fn no_run_builds_the_test_executables_without_a_doctest_producer() {
             Path::new("/toolchain"),
             &worker.path().join("artifacts"),
         );
+        let plans = plans.unwrap();
         if args.is_empty() {
-            assert!(plans.err().unwrap().to_string().contains("doctests"));
+            let docs: Vec<_> = plans
+                .iter()
+                .filter(|plan| plan.output == blaze_spec::execution::Output::Doctest)
+                .collect();
+            assert_eq!(docs.len(), 1);
+            assert!(docs[0].run);
+            assert!(!docs[0].harness);
+            assert!(docs[0].project["blaze_spec_doctest"].is_array());
         } else {
-            let plans = plans.unwrap();
             assert!(!plans.is_empty());
             assert!(plans.iter().all(|plan| !plan.run));
             assert!(
@@ -354,6 +361,66 @@ fn no_run_builds_the_test_executables_without_a_doctest_producer() {
                     .any(|plan| plan.project["crates"][0]["build"]["target_kind"] == "test")
             );
         }
+    }
+}
+
+#[test]
+fn standalone_libraries_and_checks_have_distinct_owned_outputs() {
+    let f = fixture();
+    std::fs::remove_file(f.root().join("src/main.rs")).unwrap();
+    f.write("src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    for (command, output) in [
+        (Subcommand::Build, blaze_spec::execution::Output::Object),
+        (Subcommand::Check, blaze_spec::execution::Output::Check),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        let made = saved(&f, command, &[], store.path());
+        let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+        let plans = blaze_spec::execution::programs(
+            &prepared,
+            Path::new("/toolchain"),
+            &worker.path().join("artifacts"),
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].output, output);
+        assert!(!plans[0].harness);
+        assert!(!plans[0].run);
+        assert_eq!(plans[0].project["crates"][0]["build"]["target_kind"], "lib");
+    }
+}
+
+#[test]
+fn custom_test_and_benchmark_targets_keep_test_cfg_without_libtest() {
+    let f = fixture();
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n[[test]]\nname='custom'\nharness=false\n[[bench]]\nname='custom'\nharness=false\n");
+    f.write(
+        "tests/custom.rs",
+        "#[cfg(not(test))] compile_error!(\"cfg(test) missing\");\nfn main() {}\n",
+    );
+    f.write("benches/custom.rs", "fn main() {}\n");
+    for target in ["--test", "--bench"] {
+        let store = tempfile::tempdir().unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        let made = saved(&f, Subcommand::Test, &[target, "custom"], store.path());
+        let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+        let plans = blaze_spec::execution::programs(
+            &prepared,
+            Path::new("/toolchain"),
+            &worker.path().join("artifacts"),
+        )
+        .unwrap();
+        let custom = plans.iter().find(|plan| plan.crate_name == "custom").unwrap();
+        assert_eq!(custom.output, blaze_spec::execution::Output::Executable);
+        assert!(custom.run);
+        assert!(!custom.harness);
+        assert!(
+            custom.project["crates"][0]["cfg"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("test"))
+        );
     }
 }
 
