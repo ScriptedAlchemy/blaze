@@ -64,15 +64,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo build --locked -p ra-jit --bin ra-jit
-          python3 -I harness/dist/saved_spec.py --blaze target/debug/ra-jit --work target/saved-spec-review
+          # Cargo walks parent directories for config; the fixture must not inherit
+          # this checkout's workspace-relative environment settings.
+          python3 -I harness/dist/saved_spec.py --blaze target/debug/ra-jit --work "$RUNNER_TEMP/saved-spec-review"
       - name: Save immutable replay evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
           name: saved-buildspec-execution
           path: |
-            target/saved-spec-review/results.json
-            target/saved-spec-review/*.log
+            ${{ runner.temp }}/saved-spec-review/results.json
+            ${{ runner.temp }}/saved-spec-review/*.log
           if-no-files-found: ignore
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
