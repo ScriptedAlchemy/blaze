@@ -32,25 +32,25 @@ impl<'de> serde::Deserialize<'de> for Native {
 type NativeWire = (u8, u8, Vec<(blaze_wire::Bytes, blaze_wire::Bytes)>);
 
 #[cfg(unix)]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
 #[cfg(unix)]
-fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+pub(crate) fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
     use std::os::unix::ffi::OsStringExt as _;
     Ok(OsString::from_vec(value))
 }
 
 #[cfg(windows)]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt as _;
     value.encode_wide().flat_map(u16::to_le_bytes).collect()
 }
 
 #[cfg(windows)]
-fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
+pub(crate) fn from_os_bytes(value: Vec<u8>) -> Result<OsString, &'static str> {
     use std::os::windows::ffi::OsStringExt as _;
     if value.len() % 2 != 0 {
         return Err("invalid native environment");
@@ -143,7 +143,16 @@ impl Native {
     }
 
     pub(crate) fn unicode(&self) -> Env {
-        unicode(self.vars()).collect()
+        let mut env = Env::default();
+        for (key, value) in &self.0 {
+            if let Some(key) = key.to_str() {
+                match value.to_str() {
+                    Some(value) => env.set(key, value),
+                    None => env.set_non_unicode(key),
+                }
+            }
+        }
+        env
     }
 
     pub(crate) fn over(&self, vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
@@ -320,6 +329,7 @@ mod tests {
         assert!(!decode_native("native-env-v1:bad-secret").unwrap_err().contains("bad-secret"));
         assert_eq!(env.unicode().get("EMPTY"), Some(String::new()));
         assert_eq!(env.unicode().get("BYTE_VALUE"), None);
+        assert!(env.unicode().is_non_unicode("BYTE_VALUE"));
         let mut command = Command::new("/usr/bin/printenv");
         command.env("DAEMON_ONLY", "must-not-leak");
         env.apply(&mut command);

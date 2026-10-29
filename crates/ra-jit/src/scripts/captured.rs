@@ -77,11 +77,7 @@ impl Prepared {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct NativeUnit {
-    pub(crate) env: BTreeMap<OsString, OsString>,
-    pub(crate) flags: Vec<OsString>,
-}
+pub(crate) use blaze_wire::native::Unit as NativeUnit;
 
 impl Graph {
     fn order(&self) -> Result<Vec<usize>> {
@@ -158,7 +154,7 @@ impl Graph {
         Ok(order)
     }
 
-    fn closure(&self, root: usize, prepared: &[Planned]) -> Result<Vec<Planned>> {
+    fn closure_indices(&self, root: usize, prepared: &[Planned]) -> Result<Vec<usize>> {
         fn visit(
             graph: &Graph,
             root: usize,
@@ -185,6 +181,23 @@ impl Graph {
         }
         let mut order = Vec::new();
         visit(self, root, root, prepared, &mut order)?;
+        Ok(order)
+    }
+
+    fn native_closure(
+        &self,
+        root: usize,
+        prepared: &Prepared,
+    ) -> Result<BTreeMap<u32, NativeUnit>> {
+        self.closure_indices(root, &prepared.units)?
+            .into_iter()
+            .enumerate()
+            .map(|(id, at)| Ok((u32::try_from(id)?, prepared.native[&at].clone())))
+            .collect()
+    }
+
+    fn closure(&self, root: usize, prepared: &[Planned]) -> Result<Vec<Planned>> {
+        let order = self.closure_indices(root, prepared)?;
         let indexes: BTreeMap<_, _> = order.iter().enumerate().map(|(i, &at)| (at, i)).collect();
         Ok(order
             .into_iter()
@@ -353,12 +366,16 @@ pub(crate) fn run(
                 let crates = graph.closure(action, &prepared.units)?;
                 let before = producer_image::snapshot(sysroot, &crates)?;
                 prepared.observe(before.paths().cloned(), &runtime, &generation);
+                let native = graph.native_closure(action, &prepared)?;
                 let image = producer_image::link(
                     sysroot,
                     crates,
                     &generation.join(format!("macro-{action}")),
                     &env,
-                    own_script::SourceMode::Captured(node.profile.as_ref()),
+                    own_script::SourceMode::CapturedNative {
+                        profile: node.profile.as_ref(),
+                        units: &native,
+                    },
                 )?;
                 ensure!(
                     producer_image::snapshot(sysroot, &graph.closure(action, &prepared.units)?)?
@@ -385,9 +402,13 @@ pub(crate) fn run(
         let dir = generation.join(format!("script-{at}"));
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
         let inputs = dir.join("producer.inputs");
+        let native = graph.native_closure(run.compiler, &prepared)?;
         let described = own_script::with_mode(
             own_script::planned_description(sysroot, crates.clone()),
-            own_script::SourceMode::Captured(graph.units[run.compiler].profile.as_ref()),
+            own_script::SourceMode::CapturedNative {
+                profile: graph.units[run.compiler].profile.as_ref(),
+                units: &native,
+            },
         )
         .map_err(anyhow::Error::msg)?;
         own_script::link_planned(&described, &dir, &exe, &inputs, &env)

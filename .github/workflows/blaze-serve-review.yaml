@@ -13,6 +13,9 @@ on:
       - crates/ra-jit-store/**
       - crates/ra-jit/**
       - vendor/proc-macro-srv/**
+      - vendor/rust-analyzer/crates/base-db/**
+      - vendor/rust-analyzer/crates/hir-expand/**
+      - vendor/rust-analyzer/crates/project-model/**
       - vendor/rust-analyzer/crates/syntax/**
       - vendor/rust-analyzer/crates/cfg/**
       - vendor/rust-analyzer/crates/hir/**
@@ -89,6 +92,9 @@ jobs:
           cargo test --locked -p proc-macro-api --features span/salsa --lib -- generation_tests producer_lifetime --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
           cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit -- compiler_json:: cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
+          cargo test --locked -p project-model --lib compiler_project -- --test-threads=2
+          cargo test --locked -p blaze-wire native::tests -- --test-threads=2
           python3 -I harness/dist/crossmachine.py --self-test
       - name: Test bootstrap protocol wire compatibility
         if: ${{ !cancelled() }}

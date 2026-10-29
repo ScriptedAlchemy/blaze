@@ -7,6 +7,7 @@ mod answers;
 mod borrowck;
 mod cargo;
 mod check;
+mod compiler_json;
 mod content;
 mod dep_info;
 mod deps;
@@ -3309,11 +3310,9 @@ fn workspace_at(
     let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
         && matches!(manifest, ProjectManifest::ProjectJson(_))
     {
-        use std::io::Read as _;
-        let mut text = String::new();
-        std::io::stdin().read_to_string(&mut text)?;
-        let data: project_model::ProjectJsonData = serde_json::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
+        let data: project_model::ProjectJsonData =
+            serde_json::from_value(crate::compiler_json::read(project)?)
+                .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
         let json = project_model::ProjectJson::new(
             Some(manifest.manifest_path().to_owned()),
             manifest.manifest_path().parent(),

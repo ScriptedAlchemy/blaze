@@ -61,6 +61,9 @@ use crate::{ManifestPath, TargetKind};
 /// Roots and crates that compose this Rust project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectJson {
+    /// Compiler descriptions contain authoritative per-unit cfgs and target kinds,
+    /// rather than the additional configuration used for editor analysis.
+    pub(crate) compiler_mode: bool,
     /// e.g. `path/to/sysroot`
     pub(crate) sysroot: Option<AbsPathBuf>,
     /// e.g. `path/to/sysroot/lib/rustlib/src/rust/library`
@@ -98,6 +101,7 @@ impl ProjectJson {
         base: &AbsPath,
         data: ProjectJsonData,
     ) -> ProjectJson {
+        let data = data.0;
         let absolutize_on_base = |p| base.absolutize(p);
         let sysroot_src = data.sysroot_src.map(absolutize_on_base);
         let sysroot_project =
@@ -106,6 +110,7 @@ impl ProjectJson {
             });
 
         ProjectJson {
+            compiler_mode: data.compiler_mode,
             sysroot: data.sysroot.map(absolutize_on_base),
             sysroot_src,
             sysroot_project,
@@ -155,7 +160,7 @@ impl ProjectJson {
                                 }
                             }
                         })
-                        .chain(crate_data.cfg.0)
+                        .chain(crate_data.cfg.unwrap_or_default().0)
                         .collect();
 
                     Crate {
@@ -171,6 +176,7 @@ impl ProjectJson {
                         target: crate_data.target,
                         codegen_flags: crate_data.codegen_flags,
                         env: crate_data.env,
+                        invalid_env: crate_data.blaze_invalid_env,
                         crate_attrs: crate_data.crate_attrs,
                         proc_macro_dylib_path: crate_data
                             .proc_macro_dylib_path
@@ -266,6 +272,7 @@ pub struct Crate {
     pub(crate) target: Option<String>,
     pub(crate) codegen_flags: Vec<String>,
     pub(crate) env: FxHashMap<String, String>,
+    pub(crate) invalid_env: Vec<String>,
     // Extra crate-level attributes, without the surrounding `#![]`.
     pub(crate) crate_attrs: Vec<String>,
     pub(crate) proc_macro_dylib_path: Option<AbsPathBuf>,
@@ -390,8 +397,17 @@ pub enum RunnableKind {
     Unknown,
 }
 
+#[derive(Serialize, Debug, Clone, Eq, PartialEq)]
+#[serde(transparent)]
+pub struct ProjectJsonData(ProjectJsonDataFields);
+
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
-pub struct ProjectJsonData {
+struct ProjectJsonDataFields {
+    /// In compiler mode every crate must explicitly supply its complete cfg list
+    /// and build target kind. Target defaults and editor cfg overrides do not
+    /// augment that list. Omission preserves ordinary rust-analyzer behavior.
+    #[serde(default)]
+    compiler_mode: bool,
     sysroot: Option<Utf8PathBuf>,
     sysroot_src: Option<Utf8PathBuf>,
     sysroot_project: Option<Box<ProjectJsonData>>,
@@ -402,6 +418,44 @@ pub struct ProjectJsonData {
     runnables: Vec<RunnableData>,
     //
     // New fields should be Option or #[serde(default)]. This applies to most of this datastructure.
+}
+
+impl<'de> Deserialize<'de> for ProjectJsonData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut data = ProjectJsonDataFields::deserialize(deserializer)?;
+        if data.compiler_mode {
+            for krate in &data.crates {
+                if krate.cfg.is_none() {
+                    return Err(de::Error::custom(
+                        "compiler_mode requires an explicit cfg list for every crate",
+                    ));
+                }
+                if !krate.cfg_groups.is_empty() {
+                    return Err(de::Error::custom(
+                        "compiler_mode requires resolved cfgs rather than cfg_groups",
+                    ));
+                }
+                let build = krate.build.as_ref().ok_or_else(|| {
+                    de::Error::custom("compiler_mode requires build.target_kind for every crate")
+                })?;
+                if krate.is_proc_macro && !matches!(build.target_kind, TargetKindData::Lib) {
+                    return Err(de::Error::custom(
+                        "a compiler_mode proc-macro crate must have a library target kind",
+                    ));
+                }
+            }
+        } else {
+            // Ordinary project JSON has always defaulted an omitted cfg to an
+            // empty array, including when the description is serialized again.
+            for krate in &mut data.crates {
+                krate.cfg.get_or_insert_with(CfgList::default);
+            }
+        }
+        Ok(Self(data))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Default)]
@@ -417,13 +471,14 @@ struct CrateData {
     deps: Vec<Dep>,
     #[serde(default)]
     cfg_groups: FxHashSet<String>,
-    #[serde(default)]
-    cfg: CfgList,
+    cfg: Option<CfgList>,
     target: Option<String>,
     #[serde(default)]
     codegen_flags: Vec<String>,
     #[serde(default)]
     env: FxHashMap<String, String>,
+    #[serde(default)]
+    blaze_invalid_env: Vec<String>,
     #[serde(default)]
     crate_attrs: Vec<String>,
     proc_macro_dylib_path: Option<Utf8PathBuf>,

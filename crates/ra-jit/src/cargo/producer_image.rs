@@ -18,9 +18,11 @@ type Files = BTreeMap<PathBuf, [u8; 32]>;
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
+    #[serde(with = "native_paths")]
     files: Files,
     /// Keep the route by which source was read, even when both possible targets
     /// of a symlink already occur elsewhere in the input closure.
+    #[serde(with = "native_bindings")]
     bindings: BTreeMap<PathBuf, PathBuf>,
     // Revisions detect writes/restores during compilation, but are not content
     // identity: restoring the source later may reuse the original immutable image.
@@ -74,8 +76,85 @@ pub(crate) fn runtime_paths(sysroot: &Path) -> Result<BTreeSet<PathBuf>> {
 #[derive(Serialize, Deserialize)]
 struct Record {
     files: Snapshot,
+    #[serde(with = "native_paths")]
     outputs: Files,
+    #[serde(with = "native_path")]
     library: PathBuf,
+}
+
+mod native_path {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        path: &Path,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        crate::process::os_bytes(path.as_os_str()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PathBuf, D::Error> {
+        crate::process::from_os_bytes(Vec::<u8>::deserialize(deserializer)?)
+            .map(PathBuf::from)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+mod native_paths {
+    use super::*;
+
+    pub(super) fn serialize<V: Serialize, S: serde::Serializer>(
+        paths: &BTreeMap<PathBuf, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        paths
+            .iter()
+            .map(|(path, value)| (crate::process::os_bytes(path.as_os_str()), value))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, V: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<PathBuf, V>, D::Error> {
+        let mut paths = BTreeMap::new();
+        for (path, value) in Vec::<(Vec<u8>, V)>::deserialize(deserializer)? {
+            let path = crate::process::from_os_bytes(path).map_err(serde::de::Error::custom)?;
+            if paths.insert(path.into(), value).is_some() {
+                return Err(serde::de::Error::custom("duplicate producer input path"));
+            }
+        }
+        Ok(paths)
+    }
+}
+
+mod native_bindings {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        paths: &BTreeMap<PathBuf, PathBuf>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let values: BTreeMap<_, _> = paths
+            .iter()
+            .map(|(path, target)| (path.clone(), crate::process::os_bytes(target.as_os_str())))
+            .collect();
+        native_paths::serialize(&values, serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<PathBuf, PathBuf>, D::Error> {
+        native_paths::deserialize::<Vec<u8>, _>(deserializer)?
+            .into_iter()
+            .map(|(path, target)| {
+                crate::process::from_os_bytes(target)
+                    .map(|target| (path, target.into()))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
 }
 
 fn digest(path: &Path) -> Result<[u8; 32]> {
@@ -170,7 +249,7 @@ pub(crate) fn link(
     let context =
         serde_json::to_vec(&(description, crate::process::Native::of(env.iter().cloned())))?;
     let mut hash = Sha256::new();
-    hash.update(b"blaze owned producer image 2\0");
+    hash.update(b"blaze owned producer image 3\0");
     hash.update((context.len() as u64).to_le_bytes());
     hash.update(context);
     hash.update(serde_json::to_vec(&before)?);
@@ -259,6 +338,34 @@ pub(crate) fn link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn records_preserve_raw_source_and_image_path_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        let source = raw(b"/source-\xff/main.rs");
+        let alias = raw(b"/alias-\xfe/main.rs");
+        let image = raw(b"/generation-\xfd/macro.so");
+        let before = Snapshot {
+            files: BTreeMap::from([(source.clone(), [7; 32])]),
+            bindings: BTreeMap::from([(alias.clone(), source.clone())]),
+            ..Snapshot::default()
+        };
+        let record = Record {
+            files: before,
+            outputs: BTreeMap::from([(image.clone(), [8; 32])]),
+            library: image.clone(),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let decoded: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.files.files, record.files.files);
+        assert_eq!(decoded.files.bindings, record.files.bindings);
+        assert_eq!(decoded.outputs, record.outputs);
+        assert_eq!(decoded.library, image);
+        let alternate = Record { library: raw(b"/generation-\xfc/macro.so"), ..decoded };
+        assert_ne!(serde_json::to_vec(&alternate).unwrap(), bytes);
+    }
 
     #[cfg(unix)]
     #[test]

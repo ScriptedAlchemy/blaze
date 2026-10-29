@@ -1184,36 +1184,52 @@ fn project_json_to_crate_graph(
                     target,
                     codegen_flags,
                     env,
+                    invalid_env,
                     crate_attrs,
                     proc_macro_dylib_path,
                     is_proc_macro,
                     repository,
                     is_workspace_member,
                     proc_macro_cwd,
+                    build,
                     ..
                 },
                 file_id,
             )| {
                 let mut env = env.clone().into_iter().collect::<Env>();
-                // Override existing env vars with those from `extra_env`
-                env.extend(
-                    extra_env
-                        .iter()
-                        .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
-                );
+                if project.compiler_mode {
+                    for name in invalid_env {
+                        env.set_non_unicode(name);
+                    }
+                }
+                if !project.compiler_mode {
+                    // Editor configuration can override the crate's environment.
+                    // A compiler description has already bound its source env;
+                    // service/config variables must not become env! inputs.
+                    env.extend(
+                        extra_env
+                            .iter()
+                            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
+                    );
+                }
 
-                let target_cfgs = match target.as_deref() {
-                    Some(target) => cfg_cache.entry(target).or_insert_with(|| {
-                        rustc_cfg::get(
-                            QueryConfig::Rustc(sysroot, project.project_root().as_ref()),
-                            Some(target),
-                            extra_env,
-                        )
-                    }),
-                    None => &rustc_cfg,
-                };
-
-                let cfg_options = {
+                let cfg_options = if project.compiler_mode {
+                    // The compiler description already resolved target, profile,
+                    // test and user cfgs for this unit. Adding analyzer defaults
+                    // here can activate mutually exclusive source branches (for
+                    // example both panic="abort" and panic="unwind").
+                    cfg.iter().cloned().collect()
+                } else {
+                    let target_cfgs = match target.as_deref() {
+                        Some(target) => cfg_cache.entry(target).or_insert_with(|| {
+                            rustc_cfg::get(
+                                QueryConfig::Rustc(sysroot, project.project_root().as_ref()),
+                                Some(target),
+                                extra_env,
+                            )
+                        }),
+                        None => &rustc_cfg,
+                    };
                     let mut cfg_options: CfgOptions =
                         target_cfgs.iter().chain(cfg.iter()).cloned().collect();
 
@@ -1258,7 +1274,12 @@ fn project_json_to_crate_graph(
                         CrateOrigin::Local { repo: None, name: None }
                     },
                     crate_attrs.clone(),
-                    TargetKind::Lib { is_proc_macro: *is_proc_macro },
+                    match build.as_ref().map(|build| build.target_kind) {
+                        Some(TargetKind::Lib { .. }) | None => {
+                            TargetKind::Lib { is_proc_macro: *is_proc_macro }
+                        }
+                        Some(kind) => kind,
+                    },
                     match proc_macro_cwd {
                         Some(path) => Arc::new(path.clone()),
                         None => project_root.clone(),
