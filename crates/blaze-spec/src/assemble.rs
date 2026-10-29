@@ -271,7 +271,7 @@ fn targets_of(request: &Request, command: Subcommand) -> TargetFilter {
 fn doc_tests(request: &Request, command: Subcommand) -> u8 {
     match command {
         Subcommand::Test if request.doc => 2,
-        Subcommand::Test if !request.targets.explicit => 1,
+        Subcommand::Test if !request.targets.explicit && !request.targets.all_test_targets => 1,
         _ => 0,
     }
 }

@@ -24,6 +24,15 @@ fn id(refusal: &Refusal) -> &'static str {
 }
 
 #[test]
+fn positional_test_names_rewrite_only_the_default_target_filter() {
+    assert!(parse(Subcommand::Test, &["needle"]).unwrap().targets.all_test_targets);
+    for args in [&["--", "needle"][..], &["--lib", "needle"], &["--tests", "needle"]] {
+        assert!(!parse(Subcommand::Test, args).unwrap().targets.all_test_targets);
+    }
+    assert!(!parse(Subcommand::Run, &["needle"]).unwrap().targets.all_test_targets);
+}
+
+#[test]
 fn only_commands_and_targets_that_need_dev_dependencies_enable_them() {
     for (command, args, expected) in [
         (Subcommand::Build, vec![], false),

@@ -501,7 +501,8 @@ def basic_cases():
         Case("test-threads", "test -- --test-threads=1", "runs the tests on one thread", expect="changed",
              only={"command"}, touches=["command"]),
         # RunSpec.filters and `exact`.
-        Case("filter", "test adds", "names a test", expect="changed", only={"command"}, touches=["command"]),
+        Case("filter", "test adds", "names a test and limits the default build to test targets",
+             expect="changed", only={"command", "units", "asked"}, touches=["command", "units"]),
         Case("filter-exact", "test adds -- --exact", "names a test and asks for it exactly", expect="changed",
              vs="filter", only={"command"}, touches=["command"]),
         # RunSpec.doc: 0 none, 1 with the unit tests, 2 only these.
@@ -1337,8 +1338,18 @@ def compare_graphs(blaze, cargo, doctest=False):
             only_cargo.remove(kc)
     diffs += [f"only in blaze: {label(k)} features {list(k[5])}" for k in only_blaze]
     diffs += [f"only in cargo: {label(k)} features {list(k[5])}" for k in only_cargo]
-    rb = sorted(bk[i] for i in blaze.get("roots", []) if i in bk)
-    rc = sorted(ck[i] for i in cargo.get("roots", []) if i in ck)
+    def roots(graph, units, keys):
+        selected = graph.get("roots", [])
+        if not doctest and selected and all(units[i].get("mode") == "doctest" for i in selected):
+            # Blaze represents a doc-only request by its library build units. Cargo
+            # wraps those in doctest units, which are outside this comparison.
+            selected = {d["index"] for i in selected for d in units[i].get("dependencies", [])
+                        if units[d["index"]].get("mode") == "build"
+                        and units[d["index"]].get("pkg_id") == units[i].get("pkg_id")
+                        and units[d["index"]].get("target", {}).get("name") == units[i].get("target", {}).get("name")}
+        return sorted(keys[i] for i in selected if i in keys)
+    rb = roots(blaze, bu, bk)
+    rc = roots(cargo, cu, ck)
     if rb != rc:
         diffs.append(f"roots: blaze {[label(k) for k in rb]} / cargo {[label(k) for k in rc]}")
     return diffs
@@ -2916,6 +2927,11 @@ def self_test_units(t):
     changed["units"].append(gunit("top", "top", mode="doctest"))
     t.check(not compare_graphs(base, changed), "a doctest unit of cargo's is left out")
     t.check(bool(compare_graphs(base, changed, doctest=True)), "and is compared with --units-with-doctest")
+    library = graph([gunit("top", "top")])
+    documented = graph([gunit("top", "top"), gunit("top", "top", mode="doctest", deps=[(0, "top")])], roots=(1,))
+    t.check(not compare_graphs(library, documented), "doc-only roots compare their underlying library builds")
+    documented["units"][1]["dependencies"] = []
+    t.check(bool(compare_graphs(library, documented)), "a missing doctest library is still a root mismatch")
     t.check(pkg_of("path+file:///x/y/p#0.1.0") == ("p", "0.1.0") and pkg_of("registry+https://h/index#serde@1.0.1") == ("serde", "1.0.1"),
             "a package id is read as cargo spells it, with or without the name")
 

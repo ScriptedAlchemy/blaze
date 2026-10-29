@@ -251,6 +251,15 @@ impl Filter {
         if flags.doc_only {
             return Filter::Doctest;
         }
+        if flags.all_test_targets {
+            return Filter::Only {
+                lib: LibRule::Default,
+                bins: FilterRule::Just(Vec::new()),
+                examples: FilterRule::Just(Vec::new()),
+                tests: FilterRule::All,
+                benches: FilterRule::Just(Vec::new()),
+            };
+        }
         if flags.all_targets {
             return Filter::Only {
                 lib: LibRule::Default,

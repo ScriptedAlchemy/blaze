@@ -761,6 +761,7 @@ impl Request {
             return Err(Refusal::of(Reason::DocWithTargets, format!("--doc {selecting}")));
         }
         self.targets = TargetFilter {
+            all_test_targets: false,
             doc_only: self.doc,
             explicit: seen.lib
                 || seen.all_targets
@@ -780,6 +781,8 @@ impl Request {
             all_targets: seen.all_targets,
         };
         if command == Subcommand::Test {
+            self.targets.all_test_targets =
+                !self.doc && !self.targets.explicit && !self.positional.is_empty();
             self.libtest = Libtest::read(&self.trailing)?;
         }
         Ok(())

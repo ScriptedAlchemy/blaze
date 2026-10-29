@@ -50,6 +50,8 @@ pub enum Command {
 /// `Default` is what the command compiles with none of them (cargo's `CompileFilter::Default`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetFilter {
+    /// Cargo's default-target rewrite when a positional test name is supplied.
+    pub all_test_targets: bool,
     /// Only the selected packages' doctestable libraries, compiled without the unit-test harness.
     pub doc_only: bool,
     /// Whether any of the flags was given. When none was, the command's defaults apply.
