@@ -10,21 +10,23 @@
 //! - **order**: a pull request's job is admitted only while no `Main` job waits on its
 //!   platform, and every job only after the jobs of its class queued before it;
 //! - **queue**: at most `Q` executions wait per platform, and `busy` is answered exactly then;
-//! - **placement**: an execution runs on its platform within the executor's reservation;
+//! - **placement**: an execution runs on its platform and namespace within the executor's
+//!   reservation; a live lead has exactly that assignment and cannot lead another execution;
 //! - **attempts**: an execution is reassigned at most once, a second loss ends it `Lost`, and a
 //!   dead attempt's events are refused;
 //! - **subscribers**: equal content shares one execution while it runs; `TimedOut` only past a
-//!   subscriber's own deadline; the last subscriber leaving ends it; a refusal never ends
-//!   `Passed`;
-//! - **stages**: every execution's stage timestamps go forward in order;
+//!   subscriber's own deadline and no other outcome after it; the last subscriber leaving
+//!   ends it; a refusal never ends `Passed`;
+//! - **stages**: coordinator-generated stage timestamps go forward in order. Arbitrary
+//!   worker-supplied `Stage` events are outside this check;
 //! - **progress**: every execution ends.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_wire::{
-    BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
-    Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourceRef, Stage,
-    StoreIdentity, WorkersEventsRequest,
+    Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
+    Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourcePath, SourceRef,
+    Stage, StoreIdentity, WorkersEventsRequest,
 };
 
 use super::{Rng, Violation};
@@ -55,7 +57,7 @@ const HEARTBEAT_MS: Millis = 5_000;
 #[derive(Clone, Debug)]
 struct Lead {
     executor: String,
-    attempt: blaze_wire::Attempt,
+    attempt: Attempt,
     finish_at: Millis,
     dead: bool,
     stall_until: Millis,
@@ -72,12 +74,12 @@ struct World {
     queue_limit: usize,
     /// The checker's own queue: per platform and class, the executions waiting, in order.
     shadow: BTreeMap<(Digest, Class), VecDeque<ExecutionId>>,
-    meta: BTreeMap<ExecutionId, (Digest, Namespace)>,
+    meta: BTreeMap<ExecutionId, (Digest, Namespace, Reservation)>,
     subscribers: BTreeMap<u64, (ExecutionId, u64)>,
     ended_subs: BTreeSet<u64>,
     left: BTreeSet<u64>,
     leads: BTreeMap<ExecutionId, Lead>,
-    late: Vec<(ExecutionId, String, blaze_wire::Attempt)>,
+    late: Vec<(ExecutionId, String, Attempt)>,
     kills: Vec<(Millis, String, jobs::AssignmentToken, bool)>,
     live: BTreeMap<String, jobs::AssignmentToken>,
     dead: BTreeSet<String>,
@@ -167,6 +169,7 @@ impl World {
             self.effects(out)?;
             self.check_assignments()?;
             self.jobs.admission_view().check().map_err(|e| self.violation("capacity", e))?;
+            self.assignments()?;
             if self.now >= horizon
                 && self.kills.is_empty()
                 && self.live.is_empty()
@@ -211,7 +214,7 @@ impl World {
                 for (executor, busy) in gone {
                     self.dead.insert(executor.clone());
                     self.live.remove(&executor);
-                    if let Some(execution) = busy
+                    if let Some((execution, _)) = busy
                         && let Some(lead) = self.leads.get_mut(&execution)
                         && lead.executor == executor
                     {
@@ -340,7 +343,7 @@ impl World {
             .executions()
             .find(|e| {
                 !matches!(e.state(), ExecState::Ended(_))
-                    && self.meta.get(&e.id).is_some_and(|(_, ns)| *ns == namespace)
+                    && self.meta.get(&e.id).is_some_and(|(_, ns, _)| *ns == namespace)
                     && e.content
                         == blaze_wire::JobContent::of(&blaze_wire::JobContentInput {
                             spec: blaze_wire::digest_of(&spec),
@@ -349,7 +352,7 @@ impl World {
             })
             .map(|e| e.id);
         let mut out = Vec::new();
-        match self.jobs.submit(self.now, &req, need, &mut out) {
+        match self.jobs.submit(self.now, &req, need.clone(), &mut out) {
             Ok(answer) => {
                 self.subscribers.insert(answer.subscriber, (answer.execution, req.deadline_ms));
                 match running {
@@ -374,7 +377,7 @@ impl World {
                             ));
                         }
                         self.summary.executions += 1;
-                        self.meta.insert(answer.execution, (platform, namespace));
+                        self.meta.insert(answer.execution, (platform, namespace, need));
                         self.shadow
                             .entry((platform, class))
                             .or_default()
@@ -473,8 +476,8 @@ impl World {
         Ok(())
     }
 
-    /// The agents: a kill is carried out a little later, and the executor is returned to
-    /// admission, idle or gone.
+    /// The agents: kill acknowledgements may be delayed and duplicated. Each one names its
+    /// assignment, so replay after the executor starts another job cannot free that job.
     fn agents(&mut self) {
         let now = self.now;
         let (due, later): (Vec<_>, Vec<_>) =
@@ -494,7 +497,7 @@ impl World {
         for (executor, assignment) in &self.live {
             let slot = self.jobs.admission_view().executor(executor);
             if !slot.is_some_and(|s| {
-                s.busy == Some(assignment.execution)
+                s.busy == Some((assignment.execution, assignment.attempt))
                     && s.phase != crate::admission::ExecutorPhase::Stopped
             }) {
                 return Err(self.violation(
@@ -551,18 +554,16 @@ impl World {
                         ));
                     }
                     let (_, deadline) = self.subscribers[&subscriber];
-                    if matches!(outcome, Outcome::Passed | Outcome::Failed | Outcome::Refused)
-                        && self.now > deadline
-                    {
-                        return Err(self.violation(
-                            "subscribers",
-                            format!("expired subscriber {subscriber} received {outcome:?}"),
-                        ));
-                    }
                     if outcome == Outcome::TimedOut && self.now <= deadline {
                         return Err(self.violation(
                             "subscribers",
                             format!("subscriber {subscriber} timed out before its deadline"),
+                        ));
+                    }
+                    if self.now > deadline && outcome != Outcome::TimedOut {
+                        return Err(self.violation(
+                            "subscribers",
+                            format!("subscriber {subscriber} got {outcome:?} past its deadline"),
                         ));
                     }
                 }
@@ -577,9 +578,9 @@ impl World {
         &mut self,
         id: ExecutionId,
         event: &JobEvent,
-        attempt: blaze_wire::Attempt,
+        attempt: Attempt,
     ) -> Result<(), Violation> {
-        let (platform, namespace) = self.meta.get(&id).cloned().expect("submitted");
+        let (platform, namespace, need) = self.meta.get(&id).cloned().expect("submitted");
         match event {
             JobEvent::Stage(stage) if stage.stage == Stage::Admitted => {
                 let class = Class::of(&namespace).expect("a job's");
@@ -616,7 +617,12 @@ impl World {
                 let executor = self.jobs.admission_view().executor(&assigned.executor).cloned();
                 match executor {
                     Some(e)
-                        if self.jobs.admission_view().platform(&e.machine) == Some(platform) => {}
+                        if self.jobs.admission_view().platform(&e.machine) == Some(platform)
+                            && e.namespace == namespace
+                            && e.busy == Some((id, attempt))
+                            && e.reservation.memory >= need.memory
+                            && e.reservation.cpus >= need.cpus
+                            && e.reservation.disk >= need.disk => {}
                     other => {
                         return Err(self.violation(
                             "placement",
@@ -675,6 +681,37 @@ impl World {
         }
         Ok(())
     }
+
+    /// Capacity sums alone cannot detect two executions sharing one executor reservation.
+    fn assignments(&self) -> Result<(), Violation> {
+        let mut owners = BTreeMap::new();
+        for execution in self.jobs.executions() {
+            if execution.state() != ExecState::Running {
+                continue;
+            }
+            let Some(lead) = execution.lead() else { continue };
+            if let Some(other) = owners.insert(lead, execution.id) {
+                return Err(self.violation(
+                    "placement",
+                    format!("{lead} leads both {other:?} and {:?}", execution.id),
+                ));
+            }
+            let expected = Some((execution.id, execution.attempt()));
+            if !self.dead.contains(lead)
+                && self
+                    .jobs
+                    .admission_view()
+                    .executor(lead)
+                    .is_none_or(|slot| slot.busy != expected)
+            {
+                return Err(self.violation(
+                    "placement",
+                    format!("{lead} lost the reservation of {:?}", execution.id),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Stage timestamps go forward, each stage after the one before it.
@@ -715,6 +752,8 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         split_debuginfo: 0,
         backend: 0,
         mir_opt: 0,
+        backend_opt: 0,
+        backend_emit: 0,
     };
     BuildSpec {
         source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
@@ -726,9 +765,10 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         rustflags: Vec::new(),
         config_env: blaze_wire::Set::new(Vec::new()),
         script_env: blaze_wire::Set::new(Vec::new()),
-        cwd: String::new(),
+        cwd: SourcePath::new(".".into()).unwrap(),
         command: Command::Build,
         toolchain: StoreIdentity([2; 32]),
+        workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
     }
 }
 

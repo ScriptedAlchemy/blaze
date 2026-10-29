@@ -388,11 +388,13 @@ impl Server {
                     .status(status)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::ACCEPT_RANGES, "bytes")
-                    .header(
+                    .header(header::CONTENT_LENGTH, count.to_string());
+                if object.kind != crate::blob::Kind::Packed {
+                    answer = answer.header(
                         header::ETAG,
                         format!("\"{}\"", hex(&object.digest.expect("a blob digest"))),
-                    )
-                    .header(header::CONTENT_LENGTH, count.to_string());
+                    );
+                }
                 if let Some(written) = written
                     && let Ok(value) = HeaderValue::from_str(&written_ms(written).to_string())
                 {
@@ -625,7 +627,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("listening on {}: {e}", config.listen))?;
     let local = listener.local_addr()?;
     println!(
-        "blaze-serve: serving {} on http://{local}, v{VERSION}, no authentication (C6)",
+        "blaze-serve: serving {} on http://{local}, routes /v1, codec {VERSION}, no authentication",
         server.store().dir().display()
     );
     tokio::select! {
@@ -816,7 +818,9 @@ fn method_not_allowed(method: &Method, allowed: &str) -> Error {
 /// The digest a bare `/v1/blob/<sha256>` names, when the name is one.
 fn bare_digest(name: &str) -> Option<Digest> {
     let mut digest = [0u8; 32];
-    if name.len() != 64 || !name.bytes().all(|it| it.is_ascii_hexdigit()) {
+    if name.len() != 64
+        || !name.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+    {
         return None;
     }
     for (byte, pair) in digest.iter_mut().zip(name.as_bytes().chunks(2)) {
@@ -924,6 +928,66 @@ mod tests {
     impl Drop for Running {
         fn drop(&mut self) {
             self.task.abort();
+        }
+    }
+
+    fn hello_request() -> HelloRequest {
+        HelloRequest {
+            versions: Set::new(vec![VERSION]),
+            identity: blaze_wire::StoreIdentity([0; 32]),
+            platform: blaze_wire::ExecPlatform {
+                triple: "aarch64-apple-darwin".into(),
+                os: "macos".into(),
+                sdk: None,
+                libc: None,
+                linker: ("".into(), "".into(), [0; 32]),
+                cpu: "aarch64".into(),
+                cc: None,
+                cxx: None,
+                ar: None,
+                native_root: None,
+            },
+            role: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_hello_with_small_limits_preserves_collection_bounds() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.limits.request = 512;
+            // The collection ceiling must also fit ExecPlatform's ten-field map in hello.
+            config.limits.batch_items = 16;
+            config.limits.lookup_items = 8;
+            config
+        })
+        .await;
+        let mut hello = hello_request();
+        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let answer: HelloAnswer = decode(&body, run.server.limits()).unwrap();
+        assert_eq!(answer.limits, *run.server.limits());
+
+        hello.versions = Set::new((0..=answer.limits.batch_items).collect());
+        let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
+        assert_eq!(status, 400);
+        let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
+        assert!(error.message.contains("oversize item"));
+
+        for count in [8u32, 9] {
+            let request = CacheMissingRequest {
+                blobs: Set::new((0..count).map(|at| sha256(&at.to_le_bytes())).collect()),
+            };
+            let (status, _, body) =
+                run.request("POST", "/v1/cache/missing", "", &encode(&request)).await;
+            if count == 8 {
+                assert_eq!(status, 200);
+                let answer: CacheMissingAnswer = decode(&body, run.server.limits()).unwrap();
+                assert_eq!(answer.missing, request.blobs);
+            } else {
+                assert_eq!(status, 400);
+                let error: blaze_wire::WireError = decode(&body, &Limits::DOCUMENTED).unwrap();
+                assert!(error.message.contains("oversize item"));
+            }
         }
     }
 
@@ -1191,19 +1255,7 @@ mod tests {
             blobs: Set::new((0..4097u32).map(|at| sha256(&at.to_le_bytes())).collect()),
         };
         assert_ne!(run.request("POST", "/v1/cache/missing", "", &encode(&request)).await.0, 200);
-        let hello = HelloRequest {
-            versions: Set::new(vec![VERSION]),
-            identity: blaze_wire::StoreIdentity([0; 32]),
-            platform: blaze_wire::ExecPlatform {
-                triple: "aarch64-apple-darwin".into(),
-                os: "macos".into(),
-                sdk: None,
-                libc: None,
-                linker: ("".into(), "".into(), [0; 32]),
-                cpu: "aarch64".into(),
-            },
-            role: 0,
-        };
+        let hello = hello_request();
         let (status, _, body) = run.request("POST", "/v1/hello", "", &encode(&hello)).await;
         assert_eq!(status, 200);
         let answer: HelloAnswer = decode(&body, &Limits::DOCUMENTED).unwrap();

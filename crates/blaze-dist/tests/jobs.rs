@@ -9,7 +9,7 @@ use blaze_dist::work::EndWhy;
 use blaze_wire::{
     Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobContent, JobEvent, JobRequest,
     LocalPolicy, Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, RootRef,
-    Set, SourceRef, StoreIdentity, WorkersEventsRequest,
+    Set, SourcePath, SourceRef, StoreIdentity, WorkersEventsRequest,
 };
 
 fn execution() -> Execution {
@@ -216,14 +216,17 @@ fn request(source: u8) -> JobRequest {
                 split_debuginfo: 0,
                 backend: 0,
                 mir_opt: 0,
+                backend_opt: 0,
+                backend_emit: 0,
             },
             platform: [1; 32],
             rustflags: Vec::new(),
             config_env: Set::new(Vec::new()),
             script_env: Set::new(Vec::new()),
-            cwd: String::new(),
+            cwd: SourcePath::new(".".into()).unwrap(),
             command: Command::Build,
             toolchain: StoreIdentity([2; 32]),
+            workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
         },
         namespace: Namespace::Main,
         deadline_ms: 100_000,
@@ -650,6 +653,8 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         split_debuginfo: 0,
         backend: 0,
         mir_opt: 0,
+        backend_opt: 0,
+        backend_emit: 0,
     };
     BuildSpec {
         source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
@@ -661,8 +666,9 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         rustflags: Vec::new(),
         config_env: blaze_wire::Set::new(Vec::new()),
         script_env: blaze_wire::Set::new(Vec::new()),
-        cwd: String::new(),
+        cwd: SourcePath::new(".".into()).unwrap(),
         command: Command::Build,
         toolchain: StoreIdentity([2; 32]),
+        workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
     }
 }
