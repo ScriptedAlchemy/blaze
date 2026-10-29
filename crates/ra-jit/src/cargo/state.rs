@@ -16,6 +16,7 @@ use cargo_metadata::{
     Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, Package, Target,
     TargetKind,
 };
+use cargo_util_schemas::core::PackageIdSpec;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
@@ -222,7 +223,7 @@ impl Guard {
                         break;
                     }
                 }
-                if !changed && dependencies.is_empty() {
+                if !changed && script::alone(out_dir, dependencies) {
                     return Ok(None);
                 }
                 let now = stamp_now();
@@ -718,6 +719,13 @@ impl State {
                 return Ok(Some(why));
             }
         }
+        // Each script's run is the one the build had: a run made for it is cargo's now, and
+        // cargo's next build does not make it again.
+        for done in &self.completed {
+            if let Err(why) = done.record() {
+                return Ok(Some(format!("a build script's run was not recorded: {why}")));
+            }
+        }
         Ok(None)
     }
 
@@ -1047,7 +1055,8 @@ impl State {
         let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards =
+            guards(cwd, &metadata, &used, &built.scripts, &built.artifacts, &state.checkouts);
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -1465,6 +1474,7 @@ fn guards(
     metadata: &Metadata,
     used: &[Record],
     scripts: &[BuildScript],
+    artifacts: &[Artifact],
     checkouts: &[Checkout],
 ) -> Vec<Guard> {
     let root = metadata.workspace_root.as_std_path();
@@ -1511,7 +1521,7 @@ fn guards(
         guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
-    let dependencies = script_dependencies(metadata, scripts);
+    let dependencies = script_dependencies(metadata, scripts, artifacts);
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
         let mut found = package.map(|it| rerun_guards(it, script)).unwrap_or_default();
@@ -1533,47 +1543,67 @@ fn guards(
     guards
 }
 
-/// Candidates for Cargo's run-unit edges. The metadata is `--no-deps`, so declared normal
-/// dependencies identify candidates; script judgment filters them against Cargo's recorded
-/// fingerprint to select the optional and target-gated dependencies this run actually used.
-fn script_dependencies(metadata: &Metadata, scripts: &[BuildScript]) -> Vec<script::Dependency> {
+/// Candidates for Cargo's run-unit edges: every run of a script of a package with `links` in
+/// this build, the workspace's and the others', from cargo's own messages, as the metadata is
+/// `--no-deps`. Script judgment selects among them by Cargo's recorded fingerprint, which keys
+/// each by its package's id, so an optional, target-gated or dev-dependency this run did not
+/// use is not one of its edges. The `links` of a package outside the workspace is what cargo set
+/// its script running with, and its targets are those cargo built of it.
+fn script_dependencies(
+    metadata: &Metadata,
+    scripts: &[BuildScript],
+    artifacts: &[Artifact],
+) -> Vec<script::Dependency> {
     scripts
         .iter()
         .filter_map(|run| {
-            let package = metadata.packages.iter().find(|it| it.id == run.package_id)?;
-            let links = package.links.clone()?;
+            let out_dir = run.out_dir.clone().into_std_path_buf();
+            let member = metadata.packages.iter().find(|it| it.id == run.package_id);
+            let (name, links, targets) = match member {
+                Some(package) => {
+                    let targets = package.targets.iter().map(target_of).collect();
+                    (package.name.to_string(), package.links.clone()?, targets)
+                }
+                None => {
+                    let spec = PackageIdSpec::parse(&run.package_id.repr).ok()?;
+                    let built = artifacts.iter().filter(|it| it.package_id == run.package_id);
+                    let mut targets: Vec<_> = built.map(|it| target_of(&it.target)).collect();
+                    targets.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
+                    targets.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
+                    (spec.name().to_owned(), script::links_of(&out_dir)?, targets)
+                }
+            };
             let parents = |kind| {
                 metadata
                     .packages
                     .iter()
                     .filter(|parent| {
-                        parent
-                            .dependencies
-                            .iter()
-                            .any(|dep| dep.kind == kind && *dep.name == *package.name)
+                        parent.dependencies.iter().any(|dep| dep.kind == kind && *dep.name == name)
                     })
                     .flat_map(|parent| scripts.iter().filter(move |it| it.package_id == parent.id))
                     .map(|it| it.out_dir.clone().into_std_path_buf())
                     .collect()
             };
             Some(script::Dependency {
-                package: package.name.to_string(),
+                id: Some(run.package_id.repr.clone()),
+                outside: member.is_none(),
                 links,
-                out_dir: run.out_dir.clone().into_std_path_buf(),
+                out_dir,
                 parents: parents(DependencyKind::Normal),
                 build_parents: parents(DependencyKind::Build),
-                targets: package
-                    .targets
-                    .iter()
-                    .map(|it| blaze_build_script::unit::Target {
-                        name: it.name.clone(),
-                        kind: it.kind.iter().map(ToString::to_string).collect(),
-                        crate_types: it.crate_types.iter().map(ToString::to_string).collect(),
-                    })
-                    .collect(),
+                targets,
+                package: name,
             })
         })
         .collect()
+}
+
+fn target_of(target: &Target) -> blaze_build_script::unit::Target {
+    blaze_build_script::unit::Target {
+        name: target.name.clone(),
+        kind: target.kind.iter().map(ToString::to_string).collect(),
+        crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
+    }
 }
 
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
@@ -1700,10 +1730,62 @@ mod tests {
             }))
             .unwrap()
         };
-        let edges = script_dependencies(&metadata, &[run("parent"), run("native")]);
+        let edges = script_dependencies(&metadata, &[run("parent"), run("native")], &[]);
         assert_eq!(edges.len(), 1);
         assert_eq!((edges[0].package.as_str(), edges[0].links.as_str()), ("native", "probe"));
         assert_eq!(edges[0].parents, [PathBuf::from("/w/target/debug/build/parent-0/out")]);
+    }
+
+    #[test]
+    fn a_links_dependency_outside_the_workspace_is_found_by_cargos_messages() {
+        // `--no-deps` lists the workspace's packages alone; `probe-sys` is a registry's, and its
+        // `links` is what cargo ran its script with.
+        let dir = std::env::temp_dir().join(format!("ra-jit-outside-links-{}", std::process::id()));
+        let out_dir = dir.join("target/debug/build/probe-sys-0/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let ran = serde_json::json!({
+            "real": "/w/script", "cwd": "/r/probe-sys", "env": [["CARGO_MANIFEST_LINKS", "probe"]],
+        });
+        std::fs::write(dir.join("target/debug/build/probe-sys-0/ra-jit-ran.json"), ran.to_string())
+            .unwrap();
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [{
+                "name": "parent", "version": "0.1.0", "id": "path+file:///w/parent#0.1.0",
+                "license": null, "license_file": null, "description": null, "source": null,
+                "dependencies": [{
+                    "name": "probe-sys", "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "req": "^0.1", "kind": null, "rename": null, "optional": false,
+                    "uses_default_features": true, "features": [], "target": null, "registry": null,
+                }],
+                "targets": [], "features": {}, "manifest_path": "/w/parent/Cargo.toml",
+                "metadata": null, "publish": null, "authors": [], "categories": [],
+                "keywords": [], "readme": null, "repository": null, "homepage": null,
+                "documentation": null, "edition": "2021", "links": null, "default_run": null,
+                "rust_version": null,
+            }],
+            "workspace_members": ["path+file:///w/parent#0.1.0"],
+            "workspace_default_members": ["path+file:///w/parent#0.1.0"],
+            "resolve": null, "target_directory": "/w/target", "build_directory": "/w/target",
+            "version": 1, "workspace_root": "/w", "metadata": null,
+        }))
+        .unwrap();
+        let run = |id: &str, out_dir: &Path| -> BuildScript {
+            serde_json::from_value(serde_json::json!({
+                "linked_libs": [], "linked_paths": [], "cfgs": [], "env": [],
+                "out_dir": out_dir, "package_id": id,
+            }))
+            .unwrap()
+        };
+        let registry = "registry+https://github.com/rust-lang/crates.io-index#probe-sys@0.1.3";
+        let parent = Path::new("/w/target/debug/build/parent-0/out");
+        let runs = [run("path+file:///w/parent#0.1.0", parent), run(registry, &out_dir)];
+        let edges = script_dependencies(&metadata, &runs, &[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!((edges[0].package.as_str(), edges[0].links.as_str()), ("probe-sys", "probe"));
+        assert!(edges[0].outside);
+        assert_eq!(edges[0].pkg_id(), 813625565111490420);
+        assert_eq!(edges[0].parents, [parent.to_owned()]);
     }
 
     #[test]

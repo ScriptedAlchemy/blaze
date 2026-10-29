@@ -215,14 +215,11 @@ impl Unit {
         None
     }
 
-    pub(crate) fn stale_dependencies(
-        &self,
-        dependencies: &[(&str, u64, PathBuf)],
-    ) -> Option<String> {
+    pub(crate) fn stale_dependencies(&self, edges: &[Edge<'_>]) -> Option<String> {
         let began = written(&self.output()).ok()?;
-        dependencies.iter().find_map(|(name, _, output)| match written(output) {
+        edges.iter().find_map(|edge| match written(&edge.output) {
             Ok(at) if at <= began => None,
-            _ => Some(format!("the run of {name} is missing or newer")),
+            _ => Some(format!("the run of {} is missing or newer", edge.package)),
         })
     }
 
@@ -362,29 +359,73 @@ impl Fingerprint {
         Fingerprint { local, ..self.clone() }
     }
 
-    pub(crate) fn with_dependencies(
-        &self,
-        dependencies: &[(&str, u64, PathBuf)],
-    ) -> Result<Fingerprint, String> {
+    pub(crate) fn with_dependencies(&self, edges: &[Edge<'_>]) -> Result<Fingerprint, String> {
         let mut now = self.clone();
-        for (package, hash, _) in dependencies {
-            let pkg_id = package_hash(package);
-            let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == pkg_id) else {
-                return Err(format!("no cargo run-unit dependency for {package}"));
+        for edge in edges {
+            let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == edge.pkg_id) else {
+                return Err(format!("no cargo run-unit dependency for {}", edge.package));
             };
-            dep.fingerprint = *hash;
+            dep.fingerprint = edge.fingerprint;
         }
         Ok(now)
     }
 
     /// Declared dependencies can be optional or target-gated. Only Cargo's recorded
-    /// run-unit graph says which native dependencies this particular script run used.
-    pub(crate) fn depends_on(&self, package: &str) -> bool {
-        self.deps.iter().any(|it| it.pkg_id == package_hash(package))
+    /// run-unit graph says which native dependencies this particular script run used, each
+    /// by the id cargo keys its package by ([`package_id_hash`]).
+    pub(crate) fn depends_on(&self, pkg_id: u64) -> bool {
+        self.deps.iter().any(|it| it.pkg_id == pkg_id)
+    }
+
+    /// The ids of the units it depends on, a unit once for each (`DepFingerprint::pkg_id`).
+    pub(crate) fn dependency_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.deps.iter().map(|it| it.pkg_id)
     }
 }
 
-fn package_hash(package: &str) -> u64 {
+/// The run of a package with `links` that a run is built after, as cargo keeps it in its record
+/// of that run: by the id of the package ([`package_id_hash`]) and the hash of the fingerprint of
+/// the run, whose `output` is when it began.
+pub(crate) struct Edge<'a> {
+    pub(crate) package: &'a str,
+    pub(crate) pkg_id: u64,
+    pub(crate) fingerprint: u64,
+    pub(crate) output: PathBuf,
+}
+
+/// The id cargo keys a unit of a package by in the fingerprint of a unit built after it
+/// (`DepFingerprint::new`): the hash of its name for a package of a path source, which keeps a
+/// renamed directory from building it again, and else of its whole id, its name, version and
+/// source (`impl Hash for PackageId`: the source's kind and canonical URL). `spec` is the id as
+/// cargo's messages name the package, `path+file:///w/native#0.1.0` or
+/// `registry+https://github.com/rust-lang/crates.io-index#probe-sys@0.1.3`. `None` when it is
+/// not one cargo writes.
+pub(crate) fn package_id_hash(spec: &str) -> Option<u64> {
+    use blaze_registry::{GitReference, SourceId, SourceKind};
+    use cargo_util_schemas::core::{GitReference as Spec, PackageIdSpec, SourceKind as Kind};
+    let spec = PackageIdSpec::parse(spec).ok()?;
+    let kind = match spec.kind()? {
+        Kind::Path => return Some(package_hash(spec.name())),
+        Kind::Git(reference) => SourceKind::Git(match reference {
+            Spec::Tag(it) => GitReference::Tag(it.clone()),
+            Spec::Branch(it) => GitReference::Branch(it.clone()),
+            Spec::Rev(it) => GitReference::Rev(it.clone()),
+            Spec::DefaultBranch => GitReference::DefaultBranch,
+        }),
+        Kind::Registry => SourceKind::Registry,
+        Kind::SparseRegistry => SourceKind::SparseRegistry,
+        Kind::LocalRegistry => SourceKind::LocalRegistry,
+        Kind::Directory => SourceKind::Directory,
+    };
+    let source = SourceId::new(kind, spec.url()?.clone()).ok()?;
+    let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+    spec.name().hash(&mut hasher);
+    spec.version()?.hash(&mut hasher);
+    source.hash(&mut hasher);
+    Some(Hasher::finish(&hasher))
+}
+
+pub(crate) fn package_hash(package: &str) -> u64 {
     let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
     package.hash(&mut hasher);
     Hasher::finish(&hasher)
@@ -579,6 +620,19 @@ pub(crate) mod tests {
                 val: Some("1".to_owned())
             }])
         );
+    }
+
+    #[test]
+    fn a_package_is_keyed_as_cargo_keys_it() {
+        // Read from the record cargo 1.99.0 wrote of a run built after the runs of `native`, a
+        // path package outside the workspace, and `probe-sys` 0.1.3 of crates.io, vendored as a
+        // directory source that replaces it: cargo's messages name the packages so.
+        let path = "path+file:///private/tmp/u8reg-m/outside/native#0.1.0";
+        assert_eq!(package_id_hash(path), Some(12039738031040411086));
+        assert_eq!(package_hash("native"), 12039738031040411086);
+        let registry = "registry+https://github.com/rust-lang/crates.io-index#probe-sys@0.1.3";
+        assert_eq!(package_id_hash(registry), Some(813625565111490420));
+        assert_eq!(package_id_hash("not an id"), None);
     }
 
     #[test]

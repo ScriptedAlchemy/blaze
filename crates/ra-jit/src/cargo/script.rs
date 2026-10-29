@@ -169,6 +169,14 @@ pub(crate) fn in_out_dir(path: &Path) -> bool {
         || names.windows(4).any(|it| it[0] == "build" && it[3] == "out")
 }
 
+/// The `links` of the package whose script wrote `out_dir`, as cargo set it to run it
+/// (`CARGO_MANIFEST_LINKS`), when it was written down and the package has one.
+pub(crate) fn links_of(out_dir: &Path) -> Option<String> {
+    let ran = std::fs::read(out_dir.parent()?.join(RAN)).ok()?;
+    let ran = serde_json::from_slice::<Ran>(&ran).ok()?;
+    ran.env.into_iter().find(|it| it.0 == "CARGO_MANIFEST_LINKS").map(|it| it.1)
+}
+
 /// Whether a script can be run again as cargo ran it into `out_dir`.
 pub(crate) fn can_rerun(out_dir: &Path) -> bool {
     out_dir.parent().is_some_and(|it| it.join(RAN).exists())
@@ -275,6 +283,15 @@ impl Run {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Dependency {
     pub(crate) package: String,
+    /// The package's id, as cargo's messages name it, which cargo keys the run by in the record
+    /// of a run built after it ([`records::package_id_hash`]). Without it, the hash of
+    /// `package`, as cargo keys a package of a path source.
+    #[serde(default)]
+    pub(crate) id: Option<String>,
+    /// Not a package of the workspace, such as one from a registry: its run is read as cargo
+    /// recorded it, never made by the daemon.
+    #[serde(default)]
+    pub(crate) outside: bool,
     pub(crate) links: String,
     pub(crate) out_dir: PathBuf,
     pub(crate) parents: Vec<PathBuf>,
@@ -284,6 +301,14 @@ pub(crate) struct Dependency {
     #[serde(default)]
     pub(crate) build_parents: Vec<PathBuf>,
     pub(crate) targets: Vec<blaze_build_script::unit::Target>,
+}
+
+impl Dependency {
+    /// The id cargo keys its package by in the record of a run built after it.
+    pub(crate) fn pkg_id(&self) -> u64 {
+        let id = self.id.as_deref().and_then(records::package_id_hash);
+        id.unwrap_or_else(|| records::package_hash(&self.package))
+    }
 }
 
 pub(crate) struct Cargo<'a> {
@@ -305,23 +330,28 @@ pub(crate) struct Cargo<'a> {
 /// of its last run ([`records`]): that run, when cargo would not run the script again, and else a
 /// run made now.
 ///
-/// A run made now is cargo's next, and is recorded as cargo's: it is made in `out_dir` itself, with
-/// current user variables and cargo's recorded script variables and directory, under its locks,
-/// directory, and cargo's hash of the run is emptied before it and written after it with what the
-/// run printed, as cargo does (`build_work`, `write_fingerprint`). Cargo's next build finds the
-/// script run, as after a run of its own, and does not run it again, whether that build is the one
-/// a difference sends to cargo or one after the daemon's: the script runs once for a change, as
-/// under cargo. No copy of the directory is run in: a script can read more of a directory than a
+/// A run made now is made as cargo makes its next: in `out_dir` itself, with current user
+/// variables, cargo's recorded script variables and directory and the metadata of the runs it is
+/// built after as cargo recorded them, under its locks, and cargo's hash of the run is emptied
+/// before it. It is recorded as cargo's (`write_fingerprint`) only once it is checked to be the
+/// run the build had ([`judge`]'s `keep`; for a build, [`Completed::record`]), so cargo's next
+/// build finds the script run and does not run it again: the script runs once for a change, as
+/// under cargo. One that is not is left to cargo's leg of the build, which takes it as its own
+/// run only when it runs the script with what it was run with ([`Continuation`]), and else
+/// runs it. No copy of the directory is run in: a script can read more of a directory than a
 /// copy keeps, and one that finds a copy does other than it would in cargo's
 /// (docs/reports/BUILDSCRIPT.md, "Round 3" and "Round 4").
 ///
 /// It is `Err`, the build cargo's, and nothing is run: when cargo's records are not ones cargo
-/// 1.99 wrote, or of a run that did not end; when a watched variable has another value; when a
-/// cargo holds the lock, so its run cannot be read consistently; and when there is no
-/// lock to take. An executed failure is the result of this build, not permission to retry
-/// it through cargo. Its empty fingerprint permits the next requested build to retry.
+/// 1.99 wrote, or of a run that did not end; when a watched variable has another value; when
+/// cargo's record has the run built after a run this build has no record of, or one outside the
+/// workspace that cargo would make again; when a cargo holds the lock, so its run cannot be read
+/// consistently; and when there is no lock to take. An executed failure is the result of this
+/// build, not permission to retry it through cargo. Its empty fingerprint permits the next
+/// requested build to retry.
+#[cfg(test)]
 pub(crate) fn current(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, String> {
-    judge(out_dir, cargo).map_err(|it| it.to_string())
+    judge(out_dir, cargo, |_| true).map_err(|it| it.to_string())
 }
 
 /// Failure to inspect a run is different from a run that failed this build.
@@ -350,8 +380,21 @@ impl std::fmt::Display for JudgementError {
     }
 }
 
-pub(crate) fn judge(out_dir: &Path, cargo: &Cargo<'_>) -> Result<Run, JudgementError> {
-    judge_for(out_dir, cargo, &mut Vec::new())
+/// The run [`current`] says, the runs made for it recorded as cargo's when `keep` says it is the
+/// one the build had, and left to cargo, which runs them again, when not.
+pub(crate) fn judge(
+    out_dir: &Path,
+    cargo: &Cargo<'_>,
+    keep: impl FnOnce(&Run) -> bool,
+) -> Result<Run, JudgementError> {
+    let mut completed = Vec::new();
+    let run = judge_for(out_dir, cargo, &mut completed)?;
+    if keep(&run) {
+        for done in &completed {
+            done.record()?;
+        }
+    }
+    Ok(run)
 }
 
 pub(crate) fn judge_for(
@@ -373,19 +416,82 @@ pub(crate) fn judge_for(
         if let std::collections::btree_map::Entry::Vacant(entry) = units.entry(dir) {
             entry.insert(unit.hold()?);
         }
-        let recorded = unit.recorded()?;
-        pending.extend(
-            cargo
-                .dependencies
-                .iter()
-                .filter(|it| {
-                    it.build_parents.contains(&out_dir)
-                        || it.parents.contains(&out_dir) && recorded.depends_on(&it.package)
-                })
-                .map(|it| it.out_dir.clone()),
-        );
+        let recorded = recorded_in(&out_dir, completed)?;
+        let edges = edges(&out_dir, &recorded, cargo)?;
+        let built_with = built_with(&out_dir, cargo);
+        pending.extend(edges.into_iter().chain(built_with).map(|it| it.out_dir.clone()));
     }
-    judge_locked(out_dir, cargo, completed, &mut Vec::new())
+    // The script of a package outside the workspace is judged, never run.
+    let may_run = !cargo.dependencies.iter().any(|it| it.out_dir == out_dir && it.outside);
+    judge_locked(out_dir, cargo, completed, &mut Vec::new(), may_run)
+}
+
+/// Whether cargo's record of the run in `out_dir` has it built after no other run, and no
+/// build-dependency of its is among `dependencies`: nothing but what the script itself reads
+/// makes cargo run it again. Read without cargo's lock, only to tell whether to judge it; a
+/// directory not of cargo's stable layout is not judged at all.
+pub(crate) fn alone(out_dir: &Path, dependencies: &[Dependency]) -> bool {
+    match records::Unit::of(out_dir).map(|it| it.recorded()) {
+        Err(_) => dependencies.is_empty(),
+        Ok(recorded) => {
+            recorded.is_ok_and(|it| it.dependency_ids().count() <= 1)
+                && !dependencies.iter().any(|it| it.build_parents.iter().any(|it| it == out_dir))
+        }
+    }
+}
+
+/// Cargo's record of the run in `out_dir`, as this judgment has it: that of a run made in it
+/// now, which is not cargo's until it is checked ([`Completed`]), or else cargo's own.
+fn recorded_in(out_dir: &Path, completed: &[Completed]) -> Result<records::Fingerprint, String> {
+    match completed.iter().find(|it| it.out_dir() == out_dir) {
+        Some(done) => Ok(done.fingerprint().clone()),
+        None => records::Unit::of(out_dir)?.recorded(),
+    }
+}
+
+/// The runs that cargo's record of the run in `out_dir`, `recorded`, has it built after, one
+/// for each unit it has but the script's own compile: those of the packages with `links` the
+/// package is built against (`connect_run_custom_build_deps`), whose metadata cargo gives the
+/// script. Cargo keys each by its package's id; a run of the same package in another
+/// directory, for the host or another platform, is told by the packages that declare it.
+/// `Err` when a unit is no run of this build's, or two: what cargo runs the script with is
+/// then not known, and the run is cargo's.
+fn edges<'a>(
+    out_dir: &Path,
+    recorded: &records::Fingerprint,
+    cargo: &Cargo<'a>,
+) -> Result<Vec<&'a Dependency>, String> {
+    let mut edges = Vec::new();
+    let mut unknown = 0;
+    for pkg_id in recorded.dependency_ids() {
+        let runs = cargo.dependencies.iter().filter(|it| it.out_dir != out_dir);
+        let runs: Vec<_> = runs.filter(|it| it.pkg_id() == pkg_id).collect();
+        let declared: Vec<_> =
+            runs.iter().copied().filter(|it| it.parents.iter().any(|it| it == out_dir)).collect();
+        match (&runs[..], &declared[..]) {
+            ([], _) => unknown += 1,
+            ([run], _) | (_, [run]) => edges.push(*run),
+            (_, _) => {
+                return Err(format!(
+                    "is built after a run of `{}` and there are several",
+                    runs[0].package
+                ));
+            }
+        }
+    }
+    // The one unit no run is is the script's compile.
+    if unknown != 1 {
+        return Err("is built after the run of a package with `links` whose run the daemon \
+             has no record of, so cargo runs it: \
+             docs/no-rustc.md#a-links-dependency-whose-run-the-daemon-does-not-know"
+            .to_owned());
+    }
+    Ok(edges)
+}
+
+/// The scripts of the packages that have the script that ran in `out_dir` as a build-dependency.
+fn built_with<'a>(out_dir: &Path, cargo: &Cargo<'a>) -> Vec<&'a Dependency> {
+    cargo.dependencies.iter().filter(|it| it.build_parents.iter().any(|it| it == out_dir)).collect()
 }
 
 fn judge_locked(
@@ -393,33 +499,42 @@ fn judge_locked(
     cargo: &Cargo<'_>,
     completed: &mut Vec<Completed>,
     parents: &mut Vec<PathBuf>,
+    may_run: bool,
 ) -> Result<Run, JudgementError> {
     if parents.iter().any(|it| it == out_dir) {
         return Err("a cycle in cargo's run-unit dependencies".into());
     }
+    // Made in this judgment already, as a dependency of another.
+    if let Some(done) = completed.iter().find(|it| it.out_dir() == out_dir) {
+        return Ok(done.run().clone());
+    }
     parents.push(out_dir.to_owned());
-    let result = judge_locked_inner(out_dir, cargo, completed, parents);
+    let result = judge_locked_inner(out_dir, cargo, completed, parents, may_run);
     parents.pop();
     result
 }
 
+/// The run of the script in `out_dir`, judged as [`current`] says. A run it makes is not
+/// recorded as cargo's: it is kept in `completed` until the build checks it is the run it had
+/// ([`Completed::record`]), or cargo's leg of the build takes it as the run cargo makes then,
+/// which it does only when what cargo runs the script with is what it was run with
+/// ([`Continuation`]). When `may_run` is false, of a package outside the workspace, a run that
+/// cargo would make again is not made: it is cargo's.
 fn judge_locked_inner(
     out_dir: &Path,
     cargo: &Cargo<'_>,
     completed: &mut Vec<Completed>,
     parents: &mut Vec<PathBuf>,
+    may_run: bool,
 ) -> Result<Run, JudgementError> {
-    let unit = records::Unit::of(out_dir)?;
-    let recorded = unit.recorded()?;
+    let recorded = recorded_in(out_dir, completed)?;
     // A build-dependency's script that runs makes cargo compile this script again before it
     // runs it, and the daemon compiles nothing: the build is cargo's, which finds the run made
     // here, and runs this script once. A handoff to cargo, a bug of the rule:
     // docs/no-rustc.md#a-build-dependencys-script-that-ran-again.
-    for dep in
-        cargo.dependencies.iter().filter(|it| it.build_parents.iter().any(|it| it == out_dir))
-    {
+    for dep in built_with(out_dir, cargo) {
         let context = Cargo { targets: &dep.targets, ..*cargo };
-        judge_locked(&dep.out_dir, &context, completed, parents)?;
+        judge_locked(&dep.out_dir, &context, completed, parents, !dep.outside)?;
         if completed.iter().any(|it| it.out_dir() == dep.out_dir) {
             return Err(format!(
                 "has a build-dependency, `{}`, whose script ran again, so cargo builds this script again",
@@ -430,15 +545,12 @@ fn judge_locked_inner(
     }
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
-    for dep in cargo
-        .dependencies
-        .iter()
-        .filter(|it| it.parents.iter().any(|it| it == out_dir) && recorded.depends_on(&it.package))
-    {
+    // Each from cargo's record of its run as this build has it, as cargo gives them.
+    for dep in edges(out_dir, &recorded, cargo)? {
         let context = Cargo { targets: &dep.targets, ..*cargo };
-        judge_locked(&dep.out_dir, &context, completed, parents)?;
+        judge_locked(&dep.out_dir, &context, completed, parents, !dep.outside)?;
         let unit = records::Unit::of(&dep.out_dir)?;
-        let fingerprint = unit.recorded()?;
+        let fingerprint = recorded_in(&dep.out_dir, completed)?;
         let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
         let ran: Ran = std::fs::read(dep.out_dir.parent().ok_or("no run directory")?.join(RAN))
             .map_err(|it| it.to_string())
@@ -449,7 +561,12 @@ fn judge_locked_inner(
         for (key, value) in said.metadata {
             metadata.insert(format!("{prefix}{}", blaze_build_script::envify(&key)), value);
         }
-        dependencies.push((dep.package.as_str(), fingerprint.hash_u64(), unit.output()));
+        dependencies.push(records::Edge {
+            package: &dep.package,
+            pkg_id: dep.pkg_id(),
+            fingerprint: fingerprint.hash_u64(),
+            output: unit.output(),
+        });
     }
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
@@ -506,6 +623,14 @@ fn judge_locked_inner(
     {
         return Ok(Run::left(&printed, out_dir)?);
     }
+    if !may_run {
+        return Err(format!(
+            "is built after the run of `{}`, outside the workspace, which cargo runs again: \
+             docs/no-rustc.md#a-links-dependency-whose-run-the-daemon-does-not-know",
+            var("CARGO_PKG_NAME").unwrap_or_default()
+        )
+        .into());
+    }
     let began = unit.begin()?;
     let mut env: std::collections::BTreeMap<String, String> = ran
         .env
@@ -551,7 +676,6 @@ fn judge_locked_inner(
     };
     // A run that says nothing of what it reads leaves what cargo reckoned before it.
     let fingerprint = fingerprint.with_local(reckoned(&said, &named).unwrap_or(now));
-    unit.record(&fingerprint)?;
     let run = Run::left(&again.stdout, out_dir)?;
     let inputs = continuation::Inputs::of(&ran, &env, &last, &said, &dependencies)?;
     completed.push(Completed::new(&ran, out_dir, run.clone(), again, fingerprint, began, inputs));
@@ -945,6 +1069,8 @@ mod tests {
         unit.record(&serde_json::from_value(json).unwrap()).unwrap();
         let dependencies = [Dependency {
             package: "native-edge".to_owned(),
+            id: None,
+            outside: false,
             links: "probe".to_owned(),
             out_dir: native.clone(),
             parents: vec![parent.clone()],
@@ -1003,6 +1129,8 @@ mod tests {
         unit.record(&serde_json::from_value(json).unwrap()).unwrap();
         let dependencies = [Dependency {
             package: "native-metadata".to_owned(),
+            id: None,
+            outside: false,
             links: "native-probe".to_owned(),
             out_dir: native.clone(),
             parents: vec![parent.clone()],
@@ -1059,6 +1187,8 @@ mod tests {
             let parent = ran_script(&format!("inactive-{kind}"), COUNTS, "");
             let dependencies = [Dependency {
                 package: format!("native-{kind}"),
+                id: None,
+                outside: false,
                 links: "probe".to_owned(),
                 // Cargo did not build this run unit for this parent. It need not exist.
                 out_dir: parent.join("not-built/out"),
@@ -1076,6 +1206,107 @@ mod tests {
         }
     }
 
+    /// The id cargo 1.99 keys the run of `probe-sys` 0.1.3 from crates.io by, here vendored as
+    /// a directory source that replaces crates.io: read from the record of a run built after it.
+    const PROBE_SYS: u64 = 813625565111490420;
+
+    /// Has cargo's record of the run of `parent`'s script be built after the run of the
+    /// script of `dependency`, which cargo keys by `pkg_id`.
+    fn built_after(parent: &Path, pkg_id: u64, dependency: &Path) {
+        let unit = records::Unit::of(parent).unwrap();
+        let fingerprint = records::Unit::of(dependency).unwrap().recorded().unwrap().hash_u64();
+        let mut json = serde_json::to_value(unit.recorded().unwrap()).unwrap();
+        json["deps"].as_array_mut().unwrap().push(serde_json::json!([
+            pkg_id,
+            "build_script_build",
+            false,
+            fingerprint
+        ]));
+        unit.record(&serde_json::from_value(json).unwrap()).unwrap();
+    }
+
+    /// A script that says beside its directory each time it runs, and what `DEP_PROBE_INCLUDE`
+    /// was in `observed`.
+    const OBSERVES: &str = "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nprintf %s \"${DEP_PROBE_INCLUDE-unset}\" > \"$OUT_DIR/observed\"\n";
+
+    #[test]
+    fn a_run_built_after_a_run_the_daemon_has_no_record_of_is_cargos_and_not_made() {
+        // Cargo gives the script the metadata of the run of a package with `links` outside the
+        // workspace, `probe-sys` from a registry. Without that run among the build's, a run made
+        // here would be made without it, and once recorded, cargo would take it as its own.
+        let native = ran_script("unknown-native", COUNTS, "");
+        let parent = ran_script("unknown-parent", OBSERVES, "");
+        built_after(&parent, PROBE_SYS, &native);
+        let hash = std::fs::read(hash_of(&parent)).unwrap();
+        changed(&parent);
+        let result = judge_for(&parent, &CARGO, &mut Vec::new());
+        assert!(
+            matches!(&result, Err(JudgementError::Unavailable(it)) if it.contains("no record of")),
+            "{result:?}"
+        );
+        assert_eq!((runs(&native), runs(&parent)), (0, 0));
+        assert_eq!(std::fs::read(hash_of(&parent)).unwrap(), hash, "cargo's record is kept");
+        for out_dir in [&native, &parent] {
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_links_dependency_outside_the_workspace_gives_the_metadata_of_cargos_run() {
+        let native = ran_script("outside-native", COUNTS, "");
+        recorded(&native, b"cargo::metadata=include=/opt/probe\ncargo:rerun-if-changed=watched\n");
+        let parent = ran_script("outside-parent", OBSERVES, "");
+        built_after(&parent, PROBE_SYS, &native);
+        let dependencies = [Dependency {
+            package: "probe-sys".to_owned(),
+            id: Some(
+                "registry+https://github.com/rust-lang/crates.io-index#probe-sys@0.1.3".into(),
+            ),
+            outside: true,
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: vec![parent.clone()],
+            build_parents: Vec::new(),
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        changed(&parent);
+        let mut completed = Vec::new();
+        let run = judge_for(&parent, &cargo, &mut completed).unwrap();
+        assert_eq!(std::fs::read_to_string(parent.join("observed")).unwrap(), "/opt/probe");
+        assert_eq!((runs(&native), runs(&parent)), (0, 1));
+        // Not cargo's until the build checks it: cargo would run it again.
+        assert!(records::Unit::of(&parent).unwrap().recorded().is_err());
+        assert_eq!(completed.len(), 1);
+        completed[0].record().unwrap();
+        assert_eq!(current(&parent, &cargo), Ok(run.clone()));
+        assert_eq!((runs(&native), runs(&parent)), (0, 1));
+        // Cargo would run the dependency's script again: the daemon does not, and the run of
+        // the parent is cargo's to make with what that prints.
+        changed(&native);
+        let result = judge_for(&parent, &cargo, &mut Vec::new());
+        assert!(
+            matches!(&result, Err(JudgementError::Unavailable(it)) if it.contains("outside the workspace")),
+            "{result:?}"
+        );
+        assert_eq!((runs(&native), runs(&parent)), (0, 1));
+        for out_dir in [&native, &parent] {
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_run_that_is_not_the_one_built_is_left_to_cargo() {
+        let counts = "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nwc -l < \"$OUT_DIR/../runs\" > \"$OUT_DIR/count\"\n";
+        let out_dir = ran_script("not-kept", counts, "");
+        let built = Run::of(&out_dir).unwrap();
+        changed(&out_dir);
+        let run = judge(&out_dir, &CARGO, |it| *it == built).unwrap();
+        assert_ne!(run, built);
+        assert!(records::Unit::of(&out_dir).unwrap().recorded().is_err(), "cargo runs it again");
+        std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+    }
+
     #[test]
     fn a_build_dependency_whose_script_ran_again_leaves_this_script_to_cargo() {
         // Cargo has no run-unit edge for a build-dependency, but a run of its script makes the
@@ -1085,6 +1316,8 @@ mod tests {
         let parent = ran_script("parent-build", COUNTS, "");
         let dependencies = [Dependency {
             package: "native-build".to_owned(),
+            id: None,
+            outside: false,
             links: "probe".to_owned(),
             out_dir: native.clone(),
             parents: Vec::new(),
@@ -1822,7 +2055,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         );
         run_as_cargo_does(&out_dir, 1);
         changed(&out_dir);
-        let failure = judge(&out_dir, &CARGO).unwrap_err();
+        let failure = judge(&out_dir, &CARGO, |_| true).unwrap_err();
         assert!(matches!(failure, JudgementError::Failed(_)), "{failure:?}");
         assert!(failure.to_string().contains("second run fails"));
         assert_eq!(runs(&out_dir), 2);
@@ -1846,7 +2079,9 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         judge_for(&out_dir, &CARGO, &mut completed).unwrap();
         assert_eq!(runs(&out_dir), 1);
         assert_eq!(completed.len(), 1);
-        assert_eq!(records::Unit::of(&out_dir).unwrap().recorded().unwrap(), before);
+        // Not cargo's until the build checks it; then cargo's record is the one before it.
+        assert!(records::Unit::of(&out_dir).unwrap().recorded().is_err());
+        assert_eq!(completed[0].fingerprint(), &before);
         let mut command = Command::new("sh");
         let continuation = Continuation::for_command(&mut command, &completed).unwrap().unwrap();
         let path = continuation.path();

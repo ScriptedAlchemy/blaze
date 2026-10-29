@@ -1,7 +1,7 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "9473b6e2cc18c43f9dab341a07327dd2806a0cb31caaf59466331ffa2193a964",
+  "Cargo.lock": "484afb58ae97a9a7257ee4885587b82ee3b6a5fc461aa81bc3c0d8f7680ce037",
   "Cargo.toml": "1e5561463072cc57081b6c6eedd6a789ea6c07f0cca491979c8827ccd316236a"
  },
  "packages": {
@@ -20863,6 +20863,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -20873,6 +20877,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -21176,6 +21184,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -21186,6 +21198,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -21489,6 +21505,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -21499,6 +21519,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -21802,6 +21826,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -21812,6 +21840,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -22115,6 +22147,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -22125,6 +22161,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -22428,6 +22468,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -22438,6 +22482,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -40503,6 +40551,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -40513,6 +40565,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -40816,6 +40872,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -40826,6 +40886,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -41129,6 +41193,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -41139,6 +41207,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -41442,6 +41514,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -41452,6 +41528,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -41755,6 +41835,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -41765,6 +41849,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -42068,6 +42156,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -42078,6 +42170,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -60003,6 +60099,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -60013,6 +60113,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -60316,6 +60420,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -60326,6 +60434,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -60629,6 +60741,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -60639,6 +60755,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -60942,6 +61062,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -60952,6 +61076,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -61255,6 +61383,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -61265,6 +61397,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -61568,6 +61704,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -61578,6 +61718,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -79670,6 +79814,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -79680,6 +79828,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -79983,6 +80135,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -79993,6 +80149,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -80296,6 +80456,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -80306,6 +80470,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -80609,6 +80777,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -80619,6 +80791,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -80922,6 +81098,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -80932,6 +81112,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,
@@ -81235,6 +81419,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 46,
+       "name": "blaze_registry"
+      },
+      {
        "i": 48,
        "name": "blaze_serve"
       },
@@ -81245,6 +81433,10 @@
       {
        "i": 59,
        "name": "cargo_platform"
+      },
+      {
+       "i": 60,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 61,

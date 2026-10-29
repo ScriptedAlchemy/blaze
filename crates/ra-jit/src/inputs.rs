@@ -415,18 +415,18 @@ impl Script {
         // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
         // it asked for this build, is the one cargo has, by cargo's records: it is not made
         // twice.
-        let run = script::judge(
-            &out_dir,
-            &script::Cargo { env, env_names, targets: &self.output_targets, dependencies },
-        );
-        let run = match run {
-            Ok(run) => run,
-            Err(script::JudgementError::Unavailable(_)) => return Ok(false),
+        // A run made now is cargo's only when it is the one loaded.
+        let same = |run: &script::Run| {
+            run.clone().named(&out_dir, &self.out_dir).and_then(|it| it.same_as(loaded)).is_ok()
+        };
+        let cargo = script::Cargo { env, env_names, targets: &self.output_targets, dependencies };
+        match script::judge(&out_dir, &cargo, same) {
+            Ok(run) => Ok(same(&run)),
+            Err(script::JudgementError::Unavailable(_)) => Ok(false),
             Err(script::JudgementError::Failed(why)) => {
                 anyhow::bail!("the build script of `{}` {why}", self.package);
             }
-        };
-        Ok(run.named(&out_dir, &self.out_dir).and_then(|it| it.same_as(loaded)).is_ok())
+        }
     }
 
     /// Where a run of the script that can be run again wrote: the load's, or else the last
@@ -849,6 +849,8 @@ impl Scripts {
                     };
                     Some(crate::cargo::script::Dependency {
                         package: cargo[package].name.clone(),
+                        id: Some(cargo[package].id.repr.clone()),
+                        outside: !cargo[package].is_member,
                         links,
                         out_dir,
                         parents: parents(project_model::DepKind::Normal),

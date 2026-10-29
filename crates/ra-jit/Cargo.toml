@@ -78,6 +78,9 @@ blaze-manifest.workspace = true
 blaze-serve.workspace = true
 blaze-wire.workspace = true
 blaze-metadata.workspace = true
+# Cargo's ids of packages, which its records of runs are keyed by.
+blaze-registry = { path = "../blaze-registry" }
+cargo-util-schemas = "=0.14.3"
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

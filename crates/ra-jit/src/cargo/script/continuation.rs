@@ -39,13 +39,13 @@ impl Inputs {
         env: &BTreeMap<String, String>,
         before: &blaze_build_script::Output,
         after: &blaze_build_script::Output,
-        dependencies: &[(&str, u64, PathBuf)],
+        edges: &[super::records::Edge<'_>],
     ) -> Result<Self, String> {
         let paths: std::collections::BTreeSet<_> = before
             .rerun_if_changed
             .iter()
             .chain(&after.rerun_if_changed)
-            .chain(dependencies.iter().map(|it| &it.2))
+            .chain(edges.iter().map(|it| &it.output))
             .cloned()
             .collect();
         let files = paths.into_iter().map(|path| Self::file(ran.cwd.join(path))).collect();
@@ -97,6 +97,27 @@ impl Inputs {
 impl Completed {
     pub(super) fn out_dir(&self) -> &std::path::Path {
         &self.out_dir
+    }
+
+    pub(super) fn run(&self) -> &Run {
+        &self.run
+    }
+
+    pub(super) fn fingerprint(&self) -> &super::super::records::Fingerprint {
+        &self.fingerprint
+    }
+
+    /// Records the run as cargo's, once the build has checked it is the run it had: cargo's
+    /// next build finds it and does not run the script again. Not when the directory has
+    /// another run by then.
+    pub(crate) fn record(&self) -> Result<(), String> {
+        let unit = super::super::records::Unit::of(&self.out_dir)?;
+        let _held = unit.hold()?;
+        let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
+        if Run::left(&printed, &self.out_dir)? != self.run {
+            return Err(format!("{}: another run of the script", self.out_dir.display()));
+        }
+        unit.record(&self.fingerprint)
     }
 
     pub(super) fn new(
