@@ -321,7 +321,7 @@ impl<'db> Check<'db> {
         if segment.self_token().is_some() {
             let name = rename
                 .and_then(|it| it.name())
-                .map(|it| it.text().to_string())
+                .map(|it| it.as_name().as_str().to_owned())
                 .or_else(|| use_prefix_name(tree));
             if let Some(name) = name {
                 names.bind(&name, Namespace::Types);
@@ -329,9 +329,9 @@ impl<'db> Check<'db> {
             return;
         }
         let name = match rename.and_then(|it| it.name()) {
-            Some(name) => name.text().to_string(),
+            Some(name) => name.as_name().as_str().to_owned(),
             None => match segment.name_ref() {
-                Some(name) => name.text().to_string(),
+                Some(name) => name.as_name().as_str().to_owned(),
                 None => return,
             },
         };
@@ -481,5 +481,5 @@ impl Names {
 /// The last segment of the path a nested `use` tree list is under.
 fn use_prefix_name(tree: &ast::UseTree) -> Option<String> {
     let segment = tree.parent_use_tree_list()?.parent_use_tree().path()?.segment()?;
-    Some(segment.name_ref()?.text().to_string())
+    Some(segment.name_ref()?.as_name().as_str().to_owned())
 }
