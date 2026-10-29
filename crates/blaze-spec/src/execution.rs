@@ -129,7 +129,7 @@ pub fn programs(
     let build = &prepared.resolved.spec.build;
     match &build.command {
         Command::Check => bail!("owned BuildSpec replay does not yet execute check units"),
-        Command::Test(run) if run.doc != 0 && !run.no_run => bail!(
+        Command::Test(run) if run.doc != 0 && !(run.doc == 1 && run.no_run) => bail!(
             "owned BuildSpec replay does not yet execute doctests; select --lib, --bins or --tests for unit/integration tests"
         ),
         _ => {}
