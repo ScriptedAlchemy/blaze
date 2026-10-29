@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use blaze_manifest::config::RegistryConfig;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::{SerializedPackage, export, export_package, root_manifest};
@@ -75,6 +75,23 @@ pub struct Build<'a> {
 pub struct TargetPlatform<'a> {
     pub triple: &'a str,
     pub cfg: &'a [Cfg],
+}
+
+/// The captured directory of one non-path package named by `Cargo.lock`.
+///
+/// A replay authenticates these mappings and their directory contents before passing
+/// them to [`units::unit_graph_captured`]. The original source spelling, including a
+/// Git revision, is preserved; a captured package never becomes a path dependency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedSource {
+    /// The exact source URL from the lock file, including a Git source's precise revision.
+    pub source: String,
+    /// The locked package name.
+    pub name: String,
+    /// The locked package version.
+    pub version: String,
+    /// The absolute directory containing the captured `Cargo.toml`.
+    pub root: PathBuf,
 }
 
 impl TargetPlatform<'_> {
@@ -286,8 +303,10 @@ struct Locked {
     lock_path: PathBuf,
     lock_text: String,
     lock: blaze_resolve::Resolve,
+    path_deps: PathDeps,
     path_packages: Vec<Package>,
     fetched: Vec<Package>,
+    sources: Vec<CapturedSource>,
 }
 
 impl Locked {
@@ -296,6 +315,16 @@ impl Locked {
         ctx: &Context,
         offline: bool,
         store: Option<Arc<dyn blaze_registry::Blobs>>,
+    ) -> Result<Locked> {
+        Self::read_captured(ws, ctx, offline, store, None)
+    }
+
+    fn read_captured(
+        ws: &Workspace<'_>,
+        ctx: &Context,
+        offline: bool,
+        store: Option<Arc<dyn blaze_registry::Blobs>>,
+        captured: Option<&[CapturedSource]>,
     ) -> Result<Locked> {
         let root = ws.root().to_owned();
         if summary::has_replace(&root, ctx)? {
@@ -314,8 +343,8 @@ impl Locked {
             entry.insert(m.package_id.version.clone(), SourceId::for_path(&dir)?);
         }
         let lock = lockfile::into_resolve(lockfile::parse(&lock_text)?, &lock_text, &path_deps)?;
-        let fetched = fetch(&lock, ctx, offline, store)?;
-        Ok(Locked { lock_path, lock_text, lock, path_packages, fetched })
+        let (fetched, sources) = fetch(&lock, ctx, offline, store, captured)?;
+        Ok(Locked { lock_path, lock_text, lock, path_deps, path_packages, fetched, sources })
     }
 }
 
@@ -443,7 +472,7 @@ impl<'a> World<'a> {
             rust_versions: None,
             resolve_version: ResolveVersion::default(),
         };
-        let (mut whole, targeted) = resolve_ws(
+        let (whole, targeted) = resolve_ws(
             &mut PackageRegistry::new(registry),
             &resolving,
             Some(&self.lock.lock),
@@ -451,9 +480,16 @@ impl<'a> World<'a> {
             specs,
             has_dev_units,
         )?;
-        if lockfile::lockfile_to_write(&mut whole, Some(&self.lock.lock_text), None, None)?
-            .is_some()
-        {
+        // This frontend never changes the lock. Cargo's locked contract compares
+        // the resolved packages, edges and checksums, rather than requiring its
+        // preferred comments, whitespace or serialization of equivalent entries.
+        let current = lockfile::serialize_resolve(&whole, Some(&self.lock.lock_text));
+        let locked = lockfile::Locked {
+            flag: "--locked",
+            path: &self.lock.lock_path,
+            path_deps: &self.lock.path_deps,
+        };
+        if !lockfile::are_equal_lockfiles(&self.lock.lock_text, &current, Some(locked)) {
             let path = self.lock.lock_path.display();
             bail!("{path} would change: the manifests no longer agree with it");
         }
@@ -584,7 +620,47 @@ fn fetch(
     ctx: &Context,
     offline: bool,
     store: Option<Arc<dyn blaze_registry::Blobs>>,
-) -> Result<Vec<Package>> {
+    captured: Option<&[CapturedSource]>,
+) -> Result<(Vec<Package>, Vec<CapturedSource>)> {
+    // Include unused patches: their manifests are needed to prove that the lock still
+    // leaves them unused. A captured list must cover this exact set, even if the command
+    // selects no unit from some of the packages.
+    let ids: Vec<_> = lock
+        .sort()
+        .into_iter()
+        .chain(lock.unused_patches().iter().copied())
+        .filter(|id| !id.source_id().is_path())
+        .map(|id| (id, id.source_id().as_url().to_string()))
+        .collect();
+    if let Some(captured) = captured {
+        let mut roots = BTreeMap::new();
+        for source in captured {
+            ensure!(
+                source.root.is_absolute(),
+                "captured source root is not absolute: {}",
+                source.root.display()
+            );
+            let key = (source.source.clone(), source.name.clone(), source.version.clone());
+            ensure!(
+                roots.insert(key, source.root.clone()).is_none(),
+                "duplicate captured source for {} {} from {}",
+                source.name,
+                source.version,
+                source.source
+            );
+        }
+        let mut selected = Vec::with_capacity(ids.len());
+        for (id, source) in &ids {
+            let key = (source.clone(), id.name().to_string(), id.version().to_string());
+            selected.push(roots.remove(&key).with_context(|| {
+                format!("missing captured source for {} {} from {source}", id.name(), id.version())
+            })?);
+        }
+        ensure!(roots.is_empty(), "captured source list contains packages not in Cargo.lock");
+        // No registry, Git database, transport, archive cache or source-replacement
+        // lookup is consulted when replay supplies authenticated package roots.
+        return read_fetched(ids, selected, ctx);
+    }
     let mut context = blaze_registry::Context::new(
         ctx.config.home().to_owned(),
         blaze_registry::http::HyperHttp::shared()?,
@@ -593,19 +669,13 @@ fn fetch(
     context.store = store;
     let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, Arc::new(context))?;
     let mut locked = Vec::new();
-    let mut ids = Vec::new();
-    // The `[[patch.unused]]` entries too, which the resolve has to see to keep them unused.
-    for id in lock.sort().into_iter().chain(lock.unused_patches().iter().copied()) {
-        if id.source_id().is_path() {
-            continue;
-        }
-        let source_text = id.source_id().as_url().to_string();
-        let (source, precise) = blaze_registry::SourceId::from_url(&source_text)?;
+    for (id, source_text) in &ids {
+        let (source, precise) = blaze_registry::SourceId::from_url(source_text)?;
         let from = sources.map().replacement(&source, precise.is_some())?;
         if from.is_remote_registry() && !from.is_sparse() {
             bail!("{source_text} is read from a git index, which blaze does not read yet");
         }
-        let mut checksum = lock.checksums().get(&id).cloned().flatten().unwrap_or_default();
+        let mut checksum = lock.checksums().get(id).cloned().flatten().unwrap_or_default();
         // A lock file of cargo before 1.53 may name no checksum: the index's.
         if checksum.is_empty() && from.is_remote_registry() {
             checksum = sources.registry(&from)?.checksum(id.name().as_str(), id.version())?;
@@ -616,19 +686,45 @@ fn fetch(
             checksum,
         };
         locked.push(blaze_registry::Locked { source, precise, package });
-        ids.push((id, source_text));
     }
     let roots = sources.fetch(&locked)?;
+    read_fetched(ids, roots.into_iter().map(|(root, _)| root).collect(), ctx)
+}
+
+fn read_fetched(
+    ids: Vec<(PackageId, String)>,
+    roots: Vec<PathBuf>,
+    ctx: &Context,
+) -> Result<(Vec<Package>, Vec<CapturedSource>)> {
+    ensure!(ids.len() == roots.len(), "fetched source count differs from the locked packages");
     let mut read = Vec::with_capacity(ids.len());
-    for ((_, source_text), (dir, _)) in ids.into_iter().zip(roots) {
+    let mut captured = Vec::with_capacity(ids.len());
+    for ((id, source_text), dir) in ids.into_iter().zip(roots) {
         let manifest_path = dir.join("Cargo.toml");
         let source = manifest_source(&source_text, &ctx.config)?;
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
             bail!("{} has no package", manifest_path.display());
         };
+        ensure!(
+            manifest.package_id.name == id.name().as_str()
+                && manifest.package_id.version == *id.version(),
+            "{} contains {} {}, expected locked package {} {} from {}",
+            manifest_path.display(),
+            manifest.package_id.name,
+            manifest.package_id.version,
+            id.name(),
+            id.version(),
+            source_text
+        );
+        captured.push(CapturedSource {
+            source: source_text.clone(),
+            name: id.name().to_string(),
+            version: id.version().to_string(),
+            root: dir,
+        });
         read.push(Package { manifest_path, manifest, locked_source: Some(source_text) });
     }
-    Ok(read)
+    Ok((read, captured))
 }
 
 /// The source of a package the lock file pins to `source`, as blaze-manifest names it.

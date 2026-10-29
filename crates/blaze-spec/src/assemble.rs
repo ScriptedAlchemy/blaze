@@ -131,9 +131,72 @@ pub fn build_spec_with_inputs(
     request: &Request,
     ctx: &Context<'_>,
 ) -> Result<(Spec, Vec<PathBuf>, Vec<(PathBuf, Vec<u8>)>), Refusal> {
+    let resolved = resolve(request, ctx)?;
+    let mut directories: Vec<_> =
+        resolved.graph.units.iter().map(|unit| unit.package.manifest_dir.clone()).collect();
+    directories.sort();
+    directories.dedup();
+    Ok((resolved.spec, directories, resolved.inputs))
+}
+
+/// A spec and the native source graph from the very same resolution. An executor must
+/// validate the spec before using the graph's filesystem paths.
+pub struct Resolved {
+    /// The canonical, schedulable identity.
+    pub spec: Spec,
+    /// The source paths, crate kinds and dependency edges that made that identity.
+    pub graph: UnitGraph,
+    /// Every structural read, including repeated reads of the same path.
+    pub inputs: Vec<(PathBuf, Vec<u8>)>,
+    /// The manifest selected by the request, which can be a workspace member.
+    pub manifest: PathBuf,
+    /// Cargo's resolved target and intermediate output directories, excluded from capture.
+    pub outputs: Vec<PathBuf>,
+    /// The complete locked external package closure, including unselected packages.
+    pub sources: Vec<blaze_metadata::CapturedSource>,
+}
+
+/// Resolve without discarding the native graph an owned executor needs.
+pub fn resolve(request: &Request, ctx: &Context<'_>) -> Result<Resolved, Refusal> {
+    resolve_with_platform(request, ctx, None, None)
+}
+
+/// Reproduce a spec against an already authenticated platform description without
+/// running native tools. The caller must compare the complete result with the saved
+/// spec before probing the execution machine or starting a compiler.
+pub fn resolve_recorded(
+    request: &Request,
+    ctx: &Context<'_>,
+    platform: &ExecPlatform,
+) -> Result<Resolved, Refusal> {
+    resolve_with_platform(request, ctx, Some(platform), None)
+}
+
+/// Reproduce from authenticated locked source roots without invoking Git or registry
+/// transport. The complete locked set is checked before any external manifest is read.
+pub fn resolve_captured(
+    request: &Request,
+    ctx: &Context<'_>,
+    platform: &ExecPlatform,
+    sources: &[blaze_metadata::CapturedSource],
+) -> Result<Resolved, Refusal> {
+    resolve_with_platform(request, ctx, Some(platform), Some(sources))
+}
+
+fn resolve_with_platform(
+    request: &Request,
+    ctx: &Context<'_>,
+    platform: Option<&ExecPlatform>,
+    sources: Option<&[blaze_metadata::CapturedSource]>,
+) -> Result<Resolved, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
-    let (offline, mut initial) = Opened::with(request, ctx, |opened| {
-        Ok((opened.resolved.offline, opened.manifests.sources()))
+    let (offline, mut initial, manifest, outputs) = Opened::with(request, ctx, |opened| {
+        Ok((
+            opened.resolved.offline,
+            opened.manifests.sources(),
+            opened.workspace.current_manifest().to_owned(),
+            vec![opened.workspace.target_dir(), opened.workspace.build_dir()],
+        ))
     })?;
     let (build, targets) = (&build_of(request), &targets_of(request, command));
     let asked = Asked {
@@ -165,17 +228,14 @@ pub fn build_spec_with_inputs(
         targets,
         profile: request.profile.as_deref(),
     };
-    let (graph, mut inputs) = units::unit_graph_with_inputs(&wanted).map_err(|error| {
-        Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
-    })?;
-    let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph)?;
+    let (graph, mut inputs, sources) =
+        units::unit_graph_captured(&wanted, sources).map_err(|error| {
+            Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
+        })?;
+    let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
     inputs.extend(assembly_inputs);
-    let mut directories: Vec<_> =
-        graph.units.iter().map(|unit| unit.package.manifest_dir.clone()).collect();
-    directories.sort();
-    directories.dedup();
-    Ok((spec, directories, inputs))
+    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -278,13 +338,14 @@ impl Opened<'_> {
 /// This is [`build_spec`] with the graph given, so that a spec is made without resolving
 /// anything: tests hand it graphs they build.
 pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Result<Spec, Refusal> {
-    Ok(assemble_with_inputs(request, ctx, graph)?.0)
+    Ok(assemble_with_inputs(request, ctx, graph, None)?.0)
 }
 
 fn assemble_with_inputs(
     request: &Request,
     ctx: &Context<'_>,
     graph: &UnitGraph,
+    recorded: Option<&ExecPlatform>,
 ) -> Result<(Spec, Vec<(PathBuf, Vec<u8>)>), Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let host = ctx.host;
@@ -346,7 +407,10 @@ fn assemble_with_inputs(
             env: &machine_env,
             linker: None,
         };
-        let platform = platform::exec_platform(&machine, ctx.probe)?;
+        let platform = match recorded {
+            Some(platform) => platform.clone(),
+            None => platform::exec_platform(&machine, ctx.probe)?,
+        };
         let platform_digest = digest_of(&platform);
 
         let root = opened.workspace.root();
@@ -588,6 +652,35 @@ fn unit_specs(
         specs.push(spec);
     }
     Ok(Units { specs, of_graph })
+}
+
+/// The native units in the spec's canonical order, after checking every unit and
+/// dependency edge against the spec. Paths are deliberately obtained from resolution,
+/// never guessed from package or target names.
+pub fn canonical_units<'a>(
+    build: &BuildSpec,
+    graph: &'a UnitGraph,
+) -> Result<Vec<&'a Unit>, Refusal> {
+    let words: Vec<_> = build.rustflags.iter().map(|word| word.0.clone()).collect();
+    let flags = rustflags::read(&words)?;
+    let profile = &build.profile;
+    let settings = Settings {
+        backend: profile.backend,
+        backend_opt: profile.backend_opt,
+        backend_emit: profile.backend_emit,
+        mir_opt: profile.mir_opt,
+    };
+    let units = unit_specs(graph, &flags, &settings)?;
+    if units.specs != build.units {
+        return Err(Refusal::new("execution units", "the native graph differs from the BuildSpec"));
+    }
+    let mut native = vec![None; units.specs.len()];
+    for (index, canonical) in units.of_graph.into_iter().enumerate() {
+        if let Some(at) = canonical {
+            native[at as usize] = Some(&graph.units[index]);
+        }
+    }
+    Ok(native.into_iter().map(|unit| unit.expect("canonical unit has a native unit")).collect())
 }
 
 /// The units the command asked for, as indexes in the canonical order.

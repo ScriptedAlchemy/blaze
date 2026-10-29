@@ -8,6 +8,11 @@ on:
       - crates/blaze-wire/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
+      - crates/blaze-spec/**
+      - crates/blaze-manifest/**
+      - crates/blaze-metadata/**
+      - crates/hir-ty-codegen/**
+      - vendor/rust-analyzer/crates/project-model/**
       - harness/**
       - Cargo.toml
       - Cargo.lock
@@ -24,7 +29,7 @@ concurrency:
 jobs:
   server:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
@@ -45,6 +50,30 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
+      - name: Test compiler project and replay profile integration
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p blaze-metadata -- --test-threads=2
+          cargo test --locked -p project-model --lib -- --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit cargo::spec:: -- --test-threads=2
+          python3 -I harness/tracedecay_test.py
+      - name: Test cleanup control flow with compiler assertions enabled
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
+      - name: Execute saved source with compiler subprocesses blocked
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p ra-jit --bin ra-jit
+          python3 -I harness/dist/saved_spec.py --blaze target/debug/ra-jit --work target/saved-spec-review
+      - name: Save immutable replay evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: saved-buildspec-execution
+          path: |
+            target/saved-spec-review/results.json
+            target/saved-spec-review/*.log
+          if-no-files-found: ignore
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
         run: python3 -I harness/remote.py --selftest

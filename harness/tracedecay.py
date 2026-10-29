@@ -272,18 +272,41 @@ class Ctx:
             os.unlink(path)
 
 
+class ProcessSamplingError(RuntimeError):
+    """The process table cannot safely identify this harness's processes."""
+
+
 def ps_table(env=True):
     """pid, ppid, rss (KB) and command line; with `env`, the process's environment is appended to
     the command line, which is how a run's processes are found after they were reparented
     (macOS `ps -Eww`, Linux `ps eww`; both need the wide form, or the environment is cut off).
     The wide form costs about 20 ms more than a plain `ps` on this Mac, which is why the
     one-second sampler asks without it."""
-    flags = ["-Eww" if env else "-ww", "-Ao"] if platform.system() == "Darwin" else (["eww", "-Ao"] if env else ["-Ao"])
+    system = platform.system()
+    if system == "Linux":
+        # Some sandboxes expose the host's procfs from a child PID namespace. `ps`
+        # then either fails looking up itself or returns host PIDs that can collide
+        # with unrelated local PIDs. Such rows cannot safely be measured or killed.
+        try:
+            proc_pid = int(os.readlink("/proc/self"))
+        except (OSError, ValueError):
+            raise ProcessSamplingError("process sampler unavailable: cannot identify Linux /proc/self PID") from None
+        if proc_pid != os.getpid():
+            raise ProcessSamplingError("process sampler unavailable: Linux /proc uses a different PID namespace")
+    flags = ["-Eww" if env else "-ww", "-Ao"] if system == "Darwin" else (["eww", "-Ao"] if env else ["-Ao"])
     # A process environment can contain native Unix bytes. Losing that one
     # sample disables the watchdog precisely while native-value tests run.
-    out = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="], errors="surrogateescape").stdout
+    try:
+        ran = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="],
+                 errors="surrogateescape", stderr=subprocess.PIPE)
+    except OSError:
+        raise ProcessSamplingError("process sampler unavailable: could not run ps") from None
+    if ran.returncode:
+        # Do not put either output stream in an error: process environments can
+        # contain secrets, and a failing ps is not an empty process table.
+        raise ProcessSamplingError(f"process sampler unavailable: ps exited with status {ran.returncode}")
     rows = []
-    for line in out.splitlines():
+    for line in ran.stdout.splitlines():
         parts = line.split(None, 3)
         if len(parts) < 4:
             continue
@@ -291,6 +314,8 @@ def ps_table(env=True):
             rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))
         except ValueError:
             pass
+    if not any(pid == os.getpid() for pid, _, _, _ in rows):
+        raise ProcessSamplingError("process sampler unavailable: ps omitted the current process")
     return rows
 
 
@@ -351,7 +376,7 @@ def footprints_mb(pids):
         for m in re.finditer(r"\[(\d+)\]: \S+\s+Footprint: ([\d.]+) (KB|MB|GB)", out):
             found[int(m.group(1))] = float(m.group(2)) * {"KB": 1 / 1024, "MB": 1, "GB": 1024}[m.group(3)]
         return found
-    return {r[0]: r[2] / 1024 for r in ps_table() if r[0] in pids}
+    return {r[0]: r[2] / 1024 for r in ps_table(env=False) if r[0] in pids}
 
 
 def descendants(rows, roots):
@@ -396,12 +421,15 @@ class Watchdog(threading.Thread):
 
     def __init__(self, blaze_bin, limit_mb=WATCHDOG_MB, swap_free_min_mb=SWAP_FREE_MIN_MB, interval=2.0,
                  series=None, run_id=None, homes=(), swap_fn=swap_mb, swap_growth_min_mb=SWAP_GROWTH_MIN_MB,
-                 swap_growth_max_mb=SWAP_GROWTH_MAX_MB):
+                 swap_growth_max_mb=SWAP_GROWTH_MAX_MB, process_env=True):
         super().__init__(daemon=True)
         self.series = open(series, "a", buffering=1) if series else None  # one JSON line per sample
         self.prefix = blaze_bin + os.sep
         self.limit_mb, self.swap_free_min_mb, self.interval = limit_mb, swap_free_min_mb, interval
         self.run_id, self.homes = run_id, tuple(homes)
+        # A one-shot harness can identify its own client tree/session in `pids`
+        # without inspecting the environments of unrelated processes.
+        self.process_env = process_env
         self.swap_fn = swap_fn
         self.swap_growth_min_mb, self.swap_growth_max_mb = swap_growth_min_mb, swap_growth_max_mb
         self.client = None  # callable returning the pid of the `blaze` client being timed
@@ -439,7 +467,7 @@ class Watchdog(threading.Thread):
         return (mine | descendants(rows, mine)) - theirs
 
     def sample(self):
-        rows = ps_table()
+        rows = ps_table(env=self.process_env)
         client = self.client() if self.client else None
         client_tree = descendants(rows, [client]) if client else set()
         pids = self.pids(rows, client_tree)
@@ -475,7 +503,7 @@ class Watchdog(threading.Thread):
             if client:
                 kill_pids(client_tree, signal.SIGTERM)
                 time.sleep(2)
-                kill_pids(client_tree & {r[0] for r in ps_table()})
+                kill_pids(client_tree & {r[0] for r in ps_table(env=self.process_env)})
         return self.tripped
 
     def run(self):

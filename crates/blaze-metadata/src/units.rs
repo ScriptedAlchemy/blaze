@@ -22,7 +22,7 @@ use blaze_resolve::{InternedString, PackageId};
 use cargo_util_schemas::core::SourceKind;
 use rustc_hash::FxHashMap;
 
-use crate::{Asked, Locked, Packages, World};
+use crate::{Asked, CapturedSource, Locked, Packages, World};
 
 mod deps;
 mod json;
@@ -355,6 +355,21 @@ pub fn unit_graph(asked: &UnitsAsked<'_>) -> Result<UnitGraph> {
 pub fn unit_graph_with_inputs(
     asked: &UnitsAsked<'_>,
 ) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>)> {
+    let (graph, inputs, _) = unit_graph_captured(asked, None)?;
+    Ok((graph, inputs))
+}
+
+/// Resolve from captured locked-package roots, or collect those roots while resolving
+/// normally. A supplied list must match every non-path lock-file package exactly,
+/// including unused patches; no registry or Git transport is used in that case.
+///
+/// The caller must authenticate the captured roots and their content. Their original
+/// registry/Git identities are retained in the graph, and every manifest read remains
+/// in the returned structural trace for the caller to check against its snapshot.
+pub fn unit_graph_captured(
+    asked: &UnitsAsked<'_>,
+    captured: Option<&[CapturedSource]>,
+) -> Result<(UnitGraph, Vec<(PathBuf, Vec<u8>)>, Vec<CapturedSource>)> {
     let a = asked.asked;
     let Some(build) = &a.build else {
         bail!("the unit graph is that of a build: no `Build` was given")
@@ -370,7 +385,7 @@ pub fn unit_graph_with_inputs(
     let (ctx, offline) = crate::open(a, command)?;
     refuse_what_is_not_read(&ctx.config, platform.triple)?;
     let ws = Workspace::new(&root_manifest(a.manifest_path, &ctx)?, &ctx)?;
-    let locked = Locked::read(&ws, &ctx, offline, a.store.clone())?;
+    let locked = Locked::read_captured(&ws, &ctx, offline, a.store.clone(), captured)?;
     let world = World::new(&ws, &locked)?;
     let mut warnings: Vec<String> = Vec::new();
     for warning in ws.workspace_warnings() {
@@ -465,7 +480,7 @@ pub fn unit_graph_with_inputs(
     }
     warnings.extend(ctx.config.take_warnings());
     let graph = assemble(&env, &shared, ws.root(), &locked, warnings)?;
-    Ok((graph, ctx.sources()))
+    Ok((graph, ctx.sources(), locked.sources.clone()))
 }
 
 /// The members of the workspace, as the package selection reads them.

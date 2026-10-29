@@ -32,6 +32,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 fn graph(root: &Path, home: &Path) -> blaze_metadata::units::UnitGraph {
+    try_graph(root, home).unwrap()
+}
+
+fn try_graph(root: &Path, home: &Path) -> anyhow::Result<blaze_metadata::units::UnitGraph> {
     let env = BTreeMap::from([
         ("CARGO_HOME".into(), home.to_str().unwrap().into()),
         ("PATH".into(), std::env::var("PATH").unwrap_or("/usr/bin:/bin".into())),
@@ -57,7 +61,32 @@ fn graph(root: &Path, home: &Path) -> blaze_metadata::units::UnitGraph {
         targets: &TargetFilter::default(),
         profile: None,
     })
-    .unwrap()
+}
+
+#[test]
+fn locked_resolution_accepts_equivalent_toml_but_rejects_changed_edges() {
+    let scratch = Scratch::new("compact-lock");
+    scratch.write(
+        "Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ndep={path='dep'}\n",
+    );
+    scratch.write("src/main.rs", "fn main() { dep::value(); }\n");
+    scratch.write("dep/Cargo.toml", "[package]\nname='dep'\nversion='0.1.0'\nedition='2021'\n");
+    scratch.write("dep/src/lib.rs", "pub fn value() {}\n");
+    // Cargo --locked accepts this ordering, compact array and missing generated header.
+    let text = "version = 4\n[[package]]\nname='dep'\nversion='0.1.0'\n[[package]]\nname='app'\nversion='0.1.0'\ndependencies=['dep']\n";
+    scratch.write("Cargo.lock", text);
+    let home = scratch.0.join("home");
+    let made = try_graph(&scratch.0, &home).unwrap();
+    assert_eq!(made.lock, text.as_bytes());
+    assert_eq!(std::fs::read_to_string(scratch.0.join("Cargo.lock")).unwrap(), text);
+    assert!(made.units.iter().any(|unit| unit.package.name == "dep"));
+
+    let changed = text.replace("dependencies=['dep']\n", "");
+    scratch.write("Cargo.lock", &changed);
+    let error = try_graph(&scratch.0, &home).unwrap_err();
+    assert!(format!("{error:#}").contains("manifests no longer agree"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(scratch.0.join("Cargo.lock")).unwrap(), changed);
 }
 
 #[test]

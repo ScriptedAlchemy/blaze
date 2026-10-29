@@ -46,7 +46,8 @@
 //!
 //! The program is resolved in the directories of `Machine::env`'s `PATH`, with relative paths
 //! and empty PATH entries rooted at `Machine::cwd`. Probes run in that directory without
-//! changing the serving process's cwd. No program by that name means the field is `None`: a
+//! changing the serving process's cwd. Child processes receive exactly `Machine::env`,
+//! with no serving-process variables inherited. No program by that name means the field is `None`: a
 //! build with no C dependency needs no compiler, and two machines that differ only in that one
 //! has a compiler do not share a platform, which is the safe direction.
 //!
@@ -62,9 +63,8 @@
 //! on macOS 26.6.2 — so their bytes do not name the compiler. A shim is resolved with
 //! `xcrun --find <name>` and that executable is digested; when `xcrun` is missing or names
 //! nothing, the shim's own bytes are digested and the version line is what names the tool.
-//! `Probe::run` takes no environment, so `DEVELOPER_DIR` is passed through `/usr/bin/env`:
-//! `env DEVELOPER_DIR=<value> xcrun …` when the machine sets it, and `env -u DEVELOPER_DIR
-//! xcrun …` when it does not, so that the daemon's own `DEVELOPER_DIR` cannot reach `xcrun`.
+//! `DEVELOPER_DIR` is passed through `/usr/bin/env` for canned probes as well as the real
+//! request-scoped process environment. The serving process's directory cannot reach `xcrun`.
 //!
 //! ## `linker`
 //!
@@ -122,10 +122,6 @@
 //! - The Linux half: this machine is macOS, so the libc and loader paths, what `getconf
 //!   GNU_LIBC_VERSION` prints, what a musl loader prints for `--version`, and what `uname -r`
 //!   gives are unverified here.
-//! - That a tool's `--version` line does not depend on the environment `Probe::run` inherits.
-//!   No variable is known to change one, and the line is read through the probe, which passes
-//!   the process's environment; a variable that changed it would make the platform depend on
-//!   the daemon's environment.
 //! - That `cc`'s launcher handling and this one agree for every launcher: the list is `cc`'s,
 //!   read from its source, and a launcher `cc` learns from `CC_KNOWN_WRAPPER_CUSTOM` is read
 //!   here too.
@@ -229,8 +225,15 @@ pub trait Probe {
         self.which(name, path)
     }
 
-    /// Invoke the resolved program in a request's directory. Canned probes can ignore `cwd`.
-    fn run_in(&self, _cwd: &Path, program: &Path, args: &[&str]) -> Option<String> {
+    /// Invoke the program in the request's directory and exact environment.
+    /// Canned probes may return a fixed answer; filesystem probes must not inherit ambient variables.
+    fn run_in(
+        &self,
+        _cwd: &Path,
+        _env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[&str],
+    ) -> Option<String> {
         self.run(program, args)
     }
 
@@ -238,6 +241,7 @@ pub trait Probe {
     fn run_native_in(
         &self,
         _cwd: &Path,
+        _env: &BTreeMap<String, std::ffi::OsString>,
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<String> {
@@ -248,6 +252,7 @@ pub trait Probe {
     fn run_path_in(
         &self,
         _cwd: &Path,
+        _env: &BTreeMap<String, std::ffi::OsString>,
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<Vec<u8>> {
@@ -255,7 +260,7 @@ pub trait Probe {
     }
 
     /// Operating-system queries in a request's directory.
-    fn os_in(&self, _cwd: &Path) -> Option<String> {
+    fn os_in(&self, _cwd: &Path, _env: &BTreeMap<String, std::ffi::OsString>) -> Option<String> {
         self.os()
     }
 }
@@ -266,6 +271,7 @@ pub trait Probe {
 struct InDirectory<'a> {
     probe: &'a dyn Probe,
     cwd: &'a Path,
+    env: &'a BTreeMap<String, std::ffi::OsString>,
 }
 
 impl Probe for InDirectory<'_> {
@@ -276,19 +282,19 @@ impl Probe for InDirectory<'_> {
         self.probe.which_in(self.cwd, name, path).map(|path| self.cwd.join(path))
     }
     fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
-        self.probe.run_in(self.cwd, &self.cwd.join(program), args)
+        self.probe.run_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
-        self.probe.run_native_in(self.cwd, &self.cwd.join(program), args)
+        self.probe.run_native_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
-        self.probe.run_path_in(self.cwd, &self.cwd.join(program), args)
+        self.probe.run_path_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
         self.probe.read(&self.cwd.join(path))
     }
     fn os(&self) -> Option<String> {
-        self.probe.os_in(self.cwd)
+        self.probe.os_in(self.cwd, self.env)
     }
 }
 
@@ -332,40 +338,54 @@ impl Probe for System {
         self.which_native_in(cwd, name.as_ref(), path.as_ref())
     }
 
-    fn run_in(&self, cwd: &Path, program: &Path, args: &[&str]) -> Option<String> {
-        text_output(Command::new(program).current_dir(cwd).args(args))
+    fn run_in(
+        &self,
+        cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[&str],
+    ) -> Option<String> {
+        text_output(Command::new(program).current_dir(cwd).env_clear().envs(env).args(args))
     }
 
     fn run_native_in(
         &self,
         cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<String> {
-        text_output(Command::new(program).current_dir(cwd).args(args))
+        text_output(Command::new(program).current_dir(cwd).env_clear().envs(env).args(args))
     }
 
     fn run_path_in(
         &self,
         cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<Vec<u8>> {
-        let output = Command::new(program).current_dir(cwd).args(args).output().ok()?;
+        let output = Command::new(program)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env)
+            .args(args)
+            .output()
+            .ok()?;
         output.status.success().then_some(output.stdout)
     }
 
     fn os(&self) -> Option<String> {
-        self.os_in(Path::new("."))
+        self.os_in(Path::new("."), &BTreeMap::new())
     }
 
-    fn os_in(&self, cwd: &Path) -> Option<String> {
+    fn os_in(&self, cwd: &Path, env: &BTreeMap<String, std::ffi::OsString>) -> Option<String> {
         // The OS this binary was built for, which blaze's triple says it is not cross-building
         // away from.
         match std::env::consts::OS {
             "macos" => {
                 let version =
-                    self.run_in(cwd, Path::new("/usr/bin/sw_vers"), &["-productVersion"])?;
+                    self.run_in(cwd, env, Path::new("/usr/bin/sw_vers"), &["-productVersion"])?;
                 let version = version.trim();
                 (!version.is_empty()).then(|| format!("macos {version}"))
             }
@@ -373,7 +393,7 @@ impl Probe for System {
                 // coreutils' `uname`, in either of the two places a distribution puts it.
                 let release = ["/usr/bin/uname", "/bin/uname"]
                     .iter()
-                    .find_map(|it| self.run_in(cwd, Path::new(it), &["-r"]))?;
+                    .find_map(|it| self.run_in(cwd, env, Path::new(it), &["-r"]))?;
                 let release = release.trim();
                 (!release.is_empty()).then(|| format!("linux {}", major_minor(release)))
             }
@@ -409,7 +429,7 @@ pub struct Machine<'a> {
 /// The `ExecPlatform` of `machine`, read through `probe`, or a [`Refusal`] naming the field
 /// blaze cannot name.
 pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
-    let scoped = InDirectory { probe, cwd: machine.cwd };
+    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env };
     let probe: &dyn Probe = &scoped;
     let os = probe
         .os()

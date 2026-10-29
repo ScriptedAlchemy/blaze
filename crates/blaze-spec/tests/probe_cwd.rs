@@ -13,7 +13,7 @@ use blaze_spec::{
     assemble::{Host, build_spec},
     environment,
     flags::{Request, Subcommand},
-    platform::{Probe, System},
+    platform::{Machine, Probe, System, exec_platform},
     run,
 };
 use blaze_wire::BuildSpec;
@@ -44,6 +44,43 @@ fn native_host() -> Host {
             .collect(),
         cpu: arch.to_owned(),
         llvm: false,
+    }
+}
+
+#[test]
+fn system_child_probes_receive_exactly_the_request_environment() {
+    let f = fixture();
+    let root = f.root();
+    let compiler = root.join("request-cc");
+    std::fs::write(
+        &compiler,
+        "#!/bin/sh\nprintf '%s:%s\\n' \"$BLAZE_PROBE_REQUEST_VALUE\" \"${HOME-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host = native_host();
+    let mut env = BTreeMap::from([
+        ("PATH".to_owned(), OsString::from("/usr/bin:/bin")),
+        ("CC".to_owned(), compiler.into_os_string()),
+    ]);
+    for value in ["first request", "second request"] {
+        env.insert("BLAZE_PROBE_REQUEST_VALUE".to_owned(), value.into());
+        let machine =
+            Machine { cwd: &root, triple: &host.triple, cpu: &host.cpu, env: &env, linker: None };
+        let platform = exec_platform(&machine, &System).unwrap();
+        assert_eq!(platform.cc.unwrap().1, format!("{value}:unset"));
+        // Unlike a shell, env adds no variables of its own: this exercises the
+        // byte-output path used for SDK lookup as well as text version probes.
+        let bytes = System.run_path_in(&root, &env, Path::new("/usr/bin/env"), &[]).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        let got: BTreeMap<_, _> = output
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_owned(), OsString::from(value))
+            })
+            .collect();
+        assert_eq!(got, env);
     }
 }
 

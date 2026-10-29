@@ -3013,19 +3013,40 @@ A custom test harness receives `cfg(test)` without acquiring the libtest harness
 `cargo +1.99.0 check --locked --tests -p ra-jit` also passes on Linux, including the CLI and
 test targets. These checks do not establish local execution acceptance or the macOS gate.
 
-Two source-identity gaps remain before the prototype can be used to schedule work. The CLI
-currently names `HEAD` and `HEAD^{tree}` while resolution reads the working tree: changing a
-Rust body without committing can leave `BuildSpec` and `JobContent` unchanged. It needs an
-immutable snapshot of the actual source closure, including inputs outside Git's tracked
-files. Schema version 2 now keys the selected root manifest's source-relative location
-in BuildSpec, FrontEndKeyInput and ConfigKeyInput. Sibling workspaces are distinguished
-even when package metadata matches, and relocation preserves the same logical location.
-Replay uses that location before joining workspace-relative cwd and revalidating.
-This location is not an immutable dirty/untracked/external input snapshot.
+The CLI now saves the actual source inputs, including dirty and untracked files, selected
+path/registry/Git dependency trees, configuration reads and relative symlink targets. A canonical
+locked-source index belongs to that snapshot: changing which captured package directory a locked
+source names changes the source identity. The original invocation is a separate CBOR replay recipe,
+so equivalent command spellings retain the same `BuildSpec` and `JobContent`. The selected manifest,
+config-file operands, native values and source-relative working directory survive relocation.
+Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
+complete spec, and verifies the execution platform before creating compiler descriptions.
+An empty external Cargo home does not affect source identity. When external configuration,
+registry or Git trees are inputs, capture preserves their physical topology beneath the common
+source root; equivalent dependency layouts at different relative locations are not yet normalized
+to one identity.
 
-Matching replay still deliberately ends at the owned-executor diagnostic; routing it through
-the existing Cargo dispatcher would add a compiler fallback. The executor, complete native
-input closure and local execution differential remain pending, and C2 stays draft.
+`ra-jit cargo spec --out FILE build|run|test ...` writes canonical BuildSpec CBOR to `FILE`
+and the immutable blobs plus replay recipe to `FILE.inputs/`. Copy both to replay elsewhere with
+`ra-jit cargo spec --run FILE`. Successful artifacts and a `result.json` are retained under
+`FILE.outputs/`. The original checkout is not needed. Each compiler description carries authoritative
+cfgs, environment, dependency renames, target kinds and profiles; the loader cannot add analyzer cfgs
+or substitute ambient compiler settings. Replay starts the owned compiler directly with compiler
+query fallback, Cargo producer loading, external proc-macro servers and shared publication disabled.
+
+The connected executor admits host Rust libraries as source dependencies of binaries and examples,
+and has explicit paths for unit/integration test executables. It refuses standalone library artifacts,
+check/doctest/benchmark work, build scripts, proc macros, unsupported output types and incompatible
+per-unit debug settings before starting compilation. Expanded application native link inputs are
+refused until their complete closure can be bound. The existing `ExecPlatform.native_root` is still
+a proxy for the language runtime's native inputs, not a complete SDK/library closure. Source dep-info
+is checked against the snapshot before an executable is advertised or run; an unrepresentable trace
+is refused. This is an admission check after compilation, not a filesystem sandbox.
+
+`harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
+compiler tools blocked, including removal of the original tree and hostile worker configuration.
+Its result, the broader `buildspec.py` differential, native closure coverage, other platforms and
+the original complete C2 acceptance remain separate gates. C2 stays draft until those gates pass.
 
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's

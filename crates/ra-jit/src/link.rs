@@ -192,7 +192,7 @@ impl Line {
             before.extend([format!("-B{}", gcc_ld.display()), "-fuse-ld=lld".to_owned()]);
         }
         before.extend(target.leading());
-        let native = native(db, program, &target);
+        let native = native(db, program, &target)?;
         let mut after = native.search;
         for lib in &native.libs {
             after.extend(target.lib(lib));
@@ -279,7 +279,7 @@ struct Native {
 /// The native libraries of the crates `program` links, as rustc orders them: a crate's before
 /// those of the crates it depends on, each crate's in the order written and then those its
 /// build script asked for, and each library last where it is asked for more than once.
-fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
+fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> anyhow::Result<Native> {
     let mut seen = FxHashSet::default();
     let mut order = Vec::new();
     let unlinked = crate::unlinked_panic_runtime(db, program);
@@ -288,13 +288,28 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
         depth_first(db, krate.into(), unlinked, &programs, &mut seen, &mut order);
     }
     let mut native = Native::default();
+    let replay = std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1");
     for &krate in order.iter().rev() {
-        let attributes = hir_def::nameres::crate_def_map(db, krate)
+        let attributes: Vec<_> = hir_def::nameres::crate_def_map(db, krate)
             .modules(db)
             .flat_map(|(_, module)| module.scope(db).extern_blocks())
-            .flat_map(|block| AttrFlags::native_libs(db, block).iter().cloned());
-        native.libs.extend(attributes.collect::<Vec<_>>());
+            .flat_map(|block| AttrFlags::native_libs(db, block).iter().cloned())
+            .collect();
         let asked = asked_by_script(db, krate, target);
+        // The saved snapshot binds Rust sources, while ExecPlatform currently names
+        // only a proxy of the native sysroot. Admit no application native dependency
+        // until its complete link closure can be captured too. Inspect expanded HIR
+        // here so a macro-generated #[link] cannot evade the gate.
+        if replay
+            && !Crate::from(krate).origin(db).is_lang()
+            && (!attributes.is_empty()
+                || !asked.libs.is_empty()
+                || !asked.search.is_empty()
+                || !asked.args.is_empty())
+        {
+            bail!("saved BuildSpec replay does not yet bind application native link inputs");
+        }
+        native.libs.extend(attributes);
         native.libs.extend(asked.libs);
         native.search.extend(asked.search);
         // As cargo has it: a script's arguments are for its own package's targets.
@@ -308,7 +323,7 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
     native.libs.reverse();
     let mut searched = FxHashSet::default();
     native.search.retain(|it| searched.insert(it.clone()));
-    native
+    Ok(native)
 }
 
 /// What the build script of `krate`'s package printed for the link, as cargo passes it to

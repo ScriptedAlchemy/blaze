@@ -3235,6 +3235,11 @@ fn workspace_at(
     }
     let mut debug =
         plan::Whole { debug: plan::Described::NOTHING, lto: false, lints_capped: false };
+    if matches!(&workspace.kind, ProjectWorkspaceKind::Json(_))
+        && let Some(profile) = cargo::spec::project_profile(project)?
+    {
+        debug = profile;
+    }
     let mut scripts = None;
     let mut own = None;
     if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
@@ -4820,7 +4825,7 @@ fn write_dep_info_of(
     if !env.is_empty() {
         text.push('\n');
     }
-    for (key, value) in env {
+    for (key, value) in &env {
         let key = dep_info::escaped_variable(&key);
         match value {
             Some(value) => {
@@ -4828,6 +4833,16 @@ fn write_dep_info_of(
             }
             None => text += &format!("# env-dep:{key}\n"),
         }
+    }
+    if std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1") {
+        // Admission treats this trace as exhaustive. Cargo's line-oriented format
+        // cannot represent every Unix filename; refuse any loss instead of letting
+        // a newline, target delimiter, or trailing escape hide a source input.
+        let decoded = dep_info::DepInfo::parse(&text);
+        anyhow::ensure!(
+            decoded.files == paths && decoded.env == env,
+            "saved BuildSpec replay cannot represent its complete input trace in dep-info"
+        );
     }
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
@@ -7933,9 +7948,16 @@ fn cargo_config(args: &Args) -> CargoConfig {
 
 /// How a workspace is loaded, whichever it is.
 fn load_config() -> LoadCargoConfig {
+    let replay = std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1");
     LoadCargoConfig {
-        load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+        // Replay preflight admits no build scripts or procedural macros. Keep the
+        // loader under the same policy, including the toolchain's external server.
+        load_out_dirs_from_check: !replay,
+        with_proc_macro_server: if replay {
+            ProcMacroServerChoice::None
+        } else {
+            ProcMacroServerChoice::Sysroot
+        },
         prefill_caches: false,
         num_worker_threads: 1,
         proc_macro_processes: 1,

@@ -2,12 +2,13 @@
 //! manifest are addressed by BLAKE3, independently of filesystem timestamps.
 //!
 //! A capture retains dirty, ignored and untracked files, empty directories and Unix
-//! executable permissions. Only explicitly supplied output directories and Git's
-//! administration directory are omitted. Materialization uses copies, never hard links
+//! executable permissions. The blob store, explicitly supplied output directories and Git's
+//! administration directory are omitted. A source link retains the files it refers to even
+//! inside an output directory. Materialization uses copies, never hard links
 //! to mutable requester files or to the blob store.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -99,54 +100,49 @@ impl Snapshot {
         structural: &[(PathBuf, Vec<u8>)],
         store: &Path,
     ) -> anyhow::Result<Self> {
-        let root = root.canonicalize()?;
-        let outputs: Vec<_> = outputs
-            .iter()
-            .map(|path| {
-                let path = blaze_manifest::paths::normalize_path(path);
-                path.canonicalize().unwrap_or(path)
-            })
-            .collect();
-        let mut entries = BTreeMap::new();
+        let cwd = std::env::current_dir()?;
+        let given_root = blaze_manifest::paths::normalize_path(&cwd.join(root));
+        let root = given_root.canonicalize()?;
+        fs::create_dir_all(store)?;
+        let store_root = store.canonicalize()?;
+        ensure!(root != store_root, "source root is the snapshot blob store");
+        let mut excluded =
+            vec![blaze_manifest::paths::normalize_path(&cwd.join(store)), store_root.clone()];
+        for path in outputs {
+            let path = blaze_manifest::paths::normalize_path(&cwd.join(path));
+            if let Ok(canonical) = path.canonicalize() {
+                excluded.push(canonical);
+            }
+            excluded.push(path);
+        }
+        excluded.sort();
+        excluded.dedup();
+        let mut capture = Capture {
+            root,
+            given_root,
+            outputs: excluded,
+            store,
+            store_root,
+            entries: BTreeMap::new(),
+            expanded: BTreeSet::new(),
+            links: BTreeMap::new(),
+        };
         for tree in trees {
-            let tree = tree.canonicalize()?;
-            let relative = tree.strip_prefix(&root)?;
-            directories(relative, &mut entries)?;
-            walk(&root, relative, &outputs, store, &mut entries)?;
+            let relative = capture.relative(tree)?;
+            capture.path(&relative, true)?;
         }
         for (path, bytes) in structural {
-            let path = path.canonicalize()?;
-            let relative = path.strip_prefix(&root)?;
-            if let Some(parent) = relative.parent() {
-                directories(parent, &mut entries)?;
-            }
-            let logical = SourcePath::from_native(relative)?;
-            if !entries.contains_key(&logical) {
-                #[cfg(unix)]
-                let mode = {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::metadata(&path)?.permissions().mode() & 0o111
-                };
-                #[cfg(not(unix))]
-                let mode = 0;
-                entries.insert(logical.clone(), Entry(logical, 0, mode, put(store, bytes)?));
-            }
-        }
-        let snapshot = Self { entries: entries.into_values().collect() };
-        for (path, bytes) in structural {
-            let path = blaze_manifest::paths::normalize_path(path);
-            let path = path.canonicalize().unwrap_or(path);
-            let relative = path.strip_prefix(&root).with_context(|| {
-                format!("structural input {} is outside the snapshot", path.display())
-            })?;
-            let logical = SourcePath::from_native(relative)?;
-            let entry = snapshot.entries.iter().find(|entry| entry.0 == logical);
+            let relative = capture.relative(path)?;
+            let resolved = capture.path(&relative, false)?;
+            let logical = SourcePath::from_native(&resolved)?;
+            let entry = capture.entries.get(&logical);
             ensure!(
                 entry.is_some_and(|entry| entry.1 == 0 && entry.3 == hash(bytes)),
                 "input {} changed during resolution; retry the capture",
                 path.display()
             );
         }
+        let snapshot = Self { entries: capture.entries.into_values().collect() };
         let bytes = blaze_wire::encode(&snapshot);
         parse(&bytes)?;
         put(store, &bytes)?;
@@ -158,24 +154,69 @@ impl Snapshot {
         hash(&blaze_wire::encode(self))
     }
 
+    /// Add an authenticated regular file without replacing source content or following
+    /// source symlinks. This binds replay metadata to the same root as the source inputs.
+    pub fn with_file(self, path: &SourcePath, bytes: &[u8], store: &Path) -> anyhow::Result<Self> {
+        self.check()?;
+        let relative = path.to_native()?;
+        ensure!(relative != Path::new("."), "snapshot cannot replace its root");
+        let mut entries: BTreeMap<_, _> =
+            self.entries.into_iter().map(|entry| (entry.0.clone(), entry)).collect();
+        ensure!(
+            !entries.contains_key(path),
+            "snapshot input {} already exists",
+            relative.display()
+        );
+        for parent in relative.ancestors().skip(1).filter(|path| !path.as_os_str().is_empty()) {
+            let logical = SourcePath::from_native(parent)?;
+            if let Some(entry) = entries.get(&logical) {
+                ensure!(entry.1 == 1, "snapshot parent {} is not a directory", parent.display());
+            } else {
+                entries.insert(logical.clone(), Entry(logical, 1, 0, [0; 32]));
+            }
+        }
+        entries.insert(path.clone(), Entry(path.clone(), 0, 0, put(store, bytes)?));
+        let snapshot = Self { entries: entries.into_values().collect() };
+        let bytes = blaze_wire::encode(&snapshot);
+        parse(&bytes)?;
+        put(store, &bytes)?;
+        Ok(snapshot)
+    }
+
+    /// Read a regular file only after authenticating its manifest and content. A symlink
+    /// cannot stand in for control metadata even when it resolves to a captured file.
+    pub fn read_file(root: Digest, store: &Path, path: &SourcePath) -> anyhow::Result<Vec<u8>> {
+        let snapshot = parse(&get(store, &root)?)?;
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| &entry.0 == path)
+            .context("snapshot file is absent")?;
+        ensure!(entry.1 == 0, "snapshot input is not a regular file");
+        get(store, &entry.3)
+    }
+
     /// Load and authenticate a manifest and all its blob references before writing any
     /// source files. The destination must not already exist.
     pub fn materialize(root: Digest, store: &Path, destination: &Path) -> anyhow::Result<()> {
         let bytes = get(store, &root)?;
         let snapshot = parse(&bytes)?;
-        let mut contents = Vec::with_capacity(snapshot.entries.len());
         for Entry(_, kind, _, digest) in &snapshot.entries {
-            contents.push(if *kind == 1 { Vec::new() } else { get(store, digest)? });
+            if *kind != 1 {
+                // Authenticate the whole closure before creating the destination, without
+                // retaining all source contents in memory at once.
+                get(store, digest)?;
+            }
         }
         fs::create_dir(destination)?;
         let result = (|| {
-            for (Entry(logical, kind, mode, _), bytes) in snapshot.entries.iter().zip(&contents) {
+            for Entry(logical, kind, mode, digest) in &snapshot.entries {
                 let relative = logical.to_native()?;
                 let path = destination.join(&relative);
                 match kind {
                     1 => fs::create_dir(&path)?,
                     0 => {
-                        fs::write(&path, bytes)?;
+                        fs::write(&path, get(store, digest)?)?;
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
@@ -186,12 +227,9 @@ impl Snapshot {
                         #[cfg(unix)]
                         {
                             use std::os::unix::{ffi::OsStringExt, fs::symlink};
-                            let target = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+                            let target =
+                                PathBuf::from(std::ffi::OsString::from_vec(get(store, digest)?));
                             ensure!(!target.is_absolute(), "absolute symlink in snapshot");
-                            let joined = blaze_manifest::paths::normalize_path(
-                                &relative.parent().unwrap_or(Path::new("")).join(&target),
-                            );
-                            ensure!(!joined.starts_with(".."), "symlink escapes snapshot");
                             symlink(target, &path)?;
                         }
                         #[cfg(not(unix))]
@@ -242,79 +280,150 @@ impl Snapshot {
     }
 }
 
-fn directories(path: &Path, entries: &mut BTreeMap<SourcePath, Entry>) -> anyhow::Result<()> {
-    for path in
-        path.ancestors().filter(|path| !path.as_os_str().is_empty() && *path != Path::new("."))
-    {
-        let logical = SourcePath::from_native(path)?;
-        entries.entry(logical.clone()).or_insert(Entry(logical, 1, 0, [0; 32]));
-    }
-    Ok(())
-}
-
 fn parse(bytes: &[u8]) -> anyhow::Result<Snapshot> {
     Ok(blaze_wire::decode(bytes, &blaze_wire::Limits::default())?)
 }
 
-fn walk(
-    root: &Path,
-    relative: &Path,
-    outputs: &[PathBuf],
-    store: &Path,
-    entries: &mut BTreeMap<SourcePath, Entry>,
-) -> anyhow::Result<()> {
-    for entry in fs::read_dir(root.join(relative))? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_name() == ".git" || outputs.iter().any(|out| path.starts_with(out)) {
-            continue;
-        }
-        let relative = blaze_manifest::paths::normalize_path(path.strip_prefix(root)?);
-        let logical = SourcePath::from_native(&relative)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        let (kind, mode, digest) = if metadata.is_dir() {
-            (1, 0, [0; 32])
-        } else if metadata.is_file() {
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111
-            };
-            #[cfg(not(unix))]
-            let mode = 0;
-            let bytes = fs::read(&path)?;
-            (0, mode, put(store, &bytes)?)
-        } else if metadata.is_symlink() {
-            let target = fs::read_link(&path)?;
-            let resolved = path.canonicalize()?;
-            ensure!(
-                resolved.starts_with(root),
-                "symlink {} requires a wider source root",
-                path.display()
-            );
-            ensure!(
-                !target.is_absolute(),
-                "absolute symlink {} requires relocation",
-                path.display()
-            );
-            #[cfg(unix)]
-            let bytes = {
-                use std::os::unix::ffi::OsStrExt;
-                target.as_os_str().as_bytes().to_vec()
-            };
-            #[cfg(not(unix))]
-            let bytes =
-                target.to_str().context("unrepresentable symlink target")?.as_bytes().to_vec();
-            (2, 0, put(store, &bytes)?)
-        } else {
-            bail!("{} is not a source file, directory or symlink", path.display());
-        };
-        entries.insert(logical.clone(), Entry(logical, kind, mode, digest));
-        if kind == 1 {
-            walk(root, &relative, outputs, store, entries)?;
-        }
+struct Capture<'a> {
+    root: PathBuf,
+    given_root: PathBuf,
+    outputs: Vec<PathBuf>,
+    store: &'a Path,
+    store_root: PathBuf,
+    entries: BTreeMap<SourcePath, Entry>,
+    expanded: BTreeSet<PathBuf>,
+    links: BTreeMap<PathBuf, PathBuf>,
+}
+
+impl Capture<'_> {
+    fn relative(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let path = blaze_manifest::paths::normalize_path(&std::env::current_dir()?.join(path));
+        path.strip_prefix(&self.given_root)
+            .or_else(|_| path.strip_prefix(&self.root))
+            .map(Path::to_owned)
+            .with_context(|| format!("source input {} is outside the snapshot", path.display()))
     }
-    Ok(())
+
+    fn insert(
+        &mut self,
+        relative: &Path,
+        kind: u8,
+        mode: u32,
+        digest: Digest,
+    ) -> anyhow::Result<()> {
+        let logical = SourcePath::from_native(relative)?;
+        let entry = Entry(logical.clone(), kind, mode, digest);
+        if let Some(previous) = self.entries.get(&logical) {
+            ensure!(
+                previous == &entry,
+                "source input {} changed during capture",
+                relative.display()
+            );
+        } else {
+            self.entries.insert(logical, entry);
+        }
+        Ok(())
+    }
+
+    /// Retain links in the selected path itself and in its parents. Following only the
+    /// canonical pathname would lose aliases that a manifest or source file still names.
+    /// Every link includes its target closure, even when it is outside the selected trees.
+    fn path(&mut self, relative: &Path, expand: bool) -> anyhow::Result<PathBuf> {
+        ensure!(!relative.is_absolute(), "source path escapes snapshot");
+        let components: Vec<_> = relative
+            .components()
+            .filter(|component| *component != std::path::Component::CurDir)
+            .collect();
+        let mut at = PathBuf::new();
+        for (index, component) in components.iter().enumerate() {
+            if *component == std::path::Component::ParentDir {
+                ensure!(at.pop(), "source path escapes snapshot");
+                continue;
+            }
+            at.push(component.as_os_str());
+            let path = self.root.join(&at);
+            ensure!(
+                !path.starts_with(&self.store_root),
+                "source input refers to its snapshot blob store"
+            );
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_symlink() {
+                let native = fs::read_link(&path)?;
+                ensure!(
+                    !native.is_absolute(),
+                    "absolute symlink {} requires relocation",
+                    path.display()
+                );
+                let target = at.parent().unwrap_or(Path::new("")).join(&native);
+                let resolved = path.canonicalize()?;
+                let resolved = resolved
+                    .strip_prefix(&self.root)
+                    .with_context(|| {
+                        format!("symlink {} requires a wider source root", path.display())
+                    })?
+                    .to_owned();
+                #[cfg(unix)]
+                let bytes = {
+                    use std::os::unix::ffi::OsStrExt;
+                    native.as_os_str().as_bytes().to_vec()
+                };
+                #[cfg(not(unix))]
+                let bytes =
+                    native.to_str().context("unrepresentable symlink target")?.as_bytes().to_vec();
+                self.insert(&at, 2, 0, put(self.store, &bytes)?)?;
+                if let Some(previous) = self.links.get(&at) {
+                    ensure!(
+                        previous == &resolved,
+                        "symlink {} changed during capture",
+                        path.display()
+                    );
+                } else {
+                    self.links.insert(at.clone(), resolved.clone());
+                    // A source link makes its target an input even when the caller also
+                    // names that location as build output. Other output files stay omitted.
+                    let captured = self.path(&target, true)?;
+                    ensure!(
+                        captured == resolved,
+                        "symlink {} changed during capture",
+                        path.display()
+                    );
+                }
+                at = resolved;
+            } else if metadata.is_dir() {
+                self.insert(&at, 1, 0, [0; 32])?;
+            } else if metadata.is_file() {
+                ensure!(
+                    index + 1 == components.len(),
+                    "source file {} is not a directory",
+                    path.display()
+                );
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111
+                };
+                #[cfg(not(unix))]
+                let mode = 0;
+                self.insert(&at, 0, mode, put(self.store, &fs::read(&path)?)?)?;
+            } else {
+                bail!("{} is not a source file, directory or symlink", path.display());
+            }
+        }
+        if expand && self.root.join(&at).is_dir() && self.expanded.insert(at.clone()) {
+            for entry in fs::read_dir(self.root.join(&at))? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_name() == ".git"
+                    || path.starts_with(&self.store_root)
+                    || self.outputs.iter().any(|out| path == *out)
+                {
+                    continue;
+                }
+                self.path(path.strip_prefix(&self.root)?, true)?;
+            }
+        }
+        Ok(at)
+    }
 }
 
 fn hash(bytes: &[u8]) -> Digest {

@@ -24,12 +24,14 @@
 pub mod assemble;
 pub mod config;
 pub mod environment;
+pub mod execution;
 pub mod flags;
 pub mod git_path;
 pub mod platform;
 pub mod profile;
 pub mod recipe;
 mod refuse;
+pub mod replay;
 pub mod run;
 pub mod rustflags;
 pub mod snapshot;

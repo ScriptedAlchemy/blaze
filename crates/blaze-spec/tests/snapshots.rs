@@ -119,3 +119,206 @@ fn sparse_external_package_and_config_preserve_topology_without_copying_ancestor
     assert!(destination.join("home/.cargo/config.toml").is_file());
     assert!(!destination.join("unrelated").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn selected_tree_retains_transitive_symlink_inputs_without_copying_unrelated_files() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join("project/src")).unwrap();
+    fs::create_dir_all(root.join("shared")).unwrap();
+    fs::create_dir_all(root.join("native/include")).unwrap();
+    fs::write(root.join("native/include/header.h"), "original header").unwrap();
+    fs::write(root.join("native/unrelated"), "not an input").unwrap();
+    symlink("../native/include", root.join("shared/include")).unwrap();
+    symlink("../../shared/include", root.join("project/src/include")).unwrap();
+    let snapshot =
+        Snapshot::capture_selected(&root, &[root.join("project")], &[], &[], store.path()).unwrap();
+    fs::write(root.join("native/include/header.h"), "edited header").unwrap();
+    let edited =
+        Snapshot::capture_selected(&root, &[root.join("project")], &[], &[], store.path()).unwrap();
+    assert_ne!(snapshot.digest(), edited.digest());
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), store.path(), &destination).unwrap();
+    assert_eq!(
+        fs::read(destination.join("project/src/include/header.h")).unwrap(),
+        b"original header"
+    );
+    assert_eq!(
+        fs::read_link(destination.join("project/src/include")).unwrap(),
+        std::path::Path::new("../../shared/include")
+    );
+    assert!(destination.join("shared/include").is_symlink());
+    assert!(!destination.join("native/unrelated").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_tree_and_structural_aliases_survive_relocation() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.join("packages/app/src")).unwrap();
+    fs::create_dir_all(root.join("home")).unwrap();
+    fs::create_dir_all(root.join("configuration")).unwrap();
+    fs::write(root.join("packages/app/Cargo.toml"), "manifest").unwrap();
+    fs::write(root.join("packages/app/src/lib.rs"), "source").unwrap();
+    fs::write(root.join("configuration/config.toml"), "configuration").unwrap();
+    symlink("packages/app", root.join("selected")).unwrap();
+    symlink("../configuration", root.join("home/.cargo")).unwrap();
+    let snapshot = Snapshot::capture_selected(
+        &root,
+        &[root.join("selected")],
+        &[],
+        &[
+            (root.join("selected/Cargo.toml"), b"manifest".to_vec()),
+            (root.join("home/.cargo/config.toml"), b"configuration".to_vec()),
+        ],
+        store.path(),
+    )
+    .unwrap();
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), store.path(), &destination).unwrap();
+    assert!(destination.join("selected").is_symlink());
+    assert!(destination.join("home/.cargo").is_symlink());
+    assert_eq!(fs::read(destination.join("selected/src/lib.rs")).unwrap(), b"source");
+    assert_eq!(fs::read(destination.join("home/.cargo/config.toml")).unwrap(), b"configuration");
+}
+
+#[cfg(unix)]
+#[test]
+fn source_links_capture_referenced_output_without_unrelated_build_artifacts() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/generated.rs"), "generated input").unwrap();
+    fs::write(root.join("target/unrelated"), "build output").unwrap();
+    symlink("../target/generated.rs", root.join("source/generated.rs")).unwrap();
+    let snapshot = Snapshot::capture(&root, &[root.join("target")], &[], store.path()).unwrap();
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), store.path(), &destination).unwrap();
+    assert_eq!(fs::read(destination.join("source/generated.rs")).unwrap(), b"generated input");
+    assert!(!destination.join("target/unrelated").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_components_follow_symlink_directory_topology() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::create_dir_all(root.join("deep/one/two")).unwrap();
+    fs::write(root.join("deep/payload"), "resolved parent").unwrap();
+    fs::write(root.join("payload"), "root parent").unwrap();
+    symlink("../deep/one/two", root.join("source/pivot")).unwrap();
+    symlink("pivot/../../payload", root.join("source/data")).unwrap();
+    symlink("pivot/../../../payload", root.join("source/root-data")).unwrap();
+    let snapshot =
+        Snapshot::capture_selected(&root, &[root.join("source")], &[], &[], store.path()).unwrap();
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), store.path(), &destination).unwrap();
+    assert_eq!(fs::read(destination.join("source/data")).unwrap(), b"resolved parent");
+    assert_eq!(fs::read(destination.join("source/root-data")).unwrap(), b"root parent");
+}
+
+#[test]
+fn external_structural_reads_and_repeated_versions_must_match_captured_bytes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::create_dir(root.join("project")).unwrap();
+    fs::create_dir(root.join("config")).unwrap();
+    let config = root.join("config/settings.toml");
+    fs::write(&config, "old").unwrap();
+    let trees = [root.join("project")];
+    let reads = [
+        (config.clone(), b"old".to_vec()),
+        (config.clone(), b"intermediate".to_vec()),
+        (config.clone(), b"old".to_vec()),
+    ];
+    assert!(Snapshot::capture_selected(&root, &trees, &[], &reads, store.path()).is_err());
+    fs::write(&config, "new").unwrap();
+    assert!(
+        Snapshot::capture_selected(
+            &root,
+            &trees,
+            &[],
+            &[(config.clone(), b"old".to_vec())],
+            store.path()
+        )
+        .is_err()
+    );
+    assert!(
+        Snapshot::capture_selected(&root, &trees, &[], &[(config, b"new".to_vec())], store.path())
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_blob_store_inside_the_source_is_not_recaptured() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = root.join(".snapshots");
+    let worker = tempfile::tempdir().unwrap();
+    fs::write(root.join("input"), "source").unwrap();
+    let first = Snapshot::capture(&root, &[], &[], &store).unwrap();
+    let second = Snapshot::capture(&root, &[], &[], &store).unwrap();
+    assert_eq!(first.digest(), second.digest());
+    let destination = worker.path().join("image");
+    Snapshot::materialize(first.digest(), &store, &destination).unwrap();
+    assert!(!destination.join(".snapshots").exists());
+    assert_eq!(fs::read(destination.join("input")).unwrap(), b"source");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ancestor_directory_link_is_finite_but_a_link_to_the_store_is_refused() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = root.join(".snapshots");
+    let worker = tempfile::tempdir().unwrap();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::write(root.join("source/input"), "source").unwrap();
+    symlink(".", root.join("source/self")).unwrap();
+    let snapshot = Snapshot::capture(&root, &[], &[], &store).unwrap();
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), &store, &destination).unwrap();
+    assert_eq!(fs::read(destination.join("source/self/input")).unwrap(), b"source");
+    symlink("../.snapshots", root.join("source/store")).unwrap();
+    assert!(Snapshot::capture(&root, &[], &[], &store).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn output_and_store_directory_aliases_are_excluded_before_following_links() {
+    use std::os::unix::fs::symlink;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let outputs = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    fs::write(root.join("input"), "source").unwrap();
+    fs::write(outputs.path().join("artifact"), "build output").unwrap();
+    symlink(outputs.path(), root.join("target")).unwrap();
+    symlink(store.path(), root.join("store")).unwrap();
+    let snapshot =
+        Snapshot::capture(&root, &[root.join("target")], &[], &root.join("store")).unwrap();
+    let destination = worker.path().join("image");
+    Snapshot::materialize(snapshot.digest(), store.path(), &destination).unwrap();
+    assert_eq!(fs::read(destination.join("input")).unwrap(), b"source");
+    assert!(!destination.join("target").exists());
+    assert!(!destination.join("store").exists());
+}

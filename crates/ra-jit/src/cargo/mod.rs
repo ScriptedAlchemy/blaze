@@ -18,7 +18,7 @@ pub(crate) mod run;
 mod sandboxed;
 pub(crate) mod say;
 pub(crate) mod script;
-mod spec;
+pub(crate) mod spec;
 mod state;
 pub(crate) mod switch;
 mod toolchain;

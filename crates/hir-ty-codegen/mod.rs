@@ -15713,9 +15713,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let done = body(self);
         self.inner_pad = enclosing;
         done?;
-        let Some(after) = self.builder.current_block() else {
-            unsupported!("guarded call without a block to return to");
-        };
+        // Finish the normal path before laying out the exceptional path. Its
+        // continuation must be a new block, not an unfinished block revisited
+        // after emitting the landing pad.
+        let after = self.builder.create_block();
+        self.builder.ins().jump(after, &[]);
         self.builder.switch_to_block(pad);
         let exception = self.builder.block_params(pad)[0];
         self.in_cleanup = true;
@@ -16235,9 +16237,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.inner_pad = enclosing;
         dropped?;
-        let Some(after) = self.builder.current_block() else {
-            unsupported!("drop without a block to return to");
-        };
+        let after = self.builder.create_block();
+        self.builder.ins().jump(after, &[]);
         self.in_cleanup = true;
         let mut cleaned = Ok(());
         for at in 1..count {
@@ -16744,6 +16745,58 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use test_fixture::WithFixture;
+
+    fn compile_cleanup_edges(ladder: bool) {
+        let (db, _) = ide_db::RootDatabase::with_single_file("pub fn fixture() {}\n");
+        hir::attach_db(&db, || {
+            let krate = base_db::all_crates(&db)[0];
+            let env = super::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            };
+            let isa = super::target().unwrap();
+            let mut cg =
+                super::Recorder::new(&db, &**isa, super::selected_target().unwrap(), false);
+            let mut ctx = super::build(&mut cg, env, None, false, |fx| {
+                let entry = fx.builder.create_block();
+                fx.builder.switch_to_block(entry);
+                let slot = fx.scratch();
+                let operation = |fx: &mut super::FunctionCx<'_, '_>| -> super::Result<()> {
+                    let sig = fx.cg.make_signature();
+                    let callee = fx.cg.import("cleanup_test_call", &sig)?;
+                    let callee = fx.cg.declare_func_in_func(callee, fx.builder.func);
+                    fx.invoke(callee, &[]);
+                    // A returning call can be followed by writes in the same
+                    // block. The cleanup emitter must terminate that block.
+                    let value = fx.builder.ins().iconst(types::I32, 7);
+                    fx.builder.ins().store(super::MEM, value, slot, 0);
+                    Ok(())
+                };
+                if ladder {
+                    fx.drop_ladder(3, |fx, _| operation(fx))?;
+                } else {
+                    fx.guarded(operation, operation)?;
+                }
+                fx.builder.ins().return_(&[]);
+                Ok(())
+            })
+            .unwrap();
+            cranelift_codegen::verify_function(&ctx.func, &**isa).unwrap();
+            let code = super::emit(&mut ctx).unwrap();
+            assert!(!code.bytes.is_empty());
+        });
+    }
+
+    #[test]
+    fn guarded_cleanup_fills_normal_block_before_landing_pad() {
+        compile_cleanup_edges(false);
+    }
+
+    #[test]
+    fn drop_ladder_fills_normal_block_before_landing_pads() {
+        compile_cleanup_edges(true);
+    }
 
     /// `emit` names the function itself by a placeholder id until it is stitched, and
     /// `FuncId::from_u32` asserts `u32::MAX` away where debug assertions are on, as in
