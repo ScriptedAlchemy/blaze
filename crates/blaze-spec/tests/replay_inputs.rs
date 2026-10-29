@@ -329,6 +329,31 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
 }
 
 #[test]
+fn no_run_builds_the_test_executables_without_a_doctest_producer() {
+    let f = fixture();
+    f.write("src/lib.rs", "/// ```\n/// assert!(true);\n/// ```\npub fn library() {}\n");
+    for args in [vec!["--no-run"], vec![]] {
+        let store = tempfile::tempdir().unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        let made = saved(&f, Subcommand::Test, &args, store.path());
+        let prepared = prepared(&made, store.path(), &worker.path().join("source"));
+        let plans = blaze_spec::execution::programs(
+            &prepared,
+            Path::new("/toolchain"),
+            &worker.path().join("artifacts"),
+        );
+        if args.is_empty() {
+            assert!(plans.err().unwrap().to_string().contains("doctests"));
+        } else {
+            let plans = plans.unwrap();
+            assert!(!plans.is_empty());
+            assert!(plans.iter().all(|plan| !plan.run));
+            assert!(plans.iter().any(|plan| plan.project["crates"][0]["kind"] == "test"));
+        }
+    }
+}
+
+#[test]
 fn unsupported_owned_producers_are_rejected_by_preflight() {
     let f = fixture();
     f.write("build.rs", "fn main() {}");
