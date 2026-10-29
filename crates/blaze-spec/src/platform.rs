@@ -47,13 +47,19 @@
 //! The program is resolved in the directories of `Machine::env`'s `PATH`, with relative paths
 //! and empty PATH entries rooted at `Machine::cwd`. Probes run in that directory without
 //! changing the serving process's cwd. Child processes receive exactly `Machine::env`,
-//! with no serving-process variables inherited. No program by that name means the field is `None`: a
-//! build with no C dependency needs no compiler, and two machines that differ only in that one
+//! with no serving-process variables inherited. A tool that resolves inside
+//! the requester's source tree (`exec_platform_of`), is named by the digest of its bytes
+//! alone: it is never run, so its version is empty and `cc -print-file-name` is not asked of
+//! it. That is job code, and the platform is read before the inputs are compiled or admitted.
+//! A relative `PATH` entry is cargo's own: relative to the request's directory, which a replay
+//! relocates with the sources. The executor's own `PATH` is the worker's, and its relative
+//! entries are relative to the worker's process (`replay::prepare`). No program by that name
+//! means the field is `None`: a build with no C dependency needs no compiler, and two machines that differ only in that one
 //! has a compiler do not share a platform, which is the safe direction.
 //!
 //! The tuple is the program's file name as resolved, the first line of its `--version` output
-//! trimmed (empty when it cannot be run), and the SHA-256 of its bytes. The bytes are those of
-//! the file read through the probe, which follows a symlink; the name is that of the path the
+//! trimmed (empty when it cannot be run, or is not run, as above), and the SHA-256 of its
+//! bytes. The bytes are those of the file read through the probe, which follows a symlink; the name is that of the path the
 //! program was resolved to, not of the symlink's target, so `CC=cc` and `CC=clang` name
 //! differently while digesting the same bytes. A launcher's bytes are appended to the
 //! compiler's before the digest is taken.
@@ -272,6 +278,21 @@ struct InDirectory<'a> {
     probe: &'a dyn Probe,
     cwd: &'a Path,
     env: &'a BTreeMap<String, std::ffi::OsString>,
+    /// The requester's tree by its canonical name, when the machine has one.
+    requester: Option<PathBuf>,
+}
+
+impl InDirectory<'_> {
+    /// Whether `program` is a file of the requester's tree. Such a file is named by its bytes
+    /// and never run: the platform is read before the inputs are compiled or admitted, and a
+    /// program the requester shipped is job code, not the machine's toolchain.
+    fn supplied(&self, program: &Path) -> bool {
+        let Some(root) = &self.requester else {
+            return false;
+        };
+        let path = blaze_manifest::paths::normalize_path(&self.cwd.join(program));
+        path.canonicalize().unwrap_or(path).starts_with(root)
+    }
 }
 
 impl Probe for InDirectory<'_> {
@@ -282,12 +303,21 @@ impl Probe for InDirectory<'_> {
         self.probe.which_in(self.cwd, name, path).map(|path| self.cwd.join(path))
     }
     fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_native_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn run_path(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<Vec<u8>> {
+        if self.supplied(program) {
+            return None;
+        }
         self.probe.run_path_in(self.cwd, self.env, &self.cwd.join(program), args)
     }
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -433,7 +463,22 @@ pub struct Machine<'a> {
 /// The `ExecPlatform` of `machine`, read through `probe`, or a [`Refusal`] naming the field
 /// blaze cannot name.
 pub fn exec_platform(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
-    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env };
+    exec_platform_of(machine, probe, None)
+}
+
+/// [`exec_platform`] for a machine that is also a requester's tree: a tool that resolves inside
+/// `requester` is named by the digest of its bytes and is never run, so reading the platform
+/// runs nothing the requester supplied.
+pub fn exec_platform_of(
+    machine: &Machine<'_>,
+    probe: &dyn Probe,
+    requester: Option<&Path>,
+) -> Result<ExecPlatform, Refusal> {
+    let requester = requester.map(|root| {
+        let root = blaze_manifest::paths::normalize_path(root);
+        root.canonicalize().unwrap_or(root)
+    });
+    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env, requester };
     let probe: &dyn Probe = &scoped;
     let os = probe
         .os()
@@ -671,7 +716,7 @@ fn is_shim(path: &Path) -> bool {
 }
 
 /// The first line of what `path` prints for `--version`, trimmed, or an empty string when it
-/// cannot be run.
+/// cannot be run, or must not be: a tool of the requester's tree is named by its digest alone.
 fn version(probe: &dyn Probe, path: &Path) -> String {
     probe
         .run(path, &["--version"])

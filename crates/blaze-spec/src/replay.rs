@@ -277,8 +277,9 @@ pub fn capture(
     };
     // This pass also resolves workspace-relative configuration paths against the
     // final layout, rather than the provisional workspace root.
-    let mut resolved =
-        assemble::resolve_captured(request, &captured_ctx, &first.spec.platform, &first.sources)?;
+    // The platform is read again here: the requester's tree is now the layout root, which is
+    // what a replay's snapshot is, and a tool inside it is named by its bytes and not run.
+    let mut resolved = assemble::resolve_captured(request, &captured_ctx, None, &first.sources)?;
     resolved.inputs.extend(first.inputs);
     let config_files = config_files(words, ctx.cwd, &root, &resolved.inputs)?;
     let mut sources: Vec<_> = resolved
@@ -445,6 +446,15 @@ fn prepare_record(
     let workspace = root.join(given.workspace_manifest.to_native()?);
     let workspace = workspace.parent().context("workspace manifest has no directory")?;
     let mut native = invocation.env;
+    // The executor's PATH is the worker's: a relative or empty entry in it is relative to the
+    // worker's process, never to the replayed request's directory, where the requester's tree
+    // would answer for it. The requester's own PATH, below, is relative to its directory.
+    if let Some(path) = native.get("PATH") {
+        let process = std::env::current_dir().context("the worker's directory is unknown")?;
+        let entries = std::env::split_paths(path).map(|entry| process.join(entry));
+        let path = std::env::join_paths(entries).context("the executor's PATH cannot be rooted")?;
+        native.insert("PATH".to_owned(), path);
+    }
     for (name, value) in given.script_env.iter() {
         native.insert(name.clone(), value.materialize(workspace)?);
     }
@@ -497,7 +507,7 @@ fn prepare_record(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let resolved = assemble::resolve_captured(&request, &ctx, &record.platform, &sources)?;
+    let resolved = assemble::resolve_captured(&request, &ctx, Some(&record.platform), &sources)?;
     if let Some(difference) = crate::run::first_difference(given, &resolved.spec.build) {
         bail!("captured request does not match the BuildSpec: {difference}");
     }

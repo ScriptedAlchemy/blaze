@@ -177,13 +177,15 @@ pub fn resolve_recorded(
 
 /// Reproduce from authenticated locked source roots without invoking Git or registry
 /// transport. The complete locked set is checked before any external manifest is read.
+/// `platform` is the authenticated platform to reproduce against, or `None` to read it from
+/// the machine with `ctx.source_root` as the requester's tree.
 pub fn resolve_captured(
     request: &Request,
     ctx: &Context<'_>,
-    platform: &ExecPlatform,
+    platform: Option<&ExecPlatform>,
     sources: &[blaze_metadata::CapturedSource],
 ) -> Result<Resolved, Refusal> {
-    resolve_with_platform(request, ctx, Some(platform), Some(sources))
+    resolve_with_platform(request, ctx, platform, Some(sources))
 }
 
 fn resolve_with_platform(
@@ -415,9 +417,11 @@ fn assemble_with_inputs(
             env: &machine_env,
             linker: None,
         };
+        // The requester's tree is the replayed snapshot, or the workspace of a live request.
+        let requester = ctx.source_root.unwrap_or_else(|| opened.workspace.root());
         let platform = match recorded {
             Some(platform) => platform.clone(),
-            None => platform::exec_platform(&machine, ctx.probe)?,
+            None => platform::exec_platform_of(&machine, ctx.probe, Some(requester))?,
         };
         let platform_digest = digest_of(&platform);
 
