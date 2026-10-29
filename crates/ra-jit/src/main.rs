@@ -2858,11 +2858,18 @@ impl Checkouts {
             .filter(|(name, _)| name.to_str().is_some_and(cargo::runtime_context::package_variable))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let output_of = |env: &BTreeMap<OsString, OsString>| {
-            env.get(std::ffi::OsStr::new("OUT_DIR"))
-                .and_then(|out| outputs.iter().find(|(path, _)| path.as_os_str() == out))
+        let output_of = |krate: ide_db::base_db::Crate| -> anyhow::Result<_> {
+            let Some(out) = &krate.extra_data(db).blaze_build_script_out_dir else {
+                return Ok(None);
+            };
+            let out = paths::native::resolve(Path::new(out.as_str()))?;
+            let output = outputs
+                .iter()
+                .find(|(path, _)| *path == out)
+                .context("program output directory has no matching held script output")?;
+            Ok(Some(output))
         };
-        if let Some((out, output)) = output_of(&root_env) {
+        if let Some((out, output)) = output_of(root)? {
             environment.insert("OUT_DIR".into(), out.as_os_str().to_owned());
             environment.extend(output.env.iter().map(|(name, value)| (name.into(), value.into())));
         }
@@ -2882,7 +2889,7 @@ impl Checkouts {
             {
                 continue;
             }
-            if let Some((_, output)) = output_of(&native_env(krate)?) {
+            if let Some((_, output)) = output_of(krate)? {
                 libraries.extend(cargo::loader::artifact_directories(output));
             }
             pending

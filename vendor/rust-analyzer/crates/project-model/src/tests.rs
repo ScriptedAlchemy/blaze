@@ -527,3 +527,30 @@ fn smoke_test_real_sysroot_cargo() {
         &Default::default(),
     );
 }
+
+#[test]
+fn script_output_identity_is_independent_of_an_out_dir_environment_override() {
+    let mut workspace = load_workspace_from_metadata("hello-world-metadata.json");
+    let ProjectWorkspaceKind::Cargo { cargo, build_scripts, .. } = &mut workspace.kind else {
+        unreachable!()
+    };
+    let package = cargo.packages().find(|&package| cargo[package].is_member).unwrap();
+    let out = AbsPathBuf::assert_utf8(std::env::temp_dir().join("producer-output-identity"));
+    let override_value = "overridden-by-script";
+    let message = serde_json::json!({
+        "reason": "build-script-executed", "package_id": cargo[package].id.repr,
+        "linked_libs": [], "linked_paths": [], "cfgs": [],
+        "env": [["OUT_DIR", override_value]], "out_dir": out.as_str(),
+    })
+    .to_string();
+    *build_scripts = WorkspaceBuildScripts::of_messages(cargo, [message.as_str()]);
+    assert!(build_scripts.error().is_none());
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let owners: Vec<_> =
+        graph.iter().filter(|&id| graph[id].extra.blaze_build_script_out_dir.is_some()).collect();
+    assert!(!owners.is_empty());
+    for owner in owners {
+        assert_eq!(graph[owner].extra.blaze_build_script_out_dir.as_ref(), Some(&out));
+        assert_eq!(graph[owner].env.get("OUT_DIR").as_deref(), Some(override_value));
+    }
+}

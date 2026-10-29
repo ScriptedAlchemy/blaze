@@ -23,6 +23,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: None,
             display_name: Some(
                 CrateDisplayName {
@@ -78,6 +79,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: None,
             display_name: Some(
                 CrateDisplayName {

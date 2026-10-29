@@ -1829,6 +1829,10 @@ fn add_target_crate_root(
         proc_macro_cwd,
         crate_ws_data,
     );
+    crate_graph.set_build_script_out_dir(
+        crate_id,
+        build_data.and_then(|(output, _)| output.out_dir.clone()),
+    );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
         let proc_macro = match build_data {
             Some((BuildScriptOutput { proc_macro_dylib_path, .. }, has_errors)) => {

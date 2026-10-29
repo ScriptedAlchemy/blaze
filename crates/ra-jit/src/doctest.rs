@@ -1628,6 +1628,7 @@ fn add_crates(
         };
         let extra = ExtraCrateData {
             blaze_native_unit: library.extra_data(db).blaze_native_unit,
+            blaze_build_script_out_dir: library.extra_data(db).blaze_build_script_out_dir.clone(),
             version: None,
             display_name: Some(CrateDisplayName::from_canonical_name(&name)),
             potential_cfg_options: None,

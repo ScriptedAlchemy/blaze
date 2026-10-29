@@ -32,6 +32,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: Some(
                 "0.1.0",
             ),
@@ -120,6 +121,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: Some(
                 "0.1.0",
             ),
@@ -209,6 +211,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: Some(
                 "0.1.0",
             ),
@@ -298,6 +301,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: Some(
                 "0.1.0",
             ),
@@ -371,6 +375,7 @@
         },
         extra: ExtraCrateData {
             blaze_native_unit: None,
+            blaze_build_script_out_dir: None,
             version: Some(
                 "0.2.98",
             ),
