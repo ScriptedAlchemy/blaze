@@ -52,6 +52,10 @@ Copy both `FILE` and `FILE.inputs/` to replay after deleting the original checko
 Replay materializes the snapshot, reproduces the request offline, compares the complete
 BuildSpec and verifies the execution platform before invoking the owned compiler.
 Config values preserve literal/workspace-relative tags through this process.
+A Cargo home that is neither inside nor around the workspace is kept in the snapshot under
+`.blaze-cargo-home/`, so the layout root, and with it the spec's paths and digests, is the
+workspace's and not an absolute prefix or the Cargo home's place beside it. Absolute path
+dependencies and absolute symlinks are not portable and are refused at capture.
 
 The connected executor builds binaries/examples from source dependencies and supports
 unit/integration test executables. `test --no-run` builds those executables and skips
@@ -71,6 +75,7 @@ differential acceptance and LLVM/macOS execution remain separate from source rep
 
 ```
 cargo +1.99.0 test -p blaze-wire -p blaze-spec -p blaze-metadata
+python3 -I harness/dist/saved_spec.py --blaze /path/to/ra-jit --work /tmp/saved-spec
 python3 -I harness/dist/buildspec.py --bin /path/to/ra-jit
 ```
 

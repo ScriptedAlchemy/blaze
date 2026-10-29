@@ -27,6 +27,8 @@ use crate::{
 };
 
 const SOURCES: &str = ".blaze-sources.cbor";
+/// Where a Cargo home outside the workspace's own layout is kept in the snapshot.
+const CARGO_HOME: &str = ".blaze-cargo-home";
 
 /// The inputs that have passed source, request, graph, toolchain and platform validation.
 pub struct Prepared {
@@ -231,10 +233,35 @@ pub fn capture(
     layout.extend(first.inputs.iter().filter_map(|(path, _)| path.parent().map(Path::to_owned)));
     // The layout is made of directories: spell each by its canonical name, so one directory
     // never appears under two names in the common root.
-    let root = common_root(layout.into_iter().map(|path| {
-        let path = blaze_manifest::paths::normalize_path(&path);
+    let canonical = |path: &Path| {
+        let path = blaze_manifest::paths::normalize_path(path);
         path.canonicalize().unwrap_or(path)
-    }))?;
+    };
+    // A Cargo home beside or above the workspace is mounted in the snapshot rather than laid
+    // out around it: otherwise the layout root, and with it every path and digest of the
+    // spec, would depend on where the home lives relative to the sources, and on the
+    // directories above both. Only a home that neither holds nor lies in the workspace is
+    // mounted; one inside it is captured with the rest.
+    let home_dir = canonical(&home);
+    let workspace_dir = canonical(&first.graph.root);
+    let mounted = !workspace_dir.starts_with(&home_dir) && !home_dir.starts_with(&workspace_dir);
+    let in_home = |path: &Path| mounted && anchor(&home_dir, path).starts_with(&home_dir);
+    let root = common_root(
+        layout
+            .into_iter()
+            .map(|path| canonical(&path))
+            .filter(|path| !(mounted && path.starts_with(&home_dir))),
+    )?;
+    // Where a path is in the snapshot: below the layout root, or in the mounted home.
+    let place = |path: &Path| -> anyhow::Result<SourcePath> {
+        if in_home(path) {
+            let inside = anchor(&home_dir, path);
+            let inside = inside.strip_prefix(&home_dir)?;
+            Ok(SourcePath::from_native(&Path::new(CARGO_HOME).join(inside))?)
+        } else {
+            relative(&root, path)
+        }
+    };
     let captured_ctx = Context {
         source_root: Some(&root),
         config_root: ctx.config_root,
@@ -260,7 +287,7 @@ pub fn capture(
         .map(|source| {
             Ok((
                 (source.source.clone(), source.name.clone(), source.version.clone()),
-                relative(&root, &source.root)?,
+                place(&source.root)?,
             ))
         })
         .collect::<anyhow::Result<_>>()?;
@@ -268,15 +295,29 @@ pub fn capture(
     let mut excluded = resolved.outputs;
     excluded.extend_from_slice(outputs);
     excluded.push(store.to_owned());
+    let (home_trees, trees): (Vec<_>, Vec<_>) = trees.iter().partition(|path| in_home(path));
+    let (home_inputs, inputs): (Vec<_>, Vec<_>) =
+        resolved.inputs.iter().partition(|(path, _)| in_home(path));
     let trees: Vec<_> = trees.iter().map(|path| anchor(&root, path)).collect();
     let inputs: Vec<_> =
-        resolved.inputs.iter().map(|(path, bytes)| (anchor(&root, path), bytes.clone())).collect();
-    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &inputs, store)?
-        .with_file(
-            &SourcePath::new(SOURCES.to_owned())?,
-            &blaze_wire::encode(&(1_u32, sources)),
-            store,
-        )?;
+        inputs.iter().map(|(path, bytes)| (anchor(&root, path), bytes.clone())).collect();
+    let mut snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &inputs, store)?;
+    let has_home = !home_trees.is_empty() || !home_inputs.is_empty();
+    if has_home {
+        let trees: Vec<_> = home_trees.iter().map(|path| anchor(&home_dir, path)).collect();
+        let inputs: Vec<_> = home_inputs
+            .iter()
+            .map(|(path, bytes)| (anchor(&home_dir, path), bytes.clone()))
+            .collect();
+        let at = SourcePath::new(CARGO_HOME.to_owned())?;
+        let held = Snapshot::capture_selected(&home_dir, &trees, &excluded, &inputs, store)?;
+        snapshot = snapshot.with_mount(&at, held)?;
+    }
+    let snapshot = snapshot.with_file(
+        &SourcePath::new(SOURCES.to_owned())?,
+        &blaze_wire::encode(&(1_u32, sources)),
+        store,
+    )?;
     let mut made = resolved.spec;
     made.build.source = SourceRef::Root(RootRef { root: snapshot.digest() });
     // The warm front-end and configuration keys intentionally do not contain source.
@@ -291,19 +332,23 @@ pub fn capture(
         .collect();
     let record = Record {
         recipe: ReplayRecipe::capture(&made.build, subcommand, words, &recipe_env, &config_files)?,
-        manifest: relative(&root, &resolved.manifest)?,
+        manifest: place(&resolved.manifest)?,
         // An empty external Cargo home is not a source input and must not make the
         // source root depend on the absolute spelling of a checkout's location.
-        cargo_home: resolved
-            .inputs
-            .iter()
-            .any(|(path, _)| {
-                let path = anchor(&root, path);
-                path == anchor(&root, &home).join("config")
-                    || path == anchor(&root, &home).join("config.toml")
-            })
-            .then(|| relative(&root, &home))
-            .transpose()?,
+        cargo_home: if has_home {
+            Some(SourcePath::new(CARGO_HOME.to_owned())?)
+        } else {
+            resolved
+                .inputs
+                .iter()
+                .any(|(path, _)| {
+                    let path = anchor(&root, path);
+                    path == anchor(&root, &home).join("config")
+                        || path == anchor(&root, &home).join("config.toml")
+                })
+                .then(|| relative(&root, &home))
+                .transpose()?
+        },
         platform: made.platform.clone(),
     };
     let relocated = tempfile::tempdir()?;

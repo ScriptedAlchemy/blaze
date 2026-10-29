@@ -183,6 +183,38 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    /// Place the captured tree `mounted` at the directory `at`, which holds nothing else.
+    /// The result addresses its files below `at`, whatever the mounted tree's original
+    /// root was, so the snapshot does not name where that root lived. Links of `mounted`
+    /// were checked to stay inside it, and still do.
+    pub fn with_mount(self, at: &SourcePath, mounted: Snapshot) -> anyhow::Result<Self> {
+        self.check()?;
+        mounted.check()?;
+        let prefix = at.to_native()?;
+        ensure!(prefix != Path::new("."), "a mount cannot replace the snapshot root");
+        let mut entries: BTreeMap<_, _> =
+            self.entries.into_iter().map(|entry| (entry.0.clone(), entry)).collect();
+        for parent in prefix.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+            let logical = SourcePath::from_native(parent)?;
+            if let Some(entry) = entries.get(&logical) {
+                ensure!(
+                    entry.1 == 1 && parent != prefix,
+                    "mount point {} is already in the snapshot",
+                    parent.display()
+                );
+            } else {
+                entries.insert(logical.clone(), Entry(logical, 1, 0, [0; 32]));
+            }
+        }
+        for Entry(logical, kind, mode, digest) in mounted.entries {
+            let moved = SourcePath::from_native(&prefix.join(logical.to_native()?))?;
+            entries.insert(moved.clone(), Entry(moved, kind, mode, digest));
+        }
+        let snapshot = Self { entries: entries.into_values().collect() };
+        snapshot.check()?;
+        Ok(snapshot)
+    }
+
     /// Read a regular file only after authenticating its manifest and content. A symlink
     /// cannot stand in for control metadata even when it resolves to a captured file.
     pub fn read_file(root: Digest, store: &Path, path: &SourcePath) -> anyhow::Result<Vec<u8>> {

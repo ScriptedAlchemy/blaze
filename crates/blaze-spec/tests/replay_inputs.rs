@@ -447,10 +447,53 @@ fn another_name_for_a_directory_above_the_inputs_does_not_widen_the_layout() {
     let store = tempfile::tempdir().unwrap();
     let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
     assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_HOME"));
-    let name = root.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         made.build.workspace_manifest.to_native().unwrap(),
-        Path::new(name).join("Cargo.toml"),
-        "the layout root is the real parent directory, not the unrelated one the alias lives in"
+        Path::new("Cargo.toml"),
+        "the layout root is the workspace, however the Cargo home beside it is spelled"
     );
+    drop(f);
+    drop(real);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert_eq!(replay.execution_environment().unwrap()["FROM_HOME"], "yes");
+}
+
+/// One project captured with its Cargo home at `home` under `base`, and the workspace at
+/// `workspace`, both below `base`.
+fn captured_at(base: &Path, workspace: &str, home: &str) -> Spec {
+    let parent = base.join(workspace);
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(base.join(home)).unwrap();
+    std::fs::write(base.join(home).join("config.toml"), "[env]\nFROM_HOME='yes'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&parent).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert(
+        "CARGO_HOME".to_owned(),
+        base.join(home).canonicalize().unwrap().display().to_string(),
+    );
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap()
+}
+
+#[test]
+fn identity_does_not_depend_on_where_the_sources_and_cargo_home_are() {
+    let one = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let here = captured_at(&one.path().canonicalize().unwrap(), "work", "home");
+    // Deeper, and the Cargo home somewhere else under the same base.
+    let there =
+        captured_at(&other.path().canonicalize().unwrap(), "users/someone/code", "opt/cargo");
+    assert_eq!(here.build, there.build);
+    assert_eq!(here.digest, there.digest);
 }
