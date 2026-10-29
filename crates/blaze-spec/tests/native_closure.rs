@@ -221,48 +221,71 @@ fn parent_components_require_observed_directories_and_keep_missing_prefixes_miss
     assert!(closure.admit(&path, actual.entry(Path::new("")).unwrap()).is_err());
 }
 
+#[cfg(unix)]
+fn ancestor_path(aliased: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::symlink;
+    let work = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(work.path()).unwrap();
+    let physical = base.join("physical");
+    fs::create_dir(&physical).unwrap();
+    let root = if aliased {
+        let alias = base.join("ancestor-alias");
+        symlink("physical", &alias).unwrap();
+        alias
+    } else {
+        physical
+    };
+    (work, root)
+}
+
 #[test]
 #[cfg(unix)]
 fn symlink_parent_components_follow_the_referent_without_granting_an_escape() {
     use std::os::unix::fs::symlink;
-    let work = tempfile::tempdir().unwrap();
-    let source = work.path().join("source");
-    let external = work.path().join("external");
-    fs::create_dir_all(source.join("library")).unwrap();
-    fs::create_dir_all(external.join("inner")).unwrap();
-    fs::create_dir(external.join("library")).unwrap();
-    fs::write(source.join("library/choice.a"), b"lexical choice is wrong").unwrap();
-    fs::write(external.join("library/choice.a"), b"actual native choice").unwrap();
-    symlink(&external.join("inner"), source.join("alias")).unwrap();
-    let path = source.join("alias/../library/choice.a");
-    assert_eq!(fs::read(&path).unwrap(), b"actual native choice");
-    let source_only = captured("source", &source);
-    assert!(source_only.entry(&path).is_none(), "the symlink's parent was not captured");
-    let mut both = source_only;
-    both.roots
-        .push(Root { name: "native-dependency".into(), tree: Tree::capture(&external).unwrap() });
-    let actual = Tree::capture(&path).unwrap();
-    both.admit(&path, actual.entry(Path::new("")).unwrap()).unwrap();
-    assert_eq!(both.entry(&path), both.entry(&external.join("library/choice.a")));
-    assert_ne!(both.entry(&path), both.entry(&source.join("library/choice.a")));
+    for aliased in [false, true] {
+        let (_work, base) = ancestor_path(aliased);
+        let source = base.join("source");
+        let external = base.join("external");
+        fs::create_dir_all(source.join("library")).unwrap();
+        fs::create_dir_all(external.join("inner")).unwrap();
+        fs::create_dir(external.join("library")).unwrap();
+        fs::write(source.join("library/choice.a"), b"lexical choice is wrong").unwrap();
+        fs::write(external.join("library/choice.a"), b"actual native choice").unwrap();
+        symlink(&external.join("inner"), source.join("alias")).unwrap();
+        let path = source.join("alias/../library/choice.a");
+        assert_eq!(fs::read(&path).unwrap(), b"actual native choice");
+        let source_only = captured("source", &source);
+        assert!(source_only.entry(&path).is_none(), "the symlink's parent was not captured");
+        let mut both = source_only;
+        both.roots.push(Root {
+            name: "native-dependency".into(),
+            tree: Tree::capture(&external).unwrap(),
+        });
+        let actual = Tree::capture(&path).unwrap();
+        both.admit(&path, actual.entry(Path::new("")).unwrap()).unwrap();
+        assert_eq!(both.entry(&path), both.entry(&external.join("library/choice.a")));
+        assert_ne!(both.entry(&path), both.entry(&source.join("library/choice.a")));
+    }
 }
 
 #[test]
 #[cfg(unix)]
 fn observed_root_aliases_and_compiler_style_parent_roots_retain_physical_authority() {
     use std::os::unix::fs::symlink;
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("a")).unwrap();
-    fs::create_dir(root.path().join("b")).unwrap();
-    let library = root.path().join("b/library.a");
-    fs::write(&library, b"library").unwrap();
-    let compiler_root = root.path().join("a/../b");
-    symlink("b", root.path().join("alias")).unwrap();
-    for bound in [compiler_root, root.path().join("alias")] {
-        let closure = captured("linker/libraries/0", &bound);
-        for path in [bound.join("library.a"), library.clone()] {
-            let actual = Tree::capture(&path).unwrap();
-            closure.admit(&path, actual.entry(Path::new("")).unwrap()).unwrap();
+    for aliased in [false, true] {
+        let (_work, root) = ancestor_path(aliased);
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        let library = root.join("b/library.a");
+        fs::write(&library, b"library").unwrap();
+        let compiler_root = root.join("a/../b");
+        symlink("b", root.join("alias")).unwrap();
+        for bound in [compiler_root, root.join("alias")] {
+            let closure = captured("linker/libraries/0", &bound);
+            for path in [bound.join("library.a"), library.clone()] {
+                let actual = Tree::capture(&path).unwrap();
+                closure.admit(&path, actual.entry(Path::new("")).unwrap()).unwrap();
+            }
         }
     }
 }

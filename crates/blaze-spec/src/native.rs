@@ -34,6 +34,43 @@ pub struct Closure {
 impl Closure {
     /// The bound identity of an input or absent search candidate, without filesystem reads.
     pub fn entry(&self, path: &Path) -> Option<Entry> {
+        if let Some(entry) = self.entry_at(path) {
+            return Some(entry);
+        }
+        let mut aliases = BTreeMap::<&Path, Option<&Path>>::new();
+        for root in &self.roots {
+            for (alias, resolved) in root.tree.ancestor_aliases() {
+                aliases
+                    .entry(alias)
+                    .and_modify(|previous| {
+                        if *previous != Some(resolved) {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(Some(resolved));
+            }
+        }
+        let mut current = path.to_owned();
+        let mut visited = BTreeSet::from([current.clone()]);
+        while let Some((alias, resolved)) = aliases
+            .iter()
+            .filter(|(alias, _)| current.starts_with(alias))
+            .max_by_key(|(alias, _)| alias.components().count())
+        {
+            let resolved = (*resolved)?;
+            let relative = current.strip_prefix(alias).ok()?;
+            current = resolved.join(relative);
+            if !visited.insert(current.clone()) {
+                return None;
+            }
+            if let Some(entry) = self.entry_at(&current) {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    fn entry_at(&self, path: &Path) -> Option<Entry> {
         for root in &self.roots {
             let Ok(relative) = path.strip_prefix(&root.tree.root) else { continue };
             if relative.components().any(|part| matches!(part, Component::ParentDir)) {

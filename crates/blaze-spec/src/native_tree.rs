@@ -51,6 +51,7 @@ pub struct Tree {
     /// All logical nodes in native pathname order.
     pub entries: BTreeMap<PathBuf, Entry>,
     resolved_root: Option<PathBuf>,
+    ancestor_links: BTreeMap<PathBuf, PathBuf>,
     raw_links: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>>,
     locations: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
 }
@@ -70,6 +71,7 @@ impl Tree {
             root: root.clone(),
             entries: BTreeMap::new(),
             resolved_root,
+            ancestor_links: first.ancestors.clone(),
             raw_links: BTreeMap::new(),
             locations: BTreeMap::new(),
         };
@@ -141,6 +143,7 @@ impl Tree {
             entries: BTreeMap::new(),
             resolved_root: matches!(resolved.kind, ResolvedKind::Directory(_))
                 .then(|| resolved.path.clone()),
+            ancestor_links: resolved.ancestors.clone(),
             raw_links: BTreeMap::new(),
             locations: BTreeMap::new(),
         };
@@ -252,7 +255,14 @@ impl Tree {
                 (relative.clone(), (path.clone(), path))
             })
             .collect();
-        Ok(Self { root, entries, resolved_root: None, raw_links: BTreeMap::new(), locations })
+        Ok(Self {
+            root,
+            entries,
+            resolved_root: None,
+            ancestor_links: BTreeMap::new(),
+            raw_links: BTreeMap::new(),
+            locations,
+        })
     }
 
     /// Hash the complete logical tree, without reading the filesystem.
@@ -324,11 +334,16 @@ impl Tree {
         })
     }
 
+    pub(crate) fn ancestor_aliases(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.ancestor_links.iter().map(|(alias, resolved)| (alias.as_path(), resolved.as_path()))
+    }
+
     fn visible_links(&self, links: Vec<(PathBuf, PathBuf)>) -> Vec<PathBuf> {
         links
             .into_iter()
             .filter_map(|(at, target)| {
-                let ancestor = (at != self.root && self.root.starts_with(&at))
+                let ancestor = self.ancestor_links.contains_key(&at)
+                    || (at != self.root && self.root.starts_with(&at))
                     || self
                         .resolved_root
                         .as_ref()
@@ -345,7 +360,7 @@ impl Tree {
         resolved: Resolved,
         active: &mut BTreeSet<PathBuf>,
     ) -> io::Result<()> {
-        let Resolved { path, links, kind } = resolved;
+        let Resolved { path, links, kind, .. } = resolved;
         self.locations.insert(logical.to_owned(), (requested.to_owned(), path.clone()));
         self.raw_links.insert(logical.to_owned(), links.clone());
         let links = self.visible_links(links);
@@ -452,6 +467,7 @@ fn names(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 struct Resolved {
     path: PathBuf,
     links: Vec<(PathBuf, PathBuf)>,
+    ancestors: BTreeMap<PathBuf, PathBuf>,
     kind: ResolvedKind,
 }
 
@@ -464,23 +480,28 @@ enum ResolvedKind {
 
 fn resolve(path: &Path) -> io::Result<Resolved> {
     let mut links = Vec::new();
-    let (resolved, kind) = resolve_path(path, &mut BTreeSet::new(), &mut links)?;
+    let mut ancestors = BTreeMap::new();
+    let (resolved, kind) =
+        resolve_path(path, &mut BTreeSet::new(), &mut links, &mut ancestors, None)?;
     if let ResolvedKind::File(metadata) | ResolvedKind::Directory(metadata) = &kind
         && Stamp::of(metadata)? != Stamp::of(&fs::metadata(path)?)?
     {
         return Err(changed(path));
     }
-    Ok(Resolved { path: resolved, links, kind })
+    Ok(Resolved { path: resolved, links, ancestors, kind })
 }
 
 fn resolve_path(
     path: &Path,
     active: &mut BTreeSet<PathBuf>,
     links: &mut Vec<(PathBuf, PathBuf)>,
+    ancestors: &mut BTreeMap<PathBuf, PathBuf>,
+    ancestor: Option<bool>,
 ) -> io::Result<(PathBuf, ResolvedKind)> {
     let mut current = PathBuf::new();
     let mut metadata = None;
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         match component {
             Component::Prefix(prefix) => {
                 current.push(prefix.as_os_str());
@@ -526,7 +547,14 @@ fn resolve_path(
                     }
                     links.push((current.clone(), target.clone()));
                     let destination = current.parent().unwrap_or(Path::new("/")).join(target);
-                    let result = resolve_path(&destination, active, links)?;
+                    // Prefix expansions precede the captured root. The final root's
+                    // own symlink chain remains part of its identity.
+                    let is_ancestor = ancestor.unwrap_or_else(|| components.peek().is_some());
+                    let result =
+                        resolve_path(&destination, active, links, ancestors, Some(is_ancestor))?;
+                    if is_ancestor {
+                        ancestors.insert(current.clone(), result.0.clone());
+                    }
                     active.remove(&current);
                     current = result.0;
                     match result.1 {

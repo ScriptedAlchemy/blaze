@@ -91,13 +91,7 @@ fn canned_files_derive_the_same_complete_tree_as_regular_files() {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use std::{
-        ffi::OsString,
-        os::unix::{
-            ffi::OsStringExt,
-            fs::{PermissionsExt, symlink},
-        },
-    };
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn relocation_normalizes_internal_absolute_symlinks() {
@@ -191,17 +185,29 @@ mod unix {
     }
 
     #[test]
-    fn native_file_names_and_executable_bits_change_identity() {
+    fn executable_permissions_change_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("header.h");
+        fs::write(&path, b"header").unwrap();
+        let before = digest(root.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(before, digest(root.path()));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(before, digest(root.path()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn raw_file_names_change_identity() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
         let root = tempfile::tempdir().unwrap();
         let name = OsString::from_vec(b"header-\xff.h".to_vec());
         let path = root.path().join(&name);
         fs::write(&path, b"raw name").unwrap();
         let before = Tree::capture(root.path()).unwrap();
         assert!(before.entry(Path::new(&name)).is_some());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&path, root.path().join(OsString::from_vec(b"header-\xfe.h".to_vec()))).unwrap();
         assert_ne!(before.digest(), digest(root.path()));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(before.digest(), digest(root.path()));
     }
 
     #[test]
@@ -291,35 +297,40 @@ fn batch_observes_content_and_membership_changes_between_calls() {
 
 #[cfg(unix)]
 #[test]
-fn batch_preserves_aliases_external_referents_raw_names_and_parent_components() {
-    use std::{
-        ffi::OsString,
-        os::unix::{ffi::OsStringExt, fs::symlink},
-    };
+fn batch_preserves_aliases_external_referents_and_parent_components() {
+    use std::os::unix::fs::symlink;
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("physical");
     write(&root, "SDK/include/native.h", b"header");
     write(parent.path(), "external/other.h", b"outside");
-    let raw = OsString::from_vec(b"raw-\xff".to_vec());
-    fs::write(root.join("SDK/include").join(&raw), b"raw header").unwrap();
     symlink("physical", parent.path().join("alias")).unwrap();
     symlink("include/native.h", root.join("SDK/relative-file")).unwrap();
     symlink(parent.path().join("alias/SDK/include/native.h"), root.join("SDK/absolute-file"))
         .unwrap();
     symlink(parent.path().join("external"), root.join("SDK/external")).unwrap();
     symlink("absent", root.join("SDK/broken")).unwrap();
-    same_batch_and_single(&[
+    let paths = vec![
         root.join("SDK/include"),
         parent.path().join("alias/SDK"),
         root.join("SDK/relative-file"),
         root.join("SDK/absolute-file"),
         root.join("SDK/external"),
         root.join("SDK/broken"),
-        root.join("SDK/include").join(&raw),
         root.join("SDK/include/.."),
         root.clone(),
         root.join("SDK"),
-    ]);
+    ];
+    // APFS rejects invalid UTF-8 names; all symlink and parent-path cases still run there.
+    #[cfg(target_os = "linux")]
+    let paths = {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let raw = root.join("SDK/include").join(OsString::from_vec(b"raw-\xff".to_vec()));
+        fs::write(&raw, b"raw header").unwrap();
+        let mut paths = paths;
+        paths.push(raw);
+        paths
+    };
+    same_batch_and_single(&paths);
 }
 
 #[cfg(unix)]
