@@ -24,9 +24,12 @@ prints one JSON object {refused, digests{spec,platform,front_end,config,job_cont
 {command,asked,units}, spec, platform} and exits 0 (a spec), 2 (refused: the object is still
 printed) or 1 (any other error: a message on stderr); with `--unit-graph` it prints blaze's unit
 graph in the shape of `cargo build --unit-graph -Z unstable-options`; `--out` writes the spec's
-canonical CBOR. `ra-jit cargo spec --run FILE` derives the flags and the environment from the spec
-alone, recomputes the spec, refuses (exit 2, `blaze: the tree does not match the spec: <field>`)
-when its digest differs and otherwise does what `ra-jit cargo <command>` does.
+canonical CBOR and keeps the source it was made from beside it, in `FILE.inputs`. `ra-jit cargo spec
+--run FILE` derives the flags and the environment from the spec alone, restores that source into a
+directory of its own, recomputes the spec there and runs it: the checkout it is run from, and
+whether that checkout still exists, make no difference. A command or unit kind the owned executor
+does not run yet is a refusal that names it (`owned BuildSpec replay does not yet ...`), not a
+mismatch, and the local arm reports it as `unsupported`.
 
 The arms:
 
@@ -48,7 +51,10 @@ The arms:
                 are `RunSpec.doc`).
   local (9)     `ra-jit cargo <command>` in a fresh copy of the fixture, and `ra-jit cargo spec --run
                 <spec.cbor>` in another fresh copy of the same commit (with none of the case's
-                environment: the spec alone), each with a fresh CARGO_TARGET_DIR and RA_JIT_HOME:
+                environment: the spec alone), each with a fresh CARGO_TARGET_DIR and RA_JIT_HOME.
+                The spec is also run from the checkout of another commit, and has to do exactly what
+                it did from its own: the saved source decides, not the checkout.
+                What the two runs share:
                 the programs built, the tests run, the doc tests run, what the programs and the
                 custom harness printed, and the exit status have to be equal. Both runs are under
                 tracedecay.py's memory guard (RA_JIT_MEMORY_MAX=16G, RA_JIT_OWN_BASE_MEMORY=12G,
@@ -1058,7 +1064,7 @@ def nested_cases():
              expect="base", cwd="one", compare_source=True, local=True,
              lexpect=[("test", "workspace_one", "ok"), ("no-test", "workspace_two"), ("exit", 0)]),
         Case("sibling", "test", "the same Git commit, package names and lockfile select different source in the sibling workspace",
-             expect="changed", cwd="two", compare_source=True, local=True,
+             expect="changed", cwd="two", compare_source=True, local=True, touches=["source"],
              also=[("job-differs", "base"), ("platform-same", "base")],
              lexpect=[("test", "workspace_two", "ok"), ("no-test", "workspace_one"), ("exit", 0)]),
         Case("below-sibling", "test", "a directory below the sibling workspace must be replayed below that workspace",
@@ -1769,9 +1775,15 @@ class Ctx:
                 out["diffs"].append(f"{which} timed out after {run.seconds:.0f} s")
         if out["status"] != "match":
             return out
-        if rb.code == 2 and "does not match the spec" in rb.out:
+        if rb.code != 0 and UNSUPPORTED.search(rb.out):
+            # A shape the owned executor names as not run yet is a gap, reported and not failed;
+            # it must not be taken for the spec disagreeing with its own source.
+            out["status"] = "unsupported"
+            out["diffs"].append(clip(UNSUPPORTED.search(rb.out).group(0), 200))
+            return out
+        if rb.code != 0 and re.search(r"does not match the (spec|BuildSpec)", rb.out):
             out["status"] = "MISMATCH"
-            out["diffs"].append("the spec run refused its own tree: " + clip(rb.out.strip().splitlines()[-1], 200))
+            out["diffs"].append("the spec run refused its own source: " + clip(rb.out.strip().splitlines()[-1], 200))
             return out
         for part, a, b in compare_summaries(sa, sb):
             out["diffs"].append(f"{part}: command {clip(a, 200)} / spec run {clip(b, 200)}")
@@ -1782,27 +1794,45 @@ class Ctx:
         return out
 
     def run_mismatch(self, fixture):
-        """`spec run` of the base's spec in the checkout of another commit refuses, naming a field."""
+        """The base's spec, run from the checkout of another commit, does what it does from its own:
+        the saved source decides, not the checkout (which `spec --run` used to compare against)."""
         base = self.results.get(f"{fixture.name}/base")
         edited = [c for c in fixture.cases if c.edits and self.results.get(c.full) and self.results[c.full].made]
         if not (base and base.cbor and os.path.exists(base.cbor) and edited):
             return None
         case = edited[0]
-        copy = os.path.join(self.work, "local", f"{fixture.name}__mismatch")
-        shutil.copytree(self.tree(case), copy, symlinks=True)
-        home = self.blaze.new_home()
-        env = self.blaze.env(scrubbed_env(), home=home, target=os.path.join(copy, "..", "target-mm"),
-                             cargo_home=self.cargo_home)
-        run = self.blaze.run(["cargo", "spec", "--run", base.cbor], copy, env, merge=True)
-        self.blaze.stop(home, copy, env)
-        shutil.rmtree(copy, ignore_errors=True)
-        said = run.out.strip().splitlines()[-1] if run.out.strip() else ""
+        seen = []
+        for label, tree in (("its own", base.tree), (case.name, self.tree(case))):
+            copy = os.path.join(self.work, "local", f"{fixture.name}__independent")
+            shutil.copytree(tree, copy, symlinks=True)
+            home = self.blaze.new_home()
+            env = self.blaze.env(scrubbed_env(), home=home, target=os.path.join(copy, "..", "target-mm"),
+                                 cargo_home=self.cargo_home)
+            run = self.blaze.run(["cargo", "spec", "--run", base.cbor], copy, env, merge=True)
+            self.blaze.stop(home, copy, env)
+            shutil.rmtree(copy, ignore_errors=True)
+            seen.append((label, run))
+        (_, here), (_, there) = seen
+        said = there.out.strip().splitlines()[-1] if there.out.strip() else ""
         fails = []
-        if run.code != 2:
-            fails.append(f"spec run of {fixture.name}/base's spec in the checkout of {case.name} exited {run.code}, wanted 2")
-        if not re.search(r"does not match the spec: \S+", run.out):
-            fails.append(f"it did not say `the tree does not match the spec: <field>`: {clip(said, 200)}")
-        return {"case": f"{fixture.name}/{case.name}", "exit": run.code, "said": said, "fails": fails}
+        if here.code != there.code:
+            fails.append(f"spec run of {fixture.name}/base's spec exited {here.code} from its own checkout and "
+                         f"{there.code} from the checkout of {case.name}")
+        elif summarize_for_independence(here.out) != summarize_for_independence(there.out):
+            fails.append(f"spec run of {fixture.name}/base's spec printed differently in the checkout of {case.name}: "
+                         f"{clip(summarize_for_independence(here.out), 120)} / {clip(summarize_for_independence(there.out), 120)}")
+        if re.search(r"does not match the (spec|BuildSpec)", there.out):
+            fails.append(f"it compared the checkout of {case.name} with the spec: {clip(said, 200)}")
+        return {"case": f"{fixture.name}/{case.name}", "exit": there.code, "said": said, "fails": fails}
+
+
+def summarize_for_independence(text):
+    """What a run printed, without the paths of its own scratch directories."""
+    return re.sub(r"(/[^\s:]*?)(replay-[A-Za-z0-9_]+|run-[ab]|target-mm)\S*", r"<scratch>", text).strip()
+
+
+# A shape the owned executor refuses by name (blaze-spec's execution.rs, ra-jit's link.rs).
+UNSUPPORTED = re.compile(r"(owned|saved) BuildSpec replay (does not yet|has no|cannot)[^\n]*")
 
 
 # --- Selecting, running every arm, reporting -----------------------------------------------------
@@ -1903,7 +1933,7 @@ def failures_of(ctx, case):
         if len(units["diffs"]) > 12:
             out.append(("units", f"... and {len(units['diffs']) - 12} more"))
     local = ctx.locals.get(case.full)
-    if local and local["status"] != "match":
+    if local and local["status"] not in ("match", "unsupported"):
         out += [("local", d) for d in local["diffs"]]
     return out
 
@@ -1961,7 +1991,7 @@ def print_report(ctx, reported):
         for case, res in refusals:
             print(f"  {case.full}: {res.refused.get('what')} / {res.refused.get('why')}")
     if ctx.mismatch:
-        print("\nspec run in a checkout of another commit:")
+        print("\nspec run from the checkout of another commit (the saved source decides):")
         for m in ctx.mismatch:
             print(f"  {m['case']}: exit {m['exit']}: {m['said']}{'' if not m['fails'] else '  <- FAIL'}")
     if ctx.audit is not None:
@@ -2118,6 +2148,16 @@ def main(argv=None):
 
 FAKE_RA_JIT = r'''#!@PYTHON@
 import hashlib, json, os, platform, re, shutil, subprocess, sys
+
+
+def logical_path(path):
+    # The harness's helper of the same name; this script is run on its own.
+    if path == ".":
+        return "."
+    safe = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
+    return "/".join("".join(chr(b) if b in safe else "%%%02X" % b for b in os.fsencode(part))
+                    for part in path.split(os.sep))
+
 
 BUG = os.environ.get("FAKE_BUG", "")
 
@@ -2746,8 +2786,12 @@ def main():
         words = list(saved["words"])
         if BUG == "spec-run-drops-no-run":
             words = [w for w in words if w != "--no-run"]
-        checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
-        cwd = os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"])
+        # The saved source, not the checkout this runs from, is what is replayed.
+        checkout = rest[2] + ".inputs"
+        if BUG == "run-in-checkout":
+            checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+        cwd = os.path.realpath(os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"]))
+        os.chdir(cwd)
         try:
             res = resolve(cwd, words, env)
         except Refused as r:
@@ -2777,6 +2821,9 @@ def main():
             print(json.dumps({"refused": {"what": r.what, "why": r.why}, "digests": None, "summary": None, "spec": None, "platform": None}))
             return 2
         if out:
+            here = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+            shutil.rmtree(out + ".inputs", ignore_errors=True)
+            shutil.copytree(here, out + ".inputs", symlinks=True)
             with open(out, "w") as f:
                 # As with saved words/environment, this auxiliary path models reproduction in
                 # the test double; it does not assert that the current wire has this information.
@@ -3175,8 +3222,9 @@ def self_test(args):
                 ("pkg-override-all", ["profiles/pkg-opt1"], False, "the units whose profile differs"),
                 ("head-only-source", ["source/dirty-body"], False, "wanted a different spec"),
                 ("dirty-source-refused", ["source/dirty-body"], False, "a spec was wanted"),
-                ("sibling-source-same", ["nested/sibling"], False, "wanted a different spec"),
+                ("sibling-source-same", ["nested/sibling"], False, "does not differ in"),
                 ("replay-git-root", ["nested/base"], True, "spec run"),
+                ("run-in-checkout", ["envcfg"], True, "checkout of"),
                 ("spec-run-drops-no-run", ["basic/no-run"], True, "spec run"),
                 ("unit-features", ["basic/base"], False, "features")]
         for bug, only, local, wanted in bugs:
