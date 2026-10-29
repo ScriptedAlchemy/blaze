@@ -256,6 +256,55 @@ pub(crate) fn host_tuple(rustc: &Path) -> Option<String> {
     Some(Toolchain::of(rustc)?.host)
 }
 
+/// The target facts needed to write an LLVM module. An empty module still needs
+/// the correct data layout and deployment-version triple, even though it has no
+/// machine instructions or referenced symbols.
+pub(super) struct LlvmTarget {
+    pub triple: String,
+    pub data_layout: String,
+    pub has_std: bool,
+}
+
+pub(super) fn llvm_target(
+    sysroot: &Path,
+    tuple: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<LlvmTarget> {
+    let toolchain = Toolchain::of(&sysroot.join("bin/rustc"))?;
+    let target = toolchain.release.targets.get(tuple)?;
+    let spec: serde_json::Value =
+        serde_json::from_str(target.target_spec_json.get(&toolchain.host)?).ok()?;
+    let mut triple = spec["llvm-target"].as_str()?.to_owned();
+    if tuple.ends_with("-apple-darwin") {
+        // The recorded target spec deliberately has no deployment version. The
+        // release's macOS minimum is 10.12 on x86_64 and 11.0 on arm64, and rustc
+        // clamps a lower requested deployment version to that target minimum.
+        let minimum = match spec["arch"].as_str()? {
+            "x86_64" => [10, 12, 0],
+            "aarch64" => [11, 0, 0],
+            _ => return None,
+        };
+        let version = match var("MACOSX_DEPLOYMENT_TARGET") {
+            None => minimum,
+            Some(value) => macos_version(value.to_str()?)?.max(minimum),
+        };
+        triple += &format!("{}.{}.{}", version[0], version[1], version[2]);
+    }
+    Some(LlvmTarget {
+        triple,
+        data_layout: spec["data-layout"].as_str()?.to_owned(),
+        has_std: spec["metadata"]["std"].as_bool()?,
+    })
+}
+
+fn macos_version(value: &str) -> Option<[u16; 3]> {
+    let mut version = [0; 3];
+    for (index, part) in value.split('.').enumerate() {
+        *version.get_mut(index)? = part.parse().ok()?;
+    }
+    Some(version)
+}
+
 /// Cargo's release version from the installed channel manifest, not from executing it.
 pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
     let toolchain = Toolchain::of(rustc)?;
@@ -498,6 +547,34 @@ pub(super) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llvm_targets_use_owned_layouts_and_macos_deployment_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::answers::tests::synthetic_toolchain(dir.path());
+        for (tuple, base, default) in [
+            ("x86_64-apple-darwin", "x86_64-apple-macosx", "10.12.0"),
+            ("aarch64-apple-darwin", "arm64-apple-macosx", "11.0.0"),
+        ] {
+            let target = llvm_target(dir.path(), tuple, &|_| None).unwrap();
+            assert_eq!(target.triple, format!("{base}{default}"));
+            assert!(target.has_std);
+            assert!(target.data_layout.starts_with("e-m:o-"));
+            for (value, expected) in [("10.7", default), ("14", "14.0.0"), ("14.2.1", "14.2.1")] {
+                let var = |name: &str| (name == "MACOSX_DEPLOYMENT_TARGET").then(|| value.into());
+                let target = llvm_target(dir.path(), tuple, &var).unwrap();
+                assert_eq!(target.triple, format!("{base}{expected}"));
+            }
+            for value in ["", "bad", "14.2.3.4", "65536", "14."] {
+                let var = |name: &str| (name == "MACOSX_DEPLOYMENT_TARGET").then(|| value.into());
+                assert!(llvm_target(dir.path(), tuple, &var).is_none(), "{value}");
+            }
+        }
+        let target = llvm_target(dir.path(), "x86_64-unknown-linux-gnu", &|_| None).unwrap();
+        assert_eq!(target.triple, "x86_64-unknown-linux-gnu");
+        assert!(target.data_layout.starts_with("e-m:e-"));
+        assert!(llvm_target(dir.path(), "missing-target", &|_| None).is_none());
+    }
 
     #[test]
     fn cfgs_given() {

@@ -8,6 +8,7 @@ on:
       - crates/blaze-wire/**
       - crates/ra-jit-store/**
       - crates/ra-jit/**
+      - vendor/rust-analyzer/crates/syntax/**
       - harness/**
       - Cargo.toml
       - Cargo.lock
@@ -45,6 +46,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
+      - name: Test owned compiler answers and empty-crate proofs
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p syntax empty_crate:: -- --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit answers:: -- --test-threads=2
+      - name: Verify real probe artifacts with rustc and LLVM
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p ra-jit --bin ra-jit
+          python3 -I harness/dist/empty_probe.py --blaze target/debug/ra-jit --work target/empty-probe-review
+      - name: Save owned probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: owned-empty-probe
+          path: |
+            target/empty-probe-review/results.json
+            target/empty-probe-review/*/*.log
+          if-no-files-found: ignore
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
         run: python3 -I harness/remote.py --selftest

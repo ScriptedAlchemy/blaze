@@ -458,7 +458,7 @@ fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> O
 mod tests {
     use super::*;
 
-    fn synthetic_toolchain(dir: &Path) -> PathBuf {
+    pub(super) fn synthetic_toolchain(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let rustlib = dir.join("lib/rustlib");
         std::fs::create_dir_all(&rustlib).unwrap();

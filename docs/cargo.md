@@ -124,8 +124,11 @@ and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the
 1.99 gives it. Host producers, including proc macros and their build dependencies, are
 compiled from the owned source graph. Compiler probes the owned checker cannot decide
 fail the producer build; they do not select a different implementation by reporting a
-negative feature result. In particular, the fresh proc-macro-server bootstrap still reaches
-an unsupported autocfg `--emit=llvm-ir` probe. A script runs again when cargo 1.99 would run it: for a file it named
+negative feature result. Empty library probes, including `autocfg`'s initial standard-library
+check, can emit a real LLVM IR module after complete syntax and attribute validation.
+Nonempty source probes still need the remaining compiler acceptance checks; this empty
+case does not establish general probe or proc-macro-server bootstrap parity.
+A script runs again when cargo 1.99 would run it: for a file it named
 with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
 every build), for a variable it named whose value is another (unset, empty and set are three), for
 any file of its package when it named nothing, for a change to the script, its modules or a
