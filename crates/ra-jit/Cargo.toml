@@ -64,6 +64,7 @@ shlex = "2"
 toml.workspace = true
 thorin-dwp = "0.10"
 typed-arena = "2.0.2"
+tempfile = "3"
 
 hir.workspace = true
 hir-def.workspace = true
@@ -123,7 +124,6 @@ tikv-jemalloc-sys = "0.5.4"
 object = { version = "0.37", default-features = false, features = ["write", "elf"] }
 test-fixture.workspace = true
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
-tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = { version = "0.1.46", default-features = false }
