@@ -456,8 +456,13 @@ fn toolchain_rustc(
         std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
     };
     let real = std::fs::canonicalize(&found).ok()?;
+    let rustup = found.with_file_name("rustup");
+    // rustup links its proxies where the filesystem links them, and copies them where it
+    // cannot, as a runner's image does: the copy is rustup's too, and the `rustup` it was
+    // copied from is beside it.
     let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
-        || same_file::is_same_file(&real, found.with_file_name("rustup")).unwrap_or(false);
+        || same_file::is_same_file(&real, &rustup).unwrap_or(false)
+        || is_copy_of(&real, &rustup);
     if !proxy {
         return Some(real);
     }
@@ -515,6 +520,17 @@ fn toolchain_rustc(
     };
     let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     std::fs::canonicalize(rustc).ok()
+}
+
+/// Whether `program` is a copy of `rustup`: rustup copies its proxies where the filesystem
+/// does not link them, as a runner's image does, so the proxy is not the same file there.
+fn is_copy_of(program: &Path, rustup: &Path) -> bool {
+    let Ok(copied) = std::fs::metadata(program) else { return false };
+    let Ok(original) = std::fs::metadata(rustup) else { return false };
+    copied.len() == original.len()
+        && std::fs::read(program)
+            .ok()
+            .is_some_and(|it| std::fs::read(rustup).is_ok_and(|was| it == was))
 }
 
 fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option<OsString> {
@@ -589,6 +605,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installed_selection(&home, &cwd, None), Some(installed.as_os_str().to_owned()));
+    }
+
+    /// A runner's fresh rustup install: its own home, the default toolchain by its full name,
+    /// and proxies *copied* beside `rustup` rather than linked. The release a build resolves
+    /// for is the toolchain's, from its records, with nothing run (the live-edit job's first
+    /// build). Copies are what rustup makes where the filesystem does not link.
+    #[test]
+    fn fresh_rustup_install_with_copied_proxies_answers_the_toolchain_release() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let rustup_home = home.join(".rustup");
+        let installed = rustup_home.join("toolchains/1.99.0-aarch64-apple-darwin");
+        synthetic_toolchain(&installed);
+        std::fs::write(
+            rustup_home.join("settings.toml"),
+            "version = \"12\"\ndefault_toolchain = \"1.99.0-aarch64-apple-darwin\"\n\
+             profile = \"minimal\"\n\n[overrides]\n",
+        )
+        .unwrap();
+        let bin = home.join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let rustup = bin.join("rustup");
+        std::fs::write(&rustup, "rustup, copied where links are not made").unwrap();
+        std::fs::copy(&rustup, bin.join("rustc")).unwrap();
+        assert!(!same_file::is_same_file(&rustup, bin.join("rustc")).unwrap_or(true), "a copy");
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let env: Vec<(String, String)> = [
+            ("HOME", home.display().to_string()),
+            ("PATH", bin.display().to_string()),
+            ("RUSTUP_HOME", rustup_home.display().to_string()),
+            ("CARGO_HOME", home.join(".cargo").display().to_string()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+        assert_eq!(
+            rust_release(Path::new("rustc"), &cwd, &env).as_deref(),
+            Some("1.99.0"),
+            "the release of the toolchain's rustc, from its records"
+        );
     }
 
     pub(super) fn synthetic_toolchain(dir: &Path) -> PathBuf {
