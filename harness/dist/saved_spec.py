@@ -5,7 +5,8 @@ The reference Cargo invocation belongs to this harness. Product compiler, Cargo,
 rustdoc and rustup paths are fail/count stand-ins. A source-only fixture is saved,
 its original tree is removed and the whole bundle moved, and its result must still match the
 reference from an unrelated directory with hostile ambient compiler configuration, including a
-config file in a directory above the replay's own. Corrupt
+config file in a directory above the replay's own, a repository whose own cc is first on its
+PATH (never run to read the platform), and a Cargo home that is an ancestor's .cargo. Corrupt
 inputs and unsupported input closures must produce no advertised executable.
 """
 import argparse
@@ -313,6 +314,55 @@ def main():
                    oracle_env, hostile, expected=101, contains="test result: FAILED", guarded=False)
         runner.run("no-run-artifact-failure", [executable, "--exact", "must_not_run"], env,
                    hostile, expected=101, contains="test result: FAILED")
+        # A repository that ships its own cc and puts it first on PATH, through its own
+        # configuration. Cargo would run it to link, as job code; reading the platform of a
+        # save or a replay must not run it, neither for its version nor for its search paths.
+        project = work / "shipped-cc"
+        shutil.copytree(template, project)
+        calls = work / "shipped-cc-calls.log"
+        write(project, "tools/cc", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + shlex.quote(str(calls))
+              + "\nexec /usr/bin/cc \"$@\"\n")
+        (project / "tools/cc").chmod(0o755)
+        write(project, ".cargo/config.toml", '[env]\nSAVED_SPEC_LABEL={value="config-value",force=true}\n'
+              + "PATH={value=" + json.dumps("tools:" + native_path) + ",force=true}\n")
+        expected, _ = runner.run("shipped-cc-reference", [real / "bin/cargo", "run", "--locked",
+            "--offline", *selected, "--", "argument"], oracle_env, project, guarded=False)
+        assert expected == "captured|config-value|argument\n", expected
+        calls.unlink(missing_ok=True)
+
+        def probes():
+            lines = calls.read_text().splitlines() if calls.exists() else []
+            return [line for line in lines if "--version" in line or "-print-file-name" in line]
+
+        shipped = bundle / "shipped-cc.cbor"
+        runner.run("shipped-cc-save", [blaze, "cargo", "spec", "--out", shipped, "run", *selected,
+                   "--", "argument"], env, project)
+        assert not probes(), ("save ran the repository's cc to read the platform", probes())
+        shutil.rmtree(project)
+        actual, _ = runner.run("shipped-cc-replay", [blaze, "cargo", "spec", "--run", shipped],
+                               hostile_env, hostile)
+        assert actual == expected, (actual, expected)
+        assert not probes(), ("replay ran the repository's cc to read the platform", probes())
+        # The Cargo home is an ancestor's .cargo of the workspace, between the workspace and a
+        # configuration above it: Cargo reads it there, so it wins over the file above.
+        base = work / "home-case"
+        home = base / "p/.cargo"
+        project = base / "p/project"
+        shutil.copytree(template, project)
+        write(base, ".cargo/config.toml", '[env]\nSAVED_SPEC_WHO={value="above",force=true}\nSAVED_SPEC_ABOVE="above"\n')
+        write(home, "config.toml", '[env]\nSAVED_SPEC_WHO={value="home",force=true}\n')
+        write(project, "app/src/main.rs", 'fn main() { println!("{}|{}", env!("SAVED_SPEC_WHO"), '
+              'env!("SAVED_SPEC_ABOVE")); }\n')
+        expected, _ = runner.run("home-case-reference", [real / "bin/cargo", "run", "--locked",
+            "--offline", *selected], dict(oracle_env, CARGO_HOME=str(home)), project, guarded=False)
+        assert expected == "home|above\n", expected
+        homed = bundle / "home-case.cbor"
+        runner.run("home-case-save", [blaze, "cargo", "spec", "--out", homed, "run", *selected],
+                   dict(env, CARGO_HOME=str(home)), project)
+        shutil.rmtree(base)
+        actual, _ = runner.run("home-case-replay", [blaze, "cargo", "spec", "--run", homed],
+                               hostile_env, hostile)
+        assert actual == expected, (actual, expected)
         # Each negative owns a fresh bundle; failed compilation/admission may not
         # leave a result that a caller could treat as a completed executable.
         for name in ("check", "external-include", "native-link"):

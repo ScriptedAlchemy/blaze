@@ -3023,9 +3023,22 @@ An empty external Cargo home does not affect source identity. A Cargo home besid
 workspace (its configuration, registry and Git trees) is kept in the snapshot under
 `.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:
 the same project with its home in another place, or below other directories, has the same spec.
-The configuration files resolution read are part of the replay record, in precedence order, and
-replay reads exactly those; no file above the directory a worker materializes the snapshot in is
-read. Path dependencies outside the workspace still keep their relative topology below the common
+The configuration files resolution read are part of the replay record: the top-level files in the
+precedence order discovery visited them (a Cargo home that is an ancestor's `.cargo` is where it was
+visited, not last), and every file read, including includes and `--config` files. Replay reads
+exactly those, from the snapshot, through `Config::from_image` (`Discovery::Image`); no file above
+the directory a worker materializes the snapshot in is read, and none the snapshot lacks is looked
+for. The record is found by the spec's digest and is not itself content-addressed: it cannot join
+the snapshot or `SourceRef::Root`, because an invocation's spelling is outside build identity
+(`replay_identity.rs`). It is a hint, since replay resolves again and compares the whole spec, and
+a record that was swapped fails that comparison or reproduces the same spec.
+Reading the platform of a save or a replay runs no program the requester shipped. A tool that
+resolves inside the requester's tree (the snapshot, or the workspace of a live request) is named by
+the digest of its bytes, with no version and no `-print-file-name` query. Relative and empty `PATH`
+entries are cargo's: relative to the request's directory; the executor's own `PATH` is rooted at the
+worker's process. A program the repository's tools run later, such as a `cc` that links, is job
+code as it is under cargo. A manifest may list up to 8 Mi entries in 1 GiB; past that, capture
+refuses by name (`ManifestTooLarge`). Path dependencies outside the workspace still keep their relative topology below the common
 source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
 Linux unit tests; the layout independence of path dependencies is not normalized.)
 
