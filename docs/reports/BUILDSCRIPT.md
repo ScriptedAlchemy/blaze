@@ -1,5 +1,109 @@
 # Why every edit of tracedecay's CLI went to cargo: its build script printed something else
 
+## Review closure, 2026-10-29
+
+The earlier reports and their parking statements describe the revisions they name. The current review inventory
+is based on all PR #5 comments and its three review submissions; there are no inline review
+threads. The latest findings are in
+[the second-check review](https://github.com/ScriptedAlchemy/blaze/pull/5#issuecomment-6488867981).
+
+- **Inactive optional and target-gated `links` edges: fixed.** Declared dependencies are
+  candidates. Judgment reads the parent's completed Cargo fingerprint under its lock and
+  follows only the native run units present in that fingerprint. Inactive candidates are
+  neither locked nor read, even if another workspace member built them. The active dependency
+  closure stays locked through the parent execution. `an_inactive_native_dependency_is_not_locked_read_or_run`
+  covers an absent inactive unit; `inactive_links` adds two live-Cargo differential fixtures.
+- **Inputs changed between judgment and Cargo's leg: fixed.** Each completed execution records
+  the old and new watched files and variables, native dependency outputs, current `DEP_*`
+  values, the executable and, for a script without watches, the package fingerprint. Before
+  consuming it, the stand-in checks those inputs and the execution's output. When they changed,
+  it executes the existing real script with Cargo's current environment. No compiler or Cargo
+  invocation was added. `continuation_edit` edits the watched program immediately before
+  consumption and compares program output and execution counts with Cargo alone. The unit
+  regression also covers directories, missing inputs, dropped watches, environment, metadata,
+  executable changes, recompilation with identical executable bytes, and changed output.
+- **Dropped `DEP_*` metadata: fixed at `7ba43be2`.** The parent receives the dependency's current
+  metadata, and a dropped key exposes the current caller's ambient value. The regression
+  `a_native_dependency_replaces_its_metadata_in_the_parents_environment` covers both absence
+  and an ambient replacement value, plus an unrelated metadata prefix.
+- **Unknown `cargo::` key accepted by Cargo: disproved.** The reference is Cargo 1.99.0
+  (`5f94df478`), which rejects `cargo::unknown-key=1`. The parser's error is retained; it must
+  not become a new handoff to Cargo. `cargo::error` and a failed process also fail this build
+  without retry; the empty fingerprint permits a later explicit build to retry.
+- **Unlocked current/baseline reads and inherited locks: fixed in the existing head.**
+  `Run::of` and judgment hold the Cargo locks for the complete read, and baseline capture
+  requires a completed fingerprint. The lock regressions cover busy and absent locks and
+  duplicated descriptors. Baseline output and the directory digest are read under one guard.
+- **The obsolete `Kept` execution replay: removed in the existing head.** `run_as_cargo_does`
+  executes the real script unless this same live request supplies a still-valid completed
+  execution. Continuation storage is private, single-use and deleted on return.
+- **Pinned LLVM build: fixed.** The first LLVM 20.1.8 build exposed `E0500` in
+  `hir-ty-codegen/llvm.rs`: the machine-options borrow overlapped the mutable recorder borrow
+  inside the callback that reads the emitted object. Owning the same options across the
+  callback fixes compilation without changing the options or lowering rules.
+- **Earlier logger, newly watched environment, quiet-package, failed-run, dropped-watch and
+  active-links findings:** the existing code has focused regressions and the differential
+  rows in `scriptrerun.py`; see the runtime results below.
+
+### Verification of this repair
+
+Heavy work runs on the explicitly authorized `ubuntu-main` host (Linux x86-64) in
+`/home/zack/blaze-validation-20261029-efc485a2/pr5`. The coordinator holds the parent claim.
+Every heavy command is constrained to eight CPUs, 24 GiB RAM and no swap, with six Cargo
+build jobs, `RUST_BACKTRACE=0` and a target directory owned by this lane. The Mac only runs
+formatting, static audits and the harness comparison self-test.
+
+The repair's build and harness inputs are committed at
+`b1d2d3ac9fb129f4d490701acad848a1cb0c3162`; this report adds no build input.
+A length-framed SHA-256 over the 5,156 tracked build, harness, flake and CI files
+(44,472,801 bytes) is identical in this worktree and remote staging:
+`513d2a548a09a0680727a96cfbc422bec549d8330d8708a3a69d9263bc986218`.
+
+| Check | Result |
+|---|---|
+| Pinned LLVM 20.1.8 release build, `cargo +1.99.0 build --locked --release -p ra-jit --features llvm --bins` | Pass, 1 m 49 s for the final build |
+| `cargo +1.99.0 test --release --locked -p hir-ty -p hir-def -p parser -p syntax -p blaze-build-script -p ra-jit --features ra-jit/llvm -- --test-threads=4` | **1374 passed, 0 failed, 2 ignored**, 16 s once compiled; `ra-jit` alone is 402 passed and one ignored measurement |
+| New regressions with only the edge-selection and continuation-input guards removed in remote staging | **47 script tests passed, 2 failed, 1 ignored**; precisely the two new regressions fail |
+| Complete `harness/scriptrerun.py`, Cranelift / LLVM | **Both exit 0**, 527 s / 907 s; every program, exit status and execution count matches Cargo |
+| Corrected continuation race against real Cargo, Cranelift / LLVM | Both pass: output `3 9`, three executions each; 34 s / 56 s |
+| Formatting, `git diff --check`, harness imports, compiler-site audit, comparison self-test | Pass; 138 imports and 15 existing compiler sites, none new |
+
+The release unit retry added the missing test prerequisites inside the temporary container:
+pinned Nix Perl, and links to the shell's coreutils at `/bin/sleep` and `/usr/bin/printenv`.
+The initial five `ENOENT` failures were prerequisite failures; the same unit command then
+passed without changing product code. The shell uses the repository's pinned flake and the
+coordinator's official Nix image
+`nixos/nix@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0`.
+The host's Rustup tree is mounted read-only. The compatibility loader and coreutils links
+exist only in that temporary container; no host toolchain or installed Blaze is changed.
+
+The first continuation fixture used an ordinary watched counter. Cargo correctly found
+its run fresh and never invoked the stand-in, so the fixture's expected third execution
+failed. The corrected fixture drops its watches after judgment, forcing Cargo's local-rule
+transition to invoke the stand-in; it edits the watched source at that point and requires
+both the new output and the third execution. Existing dropped-watch rows exercise unchanged
+inputs without an extra execution.
+
+The complete runtime runs include the bundle edits, counter, logger, quiet package, newly
+watched environment, failure and explicit retry, dropped watches, active native metadata,
+inactive optional and target dependencies, and the continuation edit. The two inactive
+fixtures keep both source edits in the daemon and perform no extra script execution on a
+subsequent plain Cargo build. The final container's peak was 6,202,515,456 bytes (5.78 GiB).
+The original combined wrapper retains exit 1 from its initial missing-prerequisite unit
+run; the unit retry above and both final runtime commands independently exit 0.
+
+Not run: the complete `ci.py` fast/full matrices, full tracedecay workspace, Nix product
+derivation, macOS, AArch64, Windows, benchmarks, or cross-process compiler-to-baseline
+lifetime stress. The lock tests prove coherent baseline reads, not every concurrent
+compile/load ordering. Scripts outside the workspace and the existing Cargo handoffs when
+script output changes remain limits of the hybrid path; this repair does not certify the
+repository's complete no-rustc goal. These are acceptance limits, not successful lanes.
+
+The source operations used unique function and constructor anchors and inspected their
+call sites. Mutation preview was skipped because this worktree has no project index;
+all edits completed without an interrupted mutation. The final diff was checked for
+unnecessary comments, defensive wrappers and unused code.
+
 ## Review update, 2026-10-28: baseline capture is locked; the lane stays parked
 
 The latest review found that `current` held Cargo's locks but `Run::of`, which captures
