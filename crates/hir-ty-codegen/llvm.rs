@@ -1269,8 +1269,8 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         let slot =
             builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let argument = builder.block_params(block)[0];
-        builder.ins().stack_store(argument, slot, 0);
-        let result = builder.ins().stack_load(I64, slot, 0);
+        builder.ins().stack_store(isa.pointer_type(), argument, slot, 0);
+        let result = builder.ins().stack_load(isa.pointer_type(), I64, slot, 0);
         builder.ins().return_(&[result]);
         builder.finalize(isa.frontend_config());
 

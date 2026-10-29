@@ -584,7 +584,7 @@ fn the_run_is_read_out_of_what_cargo_test_is_given() {
         ]
     );
     assert!(run.env.is_empty());
-    assert_eq!(run.doc, 1);
+    assert_eq!(run.doc, 0);
 
     let included = app(Subcommand::Test, &["--", "--include-ignored"]);
     let Command::Test(run) = &included.build.command else { panic!("a test") };
@@ -594,8 +594,16 @@ fn the_run_is_read_out_of_what_cargo_test_is_given() {
         other => panic!("{other:?}"),
     };
     assert_eq!(
-        (doc(&[]), doc(&["--doc"]), doc(&["--lib"]), doc(&["--tests"]), doc(&["--no-run"])),
-        (1, 2, 0, 0, 1)
+        (
+            doc(&[]),
+            doc(&["--doc"]),
+            doc(&["--lib"]),
+            doc(&["--tests"]),
+            doc(&["--no-run"]),
+            doc(&["filter"]),
+            doc(&["--", "filter"]),
+        ),
+        (1, 2, 0, 0, 1, 0, 1)
     );
 
     // `run` has the program's arguments, positional first, and reads none of them.

@@ -92,14 +92,6 @@ DEFAULT_BIN = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target", "rele
 
 # The five digests the contract prints, and what `spec` is made of (docs/distributed.md, "Data shapes").
 DIGESTS = ("spec", "platform", "front_end", "config", "job_content")
-def logical_path(path):
-    """Schema-3 byte-component escaping; this helper does not certify the fake CLI."""
-    if path == ".":
-        return "."
-    safe = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
-    return "/".join("".join(chr(b) if b in safe else f"%{b:02X}" for b in os.fsencode(part))
-                    for part in path.split(os.sep))
-
 SPEC_FIELDS = ("source", "lock", "units", "asked", "profile", "platform", "rustflags", "config_env",
                "script_env", "cwd", "command", "toolchain", "workspace_manifest")
 UNIT_FIELDS = ("package", "target", "features", "cfg", "edition", "deps", "test", "host", "profile")
@@ -2131,6 +2123,14 @@ FAKE_RA_JIT = r'''#!@PYTHON@
 import hashlib, json, os, platform, re, shutil, subprocess, sys
 
 BUG = os.environ.get("FAKE_BUG", "")
+
+
+def logical_path(path):
+    if path == ".":
+        return "."
+    safe = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
+    return "/".join("".join(chr(b) if b in safe else f"%{b:02X}" for b in os.fsencode(part))
+                    for part in path.split(os.sep))
 
 
 def sha(data):
