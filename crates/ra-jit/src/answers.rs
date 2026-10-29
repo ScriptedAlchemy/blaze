@@ -178,7 +178,7 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
 pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> {
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-    let rustc = toolchain_rustc(command.get_program(), &var);
+    let rustc = toolchain_rustc(command.get_program(), command.get_current_dir(), &var);
     if let Some(error) = rustc.as_ref().and_then(|it| own::deployment_error(it, &args, &var)) {
         #[cfg(unix)]
         let status = {
@@ -277,7 +277,8 @@ fn cargo_question(command: &mut Command) -> Option<io::Result<Output>> {
         let (code, said) = blaze_manifest::config::get::main(&cwd, env, &normalized);
         return Some(Ok(output(said.stdout.into_bytes(), said.stderr.into_bytes(), code)));
     }
-    let Some(rustc) = toolchain_rustc(command.get_program(), &var) else {
+    let Some(rustc) = toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
+    else {
         return Some(Err(io::Error::other(format!(
             "owned Cargo query has no toolchain model: {args:?}; Cargo was not executed"
         ))));
@@ -419,44 +420,159 @@ fn var_of(command: &Command, name: &str) -> Option<OsString> {
 
 /// The rustc of the toolchain that `program`, as this process would run it, is.
 pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
-    toolchain_rustc(program, &|name| std::env::var_os(name))
+    toolchain_rustc(program, None, &|name| std::env::var_os(name))
 }
 
-/// The executable of the toolchain that `program` runs. rustup's proxy runs the toolchain
-/// rustup set for the process it started, and is not known without that.
-fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// Resolve rustup's installed selection from its records, without executing a proxy.
+/// Direct CLI invocations do not inherit rustup's RUSTUP_HOME or expanded toolchain name.
+fn toolchain_rustc(
+    program: &OsStr,
+    cwd: Option<&Path>,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let cwd = cwd.map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
     let found = if Path::new(program).components().count() > 1 {
-        PathBuf::from(program)
+        cwd.join(program)
     } else {
         let paths = var("PATH")?;
         let name = Path::new(program).with_extension(std::env::consts::EXE_EXTENSION);
         std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
     };
-    let real = std::fs::canonicalize(found).ok()?;
-    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"));
+    let real = std::fs::canonicalize(&found).ok()?;
+    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
+        || same_file::is_same_file(&real, found.with_file_name("rustup")).unwrap_or(false);
     if !proxy {
         return Some(real);
     }
-    let toolchain = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
-    let dir = if toolchain.is_absolute() {
-        toolchain
+    if let Some(selected) = var("RUSTUP_TOOLCHAIN")
+        && Path::new(&selected).is_absolute()
+    {
+        return std::fs::canonicalize(
+            PathBuf::from(selected)
+                .join("bin")
+                .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .ok();
+    }
+    let home = var("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
+        var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(|home| PathBuf::from(home).join(".rustup"))
+    })?;
+    let toolchain = installed_selection(&home, &cwd, var("RUSTUP_TOOLCHAIN"))?;
+    let toolchain = toolchain.to_str()?;
+    let dir = if Path::new(&toolchain).is_absolute() {
+        PathBuf::from(toolchain)
     } else {
-        // rustup does not export RUSTUP_HOME for its default installation. Use the
-        // command's home, just as toolchain selection does, so worker queries see
-        // the same installed compiler without starting a rustup proxy.
-        let home = var("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
-            var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                .map(|home| PathBuf::from(home).join(".rustup"))
-        })?;
-        home.join("toolchains").join(toolchain)
+        let installed = home.join("toolchains");
+        let exact = installed.join(&toolchain);
+        if exact.is_dir() {
+            exact
+        } else {
+            // rustup expands an unqualified channel/version using its default host.
+            // The installed rustc manifest supplies the host; multiple matches are
+            // ambiguous unless settings names a default host.
+            let settings: toml::Value = toml::from_str(
+                &std::fs::read_to_string(home.join("settings.toml")).unwrap_or_default(),
+            )
+            .ok()?;
+            if let Some(host) = settings.get("default_host_triple").and_then(|it| it.as_str()) {
+                installed.join(format!("{toolchain}-{host}"))
+            } else {
+                let prefix = format!("{toolchain}-");
+                let mut matches =
+                    std::fs::read_dir(installed).ok()?.filter_map(Result::ok).filter(|entry| {
+                        let path = entry.path();
+                        path.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+                            name.starts_with(&prefix)
+                                && own::host_tuple(&path.join("bin/rustc"))
+                                    .is_some_and(|host| name == format!("{prefix}{host}"))
+                        })
+                    });
+                let selected = matches.next()?.path();
+                if matches.next().is_some() {
+                    return None;
+                }
+                selected
+            }
+        }
     };
     let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     std::fs::canonicalize(rustc).ok()
 }
 
+fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option<OsString> {
+    if let Some(selected) = env.filter(|it| !it.is_empty()) {
+        return Some(selected);
+    }
+    let settings: toml::Value =
+        toml::from_str(&std::fs::read_to_string(home.join("settings.toml")).ok()?).ok()?;
+    let cwd = std::fs::canonicalize(cwd).ok()?;
+    for dir in cwd.ancestors() {
+        if let Some(selected) = settings
+            .get("overrides")
+            .and_then(|it| it.get(dir.to_str()?))
+            .and_then(|it| it.as_str())
+        {
+            return Some(selected.into());
+        }
+        for (file, is_toml) in [("rust-toolchain", false), ("rust-toolchain.toml", true)] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(file)) {
+                if !is_toml && !text.trim_start().starts_with('[') {
+                    return Some(text.trim().into());
+                }
+                let value: toml::Value = toml::from_str(&text).ok()?;
+                return value.get("toolchain")?.get("channel")?.as_str().map(OsString::from);
+            }
+        }
+    }
+    settings.get("default_toolchain")?.as_str().map(OsString::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_proxy_resolves_home_short_channel_and_directory_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".rustup");
+        let installed = home.join("toolchains/1.99.0-aarch64-apple-darwin");
+        let compiler = synthetic_toolchain(&installed);
+        std::fs::write(home.join("settings.toml"), "default_toolchain = '1.99.0'\n").unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("rustup"), "").unwrap();
+        // rustup proxies can be hard links as well as symlinks.
+        std::fs::hard_link(bin.join("rustup"), bin.join("rustc")).unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let vars = |name: &str| match name {
+            "HOME" => Some(root.path().as_os_str().to_owned()),
+            "PATH" => Some(bin.as_os_str().to_owned()),
+            _ => None,
+        };
+        let expected = std::fs::canonicalize(compiler).unwrap();
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars), Some(expected.clone()));
+        let selected = |name: &str| {
+            if name == "RUSTUP_TOOLCHAIN" { Some("1.99.0".into()) } else { vars(name) }
+        };
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &selected), Some(expected));
+        std::fs::write(cwd.join("rust-toolchain.toml"), "[toolchain]\nchannel='missing'\n")
+            .unwrap();
+        assert!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars).is_none());
+        assert_eq!(installed_selection(&home, &cwd, Some("1.99.0".into())), Some("1.99.0".into()));
+        let override_dir = installed.to_string_lossy();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "default_toolchain='missing'\n[overrides]\n'{}'='{}'\n",
+                std::fs::canonicalize(&cwd).unwrap().display(),
+                override_dir
+            ),
+        )
+        .unwrap();
+        assert_eq!(installed_selection(&home, &cwd, None), Some(installed.as_os_str().to_owned()));
+    }
 
     pub(super) fn synthetic_toolchain(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
