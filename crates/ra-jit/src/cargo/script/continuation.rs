@@ -111,6 +111,14 @@ impl Drop for Continuation {
 
 pub(super) fn consume(ran: &Ran, out_dir: &std::path::Path) -> anyhow::Result<bool> {
     let Some(dir) = std::env::var_os(VARIABLE).map(PathBuf::from) else { return Ok(false) };
+    consume_from(&dir, ran, out_dir)
+}
+
+pub(super) fn consume_from(
+    dir: &std::path::Path,
+    ran: &Ran,
+    out_dir: &std::path::Path,
+) -> anyhow::Result<bool> {
     let completed: Vec<Completed> = serde_json::from_slice(&std::fs::read(dir.join("runs"))?)?;
     let Some((index, done)) = completed.iter().enumerate().find(|(_, it)| it.out_dir == out_dir)
     else {
@@ -129,9 +137,26 @@ pub(super) fn consume(ran: &Ran, out_dir: &std::path::Path) -> anyhow::Result<bo
     )
     .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(run == done.run, "the completed script's output changed");
+    // A file the script reads, written while this build ran after the daemon's run began, is
+    // one cargo runs the script again for: it is run, not replayed from what it read before.
+    if read_since(done, ran, out_dir) {
+        return Ok(false);
+    }
     let used = dir.join(format!("used-{index}"));
     std::fs::File::options().write(true).create_new(true).open(used)?;
     std::io::stdout().write_all(&done.stdout)?;
     std::io::stderr().write_all(&done.stderr)?;
     Ok(true)
+}
+
+/// Whether a file the run `done` said it reads has been written since the run began, or this
+/// cannot be told.
+fn read_since(done: &Completed, ran: &Ran, out_dir: &std::path::Path) -> bool {
+    let var = |name: &str| ran.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
+    let Some(package) = var("CARGO_MANIFEST_DIR") else { return true };
+    let Ok(unit) = super::super::records::Unit::of(out_dir) else { return true };
+    let compiled = ran.real.to_str().and_then(|it| it.strip_suffix(".real"));
+    let compiled = compiled.map_or_else(|| ran.real.clone(), PathBuf::from);
+    // Where cargo's home is does not matter here: what it keeps never changes.
+    unit.stale(&done.fingerprint.local, std::path::Path::new(package), &compiled, None).is_some()
 }

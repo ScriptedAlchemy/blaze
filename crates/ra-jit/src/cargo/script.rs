@@ -1763,6 +1763,36 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(!path.exists(), "a subsequent build cannot consume this run");
     }
 
+    /// The daemon's run of the script of `out_dir`, made now, as the cargo leg of a build finds
+    /// it, with the directory that holds it for that leg.
+    fn completed_run(out_dir: &Path) -> Continuation {
+        changed(out_dir);
+        let mut completed = Vec::new();
+        judge_for(out_dir, &CARGO, &mut completed).unwrap();
+        assert_eq!(completed.len(), 1);
+        Continuation::for_command(&mut Command::new("sh"), &completed).unwrap().unwrap()
+    }
+
+    #[test]
+    fn cargos_leg_takes_the_daemons_run_of_a_script() {
+        let out_dir = ran_script("replay", COUNTS, "");
+        let held = completed_run(&out_dir);
+        assert!(continuation::consume_from(&held.path(), &ran_of(&out_dir), &out_dir).unwrap());
+        assert!(held.path().join("used-0").exists());
+        assert_eq!(runs(&out_dir), 1);
+    }
+
+    #[test]
+    fn cargos_leg_runs_a_script_again_for_a_file_written_after_the_daemons_run_began() {
+        let out_dir = ran_script("replay-edit", COUNTS, "");
+        let held = completed_run(&out_dir);
+        // An edit while the build runs: cargo's fingerprint of the run is older than the file.
+        let watched = out_dir.parent().unwrap().join("watched");
+        set_written(&watched, SystemTime::now() + Duration::from_secs(60));
+        assert!(!continuation::consume_from(&held.path(), &ran_of(&out_dir), &out_dir).unwrap());
+        assert!(!held.path().join("used-0").exists());
+    }
+
     #[test]
     fn a_script_that_logs_an_error_or_prints_what_cargo_does_not_take_has_no_record_of_a_run() {
         let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::error=broken\n";
