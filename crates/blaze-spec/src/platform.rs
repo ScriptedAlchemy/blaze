@@ -4,8 +4,8 @@
 //! executable bytes, launcher bytes and selected arguments contribute to identity. Files,
 //! directory membership, missing paths, native names, modes and symlink referents are bound
 //! by complete trees. SDK identities do not contain the SDK's physical root location.
-//! Every filesystem read and process query goes through `Probe`; `System` uses the exact
-//! request cwd and environment. `describe` retains the trees for saved-input admission.
+//! Every filesystem read and process query goes through `Probe`; `System` uses the requested
+//! cwd and explicit environment. `describe` retains the trees for saved-input admission.
 
 use std::{
     collections::BTreeMap,
@@ -179,11 +179,11 @@ impl Probe for InDirectory<'_> {
     fn run_output_in(
         &self,
         _cwd: &Path,
-        _env: &BTreeMap<String, std::ffi::OsString>,
+        env: &BTreeMap<String, std::ffi::OsString>,
         program: &Path,
         args: &[std::ffi::OsString],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.probe.run_output_in(self.cwd, self.env, &self.cwd.join(program), args)
+        self.probe.run_output_in(self.cwd, env, &self.cwd.join(program), args)
     }
     fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
         self.probe.which_native_in(self.cwd, name, path).map(|path| self.cwd.join(path))
@@ -192,7 +192,16 @@ impl Probe for InDirectory<'_> {
         self.probe.which_in(self.cwd, name, path).map(|path| self.cwd.join(path))
     }
     fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
-        self.probe.run_in(self.cwd, self.env, &self.cwd.join(program), args)
+        if args == ["--version"] {
+            self.probe.run_in(
+                self.cwd,
+                &query_environment(self.env).ok()?,
+                &self.cwd.join(program),
+                args,
+            )
+        } else {
+            self.probe.run_in(self.cwd, self.env, &self.cwd.join(program), args)
+        }
     }
     fn run_native(&self, program: &Path, args: &[std::ffi::OsString]) -> Option<String> {
         self.probe.run_native_in(self.cwd, self.env, &self.cwd.join(program), args)
@@ -378,6 +387,19 @@ pub struct Description {
 
 /// Discover the platform and retain its native closure in one observation.
 pub fn describe(machine: &Machine<'_>, probe: &dyn Probe) -> Result<Description, Refusal> {
+    discover(machine, probe, true)
+}
+
+/// Native tool facts for live planning, without claiming a bound input closure.
+pub fn facts(machine: &Machine<'_>, probe: &dyn Probe) -> Result<ExecPlatform, Refusal> {
+    Ok(discover(machine, probe, false)?.platform)
+}
+
+fn discover(
+    machine: &Machine<'_>,
+    probe: &dyn Probe,
+    bind_native: bool,
+) -> Result<Description, Refusal> {
     let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env };
     let probe: &dyn Probe = &scoped;
     let os = probe
@@ -412,24 +434,39 @@ pub fn describe(machine: &Machine<'_>, probe: &dyn Probe) -> Result<Description,
             (None, Some(libc))
         }
     };
-    for (role, compiler, language) in
-        [("cc", cc.as_ref(), "c"), ("cxx", cxx.as_ref(), "c++"), ("linker", Some(&linker), "c")]
-    {
-        if let Some(compiler) = compiler {
-            compiler_roots(probe, env, role, compiler, language, &mut roots)?;
-        }
-    }
-    native_environment_roots(env, machine.triple, &mut roots)?;
     let mut native = crate::native::Closure::default();
-    let paths: Vec<_> = roots.iter().map(|(_, path)| machine.cwd.join(path)).collect();
-    let trees = probe.native_trees(&paths).map_err(|error| {
-        Refusal::new("native roots", format!("cannot bind the complete native trees: {error}"))
-    })?;
-    if trees.len() != paths.len() {
-        return Err(Refusal::new("native roots", "the probe did not return every requested tree"));
-    }
-    for ((name, _), tree) in roots.into_iter().zip(trees) {
-        native.roots.push(crate::native::Root { name, tree });
+    if bind_native {
+        let queries =
+            NativeQueries { probe, env, cc: cc.as_ref(), cxx: cxx.as_ref(), linker: &linker };
+        for (role, compiler, language) in
+            [("cc", cc.as_ref(), "c"), ("cxx", cxx.as_ref(), "c++"), ("linker", Some(&linker), "c")]
+        {
+            if let Some(compiler) = compiler {
+                compiler_roots(probe, env, role, compiler, language, &mut roots)?;
+                let words = compiler
+                    .args
+                    .iter()
+                    .map(|word| word.as_encoded_bytes().to_vec())
+                    .collect::<Vec<_>>();
+                if !words.is_empty() {
+                    native_flag_roots(role, &words, Some(&queries), Some(compiler), &mut roots)?;
+                }
+            }
+        }
+        native_environment_roots(env, machine.triple, Some(&queries), &mut roots)?;
+        let paths: Vec<_> = roots.iter().map(|(_, path)| machine.cwd.join(path)).collect();
+        let trees = probe.native_trees(&paths).map_err(|error| {
+            Refusal::new("native roots", format!("cannot bind the complete native trees: {error}"))
+        })?;
+        if trees.len() != paths.len() {
+            return Err(Refusal::new(
+                "native roots",
+                "the probe did not return every requested tree",
+            ));
+        }
+        for ((name, _), tree) in roots.into_iter().zip(trees) {
+            native.roots.push(crate::native::Root { name, tree });
+        }
     }
     let platform = ExecPlatform {
         triple: machine.triple.to_owned(),
@@ -441,14 +478,23 @@ pub fn describe(machine: &Machine<'_>, probe: &dyn Probe) -> Result<Description,
         cc: cc.map(Tool::tuple),
         cxx: cxx.map(Tool::tuple),
         ar: ar.map(Tool::tuple),
-        native_root: Some(native.digest()),
+        native_root: bind_native.then(|| native.digest()),
     };
     Ok(Description { platform, native })
+}
+
+struct NativeQueries<'a> {
+    probe: &'a dyn Probe,
+    env: &'a BTreeMap<String, std::ffi::OsString>,
+    cc: Option<&'a Tool>,
+    cxx: Option<&'a Tool>,
+    linker: &'a Tool,
 }
 
 fn native_environment_roots(
     env: &BTreeMap<String, std::ffi::OsString>,
     triple: &str,
+    queries: Option<&NativeQueries<'_>>,
     roots: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), Refusal> {
     for (name, value) in env {
@@ -465,43 +511,752 @@ fn native_environment_roots(
         } else if (name.starts_with("NIX_LDFLAGS") || name.starts_with("NIX_CFLAGS_"))
             && crate::environment::is_script_var(name, triple)
         {
-            let words: Vec<_> = value
-                .as_encoded_bytes()
-                .split(u8::is_ascii_whitespace)
-                .filter(|word| !word.is_empty())
-                .collect();
-            let mut at = 0;
-            while at < words.len() {
-                let word = words[at];
-                at += 1;
-                let (role, rest) = if let Some(path) = word.strip_prefix(b"-L") {
-                    ("linker/libraries", path)
-                } else if let Some(path) = word.strip_prefix(b"-I") {
-                    ("native/headers", path)
-                } else if let Some(path) = word.strip_prefix(b"-F") {
-                    ("linker/frameworks", path)
-                } else if matches!(
-                    word,
-                    b"-isystem" | b"-idirafter" | b"-iframework" | b"-isysroot"
-                ) {
-                    ("native/headers", &b""[..])
-                } else {
-                    continue;
-                };
-                let path = if rest.is_empty() {
-                    let path = words.get(at).ok_or_else(|| {
-                        Refusal::new(name, "native wrapper search flag needs a path")
-                    })?;
-                    at += 1;
-                    *path
-                } else {
-                    rest
-                };
-                roots.push((format!("{role}/flags/{name}/{at}"), native_path(path)?));
+            let compiler = queries.and_then(|queries| {
+                if name.starts_with("NIX_LDFLAGS") { Some(queries.linker) } else { queries.cc }
+            });
+            native_flag_roots(name, &flag_words(value, false), queries, compiler, roots)?;
+        }
+    }
+    let shell = env.get("CC_SHELL_ESCAPED_FLAGS").is_some_and(|value| {
+        !value.is_empty() && !["0", "false", "no"].iter().any(|off| value == *off)
+    });
+    let underscored = triple.replace(['-', '.'], "_");
+    // cc 1.4.3 appends flags from least to most specific. Keep host and target
+    // invocations separate: an argument can span variables within one invocation.
+    for base in ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"] {
+        let mut previous = None;
+        for kind in ["HOST", "TARGET"] {
+            let mut words = Vec::new();
+            for name in [
+                base.to_owned(),
+                format!("{kind}_{base}"),
+                format!("{base}_{underscored}"),
+                format!("{base}_{triple}"),
+            ] {
+                if crate::environment::is_script_var(&name, triple)
+                    && let Some(value) = env.get(&name)
+                {
+                    words.extend(flag_words(value, shell));
+                }
+            }
+            if !words.is_empty() && previous.as_ref() != Some(&words) {
+                let compiler = queries.and_then(|queries| match base {
+                    "CXXFLAGS" => queries.cxx,
+                    "LDFLAGS" => Some(queries.linker),
+                    _ => queries.cc,
+                });
+                native_flag_roots(&format!("{kind}_{base}"), &words, queries, compiler, roots)?;
+            }
+            previous = Some(words);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchKind {
+    Header,
+    Framework,
+    Library,
+    Sysroot,
+    HeaderSysroot,
+    Prefix,
+    PrefixBefore,
+    PrefixAfter,
+    SysrootFramework,
+    Forced,
+}
+
+struct SearchArg {
+    flag: &'static [u8],
+    value: Vec<u8>,
+    kind: SearchKind,
+    linker: bool,
+    at: usize,
+}
+
+fn search_args(words: &[Vec<u8>]) -> Vec<SearchArg> {
+    let mut args = Vec::new();
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if let Some(linker) = word.strip_prefix(b"-Wl,") {
+            args.extend(linker.split(|byte| *byte == b',').map(|word| (word.to_vec(), true)));
+        } else if matches!(word.as_slice(), b"-Xlinker" | b"-Xpreprocessor" | b"-Xclang") {
+            if let Some(arg) = words.next() {
+                args.push((arg.clone(), word == b"-Xlinker"));
+            }
+        } else {
+            args.push((word.clone(), false));
+        }
+    }
+    let mut paths = Vec::new();
+    let mut at = 0;
+    while at < args.len() {
+        let (word, linker) = &args[at];
+        at += 1;
+        let flags: &[(&[u8], SearchKind)] = &[
+            (b"--sysroot=", SearchKind::Sysroot),
+            (b"--sysroot", SearchKind::Sysroot),
+            (b"-isysroot", SearchKind::HeaderSysroot),
+            (b"-iframeworkwithsysroot", SearchKind::SysrootFramework),
+            (b"-iframework", SearchKind::Framework),
+            (b"-include-pch", SearchKind::Forced),
+            (b"-include-pth", SearchKind::Forced),
+            (b"-include", SearchKind::Forced),
+            (b"-imacros", SearchKind::Forced),
+            (b"-iwithprefixbefore", SearchKind::PrefixBefore),
+            (b"-iwithprefix", SearchKind::PrefixAfter),
+            (b"-iprefix", SearchKind::Prefix),
+            (b"-isystem-after", SearchKind::Header),
+            (b"-isystem", SearchKind::Header),
+            (b"-idirafter", SearchKind::Header),
+            (b"-iquote", SearchKind::Header),
+            (b"-L", SearchKind::Library),
+            (b"-I", SearchKind::Header),
+            (b"-F", SearchKind::Framework),
+        ];
+        let Some(&(flag, kind)) = flags.iter().find(|(flag, _)| {
+            word.starts_with(flag) && (*flag != b"--sysroot" || word.len() == flag.len())
+        }) else {
+            continue;
+        };
+        let rest = &word[flag.len()..];
+        let value = if rest.is_empty() && !flag.ends_with(b"=") {
+            let Some((path, _)) = args.get(at) else { break };
+            at += 1;
+            path.clone()
+        } else {
+            rest.to_vec()
+        };
+        paths.push(SearchArg { flag, value, kind, linker: *linker, at });
+    }
+    paths
+}
+
+fn native_flag_roots(
+    name: &str,
+    words: &[Vec<u8>],
+    queries: Option<&NativeQueries<'_>>,
+    compiler: Option<&Tool>,
+    roots: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Refusal> {
+    let mut effective = compiler
+        .map(|tool| {
+            tool.args.iter().map(|word| word.as_encoded_bytes().to_vec()).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if effective != words {
+        effective.extend_from_slice(words);
+    }
+    if let Some(queries) = queries {
+        for (key, value) in queries.env {
+            if key.starts_with("NIX_CFLAGS_") || key.starts_with("NIX_LDFLAGS") {
+                effective.extend(flag_words(value, false));
+            }
+        }
+    }
+    let paths = search_args(&effective);
+    let mut interpreted_headers = false;
+    let mut interpreted_libraries = Vec::new();
+    for arg in &paths {
+        let interpreted = arg.value.starts_with(b"=")
+            || arg.value.starts_with(b"$SYSROOT")
+            || (arg.flag == b"-I" && arg.value == b"-");
+        let role = match arg.kind {
+            SearchKind::Header | SearchKind::Framework if interpreted && !arg.linker => {
+                interpreted_headers = true;
+                continue;
+            }
+            SearchKind::Prefix
+            | SearchKind::PrefixBefore
+            | SearchKind::PrefixAfter
+            | SearchKind::SysrootFramework => {
+                interpreted_headers = true;
+                continue;
+            }
+            SearchKind::Library if interpreted => {
+                interpreted_libraries.push(arg);
+                continue;
+            }
+            SearchKind::Header => "native/headers",
+            SearchKind::Framework => "linker/frameworks",
+            SearchKind::Library => "linker/libraries",
+            SearchKind::Sysroot => "native/sysroot",
+            SearchKind::HeaderSysroot => "native/header-sysroot",
+            SearchKind::Forced => "native/forced-include",
+        };
+        roots.push((format!("{role}/flags/{name}/{}", arg.at), native_path(&arg.value)?));
+    }
+    if interpreted_headers || !interpreted_libraries.is_empty() {
+        let queries =
+            queries.ok_or_else(|| Refusal::new(name, "native search query is unavailable"))?;
+        let compiler =
+            compiler.ok_or_else(|| Refusal::new(name, "native compiler is not resolved"))?;
+        check_compound_controls(
+            name,
+            &paths,
+            queries.env,
+            interpreted_headers,
+            !interpreted_libraries.is_empty(),
+        )?;
+        if interpreted_headers {
+            interpreted_header_roots(name, words, queries, compiler, roots)?;
+        }
+        if !interpreted_libraries.is_empty() {
+            interpreted_library_roots(
+                name,
+                words,
+                &interpreted_libraries,
+                queries,
+                compiler,
+                roots,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn flag_family(name: &str) -> Option<&'static str> {
+    ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"].into_iter().find(|base| {
+        name == *base
+            || name == format!("HOST_{base}")
+            || name == format!("TARGET_{base}")
+            || name.starts_with(&format!("{base}_"))
+    })
+}
+
+fn check_compound_controls(
+    name: &str,
+    current: &[SearchArg],
+    env: &BTreeMap<String, std::ffi::OsString>,
+    headers: bool,
+    libraries: bool,
+) -> Result<(), Refusal> {
+    for (other, value) in env {
+        if (other.starts_with("NIX_CFLAGS_") || other.starts_with("NIX_LDFLAGS"))
+            && search_args(&flag_words(value, false))
+                .iter()
+                .any(|arg| arg.linker && arg.kind == SearchKind::Sysroot)
+        {
+            return Err(Refusal::new(
+                name,
+                format!(
+                    "{other} forwards a sysroot outside the validated native wrapper query interface"
+                ),
+            ));
+        }
+    }
+    let Some(family) = flag_family(name) else { return Ok(()) };
+    let shell = env.get("CC_SHELL_ESCAPED_FLAGS").is_some_and(|value| {
+        !value.is_empty() && !["0", "false", "no"].iter().any(|off| value == *off)
+    });
+    for (other, value) in env {
+        let Some(other_family) = flag_family(other) else { continue };
+        if other_family == family {
+            continue;
+        }
+        for control in search_args(&flag_words(value, shell)) {
+            let relevant = (control.kind == SearchKind::Sysroot && (headers || libraries))
+                || (headers
+                    && matches!(control.kind, SearchKind::HeaderSysroot | SearchKind::Prefix));
+            if relevant
+                && (control.kind == SearchKind::Prefix
+                    || current
+                        .iter()
+                        .rev()
+                        .find(|known| known.kind == control.kind)
+                        .is_none_or(|known| known.value != control.value))
+            {
+                return Err(Refusal::new(
+                    name,
+                    format!(
+                        "native search controls also come from {other}; the combined native invocation argv is not captured"
+                    ),
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn safe_search_args(words: &[Vec<u8>]) -> Result<Vec<std::ffi::OsString>, Refusal> {
+    let mut args = Vec::new();
+    for path in search_args(words) {
+        if path.linker || matches!(path.kind, SearchKind::Forced | SearchKind::Library) {
+            continue;
+        }
+        if path.flag == b"-I" && path.value == b"-" {
+            args.push("-I-".into());
+        } else {
+            args.push(
+                native_path(path.flag.strip_suffix(b"=").unwrap_or(path.flag))?.into_os_string(),
+            );
+            args.push(native_path(&path.value)?.into_os_string());
+        }
+    }
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if matches!(
+            word.as_slice(),
+            b"-m32"
+                | b"-m64"
+                | b"-mx32"
+                | b"-nostdinc"
+                | b"-nostdinc++"
+                | b"-nobuiltininc"
+                | b"-nostdlibinc"
+                | b"-nostdsysteminc"
+        ) || [
+            b"--target=".as_slice(),
+            b"-march=",
+            b"-mcpu=",
+            b"-mtune=",
+            b"-mabi=",
+            b"-stdlib=",
+            b"-fuse-ld=",
+            b"--ld-path=",
+            b"--gcc-toolchain=",
+            b"-resource-dir=",
+        ]
+        .iter()
+        .any(|prefix| word.starts_with(prefix))
+        {
+            args.push(native_path(word)?.into_os_string());
+        } else if matches!(
+            word.as_slice(),
+            b"--target" | b"-target" | b"-arch" | b"-B" | b"-gcc-toolchain" | b"-resource-dir"
+        ) {
+            if let Some(value) = words.next() {
+                args.push(native_path(word)?.into_os_string());
+                args.push(native_path(value)?.into_os_string());
+            }
+        } else if word.starts_with(b"-B") && word.len() > 2 {
+            args.push(native_path(word)?.into_os_string());
+        }
+    }
+    Ok(args)
+}
+
+fn query_environment(
+    env: &BTreeMap<String, std::ffi::OsString>,
+) -> Result<BTreeMap<String, std::ffi::OsString>, Refusal> {
+    let mut clean = env.clone();
+    clean.insert("LC_ALL".into(), "C".into());
+    let shell = env.get("CC_SHELL_ESCAPED_FLAGS").is_some_and(|value| {
+        !value.is_empty() && !["0", "false", "no"].iter().any(|off| value == *off)
+    });
+    for (name, value) in env {
+        let nix = name.starts_with("NIX_CFLAGS_") || name.starts_with("NIX_LDFLAGS");
+        let ordinary = ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"].iter().any(|base| {
+            name == base
+                || name == &format!("HOST_{base}")
+                || name == &format!("TARGET_{base}")
+                || name.starts_with(&format!("{base}_"))
+        });
+        if nix || ordinary {
+            let quoted = ordinary && shell;
+            let safe = safe_search_args(&flag_words(value, quoted))?;
+            let mut bytes = Vec::new();
+            for word in &safe {
+                if !bytes.is_empty() {
+                    bytes.push(b' ');
+                }
+                if quoted {
+                    bytes.push(b'\'');
+                    for byte in word.as_encoded_bytes() {
+                        if *byte == b'\'' {
+                            bytes.extend_from_slice(b"'\\''");
+                        } else {
+                            bytes.push(*byte);
+                        }
+                    }
+                    bytes.push(b'\'');
+                } else if word.is_empty() {
+                    // The only empty operand representable in whitespace mode is
+                    // a joined long option such as --sysroot=.
+                    bytes.pop();
+                    bytes.push(b'=');
+                } else {
+                    bytes.extend_from_slice(word.as_encoded_bytes());
+                }
+            }
+            clean.insert(name.clone(), native_path(&bytes)?.into_os_string());
+        }
+    }
+    Ok(clean)
+}
+
+fn native_query(
+    probe: &dyn Probe,
+    env: &BTreeMap<String, std::ffi::OsString>,
+    compiler: &Tool,
+    words: &[Vec<u8>],
+    tail: &[std::ffi::OsString],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let tool_words: Vec<_> =
+        compiler.args.iter().map(|word| word.as_encoded_bytes().to_vec()).collect();
+    let mut args = safe_search_args(&tool_words).ok()?;
+    if tool_words != words {
+        args.extend(safe_search_args(words).ok()?);
+    }
+    args.extend_from_slice(tail);
+    probe.run_output_in(Path::new("."), &query_environment(env).ok()?, &compiler.path, &args)
+}
+
+fn header_search_roots(bytes: &[u8]) -> Result<Option<Vec<PathBuf>>, Refusal> {
+    let mut roots = Vec::new();
+    let mut listing = false;
+    let mut complete = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if matches!(
+            line,
+            b"#include <...> search starts here:" | b"#include \"...\" search starts here:"
+        ) {
+            listing = true;
+            continue;
+        }
+        if line == b"End of search list." {
+            complete = true;
+            listing = false;
+            continue;
+        }
+        let missing = line.strip_prefix(b"ignoring nonexistent directory \"").and_then(|line| {
+            line.strip_suffix(b"\"").or_else(|| line.strip_suffix(b"\" (framework directory)"))
+        });
+        if let Some(path) = missing {
+            roots.push(native_path(path)?);
+        } else if listing {
+            let path = line.strip_prefix(b" ").unwrap_or(line);
+            let path = path.strip_suffix(b" (framework directory)").unwrap_or(path);
+            if !path.is_empty() {
+                roots.push(native_path(path)?);
+            }
+        }
+    }
+    Ok(complete.then_some(roots))
+}
+
+fn interpreted_header_roots(
+    name: &str,
+    words: &[Vec<u8>],
+    queries: &NativeQueries<'_>,
+    compiler: &Tool,
+    roots: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Refusal> {
+    for path in search_args(words) {
+        if path.value.contains(&b'\n') || path.value.contains(&b'\r') {
+            return Err(Refusal::new(
+                name,
+                "native compiler search listing cannot name a newline-bearing path",
+            ));
+        }
+    }
+    let language =
+        if queries.cxx.is_some_and(|tool| std::ptr::eq(tool, compiler)) { "c++" } else { "c" };
+    let (out, err) = native_query(
+        queries.probe,
+        queries.env,
+        compiler,
+        words,
+        &["-E".into(), "-x".into(), language.into(), "-".into(), "-v".into()],
+    )
+    .ok_or_else(|| {
+        Refusal::new(
+            name,
+            format!("{} has no successful native header search query", compiler.name),
+        )
+    })?;
+    let paths = header_search_roots(&err)?.or(header_search_roots(&out)?).ok_or_else(|| {
+        Refusal::new(
+            name,
+            format!("{} did not report a complete native header search listing", compiler.name),
+        )
+    })?;
+    roots.extend(
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(at, path)| (format!("native/headers/query/{name}/{at}"), path)),
+    );
+    Ok(())
+}
+
+struct DriverLink {
+    program: PathBuf,
+    sysroot: Option<PathBuf>,
+    args: Vec<Vec<u8>>,
+}
+
+fn driver_linker(
+    name: &str,
+    words: &[Vec<u8>],
+    queries: &NativeQueries<'_>,
+    compiler: &Tool,
+) -> Result<DriverLink, Refusal> {
+    if !compiler.version.to_ascii_lowercase().contains("clang")
+        && native_query(queries.probe, queries.env, compiler, words, &["-print-sysroot".into()])
+            .is_none()
+    {
+        return Err(Refusal::new(
+            name,
+            "native compiler has no safe linker driver query interface",
+        ));
+    }
+    let mut tail = Vec::new();
+    let mut effective =
+        compiler.args.iter().map(|word| word.as_encoded_bytes().to_vec()).collect::<Vec<_>>();
+    effective.extend_from_slice(words);
+    for arg in search_args(&effective) {
+        if arg.linker && arg.kind == SearchKind::Sysroot {
+            let mut option = std::ffi::OsString::from("--sysroot=");
+            option.push(native_path(&arg.value)?.as_os_str());
+            tail.extend([std::ffi::OsString::from("-Xlinker"), option]);
+        }
+    }
+    tail.extend(["-###".into(), "-x".into(), "c".into(), "/dev/null".into()]);
+    let (out, err) =
+        native_query(queries.probe, queries.env, compiler, words, &tail).ok_or_else(|| {
+            Refusal::new(name, "native compiler driver has no safe linker command query")
+        })?;
+    let mut found = None;
+    for line in err.split(|byte| *byte == b'\n').chain(out.split(|byte| *byte == b'\n')) {
+        if line
+            .windows(2)
+            .any(|pair| pair[0] == b'\\' && matches!(pair[1], b'0'..=b'7' | b'x' | b'n' | b'r'))
+        {
+            continue;
+        }
+        let args = flag_words(native_path(line)?.as_os_str(), true);
+        let Some(program) = args.first() else { continue };
+        let program = native_path(program)?;
+        if !program.is_absolute()
+            || (!args.iter().any(|arg| arg == b"-o")
+                && program.file_name() != Some(std::ffi::OsStr::new("collect2")))
+            || args.iter().any(|arg| arg.starts_with(b"-cc1"))
+            || program.file_name() == Some(std::ffi::OsStr::new("as"))
+        {
+            continue;
+        }
+        let paths = search_args(&args[1..]);
+        let sysroot = paths
+            .iter()
+            .rev()
+            .find(|arg| arg.kind == SearchKind::Sysroot)
+            .map(|arg| native_path(&arg.value))
+            .transpose()?;
+        found = Some(DriverLink { program, sysroot, args: args[1..].to_vec() });
+    }
+    found.ok_or_else(|| {
+        Refusal::new(name, "native compiler driver has no lossless linker command interface")
+    })
+}
+
+fn interpreted_library_roots(
+    name: &str,
+    words: &[Vec<u8>],
+    libraries: &[&SearchArg],
+    queries: &NativeQueries<'_>,
+    compiler: &Tool,
+    roots: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Refusal> {
+    let tool_words: Vec<_> =
+        compiler.args.iter().map(|word| word.as_encoded_bytes().to_vec()).collect();
+    let mut combined = tool_words;
+    combined.extend_from_slice(words);
+    let direct = compiler.version.contains("GNU ld")
+        || (compiler.version.contains("LLD") && compiler.version.contains("GNU linkers"));
+    let driver = if direct { None } else { Some(driver_linker(name, words, queries, compiler)?) };
+    let mut linker_name = std::ffi::OsString::from("ld");
+    for word in combined.iter().chain(driver.iter().flat_map(|driver| driver.args.iter())) {
+        if let Some(value) = word.strip_prefix(b"--ld-path=") {
+            linker_name = native_path(value)?.into_os_string();
+        } else if let Some(value) = word.strip_prefix(b"-fuse-ld=") {
+            linker_name = if value.contains(&b'/') {
+                native_path(value)?.into_os_string()
+            } else {
+                let mut name = std::ffi::OsString::from("ld.");
+                name.push(native_path(value)?.as_os_str());
+                name
+            };
+        }
+    }
+    let selected = if let Some(driver) = &driver
+        && driver.program.file_name() != Some(std::ffi::OsStr::new("collect2"))
+    {
+        driver.program.clone()
+    } else if direct {
+        compiler.path.clone()
+    } else if Path::new(&linker_name).components().count() > 1 {
+        PathBuf::from(linker_name)
+    } else {
+        let mut query = std::ffi::OsString::from("-print-prog-name=");
+        query.push(linker_name);
+        let (out, _) = native_query(queries.probe, queries.env, compiler, words, &[query])
+            .ok_or_else(|| {
+                Refusal::new(name, format!("{} cannot name its native linker", compiler.name))
+            })?;
+        let selected =
+            crate::git_path::decode_line(out).map_err(|error| Refusal::new(name, error))?;
+        if selected.components().count() > 1 {
+            selected
+        } else {
+            queries
+                .probe
+                .which_native(
+                    selected.as_os_str(),
+                    queries.env.get("PATH").map(|value| value.as_os_str()).unwrap_or_default(),
+                )
+                .ok_or_else(|| Refusal::new(name, "selected native linker cannot be resolved"))?
+        }
+    };
+    let env = query_environment(queries.env)?;
+    let (version, _) = queries
+        .probe
+        .run_output_in(Path::new("."), &env, &selected, &["--version".into()])
+        .ok_or_else(|| Refusal::new(name, "selected native linker has no version interface"))?;
+    let gnu = version.windows(b"GNU ld".len()).any(|part| part == b"GNU ld");
+    let lld = version.windows(b"LLD".len()).any(|part| part == b"LLD")
+        && version.windows(b"GNU linkers".len()).any(|part| part == b"GNU linkers");
+    if !gnu && !lld {
+        return Err(Refusal::new(
+            name,
+            "selected native linker has no owned sysroot search syntax",
+        ));
+    }
+    let paths = search_args(&combined);
+    let explicit = paths
+        .iter()
+        .rev()
+        .find(|path| path.kind == SearchKind::Sysroot && path.linker)
+        .or_else(|| paths.iter().rev().find(|path| path.kind == SearchKind::Sysroot));
+    let driver_root = driver.as_ref().and_then(|driver| driver.sysroot.clone());
+    let root = if direct {
+        explicit.map(|path| native_path(&path.value)).transpose()?
+    } else {
+        driver_root
+    };
+    let sysroot = if gnu {
+        let mut args = Vec::new();
+        if let Some(root) = &root {
+            let mut option = std::ffi::OsString::from("--sysroot=");
+            option.push(root);
+            args.push(option);
+        }
+        args.push("--print-sysroot".into());
+        let (out, _) =
+            queries.probe.run_output_in(Path::new("."), &env, &selected, &args).ok_or_else(
+                || Refusal::new(name, "native GNU linker did not report its effective sysroot"),
+            )?;
+        crate::git_path::decode_line(out).map_err(|error| Refusal::new(name, error))?
+    } else {
+        root.unwrap_or_default()
+    };
+    if let Some(driver) = driver {
+        if !roots.iter().any(|(_, root)| driver.program.starts_with(root)) {
+            roots.push((format!("native/linker/driver/{name}"), driver.program));
+        }
+    }
+    if !roots.iter().any(|(_, root)| selected.starts_with(root)) {
+        roots.push((format!("native/linker/query/{name}"), selected));
+    }
+    for arg in libraries {
+        let path = if lld {
+            // lld/ELF/DriverUtils.cpp::findFile uses path::append only for '=';
+            // '$SYSROOT' is an ordinary directory spelling, even with --sysroot.
+            if let Some(rest) = arg.value.strip_prefix(b"=") {
+                let relative = if sysroot.as_os_str().is_empty() {
+                    rest
+                } else {
+                    let start = rest.iter().position(|byte| *byte != b'/').unwrap_or(rest.len());
+                    &rest[start..]
+                };
+                sysroot.join(native_path(relative)?)
+            } else {
+                native_path(&arg.value)?
+            }
+        } else {
+            let rest = arg
+                .value
+                .strip_prefix(b"=")
+                .or_else(|| arg.value.strip_prefix(b"$SYSROOT"))
+                .unwrap();
+            let mut path = sysroot.as_os_str().to_owned();
+            path.push(native_path(rest)?.as_os_str());
+            PathBuf::from(path)
+        };
+        roots.push((format!("linker/libraries/query/{name}/{}", arg.at), path));
+    }
+    Ok(())
+}
+
+/// cc's default ASCII splitting, or its optional POSIX shlex mode, without loss of native bytes.
+fn flag_words(value: &std::ffi::OsStr, shell: bool) -> Vec<Vec<u8>> {
+    let bytes = value.as_encoded_bytes();
+    if !shell {
+        return bytes
+            .split(u8::is_ascii_whitespace)
+            .filter(|word| !word.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+    }
+    let mut words = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b' ' | b'\t' | b'\n' => {
+                at += 1;
+                continue;
+            }
+            b'#' => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut word = Vec::new();
+        let mut quote = None;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            at += 1;
+            if quote == Some(b'\'') {
+                if byte == b'\'' {
+                    quote = None;
+                } else {
+                    word.push(byte);
+                }
+            } else if byte == b'\\' {
+                let Some(&next) = bytes.get(at) else { return words };
+                at += 1;
+                if quote == Some(b'"') && !matches!(next, b'$' | b'`' | b'"' | b'\\' | b'\n') {
+                    word.push(b'\\');
+                }
+                if next != b'\n' {
+                    word.push(next);
+                }
+            } else if quote == Some(b'"') {
+                if byte == b'"' {
+                    quote = None;
+                } else {
+                    word.push(byte);
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if matches!(byte, b' ' | b'\t' | b'\n') {
+                break;
+            } else {
+                word.push(byte);
+            }
+        }
+        // cc consumes the shlex iterator without checking had_error; an incomplete
+        // final token is dropped, while preceding complete arguments are retained.
+        if quote.is_some() {
+            return words;
+        }
+        words.push(word);
+    }
+    words
 }
 
 fn compiler_roots(
@@ -513,9 +1268,13 @@ fn compiler_roots(
     roots: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), Refusal> {
     let query = |words: &[&str]| {
-        let mut args = compiler.args.clone();
-        args.extend(words.iter().map(std::ffi::OsString::from));
-        probe.run_output_in(Path::new("."), env, &compiler.path, &args)
+        native_query(
+            probe,
+            env,
+            compiler,
+            &[],
+            &words.iter().map(std::ffi::OsString::from).collect::<Vec<_>>(),
+        )
     };
     for (name, flag) in [
         ("sysroot", "-print-sysroot"),
@@ -549,27 +1308,12 @@ fn compiler_roots(
             }
         }
     }
-    if let Some((stdout, stderr)) = query(&["-E", "-x", language, "-", "-v"]) {
-        for bytes in [stdout, stderr] {
-            let mut listing = false;
-            for line in bytes.split(|b| *b == b'\n') {
-                if line == b"#include <...> search starts here:" {
-                    listing = true;
-                    continue;
-                }
-                if line == b"End of search list." {
-                    listing = false;
-                }
-                if listing {
-                    let line = line.strip_prefix(b" ").unwrap_or(line);
-                    let line = line.strip_suffix(b" (framework directory)").unwrap_or(line);
-                    if !line.is_empty() {
-                        let at = roots.len();
-                        roots.push((format!("{role}/headers/{at}"), native_path(line)?));
-                    }
-                }
-            }
-        }
+    if let Some((stdout, stderr)) = query(&["-E", "-x", language, "-", "-v"])
+        && let Some(paths) = header_search_roots(&stderr)?.or(header_search_roots(&stdout)?)
+    {
+        roots.extend(
+            paths.into_iter().enumerate().map(|(at, path)| (format!("{role}/headers/{at}"), path)),
+        );
     }
     Ok(())
 }
@@ -1035,6 +1779,92 @@ fn words_native(value: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
 
 #[cfg(test)]
 mod native_word_tests {
+    #[test]
+    fn shell_flag_control_uses_cc_boolean_values() {
+        for (control, expected) in [
+            (None, "'/quoted"),
+            (Some(""), "'/quoted"),
+            (Some("0"), "'/quoted"),
+            (Some("no"), "'/quoted"),
+            (Some("false"), "'/quoted"),
+            (Some("1"), "/quoted path"),
+            (Some("true"), "/quoted path"),
+            (Some("FALSE"), "/quoted path"),
+        ] {
+            let mut env = std::collections::BTreeMap::from([(
+                "CFLAGS".to_owned(),
+                "-I'/quoted path'".into(),
+            )]);
+            if let Some(control) = control {
+                env.insert("CC_SHELL_ESCAPED_FLAGS".into(), control.into());
+            }
+            let mut roots = Vec::new();
+            super::native_environment_roots(&env, "x86_64-unknown-linux-gnu", None, &mut roots)
+                .unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].1, std::path::Path::new(expected), "{control:?}");
+        }
+    }
+
+    #[test]
+    fn flag_operands_span_variables_within_each_build_kind() {
+        let env = std::collections::BTreeMap::from([
+            ("CFLAGS".to_owned(), "-I".into()),
+            ("HOST_CFLAGS".to_owned(), "/host/include".into()),
+            ("TARGET_CFLAGS".to_owned(), "/target/include".into()),
+        ]);
+        let mut roots = Vec::new();
+        super::native_environment_roots(&env, "x86_64-unknown-linux-gnu", None, &mut roots)
+            .unwrap();
+        assert_eq!(
+            roots.iter().map(|(_, path)| path.as_path()).collect::<Vec<_>>(),
+            [std::path::Path::new("/host/include"), std::path::Path::new("/target/include"),]
+        );
+        let mut unused = env;
+        unused.insert("TARGET_CFLAGS".into(), "".into());
+        let mut roots = Vec::new();
+        super::native_environment_roots(&unused, "x86_64-unknown-linux-gnu", None, &mut roots)
+            .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].1, std::path::Path::new("/host/include"));
+    }
+
+    #[test]
+    fn flag_words_match_cc_whitespace_and_posix_modes() {
+        let value = std::ffi::OsStr::new("-I'a b' -I\"c\\q\" # ignored\n-Ilast\\\n/path");
+        assert_eq!(
+            super::flag_words(value, false),
+            [
+                b"-I'a".to_vec(),
+                b"b'".to_vec(),
+                b"-I\"c\\q\"".to_vec(),
+                b"#".to_vec(),
+                b"ignored".to_vec(),
+                b"-Ilast\\".to_vec(),
+                b"/path".to_vec(),
+            ]
+        );
+        assert_eq!(
+            super::flag_words(value, true),
+            [b"-Ia b".to_vec(), b"-Ic\\q".to_vec(), b"-Ilast/path".to_vec(),]
+        );
+        for value in ["first 'unfinished", "first \"unfinished", "first unfinished\\"] {
+            assert_eq!(super::flag_words(std::ffi::OsStr::new(value), true), [b"first".to_vec()]);
+        }
+        assert_eq!(
+            super::flag_words(std::ffi::OsStr::new("'' a#b \"a\\$b\\`c\\\\d\\\"e\""), true),
+            [Vec::new(), b"a#b".to_vec(), b"a$b`c\\d\"e".to_vec(),]
+        );
+        assert_eq!(
+            super::flag_words(std::ffi::OsStr::new("a\r\x0bb\x0cc"), true),
+            [b"a\r\x0bb\x0cc".to_vec()]
+        );
+        assert_eq!(
+            super::flag_words(std::ffi::OsStr::new("a\r\x0bb\x0cc"), false),
+            [b"a".to_vec(), b"\x0bb".to_vec(), b"c".to_vec()]
+        );
+    }
+
     #[test]
     fn text_and_native_supported_syntax_agree() {
         for text in ["cc -O2", "'cc name' -g", "sccache cc", "cc \\", "cc\t\"a b\""] {

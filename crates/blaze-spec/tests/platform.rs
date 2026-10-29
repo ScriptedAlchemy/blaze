@@ -19,6 +19,12 @@ struct Fake {
     files: BTreeMap<String, Vec<u8>>,
     /// What a run prints, by the program and its arguments; a run that is absent failed.
     runs: BTreeMap<String, String>,
+    native_files: BTreeMap<PathBuf, Vec<u8>>,
+    deny_native_trees: bool,
+    outputs: BTreeMap<(PathBuf, Vec<std::ffi::OsString>), (Vec<u8>, Vec<u8>)>,
+    queries: std::cell::RefCell<
+        Vec<(BTreeMap<String, std::ffi::OsString>, PathBuf, Vec<std::ffi::OsString>)>,
+    >,
 }
 
 impl Fake {
@@ -31,6 +37,13 @@ impl Fake {
         self.runs.insert(run_key(program, args), out.to_owned());
         self
     }
+    fn output(mut self, program: &str, args: &[&str], stdout: &[u8], stderr: &[u8]) -> Fake {
+        self.outputs.insert(
+            (PathBuf::from(program), args.iter().map(std::ffi::OsString::from).collect()),
+            (stdout.to_vec(), stderr.to_vec()),
+        );
+        self
+    }
 }
 
 fn run_key(program: &str, args: &[&str]) -> String {
@@ -38,10 +51,30 @@ fn run_key(program: &str, args: &[&str]) -> String {
 }
 
 impl Probe for Fake {
+    fn run_output_in(
+        &self,
+        _cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[std::ffi::OsString],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.queries.borrow_mut().push((env.clone(), program.to_owned(), args.to_vec()));
+        self.outputs
+            .get(&(program.to_owned(), args.to_vec()))
+            .cloned()
+            .or_else(|| self.run_path(program, args).map(|out| (out, Vec::new())))
+    }
+
     fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        if self.deny_native_trees {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
         blaze_spec::native_tree::Tree::from_files(
             path,
-            self.files.iter().map(|(path, bytes)| (PathBuf::from(path), bytes.clone())),
+            self.files
+                .iter()
+                .map(|(path, bytes)| (PathBuf::from(path), bytes.clone()))
+                .chain(self.native_files.iter().map(|(path, bytes)| (path.clone(), bytes.clone()))),
         )
     }
 
@@ -362,6 +395,527 @@ fn compiler_search_trees_bind_headers_libraries_and_absent_candidates() {
         assert_eq!(before.libc, after.libc);
         assert_ne!(before.native_root, after.native_root, "unbound compiler search member {path}");
         assert_ne!(digest_of(&before), digest_of(&after));
+    }
+}
+
+fn native_flags_probe() -> Fake {
+    Fake { os: Some("linux 6.8".to_owned()), ..Fake::default() }
+        .file("/usr/bin/cc", b"gcc")
+        .file("/usr/bin/getconf", b"getconf")
+        .file("/lib/x86_64-linux-gnu/libc.so.6", b"glibc")
+        .run("/usr/bin/getconf", &["GNU_LIBC_VERSION"], "glibc 2.39\n")
+}
+
+fn native_flags_machine(env: &BTreeMap<String, std::ffi::OsString>) -> Machine<'_> {
+    Machine {
+        cwd: Path::new("/workspace"),
+        env,
+        triple: "x86_64-unknown-linux-gnu",
+        cpu: "x86-64",
+        linker: None,
+    }
+}
+
+#[test]
+fn live_facts_do_not_claim_or_require_portable_tree_bindings() {
+    let mut probe = native_flags_probe();
+    probe.deny_native_trees = true;
+    let env = vars(&[("PATH", "/usr/bin")]);
+    let machine = native_flags_machine(&env);
+    let facts = blaze_spec::platform::facts(&machine, &probe).unwrap();
+    assert_eq!(facts.native_root, None);
+    assert_eq!(facts.triple, machine.triple);
+    assert!(facts.cc.is_some());
+    assert!(blaze_spec::platform::describe(&machine, &probe).is_err());
+}
+
+#[test]
+fn captured_native_flag_trees_bind_external_bytes_and_membership() {
+    for base in ["CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"] {
+        for name in [
+            base.to_owned(),
+            format!("HOST_{base}"),
+            format!("TARGET_{base}"),
+            format!("{base}_x86_64_unknown_linux_gnu"),
+            format!("{base}_x86_64-unknown-linux-gnu"),
+        ] {
+            if !blaze_spec::environment::is_script_var(&name, "x86_64-unknown-linux-gnu") {
+                continue;
+            }
+            for (flag, file) in [
+                ("-I/external/include", "/external/include/config.h"),
+                ("-L /external/lib", "/external/lib/libdependency.a"),
+                ("-F/external/frameworks", "/external/frameworks/Dependency.framework/Dependency"),
+            ] {
+                let original = native_flags_probe().file(file, b"original");
+                let mut env = vars(&[("PATH", "/usr/bin")]);
+                env.insert(name.clone(), flag.into());
+                let machine = native_flags_machine(&env);
+                let before = blaze_spec::platform::describe(&machine, &original).unwrap();
+                assert!(before.native.entry(Path::new(file)).is_some(), "{name}: {flag}");
+                for changed in [
+                    original.clone().file(file, b"changed"),
+                    original.clone().file(&format!("{file}.new"), b"new member"),
+                ] {
+                    let after = exec_platform(&machine, &changed).unwrap();
+                    assert_eq!(before.platform.cc, after.cc);
+                    assert_ne!(before.platform.native_root, after.native_root, "{name}: {flag}");
+                    assert_ne!(digest_of(&before.platform), digest_of(&after), "{name}: {flag}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shell_escaped_native_flags_keep_search_order_and_relative_paths() {
+    let fake = native_flags_probe();
+    let env = vars(&[
+        ("PATH", "/usr/bin"),
+        ("CC_SHELL_ESCAPED_FLAGS", "1"),
+        (
+            "CFLAGS",
+            r#"-Ijoined -I 'include space' -isystem"/system space" -idirafter /after -iquotequoted -F'/framework space' --sysroot='/root space' -isysroot "/second root" -I"/literal\q" -I/continued\
+/path # -I/not-selected
+-I/final"#,
+        ),
+        ("HOST_CFLAGS", "-I/host"),
+        ("TARGET_CFLAGS", "-I/target"),
+        ("CFLAGS_x86_64_unknown_linux_gnu", "-I/underscored"),
+        ("CFLAGS_x86_64-unknown-linux-gnu", "-I/literal"),
+    ]);
+    assert!(blaze_spec::environment::is_script_var(
+        "CC_SHELL_ESCAPED_FLAGS",
+        "x86_64-unknown-linux-gnu"
+    ));
+    let described = blaze_spec::platform::describe(&native_flags_machine(&env), &fake).unwrap();
+    let roots: Vec<_> = described
+        .native
+        .roots
+        .iter()
+        .filter(|root| root.name.contains("/flags/"))
+        .map(|root| root.tree.root.clone())
+        .collect();
+    let common = [
+        "/workspace/joined",
+        "/workspace/include space",
+        "/system space",
+        "/after",
+        "/workspace/quoted",
+        "/framework space",
+        "/root space",
+        "/second root",
+        "/literal\\q",
+        "/continued/path",
+        "/final",
+    ];
+    let expected: Vec<_> = common
+        .iter()
+        .copied()
+        .chain(["/host", "/underscored", "/literal"])
+        .chain(common)
+        .chain(["/target", "/underscored", "/literal"])
+        .map(PathBuf::from)
+        .collect();
+    assert_eq!(roots, expected);
+}
+
+#[test]
+fn forwarded_linker_and_preprocessor_search_paths_are_bound() {
+    let fake = native_flags_probe();
+    let env = vars(&[
+        ("PATH", "/usr/bin"),
+        ("LDFLAGS", "-Wl,-L,/first,-L/second -Xlinker -L -Xlinker /third -Wl,--sysroot=/link-root"),
+        (
+            "CPPFLAGS",
+            "-Xpreprocessor -isystem -Xpreprocessor /headers -Xclang -iquote -Xclang /quoted",
+        ),
+    ]);
+    let described = blaze_spec::platform::describe(&native_flags_machine(&env), &fake).unwrap();
+    let roots: Vec<_> = described
+        .native
+        .roots
+        .iter()
+        .filter(|root| root.name.contains("/flags/"))
+        .map(|root| root.tree.root.clone())
+        .collect();
+    assert_eq!(
+        roots,
+        ["/headers", "/quoted", "/first", "/second", "/third", "/link-root"].map(PathBuf::from)
+    );
+}
+
+#[test]
+fn forced_include_files_and_explicit_sysroot_trees_are_bound() {
+    let original = native_flags_probe()
+        .file("/external/forced.h", b"forced header")
+        .file("/external/macros.h", b"forced macros")
+        .file("/external/precompiled.pch", b"precompiled header")
+        .file("/selected/sysroot/lib/libdependency.a", b"library")
+        .file("/selected/headers/include/config.h", b"header");
+    let env = vars(&[
+        ("PATH", "/usr/bin"),
+        (
+            "CFLAGS",
+            "-include /external/forced.h -imacros/external/macros.h -include-pch /external/precompiled.pch --sysroot=/selected/sysroot -isysroot /selected/headers",
+        ),
+    ]);
+    let machine = native_flags_machine(&env);
+    let before = blaze_spec::platform::describe(&machine, &original).unwrap();
+    for path in [
+        "/external/forced.h",
+        "/external/macros.h",
+        "/external/precompiled.pch",
+        "/selected/sysroot/lib/libdependency.a",
+        "/selected/headers/include/config.h",
+    ] {
+        assert!(before.native.entry(Path::new(path)).is_some());
+        let changed = original.clone().file(path, b"changed");
+        let after = exec_platform(&machine, &changed).unwrap();
+        assert_ne!(before.platform.native_root, after.native_root, "{path}");
+        assert_ne!(digest_of(&before.platform), digest_of(&after), "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_flag_trees_preserve_raw_path_bytes_without_filesystem_assumptions() {
+    use std::os::unix::ffi::OsStringExt;
+    let include =
+        PathBuf::from(std::ffi::OsString::from_vec(b"/external/raw-\xff space/config.h".to_vec()));
+    let library = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/external/rawlib-\xfe/libdependency.a".to_vec(),
+    ));
+    let forced =
+        PathBuf::from(std::ffi::OsString::from_vec(b"/external/forced-\xfd file.h".to_vec()));
+    let rooted = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/external/sysroot-\xfc space/include/config.h".to_vec(),
+    ));
+    let mut fake = native_flags_probe();
+    fake.native_files.insert(include.clone(), b"header".to_vec());
+    fake.native_files.insert(library.clone(), b"library".to_vec());
+    fake.native_files.insert(forced.clone(), b"forced".to_vec());
+    fake.native_files.insert(rooted.clone(), b"rooted".to_vec());
+    let mut env = vars(&[("PATH", "/usr/bin"), ("CC_SHELL_ESCAPED_FLAGS", "true")]);
+    env.insert(
+        "CFLAGS".into(),
+        std::ffi::OsString::from_vec(
+            b"-I'/external/raw-\xff space' -L/external/rawlib-\xfe -include '/external/forced-\xfd file.h' --sysroot '/external/sysroot-\xfc space'".to_vec(),
+        ),
+    );
+    let machine = native_flags_machine(&env);
+    let before = blaze_spec::platform::describe(&machine, &fake).unwrap();
+    for path in [include, library, forced, rooted] {
+        assert!(before.native.entry(&path).is_some());
+        let mut changed = fake.clone();
+        changed.native_files.insert(path, b"changed".to_vec());
+        let after = exec_platform(&machine, &changed).unwrap();
+        assert_ne!(before.platform.native_root, after.native_root);
+        assert_ne!(digest_of(&before.platform), digest_of(&after));
+    }
+}
+
+#[test]
+fn interpreted_header_paths_bind_actual_query_roots_and_absence() {
+    for (flags, query, selected) in [
+        ("-I=relative", vec!["-I", "=relative"], "=relative"),
+        (
+            "--sysroot=/sdk -I=relative",
+            vec!["--sysroot", "/sdk", "-I", "=relative"],
+            "/sdkrelative",
+        ),
+        (
+            "--sysroot=/sdk -I=relative",
+            vec!["--sysroot", "/sdk", "-I", "=relative"],
+            "/sdk/relative",
+        ),
+        (
+            "--sysroot=/sdk -I$SYSROOT/relative",
+            vec!["--sysroot", "/sdk", "-I", "$SYSROOT/relative"],
+            "$SYSROOT/relative",
+        ),
+        (
+            "-iprefix /prefix -iwithprefix after -iwithprefixbefore before",
+            vec!["-iprefix", "/prefix", "-iwithprefix", "after", "-iwithprefixbefore", "before"],
+            "/prefixafter",
+        ),
+        (
+            "-isysroot /sdk -iframeworkwithsysroot /Frameworks",
+            vec!["-isysroot", "/sdk", "-iframeworkwithsysroot", "/Frameworks"],
+            "/sdk/Frameworks",
+        ),
+    ] {
+        let mut args = query;
+        args.extend(["-E", "-x", "c", "-", "-v"]);
+        let missing = format!("{selected}-not-yet-present");
+        let listing = format!(
+            "ignoring nonexistent directory \"{missing}\"\n#include \"...\" search starts here:\n#include <...> search starts here:\n {selected}\nEnd of search list.\n"
+        );
+        let file = Path::new("/workspace").join(selected).join("config.h");
+        let original = native_flags_probe().file(file.to_str().unwrap(), b"original").output(
+            "/usr/bin/cc",
+            &args,
+            b"",
+            listing.as_bytes(),
+        );
+        let mut env = vars(&[("PATH", "/usr/bin")]);
+        env.insert("CFLAGS".into(), flags.into());
+        let machine = native_flags_machine(&env);
+        let before = blaze_spec::platform::describe(&machine, &original).unwrap();
+        assert!(before.native.entry(&file).is_some(), "{flags}: {selected}");
+        let selected_roots: Vec<_> = before
+            .native
+            .roots
+            .iter()
+            .filter(|root| root.name.starts_with("native/headers/query/"))
+            .map(|root| root.tree.root.clone())
+            .collect();
+        assert_eq!(
+            selected_roots,
+            [Path::new("/workspace").join(&missing), Path::new("/workspace").join(selected)]
+        );
+        for (file, bytes) in [
+            (file, b"changed".as_slice()),
+            (Path::new("/workspace").join(&missing).join("new.h"), b"appeared".as_slice()),
+        ] {
+            let changed = original.clone().file(file.to_str().unwrap(), bytes);
+            let after = exec_platform(&machine, &changed).unwrap();
+            assert_ne!(before.platform.native_root, after.native_root, "{flags}");
+            assert_ne!(digest_of(&before.platform), digest_of(&after), "{flags}");
+        }
+    }
+}
+
+#[test]
+fn native_library_prefixes_follow_the_selected_linker_interface() {
+    for (version, default_root, flags, query, expected) in [
+        ("GNU ld (GNU Binutils) 2.42\n", "", "-L=relative", "ld", "/workspace/relative"),
+        (
+            "GNU ld (GNU Binutils) 2.42\n",
+            "/default",
+            "-L$SYSROOT/relative",
+            "ld",
+            "/default/relative",
+        ),
+        ("GNU ld (GNU Binutils) 2.42\n", "", "--sysroot=/sdk -L=relative", "ld", "/sdkrelative"),
+        (
+            "LLD 20.1.8 (compatible with GNU linkers)\n",
+            "",
+            "-fuse-ld=lld --sysroot=/sdk -L=relative",
+            "ld.lld",
+            "/sdk/relative",
+        ),
+        (
+            "LLD 20.1.8 (compatible with GNU linkers)\n",
+            "",
+            "-fuse-ld=lld --sysroot=/sdk -L$SYSROOT/relative",
+            "ld.lld",
+            "/workspace/$SYSROOT/relative",
+        ),
+    ] {
+        let mut args = Vec::new();
+        if flags.contains("--sysroot=") {
+            args.extend(["--sysroot", "/sdk"]);
+        }
+        if flags.contains("-fuse-ld=lld") {
+            args.push("-fuse-ld=lld");
+        }
+        let mut preflight = args.clone();
+        preflight.push("-print-sysroot");
+        let mut driver_args = args.clone();
+        driver_args.extend(["-###", "-x", "c", "/dev/null"]);
+        let query_arg = format!("-print-prog-name={query}");
+        args.push(&query_arg);
+        let root_arg = if flags.contains("--sysroot=") { " \"--sysroot=/sdk\"" } else { "" };
+        let fuse_arg = if flags.contains("-fuse-ld=lld") { " \"-fuse-ld=lld\"" } else { "" };
+        let driver = format!(" \"/usr/lib/collect2\"{root_arg}{fuse_arg}\n");
+        let effective_root = if flags.contains("--sysroot=") { "/sdk" } else { default_root };
+        let mut root_query = Vec::new();
+        if flags.contains("--sysroot=") {
+            root_query.push("--sysroot=/sdk");
+        }
+        root_query.push("--print-sysroot");
+        let tool = format!("/usr/bin/{query}");
+        let file = format!("{expected}/libdependency.a");
+        let original = native_flags_probe()
+            .file("/usr/lib/collect2", b"GNU driver trampoline")
+            .output("/usr/bin/cc", &preflight, b"", b"")
+            .output("/usr/bin/cc", &driver_args, b"", driver.as_bytes())
+            .file(&tool, b"linker bytes")
+            .file(&file, b"library")
+            .output("/usr/bin/cc", &args, format!("{tool}\n").as_bytes(), b"")
+            .output("/usr/bin/cc", &["-print-sysroot"], b"", b"")
+            .output(&tool, &["--version"], version.as_bytes(), b"")
+            .output(&tool, &root_query, format!("{effective_root}\n").as_bytes(), b"");
+        let mut env = vars(&[("PATH", "/usr/bin")]);
+        env.insert("LDFLAGS".into(), flags.into());
+        let machine = native_flags_machine(&env);
+        let before = blaze_spec::platform::describe(&machine, &original).unwrap();
+        assert!(before.native.entry(Path::new(&file)).is_some(), "{flags}");
+        let paths: Vec<_> = before
+            .native
+            .roots
+            .iter()
+            .filter(|root| root.name.starts_with("linker/libraries/query/"))
+            .map(|root| root.tree.root.clone())
+            .collect();
+        assert_eq!(paths, [PathBuf::from(expected)], "{flags}");
+        let after = exec_platform(&machine, &original.clone().file(&file, b"changed")).unwrap();
+        assert_ne!(before.platform.native_root, after.native_root);
+        let mut missing = original.clone();
+        missing.files.remove(&file);
+        let absent = exec_platform(&machine, &missing).unwrap();
+        assert_ne!(before.platform.native_root, absent.native_root, "{flags}: absent candidate");
+    }
+}
+
+#[test]
+fn native_library_paths_use_driver_defaults_before_linker_defaults() {
+    for (clang, driver_default, expected) in [
+        (false, Some("/compiler/default"), "/compiler/defaultrelative"),
+        (true, Some("/compiler/default"), "/compiler/defaultrelative"),
+        (true, None, "/linker/defaultrelative"),
+    ] {
+        let file = format!("{expected}/libdependency.a");
+        let mut fake = native_flags_probe()
+            .file("/usr/bin/ld", b"linker")
+            .file(&file, b"library")
+            .output("/usr/bin/ld", &["--version"], b"GNU ld (GNU Binutils) 2.42\n", b"");
+        let mut root_query = Vec::new();
+        let root_arg = if let Some(root) = driver_default {
+            root_query.push(format!("--sysroot={root}"));
+            format!(" \"--sysroot={root}\"")
+        } else {
+            String::new()
+        };
+        root_query.push("--print-sysroot".into());
+        let borrowed = root_query.iter().map(String::as_str).collect::<Vec<_>>();
+        fake = fake.output(
+            "/usr/bin/ld",
+            &borrowed,
+            format!("{}\n", driver_default.unwrap_or("/linker/default")).as_bytes(),
+            b"",
+        );
+        let dry_run = format!(" \"/usr/bin/ld\"{root_arg} \"-o\" \"a.out\"\n");
+        fake =
+            fake.output("/usr/bin/cc", &["-###", "-x", "c", "/dev/null"], b"", dry_run.as_bytes());
+        if clang {
+            fake = fake.run("/usr/bin/cc", &["--version"], "clang version 20.1.8\n");
+        } else {
+            fake = fake.output("/usr/bin/cc", &["-print-sysroot"], b"/compiler/default\n", b"");
+        }
+        let env = vars(&[("PATH", "/usr/bin"), ("LDFLAGS", "-L=relative")]);
+        let machine = native_flags_machine(&env);
+        let before = blaze_spec::platform::describe(&machine, &fake).unwrap();
+        assert!(before.native.entry(Path::new(&file)).is_some());
+        let changed = fake.clone().file(&file, b"changed");
+        assert_ne!(
+            before.platform.native_root,
+            exec_platform(&machine, &changed).unwrap().native_root
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_linker_paths_preserve_native_bytes_without_a_program_name_query() {
+    use std::os::unix::ffi::OsStringExt;
+    let tool = PathBuf::from(std::ffi::OsString::from_vec(b"/external/ld-\xfe".to_vec()));
+    let mut fake = native_flags_probe()
+        .run("/usr/bin/cc", &["--version"], "clang version 20.1.8\n")
+        .file("/sdklib/libdependency.a", b"library");
+    fake.native_files.insert(tool.clone(), b"native linker".to_vec());
+    fake.outputs.insert(
+        (tool.clone(), vec!["--version".into()]),
+        (b"GNU ld (GNU Binutils) 2.42\n".to_vec(), Vec::new()),
+    );
+    let driver_args = vec![
+        "--sysroot".into(),
+        "/sdk".into(),
+        std::ffi::OsString::from_vec(b"--ld-path=/external/ld-\xfe".to_vec()),
+        "-###".into(),
+        "-x".into(),
+        "c".into(),
+        "/dev/null".into(),
+    ];
+    fake.outputs.insert(
+        (PathBuf::from("/usr/bin/cc"), driver_args),
+        (Vec::new(), b" \"/external/ld-\xfe\" \"--sysroot=/sdk\" \"-o\" \"a.out\"\n".to_vec()),
+    );
+    fake.outputs.insert(
+        (tool.clone(), vec!["--sysroot=/sdk".into(), "--print-sysroot".into()]),
+        (b"/sdk\n".to_vec(), Vec::new()),
+    );
+    let mut env = vars(&[("PATH", "/usr/bin")]);
+    env.insert(
+        "LDFLAGS".into(),
+        std::ffi::OsString::from_vec(b"--ld-path=/external/ld-\xfe --sysroot=/sdk -L=lib".to_vec()),
+    );
+    let described = blaze_spec::platform::describe(&native_flags_machine(&env), &fake).unwrap();
+    assert!(described.native.entry(Path::new("/sdklib/libdependency.a")).is_some());
+    assert!(described.native.entry(&tool).is_some());
+    assert!(!fake.queries.borrow().iter().any(|(_, _, args)| {
+        args.iter().any(|arg| arg.as_encoded_bytes().starts_with(b"-print-prog-name="))
+    }));
+}
+
+#[test]
+fn portable_unknown_search_interface_is_explicit_while_live_facts_remain_accepted() {
+    let fake = native_flags_probe();
+    let env = vars(&[("PATH", "/usr/bin"), ("CFLAGS", "--sysroot=/sdk -I=relative")]);
+    let machine = native_flags_machine(&env);
+    let error = blaze_spec::platform::describe(&machine, &fake).err().unwrap();
+    assert!(error.to_string().contains("native header search query"));
+    assert_eq!(blaze_spec::platform::facts(&machine, &fake).unwrap().native_root, None);
+}
+
+#[test]
+fn compound_environment_flag_controls_require_the_actual_native_invocation() {
+    let fake = native_flags_probe();
+    let env =
+        vars(&[("PATH", "/usr/bin"), ("CFLAGS", "--sysroot=/sdk"), ("LDFLAGS", "-L=relative")]);
+    let machine = native_flags_machine(&env);
+    let error = blaze_spec::platform::describe(&machine, &fake).err().unwrap();
+    assert!(error.to_string().contains("combined native invocation argv is not captured"));
+    assert_eq!(blaze_spec::platform::facts(&machine, &fake).unwrap().native_root, None);
+}
+
+#[test]
+fn native_queries_filter_output_plugin_and_dependency_switches() {
+    let flags = "--sysroot=/sdk -I=relative -o /output -MF /dependencies -fplugin=/plugin -O3 -include /must-not-be-read.h";
+    let listing = b"#include <...> search starts here:\n /sdkrelative\nEnd of search list.\n";
+    let fake = native_flags_probe().output(
+        "/usr/bin/cc",
+        &["--sysroot", "/sdk", "-I", "=relative", "-E", "-x", "c", "-", "-v"],
+        b"",
+        listing,
+    );
+    let env = vars(&[
+        ("PATH", "/usr/bin"),
+        ("CC", "cc -o /tool-output -fplugin=/tool-plugin"),
+        ("CFLAGS", flags),
+        ("NIX_CFLAGS_COMPILE", "-isystem /nix/include -fplugin=/nix/plugin -o /nix/output"),
+    ]);
+    blaze_spec::platform::describe(&native_flags_machine(&env), &fake).unwrap();
+    for (env, _, args) in fake.queries.borrow().iter() {
+        assert_eq!(env.get("LC_ALL").unwrap(), "C");
+        assert_eq!(env.get("NIX_CFLAGS_COMPILE").unwrap(), "-isystem /nix/include");
+        for word in args {
+            assert!(
+                ![
+                    "-o",
+                    "-MF",
+                    "-fplugin=/plugin",
+                    "-fplugin=/tool-plugin",
+                    "/tool-output",
+                    "-O3",
+                    "-include",
+                    "/must-not-be-read.h"
+                ]
+                .contains(&word.to_str().unwrap_or("")),
+                "{args:?}"
+            );
+        }
     }
 }
 
