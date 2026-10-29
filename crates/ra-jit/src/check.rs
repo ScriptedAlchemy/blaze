@@ -117,8 +117,9 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     checked.dedup();
     let sources = Sources { paths };
     let diagnostics = ide_diagnostics::DiagnosticsConfig::test_sample();
+    let mut undecided = Vec::new();
     for &file in &checked {
-        let hard = hir::attach_db(&db, || {
+        let (inferred, hard): (Vec<_>, Vec<_>) = hir::attach_db(&db, || {
             ide_diagnostics::semantic_diagnostics_within(
                 &db,
                 &diagnostics,
@@ -132,9 +133,14 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
                 matches!(it.code, ide_diagnostics::DiagnosticCode::RustcHardError(_))
                     || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
             })
-            .map(|it| it.message)
-            .collect::<Vec<_>>()
+            .partition(|it| {
+                let code = it.code.as_str();
+                INFERRED.contains(&code) || crate::BORROWCK.contains(&code)
+            })
         });
+        undecided
+            .extend(inferred.into_iter().map(|it| format!("{}: {}", it.code.as_str(), it.message)));
+        let hard: Vec<_> = hard.into_iter().map(|it| it.message).collect();
         if !hard.is_empty() {
             for message in hard {
                 eprintln!("error: {message}");
@@ -143,7 +149,10 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         }
     }
     let within = Some(std::sync::Arc::new(FxHashSet::from_iter([id])));
-    let broken = crate::broken_in(&db, &checked, &sources, &args.checkout, within, false);
+    // What rests on inferred types or the owned borrow checker is undecided above.
+    let except: Vec<&str> = INFERRED.iter().chain(crate::BORROWCK).copied().collect();
+    let broken =
+        crate::broken_in_except(&db, &checked, &sources, &args.checkout, within, false, &except);
     let refused = hir::attach_db(&db, || {
         crate::refusal(&db, &checked, &sources, &args.checkout, broken, None)
     });
@@ -158,13 +167,26 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
         }
         return Ok(false);
     }
+    // Mismatched types rustc certainly rejects are in `acceptance.errors`; the rest are
+    // undecided, a refusal and never a "no".
+    undecided.extend(acceptance.unsupported.iter().cloned());
     anyhow::ensure!(
-        acceptance.unsupported.is_empty(),
+        undecided.is_empty(),
         "owned compiler probe acceptance is not proven: {}",
-        acceptance.unsupported.join("; ")
+        undecided.join("; ")
     );
     Ok(true)
 }
+
+/// rust-analyzer's errors that rest on the types it inferred: of expressions, of method and
+/// field lookups through them, of the traits it solved and the exhaustiveness of matches on
+/// them. A gap in its inference or coercions reports one where rustc reports none, so one
+/// is not proof that rustc rejects a probe; nor is an error of the owned borrow checker.
+const INFERRED: [&str; 25] = [
+    "E0004", "E0005", "E0033", "E0054", "E0057", "E0061", "E0133", "E0277", "E0282", "E0308",
+    "E0559", "E0599", "E0600", "E0604", "E0605", "E0606", "E0607", "E0608", "E0614", "E0616",
+    "E0618", "E0620", "E0624", "E0641", "E0804",
+];
 
 /// What a checker answers when the workspace changed in a way only loading it again takes
 /// in: a source file came or went, a manifest changed, or the source of a build script or a

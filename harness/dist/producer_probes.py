@@ -9,6 +9,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import producer_plan
+from accepted_probes import ACCEPTED
 
 
 def main():
@@ -51,6 +52,8 @@ def main():
     for name in ("proc_macro_span", "proc_macro_span_location", "proc_macro_span_file"):
         cases.append((name, (cached / (name + ".rs")).read_text(),
                       ["--cfg=procmacro2_build_probe"], False))
+    # Programs rustc accepts: blaze may refuse one loudly, never answer it with a "no".
+    cases.extend(("accepted-" + name, text, [], False) for name, text in ACCEPTED)
     for name, text, flags, bootstrap in cases:
         source = work / (name + ".rs")
         source.write_text(text)
@@ -87,7 +90,9 @@ def main():
     calls = norustc.runs(str(audit_log))
     (work / "product-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
     assert not calls, calls
-    print(f"{len(rows)} source probes: oracle parity or loud undecided refusal; zero product compilers")
+    refused = sum(row.get("verdict") == "undecided-refused" for row in rows)
+    print(f"{len(rows)} source probes: oracle parity or loud undecided refusal ({refused} refused); "
+          "zero product compilers")
 
 
 if __name__ == "__main__":

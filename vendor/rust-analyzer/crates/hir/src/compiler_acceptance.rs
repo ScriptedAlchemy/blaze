@@ -19,8 +19,8 @@ use syntax::{
 };
 
 use crate::{
-    Crate, HasCrate as _, HasSource as _, HasVisibility as _, Module, ModuleDef, PathResolution,
-    Semantics, Type, db::HirDatabase,
+    AsAssocItem as _, Crate, HasCrate as _, HasSource as _, HasVisibility as _, Module, ModuleDef,
+    PathResolution, Semantics, Type, db::HirDatabase,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, SalsaValue)]
@@ -85,23 +85,63 @@ impl<'db> Check<'db> {
         for (id, _) in store.types.iter() {
             let Ok(source) = sources.type_syntax(id) else { continue };
             let node = self.sema.to_node(source);
-            if let Some(ty) = self.sema.resolve_type(&node) {
-                if ty.contains_unknown() {
+            // A bound, the trait of an impl and the trait of `<T as Trait>` name a trait,
+            // which has no type: its path resolves or not.
+            let names_a_trait = node.syntax().parent().is_some_and(|parent| {
+                ast::TypeBound::can_cast(parent.kind())
+                    || node
+                        .syntax()
+                        .siblings_with_tokens(syntax::Direction::Prev)
+                        .skip(1)
+                        .find(|it| !it.kind().is_trivia())
+                        .is_some_and(|it| it.kind() == syntax::T![as])
+                    || ast::Impl::cast(parent)
+                        .and_then(|it| it.trait_())
+                        .is_some_and(|it| it.syntax() == node.syntax())
+            });
+            if names_a_trait {
+                let resolved = match &node {
+                    ast::Type::PathType(it) => {
+                        it.path().is_some_and(|path| self.sema.resolve_path(&path).is_some())
+                    }
+                    _ => true,
+                };
+                if !resolved {
+                    self.result.errors.push(format!("unresolved trait `{node}`"));
+                }
+            } else if let Some(ty) = self.sema.resolve_type(&node) {
+                // rust-analyzer gives no type of its own to an `impl Trait`; its bounds are
+                // paths, each resolved or not.
+                let bounded =
+                    matches!(node, ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_));
+                if ty.contains_unknown() && !bounded {
                     self.result.errors.push(format!("unresolved type `{node}`"));
                 }
-                if !node
-                    .syntax()
-                    .parent()
-                    .is_some_and(|parent| ast::TypeBound::can_cast(parent.kind()))
+                if bounded
+                    && node
+                        .syntax()
+                        .descendants()
+                        .filter_map(ast::PathType::cast)
+                        .filter_map(|it| it.path())
+                        .any(|path| self.sema.resolve_path(&path).is_none())
                 {
-                    self.ty(&ty);
+                    self.result.errors.push(format!("unresolved type `{node}`"));
+                }
+                if self.dyn_incompatible(&ty) {
+                    if source.file_id.is_macro() {
+                        self.result.unsupported.push(format!(
+                            "a type a macro wrote of a trait that is not dyn compatible: `{node}`"
+                        ));
+                    } else {
+                        self.result.errors.push(format!("trait is not dyn compatible: `{node}`"));
+                    }
                 }
             } else {
                 self.result.unsupported.push(format!("cannot validate type `{node}`"));
             }
             for path in node.syntax().descendants().filter_map(ast::Path::cast) {
                 if let Some(def) = self.resolve_reference(&path) {
-                    self.reference(def, module, source.file_id.is_macro());
+                    self.reference(def, module, source.file_id);
                 }
             }
         }
@@ -142,7 +182,7 @@ impl<'db> Check<'db> {
             for path in node.syntax().children().filter_map(ast::Path::cast) {
                 for part in path.syntax().descendants().filter_map(ast::Path::cast) {
                     if let Some(def) = self.resolve_reference(&part) {
-                        self.reference(def, module, source.file_id.is_macro());
+                        self.reference(def, module, source.file_id);
                     } else if part.qualifier().is_some_and(|qualifier| {
                         matches!(
                             self.sema.resolve_path(&qualifier),
@@ -169,7 +209,7 @@ impl<'db> Check<'db> {
             }
             if let Some(call) = ast::MethodCallExpr::cast(node.syntax().clone()) {
                 if let Some(function) = self.sema.resolve_method_call(&call) {
-                    self.reference(function.into(), module, source.file_id.is_macro());
+                    self.reference(function.into(), module, source.file_id);
                     if const_exprs.contains(&id) && !function.is_const(db) {
                         self.result
                             .errors
@@ -205,25 +245,47 @@ impl<'db> Check<'db> {
         match owner {
             ExpressionStoreOwnerId::Body(def) => {
                 let inferred = InferenceResult::of(db, def);
-                if inferred.has_type_mismatches() || inferred.is_erroneous() {
-                    self.result.errors.push("type inference failed".into());
+                // A type error is rust-analyzer's inference, not rustc's: one it cannot
+                // prove would tell a probe's build script that a feature is absent.
+                if inferred.is_erroneous() {
+                    self.result.unsupported.push("type inference of a body failed".into());
                 }
-                if inferred.diagnostics().iter().any(|diagnostic| {
-                    matches!(diagnostic, InferenceDiagnostic::UnresolvedIdent { .. })
-                }) {
-                    self.result.errors.push("unresolved expression identifier".into());
+                let mut mismatches = false;
+                for diagnostic in inferred.diagnostics() {
+                    match diagnostic {
+                        InferenceDiagnostic::UnresolvedIdent { .. } => {
+                            self.result.errors.push("unresolved expression identifier".into());
+                        }
+                        InferenceDiagnostic::TypeMismatch { node, expected, .. } => {
+                            mismatches = true;
+                            self.mismatch(sources, node.unpack(), expected.as_ref());
+                        }
+                        _ => {}
+                    }
                 }
-                for (_, ty) in inferred.expression_types() {
-                    self.ty(&Type::new_body(db, owner, ty));
+                if inferred.has_type_mismatches() && !mismatches {
+                    self.result.unsupported.push("type mismatch without a diagnostic".into());
                 }
+                // An inferred type is rust-analyzer's, which may be wrong where rustc's is not.
+                if inferred
+                    .expression_types()
+                    .any(|(_, ty)| self.dyn_incompatible(&Type::new_body(db, owner, ty)))
+                {
+                    self.result
+                        .unsupported
+                        .push("an inferred type of a trait that is not dyn compatible".into());
+                }
+                // The owned borrow checker still reports some errors rustc does not, as of
+                // the object lifetime of a `dyn` behind a reference: undecided, not a "no".
                 let borrowed = hir_ty_borrowck::source_borrowck(db, def);
-                self.result.errors.extend(
-                    borrowed
-                        .diagnostics
-                        .iter()
-                        .filter(|diag| diag.code.starts_with('E'))
-                        .map(|diag| diag.message.clone()),
-                );
+                for diag in borrowed.diagnostics.iter().filter(|diag| diag.code.starts_with('E')) {
+                    // A value dropped in a constant is no question of lifetimes.
+                    if diag.code == "E0493" {
+                        self.result.errors.push(diag.message.clone());
+                    } else {
+                        self.result.unsupported.push(format!("borrow checking: {}", diag.message));
+                    }
+                }
                 if let Some(reason) = &borrowed.skipped {
                     self.result.unsupported.push(format!("borrow checking: {reason}"));
                 }
@@ -254,14 +316,17 @@ impl<'db> Check<'db> {
         }
     }
 
-    fn ty(&mut self, ty: &Type<'db>) {
+    /// Whether `ty` has a `dyn` of a trait that cannot be one.
+    fn dyn_incompatible(&self, ty: &Type<'db>) -> bool {
+        let mut found = false;
         ty.walk(self.db, |ty| {
             if let Some(trait_) = ty.as_dyn_trait()
                 && trait_.dyn_compatibility(self.db).is_some()
             {
-                self.result.errors.push("trait is not dyn compatible".into());
+                found = true;
             }
         });
+        found
     }
 
     fn imports(&mut self, module: Module) {
@@ -285,7 +350,7 @@ impl<'db> Check<'db> {
             self.sema.parse_or_expand(source.file_id);
             for path in source.value.syntax().descendants().filter_map(ast::Path::cast) {
                 if let Some(def) = self.resolve_reference(&path) {
-                    self.reference(def, module, source.file_id.is_macro());
+                    self.reference(def, module, source.file_id);
                 }
             }
             if let Some(tree) = source.value.use_tree() {
@@ -363,8 +428,27 @@ impl<'db> Check<'db> {
         found.take_values().or_else(|| found.take_types()).map(ModuleDef::from)
     }
 
-    fn reference(&mut self, def: ModuleDef, from: Module, expanded: bool) {
-        if !def.is_visible_from(self.db, from) {
+    fn reference(&mut self, def: ModuleDef, from: Module, file: hir_expand::HirFileId) {
+        let expanded = file.is_macro();
+        // The standard library's macros reach its private and unstable items by its leave
+        // (`$crate`, `#[allow_internal_unstable]`); what they expand to is its to check.
+        if file
+            .macro_file()
+            .is_some_and(|call| call.loc(self.db).def.krate.data(self.db).origin.is_lang())
+        {
+            return;
+        }
+        // An item of a trait or of a trait's impl is as visible as the trait: an impl's
+        // methods are written without `pub`.
+        let visible = match def.as_assoc_item(self.db).map(|it| it.container(self.db)) {
+            Some(crate::AssocItemContainer::Trait(it)) => it.is_visible_from(self.db, from),
+            Some(crate::AssocItemContainer::Impl(it)) => match it.trait_(self.db) {
+                Some(it) => it.is_visible_from(self.db, from),
+                None => def.is_visible_from(self.db, from),
+            },
+            None => def.is_visible_from(self.db, from),
+        };
+        if !visible {
             let message = format!("private item: {:?}", def.name(self.db));
             if expanded {
                 self.result.unsupported.push(format!("macro privacy context: {message}"));
@@ -385,6 +469,39 @@ impl<'db> Check<'db> {
             } else {
                 self.result.errors.push(message);
             }
+        }
+    }
+
+    /// A type mismatch is an error only where rustc certainly reports one: a literal
+    /// given where a type written out in the source wants a scalar it cannot be. No
+    /// coercion makes a scalar, and neither side of it rests on inference. Any other
+    /// mismatch may be a coercion or an inference rust-analyzer does not model.
+    fn mismatch(
+        &mut self,
+        sources: &hir_def::expr_store::ExpressionStoreSourceMap,
+        node: hir_def::hir::ExprOrPatId,
+        expected: hir_ide::next_solver::Ty<'db>,
+    ) {
+        let syntax = match node {
+            hir_def::hir::ExprOrPatId::ExprId(id) => sources.expr_syntax(id).ok(),
+            hir_def::hir::ExprOrPatId::PatId(_) => None,
+        };
+        let Some(source) = syntax else {
+            self.result.unsupported.push("type mismatch in a pattern".into());
+            return;
+        };
+        let node = self.sema.to_node(source).syntax().clone();
+        let certain = !source.file_id.is_macro()
+            && scalar(expected).is_some_and(|scalar| {
+                tail_literal(&node)
+                    .is_some_and(|literal| !literal_is(&literal, scalar) && declared(&literal))
+            });
+        if certain {
+            self.result.errors.push(format!("mismatched types: `{node}`"));
+        } else {
+            self.result
+                .unsupported
+                .push(format!("type mismatch rust-analyzer cannot prove: `{node}`"));
         }
     }
 
@@ -425,6 +542,128 @@ fn const_children(
         return;
     }
     store.walk_child_exprs(expr, |child| const_children(store, child, found));
+}
+
+/// A scalar type: its name and what kind of literal can be one.
+#[derive(Clone, Copy)]
+struct Scalar {
+    name: &'static str,
+    integer: bool,
+    float: bool,
+}
+
+fn scalar(ty: hir_ide::next_solver::Ty<'_>) -> Option<Scalar> {
+    use hir_ide::next_solver::TyKind;
+    use rustc_type_ir::inherent::IntoKind as _;
+    let (name, integer, float) = match ty.kind() {
+        TyKind::Bool => ("bool", false, false),
+        TyKind::Char => ("char", false, false),
+        TyKind::Int(it) => (it.name_str(), true, false),
+        TyKind::Uint(it) => (it.name_str(), true, false),
+        TyKind::Float(it) => (it.name_str(), false, true),
+        _ => return None,
+    };
+    Some(Scalar { name, integer, float })
+}
+
+/// Whether `literal` can be of type `scalar`; an unknown suffix is taken to fit.
+fn literal_is(literal: &ast::Literal, scalar: Scalar) -> bool {
+    match literal.kind() {
+        ast::LiteralKind::Bool(_) => scalar.name == "bool",
+        ast::LiteralKind::Char(_) => scalar.name == "char",
+        ast::LiteralKind::Byte(_) => scalar.name == "u8",
+        ast::LiteralKind::IntNumber(it) => match it.suffix() {
+            Some(suffix) => suffix == scalar.name || !SUFFIXES.contains(&suffix),
+            None => scalar.integer,
+        },
+        ast::LiteralKind::FloatNumber(it) => match it.suffix() {
+            Some(suffix) => suffix == scalar.name || !SUFFIXES.contains(&suffix),
+            None => scalar.float,
+        },
+        // A reference is never a scalar.
+        ast::LiteralKind::String(_)
+        | ast::LiteralKind::ByteString(_)
+        | ast::LiteralKind::CString(_) => false,
+    }
+}
+
+const SUFFIXES: [&str; 16] = [
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f16",
+    "f32", "f64", "f128",
+];
+
+/// The literal that is the value of `node`, through plain blocks and parentheses.
+fn tail_literal(node: &syntax::SyntaxNode) -> Option<ast::Literal> {
+    let mut node = node.clone();
+    loop {
+        if let Some(literal) = ast::Literal::cast(node.clone()) {
+            return Some(literal);
+        }
+        node = match ast::Expr::cast(node)? {
+            ast::Expr::ParenExpr(it) => it.expr()?.syntax().clone(),
+            ast::Expr::BlockExpr(it) if it.modifier().is_none() && it.label().is_none() => {
+                it.stmt_list()?.tail_expr()?.syntax().clone()
+            }
+            _ => return None,
+        };
+    }
+}
+
+/// Whether the type `expr` is checked against is one written out for it: the type of the
+/// `let`, `const` or `static` it initializes, or the return type of the function whose
+/// value it is, through plain blocks and parentheses.
+fn declared(expr: &ast::Literal) -> bool {
+    let mut node = expr.syntax().clone();
+    loop {
+        let Some(parent) = node.parent() else { return false };
+        if ast::ParenExpr::can_cast(parent.kind()) {
+            node = parent;
+            continue;
+        }
+        if let Some(list) = ast::StmtList::cast(parent.clone()) {
+            let Some(block) = list.syntax().parent().and_then(ast::BlockExpr::cast) else {
+                return false;
+            };
+            if list.tail_expr().is_none_or(|tail| tail.syntax() != &node)
+                || block.modifier().is_some()
+                || block.label().is_some()
+            {
+                return false;
+            }
+            node = block.syntax().clone();
+            continue;
+        }
+        if let Some(stmt) = ast::LetStmt::cast(parent.clone()) {
+            return stmt.ty().is_some()
+                && stmt.let_else().is_none()
+                && stmt.initializer().is_some_and(|it| it.syntax() == &node);
+        }
+        if let Some(function) = ast::Fn::cast(parent.clone()) {
+            return function.ret_type().and_then(|it| it.ty()).is_some()
+                && function.body().is_some_and(|it| it.syntax() == &node);
+        }
+        if ast::ReturnExpr::can_cast(parent.kind()) {
+            for ancestor in parent.ancestors().skip(1) {
+                if ast::ClosureExpr::can_cast(ancestor.kind())
+                    || ast::BlockExpr::cast(ancestor.clone())
+                        .is_some_and(|it| it.modifier().is_some())
+                {
+                    return false;
+                }
+                if let Some(function) = ast::Fn::cast(ancestor) {
+                    return function.ret_type().and_then(|it| it.ty()).is_some();
+                }
+            }
+            return false;
+        }
+        if let Some(konst) = ast::Const::cast(parent.clone()) {
+            return konst.ty().is_some() && konst.body().is_some_and(|it| it.syntax() == &node);
+        }
+        if let Some(statik) = ast::Static::cast(parent) {
+            return statik.ty().is_some() && statik.body().is_some_and(|it| it.syntax() == &node);
+        }
+        return false;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

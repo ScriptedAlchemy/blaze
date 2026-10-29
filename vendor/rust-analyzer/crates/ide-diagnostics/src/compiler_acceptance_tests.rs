@@ -262,3 +262,83 @@ fn source_acceptance_normalizes_raw_imports_and_aliases_in_each_namespace() {
         assert_eq!(result, Default::default(), "{once}: {result:?}");
     }
 }
+
+/// rustc rejects a literal given where a type written out wants a scalar it cannot be; any
+/// other mismatch rests on rust-analyzer's coercions and inference, which may be wrong where
+/// rustc accepts, so it is undecided: a refusal, never a "no".
+#[test]
+fn source_acceptance_rejects_only_certain_type_mismatches() {
+    for fixture in [
+        "pub fn value() -> u32 { \"wrong\" }\n",
+        "pub fn value() -> u32 { { (true) } }\n",
+        "pub fn value() { let x: bool = 1; }\n",
+        "pub fn value() -> u8 { return 1.5; }\n",
+        "pub fn value() -> f32 { 1 }\n",
+        "pub const X: u8 = 'c';\n",
+        "pub static Y: char = 2u8;\n",
+    ] {
+        let result = checked(fixture);
+        assert!(
+            result.errors.iter().any(|error| error.contains("mismatched types")),
+            "{fixture}: {result:?}"
+        );
+    }
+    for fixture in [
+        "fn takes(_: u64) {} pub fn value() { takes(\"x\"); }\n",
+        "pub struct S; pub fn value() -> S { 1 }\n",
+        "pub fn value() -> u32 { let s = \"x\"; s }\n",
+        "pub fn value() -> u32 { let f = || -> u32 { \"x\" }; f() }\n",
+        "pub fn value() -> u16 { 1u8 + 1u8 }\n",
+    ] {
+        let result = checked(fixture);
+        assert!(result.errors.is_empty(), "{fixture}: {result:?}");
+        assert!(
+            result
+                .unsupported
+                .iter()
+                .any(|it| it.contains("type mismatch rust-analyzer cannot prove")),
+            "{fixture}: {result:?}"
+        );
+    }
+    for fixture in [
+        "pub fn value() -> u64 { 1 }\n",
+        "pub fn value() -> f64 { 1.0 }\n",
+        "pub fn value() -> u8 { b'a' }\n",
+        "pub const X: i128 = 7;\n",
+    ] {
+        assert_eq!(checked(fixture), Default::default(), "{fixture}");
+    }
+}
+
+/// A method of a trait's impl is written without `pub`, and is as visible as the trait.
+#[test]
+fn source_acceptance_takes_trait_impl_items_as_visible_as_their_trait() {
+    let fixture = r#"
+//- /main.rs crate:main deps:library
+use library::Named;
+pub fn caller() -> u8 { 1u8.name() + <u16 as Named>::NAME }
+//- /lib.rs crate:library
+pub trait Named { const NAME: u8; fn name(&self) -> u8; }
+impl Named for u8 { const NAME: u8 = 1; fn name(&self) -> u8 { 1 } }
+impl Named for u16 { const NAME: u8 = 2; fn name(&self) -> u8 { 2 } }
+"#;
+    assert_eq!(checked(fixture), Default::default());
+    let bounded = r#"
+//- /main.rs crate:main deps:library
+pub fn total<T: library::Named>(v: &T) -> u8 { v.name() }
+pub fn unknown<T: library::Absent>(_: T) {}
+//- /lib.rs crate:library
+pub trait Named { fn name(&self) -> u8; }
+"#;
+    let result = checked(bounded);
+    assert_eq!(
+        result.errors,
+        ["unresolved trait `library::Absent`".to_owned()],
+        "a bound names a trait, not a type: {result:?}"
+    );
+    let private = checked(
+        "mod hidden { pub struct S; impl S { fn inherent(&self) {} } }\n\
+         pub fn caller(s: hidden::S) { s.inherent(); }\n",
+    );
+    assert!(private.errors.iter().any(|error| error.contains("private item")), "{private:?}");
+}
