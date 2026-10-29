@@ -5,6 +5,8 @@ use std::{collections::BTreeMap, ffi::OsString, io};
 
 /// Private descriptor field; remove it before writing a public source description.
 pub const UNIT_FIELD: &str = "blaze_native_units";
+/// Private environment of a program run by the owned executor.
+pub const RUNTIME_FIELD: &str = "blaze_runtime_environment";
 /// Descriptor field containing native root paths and content identities, without environments.
 pub const BINDINGS_FIELD: &str = "blaze_native_bindings";
 
@@ -67,10 +69,10 @@ pub fn decode_units(bytes: &[u8]) -> io::Result<BTreeMap<u32, Unit>> {
 /// Remove stdin-only native environments before any public descriptor is persisted.
 /// Callers must also remove crate environment fields already private in their descriptor.
 pub fn redact_transport(project: &mut serde_json::Value) -> io::Result<()> {
-    project
-        .as_object_mut()
-        .ok_or_else(|| invalid("compiler description is not an object"))?
-        .remove(UNIT_FIELD);
+    let object =
+        project.as_object_mut().ok_or_else(|| invalid("compiler description is not an object"))?;
+    object.remove(UNIT_FIELD);
+    object.remove(RUNTIME_FIELD);
     Ok(())
 }
 
@@ -140,12 +142,13 @@ mod tests {
         ]);
         let encoded = encode_units(&units);
         assert_eq!(decode_units(&encoded).unwrap(), units);
-        let mut private =
-            serde_json::json!({"crates": [], UNIT_FIELD: encoded, BINDINGS_FIELD: [1, 2]});
+        let mut private = serde_json::json!({"crates": [], UNIT_FIELD: encoded, RUNTIME_FIELD: encoded, BINDINGS_FIELD: [1, 2]});
         let stdin = private.clone();
         redact_transport(&mut private).unwrap();
         assert!(stdin.get(UNIT_FIELD).is_some());
         assert!(private.get(UNIT_FIELD).is_none());
+        assert!(stdin.get(RUNTIME_FIELD).is_some());
+        assert!(private.get(RUNTIME_FIELD).is_none());
         assert!(private.get(BINDINGS_FIELD).is_some());
     }
 
