@@ -1245,6 +1245,49 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         Import { export: std::sync::Arc::new(export), id, funcs, datas: Vec::new() }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn named_stack_slots_survive_llvm_debug_record_emission() {
+        use super::super::fragment::FuncTarget;
+        use cranelift_codegen::ir::{
+            AbiParam, InstBuilder, StackSlotData, StackSlotKind, UserFuncName, types::I64,
+        };
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let isa = super::super::target().unwrap();
+        let mut signature = ir::Signature::new(isa.default_call_conv());
+        signature.params.push(AbiParam::new(I64));
+        signature.returns.push(AbiParam::new(I64));
+        let mut function =
+            ir::Function::with_name_signature(UserFuncName::default(), signature.clone());
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut function, &mut context);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+        let slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let argument = builder.block_params(block)[0];
+        builder.ins().stack_store(argument, slot, 0);
+        let result = builder.ins().stack_load(I64, slot, 0);
+        builder.ins().return_(&[result]);
+        builder.finalize(isa.frontend_config());
+
+        let mut wants = Wants::new(&**isa);
+        let request = wants.func(FuncTarget::Symbol("named_stack".into()), &signature);
+        let members =
+            [Member { func: &function, named: &[slot], pointees: &[], request: request.as_u32() }];
+        let unit = emit_unit(&mut wants, &members, Optimization::NONE, &[]).unwrap();
+        let code = unit.members.into_iter().next().unwrap().unwrap();
+        assert!(!code.bytes.is_empty());
+        assert!(
+            code.slots.slots.iter().any(|(number, _)| *number == slot.as_u32()),
+            "{:?}",
+            code.slots
+        );
+    }
+
     /// bun's parser wrote garbage for a `for … of`: `ptr::write::<ForOf>` was imported
     /// through a function that passed it the address as an integer, and LLVM, given a call
     /// of a type the body did not have, kept nothing of what was written.
