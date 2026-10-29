@@ -71,14 +71,50 @@ impl Toolchain {
             return None;
         }
         let rustlib = lib.join("rustlib");
-        let host = std::fs::read_dir(&rustlib).ok()?.flatten().find_map(|it| {
-            it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
-        })?;
-        let manifest =
-            std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml")).ok()?;
-        let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
-        let (version, _) = rest.split_once('"')?;
-        let release = releases().iter().find(|it| it.version == version)?;
+        let entries =
+            std::fs::read_dir(&rustlib).ok()?.collect::<std::io::Result<Vec<_>>>().ok()?;
+        let mut hosts: Vec<_> = entries
+            .iter()
+            .filter_map(|it| {
+                it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
+            })
+            .collect();
+        if hosts.is_empty() {
+            // Component-composed installations can omit rustup's channel files.
+            // rust-lld belongs to the compiler's host component, not target std.
+            hosts = entries
+                .iter()
+                .filter(|it| {
+                    it.path().join("bin/rust-lld").is_file()
+                        || it.path().join("bin/rust-lld.exe").is_file()
+                })
+                .filter_map(|it| it.file_name().into_string().ok())
+                .collect();
+        }
+        let [host] = hosts.as_slice() else { return None };
+        let host = host.clone();
+        let release = match std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml"))
+        {
+            Ok(manifest) => {
+                let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
+                let (version, _) = rest.split_once('"')?;
+                releases().iter().find(|it| it.version == version)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let info =
+                    std::fs::read_to_string(sysroot.join("share/doc/rust/html/version_info.html"))
+                        .ok()?;
+                releases().iter().find(|it| {
+                    let Some((version, revision)) = it.version.split_once(" (") else {
+                        return false;
+                    };
+                    let Some((commit, _)) = revision.split_once(' ') else { return false };
+                    info.contains(&format!("Rust</a> {version}</span>"))
+                        && info.contains(&format!(">{commit}</a>"))
+                })?
+            }
+            Err(_) => return None,
+        };
         Some(Toolchain { sysroot, host, release })
     }
 }

@@ -592,6 +592,34 @@ mod tests {
         rustc
     }
 
+    #[test]
+    fn component_toolchains_use_installed_host_and_release_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = synthetic_toolchain(dir.path());
+        let rustlib = dir.path().join("lib/rustlib");
+        std::fs::remove_file(rustlib.join("manifest-rustc-aarch64-apple-darwin")).unwrap();
+        std::fs::remove_file(rustlib.join("multirust-channel-manifest.toml")).unwrap();
+        let host = rustlib.join("x86_64-unknown-linux-gnu/bin");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("rust-lld"), b"installed host linker").unwrap();
+        let docs = dir.path().join("share/doc/rust/html");
+        std::fs::create_dir_all(&docs).unwrap();
+        let release: serde_json::Value =
+            serde_json::from_str(include_str!("answers/rustc-1.99.0.json")).unwrap();
+        let (version, rest) = release["version"].as_str().unwrap().split_once(" (").unwrap();
+        let (commit, _) = rest.split_once(' ').unwrap();
+        let info = format!("Rust</a> {version}</span><a>{commit}</a>");
+        std::fs::write(docs.join("version_info.html"), &info).unwrap();
+        assert_eq!(own::host_tuple(&rustc).as_deref(), Some("x86_64-unknown-linux-gnu"));
+        let other = rustlib.join("aarch64-unknown-linux-gnu/bin");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("rust-lld"), b"ambiguous second host").unwrap();
+        assert!(own::host_tuple(&rustc).is_none());
+        std::fs::remove_file(other.join("rust-lld")).unwrap();
+        std::fs::write(docs.join("version_info.html"), info.replace(commit, "unknown")).unwrap();
+        assert!(own::host_tuple(&rustc).is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn rustup_queries_resolve_the_default_home_without_executing_the_proxy() {
