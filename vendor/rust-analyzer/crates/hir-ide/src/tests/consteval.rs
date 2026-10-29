@@ -155,6 +155,50 @@ fn add() {
 }
 
 #[test]
+fn column_macro_counts_unicode_scalars_in_consteval() {
+    let builtin = r#"
+#[rustc_builtin_macro]
+macro_rules! column { () => {} }
+"#;
+    for (source, expected) in [
+        ("const GOAL: u32 = { /* x */ column!() };", 29),
+        ("const GOAL: u32 = { \t column!() };", 23),
+        ("const GOAL: u32 = { /* 界 */ column!() };", 29),
+        ("const GOAL: u32 = { /* e\u{301} */ column!() };", 30),
+    ] {
+        check_number(&format!("{builtin}{source}"), expected);
+    }
+}
+
+#[test]
+fn column_macro_counts_unicode_scalars_at_nested_callsite() {
+    check_number(
+        concat!(
+            "#[rustc_builtin_macro]\n",
+            "macro_rules! column { () => {} }\n",
+            "macro_rules! nested { () => { column!() } }\n",
+            "macro_rules! outer { () => { nested!() } }\n",
+            "const GOAL: u32 = { /* 界e\u{301} */\t outer!() };",
+        ),
+        32,
+    );
+}
+
+#[test]
+fn column_macro_counts_unicode_scalars_inside_concat() {
+    check_str(
+        concat!(
+            "#[rustc_builtin_macro]\n",
+            "macro_rules! column { () => {} }\n",
+            "#[rustc_builtin_macro]\n",
+            "macro_rules! concat { ($($e:expr),* $(,)?) => {} }\n",
+            "const GOAL: &str = /* 界e\u{301} */\t concat!(\"at:\", column!());",
+        ),
+        "at:46",
+    );
+}
+
+#[test]
 fn bit_op() {
     check_number(r#"const GOAL: u8 = !0 & !(!0 >> 1)"#, 128);
     check_number(r#"const GOAL: i8 = !0 & !(!0 >> 1)"#, 0);

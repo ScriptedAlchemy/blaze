@@ -1,7 +1,7 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "330ffd5de4ef024a8986731720df9a237611e11485bcad8932eb1a2a72214e65",
+  "Cargo.lock": "d58d3a1db10322dee683bf3966010f1c5906c9875128a26a86040642ff0bc28c",
   "Cargo.toml": "d01d0e3aa1aa049db80f3e5a60cee5cbb73976be91d4c854520602023d581644"
  },
  "packages": {
@@ -16025,10 +16025,6 @@
       {
        "i": 470,
        "name": "triomphe"
-      },
-      {
-       "i": 483,
-       "name": "unicode_width"
       }
      ],
      "edition": "2024",
@@ -35683,10 +35679,6 @@
       {
        "i": 471,
        "name": "triomphe"
-      },
-      {
-       "i": 484,
-       "name": "unicode_width"
       }
      ],
      "edition": "2024",
@@ -55549,10 +55541,6 @@
       {
        "i": 471,
        "name": "triomphe"
-      },
-      {
-       "i": 484,
-       "name": "unicode_width"
       }
      ],
      "edition": "2024",
@@ -75238,10 +75226,6 @@
       {
        "i": 472,
        "name": "triomphe"
-      },
-      {
-       "i": 485,
-       "name": "unicode_width"
       }
      ],
      "edition": "2024",

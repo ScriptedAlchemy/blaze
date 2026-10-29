@@ -10,7 +10,6 @@ use hir_expand::{
 };
 use rustc_hash::FxHashMap;
 use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast};
-use unicode_width::UnicodeWidthChar;
 
 use crate::db::HirDatabase;
 
@@ -243,7 +242,7 @@ pub fn line_and_column(
     let line = starts.partition_point(|&start| start <= at);
     let line_start = *starts.get(line.checked_sub(1)?)?;
     let written = text.text(db).get(line_start as usize..at as usize)?;
-    Some((file_id, line as u32, written.chars().map(column_width).sum::<usize>() as u32 + 1))
+    Some((file_id, line as u32, written.chars().count() as u32 + 1))
 }
 
 /// Where each line of a file begins, the first of them at 0.
@@ -251,19 +250,4 @@ pub fn line_and_column(
 fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> {
     let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
     std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
-}
-
-/// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
-/// its display width, four for a tab, and one for the control characters rustc prints a
-/// visible character for.
-pub fn column_width(ch: char) -> usize {
-    match ch {
-        '\t' => 4,
-        '\0'..='\u{8}'
-        | '\u{b}'..='\u{1f}'
-        | '\u{7f}'
-        | '\u{202a}'..='\u{202e}'
-        | '\u{2066}'..='\u{2069}' => 1,
-        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
-    }
 }

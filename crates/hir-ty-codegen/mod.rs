@@ -87,8 +87,8 @@ use hir_ty::mir::{
     MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
     StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
     location::{
-        ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
-        location_of, written_call, written_range,
+        ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
+        written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
     overflow::{body_written_checked, crate_checks_overflow},
