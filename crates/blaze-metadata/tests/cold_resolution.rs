@@ -51,10 +51,22 @@ impl Fixture {
     }
 
     fn publish(&self, name: &str, version: &str, deps: &[(&str, &str)], yanked: bool) {
+        self.publish_for(name, version, deps, yanked, None);
+    }
+
+    fn publish_for(
+        &self,
+        name: &str,
+        version: &str,
+        deps: &[(&str, &str)],
+        yanked: bool,
+        rust_version: Option<&str>,
+    ) {
+        let declared = rust_version.map(|it| format!("rust-version={it:?}\n")).unwrap_or_default();
         let dependencies =
             deps.iter().map(|(name, req)| format!("{name}={req:?}\n")).collect::<String>();
         let manifest = format!(
-            "[package]\nname={name:?}\nversion={version:?}\nedition='2021'\n[dependencies]\n{dependencies}",
+            "[package]\nname={name:?}\nversion={version:?}\nedition='2021'\n{declared}[dependencies]\n{dependencies}",
         );
         let mut tar = tar::Builder::new(Vec::new());
         for (path, text) in [("Cargo.toml", manifest.as_str()), ("src/lib.rs", "pub fn f() {}\n")] {
@@ -78,6 +90,7 @@ impl Fixture {
                 "name": name, "req": req, "features": [], "optional": false,
                 "default_features": true, "kind": "normal", "target": null,
             })).collect::<Vec<_>>(), "features": {}, "cksum": checksum, "yanked": yanked,
+            "rust_version": rust_version,
         });
         writeln!(
             std::fs::OpenOptions::new().create(true).append(true).open(index).unwrap(),
@@ -91,6 +104,17 @@ impl Fixture {
         locked: bool,
         offline: bool,
     ) -> anyhow::Result<(Value, Vec<(PathBuf, Vec<u8>)>)> {
+        self.resolve_for(locked, offline, None)
+    }
+
+    /// As `resolve`, with the release of the toolchain's rustc as cargo would find it.
+    fn resolve_for(
+        &self,
+        locked: bool,
+        offline: bool,
+        release: Option<&str>,
+    ) -> anyhow::Result<(Value, Vec<(PathBuf, Vec<u8>)>)> {
+        let release = release.map(str::to_owned);
         let asked = Asked {
             cargo_home: None,
             cwd: &self.0,
@@ -105,6 +129,7 @@ impl Fixture {
             offline,
             locked,
             store: None,
+            rust_release: Some(&|_, _, _| release.clone()),
         };
         let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
         Ok((serde_json::from_str(&json)?, sources))
@@ -235,4 +260,31 @@ fn read_permission_failures_are_not_treated_as_missing_locks() {
         assert!(result.unwrap_err().to_string().contains("failed to read"));
         assert_eq!(fixture.lock(), "version = 4\n");
     }
+}
+
+/// Resolver 3 with no member `rust-version` prefers what builds with the toolchain's own
+/// rustc release, as cargo's `load_global_rustc` finds it, never blaze's own MSRV; with no
+/// known release it writes no lock rather than one cargo would not.
+#[test]
+fn unset_rust_version_resolves_for_the_toolchain_release() {
+    let fixture = Fixture::new();
+    fixture.registry();
+    fixture.publish_for("compat", "1.0.0", &[], false, Some("1.90"));
+    fixture.publish_for("compat", "1.1.0", &[], false, Some("1.99.1"));
+    fixture.publish_for("compat", "1.2.0", &[], false, Some("1.100"));
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ncompat='1'\n",
+    );
+    let error = fixture.resolve_for(false, true, None).unwrap_err().to_string();
+    assert!(error.contains("rust-version"), "{error}");
+    assert!(!fixture.0.join("Cargo.lock").exists());
+    let (metadata, _) = fixture.resolve_for(false, true, Some("1.99.0")).unwrap();
+    assert_eq!(version(&metadata, "compat"), "1.0.0");
+    std::fs::remove_file(fixture.0.join("Cargo.lock")).unwrap();
+    let (metadata, _) = fixture.resolve_for(false, true, Some("1.99.1")).unwrap();
+    assert_eq!(version(&metadata, "compat"), "1.1.0");
+    std::fs::remove_file(fixture.0.join("Cargo.lock")).unwrap();
+    let (metadata, _) = fixture.resolve_for(false, true, Some("1.100.0")).unwrap();
+    assert_eq!(version(&metadata, "compat"), "1.2.0");
 }

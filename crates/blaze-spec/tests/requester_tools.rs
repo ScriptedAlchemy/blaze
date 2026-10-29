@@ -215,6 +215,7 @@ fn a_cc_the_repository_puts_first_on_path_is_identified_and_never_run() {
         &host,
         StoreIdentity([9; 32]),
         &probe,
+        Some(&common::rust_release),
         &[("PATH".to_owned(), worker_path())].into_iter().collect(),
     )
     .unwrap();
@@ -261,6 +262,7 @@ fn an_empty_entry_of_the_workers_path_does_not_reach_into_the_snapshot() {
         &host,
         StoreIdentity([9; 32]),
         &probe,
+        Some(&common::rust_release),
         &[("PATH".to_owned(), path)].into_iter().collect(),
     )
     .unwrap();

@@ -104,6 +104,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             offline: false,
             store: None,
             probe: &blaze_spec::platform::System,
+            rust_release: Some(&crate::answers::rust_release),
         },
     )?;
     let target = resolved.outputs.first().context("resolution has no target directory")?.clone();

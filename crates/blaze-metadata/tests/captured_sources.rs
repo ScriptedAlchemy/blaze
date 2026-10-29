@@ -55,6 +55,7 @@ fn graph(
         platform: Some(TargetPlatform { triple: "x86_64-unknown-linux-gnu", cfg: &[] }),
         offline,
         store: None,
+        rust_release: None,
     };
     let resolved = unit_graph_captured(
         &UnitsAsked {

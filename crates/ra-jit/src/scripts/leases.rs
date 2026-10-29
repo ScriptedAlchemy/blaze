@@ -307,6 +307,9 @@ struct State {
     /// The builds that ran a script, and so wrote an output that stands only while they hold
     /// it: each has the admission until it is retired.
     executors: HashSet<u64>,
+    /// The leases each build holds on the producer images it was given, which its macros are
+    /// loaded from after its scripts are judged: none is collected until it is retired.
+    images: HashMap<u64, Vec<File>>,
 }
 
 /// A watch of a file of another process: which one it is (a thread ends only the registration
@@ -556,6 +559,11 @@ impl Leases {
         }
     }
 
+    /// `build` holds `leases` on producer images until it is retired.
+    pub(super) fn keep_images(&self, build: u64, leases: Vec<File>) {
+        self.state().images.entry(build).or_default().extend(leases);
+    }
+
     /// Ends `build`: its leases and its admission are released and what it judged is forgotten.
     /// How many leases it held.
     pub(super) fn retire(&self, build: u64) -> usize {
@@ -573,6 +581,7 @@ impl Leases {
         state.yielding.remove(&build);
         state.operations.remove(&build);
         state.executors.remove(&build);
+        state.images.remove(&build);
         drop(state);
         if let Some(map) = interest().as_mut() {
             map.values_mut().for_each(|it| _ = it.owners.remove(&build));

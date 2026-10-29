@@ -407,6 +407,7 @@ pub fn capture(
         offline: ctx.offline,
         store: ctx.store.clone(),
         probe: ctx.probe,
+        rust_release: ctx.rust_release,
     };
     // This pass also resolves workspace-relative configuration paths against the
     // final layout, rather than the provisional workspace root.
@@ -522,6 +523,7 @@ pub fn capture(
         ctx.host,
         ctx.toolchain,
         ctx.probe,
+        ctx.rust_release,
         &native,
         &record,
     )
@@ -536,6 +538,10 @@ pub fn capture(
 /// Authenticate and materialize a replay, reproduce its exact graph and request, and
 /// only then verify the native execution platform. Nothing from the caller's cwd or
 /// compiler environment is used. The destination must not already exist.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the authenticated identity and executor context are explicit"
+)]
 pub fn prepare(
     given: &BuildSpec,
     store: &Path,
@@ -543,12 +549,23 @@ pub fn prepare(
     host: &Host,
     identity: StoreIdentity,
     probe: &dyn Probe,
+    rust_release: Option<&blaze_metadata::RustRelease<'_>>,
     executor: &BTreeMap<String, OsString>,
 ) -> anyhow::Result<Prepared> {
     let bytes = std::fs::read(record_path(given, store))
         .context("the saved replay recipe is missing or does not match this BuildSpec")?;
     let record: Record = blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?;
-    prepare_record(given, store, destination, host, identity, probe, executor, &record)
+    prepare_record(
+        given,
+        store,
+        destination,
+        host,
+        identity,
+        probe,
+        rust_release,
+        executor,
+        &record,
+    )
 }
 
 #[expect(
@@ -562,6 +579,7 @@ fn prepare_record(
     host: &Host,
     identity: StoreIdentity,
     probe: &dyn Probe,
+    rust_release: Option<&blaze_metadata::RustRelease<'_>>,
     executor: &BTreeMap<String, OsString>,
     record: &Record,
 ) -> anyhow::Result<Prepared> {
@@ -651,6 +669,7 @@ fn prepare_record(
         offline: true,
         store: None,
         probe,
+        rust_release,
     };
     let sources = captured
         .iter()

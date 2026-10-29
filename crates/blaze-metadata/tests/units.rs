@@ -299,6 +299,8 @@ fn check(fixture: &Path, scratch: &Path) -> Outcome {
             platform: Some(TargetPlatform { triple: host, cfg: &cfg }),
             offline: true,
             store: None,
+            // The expected graphs were recorded with the pinned Rust/Cargo 1.99.0 toolchain.
+            rust_release: Some(&|_, _, _| Some("1.99.0".to_owned())),
         };
         let units = UnitsAsked {
             asked: &asked,

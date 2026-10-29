@@ -55,6 +55,7 @@ fn try_graph(root: &Path, home: &Path) -> anyhow::Result<blaze_metadata::units::
         platform: Some(TargetPlatform { triple: "x86_64-unknown-linux-gnu", cfg: &[] }),
         offline: false,
         store: None,
+        rust_release: None,
     };
     unit_graph(&UnitsAsked {
         asked: &asked,
@@ -210,6 +211,7 @@ fn native_resolution_keeps_manifest_lock_and_config_source_bytes() {
         platform: None,
         offline: true,
         store: None,
+        rust_release: None,
     };
     let (json, sources) = blaze_metadata::metadata_with_sources(&asked).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();

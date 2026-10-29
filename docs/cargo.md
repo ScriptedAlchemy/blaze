@@ -149,7 +149,18 @@ and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the
 1.99 gives it. Host producers, including proc macros and their build dependencies, are
 compiled from the owned source graph. Compiler probes the owned checker cannot decide
 fail the producer build; they do not select a different implementation by reporting a
-negative feature result. Empty library probes, including `autocfg`'s initial standard-library
+negative feature result. A probe is a "no" only for an error rustc certainly reports.
+A type error rust-analyzer finds is one only for a literal where a type written out in the
+source wants a scalar the literal cannot be; any other type error, and any error that rests on
+the types it inferred (a method, field or trait it did not find through them, a match it found
+not exhaustive), may be a coercion or an inference it does not model, so it leaves the probe
+undecided. So does an error of the owned borrow checker, which still reports some rustc does
+not, and a body it did not check, because MIR lowering does not support something in it or an
+error kept the check from being made. An undecided probe is
+refused loudly, naming the probe and why; the producer it belongs to is not built, since no
+answer but rustc's is right. `harness/dist/accepted_probes.py` holds valid probes, with
+coercions, closures, trait objects and generic inference, that rustc accepts and blaze must
+never answer with a "no". Empty library probes, including `autocfg`'s initial standard-library
 check, can emit a real LLVM IR module after complete syntax and attribute validation.
 Nonempty source probes still need the remaining compiler acceptance checks; this empty
 case does not establish general probe or proc-macro-server bootstrap parity.

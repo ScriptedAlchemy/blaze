@@ -341,6 +341,12 @@ fn macos_version(value: &str) -> Option<[u16; 3]> {
     Some(version)
 }
 
+/// The release of `rustc` as the first line of its `-V` has it, `1.99.0`, from the
+/// toolchain's records, not from executing it.
+pub(super) fn release(rustc: &Path) -> Option<String> {
+    Some(Toolchain::of(rustc)?.release.version.split_whitespace().next()?.to_owned())
+}
+
 /// Cargo's release version from the installed channel manifest, not from executing it.
 pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
     let toolchain = Toolchain::of(rustc)?;

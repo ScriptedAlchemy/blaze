@@ -42,6 +42,7 @@ fn prepared(made: &Spec, store: &Path, at: &Path) -> blaze_spec::replay::Prepare
         &host(false),
         StoreIdentity([9; 32]),
         &FakeMachine,
+        Some(&common::rust_release),
         &[("PATH".to_owned(), OsString::from("/usr/bin"))].into_iter().collect(),
     )
     .unwrap()
@@ -73,6 +74,32 @@ fn dirty_inputs_survive_origin_removal_and_are_used_by_the_execution_plan() {
     assert!(krate["cfg"].as_array().unwrap().contains(&serde_json::json!("feature=\"chosen\"")));
     assert!(plans[0].run);
     assert_eq!(prepared.request.trailing, ["original-arg"]);
+}
+
+#[test]
+fn resolver_three_uses_installed_release_facts_after_origin_removal() {
+    let f = fixture();
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2024'\n");
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    drop(f);
+    let restored = prepared(&made, store.path(), &worker.path().join("known-release"));
+    assert_eq!(restored.resolved.spec.build, made.build);
+
+    let error = prepare(
+        &made.build,
+        store.path(),
+        &worker.path().join("unknown-release"),
+        &host(false),
+        StoreIdentity([9; 32]),
+        &NoProbe,
+        None,
+        &Default::default(),
+    )
+    .err()
+    .expect("missing release facts must fail before probing native tools");
+    assert!(format!("{error:#}").contains("no workspace member declares a `rust-version`"));
 }
 
 #[test]
@@ -288,6 +315,7 @@ fn altered_profile_and_request_fail_before_native_probes() {
             &host(false),
             StoreIdentity([9; 32]),
             &NoProbe,
+            Some(&common::rust_release),
             &Default::default(),
         )
         .err()
@@ -310,6 +338,7 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
             &host(false),
             StoreIdentity([8; 32]),
             &NoProbe,
+            Some(&common::rust_release),
             &Default::default(),
         )
         .is_err()
@@ -325,6 +354,7 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
             &host(false),
             StoreIdentity([9; 32]),
             &NoProbe,
+            Some(&common::rust_release),
             &Default::default(),
         )
         .is_err()

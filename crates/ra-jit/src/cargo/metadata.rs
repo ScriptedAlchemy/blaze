@@ -103,6 +103,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             offline: selection.offline,
             locked: selection.locked,
             store: None,
+            rust_release: Some(&crate::answers::rust_release),
         };
         let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
         let metadata =
@@ -157,6 +158,7 @@ fn sysroot_metadata(
         offline,
         locked: true,
         store: None,
+        rust_release: Some(&crate::answers::rust_release),
     };
     let json = blaze_metadata::metadata(&asked)?;
     serde_json::from_str(&json).context("blaze's std metadata is not cargo's form")
@@ -214,6 +216,7 @@ pub(crate) fn programs(
             offline: selection.offline,
             locked: selection.locked,
             store: None,
+            rust_release: Some(&crate::answers::rust_release),
         };
         Ok(blaze_metadata::programs(&asked, targets)?.1)
     };

@@ -282,6 +282,7 @@ pub(crate) fn of(
         offline: selection.offline,
         locked: selection.locked,
         store: None,
+        rust_release: Some(&crate::answers::rust_release),
     };
     let (metadata, units, mut sources) =
         blaze_metadata::build_units(&asked, &TargetPlatform { triple: host, cfg: &host_cfg })?;

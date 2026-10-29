@@ -99,6 +99,8 @@ pub struct Context<'a> {
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
     /// What the platform is read through: the real machine, or a fake of one.
     pub probe: &'a dyn Probe,
+    /// Installed compiler release facts used by dependency resolution; never executes it.
+    pub rust_release: Option<&'a blaze_metadata::RustRelease<'a>>,
 }
 
 /// A spec, its platform and its keys.
@@ -266,6 +268,7 @@ fn resolve_with_platform(
         platform: Some(TargetPlatform { triple: &ctx.host.triple, cfg: &ctx.host.cfg }),
         offline: request.offline || ctx.offline || offline,
         store: ctx.store.clone(),
+        rust_release: ctx.rust_release,
     };
     let wanted = UnitsAsked {
         asked: &asked,

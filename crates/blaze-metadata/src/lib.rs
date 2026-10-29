@@ -60,7 +60,15 @@ pub struct Asked<'a> {
     pub locked: bool,
     /// blaze's store, which keeps `.crate` files by their sha256.
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
+    /// The release of the rustc a program names, run in `cwd` with `env`, as its `rustc -vV`
+    /// says it (`1.99.0`), without running it. Cargo prefers dependencies that build with that
+    /// release when no member declares a `rust-version`; a resolve that needs it and has none
+    /// fails.
+    pub rust_release: Option<&'a RustRelease<'a>>,
 }
+
+/// What answers [`Asked::rust_release`]: the program, the directory and the variables.
+pub type RustRelease<'a> = dyn Fn(&Path, &Path, &[(String, String)]) -> Option<String> + 'a;
 
 /// The members a `cargo build` builds, as its flags select them.
 pub struct Build<'a> {
@@ -114,6 +122,32 @@ struct Package {
     manifest_path: PathBuf,
     manifest: Box<Manifest>,
     locked_source: Option<String>,
+}
+
+/// The release of the rustc cargo would ask its version of, as `load_global_rustc` finds
+/// it: `RUSTC`, else `build.rustc`, else `rustc` on `PATH`. Cargo resolves for that release
+/// when no member declares a `rust-version`, never for blaze's own.
+fn toolchain_release(asked: &Asked<'_>, config: &Config) -> Result<semver::Version> {
+    let program = match asked.env.iter().find(|(name, _)| name == "RUSTC") {
+        Some((_, rustc)) if rustc.contains('/') || cfg!(windows) && rustc.contains('\\') => {
+            asked.cwd.join(rustc)
+        }
+        Some((_, rustc)) => PathBuf::from(rustc),
+        None => match &config.build_config()?.rustc {
+            Some(rustc) => rustc.resolve_program(asked.cwd),
+            None => PathBuf::from("rustc"),
+        },
+    };
+    let release = asked.rust_release.and_then(|release| release(&program, asked.cwd, &asked.env));
+    let release = release.with_context(|| {
+        format!(
+            "no workspace member declares a `rust-version`, so the dependencies are those that \
+             build with the release of `{}`, which blaze does not know",
+            program.display()
+        )
+    })?;
+    semver::Version::parse(&release)
+        .with_context(|| format!("`{}` is of release `{release}`", program.display()))
 }
 
 /// The root manifest of the workspace the manifest at `manifest_path` is in, as
@@ -482,6 +516,7 @@ impl Locked {
             let (lock, targeted, facts) = resolve_packages(
                 ws,
                 ctx,
+                asked,
                 &reads,
                 &ids[..member_count],
                 registry,
@@ -526,6 +561,7 @@ impl Locked {
         let (mut lock, targeted, facts) = resolve_packages(
             ws,
             ctx,
+            asked,
             &reads,
             &ids[..member_count],
             registry,
@@ -573,6 +609,7 @@ impl Locked {
 fn resolve_packages<R: blaze_resolve::Registry>(
     ws: &Workspace<'_>,
     ctx: &Context,
+    asked: &Asked<'_>,
     reads: &FxHashMap<PackageId, Read>,
     member_ids: &[PackageId],
     registry: R,
@@ -596,6 +633,7 @@ fn resolve_packages<R: blaze_resolve::Registry>(
         &patch,
         behavior,
         ctx,
+        asked,
     )?;
     let mut registry = PackageRegistry::new(registry);
     let (whole, targeted) = resolve_ws(
@@ -630,6 +668,7 @@ fn resolver_workspace<'a>(
     patch: &'a [(url::Url, Vec<blaze_resolve::workspace_resolve::Patch>)],
     behavior: ResolveBehavior,
     ctx: &Context,
+    asked: &Asked<'_>,
 ) -> Result<blaze_resolve::workspace_resolve::Workspace<'a>> {
     let fallback = ctx.config.get_string("resolver.incompatible-rust-versions")?;
     let fallback = fallback
@@ -646,7 +685,7 @@ fn resolver_workspace<'a>(
                 .map(|v| v.to_partial())
                 .collect::<Vec<_>>();
             if versions.is_empty() {
-                versions.push(env!("CARGO_PKG_RUST_VERSION").parse()?);
+                versions.push(toolchain_release(asked, &ctx.config)?.into());
             }
             Some(versions)
         }

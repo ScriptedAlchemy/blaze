@@ -6508,6 +6508,19 @@ fn broken_in(
     within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
     lints: bool,
 ) -> Option<errors::Said> {
+    broken_in_except(db, edited, watched, root, within, lints, &[])
+}
+
+/// [`broken_in`], but for the errors whose codes are `except`.
+fn broken_in_except(
+    db: &RootDatabase,
+    edited: &[vfs::FileId],
+    watched: &Sources,
+    root: &Path,
+    within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
+    lints: bool,
+    except: &[&str],
+) -> Option<errors::Said> {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let refuse_borrowck = std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0");
@@ -6554,6 +6567,7 @@ fn broken_in(
                                     let expanded =
                                         it.main_node.is_some_and(|it| it.file_id.is_macro());
                                     it.severity == ide_db::Severity::Error
+                                        && !except.contains(&code)
                                         && (SURE.contains(&code)
                                             || refuse_borrowck && BORROWCK.contains(&code)
                                             || lints

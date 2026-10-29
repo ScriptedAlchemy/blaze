@@ -184,6 +184,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
         offline: false,
         store: None,
         probe: &blaze_spec::platform::System,
+        rust_release: Some(&crate::answers::rust_release),
     };
     if graph {
         println!("{}", unit_graph(&request, &ctx)?);
@@ -331,6 +332,7 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
         }),
         offline: request.offline,
         store: None,
+        rust_release: ctx.rust_release,
     };
     let targets = if request.doc {
         blaze_metadata::units::TargetFilter { doc_only: true, ..Default::default() }
@@ -372,6 +374,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         &host,
         identity,
         &blaze_spec::platform::System,
+        Some(&crate::answers::rust_release),
         &executor,
     )?;
     blaze_spec::execution::preflight(&prepared, true)?;

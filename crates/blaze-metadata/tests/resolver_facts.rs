@@ -29,7 +29,7 @@ fn inactive_archive_and_manifest_are_unneeded_for_capture_profile_validation_and
         std::env::temp_dir().join(format!("blaze-resolver-facts-{}-{nonce}", std::process::id())),
     );
     std::fs::create_dir(&f.0).unwrap();
-    f.write("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nunused={version='1',optional=true}\n[profile.dev.package.unused]\nopt-level=2\n");
+    f.write("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nunused={version='1',optional=true}\n[profile.dev.package.unused]\nopt-level=2\n");
     f.write("src/lib.rs", "pub fn value() -> u8 { 1 }\n");
     f.write(
         ".cargo/config.toml",
@@ -54,6 +54,7 @@ fn inactive_archive_and_manifest_are_unneeded_for_capture_profile_validation_and
         offline: true,
         locked: false,
         store: None,
+        rust_release: Some(&|_, _, _| Some("1.99.0".to_owned())),
     };
     let units = UnitsAsked {
         asked: &asked,
@@ -85,4 +86,21 @@ fn inactive_archive_and_manifest_are_unneeded_for_capture_profile_validation_and
     assert_eq!(original.graph.lock, replay.graph.lock);
     assert_eq!(original.facts, replay.facts);
     assert!(!home.exists(), "closed replay must not consult or create a source cache");
+
+    let unknown_release = Asked { rust_release: None, ..asked };
+    let unknown_units = UnitsAsked {
+        asked: &unknown_release,
+        command: Command::Build,
+        targets: &TargetFilter::default(),
+        profile: None,
+    };
+    let error = unit_graph_captured(
+        &unknown_units,
+        Some(CapturedResolution { sources: &[], facts: &original.facts }),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("no workspace member declares a `rust-version`"));
+    assert!(!home.exists(), "missing toolchain facts must not consult a source cache");
 }

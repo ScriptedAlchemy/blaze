@@ -102,16 +102,17 @@ def main():
             app(theirs)
             return ours, theirs
 
-        def run_pair(roots, flags=(), success=True, compare_lock=True):
+        def run_pair(roots, flags=(), success=True, compare_lock=True, release="1.99.0"):
             nonlocal passed
             results = []
             for product, root in zip((True, False), roots):
                 home = work / (root.name + "-home")
                 home.mkdir(exist_ok=True)
-                env = {**base, "CARGO_HOME": str(home)}
+                env = {**base, "CARGO_HOME": str(home), "RUSTUP_TOOLCHAIN": release}
                 if product:
                     env.update(PATH=str(blockers) + ":/usr/bin:/bin", RUSTC=str(blockers / "rustc"), RUSTDOC=str(blockers / "rustdoc"))
-                command = [blaze, *flags] if product else [cargo, "+1.99.0", "metadata", "--format-version=1", *flags]
+                # Cargo asks the toolchain's rustc its release; the product is told it.
+                command = [blaze, "--rust-release", release, *flags] if product else [cargo, "+" + release, "metadata", "--format-version=1", *flags]
                 result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
                 assert (result.returncode == 0) == success, (command, result.stderr)
                 if success:
@@ -252,6 +253,19 @@ def main():
             write(root, ".cargo/config.toml", f"[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='{registry}'\n")
         run_pair(roots, ("--offline",))
         run_pair(roots, ("--frozen",))
+        # Resolver 3 and no member rust-version: cargo prefers what builds with the
+        # toolchain's own release, which is not blaze's MSRV.
+        publish(registry, "toolchain_compat", "1.0.0", rust_version="1.90")
+        publish(registry, "toolchain_compat", "1.1.0", rust_version="1.99.1")
+        publish(registry, "toolchain_compat", "1.2.0", rust_version="1.100")
+        for release in ("1.99.0", "1.99.1"):
+            roots = pair("unset-msrv-" + release)
+            for root in roots:
+                app(root, "toolchain_compat='1'\n")
+                write(root, "Cargo.toml", (root / "Cargo.toml").read_text().replace("edition='2021'", "edition='2024'"))
+                write(root, ".cargo/config.toml", f"[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='{registry}'\n")
+            run_pair(roots, ("--offline",), release=release)
+            run_pair(roots, ("--frozen",), release=release)
         roots = pair("old-msrv")
         for root in roots:
             app(root)

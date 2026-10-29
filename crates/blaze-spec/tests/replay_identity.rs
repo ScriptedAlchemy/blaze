@@ -68,6 +68,7 @@ impl Project {
             offline: true,
             store: None,
             probe: &common::FakeMachine,
+            rust_release: Some(&common::rust_release),
         };
         replay::capture(&request, &words, &context, &self.store, &[]).unwrap()
     }

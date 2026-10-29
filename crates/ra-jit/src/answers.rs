@@ -519,6 +519,7 @@ fn cargo_metadata(
                 offline,
                 locked,
                 store: None,
+                rust_release: Some(&rust_release),
             })?
         };
         Ok(format!("{json}\n").into_bytes())
@@ -573,6 +574,15 @@ fn var_of(command: &Command, name: &str) -> Option<OsString> {
 }
 
 /// The rustc of the toolchain that `program`, as this process would run it, is.
+/// The release of the rustc `program` names, run in `cwd` with the variables `env`, as cargo's
+/// `rustc -vV` would find it, from the toolchain's records; nothing is run.
+pub(crate) fn rust_release(program: &Path, cwd: &Path, env: &[(String, String)]) -> Option<String> {
+    let var = |name: &str| {
+        env.iter().find(|(key, _)| key == name).map(|(_, value)| OsString::from(value))
+    };
+    own::release(&toolchain_rustc(program.as_os_str(), Some(cwd), &var)?)
+}
+
 pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
     toolchain_rustc(program, None, &|name| std::env::var_os(name))
 }

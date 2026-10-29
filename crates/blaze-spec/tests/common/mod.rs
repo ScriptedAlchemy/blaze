@@ -159,6 +159,7 @@ pub fn context<'a>(
         offline: true,
         store: None,
         probe: &FakeMachine,
+        rust_release: Some(&rust_release),
     }
 }
 
@@ -414,4 +415,9 @@ pub fn spec_on(
         None => simple_graph(&profile),
     };
     assemble(&request, &context, &units)
+}
+
+/// The installed release supplied by this fixture, independent of the test compiler.
+pub fn rust_release(_program: &Path, _cwd: &Path, _env: &[(String, String)]) -> Option<String> {
+    Some("1.99.0".to_owned())
 }
