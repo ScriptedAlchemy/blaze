@@ -575,6 +575,13 @@ fn a_cargo_home_above_the_workspace_keeps_its_precedence_in_replay() {
     let effective = replay.execution_environment().unwrap();
     assert_eq!(effective["SHARED"], "from-home");
     assert_eq!(effective["ONLY_BASE"], "base");
+    // The replay reads the layers the capture read, in the capture's order: the home first,
+    // as an ancestor's `.cargo` nearer than the file above it. Walking the snapshot would
+    // visit the file above and then the mounted home last.
+    assert_eq!(
+        replay.config_image.layers,
+        [replay.root.join(".blaze-cargo-home/config.toml"), replay.root.join(".cargo/config.toml")]
+    );
 }
 
 #[test]
