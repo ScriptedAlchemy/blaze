@@ -398,6 +398,9 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
 #[derive(Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Planned {
+    /// The actual producer output tree, independent of a rustc-env OUT_DIR override.
+    #[serde(skip)]
+    pub(crate) out_dir: Option<PathBuf>,
     #[serde(default)]
     pub(crate) workspace_member: bool,
     pub(crate) name: String,
@@ -844,6 +847,7 @@ mod tests {
     #[test]
     fn captured_descriptions_preserve_authoritative_cfg_and_target_kinds() {
         let source = |name: &str, deps| Planned {
+            out_dir: None,
             workspace_member: false,
             name: name.into(),
             root: std::env::temp_dir().join(format!("{name}.rs")),
@@ -894,6 +898,7 @@ mod tests {
         let crates = || {
             vec![
                 Planned {
+                    out_dir: None,
                     workspace_member: false,
                     name: "derive".into(),
                     root: "/sources/derive/src/lib.rs".into(),
@@ -905,6 +910,7 @@ mod tests {
                     proc_macro: None,
                 },
                 Planned {
+                    out_dir: None,
                     workspace_member: false,
                     name: "dependency".into(),
                     root: "/sources/dependency/src/lib.rs".into(),
@@ -937,6 +943,7 @@ mod tests {
 
     fn source_crate(name: &str, deps: Vec<(String, usize)>) -> Planned {
         Planned {
+            out_dir: None,
             workspace_member: false,
             name: name.into(),
             root: format!("/sources/{name}/src/lib.rs").into(),

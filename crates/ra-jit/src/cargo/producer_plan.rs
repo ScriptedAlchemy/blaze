@@ -220,8 +220,9 @@ impl Producers {
                 && let Some((out_dir, output)) = outputs.get(&unit.package)
             {
                 krate.cfg.extend(output.cfgs.clone());
-                krate.env.extend(output.env.clone());
+                krate.out_dir = Some(out_dir.clone());
                 krate.env.insert("OUT_DIR".into(), out_dir.display().to_string());
+                krate.env.extend(output.env.clone());
                 self.scripts.insert(unit.package.clone());
             }
         }
@@ -436,6 +437,7 @@ pub(crate) fn of(
         );
         set("CARGO_CRATE_NAME", target_data.name.replace('-', "_"));
         crates.push(Planned {
+            out_dir: None,
             workspace_member: data.is_member,
             proc_macro: None,
             name: target_data.name.replace('-', "_"),
@@ -563,6 +565,7 @@ mod tests {
         let crates = ["dep", "derive"]
             .into_iter()
             .map(|name| Planned {
+                out_dir: None,
                 workspace_member: false,
                 proc_macro: None,
                 name: name.into(),

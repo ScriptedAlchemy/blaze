@@ -214,8 +214,8 @@ pub(crate) fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
             .or_else(|| krate.root.parent())
             .context("producer source without a parent")?;
         roots.insert(package.to_owned());
-        if let Some(out) = krate.env.get("OUT_DIR") {
-            roots.insert(out.into());
+        if let Some(out) = &krate.out_dir {
+            roots.insert(out.clone());
         }
     }
     // Source std is part of an owned image, including local toolchain source edits.
@@ -385,6 +385,39 @@ mod tests {
             image_description(&second).unwrap(),
             image_description(&changed.to_string()).unwrap()
         );
+    }
+
+    #[test]
+    fn snapshots_bind_actual_output_trees_independently_of_out_dir_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("package");
+        let sysroot = dir.path().join("sysroot");
+        let out = dir.path().join("generated");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir_all(sysroot.join("lib/rustlib/src/rust/library")).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(package.join("lib.rs"), "pub fn f() {}").unwrap();
+        let mut source = Planned {
+            out_dir: None,
+            workspace_member: false,
+            name: "fixture".into(),
+            root: package.join("lib.rs"),
+            edition: "2021".into(),
+            cfg: Vec::new(),
+            codegen_flags: Vec::new(),
+            env: [("OUT_DIR".into(), dir.path().join("missing-marker").display().to_string())]
+                .into_iter()
+                .collect(),
+            deps: Vec::new(),
+            proc_macro: None,
+        };
+        snapshot(&sysroot, &[source.clone()]).unwrap();
+        source.out_dir = Some(out.clone());
+        std::fs::write(out.join("generated.rs"), "one").unwrap();
+        let before = snapshot(&sysroot, &[source.clone()]).unwrap();
+        std::fs::write(out.join("generated.rs"), "two").unwrap();
+        assert_ne!(before, snapshot(&sysroot, &[source]).unwrap());
     }
 
     #[cfg(unix)]

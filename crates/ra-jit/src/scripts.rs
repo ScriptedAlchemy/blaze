@@ -1412,6 +1412,7 @@ impl<'a> Runner<'a> {
             cfg.extend(ran.output.cfgs.iter().cloned());
         }
         Ok(crate::cargo::own_script::Planned {
+            out_dir: ran.map(|ran| ran.out_dir.clone()),
             workspace_member: data.is_member,
             name: name.to_owned(),
             root: root.to_owned(),
