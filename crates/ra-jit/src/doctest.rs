@@ -1444,6 +1444,7 @@ fn add_crates(
             proc_macro_cwd: data.proc_macro_cwd.clone(),
         };
         let extra = ExtraCrateData {
+            blaze_native_unit: library.extra_data(db).blaze_native_unit,
             version: None,
             display_name: Some(CrateDisplayName::from_canonical_name(&name)),
             potential_cfg_options: None,

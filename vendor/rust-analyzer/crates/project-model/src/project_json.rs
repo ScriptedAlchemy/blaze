@@ -175,6 +175,7 @@ impl ProjectJson {
                         cfg,
                         target: crate_data.target,
                         codegen_flags: crate_data.codegen_flags,
+                        blaze_native_unit: crate_data.blaze_native_unit,
                         env: crate_data.env,
                         invalid_env: crate_data.blaze_invalid_env,
                         crate_attrs: crate_data.crate_attrs,
@@ -271,6 +272,7 @@ pub struct Crate {
     pub(crate) cfg: Vec<CfgAtom>,
     pub(crate) target: Option<String>,
     pub(crate) codegen_flags: Vec<String>,
+    pub(crate) blaze_native_unit: Option<u32>,
     pub(crate) env: FxHashMap<String, String>,
     pub(crate) invalid_env: Vec<String>,
     // Extra crate-level attributes, without the surrounding `#![]`.
@@ -475,6 +477,8 @@ struct CrateData {
     target: Option<String>,
     #[serde(default)]
     codegen_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blaze_native_unit: Option<u32>,
     #[serde(default)]
     env: FxHashMap<String, String>,
     #[serde(default)]

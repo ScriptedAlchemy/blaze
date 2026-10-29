@@ -23,6 +23,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{Args, Program, RootDatabase};
 
+mod units;
+pub(crate) use units::{NativeUnit, for_crate as native_unit_for_crate, set_native_units};
+
 type Digest = [u8; 32];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Linked {

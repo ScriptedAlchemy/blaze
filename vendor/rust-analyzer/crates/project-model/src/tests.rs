@@ -237,6 +237,29 @@ fn compiler_project() -> serde_json::Value {
 }
 
 #[test]
+fn compiler_unit_identity_preserves_distinct_instances_of_the_same_source() {
+    let mut json = compiler_project();
+    let mut shared = json["crates"][2].clone();
+    shared["root_module"] = "common.rs".into();
+    json["crates"] = serde_json::Value::Array(
+        (0..3)
+            .map(|id| {
+                let mut krate = shared.clone();
+                krate["blaze_native_unit"] = id.into();
+                krate
+            })
+            .collect(),
+    );
+    let workspace = rust_project_workspace(serde_json::from_value(json).unwrap());
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let units: Vec<_> = graph.iter().map(|id| graph[id].extra.blaze_native_unit).collect();
+    assert_eq!(units, [Some(0), Some(1), Some(2)]);
+    let files: std::collections::HashSet<_> =
+        graph.iter().map(|id| graph[id].basic.root_file_id).collect();
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
 fn compiler_project_preserves_exact_cfg_env_and_target_kinds() {
     let mut json = compiler_project();
     // Compiler cfgs are already complete for this target. Loading the graph must
