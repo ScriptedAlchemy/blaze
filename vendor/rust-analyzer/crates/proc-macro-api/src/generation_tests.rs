@@ -324,7 +324,9 @@ fn native_twenty_distinct_dylibs_and_reload() {
             .with_snapshot_root(Some(snapshots.path().to_owned()));
     let mut handles = Vec::new();
     for index in 0..20 {
-        let path = paths::AbsPathBuf::assert_utf8(root.join(format!("libmacro{index}.dylib")));
+        let path = paths::AbsPathBuf::assert_utf8(
+            root.join(format!("libmacro{index}{}", std::env::consts::DLL_SUFFIX)),
+        );
         let macros = client.load_dylib(MacroDylib::new(path)).unwrap();
         assert_eq!(macros.len(), 1);
         assert_eq!(macros[0].name(), format!("macro{index}"));
@@ -375,10 +377,11 @@ fn native_twenty_distinct_dylibs_and_reload() {
             pids.len()
         );
         for pid in &pids {
-            let output = std::process::Command::new("top")
-                .args(["-l", "1", "-pid", pid, "-stats", "pid,command,mem"])
+            let output = std::process::Command::new("ps")
+                .args(["-p", pid, "-o", "pid=,rss=,comm="])
                 .output()
                 .unwrap();
+            assert!(output.status.success());
             println!("FOOTPRINT {label} {}", String::from_utf8_lossy(&output.stdout));
         }
         pids
@@ -386,7 +389,11 @@ fn native_twenty_distinct_dylibs_and_reload() {
     assert_eq!(measure("cold20").len(), 1);
     let first = handles[0].original_dylib_path.as_ref().clone();
     let original = std::fs::read(first.as_path()).unwrap();
-    std::fs::copy(root.join("libmacro0_v2.dylib"), first.as_path()).unwrap();
+    std::fs::copy(
+        root.join(format!("libmacro0_v2{}", std::env::consts::DLL_SUFFIX)),
+        first.as_path(),
+    )
+    .unwrap();
     let reloaded = client.load_dylib(MacroDylib::new(first.clone())).unwrap();
     assert_ne!(reloaded[0].content_identity(), handles[0].content_identity());
     assert_eq!(expand(&reloaded[0]), "20");

@@ -22,6 +22,38 @@ struct Snapshot {
     /// Keep the route by which source was read, even when both possible targets
     /// of a symlink already occur elsewhere in the input closure.
     bindings: BTreeMap<PathBuf, PathBuf>,
+    // Revisions detect writes/restores during compilation, but are not content
+    // identity: restoring the source later may reuse the original immutable image.
+    #[serde(skip)]
+    revisions: BTreeMap<PathBuf, (Revision, Option<Revision>)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Revision {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    native: (u64, u64, i64, i64),
+}
+
+impl Revision {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            native: {
+                use std::os::unix::fs::MetadataExt as _;
+                (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+            },
+        }
+    }
+}
+
+impl Snapshot {
+    fn same_content(&self, other: &Self) -> bool {
+        self.files == other.files && self.bindings == other.bindings
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,9 +72,15 @@ fn digest(path: &Path) -> Result<[u8; 32]> {
 }
 
 fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> Result<()> {
-    let metadata = std::fs::metadata(path)?;
+    let link = std::fs::symlink_metadata(path)?;
+    let (metadata, link) = if link.file_type().is_symlink() {
+        (std::fs::metadata(path)?, Some(Revision::of(&link)))
+    } else {
+        (link, None)
+    };
     let canonical = std::fs::canonicalize(path)?;
     inputs.bindings.insert(path.to_owned(), canonical.clone());
+    inputs.revisions.insert(path.to_owned(), (Revision::of(&metadata), link));
     if metadata.is_file() {
         inputs.files.insert(canonical, digest(path)?);
     } else if metadata.is_dir() {
@@ -136,7 +174,7 @@ pub(crate) fn link(
     if record.exists() {
         let kept: Record = serde_json::from_slice(&std::fs::read(&record)?)?;
         anyhow::ensure!(
-            kept.files == before
+            kept.files.same_content(&before)
                 && kept.library.starts_with(&generation)
                 && kept.outputs.contains_key(&kept.library)
                 && kept.outputs.len() == 4
@@ -255,6 +293,29 @@ mod tests {
             std::os::unix::fs::symlink(dir.path(), dir.path().join("cycle")).unwrap();
             assert!(walk(dir.path(), &mut Snapshot::default(), &mut BTreeSet::new()).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_source_bytes_keep_the_key_but_not_an_in_flight_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, b"FIRST").unwrap();
+        let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let capture = || {
+            let mut snapshot = Snapshot::default();
+            walk(dir.path(), &mut snapshot, &mut BTreeSet::new()).unwrap();
+            snapshot
+        };
+        let before = capture();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&file, b"OTHER").unwrap();
+        std::fs::write(&file, b"FIRST").unwrap();
+        File::options().write(true).open(&file).unwrap().set_modified(stamp).unwrap();
+        let after = capture();
+        assert!(before.same_content(&after));
+        assert_eq!(serde_json::to_vec(&before).unwrap(), serde_json::to_vec(&after).unwrap());
+        assert_ne!(before, after, "A-to-B-to-A writes must invalidate an in-flight build");
     }
 
     #[test]

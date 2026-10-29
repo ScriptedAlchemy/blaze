@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
@@ -44,7 +45,8 @@ def fixture(work):
     text = source.read_text().replace(
         "let suffix = macro_producer::suffix();",
         'let suffix = format!("{}:{}:{}", macro_producer::suffix(), SCRIPT, env!("SCRIPT_LABEL"));')
-    source.write_text('include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n' + text)
+    source.write_text(text.replace('use proc_macro::',
+        'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\nuse proc_macro::', 1))
     return root
 
 
@@ -68,18 +70,15 @@ def main():
     (work / "oracle.log").write_text(oracle.stdout + oracle.stderr)
     assert oracle.returncode == 0, f"oracle failed: {work / 'oracle.log'}"
     audit_log = work / "product-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log)))
-    for tool in norustc.COUNTED:
-        path = audit / "bin" / tool
-        if path.exists():
-            # Keep the production audit format, but never execute the compiler.
-            script = path.read_text()
-            path.write_text(re.sub(r"^exec .*", "exit 86", script, flags=re.M))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log), block=True))
     token = "c4-plain-" + secrets.token_hex(24)
+    # Keep socket paths within sockaddr_un's platform budget independently of
+    # the caller's evidence/build directory depth.
+    home = tempfile.mkdtemp(prefix="c4plain-")
     product = dict(env, PATH=str(audit / "bin") + os.pathsep + str(bins) + os.pathsep + env["PATH"],
         CARGO=str(audit / "bin/cargo"), RUSTC=str(audit / "bin/rustc"),
         RUSTDOC=str(audit / "bin/rustdoc"), RUSTUP_TOOLCHAIN=str(audit),
-        RA_JIT_BIN=str(bins / "ra-jit"), RA_JIT_HOME=str(work / "home"),
+        RA_JIT_BIN=str(bins / "ra-jit"), RA_JIT_HOME=home,
         RA_JIT_CACHE=str(work / "store"), RA_JIT_PROC_MACRO_SERVER=str(args.owned_server.resolve()),
         RA_JIT_MEMORY_MAX="16G", RA_JIT_OWN_BASE_MEMORY="12G", RA_JIT_SPARE="0",
         RA_JIT_RUN_ID="c4-plain-" + str(os.getpid()), CARGO_TARGET_DIR=str(root / "target"),
@@ -88,6 +87,7 @@ def main():
         homes=(product["RA_JIT_HOME"],), series=str(work / "watchdog.jsonl"))
     watchdog.start()
     result = dict(rows=[], server=str(args.owned_server.resolve()))
+    roots = [str(work), home]
     try:
         for step, command in [("build", ["build", "--locked", "-p", "app"]),
                               ("run", ["run", "--locked", "-p", "app"])]:
@@ -97,7 +97,7 @@ def main():
             began = time.monotonic()
             ran = subprocess.run(argv, cwd=root, env=product, capture_output=True, text=True)
             (work / (step + ".log")).write_text(ran.stdout + ran.stderr)
-            scan = crossmachine.token_scan([str(work)], token)
+            scan = crossmachine.token_scan(roots, token)
             executed = external_execs((work / (step + ".exec")).read_text()) if sys.platform == "linux" else []
             row = dict(step=step, returncode=ran.returncode, seconds=time.monotonic() - began,
                        token_scan=scan, calls=norustc.runs(str(audit_log)), external_execs=executed)
@@ -112,14 +112,15 @@ def main():
             if not row["right"]:
                 break
     finally:
-        result["before_stop"] = crossmachine.token_scan([str(work)], token)
+        result["before_stop"] = crossmachine.token_scan(roots, token)
         subprocess.run([str(bins / "ra-jit"), "cargo", "stop"], cwd=root, env=product,
                        capture_output=True)
-        result["after_stop"] = crossmachine.token_scan([str(work)], token)
+        result["after_stop"] = crossmachine.token_scan(roots, token)
         watchdog.stop.set()
         watchdog.join(timeout=10)
         result["watchdog"] = watchdog.tripped
         (work / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        shutil.rmtree(home)
     scans = [result["before_stop"], result["after_stop"]]
     passed = (len(result["rows"]) == 2 and all(row["right"] for row in result["rows"])
               and not result["watchdog"] and all(not s["hits"] and not s["errors"] for s in scans))

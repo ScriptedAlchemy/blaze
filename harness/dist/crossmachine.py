@@ -607,10 +607,11 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
         output.write(text)
     env = machine.env(bin_dir, os.path.join(machine.top, "macro-store"), daemon_home("pm", "a"),
                       FIXTURES["macros"].get("env"))
+    env.pop("RA_JIT_PROC_MACRO_CACHE_SKIP", None)
     token = "c4-witness-" + secrets.token_hex(24)
     env["C4_PLANTED_TOKEN"] = token
     audit_log = os.path.join(work, "product-tools.log")
-    audit_bin = norustc.stand_ins(os.path.join(work, "product-audit"), audit_log)
+    audit_bin = norustc.stand_ins(os.path.join(work, "product-audit"), audit_log, block=True)
     env["PATH"] = os.path.join(audit_bin, "bin") + os.pathsep + env["PATH"]
     for variable, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc"), ("CARGO", "cargo")):
         env[variable] = os.path.join(audit_bin, "bin", tool)

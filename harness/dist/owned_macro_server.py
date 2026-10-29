@@ -2,9 +2,8 @@
 """Build the matching proc-macro server executable through blaze, for source_macro.py.
 
 The server's executable is compiled and linked by blaze, including source proc_macro.
-Its own bootstrap macro expansions still use the existing compile-time-deps handoff.
-Record every bootstrap compiler/Cargo call, without hiding compilation lines. This is
-not a strict no-rustc bootstrap gate. Never use the toolchain server as the owned server.
+Block every bootstrap compiler/Cargo call, without hiding compilation lines.
+Never use the toolchain server as the owned server.
 Run under the heavy lock and memory watchdog.
 """
 import argparse
@@ -34,7 +33,7 @@ def main():
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     log = work / "bootstrap-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(log)))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(log), block=True))
     env = {**os.environ, "PATH": str(audit / "bin") + os.pathsep + os.environ["PATH"],
            "RUSTUP_TOOLCHAIN": str(audit), "RUSTC": str(audit / "bin" / "rustc"),
            "CARGO": str(audit / "bin" / "cargo"), "RA_JIT_STD_FROM": "off",
@@ -62,8 +61,10 @@ def main():
     check = subprocess.run([str(executable), "--version"], capture_output=True, text=True,
                            env={**env, "RUST_ANALYZER_INTERNALS_DO_NOT_USE": "1"})
     assert check.returncode == 0, check.stderr
-    print(f"{executable}: {check.stdout.strip()}; {len(calls)} counted bootstrap calls "
-          "(retained, NOT a strict gate pass)")
+    calls = norustc.runs(str(log))
+    (work / "bootstrap-audit.json").write_text(json.dumps(calls, indent=2) + "\n")
+    assert not calls, f"bootstrap attempted blocked compiler/Cargo calls: {calls}"
+    print(f"{executable}: {check.stdout.strip()}; zero compiler/Cargo bootstrap calls")
 
 
 if __name__ == "__main__":

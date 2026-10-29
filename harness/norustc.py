@@ -94,7 +94,7 @@ def real_toolchain():
     return run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
 
 
-def stand_ins(work, log, run_id_env=RUN_ID_ENV):
+def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):
     """A copy of the pinned toolchain at `work/toolchain` whose rustc, rustdoc and cargo are
     stand-ins that append a line to `log` for each run and then run the real tool, which keeps
     the pid. Every other program of the toolchain is linked, and its libraries are copied, so
@@ -108,7 +108,8 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
     sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
     marker = os.path.join(toolchain, ".stand-in-log")
-    if os.path.exists(marker) and open(marker).read().strip() == log:
+    marker_text = log + ("\nblocked" if block else "")
+    if os.path.exists(marker) and open(marker).read().strip() == marker_text:
         return toolchain  # made for this log already: every blaze run of the work directory shares it
     if os.path.exists(toolchain):
         shutil.rmtree(toolchain)
@@ -130,8 +131,9 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
             continue
         shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
-            out.write(STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
-                                      run_id_env=run_id_env))
+            script = STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+                                    run_id_env=run_id_env)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
         os.chmod(copy, 0o755)
     # rustup is outside the toolchain's bin directory. Audit its query/discovery
     # processes too; no row is allowed to hide them by calling them noncompiling.
@@ -139,12 +141,13 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
     if rustup and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
         copy = os.path.join(toolchain, "bin", "rustup")
         with open(copy, "w") as out:
-            out.write(STAND_IN.format(tool="rustup", log=shlex.quote(log),
-                                      real=shlex.quote(os.path.realpath(rustup)),
-                                      run_id_env=run_id_env))
+            script = STAND_IN.format(tool="rustup", log=shlex.quote(log),
+                                    real=shlex.quote(os.path.realpath(rustup)),
+                                    run_id_env=run_id_env)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
         os.chmod(copy, 0o755)
     with open(marker, "w") as f:
-        f.write(log + "\n")
+        f.write(marker_text + "\n")
     return toolchain
 
 

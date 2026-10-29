@@ -142,6 +142,12 @@ def main():
             cases.append((f"{name}-{edition}", source, "probe", ["--edition=" + edition], True))
     for name in ("_", "0probe", "type", "caf\u00e9"):
         cases.append(("name-" + name, "", name, [], True))
+    for name, flags in (
+        ("link-arg", ["-C", "link-arg=-fuse-ld=mold"]),
+        ("link-args", ["-Clink-args=-lfirst -lsecond"]),
+        ("linker", ["-Clinker=nonexistent-linker"]),
+    ):
+        cases.append((name, "", "probe", flags, True))
     for name, source in (
         ("no-std-args", "#![no_std(unexpected)]"),
         ("no-std-value", '#![no_std = "oops"]'),

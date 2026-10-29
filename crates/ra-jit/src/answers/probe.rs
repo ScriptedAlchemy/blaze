@@ -109,7 +109,15 @@ fn parse(args: &[OsString]) -> Result<Probe> {
         );
         // Query answers intentionally ignore many codegen values which do not
         // affect cfg. They are not validation for compilation or output naming.
-        anyhow::ensure!(probe.flags.is_empty(), "unsupported LLVM IR probe codegen options");
+        anyhow::ensure!(
+            probe.flags.iter().all(|flag| {
+                matches!(
+                    flag.strip_prefix("-C").and_then(|it| it.split_once('=')),
+                    Some(("link-arg" | "link-args" | "linker", _))
+                )
+            }),
+            "unsupported LLVM IR probe codegen options"
+        );
     }
     Ok(probe)
 }
@@ -356,6 +364,12 @@ mod tests {
             let mut args = base.to_vec();
             args.push(extra.into());
             assert!(parse(&args).is_err(), "{extra}");
+        }
+        for flag in ["-Clink-arg=-fuse-ld=mold", "-Clink-args=-lfirst -lsecond", "-Clinker=absent"]
+        {
+            let mut args = base.to_vec();
+            args.push(flag.into());
+            assert!(parse(&args).is_ok(), "link-only options do not affect IR: {flag}");
         }
         for args in [
             vec!["--emit=llvm-ir", "-"],
