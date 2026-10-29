@@ -245,6 +245,21 @@ impl Snapshot {
         bytes: &[u8],
         store: &Path,
     ) -> anyhow::Result<(Self, SourcePath)> {
+        let name = self.unused_name(stem)?;
+        Ok((self.with_file(&name, bytes, store)?, name))
+    }
+
+    /// Mount a captured tree without reserving a name from user source files.
+    pub fn with_unique_mount(
+        self,
+        stem: &str,
+        mounted: Snapshot,
+    ) -> anyhow::Result<(Self, SourcePath)> {
+        let name = self.unused_name(stem)?;
+        Ok((self.with_mount(&name, mounted)?, name))
+    }
+
+    fn unused_name(&self, stem: &str) -> anyhow::Result<SourcePath> {
         let first = SourcePath::new(stem.to_owned())?;
         ensure!(
             first.to_native()?.components().count() == 1,
@@ -258,7 +273,7 @@ impl Snapshot {
                 format!("{stem}.{index}")
             })?;
             if !self.entries.iter().any(|entry| entry.0 == name) {
-                return Ok((self.with_file(&name, bytes, store)?, name));
+                return Ok(name);
             }
             index = index.checked_add(1).context("snapshot metadata filename space exhausted")?;
         }
@@ -290,6 +305,38 @@ impl Snapshot {
         let bytes = blaze_wire::encode(&snapshot);
         parse(&bytes)?;
         put(store, &bytes)?;
+        Ok(snapshot)
+    }
+
+    /// Place the captured tree `mounted` at the directory `at`, which holds nothing else.
+    /// The result addresses its files below `at`, whatever the mounted tree's original
+    /// root was, so the snapshot does not name where that root lived. Links of `mounted`
+    /// were checked to stay inside it, and still do.
+    pub fn with_mount(self, at: &SourcePath, mounted: Snapshot) -> anyhow::Result<Self> {
+        self.check()?;
+        mounted.check()?;
+        let prefix = at.to_native()?;
+        ensure!(prefix != Path::new("."), "a mount cannot replace the snapshot root");
+        let mut entries: BTreeMap<_, _> =
+            self.entries.into_iter().map(|entry| (entry.0.clone(), entry)).collect();
+        for parent in prefix.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+            let logical = SourcePath::from_native(parent)?;
+            if let Some(entry) = entries.get(&logical) {
+                ensure!(
+                    entry.1 == 1 && parent != prefix,
+                    "mount point {} is already in the snapshot",
+                    parent.display()
+                );
+            } else {
+                entries.insert(logical.clone(), Entry(logical, 1, 0, [0; 32]));
+            }
+        }
+        for Entry(logical, kind, mode, digest) in mounted.entries {
+            let moved = SourcePath::from_native(&prefix.join(logical.to_native()?))?;
+            entries.insert(moved.clone(), Entry(moved, kind, mode, digest));
+        }
+        let snapshot = Self { entries: entries.into_values().collect() };
+        snapshot.check()?;
         Ok(snapshot)
     }
 

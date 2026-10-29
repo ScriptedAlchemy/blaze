@@ -505,7 +505,7 @@ impl Locked {
         }
         let mut context = blaze_registry::Context::new(
             ctx.config.home().to_owned(),
-            blaze_registry::http::HyperHttp::shared()?,
+            Arc::new(blaze_registry::http::LazyHttp::default()),
         );
         context.net.offline = offline;
         context.store = asked.store.clone();

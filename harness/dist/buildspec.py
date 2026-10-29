@@ -24,9 +24,12 @@ prints one JSON object {refused, digests{spec,platform,front_end,config,job_cont
 {command,asked,units}, spec, platform} and exits 0 (a spec), 2 (refused: the object is still
 printed) or 1 (any other error: a message on stderr); with `--unit-graph` it prints blaze's unit
 graph in the shape of `cargo build --unit-graph -Z unstable-options`; `--out` writes the spec's
-canonical CBOR. `ra-jit cargo spec --run FILE` derives the flags and the environment from the spec
-alone, recomputes the spec, refuses (exit 2, `blaze: the tree does not match the spec: <field>`)
-when its digest differs and otherwise does what `ra-jit cargo <command>` does.
+canonical CBOR and keeps the source it was made from beside it, in `FILE.inputs`. `ra-jit cargo spec
+--run FILE` derives the flags and the environment from the spec alone, restores that source into a
+directory of its own, recomputes the spec there and runs it: the checkout it is run from, and
+whether that checkout still exists, make no difference. A command or unit kind the owned executor
+does not run yet is a refusal that names it (`owned BuildSpec replay does not yet ...`), not a
+mismatch. Any such refusal fails the required local arm.
 
 The arms:
 
@@ -48,7 +51,10 @@ The arms:
                 are `RunSpec.doc`).
   local (9)     `ra-jit cargo <command>` in a fresh copy of the fixture, and `ra-jit cargo spec --run
                 <spec.cbor>` in another fresh copy of the same commit (with none of the case's
-                environment: the spec alone), each with a fresh CARGO_TARGET_DIR and RA_JIT_HOME:
+                environment: the spec alone), each with a fresh CARGO_TARGET_DIR and RA_JIT_HOME.
+                The spec is also run from the checkout of another commit, and has to do exactly what
+                it did from its own: the saved source decides, not the checkout.
+                What the two runs share:
                 the programs built, the tests run, the doc tests run, what the programs and the
                 custom harness printed, and the exit status have to be equal. Both runs are under
                 tracedecay.py's memory guard (RA_JIT_MEMORY_MAX=16G, RA_JIT_OWN_BASE_MEMORY=12G,
@@ -1058,7 +1064,7 @@ def nested_cases():
              expect="base", cwd="one", compare_source=True, local=True,
              lexpect=[("test", "workspace_one", "ok"), ("no-test", "workspace_two"), ("exit", 0)]),
         Case("sibling", "test", "the same Git commit, package names and lockfile select different source in the sibling workspace",
-             expect="changed", cwd="two", compare_source=True, local=True,
+             expect="changed", cwd="two", compare_source=True, local=True, touches=["source"],
              also=[("job-differs", "base"), ("platform-same", "base")],
              lexpect=[("test", "workspace_two", "ok"), ("no-test", "workspace_one"), ("exit", 0)]),
         Case("below-sibling", "test", "a directory below the sibling workspace must be replayed below that workspace",
@@ -1867,9 +1873,9 @@ class Ctx:
                     out["diffs"].append("the compiler changed during the local gate")
         if out["status"] != "match":
             return out
-        if rb.code == 2 and "does not match the spec" in rb.out:
+        if rb.code != 0 and re.search(r"does not match the (spec|BuildSpec)", rb.out):
             out["status"] = "MISMATCH"
-            out["diffs"].append("the spec run refused its own tree: " + clip(rb.out.strip().splitlines()[-1], 200))
+            out["diffs"].append("the spec run refused its own source: " + clip(rb.out.strip().splitlines()[-1], 200))
             return out
         for part, a, b in compare_summaries(sa, sb):
             out["diffs"].append(f"{part}: command {clip(a, 200)} / spec run {clip(b, 200)}")
@@ -2857,8 +2863,12 @@ def main():
         words = list(saved["words"])
         if BUG == "spec-run-drops-no-run":
             words = [w for w in words if w != "--no-run"]
-        checkout = saved["checkout"]
-        cwd = os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"])
+        # The saved source, not the checkout this runs from, is what is replayed.
+        checkout = rest[2] + ".inputs"
+        if BUG == "run-in-checkout":
+            checkout = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+        cwd = os.path.realpath(os.path.join(checkout, saved["spec"]["9"] if BUG == "replay-git-root" else saved["cwd"]))
+        os.chdir(cwd)
         try:
             res = resolve(cwd, words, env)
         except Refused as r:
@@ -2906,6 +2916,9 @@ def main():
             print(json.dumps({"refused": {"what": r.what, "why": r.why}, "digests": None, "summary": None, "spec": None, "platform": None}))
             return 2
         if out:
+            here = subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode().strip()
+            shutil.rmtree(out + ".inputs", ignore_errors=True)
+            shutil.copytree(here, out + ".inputs", symlinks=True)
             with open(out, "w") as f:
                 # As with saved words/environment, this auxiliary path models reproduction in
                 # the test double; it does not assert that the current wire has this information.
@@ -3319,6 +3332,7 @@ def self_test(args):
                 ("dirty-source-refused", ["source/dirty-body"], False, "a spec was wanted"),
                 ("sibling-source-same", ["nested/sibling"], False, "wanted a different spec"),
                 ("replay-git-root", ["nested/base"], True, "spec run"),
+                ("run-in-checkout", ["envcfg"], True, "foreign checkout changed"),
                 ("spec-run-drops-no-run", ["basic/no-run"], True, "spec run"),
                 ("unit-features", ["basic/base"], False, "features")]
         for bug, only, local, wanted in bugs:

@@ -28,6 +28,7 @@ use crate::{
 
 const SOURCES: &str = ".blaze-sources.cbor";
 const FACTS: &str = ".blaze-resolver-facts.cbor";
+const CARGO_HOME: &str = ".blaze-cargo-home";
 
 /// The inputs that have passed source, request, graph, toolchain and platform validation.
 pub struct Prepared {
@@ -146,8 +147,22 @@ impl Wire for Record {
     }
 }
 
-fn relative(root: &Path, path: &Path) -> anyhow::Result<SourcePath> {
+fn anchor(root: &Path, path: &Path) -> PathBuf {
     let path = blaze_manifest::paths::normalize_path(path);
+    if path.starts_with(root) {
+        return path;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(parent) = parent.canonicalize()
+        && parent.join(name).starts_with(root)
+    {
+        return parent.join(name);
+    }
+    path
+}
+
+fn relative(root: &Path, path: &Path) -> anyhow::Result<SourcePath> {
+    let path = anchor(root, path);
     let path = path.strip_prefix(root).with_context(|| {
         format!("{} is outside the captured source layout {}", path.display(), root.display())
     })?;
@@ -180,7 +195,7 @@ fn record_path(spec: &BuildSpec, store: &Path) -> PathBuf {
 fn config_files(
     words: &[String],
     cwd: &Path,
-    root: &Path,
+    place: &impl Fn(&Path) -> anyhow::Result<SourcePath>,
     inputs: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<Vec<ConfigFile>> {
     let mut files = Vec::new();
@@ -204,8 +219,7 @@ fn config_files(
                     if inputs.iter().any(|(input, _)| {
                         input.canonicalize().unwrap_or_else(|_| input.clone()) == canonical
                     }) {
-                        files
-                            .push(ConfigFile { argument: at as u32, path: relative(root, &path)? });
+                        files.push(ConfigFile { argument: at as u32, path: place(&path)? });
                     }
                 }
             }
@@ -257,8 +271,20 @@ pub fn capture(
     trees.dedup();
     let mut layout = trees.clone();
     layout.extend(first.inputs.iter().filter_map(|(path, _)| path.parent().map(Path::to_owned)));
-    let root =
-        common_root(layout.into_iter().map(|path| blaze_manifest::paths::normalize_path(&path)))?;
+    let canonical = |path: &Path| {
+        let path = blaze_manifest::paths::normalize_path(path);
+        path.canonicalize().unwrap_or(path)
+    };
+    let home_dir = canonical(&home);
+    let workspace_dir = canonical(&first.graph.root);
+    let mounted = !workspace_dir.starts_with(&home_dir) && !home_dir.starts_with(&workspace_dir);
+    let in_home = |path: &Path| mounted && anchor(&home_dir, path).starts_with(&home_dir);
+    let root = common_root(
+        layout
+            .into_iter()
+            .map(|path| canonical(&path))
+            .filter(|path| !(mounted && path.starts_with(&home_dir))),
+    )?;
     let captured_ctx = Context {
         source_root: Some(&root),
         config_root: ctx.config_root,
@@ -282,22 +308,51 @@ pub fn capture(
         &first.facts,
     )?;
     resolved.inputs.extend(first.inputs);
-    let config_files = config_files(words, ctx.cwd, &root, &resolved.inputs)?;
+    let mut excluded = resolved.outputs;
+    excluded.extend_from_slice(outputs);
+    excluded.push(store.to_owned());
+    let (home_trees, trees): (Vec<_>, Vec<_>) = trees.iter().partition(|path| in_home(path));
+    let (home_inputs, inputs): (Vec<_>, Vec<_>) =
+        resolved.inputs.iter().partition(|(path, _)| in_home(path));
+    let trees: Vec<_> = trees.iter().map(|path| anchor(&root, path)).collect();
+    let inputs: Vec<_> =
+        inputs.iter().map(|(path, bytes)| (anchor(&root, path), bytes.clone())).collect();
+    let mut snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &inputs, store)?;
+    let home_mount = if !home_trees.is_empty() || !home_inputs.is_empty() {
+        let trees: Vec<_> = home_trees.iter().map(|path| anchor(&home_dir, path)).collect();
+        let inputs: Vec<_> = home_inputs
+            .iter()
+            .map(|(path, bytes)| (anchor(&home_dir, path), bytes.clone()))
+            .collect();
+        let held = Snapshot::capture_selected(&home_dir, &trees, &excluded, &inputs, store)?;
+        let (mounted, at) = snapshot.with_unique_mount(CARGO_HOME, held)?;
+        snapshot = mounted;
+        Some(at)
+    } else {
+        None
+    };
+    let place = |path: &Path| -> anyhow::Result<SourcePath> {
+        if in_home(path) {
+            let inside = anchor(&home_dir, path);
+            let inside = inside.strip_prefix(&home_dir)?;
+            let mount = home_mount.as_ref().context("captured Cargo home has no mount")?;
+            Ok(SourcePath::from_native(&mount.to_native()?.join(inside))?)
+        } else {
+            relative(&root, path)
+        }
+    };
+    let config_files = config_files(words, ctx.cwd, &place, &resolved.inputs)?;
     let mut sources: Vec<_> = resolved
         .sources
         .iter()
         .map(|source| {
             Ok((
                 (source.source.clone(), source.name.clone(), source.version.clone()),
-                relative(&root, &source.root)?,
+                place(&source.root)?,
             ))
         })
         .collect::<anyhow::Result<_>>()?;
     sources.sort();
-    let mut excluded = resolved.outputs;
-    excluded.extend_from_slice(outputs);
-    excluded.push(store.to_owned());
-    let snapshot = Snapshot::capture_selected(&root, &trees, &excluded, &resolved.inputs, store)?;
     let (snapshot, sources_path) =
         snapshot.with_unique_file(SOURCES, &blaze_wire::encode(&(1_u32, sources)), store)?;
     let (snapshot, facts_path) = snapshot.with_unique_file(
@@ -319,18 +374,23 @@ pub fn capture(
         .collect();
     let record = Record {
         recipe: ReplayRecipe::capture(&made.build, subcommand, words, &recipe_env, &config_files)?,
-        manifest: relative(&root, &resolved.manifest)?,
+        manifest: place(&resolved.manifest)?,
         // An empty external Cargo home is not a source input and must not make the
         // source root depend on the absolute spelling of a checkout's location.
-        cargo_home: resolved
-            .inputs
-            .iter()
-            .any(|(path, _)| {
-                let path = blaze_manifest::paths::normalize_path(path);
-                path == home.join("config") || path == home.join("config.toml")
-            })
-            .then(|| relative(&root, &home))
-            .transpose()?,
+        cargo_home: if home_mount.is_some() {
+            home_mount.clone()
+        } else {
+            resolved
+                .inputs
+                .iter()
+                .any(|(path, _)| {
+                    let path = anchor(&root, path);
+                    path == anchor(&root, &home).join("config")
+                        || path == anchor(&root, &home).join("config.toml")
+                })
+                .then(|| relative(&root, &home))
+                .transpose()?
+        },
         platform: made.platform.clone(),
         sources: sources_path,
         facts: facts_path,

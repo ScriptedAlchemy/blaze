@@ -658,3 +658,160 @@ fn source_owned_replay_metadata_names_are_preserved_without_reservation() {
     }
     prepared.validate_sources(store.path()).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn another_name_for_a_directory_above_the_inputs_does_not_widen_the_layout() {
+    // As macOS's `/var` and `/private/var` do: the Cargo home is spelled through a link
+    // in an unrelated directory, the workspace by its real name.
+    let real = tempfile::tempdir().unwrap();
+    let real_root = real.path().canonicalize().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let alias = elsewhere.path().join("alias");
+    std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+    std::fs::create_dir_all(real_root.join("home")).unwrap();
+    std::fs::write(real_root.join("home/config.toml"), "[env]\nFROM_HOME='yes'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&real_root).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert("CARGO_HOME".to_owned(), alias.join("home").display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_HOME"));
+    assert_eq!(
+        made.build.workspace_manifest.to_native().unwrap(),
+        Path::new("Cargo.toml"),
+        "the layout root is the workspace, however the Cargo home beside it is spelled"
+    );
+    drop(f);
+    drop(real);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert_eq!(replay.execution_environment().unwrap()["FROM_HOME"], "yes");
+}
+
+/// One project captured with its Cargo home at `home` under `base`, and the workspace at
+/// `workspace`, both below `base`.
+fn captured_at(base: &Path, workspace: &str, home: &str) -> Spec {
+    let parent = base.join(workspace);
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(base.join(home)).unwrap();
+    std::fs::write(base.join(home).join("config.toml"), "[env]\nFROM_HOME='yes'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&parent).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    env.insert(
+        "CARGO_HOME".to_owned(),
+        base.join(home).canonicalize().unwrap().display().to_string(),
+    );
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap()
+}
+
+#[test]
+fn identity_does_not_depend_on_where_the_sources_and_cargo_home_are() {
+    let one = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let here = captured_at(&one.path().canonicalize().unwrap(), "work", "home");
+    // Deeper, and the Cargo home somewhere else under the same base.
+    let there =
+        captured_at(&other.path().canonicalize().unwrap(), "users/someone/code", "opt/cargo");
+    assert_eq!(here.build, there.build);
+    assert_eq!(here.digest, there.digest);
+}
+
+#[test]
+fn configuration_above_the_original_root_is_captured_and_replayed() {
+    let base = tempfile::tempdir().unwrap();
+    let base_root = base.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base_root.join(".cargo")).unwrap();
+    std::fs::write(base_root.join(".cargo/config.toml"), "[env]\nFROM_ABOVE='parent'\n").unwrap();
+    let f = Fixture { dir: tempfile::tempdir_in(&base_root).unwrap() };
+    f.write("Cargo.toml", "[package]\nname='saved'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# a lock file\nversion = 4\n\n[[package]]\nname = \"saved\"\nversion = \"0.1.0\"\n",
+    );
+    let mut env = f.env();
+    // The requester's own config walk reaches the file above the workspace.
+    env.insert("__CARGO_TEST_ROOT".to_owned(), base_root.display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.build.config_env.iter().any(|(name, _)| name == "FROM_ABOVE"));
+    drop(f);
+    drop(base);
+    assert!(!base_root.exists());
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert_eq!(replay.execution_environment().unwrap()["FROM_ABOVE"], "parent");
+}
+
+#[test]
+fn mounted_cargo_home_never_reserves_source_authored_names() {
+    let f = fixture();
+    f.write(".blaze-cargo-home", "user-owned home name");
+    f.write(".blaze-cargo-home.1", "user-owned numbered home name");
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[env]\nMOUNTED='yes'\n").unwrap();
+    let mut env = f.env();
+    env.insert("CARGO_HOME".to_owned(), home.path().canonicalize().unwrap().display().to_string());
+    let root = f.root();
+    let host = host(false);
+    let store = tempfile::tempdir().unwrap();
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    drop(f);
+    drop(home);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(
+        std::fs::read(replay.cwd.join(".blaze-cargo-home")).unwrap(),
+        b"user-owned home name"
+    );
+    assert_eq!(
+        std::fs::read(replay.cwd.join(".blaze-cargo-home.1")).unwrap(),
+        b"user-owned numbered home name"
+    );
+    assert_eq!(replay.execution_environment().unwrap()["MOUNTED"], "yes");
+    assert_eq!(
+        Path::new(&replay.environment["CARGO_HOME"]).file_name().unwrap(),
+        ".blaze-cargo-home.2"
+    );
+    replay.validate_sources(store.path()).unwrap();
+}
+
+#[test]
+fn unrecorded_worker_cargo_home_configuration_cannot_enter_replay() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    drop(f);
+    let worker = tempfile::tempdir().unwrap();
+    std::fs::create_dir(worker.path().join("resolution-home")).unwrap();
+    std::fs::write(worker.path().join("resolution-home/config.toml"), "[poisoned worker config")
+        .unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+}

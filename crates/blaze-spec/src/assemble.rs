@@ -445,18 +445,30 @@ fn assemble_with_inputs(
         let normalized_manifest =
             blaze_manifest::paths::normalize_path(opened.workspace.root_manifest());
         let normalized_source = blaze_manifest::paths::normalize_path(source_root);
-        let relative_manifest =
-            normalized_manifest.strip_prefix(&normalized_source).map_err(|_| {
-                Refusal::new(
-                    "workspace manifest outside source root",
-                    format!(
-                        "{} is not contained in {}",
-                        normalized_manifest.display(),
-                        normalized_source.display()
-                    ),
-                )
-            })?;
-        let workspace_manifest = blaze_wire::SourcePath::from_native(relative_manifest)
+        // The root may be spelled by its canonical name where the manifest is not (macOS's
+        // `/var` and `/private/var`): the same directory, so compare by the canonical names
+        // when the names as written do not nest.
+        let relative_manifest = match normalized_manifest.strip_prefix(&normalized_source) {
+            Ok(relative) => relative.to_owned(),
+            Err(_) => normalized_manifest
+                .canonicalize()
+                .ok()
+                .zip(normalized_source.canonicalize().ok())
+                .and_then(|(manifest, source)| {
+                    manifest.strip_prefix(&source).ok().map(Path::to_owned)
+                })
+                .ok_or_else(|| {
+                    Refusal::new(
+                        "workspace manifest outside source root",
+                        format!(
+                            "{} is not contained in {}",
+                            normalized_manifest.display(),
+                            normalized_source.display()
+                        ),
+                    )
+                })?,
+        };
+        let workspace_manifest = blaze_wire::SourcePath::from_native(&relative_manifest)
             .map_err(|error| Refusal::new("workspace manifest", error.to_string()))?;
         let lock: Digest = Sha256::digest(&graph.lock).into();
         let toolchain = ctx.toolchain;
