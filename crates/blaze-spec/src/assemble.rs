@@ -74,6 +74,9 @@ pub struct Context<'a> {
     /// Materialized root of `source` (Git repository root, or the Root snapshot).
     /// Git requires Some; only an intentionally workspace-rooted Root snapshot permits None.
     pub source_root: Option<&'a Path>,
+    /// Ancestor configuration boundary for authenticated replay. None preserves
+    /// normal Cargo discovery while capturing an original request.
+    pub config_root: Option<&'a Path>,
     /// The directory the command was run in, absolute.
     pub cwd: &'a Path,
     /// The requester's environment, all of it: what is refused, carried or ignored is decided
@@ -229,7 +232,7 @@ fn resolve_with_platform(
         profile: request.profile.as_deref(),
     };
     let (graph, mut inputs, sources) =
-        units::unit_graph_captured(&wanted, sources).map_err(|error| {
+        units::unit_graph_captured(&wanted, sources, ctx.config_root).map_err(|error| {
             Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}"))
         })?;
     let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
@@ -310,6 +313,11 @@ impl Opened<'_> {
             None => Config::load(ctx.cwd, ctx.env.clone(), &[]),
         }
         .map_err(|error| rejected("the configuration", error))?;
+        if let Some(root) = ctx.config_root {
+            config = config
+                .with_discovery_root(root)
+                .map_err(|error| rejected("the configuration root", error))?;
+        }
         config
             .start(command.name(), &request.config)
             .map_err(|error| rejected("--config", error))?;

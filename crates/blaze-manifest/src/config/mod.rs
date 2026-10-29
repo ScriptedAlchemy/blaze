@@ -250,6 +250,7 @@ pub fn env_key(key: &str) -> String {
 pub struct Config {
     cwd: PathBuf,
     home: PathBuf,
+    discovery_root: Option<PathBuf>,
     env: BTreeMap<String, String>,
     cli: Vec<String>,
     /// The files are read at the first value asked for, and again at the next while they fail:
@@ -286,6 +287,7 @@ impl Config {
         let mut config = Config {
             cwd: cwd.to_path_buf(),
             home,
+            discovery_root: None,
             env,
             cli: Vec::new(),
             values: OnceCell::new(),
@@ -296,6 +298,22 @@ impl Config {
         };
         config.merge_cli_args(cli)?;
         Ok(config)
+    }
+
+    /// Restrict ancestor discovery to an authenticated materialized source tree.
+    /// Original requests retain Cargo's normal discovery; replay must not inherit
+    /// configuration from directories above its worker-selected destination.
+    pub fn with_discovery_root(mut self, root: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.cwd.starts_with(root),
+            "configuration cwd is outside its discovery root"
+        );
+        anyhow::ensure!(
+            self.values.get().is_none() && self.cli.is_empty(),
+            "configuration discovery has already started"
+        );
+        self.discovery_root = Some(root.to_owned());
+        Ok(self)
     }
 
     /// Configuration source bytes used by this invocation, including included files.
@@ -377,8 +395,9 @@ impl Config {
         mut walk: impl FnMut(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let mut seen_dir = FxHashSet::default();
-        let stop = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
-        for current in paths::ancestors(pwd, stop.as_deref()) {
+        let test_root = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
+        let stop = self.discovery_root.as_deref().or(test_root.as_deref());
+        for current in paths::ancestors(pwd, stop) {
             let config_root = current.join(".cargo");
             if let Some(path) = self.get_file_path(&config_root, "config") {
                 walk(&path)?;

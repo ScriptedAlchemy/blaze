@@ -215,6 +215,7 @@ pub fn capture(
         common_root(layout.into_iter().map(|path| blaze_manifest::paths::normalize_path(&path)))?;
     let captured_ctx = Context {
         source_root: Some(&root),
+        config_root: ctx.config_root,
         source: SourceRef::Root(RootRef { root: [0; 32] }),
         cwd: ctx.cwd,
         env: ctx.env,
@@ -395,6 +396,7 @@ fn prepare_record(
     let env = environment::text_view(&native)?;
     let ctx = Context {
         source_root: Some(&root),
+        config_root: Some(&root),
         cwd: &cwd,
         env: &env,
         native_env: Some(&native),

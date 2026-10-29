@@ -76,6 +76,31 @@ fn dirty_inputs_survive_origin_removal_and_are_used_by_the_execution_plan() {
 }
 
 #[test]
+fn worker_ancestor_configuration_cannot_enter_a_saved_replay() {
+    let f = fixture();
+    f.write(".cargo/config.toml", "[env]\nMESSAGE='captured'\n");
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Run, &[], store.path());
+    let worker = tempfile::tempdir().unwrap();
+    std::fs::create_dir(worker.path().join(".cargo")).unwrap();
+    std::fs::write(
+        worker.path().join(".cargo/config.toml"),
+        "[build]\ntarget='hostile-worker-target'\n[env]\nMESSAGE={value='worker',force=true}\n",
+    )
+    .unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    assert_eq!(replay.execution_environment().unwrap()["MESSAGE"], "captured");
+    let plans = blaze_spec::execution::programs(
+        &replay,
+        Path::new("/toolchain"),
+        &worker.path().join("artifacts"),
+    )
+    .unwrap();
+    assert_eq!(plans[0].project["crates"][0]["env"]["MESSAGE"], "captured");
+}
+
+#[test]
 fn git_bundle_replays_sibling_packages_without_origin_or_cargo_home() {
     let directory = tempfile::tempdir().unwrap();
     let f = Fixture { dir: tempfile::tempdir_in(directory.path()).unwrap() };

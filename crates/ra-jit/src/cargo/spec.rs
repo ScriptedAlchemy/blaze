@@ -122,6 +122,7 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
     let ctx = Context {
         native_env: Some(&native_env),
         source_root: None,
+        config_root: None,
         cwd: &cwd,
         env: &env,
         host: &host,
