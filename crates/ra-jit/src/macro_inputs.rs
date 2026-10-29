@@ -101,6 +101,7 @@ impl ArtifactInputs {
             offline: selection.offline,
             locked: selection.locked,
             store: None,
+            rust_release: Some(&crate::answers::rust_release),
         };
         let mut metadata: cargo_metadata::Metadata =
             serde_json::from_str(&blaze_metadata::metadata(&asked)?)?;
@@ -457,6 +458,7 @@ mod tests {
                 offline: true,
                 locked: false,
                 store: None,
+                rust_release: Some(&crate::answers::rust_release),
             };
             let metadata: cargo_metadata::Metadata =
                 serde_json::from_str(&blaze_metadata::metadata(&asked).unwrap()).unwrap();

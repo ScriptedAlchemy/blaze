@@ -4,11 +4,13 @@
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
 //!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
-//!                  [--programs [--bin NAME | --example NAME]]]
+//!                  [--programs [--bin NAME | --example NAME]]] [--rust-release VERSION]
 //!
 //! `--cfg-file` is what `rustc --print cfg --target TRIPLE` prints. With `--build`, the graph is
 //! that of `cargo build` with the same flags; with `--programs` too, what it prints is the
-//! programs that build links instead, a JSON list.
+//! programs that build links instead, a JSON list. `--rust-release` is the release of the
+//! toolchain's rustc, which cargo resolves for when no member declares a `rust-version`; the
+//! harness that runs cargo beside this knows which toolchain cargo used.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -27,6 +29,7 @@ fn main() -> Result<()> {
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
     let (mut packages, mut excludes) = (Vec::new(), Vec::new());
     let (mut listed, mut bin, mut example) = (false, None, None);
+    let mut rust_release: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} takes a value"));
@@ -51,6 +54,7 @@ fn main() -> Result<()> {
             "--programs" => listed = true,
             "--bin" => bin = Some(value()?),
             "--example" => example = Some(value()?),
+            "--rust-release" => rust_release = Some(value()?),
             _ => bail!("unknown argument {arg}"),
         }
     }
@@ -84,6 +88,7 @@ fn main() -> Result<()> {
         offline,
         locked,
         store: None,
+        rust_release: Some(&|_, _, _| rust_release.clone()),
     };
     if listed {
         let targets = Targets { bin: bin.as_deref(), example: example.as_deref() };

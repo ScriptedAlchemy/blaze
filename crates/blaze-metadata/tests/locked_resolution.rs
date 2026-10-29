@@ -42,6 +42,7 @@ fn metadata(root: &Path) -> anyhow::Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
         offline: true,
         locked: true,
         store: None,
+        rust_release: None,
     };
     blaze_metadata::metadata_with_sources(&asked)
 }
