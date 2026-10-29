@@ -64,7 +64,7 @@ def main():
     (work / "oracle.log").write_text(oracle.stdout + oracle.stderr)
     assert oracle.returncode == 0, f"oracle failed: {work / 'oracle.log'}"
     audit_log = work / "product-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log), block=True))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log), block=True, block_macro_server=True))
     token = "c4-plain-" + secrets.token_hex(24)
     # Keep socket paths within sockaddr_un's platform budget independently of
     # the caller's evidence/build directory depth.

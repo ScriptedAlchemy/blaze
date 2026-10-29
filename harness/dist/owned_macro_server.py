@@ -33,7 +33,7 @@ def main():
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     log = work / "bootstrap-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(log), block=True))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(log), block=True, block_macro_server=True))
     env = {**os.environ, "PATH": str(audit / "bin") + os.pathsep + os.environ["PATH"],
            "RUSTUP_TOOLCHAIN": str(audit), "RUSTC": str(audit / "bin" / "rustc"),
            "CARGO": str(audit / "bin" / "cargo"), "RA_JIT_STD_FROM": "off",

@@ -92,7 +92,7 @@ def run(argv, **kwargs):
 def external_execs(text):
     """Every external compiler/Cargo exec attempt, including split trace records."""
     return [path for path in re.findall(r'execve\("([^"\n]+)"', text)
-            if os.path.basename(path).removesuffix(".real") in COUNTED]
+            if os.path.basename(path).removesuffix(".real") in (*COUNTED, "rust-analyzer-proc-macro-srv")]
 
 
 def traced_run(argv, trace, *, cwd, env, timeout=7200):
@@ -127,7 +127,7 @@ def real_toolchain():
     return run(["rustc", "--print", "sysroot"], check=True).stdout.strip()
 
 
-def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):
+def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=False):
     """A copy of the pinned toolchain at `work/toolchain` whose rustc, rustdoc and cargo are
     stand-ins that append a line to `log` for each run and then run the real tool, which keeps
     the pid. Every other program of the toolchain is linked, and its libraries are copied, so
@@ -141,7 +141,7 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):
     sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
     marker = os.path.join(toolchain, ".stand-in-log")
-    marker_text = log + ("\nblocked" if block else "")
+    marker_text = log + ("\nblocked" if block else "") + ("\nblocked-server" if block_macro_server else "")
     if os.path.exists(marker) and open(marker).read().strip() == marker_text:
         return toolchain  # made for this log already: every blaze run of the work directory shares it
     if os.path.exists(toolchain):
@@ -149,11 +149,11 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):
     os.makedirs(os.path.join(toolchain, "bin"))
     os.makedirs(os.path.join(toolchain, "lib"))
     for entry in os.listdir(sysroot):
-        if entry not in ("bin", "lib"):
+        if entry not in ("bin", "lib") and not (block_macro_server and entry == "libexec"):
             os.symlink(os.path.join(sysroot, entry), os.path.join(toolchain, entry))
     for entry in os.listdir(os.path.join(sysroot, "lib")):
         source, copy = os.path.join(sysroot, "lib", entry), os.path.join(toolchain, "lib", entry)
-        if os.path.isdir(source):
+        if os.path.isdir(source) or block:
             os.symlink(source, copy)
         else:
             shutil.copy2(source, copy)
@@ -162,12 +162,27 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False):
         if entry not in COUNTED:
             os.symlink(source, copy)
             continue
-        shutil.copy2(source, copy + ".real")
+        if not block:
+            shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
             script = STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
                                     run_id_env=run_id_env)
             out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
         os.chmod(copy, 0o755)
+    if block_macro_server:
+        source = os.path.join(sysroot, "libexec")
+        destination = os.path.join(toolchain, "libexec")
+        os.makedirs(destination)
+        for name in os.listdir(source) if os.path.isdir(source) else []:
+            path = os.path.join(destination, name)
+            if name != "rust-analyzer-proc-macro-srv":
+                os.symlink(os.path.join(source, name), path)
+            else:
+                script = STAND_IN.format(tool=name, log=shlex.quote(log), real="unused",
+                                        run_id_env=run_id_env)
+                with open(path, "w") as output:
+                    output.write(script.rsplit("exec ", 1)[0] + "exit 86\n")
+                os.chmod(path, 0o755)
     # rustup is outside the toolchain's bin directory. Audit its query/discovery
     # processes too; no row is allowed to hide them by calling them noncompiling.
     rustup = shutil.which("rustup")
