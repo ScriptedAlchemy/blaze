@@ -668,13 +668,19 @@ fn fetch(
         // lookup is consulted when replay supplies authenticated package roots.
         return read_fetched(ids, selected, ctx);
     }
+    let source_config_of = source_config(&ctx.config)?;
+    if ids.is_empty() {
+        // Path-only locks need no transport, and building it reads the machine's
+        // certificate store, which can fail for reasons unrelated to the build.
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut context = blaze_registry::Context::new(
         ctx.config.home().to_owned(),
         blaze_registry::http::HyperHttp::shared()?,
     );
     context.net.offline = offline;
     context.store = store;
-    let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, Arc::new(context))?;
+    let sources = blaze_registry::Sources::new(&source_config_of, Arc::new(context))?;
     let mut locked = Vec::new();
     for (id, source_text) in &ids {
         let (source, precise) = blaze_registry::SourceId::from_url(source_text)?;

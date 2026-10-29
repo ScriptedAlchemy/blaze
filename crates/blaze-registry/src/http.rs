@@ -170,6 +170,19 @@ impl fmt::Display for Transport {
 
 impl std::error::Error for Transport {}
 
+/// The value in `cell`, made by `make` the first time it succeeds. A failure is returned but
+/// not kept, so the next call tries again.
+fn kept_on_success<T>(
+    cell: &OnceLock<Arc<T>>,
+    make: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<Arc<T>> {
+    if let Some(kept) = cell.get() {
+        return Ok(kept.clone());
+    }
+    let made = Arc::new(make()?);
+    Ok(cell.get_or_init(|| made).clone())
+}
+
 /// How many redirects one request follows.
 const REDIRECTS: usize = 10;
 
@@ -201,11 +214,10 @@ impl HyperHttp {
 
     /// One shared by the whole process, with cargo's default timeout of 30 seconds.
     pub fn shared() -> anyhow::Result<Arc<HyperHttp>> {
-        static SHARED: OnceLock<Result<Arc<HyperHttp>, String>> = OnceLock::new();
-        let shared = SHARED.get_or_init(|| {
-            HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
-        });
-        shared.clone().map_err(anyhow::Error::msg)
+        // Only a success is kept: a certificate store that failed to read once (it can
+        // fail under load) must not fail every later request of the process.
+        static SHARED: OnceLock<Arc<HyperHttp>> = OnceLock::new();
+        kept_on_success(&SHARED, || HyperHttp::new(Duration::from_secs(30)))
     }
 
     async fn fetch(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
@@ -280,6 +292,21 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn a_failed_shared_client_is_not_kept() {
+        let cell = OnceLock::new();
+        let tries = AtomicU32::new(0);
+        let made = |fail: bool| {
+            tries.fetch_add(1, Ordering::Relaxed);
+            if fail { Err(anyhow::anyhow!("certificates unreadable")) } else { Ok(7_u32) }
+        };
+        assert!(kept_on_success(&cell, || made(true)).is_err());
+        assert!(cell.get().is_none());
+        assert_eq!(*kept_on_success(&cell, || made(false)).unwrap(), 7);
+        assert_eq!(*kept_on_success(&cell, || made(true)).unwrap(), 7);
+        assert_eq!(tries.load(Ordering::Relaxed), 2, "a kept client is not made again");
+    }
 
     #[test]
     fn retries_what_may_pass() {
