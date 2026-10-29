@@ -60,7 +60,8 @@ def main():
         all_features=False, packages=["app"], workspace=False,
         target=None, dev_deps=False, config=[])))
     audit_log = work / "product-tools.log"
-    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log)))
+    audit = Path(norustc.stand_ins(str(work / "audit"), str(audit_log),
+                                 block=True, block_macro_server=True))
     product = dict(env, RUSTUP_TOOLCHAIN=str(audit),
         PATH=str(audit / "bin") + os.pathsep + env["PATH"],
         RA_JIT_ANSWERS="own", BLAZE_ANSWERS="own",
@@ -86,12 +87,7 @@ def main():
                                 capture_output=True, text=True)
         (work / "product-build.log").write_text(result.stdout + result.stderr)
         refused = result.returncode != 0
-        if refused:
-            assert "could not compile a producer's compiler probe" in result.stderr, result.stderr
-            assert "owned compiler probe acceptance is not proven" in result.stderr, result.stderr
-            assert not result.stdout.strip(), "a refused build published an image"
-            assert not list((work / "producer").rglob("complete.json")), "refused image admitted"
-        else:
+        if not refused:
             built = json.loads(result.stdout)
             assert len(built) == 1, built
             library = Path(built[0]["library"])
@@ -107,10 +103,9 @@ def main():
     if refused:
         (work / "verdict.json").write_text(json.dumps({
             "status": "loud-refusal", "oracle": "accepted", "product_calls": [],
-            "reason": "compiler probe acceptance remains unproven; no image admitted",
+            "reason": result.stderr,
         }, indent=2) + "\n")
-        print("registry defaults: oracle accepts, product refuses unproven probes; no image, zero product calls")
-        return
+        sys.exit("registry defaults: oracle accepts but product refuses; capability gate FAILED")
     def outputs(top, package):
         paths = list(top.rglob("output"))
         return [path.read_text() for path in paths if path.parent.name.startswith(package + "-")]
