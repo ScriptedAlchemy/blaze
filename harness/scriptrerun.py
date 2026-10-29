@@ -39,7 +39,7 @@ usage: scriptrerun.py --selftest    (the comparison alone, without a build)
 
 Python 3, stdlib only.
 """
-import glob, os, re, shutil, subprocess, sys, tempfile
+import glob, os, re, shlex, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -541,6 +541,16 @@ def continuation_edit(bin_dir):
             lines = source.read()
         if not lines.startswith("#!/bin/sh\n") or "build-script" not in lines:
             raise SystemExit(f"continuation: not a script stand-in: {wrapper}")
+        # The stand-in is the file rustc linked, `build_script_build-<hash>`, and cargo makes
+        # `build-script-build` of it again on every build, even of a fresh script: a hard link on
+        # Linux, so an edit of either name is in both, and a copy on macOS (rust-lang/cargo#7821),
+        # which replaces an edit of `build-script-build` before cargo runs it. The edit goes in
+        # the file cargo makes it from.
+        said = [shlex.split(line) for line in lines.splitlines() if line.startswith("RA_JIT_BUILD_SCRIPT=")]
+        real = said[0][0].removeprefix("RA_JIT_BUILD_SCRIPT=") if said else ""
+        linked = real.removesuffix(".real") if real.endswith(".real") else None
+        if not linked or not os.path.isfile(linked):
+            raise SystemExit(f"continuation: no file rustc linked the stand-in at: {lines!r}")
         # This runs after Cargo chose to invoke the stand-in, immediately before
         # production consume. It cannot affect the daemon's direct execution.
         edit = '''if test -n "$RA_JIT_SCRIPT_CONTINUATION"; then
@@ -554,7 +564,7 @@ p.write_text(s.replace("    8\\n", "    9\\n"))
 PY
 fi
 '''
-        with open(wrapper, "w") as out:
+        with open(linked, "w") as out:
             out.write(lines.replace("#!/bin/sh\n", "#!/bin/sh\n" + edit, 1))
         source = os.path.join(ws, "src/main.rs")
         cargo_ra_jit.rewrite(source, "    7\n", "    8\n")
@@ -563,6 +573,12 @@ fi
         if built.returncode:
             raise SystemExit(built.stderr)
         build(side, "continuation: edit during Cargo's leg", home)
+        with open(source) as edited:
+            if "    9\n" not in edited.read():
+                # Without it the build compared is not the one this is about, and cargo alone,
+                # which runs the script for the dropped watches anyway, is one edit ahead.
+                wrong.append("continuation: cargo did not run the stand-in that edits the program")
+                return wrong
         _, built = reference.cargo("build", "-q")
         ours = subprocess.run([os.path.join(ws, "target/debug/counter")], capture_output=True)
         theirs = subprocess.run([os.path.join(ws, "target-ref/debug/counter")], capture_output=True)
