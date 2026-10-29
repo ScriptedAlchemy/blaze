@@ -17,6 +17,8 @@ What they hold to:
               passes it without one is a named error, not a silently skipped check.
 """
 
+import contextlib
+import io
 import os
 import re
 import struct
@@ -25,6 +27,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_release as b  # noqa: E402
@@ -243,6 +246,30 @@ def main() -> int:
         flake = (b.ROOT / "flake.nix").read_text()
         note("the flake's store package declares nix-native",
              "--artifact-mode nix-native" in flake)
+
+        for counts in ([], [0], [4], [10], [0, 10]):
+            out = tmp / ("bootstrap-" + str(counts))
+            out.mkdir()
+            executable = out / b.SERVER_BIN
+            executable.write_bytes(b"new bootstrap image")
+            stderr = "".join(f"linked image in 1.0s, {n} functions in it ra-jit could not compile\n"
+                             for n in counts)
+            built = subprocess.CompletedProcess([], 0, "", stderr)
+            version = subprocess.CompletedProcess([], 0, "owned server\n", "")
+            with patch.object(b, "run", return_value=built) as compile_image, \
+                    patch.object(b.subprocess, "run", return_value=version) as check_version, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    b.proc_macro_server(tmp / "ra-jit", out)
+                    accepted = True
+                except SystemExit:
+                    accepted = False
+            expected = counts == [0]
+            note(f"server bootstrap requires explicit zero uncompiled functions {counts}",
+                 accepted == expected and executable.exists() == expected
+                 and check_version.called == expected)
+            note(f"server bootstrap disables all prior expansion servers {counts}",
+                 compile_image.call_args.kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"] == "0")
 
     if FAILED:
         for f in FAILED:

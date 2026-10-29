@@ -1008,10 +1008,16 @@ rust-lang/rust at b940084d7, the commit `rustc 1.99.0 -vV` names):
   `vendor/rustc_abi` is rustc's crate from the 1.99.0 tag, with its loader replaced by the one
   that reads ra-jit's static. Its protocol is the toolchain server's: rust-analyzer already
   talks to that release's server today.
-- Building the server needs serde's derives expanded (`proc-macro-api`'s messages), so the
-  first server is built with what expands them today (rustc's `serde_derive` and the
-  toolchain's server), once per release when `ra-jit std` ships it; once J2 compiles
-  `serde_derive`, each server is built with the one before it.
+- The initial server bootstrap expanded `proc-macro-api`'s Serde derives with rustc's
+  `serde_derive` and the toolchain's server. That creates a cycle for a fresh owned build:
+  the toolchain server cannot load ra-jit's macro libraries. The protocol now implements
+  Serde with public visitors and declarative schemas, preserving both JSON and postcard
+  wire formats; independent derive-based reference types live only in its tests. The
+  release builder and strict bootstrap disable expansion servers with
+  `RA_JIT_PROC_MACRO_SERVER=0` and reject an image with uncompiled functions. Transitive
+  dependencies still include unused derives; a production dependency graph alone is not
+  evidence of a server-free bootstrap. `harness/dist/owned_macro_server.py` blocks and
+  traces compiler tools and the toolchain server, and checks the new executable separately.
 
 Where J stands (2026-10-24):
 
@@ -1042,8 +1048,8 @@ Where J stands (2026-10-24):
   manifest's header lists: the loader `dlopen`s a library and reads ra-jit's list where the
   release reads rustc's metadata, `rustc_proc_macro` is the standard library's `proc_macro`,
   `rustc_lexer` is the vendored crate, and the version string and the commit are written down
-  where build scripts ran rustc and git. ra-jit builds it with nothing of rustc's (`--exe`),
-  over rustc's `serde_derive` and the toolchain's server, the bootstrap above.
+  where build scripts ran rustc and git. ra-jit builds it with nothing of rustc's (`--exe`);
+  the initial Serde bootstrap above has been replaced by the derive-free protocol core.
 - `RA_JIT_PROC_MACRO_COMPARE` (`crates/ra-jit-expand/src/compare.rs`) names that server, and
   `RA_JIT_PROC_MACRO_LIBS` a directory of ra-jit's libraries: each call the toolchain's server
   expands with rustc's library is expanded again by ra-jit's server with ra-jit's library of

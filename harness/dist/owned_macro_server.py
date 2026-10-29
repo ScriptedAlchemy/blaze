@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 HARNESS = Path(__file__).resolve().parents[1]
@@ -56,7 +57,9 @@ def main():
     assert not execs, f"bootstrap attempted external compiler/Cargo execs: {execs}"
     assert result.returncode == 0, f"server build exit {result.returncode}; see {work / 'build.log'}"
     assert executable.is_file(), "blaze did not link its server"
-    assert "0 functions in it ra-jit could not compile" in result.stderr
+    uncompiled = re.findall(r"^linked .* in \S+, (\d+) functions in it ra-jit could not compile$",
+                            result.stderr, re.M)
+    assert uncompiled and all(int(count) == 0 for count in uncompiled), uncompiled
     pins = {name: dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
             for name, path in [("blaze", args.blaze.resolve()), ("server", executable)]}
     (work / "image-pins.json").write_text(json.dumps(pins, indent=2) + "\n")
