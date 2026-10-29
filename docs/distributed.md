@@ -3050,6 +3050,12 @@ deterministic CBOR trace (`[version, files, [[name, value-or-null], ...]]`, with
 budgets) preserves application input paths and environment reads, including filenames that Cargo's
 line-oriented dep-info cannot represent. Replay checks that trace against the snapshot before an
 executable is advertised or run. This is admission after compilation, not a filesystem sandbox.
+The compiler runs with the spec's environment alone, so a variable the program reads with
+`option_env!` reads unset in the replay, never as the worker has it. That is Cargo's answer when the
+requester's process lacked the variable too, and the replay record holds the digests of the names the
+requester's process had (not the names, not the values) to tell: a read of an unset variable the
+requester lacked is admitted, and one it had, which the spec does not carry, is refused as
+undeclared because its value was not kept.
 
 A program that `run` or `test` starts gets the environment Cargo gives one, not an empty one: the
 worker's `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG` and `LC_*`; the
