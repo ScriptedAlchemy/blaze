@@ -141,6 +141,7 @@ pub const RA_JIT_NEUTRAL: &[(&str, &str)] = &[
     ("RA_JIT_IDLE_SECS", "how long a daemon waits before it ends"),
     ("RA_JIT_SPARE", "whether the daemon keeps a spare worker"),
     ("RA_JIT_STATS", "what the daemon prints of itself"),
+    ("RA_JIT_RUN_ID", "the harness watchdog's process-tree label"),
     ("RA_JIT_TRACE", "what the daemon traces"),
     ("RA_JIT_DUMP_", "what the code generators print of what they compile"),
     ("RA_JIT_SLOW_SWITCH_MS", "when the daemon says a switch of checkouts was slow"),
