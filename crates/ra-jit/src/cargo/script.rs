@@ -2209,6 +2209,50 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     }
 
     #[test]
+    fn a_run_built_after_one_cargos_leg_takes_is_consumed_too() {
+        // Cargo's leg takes the dependency's run made for this build as its own and writes what
+        // it printed again, later: the parent's run made after it is still the one cargo makes.
+        let native = ran_script("leg-native", COUNTS, "");
+        let parent = ran_script("leg-parent", COUNTS, "");
+        built_after(&parent, records::package_hash("leg-native"), &native);
+        let dependencies = [Dependency {
+            package: "leg-native".to_owned(),
+            id: None,
+            outside: false,
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: vec![parent.clone()],
+            build_parents: Vec::new(),
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        changed(&native);
+        changed(&parent);
+        let mut completed = Vec::new();
+        judge_for(&parent, &cargo, &mut completed).unwrap();
+        assert_eq!((runs(&native), runs(&parent)), (1, 1));
+        let continuation =
+            Continuation::for_command(&mut Command::new("sh"), &completed).unwrap().unwrap();
+        let path = continuation.path();
+        let output = native.parent().unwrap().join("output");
+        let printed = std::fs::read(&output).unwrap();
+        std::fs::write(&output, &printed).unwrap();
+        set_written(&output, SystemTime::now() + Duration::from_secs(1));
+        // Cargo runs the stand-in with the metadata of the run it took: `cargo:in=<OUT_DIR>`.
+        let mut ran = ran_of(&parent);
+        ran.env.push(("DEP_PROBE_IN".to_owned(), native.to_str().unwrap().to_owned()));
+        assert!(continuation::consume_in(&ran, &parent, &path).unwrap(), "the same lines, later");
+        std::fs::remove_file(path.join(format!("used-{}", completed.len() - 1))).unwrap();
+        std::fs::write(&output, b"cargo::metadata=val=2\n").unwrap();
+        assert!(!continuation::consume_in(&ran, &parent, &path).unwrap(), "other lines");
+        assert_eq!((runs(&native), runs(&parent)), (1, 1));
+        drop(continuation);
+        for out_dir in [&native, &parent] {
+            std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn a_script_that_logs_an_error_or_prints_what_cargo_does_not_take_has_no_record_of_a_run() {
         let lines = "#!/bin/sh\necho \"cargo:in=$OUT_DIR\"\necho cargo::error=broken\n";
         let out_dir = ran_script("logs-error", lines, "");

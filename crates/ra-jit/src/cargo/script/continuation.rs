@@ -27,6 +27,9 @@ pub(crate) struct Completed {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Inputs {
     files: Vec<(PathBuf, Option<SystemTime>, Option<Vec<u8>>)>,
+    /// What the runs it was built after printed, by content alone: cargo's leg, taking such a
+    /// run made for this build as its own, writes the same lines there again, later.
+    printed: Vec<(PathBuf, Option<Vec<u8>>)>,
     variables: BTreeMap<String, Option<String>>,
     metadata: BTreeMap<String, String>,
     package: Option<String>,
@@ -41,14 +44,10 @@ impl Inputs {
         after: &blaze_build_script::Output,
         edges: &[super::records::Edge<'_>],
     ) -> Result<Self, String> {
-        let paths: std::collections::BTreeSet<_> = before
-            .rerun_if_changed
-            .iter()
-            .chain(&after.rerun_if_changed)
-            .chain(edges.iter().map(|it| &it.output))
-            .cloned()
-            .collect();
+        let paths: std::collections::BTreeSet<_> =
+            before.rerun_if_changed.iter().chain(&after.rerun_if_changed).cloned().collect();
         let files = paths.into_iter().map(|path| Self::file(ran.cwd.join(path))).collect();
+        let printed = edges.iter().map(|it| Self::printed(it.output.clone())).collect();
         let variables = before
             .rerun_if_env_changed
             .iter()
@@ -62,7 +61,7 @@ impl Inputs {
             .and_then(|it| it.modified())
             .map_err(|it| it.to_string())?;
         let executable = (compiled, super::file_digest(&ran.real).map_err(|it| it.to_string())?);
-        Ok(Self { files, variables, metadata, package, executable })
+        Ok(Self { files, printed, variables, metadata, package, executable })
     }
 
     fn file(path: PathBuf) -> (PathBuf, Option<SystemTime>, Option<Vec<u8>>) {
@@ -70,6 +69,11 @@ impl Inputs {
         let digest =
             if path.is_dir() { super::tree_digest(&path) } else { super::file_digest(&path) };
         (path, modified, digest.ok())
+    }
+
+    fn printed(path: PathBuf) -> (PathBuf, Option<Vec<u8>>) {
+        let digest = super::file_digest(&path).ok();
+        (path, digest)
     }
 
     fn metadata(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -82,6 +86,7 @@ impl Inputs {
     fn unchanged(&self, ran: &Ran) -> bool {
         let env: BTreeMap<_, _> = ran.env.iter().cloned().collect();
         self.files.iter().all(|file| Self::file(file.0.clone()) == *file)
+            && self.printed.iter().all(|it| Self::printed(it.0.clone()) == *it)
             && self.variables.iter().all(|(name, value)| env.get(name) == value.as_ref())
             && Self::metadata(&env) == self.metadata
             && self.package.as_ref().is_none_or(|package| {
