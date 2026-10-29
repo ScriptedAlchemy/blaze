@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile or loudly refuse the token producer with real registry defaults.
+"""Require token producer compilation and expansion with real registry defaults.
 
 The sources and macro body are source_macro's existing fixture. Cargo/rustc are
 reference-only. All product compilation and expansion use the owned compiler

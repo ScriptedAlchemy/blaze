@@ -607,7 +607,7 @@ def token_scan(roots, token):
                     errors.append(path)
     return dict(scanned=len(seen), hits=hits, errors=errors, roots=roots)
 
-def macro_content_report(work, bin_dir, machines, sources, reloads=0):
+def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server):
     from cargo_ra_jit import Side, program_output, wait_warm
     import norustc
     machine = machines[0]
@@ -620,6 +620,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads=0):
     env = machine.env(bin_dir, os.path.join(machine.top, "macro-store"), daemon_home("pm", "a"),
                       FIXTURES["macros"].get("env"))
     env.pop("RA_JIT_PROC_MACRO_CACHE_SKIP", None)
+    env["RA_JIT_PROC_MACRO_SERVER"] = os.path.abspath(owned_server)
     token = "c4-witness-" + secrets.token_hex(24)
     env["C4_PLANTED_TOKEN"] = token
     audit_log = os.path.join(work, "product-tools.log")
@@ -1452,6 +1453,7 @@ def main():
                    help="same-daemon binary payload edit/delete/recreate on two checkout paths")
     p.add_argument("--warm-nonfunction", action="store_true")
     p.add_argument("--warm-macro-content", action="store_true")
+    p.add_argument("--owned-server", help="fresh matching blaze-built server for the strict macro witness")
     p.add_argument("--macro-reloads", type=int, default=0)
     p.add_argument("--remote", help="the server remote of unit C5; not implemented here")
     p.add_argument("--b-docker", action="store_true", help="machine B in a container of another libc: unit C5")
@@ -1468,6 +1470,8 @@ def main():
     if a.remote or a.b_docker:
         sys.exit("--remote and --b-docker belong to unit C5 (a server remote, a machine of another libc); "
                  "crossmachine.py has a directory remote and two machines of this host")
+    if a.warm_macro_content and (not a.owned_server or not os.path.isfile(a.owned_server)):
+        p.error("--warm-macro-content requires --owned-server naming the fresh matching blaze-built server")
     names = ["macros"] if a.warm_macro_content else (["vendor-payload"] if a.warm_payload or a.warm_nonfunction else (ALL if a.all else a.fixtures))
     if not names:
         p.error("name a fixture, or --all")
@@ -1513,9 +1517,13 @@ def main():
             return 1 if reference_only(names, work, bin_dir, (a_m, b_m), sources, progress) else 0
         if a.warm_payload or a.warm_nonfunction or a.warm_macro_content:
             runner = macro_content_report if a.warm_macro_content else (nonfunction_report if a.warm_nonfunction else warm_payload_report)
-            rows = runner(work, bin_dir, (a_m, b_m), sources, a.macro_reloads) if a.warm_macro_content else runner(work, bin_dir, (a_m, b_m), sources)
+            rows = runner(work, bin_dir, (a_m, b_m), sources, a.macro_reloads, a.owned_server) if a.warm_macro_content else runner(work, bin_dir, (a_m, b_m), sources)
             with open(a.json or os.path.join(work, "warm-payload.json"), "w") as output:
-                json.dump(dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip()), output, indent=1)
+                result = dict(rows=rows, built_from=open(os.path.join(bin_dir, "BUILT_FROM")).read().strip())
+                if a.warm_macro_content:
+                    result["owned_server"] = dict(path=os.path.abspath(a.owned_server),
+                        sha256=hashlib.sha256(open(a.owned_server, "rb").read()).hexdigest())
+                json.dump(result, output, indent=1)
             print(json.dumps(rows, indent=1))
             if a.warm_macro_content:
                 return 1 if not strict_macro_rows(rows) or watchdog.tripped else 0
