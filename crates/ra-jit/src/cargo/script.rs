@@ -272,6 +272,15 @@ impl Run {
 
 /// What the cargo that builds next has that a run of a build script is reckoned from, besides
 /// its directories.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Dependency {
+    pub(crate) package: String,
+    pub(crate) links: String,
+    pub(crate) out_dir: PathBuf,
+    pub(crate) parents: Vec<PathBuf>,
+    pub(crate) targets: Vec<blaze_build_script::unit::Target>,
+}
+
 pub(crate) struct Cargo<'a> {
     /// A variable as that cargo has it: from the `[env]` of its configuration, or else its
     /// environment. Cargo's record of a run keeps the value of each variable the script said it
@@ -282,6 +291,9 @@ pub(crate) struct Cargo<'a> {
     /// The targets of the script's package, as `cargo metadata` lists them: cargo takes a
     /// `rustc-link-arg-bins` line and its like only from the script of a package that has one.
     pub(crate) targets: &'a [blaze_build_script::unit::Target],
+    /// Run-unit edges for native dependencies. Their output time matters even when the
+    /// metadata and fingerprint are identical, as in cargo's `check_filesystem`.
+    pub(crate) dependencies: &'a [Dependency],
 }
 
 /// The run of the script that wrote `out_dir` that cargo's next build has, by cargo's own records
@@ -342,6 +354,33 @@ pub(crate) fn judge_for(
     cargo: &Cargo<'_>,
     completed: &mut Vec<Completed>,
 ) -> Result<Run, JudgementError> {
+    // Run dependencies before taking the parent's lock: both usually share a build directory.
+    let mut dependencies = Vec::new();
+    let mut metadata = std::collections::BTreeMap::new();
+    for dep in cargo.dependencies.iter().filter(|it| it.parents.iter().any(|it| it == out_dir)) {
+        let context = Cargo { targets: &dep.targets, ..*cargo };
+        judge_for(&dep.out_dir, &context, completed)?;
+        let unit = records::Unit::of(&dep.out_dir)?;
+        let _held = unit.hold()?;
+        let fingerprint = unit.recorded()?;
+        let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
+        let ran: Ran = std::fs::read(dep.out_dir.parent().ok_or("no run directory")?.join(RAN))
+            .map_err(|it| it.to_string())
+            .and_then(|it| serde_json::from_slice(&it).map_err(|it| it.to_string()))?;
+        let said = said_to_cargo(&printed, &dep.out_dir, &dep.out_dir, &ran, &context)
+            .map_err(|it| it.to_string())?;
+        for (key, value) in said.metadata {
+            metadata.insert(
+                format!(
+                    "DEP_{}_{}",
+                    blaze_build_script::envify(&dep.links),
+                    blaze_build_script::envify(&key)
+                ),
+                value,
+            );
+        }
+        dependencies.push((dep.package.as_str(), fingerprint.hash_u64(), unit.output()));
+    }
     let unit = records::Unit::of(out_dir)?;
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
@@ -360,6 +399,7 @@ pub(crate) fn judge_for(
     let package = var("CARGO_MANIFEST_DIR").map(Path::new).ok_or("ran without a package")?;
     let unit = records::Unit::of(out_dir)?;
     let recorded = unit.recorded()?;
+    let fingerprint = recorded.with_dependencies(&dependencies)?;
     let output = unit.output();
     let printed = std::fs::read(&output).map_err(|it| format!("{}: {it}", output.display()))?;
     let said = |printed: &[u8], generated: &Path| {
@@ -392,7 +432,11 @@ pub(crate) fn judge_for(
     let home = (cargo.env)("CARGO_HOME")
         .map(|it| ran.cwd.join(it))
         .or_else(|| (cargo.env)("HOME").map(|it| Path::new(&it).join(".cargo")));
-    if !local_changed && unit.stale(&now, package, &compiled, home).is_none() {
+    if !local_changed
+        && fingerprint == recorded
+        && unit.stale_dependencies(&dependencies).is_none()
+        && unit.stale(&now, package, &compiled, home).is_none()
+    {
         return Ok(Run::left(&printed, out_dir)?);
     }
     let began = unit.begin()?;
@@ -411,6 +455,7 @@ pub(crate) fn judge_for(
             env.insert(name.clone(), value.clone());
         }
     }
+    env.extend(metadata);
     let mut script = Command::new(&ran.real);
     script.env_clear().envs(&env);
     script.current_dir(&ran.cwd).stdin(Stdio::null());
@@ -438,7 +483,7 @@ pub(crate) fn judge_for(
         named
     };
     // A run that says nothing of what it reads leaves what cargo reckoned before it.
-    let fingerprint = recorded.with_local(reckoned(&said, &named).unwrap_or(now));
+    let fingerprint = fingerprint.with_local(reckoned(&said, &named).unwrap_or(now));
     unit.record(&fingerprint)?;
     let run = Run::left(&again.stdout, out_dir)?;
     completed.push(Completed::new(&ran, out_dir, run.clone(), again, fingerprint, began));
@@ -647,7 +692,8 @@ mod tests {
 
     /// What the cargo that builds next has, for a test: its variables, and a package with no
     /// targets.
-    const CARGO: Cargo<'static> = Cargo { env: &cargo_env, env_names: &[], targets: &[] };
+    const CARGO: Cargo<'static> =
+        Cargo { env: &cargo_env, env_names: &[], targets: &[], dependencies: &[] };
 
     /// The lines of shell a test's script is run through: the script, then what it reads.
     const WATCHES: &str =
@@ -809,6 +855,50 @@ mod tests {
     fn runs(out_dir: &Path) -> usize {
         let runs = std::fs::read_to_string(out_dir.parent().unwrap().join("runs"));
         runs.unwrap_or_default().lines().count()
+    }
+
+    #[test]
+    fn a_native_dependency_rerun_invalidates_its_parent_even_with_identical_metadata() {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let native = ran_script("native-edge", COUNTS, "");
+        let parent = ran_script("parent-edge", COUNTS, "");
+        let unit = records::Unit::of(&parent).unwrap();
+        let recorded = unit.recorded().unwrap();
+        let native_hash = records::Unit::of(&native).unwrap().recorded().unwrap().hash_u64();
+        let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+        "native-edge".hash(&mut hasher);
+        let mut json = serde_json::to_value(&recorded).unwrap();
+        json["deps"].as_array_mut().unwrap().push(serde_json::json!([
+            Hasher::finish(&hasher),
+            "build_script_build",
+            false,
+            native_hash
+        ]));
+        unit.record(&serde_json::from_value(json).unwrap()).unwrap();
+        let dependencies = [Dependency {
+            package: "native-edge".to_owned(),
+            links: "probe".to_owned(),
+            out_dir: native.clone(),
+            parents: vec![parent.clone()],
+            targets: Vec::new(),
+        }];
+        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let built = Run::of(&parent).unwrap();
+        // Native's first output is older than the parent's. Only native's watched input
+        // changes; the parent has no changed file or variable of its own.
+        set_written(
+            &native.parent().unwrap().join("output"),
+            SystemTime::now() - Duration::from_secs(4000),
+        );
+        changed(&native);
+        assert_eq!(current(&parent, &cargo), Ok(built.clone()));
+        assert_eq!((runs(&native), runs(&parent)), (1, 1));
+        assert_eq!(current(&parent, &cargo), Ok(built.clone()));
+        assert_eq!((runs(&native), runs(&parent)), (1, 1));
+        changed(&native);
+        assert_eq!(current(&parent, &cargo), Ok(built));
+        assert_eq!((runs(&native), runs(&parent)), (2, 2));
     }
 
     #[test]
@@ -1585,7 +1675,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert_eq!(rerun_is_same(&out_dir), Ok(()));
         // The cargo that builds next has another value than the one cargo's record has.
         let set = |name: &str| (name == "RA_JIT_TEST_UNSET_VARIABLE").then(|| "1".to_owned());
-        let cargo = Cargo { env: &set, env_names: &[], targets: &[] };
+        let cargo = Cargo { env: &set, ..CARGO };
         changed(&out_dir);
         let result = current(&out_dir, &cargo);
         assert!(
@@ -1628,7 +1718,7 @@ printf %s "${VP5_VAR+x}" > "$OUT_DIR/present"
                 _ => cargo_env(name),
             };
             let names = vec!["VP5_VAR".to_owned()];
-            let cargo = Cargo { env: &env, env_names: &names, targets: &[] };
+            let cargo = Cargo { env: &env, env_names: &names, ..CARGO };
             let rerun = current(&out_dir, &cargo).unwrap();
             assert_ne!(rerun, built, "{case}: the edited source changes the run");
             assert_eq!(

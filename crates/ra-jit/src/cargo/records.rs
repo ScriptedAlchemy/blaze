@@ -211,6 +211,17 @@ impl Unit {
         None
     }
 
+    pub(crate) fn stale_dependencies(
+        &self,
+        dependencies: &[(&str, u64, PathBuf)],
+    ) -> Option<String> {
+        let began = written(&self.output()).ok()?;
+        dependencies.iter().find_map(|(name, _, output)| match written(output) {
+            Ok(at) if at <= began => None,
+            _ => Some(format!("the run of {name} is missing or newer")),
+        })
+    }
+
     /// What cargo does before it runs the script (`prepare_target`, then `build_work`): it
     /// empties the hash of the fingerprint, so that a run that does not end is run again,
     /// makes `OUT_DIR`, and writes `invoked.timestamp`, whose time is when the run began.
@@ -345,6 +356,23 @@ impl Fingerprint {
     /// that read that, everything else being what cargo reckoned before it.
     pub(crate) fn with_local(&self, local: Vec<Local>) -> Fingerprint {
         Fingerprint { local, ..self.clone() }
+    }
+
+    pub(crate) fn with_dependencies(
+        &self,
+        dependencies: &[(&str, u64, PathBuf)],
+    ) -> Result<Fingerprint, String> {
+        let mut now = self.clone();
+        for (package, hash, _) in dependencies {
+            let mut hasher = rustc_stable_hash::hashers::StableSipHasher128::new();
+            package.hash(&mut hasher);
+            let pkg_id = Hasher::finish(&hasher);
+            let Some(dep) = now.deps.iter_mut().find(|it| it.pkg_id == pkg_id) else {
+                return Err(format!("no cargo run-unit dependency for {package}"));
+            };
+            dep.fingerprint = *hash;
+        }
+        Ok(now)
     }
 }
 

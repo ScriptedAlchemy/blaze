@@ -405,6 +405,7 @@ impl Script {
         &self,
         env: &dyn Fn(&str) -> Option<String>,
         env_names: &[String],
+        dependencies: &[crate::cargo::script::Dependency],
     ) -> anyhow::Result<bool> {
         use crate::cargo::script;
         let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return Ok(false) };
@@ -416,7 +417,7 @@ impl Script {
         // twice.
         let run = script::judge(
             &out_dir,
-            &script::Cargo { env, env_names, targets: &self.output_targets },
+            &script::Cargo { env, env_names, targets: &self.output_targets, dependencies },
         );
         let run = match run {
             Ok(run) => run,
@@ -817,9 +818,45 @@ impl Scripts {
                 .collect(),
         };
         let mut same = !variables;
+        let dependencies = match &self.workspace.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. } => cargo
+                .packages()
+                .filter_map(|package| {
+                    let links = cargo[package].links.clone()?;
+                    let script = self.scripts.iter().find(|it| {
+                        it.root == Path::new(cargo[package].manifest.parent().as_str())
+                    })?;
+                    let out_dir = script.ran()?;
+                    let parents = cargo
+                        .packages()
+                        .filter(|&parent| {
+                            cargo[parent].dependencies.iter().any(|dep| {
+                                dep.pkg == package && dep.kind == project_model::DepKind::Normal
+                            })
+                        })
+                        .filter_map(|parent| {
+                            self.scripts
+                                .iter()
+                                .find(|it| {
+                                    it.root == Path::new(cargo[parent].manifest.parent().as_str())
+                                })
+                                .and_then(Script::ran)
+                        })
+                        .collect();
+                    Some(crate::cargo::script::Dependency {
+                        package: cargo[package].name.clone(),
+                        links,
+                        out_dir,
+                        parents,
+                        targets: script.output_targets.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         if same {
             for &at in &changed {
-                if !self.scripts[at].reruns_the_same(&cargo_has, &env_names)? {
+                if !self.scripts[at].reruns_the_same(&cargo_has, &env_names, &dependencies)? {
                     same = false;
                     break;
                 }

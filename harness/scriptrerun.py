@@ -434,6 +434,58 @@ def counted(bin_dir, name, files, daemon):
     return wrong
 
 
+def links_only(bin_dir):
+    """A native dependency reruns with identical metadata; its parent must rerun too."""
+    files = dict(COUNTER)
+    files["Cargo.toml"] += '[dependencies]\nnative = { path = "native" }\n'
+    files.update({
+        "native/Cargo.toml": '[package]\nname="native"\nversion="0.1.0"\nedition="2021"\nlinks="probe"\n',
+        "native/src/lib.rs": "pub fn value() -> u32 { 1 }\n",
+        "native/build.rs": 'fn main() { println!("cargo::rerun-if-changed=data.txt"); println!("cargo::metadata=val=1"); }\n',
+        "native/data.txt": "1\n",
+    })
+    files["build.rs"] = files["build.rs"].replace(
+        '    let out = PathBuf::from(env::var("OUT_DIR").unwrap());',
+        '    assert_eq!(env::var("DEP_PROBE_VAL").unwrap(), "1");\n'
+        '    let out = PathBuf::from(env::var("OUT_DIR").unwrap());',
+    )
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-sl-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        with open(os.path.join(ws, path), "w") as out:
+            out.write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    env["RA_JIT_CACHE"] = "off"
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    wrong = []
+    try:
+        build(side, "links: cold", home)
+        _, built = reference.cargo("build", "-q")
+        if built.returncode:
+            raise SystemExit(built.stderr)
+        _, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"links: not ready: {states}{tails(home)}")
+        for value in ("2", "3"):
+            cargo_ra_jit.rewrite(os.path.join(ws, "native/data.txt"), f"{int(value)-1}\n", f"{value}\n")
+            how = how_built(build(side, "links: dependency edit", home))
+            _, built = reference.cargo("build", "-q")
+            ours = subprocess.run([os.path.join(ws, "target/debug/counter")], capture_output=True)
+            theirs = subprocess.run([os.path.join(ws, "target-ref/debug/counter")], capture_output=True)
+            problems = differences(ours, theirs, built)
+            counts = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
+            if counts != (int(value), int(value)):
+                problems.append(f"links: runs {counts}, expected {value}")
+            wrong.extend(problems)
+            print(f"links: dependency edit {value}: {ours.stdout!r}/{theirs.stdout!r}, runs {counts}, {how}")
+    finally:
+        side.cargo("stop")
+        shutil.rmtree(root, ignore_errors=True)
+    return wrong
+
+
 def main():
     selftest()
     if sys.argv[1:] == ["--selftest"]:
@@ -501,6 +553,7 @@ def main():
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
     wrong += failing_script(bin_dir)
+    wrong += links_only(bin_dir)
     for why in wrong:
         print(f"  {why}")
     if wrong:

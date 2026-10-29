@@ -191,6 +191,8 @@ enum Guard {
         /// The package's targets, which what cargo takes of what the script prints depends on.
         #[serde(default)]
         targets: Vec<blaze_build_script::unit::Target>,
+        #[serde(default)]
+        dependencies: Vec<script::Dependency>,
     },
 }
 
@@ -203,7 +205,15 @@ impl Guard {
         completed: &mut Vec<script::Completed>,
     ) -> Result<Option<String>, String> {
         Ok(match self {
-            Guard::Script { package, out_dir, reruns_for, checked_at, built, targets } => {
+            Guard::Script {
+                package,
+                out_dir,
+                reruns_for,
+                checked_at,
+                built,
+                targets,
+                dependencies,
+            } => {
                 let since = built_at.max(*checked_at);
                 let mut changed = false;
                 for guard in reruns_for {
@@ -212,7 +222,7 @@ impl Guard {
                         break;
                     }
                 }
-                if !changed {
+                if !changed && dependencies.is_empty() {
                     return Ok(None);
                 }
                 let now = stamp_now();
@@ -221,7 +231,8 @@ impl Guard {
                     .filter_map(|(name, _)| name.into_string().ok())
                     .chain(configured.iter().map(|it| it.name.clone()))
                     .collect();
-                let cargo = script::Cargo { env: &env, env_names: &env_names, targets };
+                let cargo =
+                    script::Cargo { env: &env, env_names: &env_names, targets, dependencies };
                 let run = match script::judge_for(out_dir, &cargo, completed) {
                     Ok(run) => Ok(run),
                     Err(script::JudgementError::Unavailable(what)) => Err(what),
@@ -1500,9 +1511,16 @@ fn guards(
         guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
+    let dependencies = script_dependencies(metadata, scripts);
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
-        guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
+        let mut found = package.map(|it| rerun_guards(it, script)).unwrap_or_default();
+        for guard in &mut found {
+            if let Guard::Script { dependencies: edges, .. } = guard {
+                *edges = dependencies.clone();
+            }
+        }
+        guards.extend(found);
     }
     let linked = checkouts.iter().flat_map(|it| &it.programs);
     let mut linked: Vec<PathBuf> = linked.flat_map(|it| it.linked_as_built.clone()).collect();
@@ -1513,6 +1531,45 @@ fn guards(
     let cargo = built.flat_map(Record::cargo_dep_info).collect();
     guards.push(Guard::beside_tests(linked, cargo));
     guards
+}
+
+/// Cargo's run-unit edges, not just changes to the metadata delivered over those edges.
+fn script_dependencies(metadata: &Metadata, scripts: &[BuildScript]) -> Vec<script::Dependency> {
+    let Some(resolve) = &metadata.resolve else { return Vec::new() };
+    scripts
+        .iter()
+        .filter_map(|run| {
+            let package = metadata.packages.iter().find(|it| it.id == run.package_id)?;
+            let links = package.links.clone()?;
+            let parents = resolve
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.deps.iter().any(|dep| {
+                        dep.pkg == package.id
+                            && dep.dep_kinds.iter().any(|kind| kind.kind == DependencyKind::Normal)
+                    })
+                })
+                .flat_map(|node| scripts.iter().filter(move |it| it.package_id == node.id))
+                .map(|it| it.out_dir.clone().into_std_path_buf())
+                .collect();
+            Some(script::Dependency {
+                package: package.name.to_string(),
+                links,
+                out_dir: run.out_dir.clone().into_std_path_buf(),
+                parents,
+                targets: package
+                    .targets
+                    .iter()
+                    .map(|it| blaze_build_script::unit::Target {
+                        name: it.name.clone(),
+                        kind: it.kind.iter().map(ToString::to_string).collect(),
+                        crate_types: it.crate_types.iter().map(ToString::to_string).collect(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
@@ -1592,6 +1649,7 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
             checked_at: 0,
             built,
             targets,
+            dependencies: Vec::new(),
         }];
     }
     files.extend(variables);
