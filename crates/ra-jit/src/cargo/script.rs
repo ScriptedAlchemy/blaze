@@ -429,7 +429,6 @@ fn judge_locked_inner(
     }
     let mut dependencies = Vec::new();
     let mut metadata = std::collections::BTreeMap::new();
-    let mut metadata_prefixes = Vec::new();
     for dep in cargo
         .dependencies
         .iter()
@@ -449,7 +448,6 @@ fn judge_locked_inner(
         for (key, value) in said.metadata {
             metadata.insert(format!("{prefix}{}", blaze_build_script::envify(&key)), value);
         }
-        metadata_prefixes.push(prefix);
         dependencies.push((dep.package.as_str(), fingerprint.hash_u64(), unit.output()));
     }
     // A fresh fingerprint does not make an unlocked read safe: cargo can invalidate it and
@@ -519,9 +517,7 @@ fn judge_locked_inner(
         }
     }
     for (name, value) in &ran.env {
-        // Cargo replaces dependency metadata; a dropped key must use the current
-        // caller's environment, not the value injected for the previous run.
-        if cargo_sets(name) && !metadata_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+        if cargo_sets(name) {
             env.insert(name.clone(), value.clone());
         }
     }
@@ -565,7 +561,6 @@ fn cargo_sets(name: &str) -> bool {
     name.starts_with("CARGO_PKG_")
         || name.starts_with("CARGO_FEATURE_")
         || name.starts_with("CARGO_CFG_")
-        || name.starts_with("DEP_")
         || matches!(
             name,
             "CARGO"
@@ -1013,7 +1008,11 @@ mod tests {
             build_parents: Vec::new(),
             targets: Vec::new(),
         }];
-        let cargo = Cargo { dependencies: &dependencies, ..CARGO };
+        let env = |name: &str| match name {
+            "DEP_NATIVE_PROBE2_VAL" => Some("old".to_owned()),
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { dependencies: &dependencies, env: &env, ..CARGO };
         changed(&native);
         let rerun = current(&parent, &cargo).unwrap();
         assert_eq!(std::fs::read_to_string(parent.join("observed")).unwrap(), "unset|new|old");
@@ -1021,6 +1020,7 @@ mod tests {
         assert_eq!(current(&parent, &cargo), Ok(rerun));
         let env = |name: &str| match name {
             "DEP_NATIVE_PROBE_VAL" => Some("ambient".to_owned()),
+            "DEP_NATIVE_PROBE2_VAL" => Some("old".to_owned()),
             _ => cargo_env(name),
         };
         let cargo = Cargo { env: &env, ..cargo };
@@ -1031,6 +1031,25 @@ mod tests {
         for out_dir in [&native, &parent] {
             std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn ambient_dep_variables_use_the_current_callers_environment() {
+        let parent = ran_script(
+            "ambient-dep",
+            "#!/bin/sh\nprintf '%s' \"${DEP_USER_VALUE-unset}\" > \"$OUT_DIR/observed\"\n",
+            "",
+        );
+        with_variable(&parent, "DEP_USER_VALUE", Path::new("x"));
+        let env = |name: &str| match name {
+            "DEP_USER_VALUE" => Some("new".to_owned()),
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &env, ..CARGO };
+        changed(&parent);
+        current(&parent, &cargo).unwrap();
+        assert_eq!(std::fs::read_to_string(parent.join("observed")).unwrap(), "new");
+        std::fs::remove_dir_all(parent.ancestors().nth(4).unwrap()).unwrap();
     }
 
     #[test]
