@@ -20,18 +20,18 @@ inputs:
 runs:
   using: composite
   steps:
-    - if: inputs.hit != 'true'
+    - if: always() && inputs.hit != 'true'
       shell: bash
       run: |
         "$SCCACHE_PATH" --show-stats
         "$SCCACHE_PATH" --stop-server > /dev/null || true
         du -sh ~/.cache/toolchain-sccache || true
-    - if: inputs.hit != 'true'
+    - if: always() && inputs.hit != 'true'
       uses: actions/cache/save@v6
       with:
         path: ~/.cache/toolchain-sccache
         key: ${{ inputs.key }}
-    - if: inputs.hit != 'true'
+    - if: always() && inputs.hit != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
