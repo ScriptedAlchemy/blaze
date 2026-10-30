@@ -117,7 +117,10 @@ jobs:
             ${{ runner.temp }}/owned-runtime/*.exec
             ${{ runner.temp }}/owned-runtime/build.log
           if-no-files-found: warn
-      - if: ${{ !cancelled() && inputs.cache-write }}
+      # Even when the run is cancelled (a newer push to the pull request): what sccache holds
+      # by then is as valid as a whole build's, and without it every run after a cancelled one
+      # starts cold. On PR #32 a push cancelled the build after 29 minutes and nothing was kept.
+      - if: ${{ always() && inputs.cache-write }}
         uses: ./.github/actions/toolchain/save
         with:
           key: ${{ steps.toolchain.outputs.sccache-key }}
