@@ -2339,6 +2339,8 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             "output",
             "dropped",
             "quiet",
+            "real",
+            "cwd",
         ] {
             let lines = format!(
                 "{COUNTS}echo cargo::rerun-if-changed=inputs\necho cargo::rerun-if-changed=missing\necho cargo::rerun-if-env-changed=PR5_CONTINUE\n"
@@ -2392,6 +2394,14 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
                     std::fs::write(&edit, "after").unwrap();
                     set_written(&edit, SystemTime::now() + Duration::from_secs(2));
                 }
+                // Cargo's leg runs another script in the directory, or runs it elsewhere: the
+                // same file by another name, and the same inputs, are not the same run.
+                "real" => {
+                    let other = ran.real.with_extension("other");
+                    std::fs::hard_link(&ran.real, &other).unwrap();
+                    ran.real = other;
+                }
+                "cwd" => ran.cwd = ran.cwd.join("inputs"),
                 _ => unreachable!(),
             }
             assert!(!continuation::consume_in(&ran, &out_dir, &path).unwrap(), "{change}: changed");
