@@ -2399,6 +2399,21 @@ fn regalloc() -> &'static str {
     *REGALLOC
 }
 
+/// Whether locals are promoted from frame slots into SSA values. Use the same cached
+/// setting for lowering and for an export context's compiler-policy identity.
+fn promotes_locals() -> bool {
+    static PROMOTE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("RA_JIT_PROMOTE").is_none_or(|it| it != "0"));
+    *PROMOTE
+}
+
+/// Whether a caller may build a callee into its own IR at all.
+fn inlines_callees() -> bool {
+    static INLINE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("RA_JIT_INLINE").is_none_or(|it| it != "0"));
+    *INLINE
+}
+
 /// The same target for a function of more than [`SINGLE_PASS`] instructions. The usual
 /// register allocator takes more than linear time: ten seconds for one of 150 000
 /// instructions, which a whole build then waits for.
@@ -4466,13 +4481,10 @@ fn compile_as<'db>(
     }
     cg.set_machine(machine);
     let tally = backend::Tally::global();
-    /// `RA_JIT_PROMOTE=0` leaves every local in its slot of the frame.
-    static PROMOTE: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_PROMOTE").is_none_or(|it| it != "0"));
     let mut ctx = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
         inline(&mut ctx, &cg.inlined)?;
-        if *PROMOTE {
+        if promotes_locals() {
             promote::promote(&mut ctx.func, cg.named_slots());
         }
         Result::Ok(ctx)
@@ -13195,11 +13207,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         args: GenericArgs<'db>,
         sig: &Signature,
     ) -> Option<ir::FuncRef> {
-        /// `RA_JIT_INLINE=0` calls every function.
-        static ENABLED: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("RA_JIT_INLINE").is_none_or(|it| it != "0"));
         let db = self.cg.db;
-        if !*ENABLED || !self.cg.target.exception_in_register() || Target::current().is_wasm() {
+        if !inlines_callees()
+            || !self.cg.target.exception_in_register()
+            || Target::current().is_wasm()
+        {
             return None;
         }
         let erased = |args| erase_regions(DbInterner::new_with(db, self.env.krate), args);

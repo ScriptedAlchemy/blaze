@@ -115,13 +115,26 @@ fn digest(domain: &[u8], fields: &[&[u8]]) -> Digest256 {
 fn settings() -> std::result::Result<Vec<u8>, String> {
     let backend = Backend::from_env()?;
     let target = Target::selected().map_err(|e| e.to_string())?;
+    #[cfg(feature = "llvm")]
+    let imports = imports::enabled();
+    #[cfg(not(feature = "llvm"))]
+    let imports = false;
+    // These are the effective settings read by lowering, including its cached
+    // environment switches. Equal contexts must produce the same requests and bytes,
+    // even where the ordinary cache permits equivalent optimization variants.
     Ok(format!(
-        "{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         target.triple(),
         backend,
         mir_opt_level().number(),
         backend::frame_pointers(),
-        regalloc()
+        regalloc(),
+        promotes_locals(),
+        inlines_callees(),
+        asm::inline_enabled(),
+        backend::whole_program(),
+        tier::across(),
+        imports,
     )
     .into_bytes())
 }
@@ -138,6 +151,11 @@ impl<'a, 'db> ExportContext<'a, 'db> {
             return Err(
                 "batch export requires the owned compiler link policy, not a mixed object".into()
             );
+        }
+        // The legacy object policy can replace a provided future-returning function
+        // with local code. Its alternate layout/import policy is not a batch binding.
+        if futures_kept_apart() {
+            return Err("batch export does not support RA_JIT_SPLIT_FUTURES".into());
         }
         if policy.variables && !policy.debug {
             return Err("variable debug requires debug information".into());
@@ -327,8 +345,12 @@ impl Bindings for ExportContext<'_, '_> {
                             .ok_or("owned root has no link name");
                     } else if self.owned.contains(&func.krate(self.db)) {
                         return Ok(FunctionBinding::Defined);
-                    } else {
+                    } else if instance.args.as_ref().iter().all(|it| it.region().is_some())
+                        && as_its_crate_compiles(self.db, self.symbols, instance)
+                    {
                         self.symbols.function(func)
+                    } else {
+                        return Err("provided function does not match the requested instance");
                     }
                 } else {
                     return Ok(FunctionBinding::Defined);

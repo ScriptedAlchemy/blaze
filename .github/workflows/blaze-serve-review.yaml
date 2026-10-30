@@ -119,6 +119,12 @@ jobs:
             target/empty-probe-review/results.json
             target/empty-probe-review/*/*.log
           if-no-files-found: ignore
+      - name: Test affected selection, retries, and native input identities
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ra-jit --bin ra-jit -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
+      - name: Test compiler export and import identities
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p hir-ty-codegen --lib export:: -- --test-threads=2
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
         run: python3 -I harness/remote.py --selftest
