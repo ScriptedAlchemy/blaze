@@ -1,19 +1,20 @@
 # blaze on tracedecay, measured against cargo
 
-Unit u1-measure of the distributed compile, cache and tests program, started by u1 and finished by
-u1b. The question: can blaze build, rebuild and test tracedecay's Rust workspace on this Mac today,
-and how does that compare with cargo on the same machine?
+Units u1 and u1b measured whether blaze could build, rebuild and test tracedecay's
+Rust workspace on this Mac, then compared it with Cargo on the same machine.
+This is the u1-measure report for the distributed compile, cache and tests program.
 
 u1 ran the measurements below on one machine, in one session (21:32 to 23:26 on 25 October 2026).
 In its last cold build blaze's daemon grew a worker to 56 GB on this 48 GiB Mac and the
-coordinator killed the run. u1b wrote up u1's data and added the one thing that was missing: a cold
-build under a memory guard (section 5). **read** means a number was read from a run, with the run
+coordinator killed the run. u1b wrote up u1's data and added a cold build under a
+memory guard, described in section 5. **read** means a number was read from a run, with the run
 count and spread given. **reported** means someone else saw it and I did not re-run it. Nothing is
 extrapolated; what was not run is marked **unverified** or **not measured**.
 
 ## The short version
 
-**No-go for blaze on tracedecay on this Mac today.** Four things stop it (item 7 ranks seven gaps):
+These runs do not support using blaze for tracedecay on this Mac. Four problems
+block it. Section 7 ranks these and the other gaps.
 
 - **Memory.** The daemon's worker for tracedecay grows without limit while it loads. Unguarded
   (u1, 3 runs) it held 22.0 GB at 7 s of loading, 42.7 GB a minute later and 58.3 GB when ready, on

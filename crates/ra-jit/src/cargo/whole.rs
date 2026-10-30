@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -41,6 +42,12 @@ pub(super) fn asked_for(asked: &Invocation) -> bool {
         && flags.targets.len() <= 1
 }
 
+/// Selected remotes use a one-shot compiler so publication finishes before the command
+/// returns. Other whole builds retain the daemon's warm state.
+pub(super) fn by_daemon(asked: &Invocation, env: &BTreeMap<String, OsString>) -> bool {
+    asked_for(asked) && !super::cache_service::selected(env)
+}
+
 /// A program of the build, as cargo plans it.
 struct Program {
     /// The name of the executable.
@@ -65,7 +72,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     let root = metadata.workspace_root.as_std_path();
     let project = programs.first().map(|it| super::state::package_dir(&it.package));
     let project = project.as_deref().unwrap_or(root);
-    let config = config_of(asked, &cwd, root, project);
+    let config = config_of(asked, &cwd, root, project)?;
     // One directory per build of the checkout, as the daemon names it: the features, the
     // profile, the target and the variables that change what is compiled are all in that
     // name, so the program one build links is never the one another places.
@@ -177,17 +184,32 @@ fn whole(
 /// The worker configuration of a whole build asked in `cwd`, of the workspace at `root` whose
 /// program is in `project`. The invocation directory selects the members and resolves a
 /// relative manifest path; the workspace root names the repository and project separately.
-fn config_of(asked: &Invocation, cwd: &Path, root: &Path, project: &Path) -> WorkerConfig {
+fn config_of(
+    asked: &Invocation,
+    cwd: &Path,
+    root: &Path,
+    project: &Path,
+) -> anyhow::Result<WorkerConfig> {
+    let caller = crate::process::native()
+        .vars()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .collect();
+    let mut cache = BTreeMap::new();
+    super::cache_service::configure(&mut cache, &caller, cwd)?;
+    let cache_env = (!cache.is_empty()).then(|| {
+        crate::process::Native::of(cache.into_iter().map(|(name, value)| (name.into(), value)))
+    });
     let asked_in =
         asked.flags.manifest_path.as_ref().map_or_else(|| cwd.to_owned(), |it| cwd.join(it));
-    WorkerConfig {
+    Ok(WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
         cfg_test: false,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
+        cache_env,
         whole: true,
-    }
+    })
 }
 
 /// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
@@ -524,12 +546,103 @@ mod tests {
             Asked::Build(invocation) => *invocation,
             other => panic!("{other:?}"),
         };
-        config_of(&asked, cwd, root, project)
+        config_of(&asked, cwd, root, project).unwrap()
     }
 
-    /// The file a whole build of `args` links its program into, before it places it where
-    /// cargo has it. Two builds whose program differs in what it compiles must not share it:
-    /// the one of the second would be placed from a file the first linked.
+    #[test]
+    fn cache_controls_follow_the_request_directory_without_changing_source_values() {
+        let source = crate::process::Native::of([
+            ("RA_JIT_CACHE".into(), "../writer-store".into()),
+            ("RA_JIT_REMOTE".into(), "../../owned-remote".into()),
+            ("RA_JIT_PROJECT".into(), "owned-cache".into()),
+            ("RA_JIT_REMOTE_UNSIGNED".into(), "1".into()),
+            ("UNRELATED_SECRET".into(), "private-value".into()),
+        ]);
+        let _scope = crate::process::enter_native(source.clone());
+        let cwd = Path::new("/checkout/member/request");
+        let config = config_in("", cwd, Path::new("/checkout"), Path::new("/checkout/member"));
+        let controls: BTreeMap<_, _> = config.cache_env.as_ref().unwrap().vars().collect();
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_CACHE")], cwd.join("../writer-store"));
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_REMOTE")], cwd.join("../../owned-remote"));
+        assert!(!controls.contains_key(std::ffi::OsStr::new("UNRELATED_SECRET")));
+        assert!(!config.env.contains_key("RA_JIT_REMOTE"));
+        assert_eq!(crate::process::native(), source);
+        let mut readonly = config.clone();
+        readonly.cache_env = Some(
+            config
+                .cache_env
+                .as_ref()
+                .unwrap()
+                .over([("RA_JIT_REMOTE_READONLY".into(), "1".into())]),
+        );
+        assert_ne!(readonly.id(), config.id());
+    }
+
+    #[test]
+    fn inactive_cache_controls_do_not_change_worker_identity() {
+        let base = {
+            let _scope = crate::process::enter_native(crate::process::Native::default());
+            config("")
+        };
+        let _scope = crate::process::enter_native(crate::process::Native::of([
+            ("RA_JIT_CACHE".into(), "off".into()),
+            ("RA_JIT_REMOTE".into(), "not-selected".into()),
+        ]));
+        let disabled = config("");
+        assert!(disabled.cache_env.is_none());
+        assert_eq!(base.id(), disabled.id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cache_paths_survive_worker_configuration_transport() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = std::ffi::OsString::from_vec(b"store-\xff".to_vec());
+        let _scope = crate::process::enter_native(crate::process::Native::of([(
+            "RA_JIT_CACHE".into(),
+            path.clone(),
+        )]));
+        let config = config("");
+        let decoded: WorkerConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let controls: BTreeMap<_, _> = decoded.cache_env.unwrap().vars().collect();
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_CACHE")], Path::new("/ws").join(path));
+    }
+
+    #[test]
+    fn a_build_with_its_own_cache_service_is_not_the_daemons() {
+        let invocation = |subcommand: &str| match Asked::parse(vec![
+            subcommand.to_owned(),
+            "--manifest-path".to_owned(),
+            "../Cargo.toml".to_owned(),
+        ]) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, OsString> {
+            pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).into())).collect()
+        };
+        let service = env(&[
+            ("RA_JIT_CACHE", "../writer-store"),
+            ("RA_JIT_REMOTE", "../../owned-remote"),
+            ("RA_JIT_PROJECT", "owned-cache"),
+            ("RA_JIT_REMOTE_LAZY", "1"),
+        ]);
+        for subcommand in ["run", "build"] {
+            let asked = invocation(subcommand);
+            assert!(!by_daemon(&asked, &service), "{subcommand} with its own store and remote");
+            // Without a remote, or with the store off, nothing is published: the daemon's.
+            assert!(by_daemon(&asked, &env(&[])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_CACHE", "../writer-store")])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_REMOTE", "../../owned-remote")])));
+            let off = env(&[("RA_JIT_CACHE", "off"), ("RA_JIT_REMOTE", "../../owned-remote")]);
+            assert!(by_daemon(&asked, &off));
+            let empty = env(&[("RA_JIT_CACHE", "../writer-store"), ("RA_JIT_REMOTE", "")]);
+            assert!(by_daemon(&asked, &empty));
+        }
+    }
+
+    /// Two builds with different compiler settings must not publish from the same file.
     #[test]
     fn a_build_links_into_a_directory_of_its_own() {
         let target = Path::new("/ws/target");

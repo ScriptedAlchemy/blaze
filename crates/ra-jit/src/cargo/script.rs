@@ -1483,8 +1483,8 @@ mod tests {
         assert_eq!(runs(&out_dir), 2);
     }
 
-    /// The verifier's case of round 3: a script that counts its runs in what it generates. It
-    /// runs once for one change, as under cargo, and cargo's next build finds it run.
+    /// A script that embeds its run count runs once per change. Cargo's next build
+    /// recognizes the completed run.
     #[test]
     fn a_script_that_counts_its_runs_runs_once_for_a_change() {
         let lines = "#!/bin/sh\ncount=$(cat \"$OUT_DIR/count\" 2>/dev/null || echo 0)\ncount=$((count + 1))\necho $count > \"$OUT_DIR/count\"\necho \"pub const RUNS: u32 = $count;\" > \"$OUT_DIR/generated.rs\"\necho \"cargo:in=$OUT_DIR\"\n";
@@ -1619,9 +1619,8 @@ mod tests {
         assert_eq!(runs(&out_dir), 0, "the script did not run");
     }
 
-    /// The verifier's case of round 3: with `build.build-dir`, cargo 1.99 holds
-    /// `.cargo-build-lock` in the build directory while it runs a script there, and its
-    /// `.cargo-lock` is in the other directory, the one of what it builds.
+    /// With `build.build-dir`, Cargo 1.99 holds `.cargo-build-lock` in the build directory
+    /// while running a script there. Its `.cargo-lock` is in the output directory.
     #[test]
     fn a_run_while_a_cargo_builds_in_a_build_directory_set_apart_is_cargos() {
         let out_dir = ran_script("build-dir", COUNTS, "");
@@ -1976,8 +1975,8 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert_eq!(wrote, (Err("wrote something else".to_owned()), "new".to_owned()));
     }
 
-    /// The verifier's case of round 2 (docs/reports/BUILDSCRIPT.md): two names of one file, which
-    /// a copy makes two files.
+    /// The script must observe hard links as one file. Copying their bytes would break
+    /// that identity, as described in docs/reports/BUILDSCRIPT.md.
     #[test]
     fn two_names_of_one_file_are_one_file_as_under_cargo() {
         let lines = "#!/bin/sh\nif [ \"$OUT_DIR/a\" -ef \"$OUT_DIR/b\" ]; then printf %s new > \"$OUT_DIR/data\"; fi\necho \"cargo:in=$OUT_DIR\"\n";
@@ -1989,8 +1988,8 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert_eq!(wrote, (Err("wrote something else".to_owned()), "new".to_owned()));
     }
 
-    /// The verifier's case of round 2: a link to a link, the middle one of which the script
-    /// points elsewhere and back, which a copy made a link to where the last one led.
+    /// The script must observe changes to an intermediate symlink. A copy that resolves
+    /// the chain to its final target would hide those changes.
     #[test]
     fn a_link_to_a_link_leads_through_it_as_under_cargo() {
         let lines = "#!/bin/sh\nrm \"$OUT_DIR/middle\"\nln -s b \"$OUT_DIR/middle\"\nif [ \"$(cat \"$OUT_DIR/alias\")\" = B ]; then printf %s new > \"$OUT_DIR/data\"; fi\nrm \"$OUT_DIR/middle\"\nln -s a \"$OUT_DIR/middle\"\necho \"cargo:in=$OUT_DIR\"\n";
@@ -2004,7 +2003,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert_eq!(wrote, (Err("wrote something else".to_owned()), "new".to_owned()));
     }
 
-    /// The verifier's case of round 2: an extended attribute, which a copy of the bytes loses.
+    /// The script must see extended attributes, which copying file bytes would lose.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_extended_attribute_is_there_as_under_cargo() {

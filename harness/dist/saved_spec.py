@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -345,6 +346,26 @@ def owned_test_policy(runner, blaze, work, env):
     run("failure-remains-uncached", always | {"steady"}, expected=101)
 
 
+def cache_phase(blaze, stop_log, command):
+    """Run the application and stop its private daemon before the trace can finish."""
+    status = 1
+    try:
+        status = subprocess.run(command).returncode
+    finally:
+        try:
+            stop = subprocess.run([blaze, "cargo", "stop"], capture_output=True)
+            stop_status, output = stop.returncode, stop.stdout + stop.stderr
+        except OSError as error:
+            stop_status, output = 1, (str(error) + "\n").encode()
+        try:
+            Path(stop_log).write_bytes(output)
+        except OSError as error:
+            print(f"cannot record cache daemon shutdown: {error}", file=sys.stderr)
+            stop_status = stop_status or 1
+    result = status if status else stop_status
+    return 128 - result if result < 0 else result
+
+
 def owned_shared_cache(runner, blaze, work, env):
     """Owned compile subprocesses publish and consume the explicitly selected directory remote."""
     project = work / "owned-shared-cache"
@@ -358,8 +379,14 @@ def owned_shared_cache(runner, blaze, work, env):
                   RA_JIT_REMOTE_UNSIGNED="1", RA_JIT_REMOTE_LAZY="1")
     command = [blaze, "cargo", "run", "--manifest-path", "../Cargo.toml",
                "--config", "profile.dev.debug=0"]
-    out, err = runner.run("owned-cache-publish", command,
-                         dict(shared, RA_JIT_CACHE="../writer-store"), cwd)
+    def phase(name, phase_env):
+        with tempfile.TemporaryDirectory(prefix="rjc-", dir="/tmp") as home:
+            os.chmod(home, 0o700)
+            wrapped = [sys.executable, __file__, "--cache-phase", str(blaze),
+                       str(work / (name + "-stop.log")), *map(str, command)]
+            return runner.run(name, wrapped, dict(phase_env, RA_JIT_HOME=home), cwd)
+
+    out, err = phase("owned-cache-publish", dict(shared, RA_JIT_CACHE="../writer-store"))
     assert out == "42\n", (out, err)
     manifest = remote / "manifests/owned-cache"
     assert manifest.is_file() and manifest.stat().st_size, manifest
@@ -367,8 +394,8 @@ def owned_shared_cache(runner, blaze, work, env):
               for path in remote.rglob("*") if path.is_file()}
     published = {path.name.split(".pack")[0] for path in (remote / "packs").iterdir()}
     assert published, before
-    out, err = runner.run("owned-cache-fresh-reader", command,
-                         dict(shared, RA_JIT_CACHE="../reader-store", RA_JIT_REMOTE_READONLY="1"), cwd)
+    out, err = phase("owned-cache-fresh-reader",
+                     dict(shared, RA_JIT_CACHE="../reader-store", RA_JIT_REMOTE_READONLY="1"))
     assert out == "42\n", (out, err)
     fetched = {path.stem for path in (project / "reader-store").glob("*.pack")}
     assert published & fetched, (published, fetched)
@@ -954,4 +981,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--cache-phase":
+        sys.exit(cache_phase(sys.argv[2], sys.argv[3], sys.argv[4:]))
     main()

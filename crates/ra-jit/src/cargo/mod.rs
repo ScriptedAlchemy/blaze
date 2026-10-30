@@ -6,6 +6,7 @@ pub(crate) mod wrapper;
 
 mod affected;
 mod ancestor;
+mod cache_service;
 mod cli;
 pub(crate) mod client;
 pub(crate) mod loader;
@@ -69,13 +70,10 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     let code = match asked {
         Asked::Build(asked) => match asked.only_cargo() {
-            _ if matches!(asked.subcommand, Subcommand::Test | Subcommand::Check)
-                || !whole::asked_for(&asked) =>
-            {
-                spec::direct::command(&asked)?
+            None if whole::by_daemon(&asked, &blaze_spec::environment::native_process()) => {
+                build(&asked)?
             }
-            Some(_) => spec::direct::command(&asked)?,
-            None => build(&asked)?,
+            _ => spec::direct::command(&asked)?,
         },
         Asked::Cargo(args) => plain_cargo(args)?,
         Asked::Cache(args) => cache(args)?,
@@ -593,6 +591,7 @@ mod request_tests {
                 cfg_test: false,
                 selection: Default::default(),
                 env: BTreeMap::new(),
+                cache_env: None,
                 whole: false,
             },
             root: Default::default(),

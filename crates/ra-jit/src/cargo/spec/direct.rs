@@ -146,7 +146,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
     )?;
     // Cache service credentials and policy are compiler controls. Add them only
     // after producer recipes/descriptions are prepared; saved replay never opts in.
-    super::cache_service::configure(&mut compiler_env, &original, &cwd)?;
+    super::super::cache_service::configure(&mut compiler_env, &original, &cwd)?;
     let mut programs = blaze_spec::execution::programs_with(
         &prepared,
         &sysroot,

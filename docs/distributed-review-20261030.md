@@ -153,7 +153,7 @@ The changes address concrete interactions needed by that architecture:
 - **Owned cache configuration:** preserve explicit shared-cache, project, trust, transport and
   resource policy for ordinary compiler children. Caller-relative service paths are resolved
   before child directories change. See
-  [cache_service.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/ra-jit/src/cargo/spec/cache_service.rs).
+  [cache_service.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/ra-jit/src/cargo/cache_service.rs).
 - **Compiler environment identity on #15/#18:** discover inputs before memoizing identity; key effective
   observed values, including authoritative crate overlays and dependency reads; distinguish
   unset, empty and non-Unicode values; and exclude only unobserved cache-service controls for

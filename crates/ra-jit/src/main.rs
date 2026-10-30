@@ -27,6 +27,7 @@ mod native_inputs;
 mod outline;
 mod plan;
 mod process;
+mod project_input;
 mod recovery;
 mod remote;
 mod sandbox;
@@ -81,6 +82,7 @@ use hir_ty_codegen::{
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
+use project_input::{CheckoutRoot, LoadOrigin, ProjectInput};
 use project_model::{
     CargoConfig, CargoFeatures, CargoWorkspace, ProjectManifest, ProjectWorkspace,
     ProjectWorkspaceKind, RustLibSource, TargetDirectoryConfig, WorkspaceBuildScripts,
@@ -169,6 +171,7 @@ struct Args {
     /// Run build scripts and build proc macros in a directory of ra-jit's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
     own_target: bool,
+    project_origin: LoadOrigin,
     /// What cargo said of the build scripts and proc macros of the build of `project`, a
     /// line each: the workspace is loaded with that, and nothing is run to find it out.
     scripts_from: Option<PathBuf>,
@@ -262,6 +265,7 @@ impl Args {
         let mut cfg_test = false;
         let mut dev_deps = false;
         let mut own_target = false;
+        let mut project_origin = LoadOrigin::Discover;
         let mut scripts_from = None;
         let mut features = Vec::new();
         let mut no_default_features = false;
@@ -312,6 +316,7 @@ impl Args {
                 "--cfg-test" => cfg_test = true,
                 "--dev-deps" => dev_deps = true,
                 "--own-target" => own_target = true,
+                "--cargo-project" => project_origin = LoadOrigin::CargoPackage,
                 "--scripts-from" => scripts_from = Some(PathBuf::from(value()?)),
                 "--also" => also.push(PathBuf::from(value()?)),
                 "--target" => target = Some(value()?),
@@ -369,6 +374,7 @@ impl Args {
             library: false,
             cfg_test,
             own_target,
+            project_origin,
             scripts_from,
             selection: plan::Selection {
                 profile: profile.unwrap_or_else(|| "dev".to_owned()),
@@ -2379,6 +2385,7 @@ fn load(
     selection: plan::Selection,
     beside: Option<Beside>,
     scripts_said: Option<Vec<String>>,
+    origin: LoadOrigin,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Checkouts)> {
     let replay = std::env::var("RA_JIT_SPEC_REPLAY").is_ok_and(|value| value == "1");
     if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
@@ -2405,6 +2412,7 @@ fn load(
     let mut checkouts = Checkouts {
         compared: Default::default(),
         roots: Vec::new(),
+        origin,
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
@@ -2434,7 +2442,8 @@ type Compared = std::sync::Mutex<FxHashMap<PathBuf, ([u8; 32], [u8; 32], bool)>>
 struct Checkouts {
     compared: Compared,
     /// The project a build names, and the root of the workspace it is in.
-    roots: Vec<(PathBuf, PathBuf)>,
+    roots: Vec<CheckoutRoot>,
+    origin: LoadOrigin,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
     splits: Vec<Option<Split>>,
     loaded: load_cargo::Loaded,
@@ -2461,15 +2470,16 @@ struct Checkouts {
 impl Checkouts {
     fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
         let project = dunce::canonicalize(project)?;
-        let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
+        let root =
+            self.roots.iter().find(|it| it.input.project == project).map(|it| it.workspace.clone());
         root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
     }
 
     /// The checkout of `project`: its root, what it shares and its crates.
     fn parts(&self, project: &Path) -> anyhow::Result<Parts> {
         let root = self.root_of(project)?;
-        let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
-        let base = self.splits[at].as_ref().map(|it| it.base.clone());
+        let at = self.roots.iter().position(|it| it.workspace == root).expect("it has a root");
+        let base = self.splits[at].as_ref().map(|it| self.roots[it.base].workspace.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
         // An override for measuring one against the other.
         let level = match std::env::var("RA_JIT_DEBUGINFO").ok().as_deref() {
@@ -2485,7 +2495,7 @@ impl Checkouts {
     /// Whether the program of the checkout `project` is of is one rustc links from bitcode.
     fn lto(&self, project: &Path) -> anyhow::Result<bool> {
         let root = self.root_of(project)?;
-        Ok(self.roots.iter().zip(&self.debug).any(|((_, it), whole)| *it == root && whole.lto))
+        Ok(self.roots.iter().zip(&self.debug).any(|(it, whole)| it.workspace == root && whole.lto))
     }
 
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
@@ -2496,11 +2506,16 @@ impl Checkouts {
 
     /// The same, among the loaded checkouts `sharing` allows.
     fn alike_by(&self, project: &Path, sharing: &Sharing) -> Option<(usize, PathBuf)> {
-        let project = dunce::canonicalize(project).ok()?;
+        let input = ProjectInput::new(project, self.origin).ok()?;
+        let project = &input.project;
         // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
         project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
-            let (loaded, base) = &self.roots[at];
+            let root = &self.roots[at];
+            let (loaded, base) = (&root.input.project, &root.workspace);
+            if !root.selects(&input).ok()? {
+                return None;
+            }
             if self.splits[at].is_some() || !sharing.allows(base) {
                 return None;
             }
@@ -2544,7 +2559,7 @@ impl Checkouts {
     /// `base`.
     fn differing(&self, base: usize, over: &Path) -> BTreeSet<PathBuf> {
         let packages = self.packages(base);
-        let base = &self.roots[base].1;
+        let base = &self.roots[base].workspace;
         let nested: FxHashSet<&Path> = packages.iter().map(|it| &*it.0).collect();
         // A procedural macro is rustc's to build: one that is not the same is another build.
         packages
@@ -2561,7 +2576,7 @@ impl Checkouts {
     /// packages of `own` where `over` has them.
     fn split(&self, base: usize, over: &Path, own: &BTreeSet<PathBuf>) -> ProjectWorkspace {
         let mut workspace = self.loaded.workspaces()[base].clone();
-        let root = AbsPathBuf::assert_utf8(self.roots[base].1.clone());
+        let root = AbsPathBuf::assert_utf8(self.roots[base].workspace.clone());
         let over = AbsPathBuf::assert_utf8(over.to_owned());
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
             *cargo = cargo.placed(&root, &over, &|dir| {
@@ -2577,9 +2592,12 @@ impl Checkouts {
         let mut differences = Vec::new();
         for (at, split) in self.splits.iter().enumerate() {
             let Some(split) = split else { continue };
-            let base = self.roots.iter().position(|(_, it)| *it == split.base);
-            let base = base.context("a checkout shares with a loaded one")?;
-            let own = self.differing(base, &self.roots[at].1);
+            let base = split.base;
+            if !self.roots[base].selects(&self.roots[at].input)? {
+                differences.push((at, base, split.own.clone()));
+                continue;
+            }
+            let own = self.differing(base, &self.roots[at].workspace);
             if own != split.own {
                 differences.push((at, base, own));
             }
@@ -2596,10 +2614,14 @@ impl Checkouts {
         differences: Vec<(usize, usize, BTreeSet<PathBuf>)>,
     ) -> anyhow::Result<()> {
         for (at, base, own) in differences {
-            let over = self.roots[at].1.clone();
+            if !self.roots[base].selects(&self.roots[at].input)? {
+                self.unloaded.insert(at);
+                continue;
+            }
+            let over = self.roots[at].workspace.clone();
             eprintln!("split {}: its own are {own:?}", over.display());
             self.loaded.replace(at, self.split(base, &over, &own));
-            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+            self.splits[at] = Some(Split { base, own });
         }
         self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
@@ -2615,16 +2637,22 @@ impl Checkouts {
         quick: &dyn Fn(&Path, &Path) -> bool,
         sharing: &Sharing,
     ) -> Option<View> {
-        let project = dunce::canonicalize(project).ok()?;
-        if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
-            return Some(View { base: root.clone(), over: root.clone(), project });
+        let input = ProjectInput::new(project, self.origin).ok()?;
+        let project = input.project.clone();
+        if let Some(root) = self.roots.iter().find(|it| it.input.project == project) {
+            return root.selects(&input).ok()?.then(|| View {
+                base: root.workspace.clone(),
+                over: root.workspace.clone(),
+                project,
+            });
         }
         if overlay == Overlay::Never {
             return None;
         }
         // One that shares packages with another has those where the other is.
         let (at, over) = self.alike_by(&project, sharing)?;
-        let (loaded, base) = &self.roots[at];
+        let root = &self.roots[at];
+        let (loaded, base) = (&root.input.project, &root.workspace);
         viewing(overlay, quick(base, &over)).then(|| View {
             base: base.clone(),
             over,
@@ -2641,22 +2669,27 @@ impl Checkouts {
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> Sharing {
-        let Ok(project) = dunce::canonicalize(project) else { return Sharing::Alone };
-        if self.roots.iter().any(|(it, _)| *it == project) {
-            return Sharing::Open;
+        let Ok(input) = ProjectInput::new(project, self.origin) else { return Sharing::Alone };
+        let project = &input.project;
+        if let Some(root) = self.roots.iter().find(|it| it.input.project == *project) {
+            return if root.selects(&input).unwrap_or(false) {
+                Sharing::Open
+            } else {
+                Sharing::Alone
+            };
         }
         let Some((at, over)) = self.alike(&project) else { return Sharing::Alone };
-        let viewed = viewing(overlay, quick(&self.roots[at].1, &over));
+        let viewed = viewing(overlay, quick(&self.roots[at].workspace, &over));
         match sharing_allowed(viewed, splitting()) {
-            true => Sharing::From(self.roots[at].1.clone()),
+            true => Sharing::From(self.roots[at].workspace.clone()),
             false => Sharing::Alone,
         }
     }
 
     /// The checkout that the one at `root` has packages of, when it has.
     fn shares_with(&self, root: &Path) -> Option<&Path> {
-        let at = self.roots.iter().position(|it| it.1 == root)?;
-        self.splits[at].as_ref().map(|it| &*it.base)
+        let at = self.roots.iter().position(|it| it.workspace == root)?;
+        self.splits[at].as_ref().map(|it| self.roots[it.base].workspace.as_path())
     }
 
     /// Whether what cargo and rustc did for the checkout at `base` is what they would do for
@@ -2747,25 +2780,32 @@ impl Checkouts {
         let mut watched = Vec::new();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
+        let mut replacements = Vec::new();
+        let mut generations = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
         // A checkout like a loaded one shares the packages they have alike, unless told not to, or
         // unless the request that joins it chose to read it through another checkout, or none
         // (`sharing`): only the checkout whose scripts were judged for it supplies its packages.
         let share = splitting();
         for project in projects {
-            if share && let Some((base, over)) = self.alike_by(project, sharing) {
+            let input = ProjectInput::new(project, self.origin)?;
+            let manifest = input.manifest()?;
+            let existing = self.roots.iter().position(|it| it.input.project == input.project);
+            if share
+                && existing.is_none()
+                && let Some((base, over)) = self.alike_by(project, sharing)
+            {
                 let own = self.differing(base, &over);
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
-                splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                splits.push(Some(Split { base, own }));
                 debug.push(self.debug[base]);
-                roots.push((dunce::canonicalize(project)?, over));
+                roots.push(CheckoutRoot { input, workspace: over, manifest });
                 continue;
             }
-            splits.push(None);
             let beside = self.beside.as_mut().filter(|it| it.at == usize::MAX);
             let beside = beside.map(|it| {
-                it.at = self.roots.len() + roots.len();
+                it.at = existing.unwrap_or(self.roots.len() + roots.len());
                 it
             });
             // Cargo's lines are of the build of the project asked for first.
@@ -2778,6 +2818,7 @@ impl Checkouts {
             let load_env = env.cloned().unwrap_or_else(scripts::load_env);
             let (workspace, told, own, generation) = workspace_at(
                 project,
+                manifest.clone(),
                 &self.cargo_config,
                 &self.load_config,
                 &self.selection,
@@ -2786,7 +2827,6 @@ impl Checkouts {
                 None,
                 Some((&load_env, build)),
             )?;
-            debug.push(told);
             // Non-producer workspaces retain the existing shared script target. Producer
             // workspaces select and lease their own content generation in workspace_at.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
@@ -2802,13 +2842,22 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            if let Some(generation) = generation {
-                self.macro_generations.insert(root.clone(), generation);
-            }
+            generations.push((
+                existing.map(|at| self.roots[at].workspace.clone()),
+                root.clone(),
+                generation,
+            ));
             world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
             watched.push((root.clone(), workspace.clone(), self.cargo_config.clone(), build, own));
-            roots.push((dunce::canonicalize(project)?, root));
-            workspaces.push(workspace);
+            let entry = CheckoutRoot { input, workspace: root, manifest };
+            if let Some(at) = existing {
+                replacements.push((at, entry, workspace, told));
+            } else {
+                roots.push(entry);
+                workspaces.push(workspace);
+                splits.push(None);
+                debug.push(told);
+            }
             scripts::barrier::hold("group", owner);
         }
         // What the database is about to be loaded from is what the scripts left: the leases of
@@ -2816,6 +2865,21 @@ impl Checkouts {
         world.sort();
         world.dedup();
         let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
+        for (before, root, generation) in generations {
+            if let Some(before) = before {
+                self.macro_generations.remove(&before);
+            }
+            if let Some(generation) = generation {
+                self.macro_generations.insert(root, generation);
+            }
+        }
+        for (at, root, workspace, debug) in replacements {
+            self.roots[at] = root;
+            self.loaded.replace(at, workspace);
+            self.splits[at] = None;
+            self.debug[at] = debug;
+            self.unloaded.remove(&at);
+        }
         self.refresh_macro_image_identities();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         for (root, workspace, config, build, own) in watched {
@@ -2930,8 +2994,11 @@ impl Checkouts {
         build: u64,
         shares: Option<&Path>,
     ) -> anyhow::Result<Vec<usize>> {
-        let project = dunce::canonicalize(project).ok();
-        let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
+        let input = ProjectInput::new(project, self.origin)?;
+        let asked = self.roots.iter().position(|it| it.input.project == input.project);
+        if let Some(at) = asked {
+            self.roots[at].input = input;
+        }
         // The checkout whose scripts the build reads: the project's own (the one it shares
         // packages with, for a split), or, for a project that is not loaded, the one chosen to be
         // read through (`shares`, from `Checkouts::sharing`; nothing else is accepted later, see
@@ -2939,28 +3006,40 @@ impl Checkouts {
         // checkout that is loaded: its own scripts are judged when it is, with its own owner and
         // variables.
         let built = match asked {
-            Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
-            None => {
-                shares.and_then(|it| self.roots.iter().map(|it| &it.1).find(|root| *root == it))
-            }
+            Some(at) => Some(
+                self.splits[at]
+                    .as_ref()
+                    .map_or(&self.roots[at].workspace, |it| &self.roots[it.base].workspace),
+            ),
+            None => shares
+                .and_then(|it| self.roots.iter().map(|it| &it.workspace).find(|root| *root == it)),
         };
         let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
-        for (at, (_, root)) in self.roots.iter().enumerate() {
+        for (at, entry) in self.roots.iter().enumerate() {
+            let root = &entry.workspace;
+            if (asked == Some(at) || reached(built.map(|it| it.as_path()), root))
+                && !entry.selects(&entry.input)?
+            {
+                stale.push(at);
+                continue;
+            }
             if self.unloaded.contains(&at) {
                 // A split that could not be loaded again is asked to be, by a request that reads
                 // it or the checkout it shares packages with, and by no other.
                 let reads = asked == Some(at)
-                    || self.splits[at]
-                        .as_ref()
-                        .is_some_and(|it| built.is_some_and(|b| *b == it.base));
+                    || self.splits[at].as_ref().is_some_and(|it| {
+                        built.is_some_and(|b| *b == self.roots[it.base].workspace)
+                    });
                 if reads {
                     stale.push(at);
                 }
                 continue;
             }
             let changed = match &self.splits[at] {
-                Some(split) => asked == Some(at) && !self.builds_alike(&split.base, root),
+                Some(split) => {
+                    asked == Some(at) && !self.builds_alike(&self.roots[split.base].workspace, root)
+                }
                 None => match known.get(&**root) {
                     Some(&changed) => changed,
                     None => {
@@ -3002,21 +3081,27 @@ impl Checkouts {
         for &at in stale {
             loaded.push(self.loaded_again(at, env, build)?);
         }
-        for (&at, (workspace, debug, config, given, own, generation)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config, &given, build, own, generation);
+        for (&at, (workspace, debug, config, given, own, generation, manifest)) in
+            stale.iter().zip(loaded)
+        {
+            self.place(at, workspace, debug, &config, &given, build, own, generation, manifest);
         }
         pause_mid_reload();
         let mut failed = Ok(());
         for at in 0..self.roots.len() {
-            let Some(base) = self.splits[at].as_ref().map(|it| it.base.clone()) else { continue };
-            let Some(base) = stale.iter().copied().find(|&it| self.roots[it].1 == base) else {
+            let Some(base) = self.splits[at].as_ref().map(|it| it.base) else { continue };
+            if !stale.contains(&base) {
                 continue;
-            };
-            let over = self.roots[at].1.clone();
-            if !self.builds_alike(&self.roots[base].1, &over) {
+            }
+            let over = self.roots[at].workspace.clone();
+            if !self.roots[base].selects(&self.roots[at].input)?
+                || !self.builds_alike(&self.roots[base].workspace, &over)
+            {
                 match self.loaded_again(at, env, build) {
-                    Ok((workspace, debug, config, given, own, generation)) => {
-                        self.place(at, workspace, debug, &config, &given, build, own, generation);
+                    Ok((workspace, debug, config, given, own, generation, manifest)) => {
+                        self.place(
+                            at, workspace, debug, &config, &given, build, own, generation, manifest,
+                        );
                         continue;
                     }
                     // Not the fallback: it is a world nothing was loaded from. This one stays
@@ -3030,7 +3115,7 @@ impl Checkouts {
             }
             let own = self.differing(base, &over);
             self.loaded.replace(at, self.split(base, &over, &own));
-            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+            self.splits[at] = Some(Split { base, own });
             self.debug[at] = self.debug[base];
         }
         self.refresh_macro_image_identities();
@@ -3077,8 +3162,11 @@ impl Checkouts {
         FxHashMap<String, Option<String>>,
         Option<scripts::Own>,
         Option<macro_inputs::Generation>,
+        ProjectManifest,
     )> {
-        let (project, root) = self.roots[at].clone();
+        let entry = &self.roots[at];
+        let (input, root) = (entry.input.clone(), entry.workspace.clone());
+        let manifest = input.manifest()?;
         let mut config = self.cargo_config.clone();
         let given = self.inputs.variables(&root, env);
         config.extra_env.extend(given.clone());
@@ -3090,7 +3178,8 @@ impl Checkouts {
         let asked: BTreeMap<String, String> =
             env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
         let (workspace, debug, own, generation) = workspace_at(
-            &project,
+            input.location(),
+            manifest.clone(),
             &config,
             &self.load_config,
             &self.selection,
@@ -3105,7 +3194,7 @@ impl Checkouts {
             }
             own
         });
-        Ok((workspace, debug, config, given, own, generation))
+        Ok((workspace, debug, config, given, own, generation, manifest))
     }
 
     /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
@@ -3120,16 +3209,18 @@ impl Checkouts {
         build: u64,
         own: Option<scripts::Own>,
         generation: Option<macro_inputs::Generation>,
+        manifest: ProjectManifest,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.macro_generations.remove(&root);
+        self.macro_generations.remove(&self.roots[at].workspace);
         if let Some(generation) = generation {
             self.macro_generations.insert(root.clone(), generation);
         }
         self.unloaded.remove(&at);
         self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
-        self.roots[at].1 = root;
+        self.roots[at].workspace = root;
+        self.roots[at].manifest = manifest;
         self.splits[at] = None;
         self.debug[at] = debug;
     }
@@ -3280,8 +3371,8 @@ fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
 /// same in both are the crates of the loaded one, and only the others are crates of its own.
 #[derive(Clone, PartialEq)]
 struct Split {
-    /// The root of the loaded checkout.
-    base: PathBuf,
+    /// The index of the loaded checkout, retained when its workspace root changes.
+    base: usize,
     /// The directories of the packages it has other files in, as they are called in both.
     own: BTreeSet<PathBuf>,
 }
@@ -3417,6 +3508,7 @@ struct View {
 #[expect(clippy::too_many_arguments, reason = "each says where what the scripts said comes from")]
 fn workspace_at(
     project: &Path,
+    manifest: ProjectManifest,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
     selection: &plan::Selection,
@@ -3430,8 +3522,6 @@ fn workspace_at(
     Option<scripts::Own>,
     Option<macro_inputs::Generation>,
 )> {
-    let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
-    let manifest = ProjectManifest::discover_single(&root)?;
     let mut config = cargo_config.clone();
     let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
         && matches!(manifest, ProjectManifest::ProjectJson(_))
@@ -6925,6 +7015,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             library: args.library,
             cfg_test: args.cfg_test,
             own_target: args.own_target,
+            project_origin: args.project_origin,
             scripts_from: None,
             selection: args.selection.clone(),
             also: Vec::new(),
@@ -8478,8 +8569,15 @@ impl Held {
         // An empty package has no build script, and asking cargo for one waits for the lock
         // of the target directory, which a build that started beside this holds until it ends.
         let scriptless = LoadCargoConfig { load_out_dirs_from_check: false, ..load_config() };
-        let (db, vfs, mut checkouts) =
-            load(&[dir], &cargo_config(&args), scriptless, args.selection, None, None)?;
+        let (db, vfs, mut checkouts) = load(
+            &[dir],
+            &cargo_config(&args),
+            scriptless,
+            args.selection,
+            None,
+            None,
+            LoadOrigin::CargoPackage,
+        )?;
         checkouts.load_config = load_config();
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
@@ -8497,6 +8595,7 @@ impl Held {
         projects: &[&Path],
         cargo_config: &CargoConfig,
         selection: &plan::Selection,
+        origin: LoadOrigin,
     ) -> Option<Held> {
         let start = Instant::now();
         // The toolchain of the build is asked for before its workspace is loaded for nothing.
@@ -8517,6 +8616,7 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
+        self.checkouts.origin = origin;
         if let Err(why) = self.checkouts.add(
             projects,
             &mut self.db,
@@ -8813,12 +8913,12 @@ fn follow_cargo(
         let all = all || ended;
         if lines.len() > beside.applied && (now != ready || all && !all_applied) {
             let artifacts = macro_inputs::validate_artifacts(
-                &checkouts.roots[beside.at].0,
+                &checkouts.roots[beside.at].input.project,
                 &checkouts.selection,
                 &lines,
             )?;
             if let Some(generation) =
-                checkouts.macro_generations.get_mut(&checkouts.roots[beside.at].1)
+                checkouts.macro_generations.get_mut(&checkouts.roots[beside.at].workspace)
             {
                 generation.artifacts = artifacts;
             }
@@ -9037,13 +9137,21 @@ fn run_holding(
     let held = held.and_then(|mut held| {
         held.checkouts.beside = said.as_ref().map(beside);
         held.checkouts.scripts_said = scripts_said.clone();
-        held.with(&projects, &cargo_config, &selection)
+        held.with(&projects, &cargo_config, &selection, args.project_origin)
     });
     let (mut db, mut vfs, mut checkouts) = match held {
         Some(Held { db, vfs, checkouts }) => (db, vfs, checkouts),
         None => {
             let beside = said.as_ref().map(beside);
-            load(&projects, &cargo_config, load_config(), selection, beside, scripts_said)?
+            load(
+                &projects,
+                &cargo_config,
+                load_config(),
+                selection,
+                beside,
+                scripts_said,
+                args.project_origin,
+            )?
         }
     };
     let listed = Arc::new(Listed::default());
@@ -11718,6 +11826,135 @@ fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
     }
 
     #[test]
+    fn producer_target_is_independent_of_project_origin() {
+        let args = |flags: &[&str]| {
+            Args::parse(
+                ["project", "--crate", "app", "--out", "app.o"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .map(str::to_owned),
+            )
+            .unwrap()
+        };
+        assert_eq!(args(&["--own-target"]).project_origin, LoadOrigin::Discover);
+        assert_eq!(args(&["--cargo-project"]).project_origin, LoadOrigin::CargoPackage);
+        assert!(!args(&["--cargo-project"]).own_target);
+    }
+
+    fn source_checkouts(root: CheckoutRoot) -> Checkouts {
+        Checkouts {
+            compared: Default::default(),
+            roots: vec![root],
+            origin: LoadOrigin::Discover,
+            splits: vec![None],
+            loaded: Default::default(),
+            cargo_config: Default::default(),
+            load_config: load_config(),
+            inputs: Default::default(),
+            unloaded: Default::default(),
+            selection: Default::default(),
+            debug: vec![plan::Whole {
+                debug: plan::Described::NOTHING,
+                lto: false,
+                lints_capped: false,
+            }],
+            beside: None,
+            scripts_said: None,
+            macro_generations: Default::default(),
+        }
+    }
+
+    #[test]
+    fn selected_source_precedes_same_directory_reuse_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("member");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname='origin'\nversion='0.1.0'\n")
+            .unwrap();
+        let input = ProjectInput::new(&project, LoadOrigin::Discover).unwrap();
+        let manifest = input.manifest().unwrap();
+        let root = CheckoutRoot { workspace: input.project.clone(), input, manifest };
+        let mut checkouts = source_checkouts(root);
+        let quick = |_: &Path, _: &Path| true;
+        assert!(checkouts.view_of(&project, Overlay::Never, &quick, &Sharing::Open).is_some());
+        std::fs::write(dir.path().join("rust-project.json"), "{\"crates\":[]}").unwrap();
+        assert!(checkouts.view_of(&project, Overlay::Never, &quick, &Sharing::Open).is_none());
+        assert!(matches!(checkouts.sharing(&project, Overlay::Never, &quick), Sharing::Alone));
+        assert_eq!(
+            checkouts.stale(&project, &ide_db::base_db::Env::default(), 0, None).unwrap(),
+            [0]
+        );
+        checkouts.splits[0] = Some(Split { base: 0, own: Default::default() });
+        assert_eq!(
+            checkouts.stale(&project, &ide_db::base_db::Env::default(), 0, None).unwrap(),
+            [0]
+        );
+        checkouts.origin = LoadOrigin::CargoPackage;
+        assert!(checkouts.view_of(&project, Overlay::Never, &quick, &Sharing::Open).is_some());
+    }
+
+    #[test]
+    fn split_ownership_survives_a_rediscovered_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dunce::canonicalize(dir.path()).unwrap();
+        let a = directory.join("a/member");
+        let b = directory.join("b/member");
+        let root = |project: &Path| {
+            std::fs::create_dir_all(project).unwrap();
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname='origin'\nversion='0.1.0'\n",
+            )
+            .unwrap();
+            let input = ProjectInput::new(project, LoadOrigin::Discover).unwrap();
+            let manifest = input.manifest().unwrap();
+            CheckoutRoot { workspace: input.project.clone(), input, manifest }
+        };
+        let mut checkouts = source_checkouts(root(&a));
+        checkouts.roots.push(root(&b));
+        checkouts.splits.push(Some(Split { base: 0, own: BTreeSet::new() }));
+        assert_eq!(checkouts.shares_with(&b), Some(a.as_path()));
+        let parent = a.parent().unwrap();
+        std::fs::write(parent.join("rust-project.json"), "{\"crates\":[]}").unwrap();
+        checkouts.roots[0].manifest = checkouts.roots[0].input.manifest().unwrap();
+        checkouts.roots[0].workspace = parent.to_owned();
+        assert_eq!(checkouts.shares_with(&b), Some(parent));
+        assert_eq!(checkouts.differences().unwrap(), [(1, 0, BTreeSet::new())]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incoming_descriptor_alias_is_reloaded_without_losing_the_loaded_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.json"), "{\"crates\":[]}").unwrap();
+        let paths = ["a", "b"].map(|name| {
+            let directory = dir.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("rust-project.json");
+            std::os::unix::fs::symlink("../data.json", &path).unwrap();
+            path
+        });
+        let input = ProjectInput::new(&paths[0], LoadOrigin::Discover).unwrap();
+        let manifest = input.manifest().unwrap();
+        let workspace = paths[0].parent().unwrap().to_owned();
+        let mut checkouts = source_checkouts(CheckoutRoot {
+            input,
+            manifest: manifest.clone(),
+            workspace: workspace.clone(),
+        });
+        assert_eq!(
+            checkouts.stale(&paths[1], &ide_db::base_db::Env::default(), 0, None).unwrap(),
+            [0]
+        );
+        assert_eq!(checkouts.roots[0].manifest, manifest);
+        assert_eq!(checkouts.roots[0].workspace, workspace);
+        assert_eq!(checkouts.roots[0].input.location(), paths[1]);
+        let quick = |_: &Path, _: &Path| true;
+        assert!(checkouts.view_of(&paths[0], Overlay::Never, &quick, &Sharing::Open).is_some());
+        assert!(checkouts.view_of(&paths[1], Overlay::Never, &quick, &Sharing::Open).is_none());
+    }
+
+    #[test]
     fn direct_builds_preserve_lockfile_policy_for_owned_loads() {
         for (flag, locked, offline) in
             [("--locked", true, false), ("--offline", false, true), ("--frozen", true, true)]
@@ -12360,9 +12597,18 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     let source = root.join("derive/src/lib.rs");
     let original = std::fs::read(&source).unwrap();
     let time = std::fs::metadata(&source).unwrap().modified().unwrap();
-    let (first_workspace, _, _, first) =
-        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
-            .unwrap();
+    let (first_workspace, _, _, first) = workspace_at(
+        &project,
+        ProjectInput::new(&project, LoadOrigin::CargoPackage).unwrap().manifest().unwrap(),
+        &config,
+        &load_config(),
+        &selection,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let first = first.unwrap();
     let first_path = first.path().to_owned();
     let macro_libraries = |workspace: &ProjectWorkspace| {
@@ -12390,9 +12636,18 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
     // No preceding Inputs::watch or manual Generation::prepare. This is the
     // production cold request ordering, with an existing producer target.
-    let (second_workspace, _, _, second) =
-        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
-            .unwrap();
+    let (second_workspace, _, _, second) = workspace_at(
+        &project,
+        ProjectInput::new(&project, LoadOrigin::CargoPackage).unwrap().manifest().unwrap(),
+        &config,
+        &load_config(),
+        &selection,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let second = second.unwrap();
     assert_ne!(first_path, second.path());
     let second_libraries = macro_libraries(&second_workspace);
@@ -12413,10 +12668,19 @@ fn cold_macro_loader_uses_content_and_rejects_input_io() {
     {
         std::os::unix::fs::symlink(root.join("absent-input"), root.join("derive/src/broken-input"))
             .unwrap();
-        let error =
-            workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
-                .err()
-                .expect("an unreadable producer must not use a default target");
+        let error = workspace_at(
+            &project,
+            ProjectInput::new(&project, LoadOrigin::CargoPackage).unwrap().manifest().unwrap(),
+            &config,
+            &load_config(),
+            &selection,
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("an unreadable producer must not use a default target");
         assert!(format!("{error:#}").contains("reading macro producer inputs"));
         std::fs::remove_file(root.join("derive/src/broken-input")).unwrap();
     }
@@ -12474,7 +12738,17 @@ fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
         (lines, artifacts)
     };
     let load_said = |lines| {
-        workspace_at(&project, &config, &load_config(), &selection, None, Some(lines), None, None)
+        workspace_at(
+            &project,
+            ProjectInput::new(&project, LoadOrigin::CargoPackage).unwrap().manifest().unwrap(),
+            &config,
+            &load_config(),
+            &selection,
+            None,
+            Some(lines),
+            None,
+            None,
+        )
     };
     let (first, artifacts) = cargo_build();
     assert!(!artifacts.is_empty() && artifacts.iter().all(|artifact| !artifact.fresh));
@@ -12515,6 +12789,7 @@ fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
     };
     let error = workspace_at(
         &project,
+        ProjectInput::new(&project, LoadOrigin::CargoPackage).unwrap().manifest().unwrap(),
         &config,
         &load_config(),
         &selection,

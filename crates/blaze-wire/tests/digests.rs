@@ -100,9 +100,8 @@ fn record_fields_0_to_5(record: &CrateRecord) -> Vec<u8> {
 
 #[test]
 fn the_golden_record_s_own_signature_is_over_its_six_fields() {
-    // The follow-up the verifier asked for: an independent check of the embedded field, not just
-    // the generic whole-value vector. The golden file's field 6 must be the vector key's signature
-    // over the six fields the server signs, under the CrateRecord domain.
+    // Field 6 must contain the vector key's signature over fields 0 to 5 under the
+    // CrateRecord domain. The whole-value vector does not check this embedded signature.
     let path = format!("{}/tests/golden/CrateRecord.txt", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).expect("no CrateRecord golden file");
     let golden = Vector::from_golden(&text).expect("the golden file is not a vector");

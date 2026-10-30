@@ -1,11 +1,19 @@
 //! Compiler-process cache policy, separate from the source request and saved BuildSpec.
 //!
-//! A direct command may explicitly select the existing shared cache service. A saved
+//! An ordinary command may explicitly select the existing shared cache service. A saved
 //! replay never acquires a worker's ambient remote, credentials or trust configuration.
 
 use std::{collections::BTreeMap, ffi::OsString, path::Path};
 
 use anyhow::Context as _;
+
+/// Whether `caller` selects a store and a remote of its own, which `configure` hands to the
+/// compiler processes. They pull before compiling and publish before they exit, so the
+/// command that started them returns with its packs on the remote.
+pub(in crate::cargo) fn selected(caller: &BTreeMap<String, OsString>) -> bool {
+    caller.get("RA_JIT_CACHE").is_some_and(|store| !ra_jit_store::is_off(store))
+        && caller.get("RA_JIT_REMOTE").is_some_and(|remote| !remote.is_empty())
+}
 
 pub(super) fn configure(
     compiler: &mut BTreeMap<String, OsString>,

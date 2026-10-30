@@ -21,9 +21,9 @@ acknowledgment for an earlier job can no longer free the slot of a newer job on 
 executor. Reassignment emits kills for the previous attempt and reserves the replacement only
 after assignment succeeds.
 
-The jobs simulator now delays and duplicates kill acknowledgments, drains those callbacks before
-finishing, checks the exact assignment reservation and checks that no live executor leads two
-executions. It also checks namespace and resource coverage as well as platform matching.
+The jobs simulator delays and duplicates kill acknowledgments, then drains them
+before finishing. It checks each assignment's reservation and rejects a live executor
+leading two executions. It also checks namespace, resource and platform matching.
 
 ### Deadlines are independent of timer ordering
 
