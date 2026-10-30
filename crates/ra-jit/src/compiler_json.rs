@@ -25,17 +25,80 @@ pub(crate) fn read(file: &Path) -> anyhow::Result<Value> {
 pub(crate) fn install_native(project: &Value) -> anyhow::Result<()> {
     let projection = projection(project)?;
     crate::dep_info::install_replay_key(project)?;
-    let units = match project.get(blaze_wire::native::UNIT_FIELD) {
-        Some(value) => {
-            let bytes: Vec<u8> = serde_json::from_value(value.clone())
-                .map_err(|_| anyhow::anyhow!("invalid owned native transport"))?;
-            blaze_wire::native::decode_units(&bytes)?
-        }
-        None => BTreeMap::new(),
-    };
+    let units = native_units(project)?;
     crate::native_inputs::set_native_units(units)?;
     paths::native::install(projection);
     Ok(())
+}
+
+fn native_units(project: &Value) -> anyhow::Result<BTreeMap<u32, blaze_wire::native::Unit>> {
+    let Some(value) = project.get(blaze_wire::native::UNIT_FIELD) else {
+        return Ok(BTreeMap::new());
+    };
+    let array =
+        value.as_array().ok_or_else(|| anyhow::anyhow!("invalid owned native transport"))?;
+    ensure!(
+        array.len() <= blaze_wire::Limits::DOCUMENTED.request as usize,
+        "invalid owned native transport"
+    );
+    let bytes: Vec<u8> = serde_json::from_value(value.clone())
+        .map_err(|_| anyhow::anyhow!("invalid owned native transport"))?;
+    blaze_wire::native::decode_units(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid owned native transport"))
+}
+
+pub(crate) fn source_environments(
+    project: &Value,
+) -> anyhow::Result<Vec<BTreeMap<OsString, OsString>>> {
+    let units = native_units(project)?;
+    let crates = project
+        .get("crates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("invalid compiler source environments"))?;
+    let mut environments = Vec::with_capacity(crates.len());
+    for krate in crates {
+        let unit = match krate.get("blaze_native_unit") {
+            Some(id) if !id.is_null() => {
+                let id: u32 = serde_json::from_value(id.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid compiler native unit"))?;
+                Some(
+                    units
+                        .get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("missing compiler native unit"))?,
+                )
+            }
+            _ => None,
+        };
+        let mut env = BTreeMap::new();
+        if let Some(values) = krate.get("env") {
+            let values = values
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("invalid compiler source environment"))?;
+            for (name, value) in values {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid compiler source environment"))?;
+                env.insert(OsString::from(name), OsString::from(value));
+            }
+        }
+        if let Some(markers) = krate.get("blaze_invalid_env") {
+            let markers = markers
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid compiler raw environment"))?;
+            for name in markers {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid compiler raw environment"))?;
+                let value = unit
+                    .and_then(|unit| unit.env.get(std::ffi::OsStr::new(name)))
+                    .filter(|value| value.to_str().is_none())
+                    .ok_or_else(|| anyhow::anyhow!("invalid compiler raw environment"))?;
+                env.insert(name.into(), value.clone());
+            }
+        }
+        environments.push(env);
+    }
+    Ok(environments)
 }
 
 fn cached(
@@ -367,6 +430,51 @@ mod tests {
         let logical = source_root(&sent).unwrap().unwrap();
         assert_eq!(physical_path(&sent, Path::new(logical.as_str())).unwrap(), root);
         assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn frontend_environments_follow_markers_and_referenced_units() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = OsString::from_vec(vec![0xff]);
+        let units = [
+            (
+                1,
+                blaze_wire::native::Unit {
+                    env: [
+                        ("RAW".into(), raw.clone()),
+                        ("TEXT".into(), raw.clone()),
+                        ("UNUSED".into(), raw.clone()),
+                    ]
+                    .into(),
+                    flags: vec![],
+                },
+            ),
+            (
+                2,
+                blaze_wire::native::Unit {
+                    env: [("OTHER".into(), raw.clone())].into(),
+                    flags: vec![],
+                },
+            ),
+        ]
+        .into();
+        let mut project = json!({
+            "crates": [{"env": {"RAW": "shadowed", "TEXT": "text"}, "blaze_invalid_env": ["RAW"], "blaze_native_unit": 1}],
+            blaze_wire::native::UNIT_FIELD: blaze_wire::native::encode_units(&units),
+        });
+        let env = source_environments(&project).unwrap().pop().unwrap();
+        assert_eq!(env[std::ffi::OsStr::new("RAW")], raw);
+        assert_eq!(env[std::ffi::OsStr::new("TEXT")], "text");
+        assert!(!env.contains_key(std::ffi::OsStr::new("UNUSED")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("OTHER")));
+        project["crates"][0]["blaze_invalid_env"] = json!(["OTHER"]);
+        assert!(source_environments(&project).is_err());
+        project["crates"][0]["blaze_invalid_env"] = json!(["TEXT"]);
+        project["crates"][0]["blaze_native_unit"] = json!(3);
+        assert!(source_environments(&project).is_err());
+        project[blaze_wire::native::UNIT_FIELD] = json!(["private-token"]);
+        assert!(!source_environments(&project).unwrap_err().to_string().contains("private-token"));
     }
 
     #[test]

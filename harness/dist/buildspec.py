@@ -1452,7 +1452,9 @@ def scan_programs(target):
     examples = set()
     for profile in sorted(os.listdir(target)):
         base = os.path.join(target, profile)
-        if profile.startswith(".") or not os.path.isdir(os.path.join(base, "deps")):
+        if profile.startswith(".") or not os.path.isdir(base):
+            continue
+        if profile not in ("debug", "release") and not os.path.isdir(os.path.join(base, "deps")):
             continue
         for sub, kind in (("", "bin"), ("examples", "example"), ("deps", "exe")):
             directory = os.path.join(base, sub) if sub else base
@@ -3108,6 +3110,15 @@ def self_test_parsing(t):
         got = scan_programs(tmp)
         t.check(got == ["bin:basic", "example:demo", "exe:basic"],
                 "programs are the executables of the profile directory, hashes dropped, libraries and metadata left out", str(got))
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel in ("debug/c", "release/c", "debug/ignored.d", "ra-jit/internal"):
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("x")
+            os.chmod(path, 0o755)
+        t.check(scan_programs(tmp) == ["bin:c x2"],
+                "published profile binaries are found without deps while internal files stay excluded")
     s = {"tests": [("a", "tests::adds", "ok"), ("a", "tests::slow", "ignored")], "programs": ["bin:basic"], "markers": ["@@bin basic add=3"], "exit": 0}
     t.check(check_lexpect(s, [("test", "adds", "ok"), ("no-test", "slow"), ("program", "bin", "basic"), ("no-program", "bin", "c"),
                               ("line", "add=3"), ("exit", 0)]) == [], "local expectations that hold are not reported")

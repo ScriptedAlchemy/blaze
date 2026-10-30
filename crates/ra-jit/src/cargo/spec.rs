@@ -975,8 +975,7 @@ pub(crate) fn admit_trace(
         }
     }
     generated.validate()?;
-    let crates =
-        project["crates"].as_array().context("no source crates in compiler description")?;
+    let environments = crate::compiler_json::source_environments(project)?;
     let trace_key = crate::dep_info::replay_key(project)?;
     let requester: Option<std::collections::BTreeSet<blaze_wire::Digest>> = project
         .get("blaze_spec_requester_names")
@@ -985,8 +984,8 @@ pub(crate) fn admit_trace(
         .context("invalid saved requester environment names")?;
     for (name, value) in &inputs.env {
         let declared = value.is_some()
-            && crates.iter().any(|krate| {
-                krate["env"].get(name).and_then(serde_json::Value::as_str).is_some_and(|declared| {
+            && environments.iter().any(|env| {
+                env.get(std::ffi::OsStr::new(name)).is_some_and(|declared| {
                     crate::dep_info::ReplayTrace::value_matches(
                         value.as_ref(),
                         Some(declared),
@@ -1001,7 +1000,7 @@ pub(crate) fn admit_trace(
                 let identity: blaze_wire::Digest = Sha256::digest(name.as_bytes()).into();
                 requester.as_ref().is_none_or(|names| names.contains(&identity))
             }) && (matches!(name.as_str(), "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" | "OUT_DIR")
-                || crates.iter().any(|krate| krate["env"].get(name).is_none()));
+                || environments.iter().any(|env| !env.contains_key(std::ffi::OsStr::new(name))));
         ensure!(declared || absent, "compiler read undeclared environment value {name}");
     }
     Ok(())
@@ -1145,6 +1144,18 @@ mod tests {
         assert!(admit_trace(&inputs("CAPTURED", None), &project).is_err());
         assert!(admit_trace(&inputs("CAPTURED", Some("worker-value")), &project).is_err());
         assert!(admit_trace(&inputs("NEVER_SET", Some("worker-value")), &project).is_err());
+        let mut mixed = project.clone();
+        mixed["crates"] = serde_json::json!([{"env": {"CAPTURED": "saved-value"}}, {"env": {}}]);
+        admit_trace(&inputs("CAPTURED", None), &mixed).unwrap();
+        mixed["blaze_spec_requester_names"] =
+            serde_json::json!([Sha256::digest(b"CAPTURED").to_vec()]);
+        assert!(admit_trace(&inputs("CAPTURED", None), &mixed).is_err());
+        for name in ["OUT_DIR", "CARGO_PRIMARY_PACKAGE", "CARGO_BIN_NAME"] {
+            mixed["crates"] = serde_json::json!([{"env": {(name): "derived"}}]);
+            mixed["blaze_spec_requester_names"] =
+                serde_json::json!([Sha256::digest(name.as_bytes()).to_vec()]);
+            admit_trace(&inputs(name, None), &mixed).unwrap();
+        }
         // A captured value remains tied to the descriptor's private trace key.
         let mut altered = project.clone();
         altered[crate::dep_info::TRACE_KEY_FIELD] = serde_json::json!([9_u8; 32].to_vec());

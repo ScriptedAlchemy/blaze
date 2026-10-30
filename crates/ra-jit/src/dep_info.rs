@@ -27,32 +27,7 @@ impl DepInfo {
         krates: &[hir::Crate],
         asked: &str,
     ) -> anyhow::Result<Self> {
-        use ide_db::base_db::SourceDatabase as _;
-
-        let mut files = Vec::new();
-        for &krate in krates {
-            let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
-            files.extend(modules.map(|it| it.original_file(db).file_id(db)));
-            files.extend(
-                hir_def::include_macro_invoc(db, krate.into())
-                    .iter()
-                    .map(|(_, file)| file.file_id(db)),
-            );
-        }
-        let named = |id: &vfs::FileId| {
-            let root = db.file_source_root(*id).source_root_id(db);
-            let root = db.source_root(root).source_root(db);
-            Some(root.path_for_file(id)?.as_path()?.to_string())
-        };
-        let mut paths = Vec::new();
-        let included = krates.iter().flat_map(|it| db.included_by((*it).into()));
-        for path in files.iter().filter_map(named).chain(included.map(|(path, _)| path.to_string()))
-        {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-        anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
+        let paths = source_files(db, krates, asked)?;
         let mut env: Vec<_> = db
             .env_read()
             .into_iter()
@@ -97,6 +72,37 @@ impl DepInfo {
     }
 }
 
+fn source_files(
+    db: &crate::RootDatabase,
+    krates: &[hir::Crate],
+    asked: &str,
+) -> anyhow::Result<Vec<String>> {
+    use ide_db::base_db::SourceDatabase as _;
+
+    let mut files = Vec::new();
+    for &krate in krates {
+        let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
+        files.extend(modules.map(|it| it.original_file(db).file_id(db)));
+        files.extend(
+            hir_def::include_macro_invoc(db, krate.into()).iter().map(|(_, file)| file.file_id(db)),
+        );
+    }
+    let named = |id: &vfs::FileId| {
+        let root = db.file_source_root(*id).source_root_id(db);
+        let root = db.source_root(root).source_root(db);
+        Some(root.path_for_file(id)?.as_path()?.to_string())
+    };
+    let mut paths = Vec::new();
+    let included = krates.iter().flat_map(|it| db.included_by((*it).into()));
+    for path in files.iter().filter_map(named).chain(included.map(|(path, _)| path.to_string())) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
+    Ok(paths)
+}
+
 pub(crate) const TRACE_KEY_FIELD: &str = "blaze_replay_trace_key";
 
 static REPLAY_KEY: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
@@ -136,6 +142,46 @@ pub(crate) struct ReplayTrace {
 }
 
 impl ReplayTrace {
+    pub(crate) fn from_crates(
+        db: &crate::RootDatabase,
+        krates: &[hir::Crate],
+        asked: &str,
+        key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        let files = source_files(db, krates, asked)?;
+        let ambient: std::collections::BTreeMap<_, _> = crate::process::native().vars().collect();
+        let mut env = Vec::new();
+        for (krate, name) in db.env_read() {
+            if !krates.iter().any(|it| ide_db::base_db::Crate::from(*it) == krate) {
+                continue;
+            }
+            let declared = krate.env(db);
+            let value = if declared.is_non_unicode(&name) {
+                let unit =
+                    crate::native_inputs::native_unit_for_crate(db, krate)?.ok_or_else(|| {
+                        anyhow::anyhow!("missing native environment for raw compiler input")
+                    })?;
+                let value = unit
+                    .env
+                    .get(std::ffi::OsStr::new(&name))
+                    .filter(|value| value.to_str().is_none())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("invalid native environment for raw compiler input")
+                    })?;
+                Some(value.clone())
+            } else if let Some(value) = declared.get(&name) {
+                Some(value.into())
+            } else {
+                ambient.get(std::ffi::OsStr::new(&name)).cloned()
+            };
+            env.push((name, value.as_deref().map(|value| value_identity(value, key))));
+        }
+        env.sort_unstable();
+        env.dedup();
+        Ok(Self { files, env })
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_inputs(inputs: &DepInfo, key: [u8; 32]) -> Self {
         let identity = crate::env_identity::Identity::from_key(key);
         Self {
@@ -169,13 +215,26 @@ impl ReplayTrace {
 
     pub(crate) fn value_matches(
         actual: Option<&[u8; 32]>,
-        value: Option<&str>,
+        value: Option<&std::ffi::OsStr>,
         key: [u8; 32],
     ) -> bool {
-        let expected = value
-            .map(|value| crate::env_identity::Identity::from_key(key).digest(value.as_bytes()));
+        let expected = value.map(|value| value_identity(value, key));
         actual.copied() == expected
     }
+}
+
+fn value_identity(value: &std::ffi::OsStr, key: [u8; 32]) -> [u8; 32] {
+    let identity = crate::env_identity::Identity::from_key(key);
+    if let Some(text) = value.to_str() {
+        return identity.digest(text.as_bytes());
+    }
+    let mut bytes = b"\xffblaze-invalid-utf8\0".to_vec();
+    #[cfg(unix)]
+    bytes.extend_from_slice(b"unix\0");
+    #[cfg(windows)]
+    bytes.extend_from_slice(b"windows-utf16le\0");
+    bytes.extend(crate::process::os_bytes(value));
+    identity.digest(&bytes)
 }
 
 /// The files of a rule, which are apart by a space that has no backslash before it.
@@ -235,7 +294,85 @@ fn unescaped_variable(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn replay_collects_operation_native_values_from_real_crate_reads() {
+        use ide_db::base_db::{self, Env, SourceDatabase as _};
+        use std::os::unix::ffi::OsStringExt as _;
+        use test_fixture::WithFixture;
+
+        let (mut db, file) =
+            crate::RootDatabase::with_single_file("//- /main.rs crate:app\nfn main() {}\n");
+        let file = file.file_id(&db);
+        let mut files = vfs::file_set::FileSet::default();
+        files.insert(file, vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8("/main.rs".into())));
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(vec![base_db::SourceRoot::new_local(files)]);
+        db.apply_change(change);
+        let krate = base_db::all_crates(&db)[0];
+        let key = [7; 32];
+        for name in ["RAW", "EMPTY", "ABSENT", "OVERLAY"] {
+            db.env_is_read(krate, name);
+        }
+        db.set_env(krate, Env::from_iter([("OVERLAY".into(), "crate-value".into())]));
+        let collect = |raw| {
+            let _scope = crate::process::enter_native(crate::process::Native::of([
+                ("RAW".into(), std::ffi::OsString::from_vec(vec![raw])),
+                ("EMPTY".into(), "".into()),
+                ("OVERLAY".into(), "operation-value".into()),
+            ]));
+            ReplayTrace::from_crates(&db, &[krate.into()], "app", key).unwrap()
+        };
+        let ff = collect(0xff);
+        let fe = collect(0xfe);
+        let value =
+            |trace: &ReplayTrace, name: &str| trace.env.iter().find(|it| it.0 == name).unwrap().1;
+        assert_ne!(value(&ff, "RAW"), value(&fe, "RAW"));
+        assert_eq!(value(&ff, "ABSENT"), None);
+        assert!(ReplayTrace::value_matches(value(&ff, "EMPTY").as_ref(), Some("".as_ref()), key));
+        assert!(ReplayTrace::value_matches(
+            value(&ff, "OVERLAY").as_ref(),
+            Some("crate-value".as_ref()),
+            key
+        ));
+        assert!(!ReplayTrace::value_matches(
+            value(&ff, "OVERLAY").as_ref(),
+            Some("operation-value".as_ref()),
+            key
+        ));
+        assert!(!ReplayTrace::value_matches(
+            value(&ff, "RAW").as_ref(),
+            Some(std::ffi::OsString::from_vec(vec![0xff]).as_os_str()),
+            [8; 32]
+        ));
+        let encoded = ff.encode();
+        assert!(!encoded.windows(b"crate-value".len()).any(|it| it == b"crate-value"));
+    }
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn native_value_identities_distinguish_presence_and_raw_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let key = [7; 32];
+        let raw_ff = std::ffi::OsString::from_vec(vec![0xff]);
+        let raw_fe = std::ffi::OsString::from_vec(vec![0xfe]);
+        let ff = value_identity(&raw_ff, key);
+        assert_ne!(ff, value_identity(&raw_fe, key));
+        assert!(ReplayTrace::value_matches(Some(&ff), Some(&raw_ff), key));
+        assert!(!ReplayTrace::value_matches(Some(&ff), Some(&raw_fe), key));
+        assert!(!ReplayTrace::value_matches(Some(&ff), Some(&raw_ff), [8; 32]));
+        assert_eq!(
+            value_identity("é".as_ref(), key),
+            [
+                0x73, 0x78, 0x19, 0xbb, 0xf9, 0x47, 0xb5, 0x66, 0x28, 0xbb, 0x1c, 0xd8, 0x50, 0x45,
+                0x57, 0xe0, 0xe0, 0x5f, 0x8f, 0x0e, 0x1b, 0xd4, 0xc9, 0x0d, 0xaf, 0xe8, 0x49, 0x35,
+                0x65, 0x6c, 0x69, 0x99,
+            ]
+        );
+        assert_ne!(value_identity("".as_ref(), key), ff);
+        assert!(!ReplayTrace::value_matches(None, Some("".as_ref()), key));
+    }
 
     #[test]
     fn replay_preserves_inputs_that_cargo_dep_info_cannot_represent() {
@@ -276,13 +413,21 @@ mod tests {
         assert!(!bytes.windows(key.len()).any(|part| part == key));
         let decoded = ReplayTrace::decode(&bytes).unwrap();
         assert_eq!(decoded, trace);
-        assert!(ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some(token), key));
-        assert!(!ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some(token), [0x72; 32]));
-        assert!(!ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some("changed"), key));
-        assert!(ReplayTrace::value_matches(decoded.env[1].1.as_ref(), Some(""), key));
+        assert!(ReplayTrace::value_matches(decoded.env[0].1.as_ref(), Some(token.as_ref()), key));
+        assert!(!ReplayTrace::value_matches(
+            decoded.env[0].1.as_ref(),
+            Some(token.as_ref()),
+            [0x72; 32]
+        ));
+        assert!(!ReplayTrace::value_matches(
+            decoded.env[0].1.as_ref(),
+            Some("changed".as_ref()),
+            key
+        ));
+        assert!(ReplayTrace::value_matches(decoded.env[1].1.as_ref(), Some("".as_ref()), key));
         assert!(!ReplayTrace::value_matches(decoded.env[1].1.as_ref(), None, key));
         assert!(ReplayTrace::value_matches(decoded.env[2].1.as_ref(), None, key));
-        assert!(!ReplayTrace::value_matches(decoded.env[2].1.as_ref(), Some(""), key));
+        assert!(!ReplayTrace::value_matches(decoded.env[2].1.as_ref(), Some("".as_ref()), key));
     }
 
     #[test]

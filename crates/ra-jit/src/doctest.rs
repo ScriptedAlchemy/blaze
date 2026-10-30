@@ -1721,9 +1721,12 @@ fn admit_example(db: &RootDatabase, asked: &Asked, name: &str) -> anyhow::Result
         .map(hir::Crate::from)
         .filter(|krate| !krate.origin(db).is_lang())
         .collect();
-    let inputs = crate::dep_info::DepInfo::from_crates(db, &crates, name)?;
-    let trace =
-        crate::dep_info::ReplayTrace::from_inputs(&inputs, crate::dep_info::replay_key(project)?);
+    let trace = crate::dep_info::ReplayTrace::from_crates(
+        db,
+        &crates,
+        name,
+        crate::dep_info::replay_key(project)?,
+    )?;
     crate::cargo::spec::admit_trace(&trace, project)
 }
 

@@ -5163,14 +5163,13 @@ fn write_dep_info_of(
     path: &Path,
     private: bool,
 ) -> anyhow::Result<()> {
-    let dep_info::DepInfo { files: paths, env } =
-        dep_info::DepInfo::from_crates(db, krates, asked)?;
     if private && let Some(key) = dep_info::installed_replay_key() {
-        let inputs = dep_info::DepInfo { files: paths, env };
-        let trace = dep_info::ReplayTrace::from_inputs(&inputs, key);
+        let trace = dep_info::ReplayTrace::from_crates(db, krates, asked, key)?;
         return std::fs::write(path, trace.encode())
             .with_context(|| format!("writing {}", path.display()));
     }
+    let dep_info::DepInfo { files: paths, env } =
+        dep_info::DepInfo::from_crates(db, krates, asked)?;
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
     let target = dep_info::escaped(&exe.display().to_string());
     let mut text = format!("{target}: {}\n\n", escaped.join(" "));
@@ -6549,6 +6548,7 @@ const SURE: &[&str] = &[
     "E0560",
     "E0583",
     "E0599",
+    "non-unicode-env",
     "unresolved-macro-call",
 ];
 
@@ -11588,6 +11588,71 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_environment_macro_error_reaches_the_owned_checker() {
+        use ide_db::base_db::{self, Env};
+        use test_fixture::WithFixture;
+
+        let (mut db, file) = RootDatabase::with_single_file(
+            r#"
+//- /main.rs crate:app
+mod option { pub enum Option<T> { None, Some(T) } }
+#[rustc_builtin_macro]
+macro_rules! option_env { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+fn main() { let _ = option_env!("CFLAGS"); let _ = env!("CFLAGS"); }
+"#,
+        );
+        let file = file.file_id(&db);
+        let krate = base_db::all_crates(&db)[0];
+        base_db::set_process_env(
+            &mut db,
+            Env::from_iter([("CFLAGS".to_owned(), "ambient".to_owned())]),
+        );
+        let mut raw = Env::default();
+        raw.set_non_unicode("CFLAGS");
+        db.set_env(krate, raw);
+        let diagnostics = hir::attach_db(&db, || {
+            ide_diagnostics::semantic_diagnostics_within(
+                &db,
+                &ide_diagnostics::DiagnosticsConfig::test_sample(),
+                &ide_db::assists::AssistResolveStrategy::None,
+                file,
+                None,
+            )
+        });
+        let message = "environment variable `CFLAGS` is not a valid Unicode string";
+        let generated = diagnostics
+            .iter()
+            .find(|d| d.severity == ide_db::Severity::Error && d.message == message)
+            .expect("the builtin must generate its Unicode error");
+        assert_eq!(generated.code.as_str(), "non-unicode-env");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message == message && d.code.as_str() == "non-unicode-env")
+                .count(),
+            2
+        );
+        let sources = Sources { paths: [(file, PathBuf::from("/main.rs"))].into_iter().collect() };
+        let refused = broken_in(&db, &[file], &sources, Path::new("/"), None, true);
+        db.set_env(krate, Env::from_iter([("CFLAGS".to_owned(), "unicode".to_owned())]));
+        let valid = hir::attach_db(&db, || {
+            ide_diagnostics::semantic_diagnostics_within(
+                &db,
+                &ide_diagnostics::DiagnosticsConfig::test_sample(),
+                &ide_db::assists::AssistResolveStrategy::None,
+                file,
+                None,
+            )
+        });
+        assert!(!valid.iter().any(|d| d.message == message));
+        assert!(
+            refused.is_some_and(|said| serde_json::to_string(&said).unwrap().contains(message))
+        );
+    }
+
     #[test]
     fn compiler_diagnostics_report_preserves_the_daemon_error_record() {
         let work = tempfile::tempdir().unwrap();
