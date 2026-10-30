@@ -966,15 +966,7 @@ impl<'a> Runner<'a> {
         if !data.is_local {
             return data.version.to_string();
         }
-        let dir = PathBuf::from(data.manifest.parent().as_str());
-        let (include, exclude) = include_exclude(&dir);
-        match blaze_build_script::files::list_files(&dir, &include, &exclude) {
-            Ok(files) => {
-                fresh::package_fingerprint(&dir, blaze_build_script::files::last_modified(&files))
-            }
-            // cargo fails the build; a fingerprint that is never the same runs the script.
-            Err(err) => format!("unlisted: {err} {:?}", SystemTime::now()),
-        }
+        path_package_fingerprint(data.manifest.parent().as_ref())
     }
 
     /// The description of `package`'s run, as cargo runs it for the profile `lib`.
@@ -1586,6 +1578,17 @@ fn target_of(target: &project_model::TargetData) -> unit::Target {
         name: target.name.clone(),
         kind: vec![kind.to_owned()],
         crate_types: vec![crate_type.to_owned()],
+    }
+}
+
+pub(crate) fn path_package_fingerprint(dir: &Path) -> String {
+    let (include, exclude) = include_exclude(dir);
+    match blaze_build_script::files::list_files(dir, &include, &exclude) {
+        Ok(files) => {
+            fresh::package_fingerprint(dir, blaze_build_script::files::last_modified(&files))
+        }
+        // cargo fails the build; a fingerprint that is never the same runs the script.
+        Err(err) => format!("unlisted: {err} {:?}", SystemTime::now()),
     }
 }
 

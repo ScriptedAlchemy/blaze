@@ -294,6 +294,11 @@ struct Script {
     built_with: Vec<PathBuf>,
     /// What cargo compiles the script again for a change to: as it was when cargo last read it.
     files: Vec<Watched>,
+    /// What the run the daemon loaded printed and wrote, which a run after it is compared
+    /// with: `None` when it could not be read.
+    loaded: Option<crate::cargo::script::Run>,
+    /// The package's targets, which what cargo takes of what the script prints depends on.
+    output_targets: Vec<blaze_build_script::unit::Target>,
     /// What the files of the package that were no newer than the last run's start were, which a
     /// script that said nothing of what it reads runs again for any change to: a file written
     /// since the run began is a change by its time alone, as cargo's fingerprint of the
@@ -397,24 +402,33 @@ impl Script {
     /// Whether the script, run again as cargo ran it, prints and writes what it did for the
     /// load: what cargo would find when it ran it, without asking cargo. Not when the script
     /// itself is older than its source, or was compiled reading a variable cargo does not
-    /// set; cargo compiles it again.
-    fn reruns_the_same(&self) -> bool {
+    /// set; cargo compiles it again. `env` is a variable as the cargo that builds next has it.
+    fn reruns_the_same(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+        env_names: &[String],
+        dependencies: &[crate::cargo::script::Dependency],
+    ) -> anyhow::Result<bool> {
         use crate::cargo::script;
-        let Some(out_dir) = self.ran() else { return false };
+        let (Some(out_dir), Some(loaded)) = (self.ran(), &self.loaded) else { return Ok(false) };
         if !script::compiled_from_what_is_there(&out_dir, &self.workspace) {
-            return false;
+            return Ok(false);
         }
-        // `cargo ra-jit` ran it again before it asked for this build, as it does when
-        // something it reads changes: that is not done twice.
-        let package = std::iter::once(newest(&self.root, true));
-        let newest = self.files.iter().map(|it| newest(&it.path, it.package)).chain(package);
-        let newest = newest.collect::<Option<Vec<_>>>().and_then(|it| it.into_iter().max());
-        if newest.is_some_and(|it| script::checked_after(&out_dir, it))
-            && script::same_run(&out_dir, &self.out_dir)
-        {
-            return true;
+        // A run made since what it reads last changed, by cargo or by `cargo ra-jit` before
+        // it asked for this build, is the one cargo has, by cargo's records: it is not made
+        // twice.
+        // A run made now is cargo's only when it is the one loaded.
+        let same = |run: &script::Run| {
+            run.clone().named(&out_dir, &self.out_dir).and_then(|it| it.same_as(loaded)).is_ok()
+        };
+        let cargo = script::Cargo { env, env_names, targets: &self.output_targets, dependencies };
+        match script::judge(&out_dir, &cargo, same) {
+            Ok(run) => Ok(same(&run)),
+            Err(script::JudgementError::Unavailable(_)) => Ok(false),
+            Err(script::JudgementError::Failed(why)) => {
+                anyhow::bail!("the build script of `{}` {why}", self.package);
+            }
         }
-        script::rerun_matches(&out_dir, &self.out_dir).is_ok()
     }
 
     /// Where a run of the script that can be run again wrote: the load's, or else the last
@@ -723,6 +737,12 @@ impl Scripts {
                 package: cargo[package].name.clone(),
                 root: root.to_owned(),
                 workspace: workspace.to_owned(),
+                loaded: crate::cargo::script::Run::of(out_dir).ok(),
+                output_targets: cargo[package]
+                    .targets
+                    .iter()
+                    .map(|&it| target(&cargo[it]))
+                    .collect(),
                 targets: targets.map(|it| PathBuf::from(it.root.as_str())).collect(),
                 built_with: built_with(cargo, package),
                 files: Vec::new(),
@@ -813,7 +833,79 @@ impl Scripts {
         }
         // Cargo would run only the scripts whose files changed: each is run again here as
         // cargo ran it, which costs the script and not a cargo that resolves the workspace.
-        if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same()) {
+        let configured = crate::cargo::configured_env(self.workspace.workspace_root().as_ref());
+        let cargo_has = |name: &str| match env {
+            Some(env) => match configured.iter().find(|it| it.name == name) {
+                Some(it) if it.force || env.get(name).is_none() => Some(it.value.clone()),
+                _ => self.config.extra_env.get(name).cloned().unwrap_or_else(|| env.get(name)),
+            },
+            None => run_with(&self.config, name),
+        };
+        let env_names: Vec<String> = match env {
+            Some(env) => env
+                .iter()
+                .map(|(name, _)| name.to_owned())
+                .chain(self.config.extra_env.keys().cloned())
+                .chain(configured.iter().map(|it| it.name.clone()))
+                .collect(),
+            None => std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .chain(self.config.extra_env.keys().cloned())
+                .collect(),
+        };
+        let mut same = !variables;
+        let dependencies = match &self.workspace.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. } => cargo
+                .packages()
+                .filter_map(|package| {
+                    let links = cargo[package].links.clone()?;
+                    let script = self.scripts.iter().find(|it| {
+                        it.root == Path::new(cargo[package].manifest.parent().as_str())
+                    })?;
+                    let out_dir = script.ran()?;
+                    let parents = |kind| {
+                        cargo
+                            .packages()
+                            .filter(|&parent| {
+                                cargo[parent]
+                                    .dependencies
+                                    .iter()
+                                    .any(|dep| dep.pkg == package && dep.kind == kind)
+                            })
+                            .filter_map(|parent| {
+                                self.scripts
+                                    .iter()
+                                    .find(|it| {
+                                        it.root
+                                            == Path::new(cargo[parent].manifest.parent().as_str())
+                                    })
+                                    .and_then(Script::ran)
+                            })
+                            .collect()
+                    };
+                    Some(crate::cargo::script::Dependency {
+                        package: cargo[package].name.clone(),
+                        id: Some(cargo[package].id.repr.clone()),
+                        outside: !cargo[package].is_member,
+                        links,
+                        out_dir,
+                        parents: parents(project_model::DepKind::Normal),
+                        build_parents: parents(project_model::DepKind::Build),
+                        targets: script.output_targets.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if same {
+            for &at in &changed {
+                if !self.scripts[at].reruns_the_same(&cargo_has, &env_names, &dependencies)? {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if same {
             for at in changed {
                 self.scripts[at].files = self.scripts[at].watched(&[]);
                 self.scripts[at].package_stamp = self.scripts[at].package_now();
@@ -863,6 +955,25 @@ impl Scripts {
             self.ready = Some(said);
         }
         Ok(other)
+    }
+}
+
+/// `target` as `cargo metadata` lists it, which is what [`blaze_build_script`] reads.
+fn target(target: &project_model::TargetData) -> blaze_build_script::unit::Target {
+    let kind = match target.kind {
+        TargetKind::Bin => "bin",
+        TargetKind::Lib { is_proc_macro: true } => "proc-macro",
+        TargetKind::Lib { is_proc_macro: false } => "lib",
+        TargetKind::Example => "example",
+        TargetKind::Test => "test",
+        TargetKind::Bench => "bench",
+        TargetKind::BuildScript => "custom-build",
+        TargetKind::Other => "other",
+    };
+    blaze_build_script::unit::Target {
+        name: target.name.clone(),
+        kind: vec![kind.to_owned()],
+        crate_types: Vec::new(),
     }
 }
 
@@ -1222,6 +1333,8 @@ mod tests {
             package: "pkg".to_owned(),
             root: package.clone(),
             workspace: root.to_owned(),
+            loaded: None,
+            output_targets: Vec::new(),
             targets: vec![package.join("build.rs")],
             built_with: Vec::new(),
             files: Vec::new(),
