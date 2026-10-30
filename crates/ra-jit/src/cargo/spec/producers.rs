@@ -123,7 +123,7 @@ pub(super) fn prepare(
     runtime: Option<&serde_json::Value>,
     bindings: &blaze_spec::native::Closure,
 ) -> anyhow::Result<Producers> {
-    prepare_with(replay, sysroot, work, process_environment, runtime, Some(bindings), None)
+    prepare_with(replay, sysroot, work, process_environment, runtime, Some(bindings), None, None)
 }
 
 pub(super) fn prepare_live(
@@ -133,8 +133,18 @@ pub(super) fn prepare_live(
     process_environment: crate::process::Native,
     runtime: Option<&serde_json::Value>,
     environment: &BTreeMap<String, OsString>,
+    cargo: &Path,
 ) -> anyhow::Result<Producers> {
-    prepare_with(replay, sysroot, work, process_environment, runtime, None, Some(environment))
+    prepare_with(
+        replay,
+        sysroot,
+        work,
+        process_environment,
+        runtime,
+        None,
+        Some(environment),
+        Some(cargo),
+    )
 }
 
 fn prepare_with(
@@ -145,6 +155,7 @@ fn prepare_with(
     runtime: Option<&serde_json::Value>,
     bindings: Option<&blaze_spec::native::Closure>,
     environment: Option<&BTreeMap<String, OsString>>,
+    cargo: Option<&Path>,
 ) -> anyhow::Result<Producers> {
     let build = &replay.resolved.spec.build;
     let canonical = blaze_spec::assemble::canonical_units(build, &replay.resolved.graph)?;
@@ -169,8 +180,12 @@ fn prepare_with(
         .map(|(run, (at, _))| (at, run))
         .collect();
     let effective = environment.cloned().unwrap_or(replay.execution_environment()?);
-    let cargo =
-        super::runtime::cargo_frontend(&std::env::current_exe()?, &work.join("cargo-runtime"))?;
+    let cargo = match cargo {
+        Some(cargo) => cargo.to_owned(),
+        None => {
+            super::runtime::cargo_frontend(&std::env::current_exe()?, &work.join("cargo-runtime"))?
+        }
+    };
     let path = process_environment.vars().find(|(key, _)| key == "PATH").map(|(_, value)| value);
     let mut graph = captured::Graph { units: Vec::new(), runs: Vec::new() };
     let mut native = BTreeMap::new();

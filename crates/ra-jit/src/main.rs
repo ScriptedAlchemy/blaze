@@ -1534,7 +1534,7 @@ impl SymbolResolver for Resolver<'_> {
                 &root,
                 &self.root,
                 &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
-                &|krate| process_reads(self.db, krate),
+                &|krate| environment_reads(self.db, krate),
             ));
         }
         self.contents.id(
@@ -1542,11 +1542,14 @@ impl SymbolResolver for Resolver<'_> {
             places,
             krate,
             &|krate| self.stable_crate_id(krate),
-            // Every body of the crate has been looked through once it is listed, so that
-            // every variable it asks for is known.
+            // Keep local crates registered with the build's listing. Contents discovers
+            // all expression owners before asking for reads, including outside crates
+            // reached only through a dependency's environment identity.
             &|krate| {
-                self.listed.of(self.db, krate.into());
-                process_reads(self.db, krate)
+                if krate.data(self.db).origin.is_local() {
+                    self.listed.of(self.db, krate.into());
+                }
+                environment_reads(self.db, krate)
             },
         )
     }
@@ -6141,21 +6144,36 @@ fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     built
 }
 
-/// The variables of the process the build is for that `env!` and `option_env!` in `krate` have
-/// asked for and that are set, sorted. Those the crate's own variables answer are not asked of
-/// the process.
-fn process_reads(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<(String, String)> {
+/// Effective values observed by `env!` and `option_env!`, including authoritative
+/// crate overlays. Missing and non-Unicode inputs must not alias an empty string.
+fn environment_reads(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+) -> content::EnvironmentReads {
+    use content::EnvironmentValue;
     let env = krate.env(db);
-    let mut reads: Vec<(String, String)> = db
+    let mut reads: Vec<_> = db
         .env_read()
         .into_iter()
-        .filter(|(of, key)| *of == krate && !env.contains_key(key))
-        .filter_map(|(_, key)| {
-            let value = ide_db::base_db::process_env_var(db, &key)?;
-            Some((key, value))
+        .filter(|(of, _)| *of == krate)
+        .map(|(_, key)| {
+            let (value, non_unicode) = if env.contains_key(&key) {
+                (env.get(&key), env.is_non_unicode(&key))
+            } else {
+                (
+                    ide_db::base_db::process_env_var(db, &key),
+                    ide_db::base_db::process_env_is_non_unicode(db, &key),
+                )
+            };
+            let value = match (value, non_unicode) {
+                (_, true) => EnvironmentValue::NonUnicode,
+                (Some(value), false) => EnvironmentValue::Text(value),
+                (None, false) => EnvironmentValue::Unset,
+            };
+            (key, value)
         })
         .collect();
-    reads.sort_unstable();
+    reads.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     reads
 }
 
@@ -9340,6 +9358,7 @@ fn run_holding(
                     native.write(&path.with_extension("native.json"))?;
                 }
             }
+            write_reach(&db, &listed, &args, true);
             // The first program is compiled and linked: a process no daemon's build started
             // holds the scripts' output no more.
             scripts::release_load();

@@ -20,12 +20,23 @@ use triomphe::Arc;
 
 type Hash = [u8; 32];
 
+#[derive(Debug)]
+pub(crate) enum EnvironmentValue {
+    Text(String),
+    Unset,
+    NonUnicode,
+}
+
+pub(crate) type EnvironmentReads = Vec<(String, EnvironmentValue)>;
+
 /// The crates of one build. An edit makes another crate of the one it is in and of every
 /// crate of the checkout that depends on it.
 #[derive(Default)]
 pub(crate) struct Contents {
     crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
     source_hashes: Mutex<FxHashMap<Crate, Hash>>,
+    environments: Mutex<FxHashMap<Crate, Hash>>,
+    macro_consumers: Mutex<FxHashMap<Crate, bool>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -45,6 +56,134 @@ impl Contents {
         hash
     }
 
+    /// A reexport may put a macro in scope without a direct proc-macro dependency.
+    /// Their environment accesses are not observed, so their consumers retain the
+    /// complete crate environment in their identity.
+    fn uses_macros(&self, db: &RootDatabase, krate: Crate) -> bool {
+        if let Some(&known) =
+            self.macro_consumers.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+        {
+            return known;
+        }
+        let data = krate.data(db);
+        let uses = data.target_kind.is_proc_macro()
+            || data.dependencies.iter().any(|dep| self.uses_macros(db, dep.crate_id));
+        self.macro_consumers.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, uses);
+        uses
+    }
+
+    fn keyed_environment(&self, db: &RootDatabase, krate: Crate) -> ide_db::base_db::Env {
+        let mut env = krate.env(db).clone();
+        if !self.uses_macros(db, krate) {
+            // These exact cache-service controls do not affect Rust semantics unless
+            // source reads them. Such reads are hashed separately, before an entry is
+            // admitted. This copy only forms an identity: expansion and producers keep
+            // the original values, including native non-Unicode values.
+            for key in [
+                "RA_JIT_CACHE",
+                "RA_JIT_CACHE_MAX",
+                "RA_JIT_CACHE_SEAL_AT",
+                "RA_JIT_CACHE_CHECK",
+                "RA_JIT_REMOTE",
+                "RA_JIT_PROJECT",
+                "RA_JIT_REMOTE_READONLY",
+                "RA_JIT_REMOTE_LAZY",
+                "RA_JIT_REMOTE_PUSH_EVERY",
+                "RA_JIT_REMOTE_JOBS",
+                "RA_JIT_REMOTE_TIMEOUT",
+                "RA_JIT_REMOTE_MAX",
+                "RA_JIT_REMOTE_TRUST",
+                "RA_JIT_REMOTE_UNSIGNED",
+                "RA_JIT_REMOTE_SIGN",
+            ] {
+                env.set(key, "");
+            }
+        }
+        env
+    }
+
+    fn normalized_environment(
+        &self,
+        db: &RootDatabase,
+        krate: Crate,
+        checkouts: (&Path, Option<&Path>),
+        mut text: String,
+    ) -> String {
+        let env = krate.env(db);
+        let manifest = env.get("CARGO_MANIFEST_DIR");
+        let out = env.get("OUT_DIR");
+        let mut places: Vec<_> =
+            manifest.as_deref().map(|it| (it, "$PACKAGE")).into_iter().collect();
+        places.extend(out.as_deref().map(|it| (it, "$OUT")));
+        let (checkout, base) =
+            (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
+        places.push((&*checkout, "$CHECKOUT"));
+        places.extend(base.as_deref().map(|it| (it, "$CHECKOUT")));
+        // A package and its generated files may be below the checkout. Replace the
+        // longest path first, using the same convention as the existing crate key.
+        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        for (path, stands_for) in places.into_iter().filter(|(path, _)| !path.is_empty()) {
+            text = text.replace(path, stands_for);
+        }
+        if let Some(out) = out {
+            self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
+        }
+        text
+    }
+
+    fn environment_hash(
+        &self,
+        db: &RootDatabase,
+        krate: Crate,
+        environment_reads: &dyn Fn(Crate) -> EnvironmentReads,
+    ) -> Hash {
+        if let Some(&known) =
+            self.environments.lock().unwrap_or_else(|e| e.into_inner()).get(&krate)
+        {
+            return known;
+        }
+        // Discovery covers bodies, consts, discriminants, type signatures, and generic
+        // defaults. Identity must not depend on which lazy owner was requested first.
+        hir::input_owners::discover_current_inputs(db, krate);
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(b"ra-jit observed environment 1");
+        let reads = environment_reads(krate);
+        // Observed values remain exact. Even a checkout path can be used for a
+        // compile-time length or comparison, leaving no relocatable string behind.
+        field(&(reads.len() as u64).to_le_bytes());
+        for (key, value) in reads {
+            field(key.as_bytes());
+            match value {
+                EnvironmentValue::Unset => field(&[0]),
+                EnvironmentValue::NonUnicode => field(&[1]),
+                EnvironmentValue::Text(value) => {
+                    field(&[2]);
+                    field(value.as_bytes());
+                }
+            }
+        }
+        let macros = self.uses_macros(db, krate);
+        field(&[u8::from(macros)]);
+        if macros {
+            field(format!("{:?}", krate.env(db)).as_bytes());
+        }
+        // A caller may inline a library body, including its expanded environment
+        // constants. Source bytes and a library's linkage id alone do not cover these.
+        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
+        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        for dependency in dependencies {
+            field(dependency.name.as_str().as_bytes());
+            field(&self.environment_hash(db, dependency.crate_id, environment_reads));
+        }
+        let hash = hasher.finalize().into();
+        self.environments.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, hash);
+        hash
+    }
+
     /// `None` for a crate that depends on one `stable_crate_id` has nothing for and that is
     /// not of the checkout.
     pub(crate) fn id(
@@ -53,12 +192,12 @@ impl Contents {
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        environment_reads: &dyn Fn(Crate) -> EnvironmentReads,
     ) -> Option<ContentId> {
         if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return known;
         }
-        let id = self.hash(db, checkouts, krate, stable_crate_id, process_reads);
+        let id = self.hash(db, checkouts, krate, stable_crate_id, environment_reads);
         self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
         id
     }
@@ -118,7 +257,7 @@ impl Contents {
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        environment_reads: &dyn Fn(Crate) -> EnvironmentReads,
     ) -> Option<ContentId> {
         let data = krate.data(db);
         let mut hasher = Sha256::new();
@@ -126,7 +265,7 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit crate 3");
+        field(b"ra-jit crate 4");
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
@@ -169,26 +308,11 @@ impl Contents {
             field(path.as_bytes());
             field(hash);
         }
-        // Sorted by its `Debug`. Where the crate is stands for itself: code that has the place
-        // in it is not kept, see [`Contents::names_place`].
-        let mut env = format!("{env:?}");
-        // The longer path first: the others are often what it starts with.
-        let mut places = vec![(manifest.as_str(), "$PACKAGE")];
-        places.extend(out.as_deref().map(|out| (out, "$OUT")));
-        let (checkout, base) =
-            (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
-        places.push((&*checkout, "$CHECKOUT"));
-        places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
-        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
-        for (path, stands_for) in places {
-            env = env.replace(path, stands_for);
-        }
-        if let Some(out) = out.clone() {
-            self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
-        }
-        field(env.as_bytes());
-        // What `env!` and `option_env!` in it read of the process the build is for.
-        field(format!("{:?}", process_reads(krate)).as_bytes());
+        // Discover reads before keying the environment, including values supplied by
+        // Cargo or a build script instead of by the caller's process.
+        field(&self.environment_hash(db, krate, environment_reads));
+        let env = format!("{:?}", self.keyed_environment(db, krate));
+        field(self.normalized_environment(db, krate, checkouts, env).as_bytes());
         // What `include_bytes!` and `include_str!` in it read that no source root has, as it
         // was read: known once the crate is listed, which asking its reads had it be.
         let mut read: Vec<(Written, String, Hash)> = db
@@ -222,7 +346,7 @@ impl Contents {
             field(dependency.name.as_str().as_bytes());
             field(&macro_producer_identity(db, on));
             match on.data(db).origin.is_local() {
-                true => field(&self.id(db, checkouts, on, stable_crate_id, process_reads)?.0),
+                true => field(&self.id(db, checkouts, on, stable_crate_id, environment_reads)?.0),
                 false => {
                     field(&Self::outside(db, on, stable_crate_id(on)));
                     field(&self.source_hash(db, on));
@@ -243,7 +367,7 @@ impl Contents {
         root: &Path,
         checkout: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        environment_reads: &dyn Fn(Crate) -> EnvironmentReads,
     ) -> ContentId {
         if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
             return id;
@@ -253,7 +377,7 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit library 7");
+        field(b"ra-jit library 8");
         field(format!("{:?}", krate.data(db).codegen_flags).as_bytes());
         field(Self::version(db, krate).as_bytes());
         field(&self.source_hash(db, krate));
@@ -269,7 +393,7 @@ impl Contents {
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
         cfgs.sort_unstable();
         field(cfgs.join("\n").as_bytes());
-        field(format!("{:?}", process_reads(krate)).as_bytes());
+        field(&self.environment_hash(db, krate, environment_reads));
         let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
@@ -278,7 +402,7 @@ impl Contents {
             field(&macro_producer_identity(db, on));
             match known(on) {
                 Some((None, root)) => {
-                    field(&self.library(db, on, &root, checkout, known, process_reads).0)
+                    field(&self.library(db, on, &root, checkout, known, environment_reads).0)
                 }
                 Some((id, _)) => {
                     field(&Self::outside(db, on, id));
@@ -401,6 +525,308 @@ impl FileHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn environment_fixture(
+        body: &str,
+        library: bool,
+        macro_dependency: bool,
+        values: &[(&str, &str)],
+    ) -> (RootDatabase, [Crate; 2]) {
+        use test_fixture::WithFixture;
+        let library = if library { "library" } else { "" };
+        let macros = if macro_dependency { "deps:macros" } else { "" };
+        let fixture = format!(
+            "//- /checkout/app/lib.rs crate:app deps:dep\n\
+             pub fn caller() -> &'static str {{ dep::value() }}\n\
+             //- /checkout/dep/lib.rs crate:dep {library} {macros} new_source_root:local\n\
+             #[rustc_builtin_macro]\nmacro_rules! env {{ () => {{}} }}\n\
+             #[rustc_builtin_macro]\nmacro_rules! option_env {{ () => {{}} }}\n\
+             {body}\n\
+             //- /checkout/macros/lib.rs crate:proc-macro:macros new_source_root:local\n\
+             pub fn macro_producer() {{}}\n"
+        );
+        let (mut db, files) = RootDatabase::with_many_files(&fixture);
+        let mut change = ide_db::ChangeWithProcMacros::default();
+        change.set_roots(
+            ["app", "dep", "macros"]
+                .into_iter()
+                .zip(&files)
+                .map(|(name, file)| {
+                    let mut files = vfs::file_set::FileSet::default();
+                    files.insert(
+                        file.file_id(&db),
+                        vfs::VfsPath::from(paths::AbsPathBuf::assert_utf8(
+                            format!("/checkout/{name}/lib.rs").into(),
+                        )),
+                    );
+                    ide_db::base_db::SourceRoot::new_local(files)
+                })
+                .collect(),
+        );
+        db.apply_change(change);
+        let crates = ide_db::base_db::all_crates(&db);
+        let named = |name: &str| {
+            *crates
+                .iter()
+                .find(|krate| {
+                    krate.extra_data(&db).display_name.as_ref().unwrap().to_string() == name
+                })
+                .unwrap()
+        };
+        let [app, dep, macros] = ["app", "dep", "macros"].map(named);
+        for (name, krate) in [("app", app), ("dep", dep), ("macros", macros)] {
+            let mut env = krate.env(&db).clone();
+            env.set("CARGO_MANIFEST_DIR", format!("/checkout/{name}"));
+            if krate == dep {
+                for &(name, value) in values {
+                    env.set(name, value);
+                }
+            }
+            db.set_env(krate, env);
+        }
+        (db, [app, dep])
+    }
+
+    fn environment_ids(
+        db: &RootDatabase,
+        [app, dep]: [Crate; 2],
+        dependency_first: bool,
+        discover_first: bool,
+    ) -> [Hash; 2] {
+        hir::attach_db(db, || {
+            if discover_first {
+                hir::input_owners::discover_current_inputs(db, dep);
+            } else {
+                assert!(db.env_read().is_empty(), "identity is the first body consumer");
+            }
+            let table = crate::symbols::SymbolTable::default();
+            let known = hir_ty_codegen::Rejections::default();
+            let listed = crate::Listed::default();
+            let contents = Contents::default();
+            let mut args = crate::Args::parse(
+                ["/checkout", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned),
+            )
+            .unwrap();
+            args.checkout = Path::new("/checkout").to_owned();
+            let resolver = crate::Resolver::of(db, &table, &args, &known, &contents, &listed);
+            use hir_ty_codegen::SymbolResolver as _;
+            if dependency_first {
+                let dep_id = resolver.content_id(dep).unwrap().0;
+                [resolver.content_id(app).unwrap().0, dep_id]
+            } else {
+                [resolver.content_id(app).unwrap().0, resolver.content_id(dep).unwrap().0]
+            }
+        })
+    }
+
+    #[test]
+    fn unused_cache_service_environment_does_not_split_plain_source_identity() {
+        let identity = |value| {
+            let (db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { \"same source\" }",
+                false,
+                false,
+                &[
+                    ("RA_JIT_CACHE", value),
+                    ("RA_JIT_REMOTE", value),
+                    ("RA_JIT_PROJECT", value),
+                    ("RA_JIT_REMOTE_READONLY", value),
+                ],
+            );
+            environment_ids(&db, crates, false, false)
+        };
+        assert_eq!(identity("worker-one"), identity("worker-two"));
+        let arbitrary = |value| {
+            let (db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { \"same source\" }",
+                false,
+                false,
+                &[("ARBITRARY_BUILD_INPUT", value)],
+            );
+            environment_ids(&db, crates, false, false)
+        };
+        assert_ne!(arbitrary("one"), arbitrary("two"), "other inputs remain conservative");
+    }
+
+    #[test]
+    fn library_environment_reads_invalidate_both_library_and_dependent_content() {
+        let identity = |value, dependency_first, discover_first| {
+            let (db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { env!(\"RA_JIT_REMOTE\") }",
+                true,
+                false,
+                &[("RA_JIT_REMOTE", value)],
+            );
+            let ids = environment_ids(&db, crates, dependency_first, discover_first);
+            assert!(
+                db.env_read()
+                    .iter()
+                    .any(|&(of, ref key)| { of == crates[1] && key == "RA_JIT_REMOTE" })
+            );
+            hir::attach_db(&db, || {
+                let declared = crate::declared_in(&db, crates[1].into());
+                let body = hir_def::expr_store::body::Body::of(&db, declared.functions[0].into());
+                assert!(format!("{body:?}").contains(value), "expanded body must retain the value");
+            });
+            ids
+        };
+        let one = identity("worker-one", false, false);
+        let two = identity("worker-two", false, false);
+        assert_ne!(one[1], two[1], "the library body embeds the changed crate variable");
+        assert_ne!(one[0], two[0], "a caller may inline the changed library body");
+        for dependency_first in [false, true] {
+            for discover_first in [false, true] {
+                assert_eq!(one, identity("worker-one", dependency_first, discover_first));
+                assert_eq!(two, identity("worker-two", dependency_first, discover_first));
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_environment_owners_are_discovered_before_the_first_content_identity() {
+        for body in [
+            "pub fn value() -> &'static str { env!(\"RA_JIT_REMOTE\") }",
+            "const UNUSED: &str = env!(\"RA_JIT_REMOTE\"); pub fn value() -> &'static str { \"ok\" }",
+            "#[repr(u8)] enum E { X = env!(\"RA_JIT_REMOTE\").as_bytes()[0] } pub fn value() -> &'static str { \"ok\" }",
+            "type A = [u8; env!(\"RA_JIT_REMOTE\").len()]; pub fn value() -> &'static str { \"ok\" }",
+            "struct A([u8; env!(\"RA_JIT_REMOTE\").len()]); pub fn value() -> &'static str { \"ok\" }",
+            "struct A<const N: usize = { env!(\"RA_JIT_REMOTE\").len() }>; pub fn value() -> &'static str { \"ok\" }",
+        ] {
+            for library in [false, true] {
+                let identity = |value, dependency_first, discover_first| {
+                    let (db, crates) =
+                        environment_fixture(body, library, false, &[("RA_JIT_REMOTE", value)]);
+                    let result = environment_ids(&db, crates, dependency_first, discover_first);
+                    assert!(
+                        db.env_read()
+                            .iter()
+                            .any(|&(of, ref key)| { of == crates[1] && key == "RA_JIT_REMOTE" }),
+                        "cold discovery must visit {body}"
+                    );
+                    result
+                };
+                let one = identity("one", false, false);
+                let two = identity("other", false, false);
+                assert_ne!(one[0], two[0]);
+                assert_ne!(one[1], two[1]);
+                for dependency_first in [false, true] {
+                    for discover_first in [false, true] {
+                        assert_eq!(one, identity("one", dependency_first, discover_first));
+                        assert_eq!(two, identity("other", dependency_first, discover_first));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_environment_uses_crate_precedence_and_distinguishes_missing_native_values() {
+        let identity = |overlaid: Option<EnvironmentValue>, process: &str| {
+            let (mut db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { option_env!(\"BUILD_INPUT\").unwrap_or(\"absent\") }",
+                true,
+                false,
+                &[],
+            );
+            let mut env = crates[1].env(&db).clone();
+            let unset = matches!(overlaid, Some(EnvironmentValue::Unset));
+            match overlaid {
+                Some(EnvironmentValue::Text(value)) => env.set("BUILD_INPUT", value),
+                Some(EnvironmentValue::NonUnicode) => env.set_non_unicode("BUILD_INPUT"),
+                Some(EnvironmentValue::Unset) | None => {}
+            }
+            db.set_env(crates[1], env);
+            if !unset {
+                ide_db::base_db::set_process_env(
+                    &mut db,
+                    [("BUILD_INPUT".to_owned(), process.to_owned())].into_iter().collect(),
+                );
+            }
+            environment_ids(&db, crates, false, false)
+        };
+        let explicit = || Some(EnvironmentValue::Text("crate-value".to_owned()));
+        assert_eq!(identity(explicit(), "caller-one"), identity(explicit(), "caller-two"));
+        assert_ne!(identity(None, "caller-one"), identity(None, "caller-two"));
+        let missing = identity(Some(EnvironmentValue::Unset), "ignored");
+        let empty = identity(Some(EnvironmentValue::Text(String::new())), "caller");
+        let native = identity(Some(EnvironmentValue::NonUnicode), "caller");
+        assert_ne!(missing, empty);
+        assert_ne!(missing, native);
+        assert_ne!(empty, native);
+        assert_ne!(native, identity(None, "caller"), "a native crate value must not fall through");
+    }
+
+    #[test]
+    fn codegen_attribute_environment_is_discovered_before_the_first_content_identity() {
+        for body in [
+            "#[unsafe(export_name = env!(\"RA_JIT_REMOTE\"))] pub fn value() -> &'static str { \"ok\" }",
+            "#[unsafe(link_section = env!(\"RA_JIT_REMOTE\"))] pub fn value() -> &'static str { \"ok\" }",
+            "unsafe extern \"C\" { #[link_name = env!(\"RA_JIT_REMOTE\")] fn foreign(); } pub fn value() -> &'static str { \"ok\" }",
+            "#[linkage = env!(\"RA_JIT_REMOTE\")] static VALUE: u8 = 1; pub fn value() -> &'static str { \"ok\" }",
+        ] {
+            for library in [false, true] {
+                let identity = |value, dependency_first, discover_first| {
+                    let (db, crates) =
+                        environment_fixture(body, library, false, &[("RA_JIT_REMOTE", value)]);
+                    let ids = environment_ids(&db, crates, dependency_first, discover_first);
+                    assert!(
+                        db.env_read()
+                            .iter()
+                            .any(|&(of, ref key)| { of == crates[1] && key == "RA_JIT_REMOTE" }),
+                        "codegen attribute discovery must visit {body}"
+                    );
+                    ids
+                };
+                let one = identity("weak", false, false);
+                let two = identity("external", false, false);
+                assert_ne!(one[0], two[0]);
+                assert_ne!(one[1], two[1]);
+                assert_eq!(one, identity("weak", true, true));
+                assert_eq!(two, identity("external", true, true));
+            }
+        }
+    }
+
+    #[test]
+    fn observed_paths_are_semantic_values_even_when_their_prefix_is_relocatable() {
+        let identity = |manifest| {
+            let (db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+                true,
+                false,
+                &[("CARGO_MANIFEST_DIR", manifest)],
+            );
+            environment_ids(&db, crates, false, false)
+        };
+        assert_ne!(identity("/first/dep"), identity("/another/depth/dep"));
+    }
+
+    #[test]
+    fn proc_macro_consumers_keep_their_full_environment_through_reexports() {
+        let identity = |value: &str, library: bool, at_caller: bool| {
+            let (mut db, crates) = environment_fixture(
+                "pub fn value() -> &'static str { \"same source\" }",
+                library,
+                true,
+                &[],
+            );
+            let krate = crates[usize::from(!at_caller)];
+            let mut env = krate.env(&db).clone();
+            env.set("RA_JIT_REMOTE", value);
+            db.set_env(krate, env);
+            environment_ids(&db, crates, false, false)
+        };
+        for library in [false, true] {
+            for at_caller in [false, true] {
+                let one = identity("one", library, at_caller);
+                let two = identity("other", library, at_caller);
+                assert_ne!(one[0], two[0], "indirect macro consumers cannot discard env inputs");
+                if !at_caller {
+                    assert_ne!(one[1], two[1]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn binary_file_identity_reads_the_active_filesystem_view() {

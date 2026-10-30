@@ -929,6 +929,9 @@ impl Jobs {
         need: Reservation,
         out: &mut Vec<(ExecutionId, Effect)>,
     ) -> Result<JobAnswer, (Refusal, Option<u64>)> {
+        // Coalescing is only for live executions. Expire prior subscribers before a new
+        // deadline can extend their execution, even when the driver's timer has not run.
+        self.tick(now, out);
         let content = JobContent::of(&JobContentInput {
             spec: blaze_wire::digest_of(&req.spec),
             namespace: req.namespace.clone(),

@@ -236,6 +236,54 @@ fn request(source: u8) -> JobRequest {
 }
 
 #[test]
+fn resubmission_cannot_revive_an_execution_past_its_last_deadline() {
+    for running in [false, true] {
+        let (mut jobs, _) = registry();
+        let mut req = request(1);
+        req.deadline_ms = 10;
+        let first = jobs.submit(0, &req, reservation(), &mut Vec::new()).unwrap();
+        if running {
+            jobs.tick(0, &mut Vec::new());
+        }
+        req.deadline_ms = 100;
+        let mut effects = Vec::new();
+        let second = jobs.submit(11, &req, reservation(), &mut effects).unwrap();
+        assert_ne!(second.execution, first.execution);
+        assert_eq!(
+            jobs.execution(first.execution).unwrap().state(),
+            ExecState::Ended(Outcome::Cancelled)
+        );
+        assert_eq!(
+            jobs.terminal(first.execution, first.subscriber).unwrap().termination.outcome,
+            Outcome::TimedOut
+        );
+        assert!(effects.iter().any(|(id, effect)| *id == first.execution
+            && matches!(effect, Effect::SubscriberEnded { outcome: Outcome::TimedOut, .. })));
+        assert_eq!(jobs.execution(second.execution).unwrap().deadline(), Some(100));
+    }
+}
+
+#[test]
+fn resubmission_still_coalesces_when_an_existing_subscriber_is_live() {
+    let (mut jobs, _) = registry();
+    let mut req = request(1);
+    req.deadline_ms = 10;
+    let first = jobs.submit(0, &req, reservation(), &mut Vec::new()).unwrap();
+    req.deadline_ms = 100;
+    let live = jobs.submit(1, &req, reservation(), &mut Vec::new()).unwrap();
+    req.deadline_ms = 200;
+    let next = jobs.submit(11, &req, reservation(), &mut Vec::new()).unwrap();
+    assert_eq!(first.execution, live.execution);
+    assert_eq!(next.execution, live.execution);
+    assert_eq!(
+        jobs.terminal(first.execution, first.subscriber).unwrap().termination.outcome,
+        Outcome::TimedOut
+    );
+    assert!(jobs.terminal(live.execution, live.subscriber).is_none());
+    assert_eq!(jobs.execution(next.execution).unwrap().deadline(), Some(200));
+}
+
+#[test]
 fn review_a_late_kill_ack_cannot_release_a_new_execution() {
     for alive in [true, false] {
         let mut admission = Admission::new(AdmissionConfig::default());

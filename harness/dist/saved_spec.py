@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -275,6 +276,100 @@ def native_link_arguments(artifact):
     return [decode(word) for word in plan["before"]], [decode(word) for word in plan["after"]]
 
 
+def owned_test_policy(runner, blaze, work, env):
+    """Ordinary owned test commands retain the merged affected/flaky contract with no tools."""
+    project = work / "owned-test-policy"
+    write(project, "Cargo.toml", '[package]\nname="owned-test-policy"\nversion="0.1.0"\nedition="2021"\n[lib]\ndoctest=false\n')
+    write(project, "Cargo.lock", 'version=4\n[[package]]\nname="owned-test-policy"\nversion="0.1.0"\n')
+    write(project, "blaze-tests.toml", 'data=["data.txt"]\nenv=["POLICY_VALUE"]\nflaky=["flaky_once"]\nno_cache=["always"]\nexternal=["external"]\n')
+    write(project, "data.txt", "declared")
+    source = write(project, "src/lib.rs", r'''fn double(x: u32) -> u32 { x * 2 }
+#[test] fn steady() { assert_eq!(1 + 1, 2); }
+#[test] fn changed() { assert_eq!(double(2), 4); }
+#[test] fn reads() {
+    assert!(!std::fs::read_to_string("data.txt").unwrap().is_empty());
+    assert!(std::env::var("POLICY_VALUE").is_ok());
+}
+#[test] fn always() { assert_eq!(double(2), 4); }
+#[test] fn external() { assert_eq!(2 + 2, 4); }
+#[test] fn flaky_once() {
+    let marker = std::path::Path::new("attempted");
+    if !marker.exists() {
+        std::fs::write(marker, "attempted").unwrap();
+        panic!("retry this test once");
+    }
+}
+''')
+    policy_env = dict(env, RA_JIT_TESTS="affected", RA_JIT_SANDBOX="off", POLICY_VALUE="first")
+    all_tests = {"steady", "changed", "reads", "always", "external", "flaky_once"}
+    always = {"always", "external"}
+
+    def run(name, wanted, extra=None, arguments=(), expected=0, retry=False):
+        out, err = runner.run("owned-tests-" + name,
+            [blaze, "cargo", "test", "--lib", "-v", "--", *arguments],
+            dict(policy_env, **(extra or {})), project, expected=expected)
+        outcomes = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)", out, re.M)
+        assert {name for name, _ in outcomes} == wanted, (name, wanted, out, err)
+        if retry:
+            assert [end for name, end in outcomes if name == "flaky_once"] == ["FAILED", "ok"], (out, err)
+            assert "Retrying" in err and "Flaky" in err, (out, err)
+        else:
+            assert "Retrying" not in err, (out, err)
+
+    run("first-and-retry", all_tests, retry=True)
+    run("cache-hit-and-opt-outs", always)
+    source.write_text(source.read_text().replace("x * 2", "x + x"))
+    run("changed-reachable-body", always | {"changed"})
+    write(project, "data.txt", "declared again")
+    run("changed-declared-data", all_tests)
+    policy_env["POLICY_VALUE"] = "second"
+    run("changed-declared-env", all_tests)
+    run("new-env-cache-hit", always)
+    (project / "attempted").unlink()
+    run("failed-filter-invalidates", {"flaky_once"},
+        extra={"RA_JIT_FLAKY_TEST_ATTEMPTS": "1"}, arguments=("--exact", "flaky_once"), expected=101)
+    run("failure-reruns", all_tests)
+    (project / "attempted").unlink()
+    run("exact-retry", {"flaky_once"}, arguments=("--exact", "flaky_once"), retry=True)
+    source.write_text(source.read_text().replace("assert_eq!(1 + 1, 2)", "assert_eq!(1 + 1, 3)"))
+    write(project, "data.txt", "mixed failures")
+    (project / "attempted").unlink()
+    run("exhausted-peer-does-not-block-retry", all_tests, expected=101, retry=True)
+    run("failure-remains-uncached", always | {"steady"}, expected=101)
+
+
+def owned_shared_cache(runner, blaze, work, env):
+    """Owned compile subprocesses publish and consume the explicitly selected directory remote."""
+    project = work / "owned-shared-cache"
+    write(project, "Cargo.toml", '[package]\nname="owned-shared-cache"\nversion="0.1.0"\nedition="2021"\n')
+    write(project, "Cargo.lock", 'version=4\n[[package]]\nname="owned-shared-cache"\nversion="0.1.0"\n')
+    write(project, "src/main.rs", 'fn answer(x: u32) -> u32 { x + 2 }\nfn main() { assert_eq!(env!("RA_JIT_REMOTE"), "../../owned-remote"); println!("{}", answer(40)); }\n')
+    cwd = project / "request"
+    cwd.mkdir()
+    remote = work / "owned-remote"
+    shared = dict(env, RA_JIT_REMOTE="../../owned-remote", RA_JIT_PROJECT="owned-cache",
+                  RA_JIT_REMOTE_UNSIGNED="1", RA_JIT_REMOTE_LAZY="1")
+    command = [blaze, "cargo", "run", "--manifest-path", "../Cargo.toml",
+               "--config", "profile.dev.debug=0"]
+    out, err = runner.run("owned-cache-publish", command,
+                         dict(shared, RA_JIT_CACHE="../writer-store"), cwd)
+    assert out == "42\n", (out, err)
+    manifest = remote / "manifests/owned-cache"
+    assert manifest.is_file() and manifest.stat().st_size, manifest
+    before = {str(path.relative_to(remote)): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in remote.rglob("*") if path.is_file()}
+    published = {path.name.split(".pack")[0] for path in (remote / "packs").iterdir()}
+    assert published, before
+    out, err = runner.run("owned-cache-fresh-reader", command,
+                         dict(shared, RA_JIT_CACHE="../reader-store", RA_JIT_REMOTE_READONLY="1"), cwd)
+    assert out == "42\n", (out, err)
+    fetched = {path.stem for path in (project / "reader-store").glob("*.pack")}
+    assert published & fetched, (published, fetched)
+    after = {str(path.relative_to(remote)): hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in remote.rglob("*") if path.is_file()}
+    assert before == after, "read-only compiler changed the remote"
+
+
 def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile):
     def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True):
         expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *command, "--locked", "--offline"], reference_env, project, guarded=False)
@@ -287,6 +382,8 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
         return saved, expected, actual
 
     raw_compiler_case(runner, blaze, real, work, env, oracle_env)
+    owned_test_policy(runner, blaze, work, env)
+    owned_shared_cache(runner, blaze, work, env)
     profile = ["--config", "profile.dev.debug=0"]
     project = work / "producer-profile"
     producer_fixture(project)
@@ -585,7 +682,14 @@ def main():
         shutil.rmtree(original)
         # The bundle moves as a unit: nothing in it may name where it was made.
         moved = work / "moved-bundle"
-        shutil.move(bundle, moved)
+        if sys.platform == "linux":
+            # Resolve an ordinary CLI spelling to a native-byte bundle directory.
+            # Its blob store must survive the same descriptor projection as source files.
+            native_moved = work / os.fsdecode(b"moved-bundle-\xff")
+            shutil.move(bundle, native_moved)
+            moved.symlink_to(native_moved, target_is_directory=True)
+        else:
+            shutil.move(bundle, moved)
         bundle.mkdir()
         spec = moved / "saved.cbor"
         hostile = work / "unrelated"
@@ -598,10 +702,14 @@ def main():
         ancestor = write(work, ".cargo/config.toml", '[env]\nANCESTOR_ONLY="leaked"\n[build]\nrustflags=["--cfg", "ancestor_hostile"]\n')
         hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
                            CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value",
-                           RA_JIT_PROC_MACRO_SERVER=str(owned_server))
+                           RA_JIT_PROC_MACRO_SERVER=str(owned_server),
+                           RA_JIT_CACHE=str(work / "worker-cache"),
+                           RA_JIT_REMOTE=str(work / "worker-remote"),
+                           RA_JIT_PROJECT="must-not-inherit", RA_JIT_REMOTE_UNSIGNED="1")
         actual, _ = runner.run("replay-after-removal", [blaze, "cargo", "spec", "--run", spec],
                                hostile_env, hostile)
         assert actual == expected, (actual, expected)
+        assert not (work / "worker-remote").exists(), "saved replay inherited worker remote policy"
         ancestor.unlink()
         observed = runner.rows[-1]
         assert observed["watchdog_samples"] > 0 and observed["rajit_footprint_peak_mb"] > 0, observed

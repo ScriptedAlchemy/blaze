@@ -17,6 +17,7 @@ use blaze_spec::{
     replay::Prepared,
 };
 use blaze_wire::{RootRef, SourceRef};
+use sha2::{Digest as _, Sha256};
 
 use super::super::cli::{Invocation, Subcommand as CargoCommand};
 
@@ -131,6 +132,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
     } else {
         None
     };
+    let cargo = cargo_frontend(&target, identity, &original)?;
     let producers = super::producers::prepare_live(
         &prepared,
         &sysroot,
@@ -140,7 +142,11 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         ),
         runtime.as_ref(),
         &effective,
+        &cargo,
     )?;
+    // Cache service credentials and policy are compiler controls. Add them only
+    // after producer recipes/descriptions are prepared; saved replay never opts in.
+    super::cache_service::configure(&mut compiler_env, &original, &cwd)?;
     let mut programs = blaze_spec::execution::programs_with(
         &prepared,
         &sysroot,
@@ -150,6 +156,13 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
     let native = blaze_spec::assemble::canonical_units(
         &prepared.resolved.spec.build,
         &prepared.resolved.graph,
+    )?;
+    let tests = super::test_policy::Policy::new(
+        &prepared,
+        &target.join("ra-jit/test-results"),
+        &effective,
+        &programs,
+        Some(asked),
     )?;
     let destinations: Vec<_> = programs
         .iter()
@@ -189,7 +202,8 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         }
         let environment =
             super::compiler_for(program, &prepared, &producers, &compiler_env, &sysroot)?;
-        super::compile_at(program, &environment, Some(&prepared.resolved.graph.root))?;
+        let reach = tests.as_ref().is_some_and(|tests| tests.reach(program));
+        super::compile_at(program, &environment, Some(&prepared.resolved.graph.root), reach)?;
         super::admit_inputs(program)?;
     }
     let mut published_support = false;
@@ -202,7 +216,13 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             std::fs::create_dir_all(
                 profile_root(&target, options.target.as_deref(), &unit.profile.name).join("deps"),
             )?;
-            publish(&program.executable, &destination)?;
+            if tests.is_some() && program.run && program.output == Output::Executable {
+                // Test execution and its reach metadata remain one private generation,
+                // even if another client publishes to the shared target path meanwhile.
+                publish_copy(&program.executable, &destination)?;
+            } else {
+                publish(&program.executable, &destination)?;
+            }
             published_support |= matches!(program.output, Output::Object | Output::Executable);
             if program.output == Output::Object {
                 let supporting = program.executable.with_extension("std.a");
@@ -217,7 +237,15 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             }
         }
         super::super::messages::passed(format);
-        super::execute(&programs, &prepared, &compiler_env, &effective, &producers, &sysroot)
+        super::execute(
+            &programs,
+            &prepared,
+            &compiler_env,
+            &effective,
+            &producers,
+            &sysroot,
+            tests.as_ref(),
+        )
     })();
     let mut retained = BTreeSet::new();
     if published_support {
@@ -234,6 +262,33 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         prune_support(&directory, &retained)?;
     }
     result
+}
+
+/// A test's Cargo frontend is an effective environment input. Giving it a new temporary
+/// name on every compile would invalidate every sandboxed test even when nothing changed.
+fn cargo_frontend(
+    target: &Path,
+    identity: blaze_wire::StoreIdentity,
+    environment: &BTreeMap<String, OsString>,
+) -> anyhow::Result<PathBuf> {
+    let compiler = std::env::current_exe()?;
+    let mut key = Sha256::new();
+    key.update(blaze_wire::encode(&identity));
+    for value in [Some(compiler.as_os_str()), environment.get("PATH").map(OsString::as_os_str)] {
+        let bytes = value.map_or(&[][..], |value| value.as_encoded_bytes());
+        key.update((bytes.len() as u64).to_le_bytes());
+        key.update(bytes);
+    }
+    let digest: [u8; 32] = key.finalize().into();
+    let directory = target.join("ra-jit/runtime").join(super::hex(&digest));
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("lock"))?;
+    lock.lock().context("locking owned Cargo frontend")?;
+    super::runtime::cargo_frontend(&compiler, &directory)
 }
 
 fn planning_environment(original: &BTreeMap<String, OsString>) -> BTreeMap<String, OsString> {
@@ -409,11 +464,18 @@ fn publish(source: &Path, destination: &Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
         Err(error) => return Err(error.into()),
     }
+    publish_copy(source, destination)?;
+    std::fs::remove_file(source)?;
+    Ok(())
+}
+
+fn publish_copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let directory = destination.parent().context("artifact has no parent")?;
+    std::fs::create_dir_all(directory)?;
     let mut writing = tempfile::NamedTempFile::new_in(directory)?;
     std::io::copy(&mut std::fs::File::open(source)?, writing.as_file_mut())?;
     writing.as_file().set_permissions(std::fs::metadata(source)?.permissions())?;
     writing.persist(destination).map_err(|error| error.error)?;
-    std::fs::remove_file(source)?;
     Ok(())
 }
 
@@ -457,6 +519,36 @@ pub(super) fn admit_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_publication_preserves_the_private_compiled_generation() {
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("compiled");
+        let destination = work.path().join("target/tests");
+        std::fs::write(&source, b"the admitted test generation").unwrap();
+        publish_copy(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), std::fs::read(&destination).unwrap());
+        std::fs::write(&destination, b"another client's generation").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"the admitted test generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cargo_frontend_is_stable_and_serializes_concurrent_creation() {
+        let work = tempfile::tempdir().unwrap();
+        let environment = blaze_spec::environment::native_process();
+        let identity = blaze_wire::StoreIdentity([7; 32]);
+        let made = std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| cargo_frontend(work.path(), identity, &environment).unwrap());
+            let second =
+                scope.spawn(|| cargo_frontend(work.path(), identity, &environment).unwrap());
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(made[0], made[1]);
+        assert!(made[0].is_file());
+        assert_eq!(cargo_frontend(work.path(), identity, &environment).unwrap(), made[0]);
+    }
 
     #[test]
     fn publication_moves_the_artifact_and_retains_only_referenced_support() {

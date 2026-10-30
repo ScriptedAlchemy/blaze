@@ -59,21 +59,26 @@ root, spec paths and digests, independent of the Cargo home's absolute location.
 Capture refuses absolute path dependencies and absolute symlinks because they
 cannot be relocated.
 
-The connected executor builds binaries/examples from source dependencies and supports
-unit/integration test executables. `test --no-run` builds those executables and skips
-implicit doctests, as Cargo does. It retains successful artifacts and `result.json`
-under `FILE.outputs/`; failed compilation or input admission publishes no result.
+The connected executor builds binaries, examples and unit/integration test executables
+from source dependencies. Check and doctest roots use the owned frontend. Build scripts
+and procedural macros use the shared owned producer scheduler; macro graphs require an
+explicitly pinned complete owned macro server. `test --no-run` builds test executables
+and skips implicit doctests, as Cargo does. Library roots produce native objects,
+supporting std archives and a versioned native link plan for C consumers. The executor
+retains successful artifacts and `result.json` under `FILE.outputs/`; failed compilation
+or input admission publishes no result.
 A version-2 CBOR input trace preserves filenames that Cargo dep-info cannot represent.
 Environment reads carry HMAC identities; the per-description key travels only through
 private stdin. Every traced application source read is checked against the snapshot
 or its authenticated producer generation before execution.
 This is admission after compilation, not a filesystem sandbox.
 
-Owned execution is incomplete for check, doctest and benchmark units, standalone
-library artifacts, build scripts, proc macros, other output types and incompatible
-per-unit debug settings. Application native linking is refused until the native
-input closure is bound. The platform's SDK/sysroot proxy is not complete native closure. Broader C2
-differential acceptance and LLVM/macOS execution remain separate from source replay.
+Execution still refuses other crate output types, special extern options, native-symbol
+stripping and incompatible per-unit debug/strip/split settings. Native links validate
+their observed inputs against authenticated source, producer generations and the current
+native tool/platform closure. The platform's SDK/sysroot proxy alone does not identify a
+complete native closure on another host. Broader C2 differential acceptance and
+LLVM/macOS execution remain separate from source replay.
 
 ## Tests
 

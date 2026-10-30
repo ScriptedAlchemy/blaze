@@ -48,7 +48,11 @@ pub(crate) const ATTEMPTS: &str = "RA_JIT_FLAKY_TEST_ATTEMPTS";
 
 /// Additional inherited variables the owner declares for the sandboxed test environment.
 pub(crate) fn declared_env(state: &State) -> Vec<String> {
-    Manifest::read(&state.root).0.map(|it| it.env).unwrap_or_default()
+    declared_env_at(&state.root)
+}
+
+pub(crate) fn declared_env_at(root: &Path) -> Vec<String> {
+    Manifest::read(root).0.map(|it| it.env).unwrap_or_default()
 }
 
 /// The attempts of a test marked `flaky`, as Bazel gives it.
@@ -91,6 +95,15 @@ pub(crate) fn forget(state: &State) {
         if let Some(dir) = state.plan_dir(program) {
             _ = std::fs::remove_file(dir.join(plan::REACH));
         }
+    }
+}
+
+/// A failed run outside affected selection cannot leave an earlier success reusable.
+/// Without a complete outcome list, every test of this target must run again.
+pub(crate) fn forget_passes_at(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(PASSED)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -173,7 +186,41 @@ pub(crate) fn pick(
     if !on() || !asked.positional.is_empty() || !plain(&asked.trailing) {
         return Pick::Asked;
     }
-    let Some(dir) = state.plan_dir(test) else { return Pick::Asked };
+    let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+    let context = TestContext {
+        root: &state.root,
+        directory: state.plan_dir(test),
+        package: &test.package,
+        programs: programs_run_by(state, test),
+        enabled: on(),
+        passed_env: &passed,
+        inherit_env: true,
+    };
+    pick_for(asked, &context, sandbox, command)
+}
+
+/// The inputs of one test target, independent of the daemon's persisted build state.
+pub(crate) struct TestContext<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) directory: Option<&'a Path>,
+    pub(crate) package: &'a str,
+    pub(crate) programs: Result<String, String>,
+    pub(crate) enabled: bool,
+    pub(crate) passed_env: &'a str,
+    /// False for owned commands whose environment was cleared and reconstructed.
+    pub(crate) inherit_env: bool,
+}
+
+pub(crate) fn pick_for(
+    asked: &Invocation,
+    context: &TestContext<'_>,
+    sandbox: Option<&str>,
+    command: &Command,
+) -> Pick {
+    if !context.enabled || !asked.positional.is_empty() || !plain(&asked.trailing) {
+        return Pick::Asked;
+    }
+    let Some(dir) = context.directory else { return Pick::Asked };
     let Ok(reach) = std::fs::read_to_string(dir.join(plan::REACH)) else { return Pick::Asked };
     let file = dir.join(PASSED);
     let before = std::fs::read_to_string(&file).unwrap_or_default();
@@ -182,9 +229,17 @@ pub(crate) fn pick(
         .filter_map(|it| it.split_once('\t'))
         .map(|(identity, name)| (name, identity))
         .collect();
-    let manifest = Manifest::read(&state.root);
-    let given = manifest.given(&state.root, &asked.trailing, command);
-    let programs = format!("{}{}", programs_run_by(state, test), given.as_deref().unwrap_or(""));
+    let manifest = Manifest::read(context.root);
+    let given = manifest
+        .given_with(context.root, &asked.trailing, command, context.passed_env, context.inherit_env)
+        .and_then(|given| {
+            context
+                .programs
+                .as_ref()
+                .map(|programs| format!("{programs}{given}"))
+                .map_err(Clone::clone)
+        });
+    let programs = given.as_deref().unwrap_or("");
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -195,7 +250,8 @@ pub(crate) fn pick(
             return Pick::Asked;
         }
         total += 1;
-        let why = manifest.opts_out(&test.package, name).or_else(|| given.as_ref().err().cloned());
+        let why =
+            manifest.opts_out(context.package, name).or_else(|| given.as_ref().err().cloned());
         if let Some(why) = why {
             names.push(name.to_owned());
             always.push(Always { name: name.to_owned(), why, path: None });
@@ -279,24 +335,48 @@ fn plain(trailing: &[String]) -> bool {
 }
 
 /// What stands for the programs an integration test of `test`'s package runs, which cargo
-/// gives it as `CARGO_BIN_EXE_<name>`: their sizes and times, which a build changes. Empty
-/// for a unit test.
-fn programs_run_by(state: &State, test: &Program) -> String {
+/// gives it as `CARGO_BIN_EXE_<name>`: their contents and executable modes. A copied or
+/// restored artifact can change without changing its size or modification time.
+fn programs_run_by(state: &State, test: &Program) -> Result<String, String> {
     if !matches!(test.kind, Kind::Test | Kind::Bench) {
-        return String::new();
+        return Ok(String::new());
     }
-    let mut hash = Sha256::new();
     let runs = |it: &&Program| it.package == test.package && it.kind == Kind::Bin && !it.test;
-    for program in state.programs.iter().filter(runs) {
-        hash.update(program.executable.as_os_str().as_encoded_bytes());
-        let meta = std::fs::metadata(&program.executable).ok();
-        let at = meta.as_ref().and_then(|it| it.modified().ok());
-        let at = at.and_then(|it| it.duration_since(std::time::UNIX_EPOCH).ok());
-        hash.update(meta.map_or(0, |it| it.len()).to_le_bytes());
-        hash.update(at.map_or(0, |it| it.as_nanos()).to_le_bytes());
+    programs_identity(
+        state.programs.iter().filter(runs).map(|it| (it.name.as_str(), it.executable.as_path())),
+    )
+}
+
+pub(crate) fn programs_identity<'a>(
+    programs: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(b"test programs 3\0");
+    for (name, program) in programs {
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        let path = program.as_os_str().as_encoded_bytes();
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path);
+        let mut read = || -> std::io::Result<()> {
+            let meta = std::fs::metadata(program)?;
+            if !meta.is_file() {
+                return Err(std::io::Error::other("not a regular executable"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                hash.update((meta.permissions().mode() & 0o7777).to_le_bytes());
+            }
+            hash.update(crate::native_inputs::output_digest(program)?);
+            Ok(())
+        };
+        read().map_err(|error| {
+            format!("test program `{}` can't be read ({error})", program.display())
+        })?;
     }
     let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
-    format!("-{hex}")
+    Ok(format!("-{hex}"))
 }
 
 /// What the owner wrote in [`MANIFEST`], or why it can't be read.
@@ -357,7 +437,20 @@ impl Manifest {
     /// contents of the files of `data` (and which are not there), and the value of each
     /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
     /// pass was under another runs.
+    #[cfg(test)]
     fn given(&self, root: &Path, trailing: &[String], command: &Command) -> Result<String, String> {
+        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+        self.given_with(root, trailing, command, &passed, true)
+    }
+
+    fn given_with(
+        &self,
+        root: &Path,
+        trailing: &[String],
+        command: &Command,
+        passed: &str,
+        inherit_env: bool,
+    ) -> Result<String, String> {
         let declared = self.0.as_ref().map_err(Clone::clone)?;
         let mut hash = Sha256::new();
         hash.update(b"test inputs 2\0threads\0");
@@ -369,7 +462,7 @@ impl Manifest {
             None => hash.update(b"unset"),
         }
         hash.update([0]);
-        match environment(command, "RUST_TEST_THREADS") {
+        match environment(command, "RUST_TEST_THREADS", inherit_env) {
             Some(value) => {
                 hash.update(b"set\0");
                 hash.update(value.as_encoded_bytes());
@@ -386,9 +479,12 @@ impl Manifest {
             })?;
             hash.update(digest);
         }
-        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
-        let mut names: Vec<&str> =
-            declared.env.iter().map(String::as_str).chain(passed.split(',')).collect();
+        let mut names: Vec<&str> = declared
+            .env
+            .iter()
+            .map(String::as_str)
+            .chain(passed.split(',').map(str::trim))
+            .collect();
         names.retain(|it| !it.trim().is_empty());
         names.sort_unstable();
         names.dedup();
@@ -396,7 +492,7 @@ impl Manifest {
         for name in names {
             hash.update(name.as_bytes());
             hash.update([0]);
-            match environment(command, name) {
+            match environment(command, name, inherit_env) {
                 Some(value) => {
                     hash.update(b"set\0");
                     hash.update(value.as_encoded_bytes());
@@ -445,11 +541,11 @@ fn test_threads(trailing: &[String]) -> Option<&str> {
 }
 
 /// The value the test receives, including Cargo's configured overrides and removals.
-fn environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
-    command
-        .get_envs()
-        .find(|(key, _)| *key == name)
-        .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()))
+fn environment(command: &Command, name: &str, inherit_env: bool) -> Option<std::ffi::OsString> {
+    command.get_envs().find(|(key, _)| *key == name).map_or_else(
+        || inherit_env.then(|| std::env::var_os(name)).flatten(),
+        |(_, value)| value.map(|it| it.to_owned()),
+    )
 }
 
 /// Each child has its own digest: file bytes cannot impersonate the next directory entry.
@@ -519,8 +615,12 @@ pub(crate) struct Attempts {
 }
 
 pub(crate) fn attempts(state: &State) -> Attempts {
-    let all = std::env::var(ATTEMPTS).ok().and_then(|it| it.trim().parse().ok());
-    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(&state.root) }
+    attempts_at(&state.root, std::env::var(ATTEMPTS).ok().as_deref())
+}
+
+pub(crate) fn attempts_at(root: &Path, override_value: Option<&str>) -> Attempts {
+    let all = override_value.and_then(|it| it.trim().parse().ok());
+    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(root) }
 }
 
 impl Attempts {
@@ -555,6 +655,187 @@ impl Attempts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_test_context_reuses_passes_and_invalidates_code_and_program_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = match crate::cargo::cli::Asked::parse(vec!["test".to_owned()]) {
+            crate::cargo::cli::Asked::Build(asked) => *asked,
+            _ => panic!("expected a test invocation"),
+        };
+        let mut context = TestContext {
+            root: dir.path(),
+            directory: Some(dir.path()),
+            package: "test-package",
+            programs: Ok("program-a".into()),
+            enabled: true,
+            passed_env: "",
+            inherit_env: false,
+        };
+        let mut command = Command::new("owned-test");
+        command.env_clear();
+        std::fs::write(dir.path().join(plan::REACH), "code-a\tfirst\n").unwrap();
+        let Pick::Some { names: None, passed, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("a test without a pass must run");
+        };
+        passed.passed();
+        let Pick::Some { names: Some(names), .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("the unchanged owned target must reuse its pass");
+        };
+        assert!(names.is_empty());
+        forget_passes_at(dir.path()).unwrap();
+        let Pick::Some { names: None, passed, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("a failed untracked run must revoke the older pass");
+        };
+        passed.passed();
+        std::fs::write(dir.path().join(plan::REACH), "code-b\tfirst\n").unwrap();
+        assert!(matches!(
+            pick_for(&asked, &context, None, &command),
+            Pick::Some { names: None, .. }
+        ));
+        std::fs::write(dir.path().join(plan::REACH), "code-a\tfirst\n").unwrap();
+        context.programs = Ok("program-b".into());
+        assert!(matches!(
+            pick_for(&asked, &context, None, &command),
+            Pick::Some { names: None, .. }
+        ));
+        context.programs = Err("missing auxiliary executable".into());
+        let Pick::Some { names: None, always, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("unverified auxiliary inputs must run");
+        };
+        assert_eq!(always.len(), 1);
+        context.enabled = false;
+        assert!(matches!(pick_for(&asked, &context, None, &command), Pick::Asked));
+    }
+
+    #[test]
+    fn owned_test_policy_uses_explicit_environment_and_retry_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = manifest("env = [\"PATH\", \"RUST_TEST_THREADS\"]\n");
+        let mut exact = Command::new("owned-test");
+        exact.env_clear();
+        let mut removed = Command::new("owned-test");
+        removed.env_remove("PATH").env_remove("RUST_TEST_THREADS");
+        assert_eq!(
+            declared.given_with(dir.path(), &[], &exact, "", false),
+            declared.given_with(dir.path(), &[], &removed, "", true),
+            "an env_clear command cannot inherit the worker's PATH or test-thread setting"
+        );
+        exact.env("PATH", "recorded-path");
+        assert_ne!(
+            declared.given_with(dir.path(), &[], &exact, "", false),
+            declared.given_with(dir.path(), &[], &removed, "", true)
+        );
+        std::fs::write(dir.path().join(MANIFEST), "flaky = [\"first\"]\n").unwrap();
+        assert_eq!(attempts_at(dir.path(), None).of("test-package", "first"), 3);
+        assert_eq!(attempts_at(dir.path(), Some("1")).of("test-package", "first"), 1);
+        assert_eq!(attempts_at(dir.path(), Some("2")).of("test-package", "other"), 2);
+    }
+
+    #[test]
+    fn passed_environment_names_match_the_sandbox_with_whitespace_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data"), "same").unwrap();
+        let declared = manifest("data = [\"data\"]\n");
+        let mut command = Command::new("owned-test");
+        command.env_clear().env("T1_PASSED", "one");
+        let padded = " T1_PASSED, ,T1_PASSED ";
+        let before = declared.given_with(dir.path(), &[], &command, padded, false).unwrap();
+        assert_eq!(
+            before,
+            declared.given_with(dir.path(), &[], &command, "T1_PASSED", false).unwrap(),
+            "the cache must identify the variable that the sandbox actually forwards"
+        );
+        command.env("T1_PASSED", "two");
+        assert_ne!(
+            before,
+            declared.given_with(dir.path(), &[], &command, padded, false).unwrap(),
+            "declared data cannot hide a changed explicitly passed environment value"
+        );
+    }
+
+    fn test_programs(dir: &Path) -> (State, Program) {
+        let program = |kind, test, name: &str| {
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "package": "test-package",
+                "test": test,
+                "source": dir.join("src.rs"),
+                "package_dir": dir,
+                "executable": dir.join(name),
+                "cargos": dir.join(format!("{name}.cargo")),
+                "asked_as": null,
+                "left_to_cargo": null,
+                "inputs": [],
+                "env": [],
+            })
+        };
+        let test = program("Test", true, "integration");
+        let state = serde_json::from_value(serde_json::json!({
+            "version": "test",
+            "key": "test",
+            "root": dir,
+            "built_at": 0,
+            "profile": "debug",
+            "programs": [program("Bin", false, "tool"), test.clone()],
+            "guards": [],
+            "checkouts": [],
+            "refusal": null,
+            "doc_tests": false,
+            "counts": {"served": 0, "cargo": {}},
+        }))
+        .unwrap();
+        (state, serde_json::from_value(test).unwrap())
+    }
+
+    #[test]
+    fn cargo_binary_contents_are_inputs_even_when_size_and_mtime_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"first").unwrap();
+        let stamp = std::fs::metadata(&tool).unwrap().modified().unwrap();
+        let (state, test) = test_programs(dir.path());
+        let before = programs_run_by(&state, &test);
+        assert_eq!(before, programs_run_by(&state, &test));
+        std::fs::write(&tool, b"other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        assert_ne!(before, programs_run_by(&state, &test));
+        std::fs::write(&tool, b"first").unwrap();
+        assert_eq!(before, programs_run_by(&state, &test));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_binary_permission_changes_invalidate_test_passes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"tool").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (state, test) = test_programs(dir.path());
+        let before = programs_run_by(&state, &test);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_ne!(before, programs_run_by(&state, &test));
+    }
+
+    #[test]
+    fn missing_or_non_file_cargo_binaries_cannot_certify_a_test_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, test) = test_programs(dir.path());
+        assert!(programs_run_by(&state, &test).is_err());
+        std::fs::create_dir(dir.path().join("tool")).unwrap();
+        assert!(programs_run_by(&state, &test).is_err());
+    }
 
     fn of(args: &[&str]) -> bool {
         plain(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())
