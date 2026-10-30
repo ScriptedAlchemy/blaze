@@ -64,10 +64,7 @@ impl Toolchain {
     fn of(rustc: &Path) -> Option<Toolchain> {
         let sysroot = rustc.parent()?.parent()?.to_owned();
         let lib = sysroot.join("lib");
-        let has_driver = std::fs::read_dir(&lib).ok()?.flatten().any(|it| {
-            it.file_name().to_str().is_some_and(|name| name.starts_with("librustc_driver-"))
-        });
-        if !has_driver {
+        if !is_compiler(rustc) {
             return None;
         }
         let rustlib = lib.join("rustlib");
@@ -286,6 +283,19 @@ pub(crate) fn target_cfg(
     let target = toolchain.release.targets.get(target)?;
     let given = Given { opt_level: Some("2"), ..Given::default() };
     cfgs(target, &given, nightly)
+}
+
+/// Whether `rustc` is a compiler: one with its driver library in the sysroot beside it,
+/// which is how rustc finds its sysroot. A launcher or a proxy has none.
+pub(super) fn is_compiler(rustc: &Path) -> bool {
+    let Some(lib) = rustc.parent().and_then(Path::parent).map(|sysroot| sysroot.join("lib")) else {
+        return false;
+    };
+    std::fs::read_dir(lib).is_ok_and(|entries| {
+        entries.flatten().any(|it| {
+            it.file_name().to_str().is_some_and(|name| name.starts_with("librustc_driver-"))
+        })
+    })
 }
 
 pub(crate) fn host_tuple(rustc: &Path) -> Option<String> {

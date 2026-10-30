@@ -463,9 +463,21 @@ fn toolchain_rustc(
     let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
         || same_file::is_same_file(&real, &rustup).unwrap_or(false)
         || is_copy_of(&real, &rustup);
-    if !proxy {
+    if proxy {
+        return rustup_selected(&cwd, var);
+    }
+    if own::is_compiler(&real) {
         return Some(real);
     }
+    // A packaged rustup puts launchers on PATH instead: Homebrew's (rustup 1.29, the
+    // macOS runner image's) are scripts that name its settings and exec the proxy it keeps
+    // in libexec. A launcher is neither rustup nor a compiler, and rustup's records name the
+    // toolchain it reaches; with no such records it is all there is to name.
+    rustup_selected(&cwd, var).or(Some(real))
+}
+
+/// The rustc of rustup's selection for `cwd`, from its records.
+fn rustup_selected(cwd: &Path, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if let Some(selected) = var("RUSTUP_TOOLCHAIN")
         && Path::new(&selected).is_absolute()
     {
@@ -480,7 +492,7 @@ fn toolchain_rustc(
         var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(|home| PathBuf::from(home).join(".rustup"))
     })?;
-    let toolchain = installed_selection(&home, &cwd, var("RUSTUP_TOOLCHAIN"))?;
+    let toolchain = installed_selection(&home, cwd, var("RUSTUP_TOOLCHAIN"))?;
     let toolchain = toolchain.to_str()?;
     let dir = if Path::new(&toolchain).is_absolute() {
         PathBuf::from(toolchain)
@@ -645,6 +657,71 @@ pub(crate) mod tests {
             rust_release(Path::new("rustc"), &cwd, &env).as_deref(),
             Some("1.99.0"),
             "the release of the toolchain's rustc, from its records"
+        );
+    }
+
+    /// Homebrew's rustup 1.29, the macOS runner image's: `rustc` on PATH is a script that
+    /// names its settings and execs the proxy in libexec, so it is neither rustup, a link to
+    /// it nor a copy of it. The planner's host facts come from the toolchain it reaches.
+    #[cfg(unix)]
+    #[test]
+    fn packaged_rustup_launchers_resolve_to_the_selected_toolchain() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let rustup_home = home.join(".rustup");
+        let installed = rustup_home.join("toolchains/1.99.0-aarch64-apple-darwin");
+        let compiler = synthetic_toolchain(&installed);
+        std::fs::write(
+            rustup_home.join("settings.toml"),
+            "version = \"12\"\ndefault_toolchain = \"1.99.0-aarch64-apple-darwin\"\n",
+        )
+        .unwrap();
+        let keg = root.path().join("Cellar/rustup/1.29.2");
+        std::fs::create_dir_all(keg.join("libexec/bin")).unwrap();
+        std::fs::write(keg.join("libexec/bin/rustup"), "rustup, as Homebrew built it").unwrap();
+        std::os::unix::fs::symlink("rustup", keg.join("libexec/bin/rustc")).unwrap();
+        let bin = keg.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["rustc", "rustup"] {
+            let proxy = keg.join("libexec/bin").join(name);
+            std::fs::write(
+                bin.join(name),
+                format!(
+                    "#!/bin/bash\nRUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS=\"/etc/rustup/settings.toml\" \
+                     exec {:?} \"$@\"\n",
+                    proxy
+                ),
+            )
+            .unwrap();
+        }
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let resolve = |toolchain: Option<&str>| {
+            let var = |name: &str| match name {
+                "PATH" => Some(bin.clone().into_os_string()),
+                "HOME" => Some(home.clone().into_os_string()),
+                "RUSTUP_TOOLCHAIN" => toolchain.map(OsString::from),
+                _ => None,
+            };
+            toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &var)
+        };
+        let expected = std::fs::canonicalize(&compiler).unwrap();
+        for toolchain in [None, Some("1.99.0")] {
+            let rustc = resolve(toolchain).unwrap();
+            assert_eq!(rustc, expected, "{toolchain:?}: the launcher reaches rustup's selection");
+            assert_eq!(own::host_tuple(&rustc).as_deref(), Some("aarch64-apple-darwin"));
+        }
+
+        // A compiler on PATH outside rustup is itself, whatever rustup has selected.
+        let other = synthetic_toolchain(&root.path().join("other"));
+        let var = |name: &str| match name {
+            "PATH" => Some(other.parent().unwrap().as_os_str().to_owned()),
+            "HOME" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(
+            toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &var),
+            Some(std::fs::canonicalize(&other).unwrap())
         );
     }
 
