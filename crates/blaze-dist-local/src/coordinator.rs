@@ -295,7 +295,9 @@ impl Coordinator {
         {
             return Err(error(ErrorCode::Busy, "replay-capacity: use a new session"));
         }
-        let mut effects = Vec::new();
+        // Apply deadlines before route-level retention checks. An expired execution is
+        // retained terminal work, not a live coalescing target that may bypass capacity.
+        let mut effects = self.tick(now);
         let answer = match self.route(now, &request.command, &mut effects) {
             Ok(answer) => answer,
             Err(error) => Answer::Error(error),
@@ -563,6 +565,49 @@ mod tests {
         let jobs =
             Jobs::new(Admission::new(AdmissionConfig::default()), ExecutionConfig::default());
         Coordinator::new(jobs, config, [7; 32])
+    }
+
+    #[test]
+    fn expired_work_cannot_bypass_execution_retention_by_resubmitting_the_same_content() {
+        let mut c = coordinator(Config { max_executions: 1, ..Config::default() });
+        let welcome = c.hello(0, &hello([1; 32])).unwrap();
+        let mut job: JobRequest = blaze_wire::Sample::sample(&mut blaze_wire::Gen::new(7));
+        job.namespace = blaze_wire::Namespace::Main;
+        job.deadline_ms = 10;
+        let request = |sequence, job: &JobRequest| Request {
+            epoch: welcome.epoch,
+            session: welcome.session,
+            sequence,
+            command: Command::Submit(submission(
+                job,
+                blaze_wire::Reservation { memory: 1, cpus: 1, disk: 1 },
+            )),
+        };
+        let (first, _) = c.request(0, &request(1, &job)).unwrap();
+        let ServerFrame::Response(Response { answer: Answer::Binding(first), .. }) =
+            decode(&first, &Limits::DOCUMENTED).unwrap()
+        else {
+            panic!("first job was not submitted")
+        };
+        job.deadline_ms = 100;
+        let (second, effects) = c.request(11, &request(2, &job)).unwrap();
+        let ServerFrame::Response(Response { answer: Answer::Error(error), .. }) =
+            decode(&second, &Limits::DOCUMENTED).unwrap()
+        else {
+            panic!("expired execution was revived or retention was exceeded")
+        };
+        assert_eq!(error.code(), Some(ErrorCode::Busy));
+        assert_eq!(error.message, "execution-retention-capacity");
+        assert!(effects.iter().any(|(id, effect)| *id == first.subscription.execution
+            && matches!(
+                effect,
+                Effect::SubscriberEnded { outcome: blaze_wire::Outcome::TimedOut, .. }
+            )));
+        assert_eq!(c.jobs.executions().count(), 1);
+        assert!(matches!(
+            c.jobs.execution(first.subscription.execution).unwrap().state(),
+            ExecState::Ended(_)
+        ));
     }
 
     /// A label is never issued twice. Running the counter out is a typed capacity refusal,

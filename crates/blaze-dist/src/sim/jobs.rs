@@ -334,6 +334,15 @@ impl World {
         };
         let platform = spec.platform;
         let class = Class::of(&namespace).expect("a job's namespace");
+        let mut out = Vec::new();
+        let answer = self.jobs.submit(self.now, &req, need.clone(), &mut out);
+        // Submission advances timers before coalescing or queueing. Apply those existing
+        // executions' events to the shadow before checking admission at this instant.
+        // A new execution's first event starts the submission itself, which is checked below.
+        let first_new =
+            out.iter().position(|(id, _)| !self.meta.contains_key(id)).unwrap_or(out.len());
+        let submitted = out.split_off(first_new);
+        self.effects(out)?;
         let waiting: usize = [Class::Main, Class::Pr]
             .iter()
             .map(|c| self.shadow.get(&(platform, *c)).map_or(0, VecDeque::len))
@@ -351,8 +360,7 @@ impl World {
                         })
             })
             .map(|e| e.id);
-        let mut out = Vec::new();
-        match self.jobs.submit(self.now, &req, need.clone(), &mut out) {
+        match answer {
             Ok(answer) => {
                 self.subscribers.insert(answer.subscriber, (answer.execution, req.deadline_ms));
                 match running {
@@ -398,7 +406,7 @@ impl World {
                 return Err(self.violation("queue", format!("a submit refused: {other:?}")));
             }
         }
-        self.effects(out)
+        self.effects(submitted)
     }
 
     fn unsubscribe(&mut self, s: u64) -> Result<(), Violation> {

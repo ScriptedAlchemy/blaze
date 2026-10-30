@@ -103,14 +103,6 @@ impl Server {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).map_err(|e| Error::internal(e.to_string()))?;
             let id: String = nonce.iter().map(|it| format!("{it:02x}")).collect();
-            let mut snapshots = self.pages.0.lock().unwrap_or_else(|e| e.into_inner());
-            if snapshots.len() >= self.resources.connections {
-                return Err(Error::new(ErrorCode::Busy, "listing snapshot leases are busy"));
-            }
-            snapshots.insert(
-                id.clone(),
-                Snapshot { prefix, created: Instant::now(), objects: objects.clone() },
-            );
             (id, 0, objects)
         };
         let available = count.min(objects.len() - offset);
@@ -133,6 +125,9 @@ impl Server {
             bytes = encode(take);
         }
         if (available != 0 && take == 0) || bytes.len() > self.limits.request as usize {
+            // No page can make progress over this row. Do not retain an unreachable lease
+            // until expiry or let repeated failed listings exhaust all snapshot slots.
+            self.pages.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             return Err(Error::too_large(
                 "one listing object cannot fit the negotiated response limit",
             ));
@@ -145,6 +140,17 @@ impl Server {
         let next = offset + take;
         if next < objects.len() {
             answer = answer.header("x-blaze-listing-next", format!("{id}.{next}"));
+            if offset == 0 {
+                self.pages.expire(self.resources.snapshot_age);
+                let mut snapshots = self.pages.0.lock().unwrap_or_else(|e| e.into_inner());
+                if snapshots.len() >= self.resources.connections {
+                    return Err(Error::new(ErrorCode::Busy, "listing snapshot leases are busy"));
+                }
+                snapshots.insert(
+                    id,
+                    Snapshot { prefix, created: Instant::now(), objects: objects.clone() },
+                );
+            }
         } else {
             self.pages.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         }
