@@ -569,7 +569,7 @@ def ws_cases():
         Case("build-p-b-p-a", "build -p b -p a", "names them the other way round", expect="same",
              vs="build-p-a-p-b", asked_pkgs={"a", "b"}),
         # `--workspace` in a virtual workspace is what `build` does.
-        Case("workspace", "build --workspace", "names every member", expect="same", asked_pkgs={"a", "b", "c"}),
+        Case("workspace", "build --workspace", "names every member", expect="changed", asked_pkgs={"a", "b", "c"}),
         # cargo takes the package whose directory the command runs in, as `-p a`: the units are the
         # same, and the directory the command ran in is the spec's `cwd` field, so the digests differ.
         Case("in-a", "build", "from inside crates/a", cwd="crates/a", vs="build-p-a", expect="changed",

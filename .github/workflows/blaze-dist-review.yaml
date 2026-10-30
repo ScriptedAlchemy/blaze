@@ -189,6 +189,19 @@ jobs:
           done
           cat "$rows" >> "$GITHUB_STEP_SUMMARY"
           test -z "$failed"
+      # Control only: the flipped expectation fails the workspace lane, and the job must have
+      # recorded that failure (its row and its tail) and run every other lane of the job.
+      - name: Control - the failed lane is reported and the others still ran
+        if: ${{ always() && contains(matrix.lanes, 'workspace') }}
+        env:
+          C2_LANES: ${{ matrix.lanes }}
+        run: |
+          rows="$RUNNER_TEMP/c2-evidence/lanes.md"
+          cat "$rows"
+          grep -E '^\| workspace \| FAIL \(1\) \|' "$rows"
+          for lane in $C2_LANES; do grep -E "^\| $lane \| " "$rows"; done
+          grep -c "problem" "$RUNNER_TEMP/c2-evidence/local-workspace.log"
+          ! grep -q "refused (RA_JIT_BUNDLE\|refused (RA_JIT_" "$RUNNER_TEMP/c2-evidence/local-workspace.log"
       - name: Keep C2 runtime and tool audit evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
