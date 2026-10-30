@@ -83,31 +83,34 @@ SourcePath escapes native byte components reversibly: ASCII letters/digits and
 `-_.` are literal, all other bytes use uppercase `%HH`. `/` separates components;
 `.` denotes the root. Colon/backslash and raw Unix bytes are not path separators.
 Decoded slash/NUL, empty/dot/parent components and noncanonical escapes are rejected.
-cwd is SourcePath at generation and decode. Manifest basename must be Cargo.toml.
-Missing location fields and unknown fields are rejected, not defaulted.
-Field 7's config values are now `[0, literal_text]` or `[1, workspace_relative_path]`.
+Generation and decoding represent `cwd` as a `SourcePath`. The manifest basename
+must be `Cargo.toml`. Missing location fields and unknown fields are rejected
+without defaults. Field 7's config values are `[0, literal_text]` or
+`[1, workspace_relative_path]`.
 The old untagged config string encoding is invalid in schemas 2 and 3. The serialized tag determines
 whether a worker keeps the literal or joins the selected workspace path.
 
-Config values additionally support `[2, native_bytes]` and script env values use
+Config values also support `[2, native_bytes]` and script env values use
 the same tags. NUL-free native bytes preserve raw Unix values without replacement.
-Literal environment values are NUL-free EnvText; individual rustflags/cfg values
-are InputText: unchanged CBOR
-text, bounded by Limits.request rather than the 4 KiB identifier limit.
+Literal environment values use NUL-free `EnvText`. Individual rustflags and cfg
+values use `InputText`. These retain CBOR text encoding but use the
+`Limits.request` budget rather than the 4 KiB identifier limit.
 The raw-byte variant and tagged script-env representation require schema 4;
 text budget changes alone do not change encoding.
 Native tags are canonical only for non-UTF-8, NUL-free values. Valid UTF-8 uses
-Literal. Environment map names are nonempty, exclude `=`/NUL, and may appear
-only once. Ambient script_env does not admit WorkspaceRelative origins; config
-values remain in config_env and are materialized only for local probing/execution.
+Literal. Environment map names must be nonempty, exclude `=` and NUL, and appear
+only once. Ambient `script_env` does not admit `WorkspaceRelative` origins.
+Configuration values stay in `config_env` and are materialized only for local
+probing and execution.
 This prevents materialized checkout paths from entering portable script identities.
 
 This crate speaks schema 4 only. Prior versions require a separately pinned codec at
 the transport negotiation boundary; this implementation does not advertise it or
 silently assign their records version-4 identity. Unchanged structural types may
 decode older bytes; version negotiation and typed domains must gate their identity.
-Every typed digest/signature domain is now `/v4`; golden vectors were regenerated. `/v1` HTTP routes and the
-`blaze/req/v1` request-authentication framing are transport contracts, unchanged.
+Every typed digest and signature domain is `/v4`, as recorded in the regenerated
+golden vectors. HTTP routes retain `/v1`, and request authentication retains
+`blaze/req/v1`. Those transport versions have not changed.
 No prior-version typed digest identity can be reused as a version-4 typed digest.
 
 ## Limits
