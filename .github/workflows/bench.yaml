@@ -1,3 +1,15 @@
+# Microbenchmarks of the store's hot paths (crates/ra-jit-bench), run by tango in pairs: on a
+# pull request the base's binary and the change's, both from the bundle, interleaved on one
+# runner so that the runner's own drift cancels out. A change fails the run only when the same
+# benchmark is slower than on the base beyond doubt (tango's z-score) and by more than NOISE
+# percent in two comparisons in a row; a benchmark that is slow in one comparison and another in
+# the next is noise. Before the comparison the runner is asked whether it can tell two copies of
+# the same binary apart (bench-base against a copy of itself, the A/A control): if a benchmark is
+# over NOISE percent there, the verdict is "environmental" and the comparison with the base is
+# reported and not counted. PR18's tango failed on a pair that was bit-identical in seven runs
+# (docs/reports/CI-fork.md). The runner's CPU and both binaries' sha256 are recorded beside every
+# verdict. The verdict is .github/scripts/bench_verdict.py's. On main the benchmarks run alone,
+# for the times.
 name: bench
 on:
   workflow_call:
@@ -43,7 +55,9 @@ jobs:
       # Both binaries were built by the producer with the same compiler, flags
       # and benchmark profile. They are paired on this one runner, as before.
       - name: Check benchmark provenance rejection
-        run: python3 -B .github/scripts/test_bench_pair.py -v
+        run: |
+          python3 -B .github/scripts/test_bench_pair.py -v
+          python3 -B .github/scripts/test_bench_verdict.py -v
       - name: Verify benchmark pair provenance
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -77,22 +91,43 @@ jobs:
             lscpu
             sha256sum "$RUNNER_TEMP"/bench-*
           } > "$RUNNER_TEMP/tango/context.txt"
+      # The A/A control, then at most two comparisons; tango's exit status is not the verdict,
+      # bench_verdict.py's reading of its output is (same benchmark in both comparisons).
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
           [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
-          attempt=0
-          compare() {
-            attempt=$((attempt + 1))
+          tango="$RUNNER_TEMP/tango"
+          mkdir -p "$tango"
+          cp "$RUNNER_TEMP/bench-base" "$RUNNER_TEMP/bench-base-copy"
+          started=$SECONDS
+          "$RUNNER_TEMP/bench-base" --color never compare "$RUNNER_TEMP/bench-base-copy" \
+            -t "$TIME" --noise-threshold "$NOISE" -o -v \
+            --dump "$tango/aa" | tee "$tango/aa.txt" || true
+          aa_seconds=$((SECONDS - started))
+          attempts=()
+          for attempt in 1 2; do
+            status=0
             "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" \
               -t "$TIME" --noise-threshold "$NOISE" -o -v \
-              --dump "$RUNNER_TEMP/tango/compare-$attempt" | tee -a "$RUNNER_TEMP/bench.txt"
-          }
-          { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              --dump "$tango/compare-$attempt" | tee "$tango/compare-$attempt.txt" || status=$?
+            attempts+=("$tango/compare-$attempt.txt")
+            [ "$status" != 0 ] || break
+            [ "$attempt" = 2 ] || echo "A slowdown over ${NOISE}%: measuring again"
+          done
           status=0
-          compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
-          { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$status" = 0 ] || echo "::error::both benchmark comparisons report a slowdown over ${NOISE}%"
+          python3 -I .github/scripts/bench_verdict.py --aa "$tango/aa.txt" --aa-seconds "$aa_seconds" \
+            --cpu-file "$tango/cpu.txt" "${attempts[@]}" | tee "$tango/verdict.txt" || status=$?
+          {
+            echo '### tango: change against base'; echo '```'; cat "$tango/verdict.txt"; echo '```'
+            echo '```'; cat "$tango/aa.txt" "${attempts[@]}"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          { cat "$tango/verdict.txt" "$tango/aa.txt" "${attempts[@]}"; } >> "$RUNNER_TEMP/bench.txt"
+          case "$(head -1 "$tango/verdict.txt")" in
+            *environmental) echo "::warning::the runner shows over ${NOISE}% between two copies of the same binary: the comparison with the base is not counted" ;;
+            *regression) echo "::error::the same benchmark is over ${NOISE}% slower than on the base in both comparisons" ;;
+            *error) echo "::error::tango measured nothing in its last comparison" ;;
+          esac
           exit "$status"
       # On main, and on a pull request whose base has no benchmarks.
       - name: Times

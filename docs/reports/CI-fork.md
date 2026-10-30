@@ -140,21 +140,52 @@ verify the bundle before execution; `server` rejects failures, cancellations and
 The benchmark producer compiles **both benchmark executables**, rather than a complete
 base ra-jit. The consumer checks the PR base identity and equal Cargo arguments, verifies
 the executable pins, and compares the pair on one runner. The existing 3-second samples,
-10% threshold and retry on a slowdown are unchanged. A missing base is a failure unless
+10% threshold and retry on a slowdown are unchanged, and the retry confirms the same benchmark
+(below). A missing base is a failure unless
 the producer explicitly records that the base lacks `crates/ra-jit-bench`.
 
-**An open question on `tango`'s repeated failure (2026-10-30).** PR18's `tango` failed
-repeatedly on `store/has_miss` at +48%. A perf writer fetched the pair from seven runs: the
-`bench-base` and `bench-head` binaries were bit-identical across all seven, so the code is
-not the variable. The one failing run whose CPU was recorded ran on an AMD EPYC 7763 (Zen 3);
-the six passing runs ran on EPYC 9V74, EPYC 9V45 and Xeon 6975P. That is a lead, not proof: a
-layout effect of the head binary that shows on one CPU family only, or that family's own noise
-under the 3 s samples. To make it testable, the `tango` job now records the runner's CPU
-(`lscpu`'s model name and count, `/proc/cpuinfo`'s flags) and both binaries' sha256 beside
-every verdict, pass or fail: in the step summary, at the top of `bench.txt`, and in the
-`tango-<run>-<attempt>` artifact (`tango/cpu.txt`), which is now kept on every run. The
-threshold (10%) and the second comparison on a slowdown are unchanged. Open: whether every
-failure lands on Zen 3, and whether the +48% reproduces on a Zen 3 host outside CI.
+**What `tango` failed on, and how it now judges (2026-10-30).** PR18's `tango` failed repeatedly
+on `store/has_miss` at +48%. A perf writer fetched the pair from seven runs: the `bench-base` and
+`bench-head` binaries were bit-identical across all seven (and the diff of the store,
+`hir-ty-codegen`, the bench crate and `Cargo.lock` between a failing and a passing head was empty),
+so the code is not the variable. The one failing run whose CPU was recorded ran on an AMD EPYC 7763
+(Zen 3); the six passing runs ran on EPYC 9V74, EPYC 9V45 and Xeon 6975P. That is a lead, not
+proof: a layout effect of the head binary that shows on one CPU family only, or that family's own
+noise under the 3 s samples. Nor was the failure one benchmark twice. In run 41131270465 the first
+comparison was over the threshold on `pack/check_1000x512` (+23%, equal medians, a burst of
+outliers raised the mean) and `store/has_miss` was at -1.6%; the second was over on
+`store/has_miss` (+48%, a stable 143 ns against 96 ns, so a state of that process) and
+`pack/check_1000x512` was at -0.2%. The job's comment said "twice in a row" and the script failed
+when any benchmark was over in each. It could not be reproduced on an AArch64 Mac (three
+comparisons, all within 3%).
+
+The job now does three things (`.github/scripts/bench_verdict.py`, tested by
+`test_bench_verdict.py` on the output of that run):
+
+- **The same benchmark in both comparisons.** The threshold (10%), the 3 s samples and the number
+  of comparisons (a second one only after a slowdown) are unchanged; the job fails only when a
+  benchmark is over the threshold in both. A slowdown that moves to another benchmark, or does not
+  come back, is "noise" and passes.
+- **An A/A control first.** `bench-base` is compared with a copy of itself on the same runner. If a
+  benchmark is over the threshold there, the runner cannot tell a slowdown from itself, the verdict
+  is "environmental", the comparison with the base is reported with the numbers and not counted
+  (a warning, exit 0), and everything is still uploaded. It adds 18 s to the job (six benchmarks
+  of 3 s, once; run 41136287813). It catches a runner whose processes differ from each
+  other, which is what the failure was: it does not catch one whose head-only process is slow
+  while the control's two are not, so the CPU record below is how that is told.
+- **The CPU beside every verdict.** `lscpu`'s model name and count, `/proc/cpuinfo`'s flags and
+  both binaries' sha256 are in the step summary, at the top of `bench.txt` and in the
+  `tango-<run>-<attempt>` artifact (`tango/cpu.txt`, with `aa.txt`, `compare-N.txt`,
+  `verdict.txt` and the raw samples), on pass and on fail; the verdict's first lines name the CPU
+  and the digests. Open: whether every failure lands on Zen 3.
+
+The control reproduced the failure with no code involved. In the first dispatched run of the job
+(41136287813, `pr.yaml` by hand, base and head of this change), on an AMD EPYC 7763 (4 CPUs),
+`bench-base` against a copy of itself was `store/has_miss` +49.41% (95.2 ns against 142.3 ns, close to
+PR18's 96.7 ns against 143.2 ns) and the comparison with the base had nothing over the threshold; the
+verdict was "environmental". So the +48% is a state of a process on that CPU family, which the
+base's own binary shows against itself, and not a property of the head's code. Why a process
+lands in the slow state (its memory placement, as ASLR varies it, or the CPU) is still open.
 
 What changed on purpose in the server checks, beside where the binaries come from (opus's
 cross-review of 2026-10-30, S1 to S5):

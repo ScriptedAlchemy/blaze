@@ -432,7 +432,11 @@ repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-
 microbenchmarks. The producer compiles the base and head benchmark executables with the
 same pinned shell and `cargo bench` arguments; the consumer checks their provenance and
 compares them on one runner with the existing three-second samples, 10% noise threshold,
-and second comparison on a slowdown. A missing base executable fails unless the producer
+and second comparison on a slowdown. The job fails only when the same benchmark is over the
+threshold in both comparisons; before them, `bench-base` is compared with a copy of itself, and
+a benchmark over the threshold there makes the verdict "environmental" (reported, not counted).
+The runner's CPU and both binaries' sha256 are in the summary and the artifact of every run
+(`.github/scripts/bench_verdict.py`, [reports/CI-fork.md](reports/CI-fork.md)). A missing base executable fails unless the producer
 explicitly records that the base has no benchmark package. The consumer compiles neither
 side. `blaze-serve-review.yaml` is also called by `pr.yaml`: it verifies the bundle and
 replays the test processes of `.github/ci/test-sets.json` with the original test filters,
