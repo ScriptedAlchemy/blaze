@@ -209,7 +209,16 @@ impl Producers {
         raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
         raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
         let (outputs, images, world, _leases) =
-            crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs, &raw)?;
+            // Every package of the plan is a host unit, and each one's output is applied.
+            crate::scripts::run_producers(
+                &cargo,
+                &asked,
+                sysroot.to_owned(),
+                flags,
+                cfgs,
+                &raw,
+                &|_| true,
+            )?;
         anyhow::ensure!(
             !failure.exists(),
             "blaze could not compile a producer's compiler probe: {}",

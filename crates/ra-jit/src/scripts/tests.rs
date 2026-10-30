@@ -1001,3 +1001,58 @@ fn a_script_runs_again_after_the_script_of_a_library_it_is_compiled_with_ran_aga
     assert_eq!(pkg.runs(), ["a", "a"], "and only once: the dependency did not run again");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The host pass of a whole build runs the scripts of the packages it builds for the host alone.
+/// One built for the target alone runs once, for the target, as cargo has no host unit of it:
+/// before, every package's script ran for the host too, in a directory of its own, so each ran
+/// twice in a build and one that reads its `links` dependency's metadata, which the host's
+/// description of a target package does not have, failed (`scriptrerun.py`'s `counter` and
+/// `links`).
+#[cfg(unix)]
+#[test]
+fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
+    let base = dir("host-pass");
+    let pkg = Fixture::at(&base);
+    let id = pkg.cargo[pkg.package].id.repr.clone();
+    let env = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), base.join("home").display().to_string()),
+        ("COUNTER".to_owned(), pkg.counter().display().to_string()),
+        ("GEN".to_owned(), "a".to_owned()),
+    ]);
+    let for_target = FxHashMap::from_iter([(id.clone(), true)]);
+    let for_host = FxHashMap::from_iter([(id.clone(), false)]);
+    let asked = |packages| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages,
+        host_cargo: None,
+    };
+    assert!(!for_the_host_alone(&asked(Some(&for_target)), &id));
+    assert!(for_the_host_alone(&asked(Some(&for_host)), &id));
+    assert!(for_the_host_alone(&asked(None), &id), "every package is the host's when none is said");
+    assert!(
+        !for_the_host_alone(&asked(Some(&for_host)), "another"),
+        "nor one the build does not have"
+    );
+    // A package for the target alone: the host pass neither compiles nor runs its script.
+    let host_cfgs = vec!["unix".to_owned()];
+    let ran = run_producers(
+        &pkg.cargo,
+        &asked(Some(&for_target)),
+        pkg.sysroot.clone(),
+        Vec::new(),
+        host_cfgs,
+        &BTreeMap::new(),
+        &|id| for_the_host_alone(&asked(Some(&for_target)), id),
+    )
+    .unwrap();
+    assert!(ran.0.is_empty(), "no host output of a package built for the target alone");
+    assert!(ran.2.is_empty(), "and no run judged");
+    assert!(pkg.runs().is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}

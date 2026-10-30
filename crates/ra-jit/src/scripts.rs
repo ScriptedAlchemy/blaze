@@ -309,6 +309,10 @@ pub(crate) fn run(
 
 /// Run the host projection of an owned producer plan, without folding target features
 /// into its scripts. The caller keeps this build's leases through producer compilation.
+/// `host_unit` says which packages' scripts run for the host whether or not a producer or a
+/// script compiled for it needs them: cargo runs a script for the host only for a package it
+/// builds for the host, and the script of a package it builds for the target alone runs once,
+/// in that package's target unit. The others run when what is compiled for the host needs them.
 pub(crate) fn run_producers(
     cargo: &CargoWorkspace,
     asked: &Asked<'_>,
@@ -316,6 +320,7 @@ pub(crate) fn run_producers(
     flags: Vec<String>,
     cfgs: Vec<String>,
     raw_env: &BTreeMap<OsString, OsString>,
+    host_unit: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<(
     BTreeMap<String, (PathBuf, blaze_build_script::Output)>,
     BTreeMap<String, PathBuf>,
@@ -338,7 +343,7 @@ pub(crate) fn run_producers(
                 }) {
                     runner.producer(package).map_err(|why| Attempt::of(runner.busy.take(), why))?;
                 }
-                if runner.runs(package) {
+                if runner.runs(package) && host_unit(&cargo[package].id.repr) {
                     let done = runner
                         .script(package, true)
                         .map_err(|why| Attempt::of(runner.busy.take(), why))?;
@@ -363,6 +368,16 @@ pub(crate) fn run_producers(
         }
         result
     })
+}
+
+/// Whether the build `asked` builds the package `id` for the host alone, as a build-dependency
+/// or a proc macro, or what is compiled with one, and not for the target: its script runs for
+/// the host whatever needs it, and its outputs are the host's. A package built for the target
+/// too has its script run for the target, and for the host only when a script or producer
+/// compiled for the host needs it, as cargo has no host unit of a package it builds for the
+/// target alone. Every package is the host's when the build says none.
+fn for_the_host_alone(asked: &Asked<'_>, id: &str) -> bool {
+    asked.packages.is_none_or(|it| it.get(id) == Some(&false))
 }
 
 fn run_with(
@@ -483,6 +498,7 @@ fn pass(
             runner.host_flags.clone(),
             runner.host_cfgs.clone().context("no host cfg for owned producers")?,
             &runner.child_env(),
+            &|id| for_the_host_alone(asked, id),
         )?;
         runner.judged.extend(world);
         runner.image_leases.extend(leases);
