@@ -1,0 +1,11 @@
+{
+  "_doc": "Test and build sets the build bundle (.github/workflows/pr.yaml, job build) compiles once per platform; checks run them with `bundle.py test <set> -- <libtest args>` or use their executables. Each set is its own cargo command, so its feature resolution is the one the command alone has. The area that runs a set owns its entry. Contract: docs/reports/CI-fork.md.",
+  "dist": {
+    "platforms": ["linux-x64", "macos-arm64"],
+    "test": ["-p", "blaze-dist", "-p", "blaze-dist-local", "-p", "blaze-wire", "-p", "blaze-spec"]
+  },
+  "c2-contracts": {
+    "platforms": ["linux-x64", "macos-arm64"],
+    "test": ["-p", "blaze-wire", "-p", "blaze-spec"]
+  }
+}
