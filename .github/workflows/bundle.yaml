@@ -100,13 +100,23 @@ jobs:
           compression-level: 0
           retention-days: 3
           if-no-files-found: error
-      - name: Keep the bootstrap log
+      # The bootstrap's audit, kept as the C2 and server checks kept it before they stopped
+      # bootstrapping their own (the bundle itself is kept 3 days).
+      - name: Keep the owned runtime's bootstrap evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bundle-${{ inputs.platform }}-log
-          path: ${{ runner.temp }}/owned-runtime.log
-          if-no-files-found: ignore
+          name: owned-runtime-evidence-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/owned-runtime.log
+            ${{ runner.temp }}/owned-runtime/image-pins.json
+            ${{ runner.temp }}/owned-runtime/tool-controls.json
+            ${{ runner.temp }}/owned-runtime/*.watchdog.json
+            ${{ runner.temp }}/owned-runtime/*audit.json
+            ${{ runner.temp }}/owned-runtime/*external-execs.json
+            ${{ runner.temp }}/owned-runtime/*.exec
+            ${{ runner.temp }}/owned-runtime/build.log
+          if-no-files-found: warn
       - if: ${{ !cancelled() && inputs.cache-write }}
         uses: ./.github/actions/toolchain/save
         with:
