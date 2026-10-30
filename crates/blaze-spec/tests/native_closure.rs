@@ -554,3 +554,36 @@ fn a_root_spelled_with_parent_components_answers_below_a_shorter_bound_prefix() 
     let actual = Tree::capture(&escape).unwrap();
     assert!(admission.admit(&escape, actual.entry(Path::new("")).unwrap()).is_err());
 }
+
+#[test]
+fn parent_spelled_roots_allow_parent_traversal_inside_observed_directories() {
+    let work = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(work.path()).unwrap();
+    let prefix = base.join("a");
+    let library = base.join("b");
+    fs::create_dir_all(&prefix).unwrap();
+    fs::create_dir_all(library.join("sub")).unwrap();
+    fs::write(library.join("libchoice.a"), b"chosen archive").unwrap();
+    fs::write(base.join("outside.a"), b"not captured").unwrap();
+    let spelled = prefix.join("../b");
+    let closure = captured("linker/libraries/0", &spelled);
+    let admission = closure.admission();
+    let path = spelled.join("sub/../libchoice.a");
+    assert_eq!(fs::read(&path).unwrap(), b"chosen archive");
+    let actual = Tree::capture(&path).unwrap();
+    admission.admit(&path, actual.entry(Path::new("")).unwrap()).unwrap();
+    assert_eq!(admission.entry(&path), admission.entry(&library.join("libchoice.a")));
+    assert!(admission.entry(&spelled.join("libchoice.a/../libchoice.a")).is_none());
+    assert_eq!(
+        admission.entry(&spelled.join("absent/../libchoice.a")),
+        Some(Entry { links: vec![], kind: Kind::Missing })
+    );
+    let escape = spelled.join("sub/../../outside.a");
+    assert_eq!(fs::read(&escape).unwrap(), b"not captured");
+    assert!(admission.entry(&escape).is_none());
+    drop(admission);
+    let mut closure = closure;
+    closure.roots.push(Root { name: "source".into(), tree: Tree::capture(&base).unwrap() });
+    let actual = Tree::capture(&escape).unwrap();
+    closure.admission().admit(&escape, actual.entry(Path::new("")).unwrap()).unwrap();
+}

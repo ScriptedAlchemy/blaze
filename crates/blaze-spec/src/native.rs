@@ -242,7 +242,7 @@ impl Admission<'_> {
     /// (`…/gcc/<triple>/12/../../../../<triple>/lib`), is that root's: the walk from the
     /// shortest prefix would reach a shorter bound directory first and then have to cross the
     /// `..` through directories no root captured. The longest such root that is a lexical
-    /// prefix of `path` answers; a `..` below it, which could leave it, is refused.
+    /// prefix of `path` answers through the same observed-node traversal as other roots.
     fn parent_spelled_root(&self, path: &Path) -> Option<Lookup<Entry>> {
         let parent = |path: &Path| path.components().any(|it| matches!(it, Component::ParentDir));
         let root = self
@@ -253,9 +253,6 @@ impl Admission<'_> {
             .filter(|root| parent(root) && path.starts_with(root))
             .max_by_key(|root| root.components().count())?;
         let relative = path.strip_prefix(root).ok()?;
-        if parent(relative) {
-            return Some(Lookup::Rejected);
-        }
         match observed_node(&self.nodes, root) {
             Lookup::Bound(node) => Some(walk_captured(
                 &self.nodes,
