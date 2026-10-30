@@ -1,5 +1,6 @@
-//! Three proc macros: a derive and an attribute that read only their input, and a derive that
-//! reads a file of the package it is used in while it expands, as `rust-embed` does.
+//! Proc macros: a derive and an attribute that read only their input, a derive that reads a
+//! file of the package it is used in while it expands, as `rust-embed` does, and derives that
+//! read the environment of the compiler that expands them.
 
 use proc_macro::{TokenStream, TokenTree};
 
@@ -53,4 +54,14 @@ pub fn manifest_length(input: TokenStream) -> TokenStream {
     let name = name_of(&input);
     let length = std::env::var("CARGO_MANIFEST_DIR").unwrap().len();
     format!("impl {name} {{ pub fn manifest_length() -> usize {{ {length} }} }}").parse().unwrap()
+}
+
+/// `impl Name { pub fn private() -> &'static str }`, with what the expanding process has of
+/// `PR15_PRIVATE`, as `{:?}` of its `var_os` shows it: a variable the process does not have
+/// is `None`, whatever a process that expanded before had.
+#[proc_macro_derive(Private)]
+pub fn private(input: TokenStream) -> TokenStream {
+    let name = name_of(&input);
+    let seen = format!("{:?}", std::env::var_os("PR15_PRIVATE"));
+    format!("impl {name} {{ pub fn private() -> &'static str {{ {seen:?} }} }}").parse().unwrap()
 }

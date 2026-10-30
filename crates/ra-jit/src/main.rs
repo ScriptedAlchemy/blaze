@@ -2784,6 +2784,7 @@ impl Checkouts {
         world.sort();
         world.dedup();
         let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
+        self.loaded.set_proc_macro_env(self.macro_env());
         self.refresh_macro_image_identities();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         for (root, workspace, config, build, own) in watched {
@@ -2893,6 +2894,7 @@ impl Checkouts {
         for &at in stale {
             loaded.push(self.loaded_again(at, env, build)?);
         }
+        self.loaded.set_proc_macro_env(self.macro_env());
         for (&at, (workspace, debug, config, given, own, generation)) in stale.iter().zip(loaded) {
             self.place(at, workspace, debug, &config, &given, build, own, generation);
         }
@@ -2928,6 +2930,15 @@ impl Checkouts {
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.collect_macro_generations();
         failed
+    }
+
+    /// The variables the proc-macro servers of a load for the request this thread serves
+    /// start with: its complete snapshot over the daemon's, not those of a process that asked
+    /// before, so one it has not is removed and a value that is not Unicode is its own.
+    fn macro_env(&self) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+        let base = self.cargo_config.extra_env.iter();
+        let base = base.map(|(name, value)| (name.into(), value.as_ref().map(Into::into)));
+        base.chain(inputs::server_env(&process::native())).collect()
     }
 
     fn collect_macro_generations(&self) {

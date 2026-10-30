@@ -516,6 +516,30 @@ fn run_env<'a>(
     vars
 }
 
+/// The variables a proc-macro server started for a request with the complete snapshot
+/// `asked` has over the daemon's: each the request has otherwise than the daemon, native, and
+/// each the daemon has and the request has not, removed. A macro reads its server's variables
+/// as it reads rustc's, which are the asking process's. The daemon's own (`RA_JIT_*`, [`OWN`])
+/// stay the daemon's.
+pub(crate) fn server_env(
+    asked: &crate::process::Native,
+) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    let theirs = |name: &std::ffi::OsStr| {
+        let name = name.to_string_lossy();
+        !name.starts_with("RA_JIT_") && !OWN.contains(&&*name)
+    };
+    let asked: std::collections::BTreeMap<_, _> =
+        asked.vars().filter(|(name, _)| theirs(name)).collect();
+    let own: std::collections::BTreeMap<_, _> =
+        std::env::vars_os().filter(|(name, _)| theirs(name)).collect();
+    let set = asked
+        .iter()
+        .filter(|&(name, value)| own.get(name) != Some(value))
+        .map(|(name, value)| (name.clone(), Some(value.clone())));
+    let removed = own.keys().filter(|name| !asked.contains_key(*name)).map(|it| (it.clone(), None));
+    set.chain(removed).collect()
+}
+
 impl Inputs {
     /// Has the workspace at `root`, loaded with `config`, be one whose inputs are watched. The
     /// variables the process it was loaded for gave it over the daemon's are `given`, and
@@ -1513,6 +1537,41 @@ mod tests {
 
     /// A process that asks for a build gives the scripts its variables: those the daemon does
     /// not have alike, those it has not that one before had, and the ones asked for.
+    /// PR15_PRIVATE: a daemon started by a process that had it, then a request without it,
+    /// then one with a value that is not Unicode. The servers of each have what it has.
+    #[cfg(unix)]
+    #[test]
+    fn macro_servers_start_with_the_complete_snapshot_of_the_request() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        let own: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let gone = own
+            .iter()
+            .map(|(name, _)| name.clone())
+            .find(|it| {
+                it.to_str().is_some_and(|it| !it.starts_with("RA_JIT_") && !OWN.contains(&it))
+            })
+            .expect("the test runs with a variable of its own");
+        let raw = OsString::from_vec(b"raw-\xff-value".to_vec());
+        let asked = crate::process::Native::of(
+            own.iter().filter(|(name, _)| *name != gone).cloned().chain([
+                ("PR15_PRIVATE".into(), raw.clone()),
+                ("RA_JIT_NOT_THEIRS".into(), "1".into()),
+                ("CARGO_TARGET_DIR".into(), "/elsewhere".into()),
+            ]),
+        );
+        let env = server_env(&asked);
+        assert!(env.contains(&(gone.clone(), None)), "what the request has not is removed");
+        assert!(
+            env.contains(&("PR15_PRIVATE".into(), Some(raw))),
+            "a value is the request's, native"
+        );
+        assert!(
+            env.iter().all(|(name, _)| *name == gone || name == "PR15_PRIVATE"),
+            "nothing else differs, and the daemon's own stay its own: {env:?}"
+        );
+        assert_eq!(server_env(&crate::process::Native::own()), Vec::new());
+    }
+
     #[test]
     fn the_scripts_run_with_the_variables_of_the_process_that_asks() {
         let daemon = |name: &str| match name {

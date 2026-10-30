@@ -94,30 +94,57 @@ pub struct ProcMacroClient {
     /// That means that concurrent salsa requests may block each other when expanding proc macros,
     /// which is unfortunate, but simple and good enough for the time being.
     epochs: Arc<Mutex<Epochs>>,
-    /// New library generations get a pool whose lifetime follows their handles.
-    /// This releases native server images without changing either wire protocol.
-    spawn_generation: Option<Arc<dyn Fn() -> io::Result<ProcMacroServerPool> + Send + Sync>>,
+    /// New library generations get a pool whose lifetime follows their handles, started with
+    /// the environment of the load ([`Epochs::env`]). This releases native server images
+    /// without changing either wire protocol.
+    spawn_generation: Option<Arc<SpawnGeneration>>,
     snapshot_root: Option<std::path::PathBuf>,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
 }
+
+/// The variables a server starts with over this process's: a `None` removes one.
+type GenerationEnv = Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>;
+
+type SpawnGeneration = dyn Fn(&GenerationEnv) -> io::Result<ProcMacroServerPool> + Send + Sync;
 
 /// Only the unused first pool is held strongly. Serving pools belong to consumers.
 struct Epochs {
     initial: Option<Arc<ProcMacroServerPool>>,
     current: Weak<ProcMacroServerPool>,
     live: Vec<Weak<ProcMacroServerPool>>,
+    /// What the next generation starts with: the environment of the latest load, whose
+    /// macros a server that a load before it started must not expand.
+    env: GenerationEnv,
 }
 
 impl Epochs {
-    fn new(pool: ProcMacroServerPool) -> Self {
+    fn new(pool: ProcMacroServerPool, env: GenerationEnv) -> Self {
         let pool = Arc::new(pool);
         Self {
             current: Arc::downgrade(&pool),
             live: vec![Arc::downgrade(&pool)],
             initial: Some(pool),
+            env,
         }
     }
+}
+
+/// `env` in one order, the last of a name standing, without what changes nothing of what a
+/// server has from this process: two loads whose servers would have the same variables have
+/// equal environments.
+fn generation_env<'a>(
+    env: impl IntoIterator<
+        Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+    >,
+) -> GenerationEnv {
+    let vars: std::collections::BTreeMap<_, _> = env
+        .into_iter()
+        .map(|(key, value)| {
+            (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned()))
+        })
+        .collect();
+    vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
 }
 
 impl fmt::Debug for ProcMacroClient {
@@ -275,14 +302,9 @@ impl ProcMacroClient {
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
         let path = process_path.to_owned();
-        let vars: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = env
-            .into_iter()
-            .map(|(key, value)| {
-                (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned()))
-            })
-            .collect();
+        let vars = generation_env(env);
         let version = version.cloned();
-        let factory = move || {
+        let factory = move |vars: &GenerationEnv| {
             let mut workers = Vec::with_capacity(num_process);
             for _ in 0..num_process {
                 workers.push(ProcMacroServerProcess::spawn(
@@ -293,9 +315,9 @@ impl ProcMacroClient {
             }
             Ok(ProcMacroServerPool::new(workers))
         };
-        let pool = factory()?;
+        let pool = factory(&vars)?;
         Ok(ProcMacroClient {
-            epochs: Arc::new(Mutex::new(Epochs::new(pool))),
+            epochs: Arc::new(Mutex::new(Epochs::new(pool, vars))),
             path: process_path.to_owned(),
             spawn_generation: Some(Arc::new(factory)),
             snapshot_root: None,
@@ -325,7 +347,10 @@ impl ProcMacroClient {
             })?);
         }
         Ok(ProcMacroClient {
-            epochs: Arc::new(Mutex::new(Epochs::new(ProcMacroServerPool::new(workers)))),
+            epochs: Arc::new(Mutex::new(Epochs::new(
+                ProcMacroServerPool::new(workers),
+                Vec::new(),
+            ))),
             path: process_path.to_owned(),
             spawn_generation: None,
             snapshot_root: None,
@@ -350,7 +375,7 @@ impl ProcMacroClient {
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
         let version = version.cloned();
-        let factory = move || {
+        let factory = move |_: &GenerationEnv| {
             let mut workers = Vec::with_capacity(num_process);
             for _ in 0..num_process {
                 workers.push(ProcMacroServerProcess::run(spawn.clone(), version.as_ref(), || {
@@ -360,7 +385,7 @@ impl ProcMacroClient {
             Ok(ProcMacroServerPool::new(workers))
         };
         Ok(ProcMacroClient {
-            epochs: Arc::new(Mutex::new(Epochs::new(factory()?))),
+            epochs: Arc::new(Mutex::new(Epochs::new(factory(&Vec::new())?, Vec::new()))),
             path: process_path.to_owned(),
             spawn_generation: Some(Arc::new(factory)),
             snapshot_root: None,
@@ -386,6 +411,30 @@ impl ProcMacroClient {
         }
     }
 
+    /// Has the generations started from now on start with `env` over this process's
+    /// variables, a `None` removing one, as the load they serve has them. A server reads the
+    /// variables it started with, and a macro reads them as rustc's process has them, so an
+    /// environment other than the one the serving epoch started with retires that epoch, and
+    /// the unused first pool with it: what is loaded next is loaded into servers of `env`.
+    /// Consumers of the old epoch keep it, as at any reload.
+    pub fn set_generation_env<'a>(
+        &self,
+        env: impl IntoIterator<
+            Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+        >,
+    ) {
+        if self.spawn_generation.is_none() {
+            return;
+        }
+        let env = generation_env(env);
+        let Ok(mut epochs) = self.epochs.lock() else { return };
+        if epochs.env != env {
+            epochs.env = env;
+            epochs.current = Weak::new();
+            epochs.initial = None;
+        }
+    }
+
     /// Returns the absolute path to the proc-macro server.
     pub fn server_path(&self) -> &AbsPath {
         &self.path
@@ -402,7 +451,7 @@ impl ProcMacroClient {
         let mut pool = epochs.current.upgrade();
         if let Some(factory) = &self.spawn_generation {
             if pool.as_ref().is_none_or(|pool| pool.replaces(&dylib.path, prepared.content)) {
-                let next = Arc::new(factory().map_err(|error| ServerError {
+                let next = Arc::new(factory(&epochs.env).map_err(|error| ServerError {
                     message: "spawning proc-macro epoch".into(),
                     io: Some(Arc::new(error)),
                 })?);

@@ -150,6 +150,9 @@ pub struct Loaded {
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
     snapshot_root: Option<std::path::PathBuf>,
     expected_macro_images: FxHashMap<AbsPathBuf, [u8; 32]>,
+    /// The variables the proc-macro servers start with over the worker's, as the latest
+    /// request has them ([`Self::set_proc_macro_env`]); the load's own when none was told.
+    proc_macro_env: Option<Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>>,
 }
 
 impl Loaded {
@@ -160,6 +163,22 @@ impl Loaded {
     /// Explicit worker ownership for snapshots, set before starting either server.
     pub fn set_proc_macro_snapshot_root(&mut self, root: Option<std::path::PathBuf>) {
         self.snapshot_root = root;
+    }
+
+    /// The variables of the process the next load is for, over the worker's own, a `None`
+    /// removing one the worker has. A proc macro reads its server's environment, as it reads
+    /// rustc's, so a server started for an earlier request with other variables does not
+    /// expand what is loaded from now on: a new generation is started with these.
+    pub fn set_proc_macro_env(
+        &mut self,
+        env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    ) {
+        for server in [&self.proc_macro_server, &self.listed_server] {
+            if let Some(Ok(server)) = server {
+                server.set_generation_env(env.iter().map(|(name, value)| (name, value)));
+            }
+        }
+        self.proc_macro_env = Some(env);
     }
 
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
@@ -256,17 +275,22 @@ impl Loaded {
             Ok((_, path)) => !listed.contains(path),
             Err(_) => false,
         });
+        let server_env = self.proc_macro_env.clone().unwrap_or_else(|| {
+            let env = extra_env.iter();
+            env.map(|(name, value)| (name.into(), value.as_ref().map(Into::into))).collect()
+        });
         if self.proc_macro_server.is_none() && unlisted {
             self.proc_macro_server =
-                spawn_proc_macro_server(ws, extra_env, load_config).map(|server| {
+                spawn_proc_macro_server(ws, &server_env, load_config).map(|server| {
                     server.map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
                 });
         }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {
+            let env = server_env.iter().map(|(name, value)| (name, value));
             let spawned =
-                ProcMacroClient::spawn(server, extra_env, None, load_config.proc_macro_processes);
+                ProcMacroClient::spawn(server, env, None, load_config.proc_macro_processes);
             self.listed_server = Some(
                 spawned
                     .map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
@@ -430,13 +454,13 @@ fn join_root(
 
 fn spawn_proc_macro_server(
     ws: &ProjectWorkspace,
-    extra_env: &FxHashMap<String, Option<String>>,
+    env: &[(std::ffi::OsString, Option<std::ffi::OsString>)],
     load_config: &LoadCargoConfig,
 ) -> Option<Result<ProcMacroClient, ProcMacroLoadingError>> {
     let spawn = |path: &AbsPath| {
         ProcMacroClient::spawn(
             path,
-            extra_env,
+            env.iter().map(|(name, value)| (name, value)),
             ws.toolchain.as_ref(),
             load_config.proc_macro_processes,
         )
