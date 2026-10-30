@@ -2,8 +2,9 @@
 
 use base_db::{AbsPathBuf, Crate, CurrentIncludedInput};
 use hir_def::{
-    AdtId, AssocItemId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, ItemContainerId,
-    Lookup, ModuleDefId, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId,
+    ItemContainerId, Lookup, ModuleDefId, VariantId,
+    attrs::AttrFlags,
     expr_store::ExpressionStore,
     item_scope::ItemScope,
     signatures::{FnFlags, FunctionSignature},
@@ -67,19 +68,35 @@ impl Owners {
         self.owner(ExpressionStoreOwnerId::Body(owner));
     }
 
-    fn assoc(&mut self, item: AssocItemId) {
+    fn assoc(&mut self, db: &dyn HirDatabase, item: AssocItemId) {
         self.signature(item.into());
         match item {
-            AssocItemId::FunctionId(id) => self.body(id.into()),
+            AssocItemId::FunctionId(id) => {
+                Self::codegen_attributes(db, id.into());
+                self.body(id.into());
+            }
             AssocItemId::ConstId(id) => self.body(id.into()),
             AssocItemId::TypeAliasId(_) => {}
         }
+    }
+
+    fn codegen_attributes(db: &dyn HirDatabase, owner: AttrDefId) {
+        // These values expand macros lazily outside expression stores. Their
+        // environment and included-file reads affect symbols/sections and must be
+        // discovered before content identity or missing-input validation, even when
+        // no body or emitted symbol has been requested yet. Reuse the compiler's
+        // tracked semantic queries rather than inspecting attribute token text.
+        AttrFlags::export_name(db, owner);
+        AttrFlags::link_name(db, owner);
+        AttrFlags::link_section(db, owner);
+        AttrFlags::linkage(db, owner);
     }
 
     fn scope(&mut self, db: &dyn HirDatabase, scope: &ItemScope) {
         for def in scope.declarations() {
             match def {
                 ModuleDefId::FunctionId(id) => {
+                    Self::codegen_attributes(db, id.into());
                     self.signature(id.into());
                     let sig = FunctionSignature::of(db, id);
                     if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_))
@@ -93,6 +110,7 @@ impl Owners {
                     self.body(id.into());
                 }
                 ModuleDefId::StaticId(id) => {
+                    Self::codegen_attributes(db, id.into());
                     self.signature(id.into());
                     self.body(id.into());
                 }
@@ -113,7 +131,7 @@ impl Owners {
                 ModuleDefId::TraitId(id) => {
                     self.signature(id.into());
                     for &(_, item) in id.trait_items(db).items.iter() {
-                        self.assoc(item);
+                        self.assoc(db, item);
                     }
                 }
                 ModuleDefId::TypeAliasId(id) => self.signature(id.into()),
@@ -126,7 +144,7 @@ impl Owners {
         for id in scope.impls() {
             self.signature(id.into());
             for &(_, item) in id.impl_items(db).items.iter() {
-                self.assoc(item);
+                self.assoc(db, item);
             }
         }
     }
