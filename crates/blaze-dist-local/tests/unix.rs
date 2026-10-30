@@ -751,7 +751,7 @@ fn real_cli_hello_and_lifetime_retention_are_bounded() {
 
 #[test]
 fn actual_process_stop_callback_precedes_fenced_acknowledgment() {
-    let child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
     let process = Arc::new(Mutex::new(Some(child)));
     let stopped = Arc::new(AtomicBool::new(false));
     let process_callback = process.clone();

@@ -91,7 +91,7 @@ mod environment_tests {
             flags: Vec::new(),
         };
         let env = Environment(unit.env.clone());
-        let mut command = Command::new("/usr/bin/printenv");
+        let mut command = crate::process::printenv_for_test();
         command.env("BLAZE_LINK_LEAK", "worker");
         env.apply(&mut command);
         let output = command.output().unwrap();
@@ -109,7 +109,7 @@ mod environment_tests {
         base_db::set_process_env(&mut db, request("b"));
         let second = Environment::of(&db);
         for (env, want) in [(first, "a"), (second, "b")] {
-            let mut command = Command::new("/usr/bin/printenv");
+            let mut command = crate::process::printenv_for_test();
             command.env("BLAZE_LINK_LEAK", "worker");
             env.apply(&mut command);
             let output = command.output().unwrap();
@@ -138,7 +138,7 @@ mod environment_tests {
         std::thread::scope(|scope| {
             for (env, byte) in [(first, b'a'), (second, b'b')] {
                 scope.spawn(move || {
-                    let mut command = Command::new("/usr/bin/printenv");
+                    let mut command = crate::process::printenv_for_test();
                     env.apply(&mut command);
                     command.env("SOURCE", "same");
                     let output = command.output().unwrap();
