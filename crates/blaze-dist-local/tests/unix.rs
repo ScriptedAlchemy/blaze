@@ -634,11 +634,9 @@ fn pending_request_is_never_migrated_into_a_fresh_lifetime() {
 
 #[test]
 fn committed_lost_answer_cannot_be_reissued_by_renewal_or_replayed_after_expiry() {
-    // The real sequence the guarantee is about: a Submit that COMMITTED, whose answer the
-    // client never saw, and then two ways the client could try to carry it forward — renewing
-    // into a fresh lifetime, and replaying the old bytes after expiry. Neither may repeat the
-    // effect. The client here is the production one; only the wire is raw, so the answer is
-    // genuinely lost rather than simulated by a flag.
+    // Drop the answer after Submit commits. Neither renewing into a fresh session nor
+    // replaying the old bytes after expiry may submit the work again. The production client
+    // receives no answer because the test drops it on the socket.
     let f = Fixture::new(true, Config { session_ms: 40, ..Config::default() });
     let count_assigned = |f: &Fixture| {
         f.effects

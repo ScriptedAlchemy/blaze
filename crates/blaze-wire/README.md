@@ -1,9 +1,10 @@
 # blaze-wire
 
-blaze's wire schema: every type of [docs/distributed.md](../../docs/distributed.md)'s "Data shapes"
-and section 8, in deterministic CBOR, with its validator, its digests and signatures, its errors and
-limits, and a JSON rendering for people. One crate holds the schema for the cache, compile and test
-API and the agent API ([docs/roadmap.md](../../docs/roadmap.md#8-the-agent-api)).
+`blaze-wire` defines the types in [distributed.md](../../docs/distributed.md)'s
+"Data shapes" and section 8. It encodes them as deterministic CBOR and provides
+validation, digests, signatures, errors, limits and a JSON rendering for people.
+The cache, compile, test and [agent APIs](../../docs/roadmap.md#8-the-agent-api)
+share this schema.
 
 ## The encoding
 
@@ -38,7 +39,7 @@ bounded structural pass first and then typed field budgets (including the path e
 `MAX_DEPTH` counts every item, containers and scalars alike, so a scalar inside 31 arrays is the
 deepest item a message may have.
 
-Nothing canonicalizes a bad message: a client that encodes wrong finds out.
+The decoder rejects noncanonical messages rather than rewriting them.
 
 ## Digests and signatures
 
@@ -68,10 +69,10 @@ cargo run -p blaze-wire --example write_golden
 
 ## JSON
 
-[`to_json`] renders a value for people (`Accept: application/json`, `--json`): field numbers as text,
-byte strings as lowercase hex, sets as arrays, and an enum as the wire's two-element array
-(`[discriminant, payload]`, `Namespace::Main` as `[0,null]`). It is never the wire and nothing's
-identity is taken from it.
+[`to_json`] renders a value for people through `Accept: application/json` or `--json`.
+It renders field numbers as text, byte strings as lowercase hex, sets as arrays
+and enums as `[discriminant, payload]`. For example, `Namespace::Main` is `[0,null]`.
+The protocol uses CBOR. JSON does not determine identity.
 
 ## Schema version 4
 
@@ -134,6 +135,6 @@ budget failures are transport resource limits, not language-path restrictions.
 
 ## What is not here
 
-The transport (HTTP/1.1 on `hyper`, a Unix socket locally, blobs by `GET`/`PUT /v1/blob/<sha256>`)
-and the server's state machine are not this crate's: it is the schema, and the units after C1 build
-on it.
+Later units implement the server state machine and transports using this schema.
+The transports are HTTP/1.1 on `hyper` and a local Unix socket, with blobs served
+through `GET` and `PUT /v1/blob/<sha256>`.

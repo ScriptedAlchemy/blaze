@@ -300,7 +300,7 @@ crate under `harness/breakers/`.
 The focused `answers` unit tests can also exercise an armed copied toolchain:
 set `RA_JIT_TEST_QUERY_TOOLCHAIN` to the directory made by
 `harness/norustc.py`'s `stand_ins`. The synthetic non-executable control always
-runs; the supplied copy additionally proves that owned print queries do not
+runs; the supplied copy also proves that owned print queries do not
 execute its compiler or Cargo wrappers. A zero-hit audit file is absent.
 
 Start from the script's last lines. Each daemon harness prints the path of the daemon's log
