@@ -55,6 +55,12 @@ struct Section<'data> {
     relocations: Vec<Relocation>,
 }
 
+impl Section<'_> {
+    fn alias_type(&self) -> u8 {
+        if self.sh_flags & u64::from(elf::SHF_TLS) != 0 { elf::STT_TLS } else { elf::STT_NOTYPE }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Relocation {
     offset: u64,
@@ -553,36 +559,38 @@ impl Input<'_, '_> {
         }
         for (at, _) in self.sections.iter().enumerate().filter(|it| it.1.part == part) {
             if self.named_section[at] {
+                let st_type = self.sections[at].alias_type();
                 object.add_symbol(write::Symbol {
                     name: section_name(at),
                     value: 0,
                     size: 0,
-                    kind: SymbolKind::Label,
+                    kind: kind_of(st_type),
                     scope: SymbolScope::Linkage,
                     weak: false,
                     section: write::SymbolSection::Section(ids[&at]),
                     flags: SymbolFlags::Elf {
-                        st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                        st_info: (elf::STB_GLOBAL << 4) | st_type,
                         st_other: elf::STV_HIDDEN,
                     },
                 });
             }
         }
         let mut referred: FxHashMap<Vec<u8>, write::SymbolId> = FxHashMap::default();
-        let mut refer = |object: &mut write::Object<'_>, name: Vec<u8>, st_info: u8| {
-            *referred.entry(name.clone()).or_insert_with(|| {
-                object.add_symbol(write::Symbol {
-                    name,
-                    value: 0,
-                    size: 0,
-                    kind: SymbolKind::Unknown,
-                    scope: SymbolScope::Unknown,
-                    weak: st_info >> 4 == elf::STB_WEAK,
-                    section: write::SymbolSection::Undefined,
-                    flags: SymbolFlags::Elf { st_info, st_other: elf::STV_DEFAULT },
+        let mut refer =
+            |object: &mut write::Object<'_>, name: Vec<u8>, st_info: u8, st_other: u8| {
+                *referred.entry(name.clone()).or_insert_with(|| {
+                    object.add_symbol(write::Symbol {
+                        name,
+                        value: 0,
+                        size: 0,
+                        kind: kind_of(st_info & 0xf),
+                        scope: SymbolScope::Unknown,
+                        weak: st_info >> 4 == elf::STB_WEAK,
+                        section: write::SymbolSection::Undefined,
+                        flags: SymbolFlags::Elf { st_info, st_other },
+                    })
                 })
-            })
-        };
+            };
         for (at, section) in self.sections.iter().enumerate().filter(|it| it.1.part == part) {
             for relocation in &section.relocations {
                 let target = relocation.target;
@@ -591,15 +599,28 @@ impl Input<'_, '_> {
                     Some(&id) => id,
                     None if symbol.st_type() == elf::STT_SECTION => {
                         let home = symbol.section.expect("a section symbol is of a section");
-                        refer(&mut object, section_name(home), elf::STB_GLOBAL << 4)
+                        refer(
+                            &mut object,
+                            section_name(home),
+                            (elf::STB_GLOBAL << 4) | self.sections[home].alias_type(),
+                            elf::STV_HIDDEN,
+                        )
                     }
-                    None if self.named_symbol[target] => {
-                        refer(&mut object, self.named(target), elf::STB_GLOBAL << 4)
-                    }
+                    None if self.named_symbol[target] => refer(
+                        &mut object,
+                        self.named(target),
+                        (elf::STB_GLOBAL << 4) | symbol.st_type(),
+                        (symbol.st_other & !3) | elf::STV_HIDDEN,
+                    ),
                     None => {
                         let weak = symbol.section.is_none() && symbol.bind() == elf::STB_WEAK;
                         let bind = if weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
-                        refer(&mut object, symbol.name.to_vec(), bind << 4)
+                        refer(
+                            &mut object,
+                            symbol.name.to_vec(),
+                            (bind << 4) | symbol.st_type(),
+                            symbol.st_other,
+                        )
                     }
                 };
                 object.add_relocation(
@@ -882,5 +903,110 @@ mod tests {
         indexed.sort();
         assert_eq!(indexed, names);
         assert!(indexed.contains(&"weak_d".to_owned()));
+    }
+
+    #[test]
+    fn cross_part_tls_symbols_keep_type_binding_and_visibility() {
+        let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let data = object.add_section(Vec::new(), b".tdata.value".to_vec(), SectionKind::Tls);
+        object.set_section_data(data, vec![0; 16], 8);
+        let bss =
+            object.add_section(Vec::new(), b".tbss.local".to_vec(), SectionKind::UninitializedTls);
+        object.append_section_bss(bss, 16, 8);
+        let text = object.add_section(Vec::new(), b".text.probe".to_vec(), SectionKind::Text);
+        object.set_section_data(text, vec![0; 64], 16);
+        let mut tls = |name: &str, section, scope, weak, flags| {
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 8,
+                kind: SymbolKind::Tls,
+                scope,
+                weak,
+                section,
+                flags,
+            })
+        };
+        let global = tls(
+            "tls_global",
+            SymbolSection::Section(data),
+            SymbolScope::Dynamic,
+            false,
+            SymbolFlags::Elf {
+                st_info: (elf::STB_GLOBAL << 4) | elf::STT_TLS,
+                st_other: elf::STV_PROTECTED,
+            },
+        );
+        let local = tls(
+            "tls_local",
+            SymbolSection::Section(bss),
+            SymbolScope::Compilation,
+            false,
+            SymbolFlags::None,
+        );
+        let weak = tls(
+            "tls_weak_external",
+            SymbolSection::Undefined,
+            SymbolScope::Unknown,
+            true,
+            SymbolFlags::None,
+        );
+        let external = tls(
+            "tls_external",
+            SymbolSection::Undefined,
+            SymbolScope::Unknown,
+            false,
+            SymbolFlags::None,
+        );
+        let section = object.section_symbol(data);
+        for (at, symbol) in [global, local, weak, external, section].into_iter().enumerate() {
+            object
+                .add_relocation(
+                    text,
+                    Relocation {
+                        offset: (at * 8) as u64,
+                        symbol,
+                        addend: 0,
+                        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_TLSGD },
+                    },
+                )
+                .unwrap();
+        }
+        let archive = super::split(&object.write().unwrap(), 1).unwrap();
+        let file = ArchiveFile::parse(&*archive).unwrap();
+        let (mut definitions, mut references) = (0, 0);
+        for member in file.members() {
+            let member = member.unwrap();
+            let object = object::File::parse(member.data(&*archive).unwrap()).unwrap();
+            for symbol in object.symbols() {
+                let name = symbol.name().unwrap();
+                if !name.starts_with("tls_") && !name.starts_with("ra-jit.part.section.") {
+                    continue;
+                }
+                let SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
+                    panic!("ELF symbol");
+                };
+                assert_eq!(st_info & 0xf, elf::STT_TLS, "{name}");
+                assert_eq!(symbol.kind(), SymbolKind::Tls, "{name}");
+                let binding =
+                    if name == "tls_weak_external" { elf::STB_WEAK } else { elf::STB_GLOBAL };
+                assert_eq!(st_info >> 4, binding, "{name}");
+                let visibility =
+                    if name.starts_with("tls_local") || name.starts_with("ra-jit.part.section.") {
+                        elf::STV_HIDDEN
+                    } else if name == "tls_global" {
+                        elf::STV_PROTECTED
+                    } else {
+                        elf::STV_DEFAULT
+                    };
+                assert_eq!(st_other & 3, visibility, "{name}");
+                if symbol.is_undefined() {
+                    references += 1;
+                } else {
+                    definitions += 1;
+                }
+            }
+        }
+        assert_eq!((definitions, references), (3, 5));
     }
 }
