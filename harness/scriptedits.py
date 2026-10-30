@@ -341,7 +341,7 @@ case("env-new", "a variable the script watches only after an edit of it", single
     step("unset", 1),
 ])
 
-# 3c. A variable the script starts to watch on its second run, as the verifier's did.
+# 3c. The script starts watching a variable on its second run.
 case("env-later", "a script that watches a variable from its second run on", single(r'''
 fn main() {
     note("probe");

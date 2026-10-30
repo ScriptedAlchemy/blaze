@@ -151,7 +151,7 @@ def selftest():
         ("another standard output", Ran(returncode=0, stdout="onetwo8\n", stderr=""), ok, built, 1),
         ("another exit status", Ran(returncode=3, stdout="onetwo7\n", stderr=""), ok, built, 1),
         ("another standard error", Ran(returncode=0, stdout="onetwo7\n", stderr="boom\n"), ok, built, 1),
-        # What `program_output` takes out as cargo's or as noise (the verifier's cases).
+        # `program_output` removes Cargo output and diagnostic noise.
         ("a line on standard error that looks like a warning of cargo's",
          Ran(returncode=0, stdout="onetwo7\n", stderr="warning: boom\n"), ok, built, 1),
         ("no newline at the end", Ran(returncode=0, stdout="onetwo7", stderr=""), ok, built, 1),

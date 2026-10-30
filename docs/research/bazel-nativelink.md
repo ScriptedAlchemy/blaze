@@ -1,12 +1,13 @@
 # Bazel with NativeLink, for Rust, against blaze's distributed design
 
-2026-10-25, unit u3 of the distributed program. How Bazel with NativeLink does distributed
-compile and caching end to end for Rust (rules_rust), what of it blaze should adopt, adapt or
-reject, and what that changes in [distributed.md](../distributed.md) (PR
-[#1](https://github.com/ScriptedAlchemy/blaze/pull/1), branch `dist/u2-design` at `45449ae6`).
-Each claim is marked **read** (in a source we read, at the pin below), **reported** (a document
-or someone says so, not re-checked) or **unverified** (our inference). No code was built or run;
-every source was read as text.
+This survey, dated 2026-10-25, is unit u3 of the distributed program. It examines
+Rust compilation and caching in Bazel, rules_rust and NativeLink, then proposes
+changes to blaze's [distributed design](../distributed.md). It reviews PR
+[#1](https://github.com/ScriptedAlchemy/blaze/pull/1) at `45449ae6` on `dist/u2-design`.
+
+A claim marked **read** comes from a source at a pin below. **reported** means
+another document or person reports it without a recheck here. **unverified** marks
+an inference. This survey read source text without building or running code.
 
 ## Sources
 
@@ -569,8 +570,8 @@ blaze's side is **read** at `c8e5f6a8` and in the design at `45449ae6` unless ma
   off for Rustc because large links on the hosted VM hurt, and turned fallback off (section 2).
 - **blaze.** `LocalPolicy { Never, Fallback, Race }`, racing per job (distributed.md lines 223, 497-503).
 - **Verdict: adapt.** Race per job, never per function. Keep Bazel's rule that a first-finishing
-  failure fails the job, so local and remote differences surface. Default `Never` on hosted runners,
-  with tracedecay's reason as the evidence.
+  failure fails the job. A successful build on the other executor cannot hide that
+  failure. Default `Never` on hosted runners, with tracedecay's reason as the evidence.
 
 ### 7.5 Persistent workers against warm slots
 
