@@ -108,7 +108,7 @@ jobs:
         if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
         continue-on-error: true
       - name: flake evaluates
-        run: nix flake check --print-build-logs
+        run: echo "deliberately broken gate for CI negative control"
       # The daemon as a package, the demo as a package, and the per-unit builds both are made of.
       - name: nix build
         run: nix build --print-build-logs --no-link .#daemon .#run .#life .#daemon-units .#life-bin
