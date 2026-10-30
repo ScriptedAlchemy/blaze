@@ -414,8 +414,18 @@ out right, it fails the run until it is taken off the list:
 
 The other workflows: `bench-readme.yaml` measures real projects on each platform's dedicated
 benchmark machine and commits the tables and the README's numbers to main. It runs a platform only once the
-repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). `bench.yaml` (the store's
-microbenchmarks, two minutes) runs on pull requests and pushes too. `claims.yaml` (all of
+repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). On the fork, `pr.yaml` calls `bench.yaml` as a bundle consumer for the store's
+microbenchmarks. The producer compiles the base and head benchmark executables with the
+same pinned shell and `cargo bench` arguments; the consumer checks their provenance and
+compares them on one runner with the existing three-second samples, 10% noise threshold,
+and second comparison on a slowdown. A missing base executable fails unless the producer
+explicitly records that the base has no benchmark package. The consumer compiles neither
+side. `blaze-serve-review.yaml` is also called by `pr.yaml`: it verifies the bundle and
+replays the test processes of `.github/ci/test-sets.json` with the original test filters,
+then runs saved-source replay and the probe/oracle harnesses against the shared release CLI.
+Its `server` aggregate requires both server tests and saved-source replay to pass. The
+central producer owns the release build and macro bootstrap; no check rebuilds those in
+the server workflow. `claims.yaml` (all of
 rustc's `tests/ui`, both backends, and the scoreboard) and `nix-live.yaml` (the flake, the demo
 and live edits, 40 minutes; also on a change to the flake, `nix/` or the dependencies) run
 nightly and open an issue when they fail, like ra-jit.yaml's full tier. `fork-sync.yaml` runs

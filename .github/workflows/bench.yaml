@@ -1,16 +1,13 @@
 name: bench
 on:
-  push:
-    branches: ["main"]
-    paths-ignore: ["site/**", "**.md", "harness/**"]
-  pull_request:
-    paths-ignore: ["site/**", "**.md", "harness/**"]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      bundle-linux-x64-sha256:
+        type: string
+        required: true
 
-concurrency:
-  # As ra-jit.yaml: a pull request's newer push cancels its run, every push to main finishes.
-  group: bench-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
 
 env:
   CARGO_INCREMENTAL: 0
@@ -33,27 +30,22 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchain
         with:
-          key: bench
-      # The base first, in the same checkout, so that the change's build reuses whatever of
-      # it the change did not touch. A base without the benchmarks has nothing to pair with.
-      - name: Build the base
-        if: github.event_name == 'pull_request'
-        run: |
-          git checkout -q --detach ${{ github.event.pull_request.base.sha }}
-          if [ -d crates/ra-jit-bench ]; then
-            cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-              | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-              | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
-          fi
-          git checkout -q --detach ${{ github.sha }}
-      - name: Build the change
-        run: |
-          cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-            | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-            | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
+          llvm: build
+          shell: bench
+      - uses: ./.github/actions/bundle
+        with:
+          platform: linux-x64
+          sha256: ${{ inputs.bundle-linux-x64-sha256 }}
+      # Both binaries were built by the producer with the same compiler, flags
+      # and benchmark profile. They are paired on this one runner, as before.
+      - name: Check benchmark provenance rejection
+        run: python3 -B .github/scripts/test_bench_pair.py
+      - name: Verify benchmark pair provenance
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 -I .github/scripts/bench_pair.py
       - name: Record benchmark context
         if: github.event_name == 'pull_request'
         env:
@@ -62,8 +54,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tango"
           {
             git rev-parse HEAD "$BASE_SHA"
-            rustc -vV
-            cargo --version
+            nix develop .#bench --command rustc -vV
+            nix develop .#bench --command cargo --version
             uname -a
             lscpu
             sha256sum "$RUNNER_TEMP"/bench-*

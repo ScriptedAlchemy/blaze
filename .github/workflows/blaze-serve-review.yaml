@@ -1,172 +1,96 @@
 name: cache server regressions
 
 on:
-  pull_request:
-    branches: [dist/main, dist/c4-keys]
-    paths:
-      - crates/blaze-serve/**
-      - crates/blaze-wire/**
-      - crates/blaze-metadata/**
-      - crates/blaze-manifest/**
-      - crates/blaze-resolve/**
-      - crates/hir-ty-codegen/**
-      - crates/ra-jit-store/**
-      - crates/ra-jit/**
-      - crates/blaze-spec/**
-      - vendor/rust-analyzer/crates/project-model/**
-      - vendor/proc-macro-srv/**
-      - vendor/rust-analyzer/crates/base-db/**
-      - vendor/rust-analyzer/crates/hir-expand/**
-      - vendor/rust-analyzer/crates/project-model/**
-      - vendor/rust-analyzer/crates/syntax/**
-      - vendor/rust-analyzer/crates/cfg/**
-      - vendor/rust-analyzer/crates/hir/**
-      - vendor/rust-analyzer/crates/hir-def/**
-      - vendor/rust-analyzer/crates/hir-ty/**
-      - vendor/rust-analyzer/crates/hir-ty-borrowck/**
-      - vendor/rust-analyzer/crates/paths/**
-      - vendor/rust-analyzer/crates/vfs/**
-      - vendor/rust-analyzer/crates/vfs-notify/**
-      - vendor/rust-analyzer/crates/ide-db/**
-      - vendor/rust-analyzer/crates/ide-diagnostics/**
-      - vendor/rust-analyzer/crates/load-cargo/**
-      - vendor/rust-analyzer/crates/proc-macro-api/**
-      - harness/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/blaze-serve-review.yaml
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      bundle-linux-x64-sha256:
+        type: string
+        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: serve-review-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+env:
+  RUST_BACKTRACE: "0"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  server:
+  server-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      RUST_BACKTRACE: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt
           llvm: build
+          shell: bench
+      - uses: ./.github/actions/bundle
+        with:
+          platform: linux-x64
+          sha256: ${{ inputs.bundle-linux-x64-sha256 }}
       - name: Verify execution tracing and audit integrity
         run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
       - name: Check server formatting
         run: cargo fmt -p blaze-serve -- --check
       - name: Test the actual server, HTTP routes, and publication races
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p blaze-serve -- --test-threads=2
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-server -- --test-threads=2
       - name: Test remote clients and fetch recovery
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- remote:: --test-threads=2
       - name: Test compiler project and replay profile integration
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p project-model --lib -- --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit cargo::spec:: -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-project -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::spec:: --test-threads=2
           python3 -I harness/tracedecay_test.py
-      - name: Build the owned replay CLI in the pinned native environment
-        id: replay_cli
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
-          {
-            git rev-parse HEAD
-            uname -a
-            nix develop .#bench --command rustc -vV
-            nix develop .#bench --command cargo -V
-          } > "$RUNNER_TEMP/saved-spec-evidence/identity.txt"
-          nix develop .#bench --command cargo build --locked --release -p ra-jit --bins
-          git rev-parse HEAD > target/release/BUILT_FROM
-      - name: Bootstrap a fresh complete owned replay runtime
-        id: owned_runtime
-        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
-        run: |
-          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
-            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
-            --work "$RUNNER_TEMP/saved-spec-owned-server" --memory-mib 8192 --timeout 1800 \
-            > "$RUNNER_TEMP/saved-spec-evidence/bootstrap.log" 2>&1
-      - name: Execute saved source with compiler subprocesses blocked
-        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
-        run: |
-          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
-            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
-            --work "$RUNNER_TEMP/saved-spec-review" --memory-mib 8192 --timeout 1200 \
-            --owned-server "$RUNNER_TEMP/saved-spec-owned-server/blaze-proc-macro-srv" \
-            --backend cranelift > "$RUNNER_TEMP/saved-spec-evidence/replay.log" 2>&1
-      - name: Save immutable replay evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: saved-buildspec-execution
-          path: |
-            ${{ runner.temp }}/saved-spec-evidence
-            ${{ runner.temp }}/saved-spec-review/results.json
-            ${{ runner.temp }}/saved-spec-review/*.log
-            ${{ runner.temp }}/saved-spec-review/*.exec
-            ${{ runner.temp }}/saved-spec-owned-server/image-pins.json
-            ${{ runner.temp }}/saved-spec-owned-server/tool-controls.json
-            ${{ runner.temp }}/saved-spec-owned-server/*.watchdog.json
-            ${{ runner.temp }}/saved-spec-owned-server/*audit.json
-            ${{ runner.temp }}/saved-spec-owned-server/*external-execs.json
-            ${{ runner.temp }}/saved-spec-owned-server/*.exec
-          if-no-files-found: warn
       - name: Test owned dependency resolution and Cargo lock parity
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p blaze-metadata -p blaze-registry -p blaze-resolve --all-targets -- --test-threads=2
-          cargo build --locked -p blaze-metadata --example metadata
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-resolve -- --test-threads=2
           python3 crates/blaze-metadata/tests/cargo_oracle.py "$PWD/target/debug/examples/metadata"
       - name: Test cleanup control flow with debug assertions
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-codegen -- fills_normal_block --test-threads=2
       - name: Test owned compiler answers and empty-crate proofs
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p syntax empty_crate:: -- --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit answers:: -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-syntax -- empty_crate:: --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- answers:: --test-threads=2
       - name: Verify real probe artifacts with rustc and LLVM
         if: ${{ !cancelled() }}
         run: |
-          cargo build --locked -p ra-jit --bin ra-jit
-          python3 -I harness/dist/empty_probe.py --blaze target/debug/ra-jit --work target/empty-probe-review
+          python3 -I harness/dist/empty_probe.py --blaze target/release/ra-jit --work target/empty-probe-review
       - name: Test compiler acceptance and constant evaluation
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p ide-diagnostics --lib compiler_acceptance_tests -- --test-threads=2
-          cargo test --locked -p hir-ide --lib tests::consteval -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-diagnostics -- compiler_acceptance_tests --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-hir-ide -- tests::consteval --test-threads=2
       - name: Test producer identities and lifetime boundaries
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p proc-macro-api --features span/salsa --lib -- generation_tests producer_lifetime --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
-          cargo test --locked -p cfg --lib check_cfg -- --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit -- compiler_json:: dep_info:: native_inputs::units::tests cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
-          cargo test --locked -p paths --lib native:: -- --test-threads=2
-          cargo test --locked -p project-model --lib compiler_project -- --test-threads=2
-          cargo test --locked -p hir-def --lib -- non_unicode_process_environment unicode_crate_environment --test-threads=2
-          cargo test --locked -p blaze-wire native::tests -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-proc-macro -- generation_tests producer_lifetime --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cfg -- check_cfg --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- compiler_json:: dep_info:: native_inputs::units::tests cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-paths -- native:: --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-project -- compiler_project --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-hir-def -- non_unicode_process_environment unicode_crate_environment --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-wire -- native::tests --test-threads=2
           python3 -I harness/dist/crossmachine.py --self-test
       - name: Test bootstrap protocol wire compatibility
         if: ${{ !cancelled() }}
-        run: cargo test --locked --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-api --lib -- --test-threads=2
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-bootstrap -- --test-threads=2
       - name: Test build-script reruns and Cargo fingerprints
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p ra-jit --bin ra-jit cargo::script:: -- --test-threads=2
-          cargo test --locked -p ra-jit --bin ra-jit cargo::records:: -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::script:: --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::records:: --test-threads=2
       - name: Save owned probe evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
@@ -179,11 +103,63 @@ jobs:
       - name: Test affected selection, retries, and native input identities
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p ra-jit --bin ra-jit -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
       - name: Test compiler export and import identities
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p hir-ty-codegen --lib export:: -- --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-codegen -- export:: --test-threads=2
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
         run: python3 -I harness/remote.py --selftest
+
+  saved-spec:
+    name: Saved source replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+          llvm: build
+          shell: bench
+      - uses: ./.github/actions/bundle
+        with:
+          platform: linux-x64
+          sha256: ${{ inputs.bundle-linux-x64-sha256 }}
+      - name: Execute saved source with compiler subprocesses blocked
+        run: |
+          mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/saved-spec-review" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv" \
+            --backend cranelift > "$RUNNER_TEMP/saved-spec-evidence/replay.log" 2>&1
+      - name: Save immutable replay evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: saved-buildspec-execution
+          path: |
+            ${{ runner.temp }}/saved-spec-evidence
+            ${{ runner.temp }}/saved-spec-review/results.json
+            ${{ runner.temp }}/saved-spec-review/*.log
+            ${{ runner.temp }}/saved-spec-review/*.exec
+          if-no-files-found: warn
+
+  server:
+    needs: [server-tests, saved-spec]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every server and replay check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYGATE'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          assert not failed, failed
+          PYGATE
