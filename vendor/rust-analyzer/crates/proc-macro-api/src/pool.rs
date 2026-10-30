@@ -19,7 +19,7 @@ pub(crate) struct ProcMacroServerPool {
 pub(crate) struct PreparedLibrary {
     snapshot: Arc<LibrarySnapshot>,
     pub(crate) content: [u8; 32],
-    _producer_leases: Arc<Vec<std::fs::File>>,
+    _producer_leases: Arc<Vec<crate::producer_lifetime::Lease>>,
 }
 
 impl PreparedLibrary {

@@ -162,6 +162,11 @@ jobs:
       - name: Test bootstrap protocol wire compatibility
         if: ${{ !cancelled() }}
         run: cargo test --locked --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-api --lib -- --test-threads=2
+      - name: Test build-script reruns and Cargo fingerprints
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ra-jit --bin ra-jit cargo::script:: -- --test-threads=2
+          cargo test --locked -p ra-jit --bin ra-jit cargo::records:: -- --test-threads=2
       - name: Save owned probe evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

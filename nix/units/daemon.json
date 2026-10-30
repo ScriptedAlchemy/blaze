@@ -1,7 +1,7 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "61396a3668a47f8acb5305fbf8920d04f468609c10094b49a1348e03d976ee88",
+  "Cargo.lock": "35c2ed16c9426050dc734dbf041d7e840061a8761a48fc3b9bd910ee650394f2",
   "Cargo.toml": "d01d0e3aa1aa049db80f3e5a60cee5cbb73976be91d4c854520602023d581644"
  },
  "packages": {
@@ -21224,6 +21224,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -21238,6 +21242,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -21380,6 +21388,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -21470,6 +21482,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -21537,6 +21553,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -21551,6 +21571,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -21693,6 +21717,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -21783,6 +21811,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -21850,6 +21882,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -21864,6 +21900,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -22006,6 +22046,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -22096,6 +22140,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -22163,6 +22211,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -22177,6 +22229,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -22319,6 +22375,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -22409,6 +22469,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -22476,6 +22540,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -22490,6 +22558,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -22632,6 +22704,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -22722,6 +22798,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -22789,6 +22869,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -22803,6 +22887,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -22945,6 +23033,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 360,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 368,
        "name": "rustls"
       },
@@ -23035,6 +23127,10 @@
       {
        "i": 493,
        "name": "vfs"
+      },
+      {
+       "i": 496,
+       "name": "walkdir"
       },
       {
        "i": 498,
@@ -41173,6 +41269,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -41187,6 +41287,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -41329,6 +41433,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -41419,6 +41527,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -41486,6 +41598,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -41500,6 +41616,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -41642,6 +41762,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -41732,6 +41856,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -41799,6 +41927,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -41813,6 +41945,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -41955,6 +42091,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -42045,6 +42185,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -42112,6 +42256,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -42126,6 +42274,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -42268,6 +42420,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -42358,6 +42514,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -42425,6 +42585,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -42439,6 +42603,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -42581,6 +42749,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -42671,6 +42843,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -42738,6 +42914,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -42752,6 +42932,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -42894,6 +43078,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 363,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 371,
        "name": "rustls"
       },
@@ -42984,6 +43172,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -60986,6 +61178,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -61000,6 +61196,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -61142,6 +61342,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -61232,6 +61436,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -61299,6 +61507,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -61313,6 +61525,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -61455,6 +61671,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -61545,6 +61765,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -61612,6 +61836,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -61626,6 +61854,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -61768,6 +62000,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -61858,6 +62094,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -61925,6 +62165,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -61939,6 +62183,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -62081,6 +62329,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -62171,6 +62423,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -62238,6 +62494,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -62252,6 +62512,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -62394,6 +62658,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -62484,6 +62752,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -62551,6 +62823,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -62565,6 +62841,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -62707,6 +62987,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 361,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 369,
        "name": "rustls"
       },
@@ -62797,6 +63081,10 @@
       {
        "i": 494,
        "name": "vfs"
+      },
+      {
+       "i": 497,
+       "name": "walkdir"
       },
       {
        "i": 499,
@@ -80966,6 +81254,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -80980,6 +81272,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -81122,6 +81418,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -81212,6 +81512,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,
@@ -81279,6 +81583,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -81293,6 +81601,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -81435,6 +81747,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -81525,6 +81841,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,
@@ -81592,6 +81912,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -81606,6 +81930,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -81748,6 +82076,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -81838,6 +82170,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,
@@ -81905,6 +82241,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -81919,6 +82259,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -82061,6 +82405,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -82151,6 +82499,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,
@@ -82218,6 +82570,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -82232,6 +82588,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -82374,6 +82734,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -82464,6 +82828,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,
@@ -82531,6 +82899,10 @@
        "name": "blaze_metadata"
       },
       {
+       "i": 50,
+       "name": "blaze_registry"
+      },
+      {
        "i": 52,
        "name": "blaze_serve"
       },
@@ -82545,6 +82917,10 @@
       {
        "i": 64,
        "name": "cargo_platform"
+      },
+      {
+       "i": 65,
+       "name": "cargo_util_schemas"
       },
       {
        "i": 66,
@@ -82687,6 +83063,10 @@
        "name": "rustc_hash"
       },
       {
+       "i": 364,
+       "name": "rustc_stable_hash"
+      },
+      {
        "i": 372,
        "name": "rustls"
       },
@@ -82777,6 +83157,10 @@
       {
        "i": 495,
        "name": "vfs"
+      },
+      {
+       "i": 498,
+       "name": "walkdir"
       },
       {
        "i": 500,

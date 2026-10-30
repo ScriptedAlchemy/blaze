@@ -422,7 +422,17 @@ impl Unit {
                 return Err(why.unwrap_or("the build is not one the daemon has loaded").to_owned());
             }
         };
-        if let Some(why) = state.refusal.clone().or_else(|| state.broken_guard()) {
+        let reason = match &state.refusal {
+            Some(why) => Some(why.clone()),
+            None => match state.broken_guard() {
+                Ok(reason) => reason,
+                Err(why) => {
+                    eprintln!("error: {why}");
+                    std::process::exit(super::FAILED);
+                }
+            },
+        };
+        if let Some(why) = reason {
             return Err(why);
         }
         let (checkout, at) = state.asked_for(dir)?;

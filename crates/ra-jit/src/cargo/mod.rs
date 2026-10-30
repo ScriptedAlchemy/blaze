@@ -17,6 +17,7 @@ mod package;
 pub(crate) mod plan;
 pub(crate) mod producer_image;
 pub(crate) mod producer_plan;
+mod records;
 pub(crate) mod run;
 pub(crate) mod runtime_context;
 mod sandboxed;
@@ -36,6 +37,7 @@ use anyhow::Context as _;
 use cli::{Asked, Invocation, Subcommand};
 use client::Start;
 use daemon::{Checkout, NotBuilt, Reply, Request};
+pub(crate) use state::configured_env;
 use state::{Built, Counts, Held, Staged, State};
 pub(crate) use units::Record;
 
@@ -137,7 +139,7 @@ fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
         let cwd = std::env::current_dir()?;
         let key = asked.key(&cwd);
         eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
-        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default(), None)? {
+        if let Ok(state) = by_cargo(&asked, &cwd, &key, Counts::default(), None, &[])? {
             state.write()?;
         }
         anyhow::Ok(())
@@ -276,11 +278,15 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             eprintln!("{written}");
             return Ok(FAILED);
         }
+        Ok(Err(NotServed::Script(why))) => {
+            eprintln!("error: {why}");
+            return Ok(FAILED);
+        }
         Ok(Err(NotServed::Cargo(ToCargo(state, reason)))) => {
             say::cargo_builds(&reason, "building with cargo", say::EDIT);
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
-            match by_cargo(asked, &cwd, &key, counts, None)? {
+            match by_cargo(asked, &cwd, &key, counts, None, &state.completed)? {
                 Ok(state) => state,
                 Err(code) => return Ok(code),
             }
@@ -300,7 +306,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                     if let Some(why) = why {
                         say::cargo_builds(&why, "building with cargo", say::COLD);
                     }
-                    let state = match by_cargo(asked, &cwd, &key, Counts::default(), ahead)? {
+                    let state = match by_cargo(asked, &cwd, &key, Counts::default(), ahead, &[])? {
                         Ok(state) => state,
                         Err(code) => return Ok(code),
                     };
@@ -313,6 +319,10 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                         }
                         Err(NotServed::Error(_, written)) => {
                             eprintln!("{written}");
+                            return Ok(FAILED);
+                        }
+                        Err(NotServed::Script(why)) => {
+                            eprintln!("error: {why}");
                             return Ok(FAILED);
                         }
                         Err(NotServed::Cargo(ToCargo(state, reason))) => {
@@ -456,6 +466,8 @@ struct ToCargo(Box<State>, String);
 /// Why the daemon's programs are not the build.
 enum NotServed {
     Cargo(ToCargo),
+    /// A build script executed for this request and failed. Do not retry it.
+    Script(String),
     /// The source has errors: them, and them as rustc and cargo write them.
     Error(crate::errors::Said, String),
 }
@@ -467,7 +479,10 @@ fn by_daemon(mut state: State) -> Result<(State, Held), NotServed> {
     use crate::trace::{CLIENT, note};
     let to_cargo = |state, why| NotServed::Cargo(ToCargo(Box::new(state), why));
     let checking = Instant::now();
-    let cargos = state.refusal.clone().or_else(|| state.broken_guard());
+    let cargos = match &state.refusal {
+        Some(why) => Some(why.clone()),
+        None => state.broken_guard().map_err(NotServed::Script)?,
+    };
     if let Some(reason) = cargos.or_else(|| state.stale_cargos()) {
         return Err(to_cargo(state, reason));
     }
@@ -621,13 +636,14 @@ fn by_cargo(
     key: &str,
     counts: Counts,
     ahead: Option<daemon::Ahead>,
+    completed: &[script::Completed],
 ) -> anyhow::Result<Result<State, i32>> {
     State::give_back(key);
     if let Some(ahead) = &ahead {
         // Without an answer the daemon loads the workspace once cargo is done.
         let _ = client::ask(Request::Ahead(ahead.clone()), Start::IfMissing);
     }
-    let built = loaded_by_cargo(asked, cwd, key, counts, ahead.as_ref());
+    let built = loaded_by_cargo(asked, cwd, key, counts, ahead.as_ref(), completed);
     // The worker that loaded ahead is the one the build was given to, unless there is none.
     if let Some(ahead) = ahead {
         let _ = client::ask(Request::Forget(ahead.config.id()), Start::Never);
@@ -641,8 +657,9 @@ fn loaded_by_cargo(
     key: &str,
     counts: Counts,
     ahead: Option<&daemon::Ahead>,
+    completed: &[script::Completed],
 ) -> anyhow::Result<Result<State, i32>> {
-    let built = match Built::by_cargo(asked, ahead)? {
+    let built = match Built::by_cargo(asked, ahead, completed)? {
         Ok(built) => built,
         Err(code) => return Ok(Err(code)),
     };

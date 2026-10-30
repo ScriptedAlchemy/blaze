@@ -57,6 +57,9 @@ same-file = "1"
 dunce = "1"
 pdb = "0.8"
 sha2 = "0.10"
+# The hasher of cargo's fingerprints, for the record of a run of a build script.
+rustc-stable-hash = "0.1.2"
+walkdir = "2"
 cargo_metadata.workspace = true
 shlex = "2"
 toml.workspace = true
@@ -77,6 +80,9 @@ blaze-serve.workspace = true
 blaze-wire.workspace = true
 blaze-metadata.workspace = true
 blaze-spec = { path = "../blaze-spec" }
+# Cargo's ids of packages, which its records of runs are keyed by.
+blaze-registry = { path = "../blaze-registry" }
+cargo-util-schemas = "=0.14.3"
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

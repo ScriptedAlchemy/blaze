@@ -113,7 +113,7 @@ pub(crate) fn runtime_outputs(
 /// ([`Own`]) for as long as the database loaded from it serves their macros: a request that
 /// names no build is retired by nothing, and its images are loaded by the proc-macro client
 /// of the database, after the pass that admitted them.
-pub(crate) type Images = Vec<Arc<std::fs::File>>;
+pub(crate) type Images = Vec<Arc<load_cargo::proc_macro_producer_lifetime::Lease>>;
 
 /// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
 /// stays as cargo has it.
@@ -316,6 +316,10 @@ pub(crate) fn run(
 
 /// Run the host projection of an owned producer plan, without folding target features
 /// into its scripts. The caller keeps this build's leases through producer compilation.
+/// `host_unit` says which packages' scripts run for the host whether or not a producer or a
+/// script compiled for it needs them: cargo runs a script for the host only for a package it
+/// builds for the host, and the script of a package it builds for the target alone runs once,
+/// in that package's target unit. The others run when what is compiled for the host needs them.
 pub(crate) fn run_producers(
     cargo: &CargoWorkspace,
     asked: &Asked<'_>,
@@ -323,6 +327,7 @@ pub(crate) fn run_producers(
     flags: Vec<String>,
     cfgs: Vec<String>,
     raw_env: &BTreeMap<OsString, OsString>,
+    host_unit: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<(
     BTreeMap<String, (PathBuf, blaze_build_script::Output)>,
     BTreeMap<String, PathBuf>,
@@ -345,7 +350,7 @@ pub(crate) fn run_producers(
                 }) {
                     runner.producer(package).map_err(|why| Attempt::of(runner.busy.take(), why))?;
                 }
-                if runner.runs(package) {
+                if runner.runs(package) && host_unit(&cargo[package].id.repr) {
                     let done = runner
                         .script(package, true)
                         .map_err(|why| Attempt::of(runner.busy.take(), why))?;
@@ -370,6 +375,16 @@ pub(crate) fn run_producers(
         }
         result
     })
+}
+
+/// Whether the build `asked` builds the package `id` for the host alone, as a build-dependency
+/// or a proc macro, or what is compiled with one, and not for the target: its script runs for
+/// the host whatever needs it, and its outputs are the host's. A package built for the target
+/// too has its script run for the target, and for the host only when a script or producer
+/// compiled for the host needs it, as cargo has no host unit of a package it builds for the
+/// target alone. Every package is the host's when the build says none.
+fn for_the_host_alone(asked: &Asked<'_>, id: &str) -> bool {
+    asked.packages.is_none_or(|it| it.get(id) == Some(&false))
 }
 
 fn run_with(
@@ -490,6 +505,7 @@ fn pass(
             runner.host_flags.clone(),
             runner.host_cfgs.clone().context("no host cfg for owned producers")?,
             &runner.child_env(),
+            &|id| for_the_host_alone(asked, id),
         )?;
         runner.judged.extend(world);
         runner.image_leases.extend(leases);
@@ -610,6 +626,9 @@ struct Runner<'a> {
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
     images: FxHashMap<Package, PathBuf>,
+    /// When the newest run of a script that an image's crates were compiled with wrote its
+    /// output, by the image's library ([`Runner::newest_run`]).
+    image_runs: FxHashMap<PathBuf, SystemTime>,
     /// The leases on the images of a request that names no build: it is retired by nothing, so
     /// the load that asked keeps them, through [`Own::images`], until its proc-macro client
     /// has loaded them and while it serves them.
@@ -695,6 +714,7 @@ impl<'a> Runner<'a> {
             judged: Vec::new(),
             making: Vec::new(),
             images: FxHashMap::default(),
+            image_runs: FxHashMap::default(),
             image_leases: Vec::new(),
             making_images: Vec::new(),
         })
@@ -973,15 +993,7 @@ impl<'a> Runner<'a> {
         if !data.is_local {
             return data.version.to_string();
         }
-        let dir = PathBuf::from(data.manifest.parent().as_str());
-        let (include, exclude) = include_exclude(&dir);
-        match blaze_build_script::files::list_files(&dir, &include, &exclude) {
-            Ok(files) => {
-                fresh::package_fingerprint(&dir, blaze_build_script::files::last_modified(&files))
-            }
-            // cargo fails the build; a fingerprint that is never the same runs the script.
-            Err(err) => format!("unlisted: {err} {:?}", SystemTime::now()),
-        }
+        path_package_fingerprint(data.manifest.parent().as_ref())
     }
 
     /// The description of `package`'s run, as cargo runs it for the profile `lib`.
@@ -1154,6 +1166,7 @@ impl<'a> Runner<'a> {
             deps.push((name.replace('-', "_"), self.add(dep, &mut crates, &mut at)?));
         }
         crates[0].deps = deps;
+        let newest_run = self.newest_run(&crates);
         let key = json!([data.id.repr, format!("{host:?}"), self.host_flags, self.rustc]);
         let hash = fresh::hash_bytes(key.to_string().as_bytes());
         let dir = self
@@ -1178,7 +1191,7 @@ impl<'a> Runner<'a> {
         let inputs = dir.join("build-script-build.inputs");
         let record = dir.join("blaze-compile.json");
         if let Some(made) = self.compiled(&exe, &inputs, &record, fingerprint) {
-            return Ok((exe, (fingerprint, made)));
+            return Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))));
         }
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
@@ -1206,7 +1219,31 @@ impl<'a> Runner<'a> {
             .map_err(|it| format!("{}: {it}", record.display()))?;
         let made =
             std::fs::metadata(&exe).and_then(|it| it.modified()).map_err(|it| it.to_string())?;
-        Ok((exe, (fingerprint, made)))
+        Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))))
+    }
+
+    /// When the newest run of a script that one of `crates` is compiled with wrote its output,
+    /// directly or in a producer image they use. Cargo compiles a library again after its
+    /// script ran (`check_filesystem`: a dependency newer than the unit's output), then
+    /// everything compiled with it, so a build script whose build-dependency's script ran again
+    /// is linked again and runs again, whether or not what it was linked from changed (a
+    /// build-dependency with `links` reruns its parent's script so, `edges.py`'s
+    /// `build-dep-counter`). blaze links it again only when what it is compiled from changed;
+    /// the time it gives the script's run to depend on is the newest of the two, which has the
+    /// run judged as cargo judges it.
+    fn newest_run(&self, crates: &[crate::cargo::own_script::Planned]) -> Option<SystemTime> {
+        let ran = |out_dir: &PathBuf| {
+            let done = self.done.values().filter_map(|it| it.as_ref().ok());
+            done.filter(|it| it.out_dir == *out_dir).find_map(|it| it.made)
+        };
+        let image = |library: &PathBuf| self.image_runs.get(library).copied();
+        crates
+            .iter()
+            .flat_map(|it| {
+                [it.out_dir.as_ref().and_then(ran), it.proc_macro.as_ref().and_then(image)]
+            })
+            .flatten()
+            .max()
     }
 
     /// When the script at `exe` was made, when it stands: compiled from `fingerprint`, with
@@ -1277,6 +1314,7 @@ impl<'a> Runner<'a> {
         let result = (|| {
             let mut crates = Vec::new();
             self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+            let newest_run = self.newest_run(&crates);
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
             let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
@@ -1291,10 +1329,14 @@ impl<'a> Runner<'a> {
                     env: &env,
                 },
             )
+            .map(|image| (image, newest_run))
             .map_err(|it| format!("{it:#}"))
         })();
         self.making_images.pop();
-        let image = result?;
+        let (image, newest_run) = result?;
+        if let Some(newest_run) = newest_run {
+            self.image_runs.insert(image.library.clone(), newest_run);
+        }
         // The image is loaded after this pass, by the build that asked for it, or by the load
         // of a request that names no build: there is no build to retire then, and the load
         // holds the lease until its proc-macro client has loaded the image, and while it
@@ -1593,6 +1635,17 @@ fn target_of(target: &project_model::TargetData) -> unit::Target {
         name: target.name.clone(),
         kind: vec![kind.to_owned()],
         crate_types: vec![crate_type.to_owned()],
+    }
+}
+
+pub(crate) fn path_package_fingerprint(dir: &Path) -> String {
+    let (include, exclude) = include_exclude(dir);
+    match blaze_build_script::files::list_files(dir, &include, &exclude) {
+        Ok(files) => {
+            fresh::package_fingerprint(dir, blaze_build_script::files::last_modified(&files))
+        }
+        // cargo fails the build; a fingerprint that is never the same runs the script.
+        Err(err) => format!("unlisted: {err} {:?}", SystemTime::now()),
     }
 }
 
