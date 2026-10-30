@@ -2208,6 +2208,124 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(!path.exists(), "a subsequent build cannot consume this run");
     }
 
+    /// Cargo 1.99 writes the value of each variable a script says it reads
+    /// (`rerun-if-env-changed`, `LocalFingerprint::from_env`) into its fingerprint of the run,
+    /// and of no other variable: a run made for it has the same fingerprint, which goes where
+    /// cargo writes it. The private file cargo's leg is given has no value.
+    #[test]
+    fn a_completed_run_carries_no_value_of_a_variable_to_cargos_leg() {
+        let lines = format!(
+            "{COUNTS}echo cargo::rerun-if-env-changed=PR15_DECLARED\nprintf %s \"$PR15_READ\" > /dev/null\n"
+        );
+        let out_dir = ran_script("carried-values", &lines, "");
+        let mut ran = ran_of(&out_dir);
+        ran.env.push(("PR15_READ".to_owned(), "pr15-planted-read".to_owned()));
+        write_ran(out_dir.parent().unwrap(), &ran);
+        let planted = |name: &str| match name {
+            "PR15_DECLARED" => Some("pr15-planted-declared".to_owned()),
+            "PR15_READ" => Some("pr15-planted-read".to_owned()),
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &planted, ..CARGO };
+        changed(&out_dir);
+        let mut completed = Vec::new();
+        judge_for(&out_dir, &cargo, &mut completed).unwrap();
+        assert_eq!(completed.len(), 1);
+        let json = serde_json::to_string(completed[0].fingerprint()).unwrap();
+        let declared =
+            r#"{"RerunIfEnvChanged":{"var":"PR15_DECLARED","val":"pr15-planted-declared"}}"#;
+        assert!(json.contains(declared), "cargo's format, with the declared value: {json}");
+        assert!(!json.contains("pr15-planted-read"), "and no other: {json}");
+        let continuation =
+            Continuation::for_command(&mut Command::new("sh"), &completed).unwrap().unwrap();
+        let path = continuation.path();
+        let carried =
+            String::from_utf8_lossy(&std::fs::read(path.join("runs")).unwrap()).into_owned();
+        assert!(!carried.contains("pr15-planted"), "a value in the private file: {carried}");
+        assert!(continuation::consume_in(&ran, &out_dir, &path).unwrap(), "still the run");
+        drop(continuation);
+        completed[0].record().unwrap();
+        let written = std::fs::read_to_string(hash_of(&out_dir).with_extension("json")).unwrap();
+        assert_eq!(written, json, "written as cargo writes it");
+        std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+    }
+
+    /// The run of `golden`'s script that cargo 1.99.0 recorded (`records/run-build-script-
+    /// build-script-build.json`: two `rerun-if-changed`, `U8R_GOLDEN=on` and `U8R_UNSET` unset),
+    /// made again by the daemon in cargo's `OUT_DIR` after a file it watches was written: the
+    /// same inputs, so the fingerprint it records is cargo's file byte for byte, and its hash,
+    /// with the declared value and nothing else, as cargo writes it after its own run.
+    #[test]
+    fn a_run_the_daemon_makes_is_recorded_byte_for_byte_as_cargo_records_it() {
+        let json = include_str!("records/run-build-script-build-script-build.json");
+        let hash = include_str!("records/run-build-script-build-script-build");
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-script-golden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("target/debug");
+        let run_dir = dest.join("build/golden-5c9bbc4b342d463e");
+        let out_dir = run_dir.join("out");
+        let package = root.join("golden");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(package.join("data")).unwrap();
+        for lock in [".cargo-build-lock", ".cargo-lock"] {
+            std::fs::write(dest.join(lock), "").unwrap();
+        }
+        std::fs::write(package.join("build.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(package.join("data/in.txt"), "in\n").unwrap();
+        let said = "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=data/./in.txt\n\
+                    cargo:rerun-if-env-changed=U8R_GOLDEN\ncargo:rerun-if-env-changed=U8R_UNSET\n";
+        let real = run_dir.join("script");
+        let lines = format!(
+            "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nprintf '{}'\n",
+            said.replace('\n', "\\n")
+        );
+        let written = Command::new("sh")
+            .args(["-c", "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\""])
+            .arg(&real)
+            .arg(&lines)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
+        let env = vec![
+            ("OUT_DIR".to_owned(), text(&out_dir)),
+            ("CARGO_MANIFEST_DIR".to_owned(), text(&package)),
+            ("U8R_GOLDEN".to_owned(), "on".to_owned()),
+            ("PATH".to_owned(), std::env::var("PATH").unwrap()),
+        ];
+        let ran = Ran { real: real.clone(), cwd: package.clone(), env };
+        write_ran(&run_dir, &ran);
+        std::fs::write(run_dir.join("output"), said).unwrap();
+        std::fs::write(run_dir.join("root-output"), out_dir.as_os_str().as_encoded_bytes())
+            .unwrap();
+        let fingerprints = dest.join(".fingerprint/golden-5c9bbc4b342d463e");
+        std::fs::create_dir_all(&fingerprints).unwrap();
+        let recorded = fingerprints.join("run-build-script-build-script-build");
+        std::fs::write(&recorded, hash).unwrap();
+        std::fs::write(recorded.with_extension("json"), json).unwrap();
+        // Run an hour ago, compiled before it, and a file it watches written since.
+        let ago = |seconds| SystemTime::now() - Duration::from_secs(seconds);
+        set_written(&real, ago(7200));
+        set_written(&run_dir.join("output"), ago(3600));
+        set_written(&package.join("build.rs"), ago(5400));
+        set_written(&package.join("data/in.txt"), ago(1800));
+        let values = |name: &str| match name {
+            "U8R_GOLDEN" => Some("on".to_owned()),
+            "U8R_UNSET" => None,
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &values, ..CARGO };
+        let mut completed = Vec::new();
+        judge_for(&out_dir, &cargo, &mut completed).unwrap();
+        assert_eq!(std::fs::read_to_string(run_dir.join("runs")).unwrap(), "run\n");
+        assert_eq!(completed.len(), 1, "the daemon made the run");
+        completed[0].record().unwrap();
+        assert_eq!(std::fs::read_to_string(recorded.with_extension("json")).unwrap(), json);
+        assert_eq!(std::fs::read_to_string(&recorded).unwrap(), hash);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn a_completed_run_is_consumed_only_for_unchanged_inputs() {
         for change in [
