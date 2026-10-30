@@ -99,9 +99,46 @@ jobs:
       os: macos-15
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
 
+  serve:
+    name: serve
+    needs: [changes, build-linux, bundle-linux]
+    if: needs.changes.outputs.serve == 'true'
+    uses: ./.github/workflows/blaze-serve-review.yaml
+    with:
+      bundle-linux-x64-sha256: ${{ needs.build-linux.outputs.sha256 }}
+
+  # Reusable job names gain a caller prefix; retain the original required context.
+  server:
+    name: server
+    needs: [changes, serve]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          SELECTED: ${{ needs.changes.outputs.serve }}
+          RESULT: ${{ needs.serve.result }}
+        run: |
+          test "$CHANGES" = success
+          if [ "$SELECTED" = true ]; then
+            test "$RESULT" = success
+          else
+            test "$SELECTED" = false
+            test "$RESULT" = skipped
+          fi
+
+  bench:
+    name: bench
+    needs: [changes, build-linux]
+    if: needs.changes.outputs.bench == 'true'
+    uses: ./.github/workflows/bench.yaml
+    with:
+      bundle-linux-x64-sha256: ${{ needs.build-linux.outputs.sha256 }}
+
   ci:
     name: ci
-    needs: [changes, build-linux, build-macos, bundle-linux, bundle-macos]
+    needs: [changes, build-linux, build-macos, bundle-linux, bundle-macos, serve, server, bench]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
