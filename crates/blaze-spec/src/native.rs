@@ -197,6 +197,17 @@ impl Closure {
         hash.finalize().into()
     }
 
+    pub(crate) fn observation(&self) -> Observation {
+        let mut roots = Vec::with_capacity(self.roots.len().min(64));
+        for root in self.roots.iter().take(64) {
+            let mut hash = Sha256::new();
+            frame(&mut hash, b"blaze/native-role-observation/v1");
+            frame(&mut hash, root.name.as_bytes());
+            roots.push(RootObservation { role: hash.finalize().into(), tree: root.tree.summary() });
+        }
+        Observation { digest: self.digest(), total: self.roots.len(), roots }
+    }
+
     /// Require an observed input to match an entry in a complete bound tree.
     /// No library name or filename extension confers authority.
     pub fn admit(&self, path: &Path, observed: &Entry) -> anyhow::Result<()> {
@@ -264,6 +275,94 @@ impl Closure {
     }
 }
 
+struct RootObservation {
+    role: Digest,
+    tree: crate::native_tree::Summary,
+}
+
+pub(crate) struct Observation {
+    digest: Digest,
+    total: usize,
+    roots: Vec<RootObservation>,
+}
+
+impl Observation {
+    pub(crate) fn difference(&self, actual: &Self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(8192);
+        let _ = write!(out, "native closure expected ");
+        hex(&mut out, &self.digest);
+        out.push_str(" actual ");
+        hex(&mut out, &actual.digest);
+        let _ = writeln!(out, "\nroots expected {} actual {}", self.total, actual.total);
+        let _ = writeln!(
+            out,
+            "observation roots omitted expected {} actual {}",
+            self.total - self.roots.len(),
+            actual.total - actual.roots.len()
+        );
+        let aligned = self.total == actual.total
+            && self.roots.iter().zip(&actual.roots).all(|(a, b)| a.role == b.role);
+        if !aligned {
+            out.push_str("root alignment uncertain (role, order, insertion or removal)\n");
+            out.push_str("output root rows omitted 0 (row limit); other rows suppressed by alignment uncertainty\n");
+            return out;
+        }
+        let mut changed = 0_usize;
+        for (ordinal, (expected, actual)) in self.roots.iter().zip(&actual.roots).enumerate() {
+            let a = &expected.tree;
+            let b = &actual.tree;
+            if a.digest == b.digest {
+                continue;
+            }
+            changed += 1;
+            if changed > 16 {
+                continue;
+            }
+            let _ = write!(out, "root {ordinal} expected ");
+            hex(&mut out, &a.digest);
+            out.push_str(" actual ");
+            hex(&mut out, &b.digest);
+            let _ = write!(
+                out,
+                "\n  counts missing/directory/file/cycle/link expected {}/{}/{}/{}/{} actual {}/{}/{}/{}/{}\n  changed",
+                a.counts[0],
+                a.counts[1],
+                a.counts[2],
+                a.counts[3],
+                a.counts[4],
+                b.counts[0],
+                b.counts[1],
+                b.counts[2],
+                b.counts[3],
+                b.counts[4]
+            );
+            if a.membership != b.membership {
+                out.push_str(" membership");
+            }
+            if a.content != b.content {
+                out.push_str(" content");
+            }
+            if a.mode != b.mode {
+                out.push_str(" mode");
+            }
+            if a.links != b.links {
+                out.push_str(" links");
+            }
+            out.push('\n');
+        }
+        let _ = writeln!(out, "output root rows omitted {}", changed.saturating_sub(16));
+        out
+    }
+}
+
+fn hex(out: &mut String, digest: &Digest) {
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+}
+
 fn frame(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
@@ -277,4 +376,114 @@ struct Node {
 
 fn missing() -> Entry {
     Entry { links: Vec::new(), kind: Kind::Missing }
+}
+
+#[cfg(all(test, unix))]
+mod observation_tests {
+    use super::*;
+
+    fn tree(bytes: &[u8]) -> Tree {
+        Tree::from_files("/private-sentinel", [(PathBuf::from("secret-sentinel"), bytes.to_vec())])
+            .unwrap()
+    }
+
+    fn closure(trees: Vec<(&str, Tree)>) -> Closure {
+        Closure {
+            roots: trees.into_iter().map(|(name, tree)| Root { name: name.into(), tree }).collect(),
+        }
+    }
+
+    fn report(a: &Closure, b: &Closure) -> String {
+        a.observation().difference(&b.observation())
+    }
+
+    #[test]
+    fn dimensions_and_privacy() {
+        let initial = closure(vec![("role-secret-sentinel", tree(b"one"))]);
+        let same = closure(vec![("role-secret-sentinel", tree(b"one"))]);
+        let unchanged = report(&initial, &same);
+        assert!(unchanged.contains("output root rows omitted 0\n"));
+        assert!(!unchanged.contains("root 0 expected"));
+        let content = closure(vec![("role-secret-sentinel", tree(b"two"))]);
+        let changed = report(&initial, &content);
+        assert!(changed.contains("  changed content\n"));
+        assert!(!changed.contains("secret-sentinel"));
+        let member = closure(vec![(
+            "role-secret-sentinel",
+            Tree::from_files("/private-sentinel", [(PathBuf::from("other"), b"one".to_vec())])
+                .unwrap(),
+        )]);
+        assert!(report(&initial, &member).contains("  changed membership content mode\n"));
+        let mut executable = tree(b"one");
+        if let Kind::File { executable, .. } =
+            &mut executable.entries.get_mut(Path::new("secret-sentinel")).unwrap().kind
+        {
+            *executable = true;
+        }
+        assert!(
+            report(&initial, &closure(vec![("role-secret-sentinel", executable)]))
+                .contains("  changed mode\n")
+        );
+    }
+
+    #[test]
+    fn links_use_relocated_identity() {
+        let mut a = tree(b"one");
+        a.entries
+            .get_mut(Path::new("secret-sentinel"))
+            .unwrap()
+            .links
+            .push(PathBuf::from("/private-sentinel/inside"));
+        let mut b =
+            Tree::from_files("/relocated", [(PathBuf::from("secret-sentinel"), b"one".to_vec())])
+                .unwrap();
+        b.entries
+            .get_mut(Path::new("secret-sentinel"))
+            .unwrap()
+            .links
+            .push(PathBuf::from("/relocated/inside"));
+        assert!(
+            !report(&closure(vec![("r", a)]), &closure(vec![("r", b.clone())]))
+                .contains("root 0 expected")
+        );
+        b.entries.get_mut(Path::new("secret-sentinel")).unwrap().links[0] =
+            PathBuf::from("/external-secret");
+        let mut c = tree(b"one");
+        c.entries
+            .get_mut(Path::new("secret-sentinel"))
+            .unwrap()
+            .links
+            .push(PathBuf::from("/private-sentinel/inside"));
+        let output = report(&closure(vec![("r", c)]), &closure(vec![("r", b)]));
+        assert!(output.contains("  changed links\n"));
+        assert!(!output.contains("external-secret"));
+    }
+
+    #[test]
+    fn alignment_and_bounds() {
+        let a = closure(vec![("a", tree(b"a")), ("b", tree(b"b"))]);
+        let b = closure(vec![("b", tree(b"b")), ("a", tree(b"a"))]);
+        let output = report(&a, &b);
+        assert!(output.contains("root alignment uncertain"));
+        assert!(!output.contains("root 0 expected"));
+        let renamed = closure(vec![("changed-role", tree(b"a")), ("b", tree(b"b"))]);
+        assert!(report(&a, &renamed).contains("root alignment uncertain"));
+        let inserted = closure(vec![("new", tree(b"a")), ("a", tree(b"a")), ("b", tree(b"b"))]);
+        assert!(report(&a, &inserted).contains("root alignment uncertain"));
+        let many = |bytes: &[u8]| Closure {
+            roots: (0..70).map(|i| Root { name: format!("r{i}"), tree: tree(bytes) }).collect(),
+        };
+        let expected = many(b"a").observation();
+        let actual = many(b"b").observation();
+        assert!(
+            std::mem::size_of::<Observation>()
+                + expected.roots.capacity() * std::mem::size_of::<RootObservation>()
+                <= 32 * 1024
+        );
+        let output = expected.difference(&actual);
+        assert!(output.contains("observation roots omitted expected 6 actual 6"));
+        assert!(output.contains("output root rows omitted 48"));
+        assert!(output.len() <= 8192);
+        assert!(!output.contains("secret-sentinel"));
+    }
 }

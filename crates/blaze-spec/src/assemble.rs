@@ -166,6 +166,7 @@ pub struct Resolved {
     pub facts: blaze_metadata::ResolverFacts,
     /// The configuration files the resolution read.
     pub config: ConfigRead,
+    pub(crate) observation: Option<crate::native::Observation>,
 }
 
 /// The configuration files a resolution read: the layers in precedence order, and every file
@@ -284,10 +285,20 @@ fn resolve_with_platform(
         units::unit_graph_captured(&wanted, sources, ctx.config_root, ctx.config_image).map_err(
             |error| Refusal::with(Reason::UnitGraphFailed, "the unit graph", format!("{error:#}")),
         )?;
-    let (spec, assembly_inputs) = assemble_with_inputs(request, ctx, &graph, platform)?;
+    let assembly = assemble_with_inputs(request, ctx, &graph, platform)?;
     inputs.append(&mut initial);
-    inputs.extend(assembly_inputs);
-    Ok(Resolved { spec, graph, inputs, manifest, outputs, sources, facts, config })
+    inputs.extend(assembly.inputs);
+    Ok(Resolved {
+        spec: assembly.spec,
+        graph,
+        inputs,
+        manifest,
+        outputs,
+        sources,
+        facts,
+        config,
+        observation: assembly.observation,
+    })
 }
 
 /// The members a command builds and whether it builds what the dev-dependencies are for.
@@ -401,7 +412,22 @@ impl Opened<'_> {
 /// This is [`build_spec`] with the graph given, so that a spec is made without resolving
 /// anything: tests hand it graphs they build.
 pub fn assemble(request: &Request, ctx: &Context<'_>, graph: &UnitGraph) -> Result<Spec, Refusal> {
-    Ok(assemble_with_inputs(request, ctx, graph, Platform::Bound)?.0)
+    Ok(assemble_with_inputs(request, ctx, graph, Platform::Bound)?.spec)
+}
+
+pub(crate) fn assemble_observed(
+    request: &Request,
+    ctx: &Context<'_>,
+    graph: &UnitGraph,
+) -> Result<(Spec, Option<crate::native::Observation>), Refusal> {
+    let assembly = assemble_with_inputs(request, ctx, graph, Platform::Bound)?;
+    Ok((assembly.spec, assembly.observation))
+}
+
+struct Assembly {
+    spec: Spec,
+    inputs: Vec<(PathBuf, Vec<u8>)>,
+    observation: Option<crate::native::Observation>,
 }
 
 fn assemble_with_inputs(
@@ -409,7 +435,7 @@ fn assemble_with_inputs(
     ctx: &Context<'_>,
     graph: &UnitGraph,
     platform: Platform<'_>,
-) -> Result<(Spec, Vec<(PathBuf, Vec<u8>)>), Refusal> {
+) -> Result<Assembly, Refusal> {
     let command = request.command.unwrap_or(Subcommand::Build);
     let host = ctx.host;
     Opened::with(request, ctx, |opened| {
@@ -472,10 +498,14 @@ fn assemble_with_inputs(
         };
         // The requester tree is the replayed snapshot, or the live workspace.
         let requester = ctx.source_root.unwrap_or_else(|| opened.workspace.root());
-        let platform = match platform {
-            Platform::Recorded(platform) => platform.clone(),
-            Platform::Bound => platform::exec_platform_of(&machine, ctx.probe, Some(requester))?,
-            Platform::Live => platform::facts(&machine, ctx.probe)?,
+        let (platform, observation) = match platform {
+            Platform::Recorded(platform) => (platform.clone(), None),
+            Platform::Bound => {
+                let description = platform::describe_of(&machine, ctx.probe, Some(requester))?;
+                let observation = description.native.observation();
+                (description.platform, Some(observation))
+            }
+            Platform::Live => (platform::facts(&machine, ctx.probe)?, None),
         };
         let platform_digest = digest_of(&platform);
 
@@ -560,10 +590,11 @@ fn assemble_with_inputs(
         let digest = digest_of(&build);
         let front_end = front_end_key(&build, &flags, &host.triple);
         let config = config_key(&build, kind_of(command));
-        Ok((
-            Spec { build, platform, platform_digest, digest, front_end, config },
-            opened.manifests.sources(),
-        ))
+        Ok(Assembly {
+            spec: Spec { build, platform, platform_digest, digest, front_end, config },
+            inputs: opened.manifests.sources(),
+            observation,
+        })
     })
 }
 

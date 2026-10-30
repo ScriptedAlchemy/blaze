@@ -365,7 +365,8 @@ pub fn capture(
 ) -> anyhow::Result<Spec> {
     let subcommand = request.command.unwrap_or(Subcommand::Build);
     ensure!(Request::parse(subcommand, words)? == *request, "request does not match its words");
-    let first = assemble::resolve(request, ctx)?;
+    let mut first = assemble::resolve(request, ctx)?;
+    drop(first.observation.take());
     let native = native(ctx);
     let home = environment::cargo_home(&native, ctx.cwd)
         .unwrap_or_else(|| first.graph.root.join(".blaze-cargo-home"));
@@ -519,6 +520,7 @@ pub fn capture(
         facts: facts_path,
     };
     let relocated = tempfile::tempdir()?;
+    let baseline = resolved.observation.take();
     prepare_record(
         &made.build,
         store,
@@ -529,8 +531,10 @@ pub fn capture(
         ctx.rust_release,
         &native,
         &record,
+        baseline.as_ref(),
     )
     .context("captured inputs cannot reproduce the request offline")?;
+    drop(baseline);
     let mut writing = tempfile::NamedTempFile::new_in(store)?;
     writing.write_all(&blaze_wire::encode(&record))?;
     writing.as_file().sync_all()?;
@@ -568,6 +572,7 @@ pub fn prepare(
         rust_release,
         executor,
         &record,
+        None,
     )
 }
 
@@ -585,6 +590,7 @@ fn prepare_record(
     rust_release: Option<&blaze_metadata::RustRelease<'_>>,
     executor: &BTreeMap<String, OsString>,
     record: &Record,
+    baseline: Option<&crate::native::Observation>,
 ) -> anyhow::Result<Prepared> {
     let SourceRef::Root(source) = &given.source else {
         bail!("this spec has no immutable replay inputs; save it again with --out");
@@ -722,7 +728,7 @@ fn prepare_record(
         relative(&root, &unit.package.manifest_dir.canonicalize()?)?;
     }
     assemble::canonical_units(given, &resolved.graph)?;
-    let verified = assemble::assemble(&request, &ctx, &resolved.graph)?;
+    let (verified, observation) = assemble::assemble_observed(&request, &ctx, &resolved.graph)?;
     if record.platform != verified.platform {
         let (a, b) = (&record.platform, &verified.platform);
         let fields: Vec<_> = [
@@ -740,10 +746,20 @@ fn prepare_record(
         .into_iter()
         .filter_map(|(field, same)| (!same).then_some(field))
         .collect();
-        bail!(
+        let detail = if a.native_root != b.native_root {
+            baseline.zip(observation.as_ref()).map(|(before, after)| before.difference(after))
+        } else {
+            None
+        };
+        let mut message = format!(
             "execution machine does not match the BuildSpec: platform fields differ: {}",
             fields.join(", ")
         );
+        if let Some(detail) = detail {
+            message.push_str("; ");
+            message.push_str(&detail);
+        }
+        bail!("{message}");
     }
     if let Some(difference) = crate::run::first_difference(given, &verified.build) {
         bail!("execution machine does not match the BuildSpec: {difference}");

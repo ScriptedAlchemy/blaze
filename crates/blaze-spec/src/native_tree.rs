@@ -277,24 +277,7 @@ impl Tree {
             frame(&mut hash, path.as_os_str().as_encoded_bytes());
             hash.update((entry.links.len() as u64).to_le_bytes());
             for target in &entry.links {
-                if target.is_absolute() {
-                    let relative = target.strip_prefix(&self.root).ok().or_else(|| {
-                        self.resolved_root.as_ref().and_then(|root| target.strip_prefix(root).ok())
-                    });
-                    match relative {
-                        Some(relative) => {
-                            frame(&mut hash, b"root");
-                            frame(&mut hash, relative.as_os_str().as_encoded_bytes());
-                        }
-                        None => {
-                            frame(&mut hash, b"absolute");
-                            frame(&mut hash, target.as_os_str().as_encoded_bytes());
-                        }
-                    }
-                } else {
-                    frame(&mut hash, b"relative");
-                    frame(&mut hash, target.as_os_str().as_encoded_bytes());
-                }
+                self.hash_link(&mut hash, target);
             }
             match &entry.kind {
                 Kind::Missing => frame(&mut hash, b"missing"),
@@ -309,6 +292,79 @@ impl Tree {
             }
         }
         hash.finalize().into()
+    }
+
+    fn hash_link(&self, hash: &mut Sha256, target: &Path) {
+        if target.is_absolute() {
+            let relative = target.strip_prefix(&self.root).ok().or_else(|| {
+                self.resolved_root.as_ref().and_then(|root| target.strip_prefix(root).ok())
+            });
+            match relative {
+                Some(relative) => {
+                    frame(hash, b"root");
+                    frame(hash, relative.as_os_str().as_encoded_bytes());
+                }
+                None => {
+                    frame(hash, b"absolute");
+                    frame(hash, target.as_os_str().as_encoded_bytes());
+                }
+            }
+        } else {
+            frame(hash, b"relative");
+            frame(hash, target.as_os_str().as_encoded_bytes());
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Summary {
+        let mut membership = component(b"membership");
+        let mut content = component(b"content");
+        let mut mode = component(b"mode");
+        let mut links = component(b"links");
+        let mut counts = [0_u64; 5];
+        for (path, entry) in &self.entries {
+            let path = path.as_os_str().as_encoded_bytes();
+            frame(&mut membership, path);
+            let kind = match &entry.kind {
+                Kind::Missing => {
+                    counts[0] += 1;
+                    b"missing".as_slice()
+                }
+                Kind::Directory => {
+                    counts[1] += 1;
+                    b"directory".as_slice()
+                }
+                Kind::File { digest, len, executable } => {
+                    counts[2] += 1;
+                    frame(&mut content, path);
+                    content.update(len.to_le_bytes());
+                    content.update(digest);
+                    frame(&mut mode, path);
+                    mode.update([u8::from(*executable)]);
+                    b"file".as_slice()
+                }
+                Kind::Cycle => {
+                    counts[3] += 1;
+                    b"cycle".as_slice()
+                }
+            };
+            frame(&mut membership, kind);
+            if !entry.links.is_empty() {
+                counts[4] += entry.links.len() as u64;
+                frame(&mut links, path);
+                links.update((entry.links.len() as u64).to_le_bytes());
+                for target in &entry.links {
+                    self.hash_link(&mut links, target);
+                }
+            }
+        }
+        Summary {
+            digest: self.digest(),
+            counts,
+            membership: membership.finalize().into(),
+            content: content.finalize().into(),
+            mode: mode.finalize().into(),
+            links: links.finalize().into(),
+        }
     }
 
     /// Find the captured entry of an absolute or root-relative native pathname.
@@ -441,6 +497,22 @@ impl Tree {
         self.entries.insert(logical.to_owned(), Entry { links, kind });
         Ok(())
     }
+}
+
+pub(crate) struct Summary {
+    pub(crate) digest: Digest,
+    pub(crate) counts: [u64; 5],
+    pub(crate) membership: Digest,
+    pub(crate) content: Digest,
+    pub(crate) mode: Digest,
+    pub(crate) links: Digest,
+}
+
+fn component(domain: &[u8]) -> Sha256 {
+    let mut hash = Sha256::new();
+    frame(&mut hash, b"blaze/native-tree-observation/v1");
+    frame(&mut hash, domain);
+    hash
 }
 
 fn same_kind(actual: &ResolvedKind, expected: &Kind) -> bool {
@@ -651,4 +723,50 @@ fn lexical(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+#[cfg(all(test, unix))]
+mod digest_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn native_tree_digest_literal_vectors() {
+        let root = Path::new("/golden-root");
+        let missing = Tree::from_files(root, std::iter::empty()).unwrap();
+        assert_eq!(
+            missing.digest(),
+            [
+                0xd0, 0x7b, 0xc4, 0xea, 0x26, 0x45, 0xf2, 0x49, 0xaa, 0x9a, 0xac, 0x87, 0x03, 0x7b,
+                0x5e, 0x26, 0x40, 0x10, 0xb1, 0x41, 0xbc, 0x8b, 0x73, 0x97, 0x8e, 0x8f, 0x89, 0x86,
+                0xba, 0x1a, 0xce, 0x3e,
+            ]
+        );
+
+        let mut tree =
+            Tree::from_files(root, [("include/a.h".into(), b"header".to_vec())]).unwrap();
+        assert_eq!(
+            tree.digest(),
+            [
+                0x55, 0xc1, 0x33, 0x8e, 0x17, 0x65, 0x05, 0xff, 0x86, 0x27, 0x18, 0xdf, 0x2c, 0xc6,
+                0x2d, 0x88, 0x89, 0x83, 0x76, 0x34, 0x08, 0xff, 0xe5, 0xe7, 0x10, 0xc2, 0x0b, 0x31,
+                0x2a, 0x94, 0x96, 0x9b,
+            ]
+        );
+        let entry = tree.entries.get_mut(Path::new("include/a.h")).unwrap();
+        entry.links =
+            vec![root.join("include/a.h"), PathBuf::from("/outside/x"), PathBuf::from("../other")];
+        if let Kind::File { executable, .. } = &mut entry.kind {
+            *executable = true;
+        } else {
+            panic!("fixture is not a file");
+        }
+        assert_eq!(
+            tree.digest(),
+            [
+                0x3b, 0x02, 0xd5, 0x28, 0xfc, 0xd5, 0xe2, 0xef, 0xfd, 0xb6, 0xca, 0x92, 0x9d, 0x27,
+                0x0d, 0xe4, 0xf5, 0x23, 0x70, 0xca, 0x92, 0x0d, 0x67, 0x45, 0xb8, 0x93, 0x09, 0xdd,
+                0x44, 0xbe, 0x8c, 0x35,
+            ]
+        );
+    }
 }

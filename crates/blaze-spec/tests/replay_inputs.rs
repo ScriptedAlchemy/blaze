@@ -1103,3 +1103,176 @@ fn a_replay_knows_which_variables_the_requester_had_without_holding_their_names(
         assert!(!record.windows(held.len()).any(|window| window == held));
     }
 }
+
+struct ChangingProbe {
+    calls: std::cell::Cell<usize>,
+    batches: std::cell::Cell<usize>,
+    change_after: usize,
+}
+
+impl ChangingProbe {
+    fn new(change_after: usize) -> Self {
+        Self { calls: std::cell::Cell::new(0), batches: std::cell::Cell::new(0), change_after }
+    }
+
+    fn called(&self) {
+        self.calls.set(self.calls.get() + 1);
+    }
+}
+
+impl Probe for ChangingProbe {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        self.called();
+        let bytes: &[u8] =
+            if self.batches.get() > self.change_after { b"changed" } else { b"original" };
+        blaze_spec::native_tree::Tree::from_files(
+            path,
+            [(path.join("secret-native-entry"), bytes.to_vec())],
+        )
+    }
+
+    fn native_trees(
+        &self,
+        paths: &[PathBuf],
+    ) -> std::io::Result<Vec<blaze_spec::native_tree::Tree>> {
+        self.called();
+        self.batches.set(self.batches.get() + 1);
+        paths.iter().map(|path| self.native_tree(path)).collect()
+    }
+
+    fn which_native(&self, name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+        self.called();
+        FakeMachine.which_native(name, path)
+    }
+    fn run_native(&self, program: &Path, args: &[OsString]) -> Option<String> {
+        self.called();
+        FakeMachine.run_native(program, args)
+    }
+    fn run_path(&self, program: &Path, args: &[OsString]) -> Option<Vec<u8>> {
+        self.called();
+        FakeMachine.run_path(program, args)
+    }
+    fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
+        self.called();
+        FakeMachine.which(name, path)
+    }
+    fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        self.called();
+        FakeMachine.run(program, args)
+    }
+    fn run_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+        program: &Path,
+        args: &[&str],
+    ) -> Option<String> {
+        self.called();
+        FakeMachine.run_in(cwd, env, program, args)
+    }
+    fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        self.called();
+        FakeMachine.read(path)
+    }
+    fn os(&self) -> Option<String> {
+        self.called();
+        FakeMachine.os()
+    }
+}
+
+#[test]
+fn capture_compares_native_observations_without_an_extra_probe() {
+    let f = fixture();
+    let root = f.root();
+    let host = host(false);
+    let mut env = f.env();
+    env.insert("NIX_CFLAGS_COMPILE".into(), "-I/secret-native-role".into());
+    env.insert("PRIVATE_TOKEN".into(), "secret-native-env".into());
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let stable = ChangingProbe::new(usize::MAX);
+    let mut ctx = context(&f, &env, &host, &root);
+    ctx.probe = &stable;
+    capture(&request, &[], &ctx, store.path(), &[]).unwrap();
+    assert_eq!(stable.batches.get(), 3);
+
+    let changed_store = tempfile::tempdir().unwrap();
+    let changed = ChangingProbe::new(2);
+    ctx.probe = &changed;
+    let error = capture(&request, &[], &ctx, changed_store.path(), &[]).err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("platform fields differ: native_root"), "{message}");
+    assert!(message.contains("content"), "{message}");
+    for secret in ["secret-native-entry", "secret-native-role", "secret-native-env"] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    assert_eq!(changed.batches.get(), stable.batches.get());
+    assert_eq!(changed.calls.get(), stable.calls.get());
+}
+
+#[test]
+fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
+    let f = fixture();
+    let root = f.root();
+    let host = host(false);
+    let env = f.env();
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let probe = ChangingProbe::new(3);
+    let mut ctx = context(&f, &env, &host, &root);
+    ctx.probe = &probe;
+    let made = capture(&request, &[], &ctx, store.path(), &[]).unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let before = probe.calls.get();
+    let error = prepare(
+        &made.build,
+        store.path(),
+        &worker.path().join("wrong"),
+        &host,
+        StoreIdentity([8; 32]),
+        &probe,
+        Some(&common::rust_release),
+        &[("PATH".to_owned(), OsString::from("/usr/bin"))].into_iter().collect(),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("toolchain differs"));
+    assert_eq!(probe.calls.get(), before);
+    let error = prepare(
+        &made.build,
+        store.path(),
+        &worker.path().join("changed"),
+        &host,
+        StoreIdentity([9; 32]),
+        &probe,
+        Some(&common::rust_release),
+        &[("PATH".to_owned(), OsString::from("/usr/bin"))].into_iter().collect(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        "execution machine does not match the BuildSpec: platform fields differ: native_root"
+    );
+    assert_eq!(probe.batches.get(), 4);
+}
+
+#[test]
+fn live_and_recorded_resolution_do_not_bind_native_trees() {
+    let f = fixture();
+    let root = f.root();
+    let host = host(false);
+    let env = f.env();
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let probe = ChangingProbe::new(usize::MAX);
+    let mut ctx = context(&f, &env, &host, &root);
+    ctx.probe = &probe;
+    let bound = blaze_spec::assemble::resolve(&request, &ctx).unwrap();
+    assert_eq!(probe.batches.get(), 1);
+    blaze_spec::assemble::resolve_live(&request, &ctx).unwrap();
+    assert_eq!(probe.batches.get(), 1);
+    let calls = probe.calls.get();
+    blaze_spec::assemble::resolve_recorded(&request, &ctx, &bound.spec.platform).unwrap();
+    assert_eq!(probe.batches.get(), 1);
+    assert_eq!(probe.calls.get(), calls);
+}
