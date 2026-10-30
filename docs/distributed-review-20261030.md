@@ -39,7 +39,7 @@ compiled artifact. See [cached.rs](../crates/hir-ty-codegen/cached.rs), Entry, a
 Persistent invalidation is nevertheless conservative at the crate dependency-closure boundary.
 StableNames::spell_crate prefixes owned names with a ContentId. In
 [content.rs](../crates/ra-jit/src/content.rs), Contents::hash includes package source bytes,
-generated inputs, configuration, observed environment values, and dependencies. Editing one
+generated inputs, configuration, environment inputs, and dependencies. Editing one
 function changes names throughout its crate and the local crates depending on it. Unchanged
 dependencies and unaffected workspace crates remain reusable across PRs. Within an already
 running daemon, Salsa can retain unchanged functions of an edited crate; the disk key does
@@ -49,6 +49,19 @@ For example, two PRs changing different application crates can share an unchange
 library. A PR changing the common library invalidates its persisted function entries and
 dependent crate identities, even when some of those functions' text is unchanged. This is
 a safe but broader invalidation boundary, not a correctness defect.
+
+Environment identity also limits reuse. The #15/#18 repair removes exact cache-service
+controls from a copy used to key ordinary crates when no transitive procedural macro is
+present. Effective values read by `env!` or `option_env!` still affect the identity, including
+reads in dependencies, signatures, constants and codegen attributes. Actual source and
+producer environments are unchanged. Other declared environment inputs remain conservatively
+keyed; for example, per-PR CI variables can still prevent reuse even when source is unchanged.
+Consumers of transitive procedural macros retain their represented environment because macro
+reads are not observed individually. Complete native-byte macro provenance and a portable
+producer-result cache remain separate work. Matching source text alone does not promise a hit.
+See [content.rs on #15](https://github.com/ScriptedAlchemy/blaze/blob/dist/c4-keys/crates/ra-jit/src/content.rs),
+environment_hash/keyed_environment, and the
+[tracked input discovery on #15](https://github.com/ScriptedAlchemy/blaze/blob/dist/c4-keys/vendor/rust-analyzer/crates/hir/src/input_owners.rs).
 
 ## Identity boundaries
 
@@ -141,6 +154,12 @@ The changes address concrete interactions needed by that architecture:
   resource policy for ordinary compiler children. Caller-relative service paths are resolved
   before child directories change. See
   [cache_service.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/ra-jit/src/cargo/spec/cache_service.rs).
+- **Compiler environment identity on #15/#18:** discover inputs before memoizing identity; key effective
+  observed values, including authoritative crate overlays and dependency reads; distinguish
+  unset, empty and non-Unicode values; and exclude only unobserved cache-service controls for
+  ordinary crates. Lazy symbol/section attributes use the compiler's existing semantic
+  queries. This fixes both unnecessary cache misses and stale reuse of a library whose
+  embedded environment value changed. Proc-macro consumers retain conservative text inputs.
 - **T1 tests:** identify executables and recorded inputs by content/mode, retain symlink text
   and target observations, and revoke old passes after forced or filtered failures. See
   [affected.rs](../crates/ra-jit/src/cargo/affected.rs),
@@ -160,14 +179,17 @@ the scheduler. Start with two independent worker processes through the local car
 exercise the same adapter over a multi-host transport. Acceptance should establish:
 
 1. Both workers materialize the authenticated BuildSpec, agree on canonical roots, and retain
-   actual local requests. Both receive and compile real work from one build.
+   actual local requests. Each has a separate local store, and both receive and compile real
+   work from one build.
 2. Cache hits are admitted before compile queries. Misses run through D0, upload packs, and
    commit under the scheduler's lease; retries cannot duplicate accepted accounting.
 3. The lead imports the accepted closure and links/runs the program. Counters demonstrate
    that accepted helper work is not compiled again during final assembly.
-4. A second PR, in a different checkout root, changes only another application crate. With
-   the same compiler and settings, unchanged shared-library entries hit the cache with zero
-   backend compilation of those eligible instances. Changed inputs produce the expected misses.
+4. A second PR, in a different checkout root and fresh process with an initially empty local
+   store, changes only another application crate. Its only reusable artifacts come from the
+   first build's remote. With compatible compiler, settings and declared inputs, unchanged
+   shared-library entries are retrieved remotely with zero backend compilation of those
+   eligible instances. Changed inputs produce the expected misses.
 5. Worker loss and a missing/corrupt pack take the existing retry/local path without claiming
    nonexistent completion. The final behavior agrees with a fully local Blaze build.
 
@@ -175,13 +197,29 @@ Record compiler-query counts, hits/misses, local remainder, transferred bytes, f
 peak memory and end-to-end elapsed time. These establish correctness and explain costs;
 speedup requires a separate measured comparison on representative workloads.
 
+Environment discovery reuses the tracked owner walk already needed for external source
+identity. Completing local identity also visits lazy signature/constant owners and codegen
+attributes. Results are memoized per crate; this is a conservative correctness cost, not a
+measured frontend optimization. Compiled-code cache hits still require frontend work.
+
 ## Evidence limits at writing
 
 Cache/scheduler changes passed 262 crate tests; the simulation additionally passed with
 10,000 seeds each for job and work scenarios. The earlier D0 default-Cranelift suite passed
 50 tests, with its process-child fixture invoked by parent tests. Combined compiler
 validation subsequently passed 101 focused tests, and the full combined codegen suite passed
-67 tests, with one subprocess helper exercised by parent tests. Metadata suites passed 21 tests
-on C4 and 34 on C2, including the Cargo unit-graph oracle; these are branch receipts, not an
-aggregate count of unique tests. These are component and integration regressions, not a two-host
-build receipt. No LLVM/macOS or distributed performance result is claimed here.
+67 tests, with one subprocess helper exercised by parent tests. After the final environment
+repair, 13 Content tests passed through the real Resolver and frontend database, and the
+full default-Cranelift codegen suite again passed 67 tests with its one subprocess helper
+exercised by parent tests. The initial identity and cold-attribute cases were reproduced
+failing before their fixes. The direct service
+handoff passed six tests, including publish from one process followed by lazy retrieval into
+another process's fresh local store and a read-only peer check. Metadata suites passed 21 tests
+on C4 and 34 on C2, including the Cargo unit-graph oracle. These are separate branch receipts,
+not an aggregate count of unique tests.
+
+The saved-execution harness now includes the shared test-policy and two-build remote-cache
+cases. Their full owned compiler/runtime execution remains a CI acceptance gate; a harness
+self-check or a transport round-trip does not establish that runtime result. Component and
+integration regressions are not a two-host build receipt. No LLVM/macOS or distributed
+performance result is claimed here.
