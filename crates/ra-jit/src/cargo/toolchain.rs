@@ -288,11 +288,10 @@ mod tests {
                 manifest.as_ref(),
                 &crate::plan::Selection::default(),
                 &crate::plan::Asked {
-                    sysroot: Path::new(&std::env::var_os("RUSTC").unwrap())
-                        .parent()
-                        .unwrap()
-                        .parent()
-                        .unwrap(),
+                    // The sysroot `settle` chose, which it also exported for the planner.
+                    sysroot: match &chosen {
+                        Chosen::Given(dir) | Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
+                    },
                     triple: "aarch64-apple-darwin",
                     cfg: &[],
                     env: &Default::default(),
