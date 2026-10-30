@@ -1,6 +1,6 @@
 //! Compiler-process cache policy, separate from the source request and saved BuildSpec.
 //!
-//! A direct command may explicitly select the existing shared cache service. A saved
+//! An ordinary command may explicitly select the existing shared cache service. A saved
 //! replay never acquires a worker's ambient remote, credentials or trust configuration.
 
 use std::{collections::BTreeMap, ffi::OsString, path::Path};

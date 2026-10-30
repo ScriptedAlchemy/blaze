@@ -474,6 +474,7 @@ impl Staged {
                 cfg_test: false,
                 selection: asked.selection(),
                 env: worker_env(),
+                cache_env: None,
                 whole: false,
             };
             daemon::Ahead { config, crates: roots.clone(), root, native_env: None }
@@ -507,6 +508,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         cfg_test: asked.flags.dev_targets,
         selection: asked.selection(),
         env: worker_env(),
+        cache_env: None,
         whole: false,
     };
     Ok(daemon::Ahead { config, crates, root, native_env: None })
@@ -972,6 +974,7 @@ impl State {
             cfg_test: unit_test,
             selection: asked.selection(),
             env: worker_env(),
+            cache_env: None,
             whole: false,
         };
         let sysroot_libraries = sysroot_libraries();

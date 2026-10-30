@@ -6,6 +6,7 @@ pub(crate) mod wrapper;
 
 mod affected;
 mod ancestor;
+mod cache_service;
 mod cli;
 pub(crate) mod client;
 pub(crate) mod loader;
@@ -593,6 +594,7 @@ mod request_tests {
                 cfg_test: false,
                 selection: Default::default(),
                 env: BTreeMap::new(),
+                cache_env: None,
                 whole: false,
             },
             root: Default::default(),

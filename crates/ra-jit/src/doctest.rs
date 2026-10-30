@@ -216,6 +216,7 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
         args.selection.clone(),
         None,
         None,
+        args.project_origin,
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let parts = checkouts.parts(project)?;

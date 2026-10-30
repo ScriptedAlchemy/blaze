@@ -101,8 +101,10 @@ pub(crate) fn disk_json(
             serde_json::Value::Object(fields) => {
                 for (name, field) in fields.iter_mut() {
                     let at = format!("{prefix}/{}", name.replace('~', "~0").replace('/', "~1"));
-                    if matches!(name.as_str(), "env" | "native_env" | "crate_env" | "configured")
-                        && !field.is_null()
+                    if matches!(
+                        name.as_str(),
+                        "env" | "native_env" | "crate_env" | "configured" | "cache_env"
+                    ) && !field.is_null()
                     {
                         removed.insert(at, field.take());
                         *field = serde_json::Value::Null;
@@ -189,14 +191,20 @@ mod tests {
         let value = serde_json::json!({
             "checkouts": [{"env": {"TOKEN": secret}, "native_env": null}],
             "configured": [{"name": "TOKEN", "value": secret}],
+            "cache_env": crate::process::Native::of([("AWS_SECRET_ACCESS_KEY".into(), secret.into())]),
             "key": "ordinary"
         });
         // A missing daemon is harmless for serialization and loses read eligibility.
         let bytes = super::disk_json(&path, &value).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["cache_env"].is_null()
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains(value["cache_env"].as_str().unwrap()));
         let fields = std::collections::BTreeMap::from([
             ("/checkouts/0/env", value["checkouts"][0]["env"].clone()),
             ("/configured", value["configured"].clone()),
+            ("/cache_env", value["cache_env"].clone()),
         ]);
         crate::cargo::script::remember(
             path.clone(),
