@@ -161,6 +161,21 @@ def main() -> int:
         True,
     )
 
+    # Consumers must not evict the shared build cache with full store/target snapshots.
+    for action in c.ACTIONS_CACHE_ACTIONS:
+        case(
+            f"consumer Actions cache rejected: {action}",
+            text.replace("      - uses: actions/checkout@v7", f"      - uses: {action}@v1\n      - uses: actions/checkout@v7", 1),
+            False,
+            must_mention="outside the bundle producer",
+        )
+    case(
+        "consumer composite cannot allocate a cache",
+        text.replace("      - uses: actions/checkout@v7", "      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix sccache\n      - uses: actions/checkout@v7", 1),
+        False,
+        must_mention="cache allocation belongs to the bundle producer",
+    )
+
     # A gate that is only mentioned is not a gate. The argument keeps the command's exact
     # spelling, so a substring check would pass it.
     case(

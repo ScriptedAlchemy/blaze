@@ -20,6 +20,9 @@
 # way. `harness/dist/check_nix_workflow.py` runs as a step in `unit-graphs` and fails when an
 # expected gate is missing or made conditional, so deleting a gate is not a way to pass.
 # No job adds `id-token: write`: the cache is not worth granting identity.
+# The fork has a shared 10 GB Actions-cache budget. Only the central bundle producer
+# spends it; these checks never snapshot /nix or save Cargo targets. The optional
+# FlakeHub service above is external to that budget.
 name: nix and live
 on:
   push:
@@ -133,11 +136,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            demo/life -> target
       # ra-jit-live is a stub where live edits are not supported, and says so.
       - run: cargo test --release -p ra-jit-live
       - run: cargo build --locked
@@ -164,7 +162,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: cargo test --release -p ra-jit-live
       - run: cargo build --release -p ra-jit
