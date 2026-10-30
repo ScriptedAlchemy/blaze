@@ -1034,7 +1034,10 @@ fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
     };
     assert!(!for_the_host_alone(&asked(Some(&for_target)), &id));
     assert!(for_the_host_alone(&asked(Some(&for_host)), &id));
-    assert!(for_the_host_alone(&asked(None), &id), "every package is the host's when none is said");
+    assert!(
+        !for_the_host_alone(&asked(None), &id),
+        "every package is the target's when none is said"
+    );
     assert!(
         !for_the_host_alone(&asked(Some(&for_host)), "another"),
         "nor one the build does not have"
@@ -1053,6 +1056,19 @@ fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
     .unwrap();
     assert!(ran.0.is_empty(), "no host output of a package built for the target alone");
     assert!(ran.2.is_empty(), "and no run judged");
+    assert!(pkg.runs().is_empty());
+    // Nor of a build that says no packages, whose target pass runs the script for the target.
+    let ran = run_producers(
+        &pkg.cargo,
+        &asked(None),
+        pkg.sysroot.clone(),
+        Vec::new(),
+        vec!["unix".to_owned()],
+        &BTreeMap::new(),
+        &|id| for_the_host_alone(&asked(None), id),
+    )
+    .unwrap();
+    assert!(ran.0.is_empty() && ran.2.is_empty(), "a build that says none runs none for the host");
     assert!(pkg.runs().is_empty());
     let _ = std::fs::remove_dir_all(&base);
 }

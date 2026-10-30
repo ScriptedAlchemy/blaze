@@ -375,9 +375,11 @@ pub(crate) fn run_producers(
 /// the host whatever needs it, and its outputs are the host's. A package built for the target
 /// too has its script run for the target, and for the host only when a script or producer
 /// compiled for the host needs it, as cargo has no host unit of a package it builds for the
-/// target alone. Every package is the host's when the build says none.
+/// target alone. A build that says none has every package built for the target, as the
+/// target pass has it ([`Asked::packages`]): the host pass runs none of their scripts up front,
+/// or one of them would run twice, once in each pass.
 fn for_the_host_alone(asked: &Asked<'_>, id: &str) -> bool {
-    asked.packages.is_none_or(|it| it.get(id) == Some(&false))
+    asked.packages.is_some_and(|it| it.get(id) == Some(&false))
 }
 
 fn run_with(
