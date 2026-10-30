@@ -133,8 +133,7 @@ class Arm(unittest.TestCase):
                      "the build wrote no program")
 
     def test_a_program_that_is_not_there_at_any_step_is_not_accepted(self):
-        # Every run failing the same way is not the program saying what it said: the verifier
-        # found `one_arm` accepting it.
+        # Repeated failures must not count as matching program output.
         self.run_script = [(None, "the build wrote no program")] * 5
         self.refused("the unedited program did not run: the build wrote no program")
         self.assertEqual(self.builds, [], "no edit is made to a program that does not run")
