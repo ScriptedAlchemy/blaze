@@ -1,8 +1,8 @@
 # SCRIPTEDITS: build scripts rerun across edits in the whole build
 
-Unit p05w of the distributed program, 2026-10-26, branch `dist/p05w`. I ran everything below; "I
-ran" means that. Claims are labelled as in the other reports: **measured** is a number I took
-here, **read** is from the code, **reported** is another report's.
+This report records unit p05w of the distributed program on 2026-10-26, on branch
+`dist/p05w`. I ran the checks below. **measured** marks a measurement from those
+runs, **read** marks source evidence, and **reported** marks another report's claim.
 
 Unit p05r (2026-10-26, same branch) replaced the finding below: the whole build compiles and runs
 its build scripts itself, with no `cargo check` and no rustc; see [blaze runs the

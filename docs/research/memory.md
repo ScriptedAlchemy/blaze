@@ -1,17 +1,22 @@
 # Does the warm daemon leak, and what would shrink it
 
-2026-10-26, for the distributed program (unit u4-memory): warm daemons ("slots") on fleet
-machines, where a slot's memory decides how many fit on a 128-core/256 GB Linux box, a 64 GB M1
-Ultra, a 12-core/64 GB box and a 12-core/16 GB laptop. Read at `c8e5f6a88a` (origin/dist/main,
-which is upstream `indexable-inc/blaze` main). Nothing was built or run for this page: it is
-the in-tree sources and research, upstream's issues and pull requests (read with `gh`, never
-commented on) and the commits of every fork (read with `gh api`). Each claim is **read** (measured
-by someone and recorded, or read in a source), **reported** (someone says so in an issue or a
-pull request) or **unverified** (our inference). What would settle each open point is a proposed
-measurement in [section 5](#5-proposed-measurements), not a number. This page adds to
-[daemon-memory.md](daemon-memory.md) (what the heap is, salsa's `lru`, the allocator, sharing
-debug types) and [lean-frontend.md](lean-frontend.md) (the heap by holder, interned arguments);
-it does not repeat their tables.
+This survey, dated 2026-10-26, is unit u4-memory of the distributed program.
+It examines how much memory warm daemons use and how many fit on each fleet machine:
+a 128-core/256 GB Linux host, a 64 GB M1 Ultra, a 12-core/64 GB host and a
+12-core/16 GB laptop. The source revision is `c8e5f6a88a`, then `origin/dist/main`
+and upstream `indexable-inc/blaze` main.
+
+Nothing was built or run for this page. Sources include in-tree code and research,
+upstream issues and pull requests read with `gh`, and fork commits read with
+`gh api`. No comments were posted. **read** marks source code or a recorded
+measurement, **reported** marks an issue or pull request's claim, and **unverified**
+marks an inference. [Section 5](#5-proposed-measurements) proposes measurements
+for the open questions.
+
+This page adds to [daemon-memory.md](daemon-memory.md), which covers the heap,
+salsa's `lru`, the allocator and shared debug types, and
+[lean-frontend.md](lean-frontend.md), which covers allocation owners and interned
+arguments.
 
 ## Short version
 

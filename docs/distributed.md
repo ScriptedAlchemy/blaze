@@ -1,24 +1,29 @@
 # Distributed cache, compile and tests
 
-2026-10-26, revision 3.2. Status: design, nothing built. Written against the fork's `dist/main` at
-`f9b5da46` (code as at `c8e5f6a8` plus u5's memory instruments; line numbers are those of
-`f9b5da46`) and tracedecay at `d79de82273`. Each claim is marked **read** (in a source we read,
-or measured by us), **reported** (a document or someone says so, not re-checked here) or
-**unverified** (our inference or an estimate). A number taken from another document that states
-no run count, spread or limiter is marked **n not stated**. Numbers name the file they come from.
-Code paths are still `ra-jit` where the rename to blaze has not reached them.
+Revision 3.2, 2026-10-26. This document records a design; nothing was built for it.
+It uses the fork's `dist/main` at `f9b5da46` and tracedecay at `d79de82273`.
+The blaze tree contains `c8e5f6a8` plus u5's memory instruments. Line numbers refer
+to `f9b5da46`. Paths retain `ra-jit` where the rename to blaze is incomplete.
+
+Claims use these labels:
+
+- **read** means we read the source or measured the result.
+- **reported** means another document or person reports it; we did not recheck it.
+- **unverified** means an inference or estimate.
+- **n not stated** means the cited document omits the run count, spread or limiter.
+
+Each number names its source file.
 
 Revision 1 (`45449ae6`) was rejected by both reviews of [PR
 #1](https://github.com/ScriptedAlchemy/blaze/pull/1). Revision 2 (`2fd75c16`) was rejected by both
 re-reviews: re-review A found 10 of 25 findings resolved, 13 partly, 1 not (a-B1) and 1 regressed
 (b-M8), and seven new problems; re-review B found three blockers (the no-rustc boundary is not a
 process tree, a work item cannot rebuild a generic instance on a helper, and the ahead queue
-writes no linkable entries) and seven majors. This revision follows one rule: every blocker, every
-finding not resolved and every regression is fixed here, in the design; every finding partly
-resolved and every major is turned into acceptance lines of the unit that owns it, so the code
-settles it, each line tagged with the finding's id. [Appendix A](#appendix-a-review-findings) gives
-every finding of both re-reviews its status. It also takes in two reports written since revision
-2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
+writes no linkable entries) and seven majors. This revision changes the design to address
+every blocker, unresolved finding and regression. Each partially resolved finding and major
+has an acceptance check in the responsible unit, tagged with the finding's ID.
+[Appendix A](#appendix-a-review-findings) records every finding's status. The
+revision also takes in two reports written since revision 2: what holds a loading worker's memory ([reports/LOADMEM.md](reports/LOADMEM.md)) and why every
 edit of the CLI went to cargo (`docs/reports/BUILDSCRIPT.md` on `dist/u8-buildscript`, PR #5,
 parked after four failed verifications; P0.5 does its job in the whole build,
 [reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md)).
@@ -52,11 +57,11 @@ Revision 2 took in the measurement of blaze on tracedecay
 [appendix B](#appendix-b-the-research-edits)) and the memory survey
 ([research/memory.md](research/memory.md)).
 
-The goal: blaze gives tracedecay a distributed cache, distributed compile and distributed tests
-for Rust on Linux x86-64 and macOS arm64, good enough that tracedecay drops NativeLink for its
-Rust build and test actions there, and no more than NativeLink gives it (see the scope section).
-Bazel keeps Windows, JS, Python, Clippy and the release and dist (thin LTO) builds. Workers run
-blaze, never rustc ([no-rustc.md](no-rustc.md)).
+The goal is to replace NativeLink for tracedecay's Rust build and test actions on
+Linux x86-64 and macOS arm64. blaze will provide a distributed cache, compilation
+and tests with the parity defined in the scope section. Bazel keeps Windows, JS,
+Python, Clippy and the release and dist builds with thin LTO. Workers run blaze
+and never rustc, as required by [no-rustc.md](no-rustc.md).
 
 Three decisions of the program's owner bind this design, and a fourth, the scope, has its own
 section after them:
@@ -78,11 +83,11 @@ section after them:
 
 ## Scope: parity with Bazel and NativeLink
 
-**The ruling (owner, 2026-10-26).** The program adds nothing beyond what Bazel with NativeLink
-already gives tracedecay for Rust. Where an earlier revision of this document asked for more, the
-more is out of scope until the owner asks for it. A piece that is out of scope is marked "out of
-scope (owner, 2026-10-26)" where it stands; its text is kept as a record of what was designed, and
-no unit builds it.
+The owner ruled on 2026-10-26 that this program provides the Rust build and test
+behavior tracedecay gets from Bazel with NativeLink. Additional requirements from
+earlier revisions are out of scope until the owner requests them. They remain
+marked "out of scope (owner, 2026-10-26)" to preserve the design history. No unit
+implements them.
 
 **In scope (parity):**
 
@@ -2094,8 +2099,8 @@ the reason. A helper that misses them loses only its lease. `LocalPolicy`:
 the smaller hosted VM"), `Fallback` (build locally after the deadline or a remote failure),
 `Race` (build locally from the start, per job, never per function). Under `Race` the first to
 finish wins, but a first-finishing failure fails the job, as Bazel's dynamic execution does
-(research 7.4), so local and remote differences surface. Locally, every policy runs under the
-same no-rustc rule.
+(research 7.4). A successful build on the other executor cannot hide that failure.
+Locally, every policy runs under the same no-rustc rule.
 
 ## 5. Admission and scheduling
 
@@ -2280,8 +2285,8 @@ Each tier has a default, a command and a harness check (the owner's requirement,
 | Stale identity, local | packs of an old blaze identity stay until LRU reaches them | packs no record or root of the current identity names are collected first | on every collect | `blaze store collect --stale` | C7: upgrade the binary, collect, old identity's packs gone, the new identity's build compiles what it must |
 | Target directory | unmanaged; blaze's is 23.0 to 27.3 GB against cargo's 14.2 GB on tracedecay (TRACEDECAY.md), up to 3.9 times cargo's elsewhere (biome 42.5 GB against 11.0, benchmarks.md) | blaze's own files in it (its objects, programs, `.ra-jit-*` records) within `BLAZE_TARGET_MAX`, oldest program first, never the running program's | 2 times the size cargo's own build leaves, measured at the first build | `blaze clean --keep-latest` | C7: twenty builds of moving commits stay within the bound; P0.7 explains the extra 8.9 to 13.1 GB first |
 | Cache server | none (revision 1: GC by roots) | section 3's GC: `--max`, low-water 80%, roots by generation, leases, completeness, hourly | `--max` 70% of the server's disk | `ra-jit serve collect --dry-run` | C7: 30 `master` commits and 10 pull requests with new generic instances each, within budget, the last 20 roots hit, obsolete instances gone |
-| Executors | — | an executor's work directory is deleted when its job ends; a builder's worktree is one path, moved by edits, and its daemon unloads checkouts that are gone (memory.md item 3) | at job end | `blaze-agent prune` | E1: after 10 jobs, no work directory or process left |
-| Stale identity, server | — | records of identities not served are dead after 7 days | | `ra-jit serve collect` | C7 |
+| Executors | None | an executor's work directory is deleted when its job ends; a builder's worktree is one path, moved by edits, and its daemon unloads checkouts that are gone (memory.md item 3) | at job end | `blaze-agent prune` | E1: after 10 jobs, no work directory or process left |
+| Stale identity, server | None | records of identities not served are dead after 7 days | | `ra-jit serve collect` | C7 |
 
 ## 8. Wire protocol
 
