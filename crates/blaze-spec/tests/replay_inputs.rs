@@ -49,6 +49,47 @@ fn prepared(made: &Spec, store: &Path, at: &Path) -> blaze_spec::replay::Prepare
 }
 
 #[test]
+fn foreign_nix_target_flags_do_not_change_the_captured_native_platform() {
+    let f = fixture();
+    let root = f.root();
+    let host = host(false);
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let mut env = f.env();
+    env.insert("NIX_CFLAGS_COMPILE".into(), "-I/native-current".into());
+    let first = tempfile::tempdir().unwrap();
+    let baseline =
+        capture(&request, &[], &context(&f, &env, &host, &root), first.path(), &[]).unwrap();
+    env.insert("NIX_CFLAGS_COMPILE_x86_64_apple_darwin".into(), "-I/native-foreign".into());
+    let second = tempfile::tempdir().unwrap();
+    let foreign =
+        capture(&request, &[], &context(&f, &env, &host, &root), second.path(), &[]).unwrap();
+    assert_eq!(baseline.platform, foreign.platform);
+    assert_eq!(baseline.build.script_env, foreign.build.script_env);
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&foreign, second.path(), &worker.path().join("source"));
+    assert_eq!(replay.resolved.spec.build, foreign.build);
+}
+
+#[test]
+fn apple_toolchain_selection_is_restored_before_platform_verification() {
+    let f = fixture();
+    let root = f.root();
+    let host = host(false);
+    let mut env = f.env();
+    env.insert("TOOLCHAINS".into(), "org.example.selected-toolchain".into());
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &context(&f, &env, &host, &root), store.path(), &[]).unwrap();
+    assert!(made.platform.linker.1.contains("org.example.selected-toolchain"));
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("source"));
+    assert_eq!(
+        replay.execution_environment().unwrap()["TOOLCHAINS"],
+        "org.example.selected-toolchain"
+    );
+}
+
+#[test]
 fn dirty_inputs_survive_origin_removal_and_are_used_by_the_execution_plan() {
     let f = fixture();
     let store = tempfile::tempdir().unwrap();

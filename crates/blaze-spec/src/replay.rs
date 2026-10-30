@@ -720,6 +720,28 @@ fn prepare_record(
     }
     assemble::canonical_units(given, &resolved.graph)?;
     let verified = assemble::assemble(&request, &ctx, &resolved.graph)?;
+    if record.platform != verified.platform {
+        let (a, b) = (&record.platform, &verified.platform);
+        let fields: Vec<_> = [
+            ("triple", a.triple == b.triple),
+            ("os", a.os == b.os),
+            ("sdk", a.sdk == b.sdk),
+            ("libc", a.libc == b.libc),
+            ("linker", a.linker == b.linker),
+            ("cpu", a.cpu == b.cpu),
+            ("cc", a.cc == b.cc),
+            ("cxx", a.cxx == b.cxx),
+            ("ar", a.ar == b.ar),
+            ("native_root", a.native_root == b.native_root),
+        ]
+        .into_iter()
+        .filter_map(|(field, same)| (!same).then_some(field))
+        .collect();
+        bail!(
+            "execution machine does not match the BuildSpec: platform fields differ: {}",
+            fields.join(", ")
+        );
+    }
     if let Some(difference) = crate::run::first_difference(given, &verified.build) {
         bail!("execution machine does not match the BuildSpec: {difference}");
     }

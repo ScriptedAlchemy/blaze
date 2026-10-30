@@ -120,6 +120,22 @@ impl Probe for FakeMachine {
         Some(format!("{} 1.0.0\n", program.display()))
     }
 
+    fn run_in(
+        &self,
+        _cwd: &Path,
+        env: &BTreeMap<String, std::ffi::OsString>,
+        program: &Path,
+        args: &[&str],
+    ) -> Option<String> {
+        let version = self.run(program, args)?;
+        if args == ["--version"]
+            && let Some(selection) = env.get("TOOLCHAINS")
+        {
+            return Some(format!("{} toolchain {}\n", version.trim(), selection.to_str()?));
+        }
+        Some(version)
+    }
+
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
         Some(path.display().to_string().into_bytes())
     }

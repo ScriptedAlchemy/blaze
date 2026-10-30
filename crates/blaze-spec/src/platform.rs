@@ -487,8 +487,14 @@ fn discover(
     };
     let mut native = crate::native::Closure::default();
     if bind_native {
-        let queries =
-            NativeQueries { probe, env, cc: cc.as_ref(), cxx: cxx.as_ref(), linker: &linker };
+        let queries = NativeQueries {
+            probe,
+            env,
+            triple: machine.triple,
+            cc: cc.as_ref(),
+            cxx: cxx.as_ref(),
+            linker: &linker,
+        };
         for (role, compiler, language) in
             [("cc", cc.as_ref(), "c"), ("cxx", cxx.as_ref(), "c++"), ("linker", Some(&linker), "c")]
         {
@@ -537,6 +543,7 @@ fn discover(
 struct NativeQueries<'a> {
     probe: &'a dyn Probe,
     env: &'a BTreeMap<String, std::ffi::OsString>,
+    triple: &'a str,
     cc: Option<&'a Tool>,
     cxx: Option<&'a Tool>,
     linker: &'a Tool,
@@ -701,7 +708,9 @@ fn native_flag_roots(
     }
     if let Some(queries) = queries {
         for (key, value) in queries.env {
-            if key.starts_with("NIX_CFLAGS_") || key.starts_with("NIX_LDFLAGS") {
+            if (key.starts_with("NIX_CFLAGS_") || key.starts_with("NIX_LDFLAGS"))
+                && crate::environment::is_script_var(key, queries.triple)
+            {
                 effective.extend(flag_words(value, false));
             }
         }

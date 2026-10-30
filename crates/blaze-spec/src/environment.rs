@@ -197,6 +197,7 @@ const SCRIPT_EXACT: &[&str] = &[
     "CC_SHELL_ESCAPED_FLAGS",
     "SDKROOT",
     "DEVELOPER_DIR",
+    "TOOLCHAINS",
     "CPATH",
     "C_INCLUDE_PATH",
     "CPLUS_INCLUDE_PATH",
