@@ -118,52 +118,76 @@ jobs:
         env:
           C2_LANES: ${{ matrix.lanes }}
         run: |
-          cp "$BLAZE_BUNDLE" "$RUNNER_TEMP/c2-evidence/bundle.json"
+          cp "$CI_BUNDLE_JSON" "$RUNNER_TEMP/c2-evidence/bundle.json"
           "$GITHUB_WORKSPACE/target/release/ra-jit" --version
           echo "name=${C2_LANES// /-}" >> "$GITHUB_OUTPUT"
+      # ra-jit takes every BLAZE_<NAME> of its environment as its own setting RA_JIT_<NAME>, and
+      # `cargo spec` refuses a setting it does not know: one such variable in the job's environment
+      # refused every spec arm of every lane once (CI-fork.md). The harnesses set their own inside
+      # the processes they start; the job's environment must carry none.
+      - name: No blaze setting in the job's environment
+        run: |
+          if env | grep -E '^(BLAZE|RA_JIT)_'; then
+            echo "::error::the job's environment carries a blaze setting; ra-jit would take it and refuse every spec"
+            exit 1
+          fi
+          echo "no BLAZE_* or RA_JIT_* in the environment"
       - name: C2 lanes (${{ matrix.lanes }})
         if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
         env:
           C2_LANES: ${{ matrix.lanes }}
         run: |
+          # Every lane of the job runs, a failed one is tailed and recorded, and the step fails at
+          # the end: the shell runs with -e, so a lane's status is taken with `|| code=$?`.
           set -uo pipefail
           blaze="$GITHUB_WORKSPACE/target/release/ra-jit"
           server="$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv"
           evidence="$RUNNER_TEMP/c2-evidence"
           failed=""
+          rows="$evidence/lanes.md"
           {
             echo "### C2 lanes (${{ inputs.os }})"
             echo
             echo '| lane | result | seconds |'
             echo '|---|---|---|'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$rows"
           for lane in $C2_LANES; do
             echo "::group::lane $lane"
             started=$(date +%s)
+            code=0
             case "$lane" in
               saved-cranelift|saved-llvm)
                 # Saved execution with compiler subprocesses blocked, under one backend.
                 backend=${lane#saved-}
+                log="$evidence/$backend.log"
                 nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
                   --blaze "$blaze" --work "$RUNNER_TEMP/c2-$backend" --memory-mib 8192 --timeout 1200 \
-                  --owned-server "$server" --backend "$backend" > "$evidence/$backend.log" 2>&1
+                  --owned-server "$server" --backend "$backend" > "$log" 2>&1 || code=$?
                 ;;
               *)
                 # Original C2 generation and local command differential, one fixture group.
+                log="$evidence/local-$lane.log"
                 nix develop .#bench --command python3 -I harness/dist/buildspec.py \
                   --bin "$blaze" --work "$RUNNER_TEMP/c2-local-$lane" --memory-mib 8192 --timeout 1200 --shared-store \
                   --owned-server "$server" --ci-group "$lane" --json "$evidence/local-$lane.json" \
-                  > "$evidence/local-$lane.log" 2>&1
+                  > "$log" 2>&1 || code=$?
                 ;;
             esac
-            code=$?
             seconds=$(( $(date +%s) - started ))
-            if [ "$code" = 0 ]; then result=pass; else result="FAIL ($code)"; failed="$failed $lane"; tail -30 "$evidence"/*"${lane#saved-}"*.log; fi
+            if [ "$code" = 0 ]; then
+              result=pass
+            else
+              result="FAIL ($code)"
+              failed="$failed $lane"
+              echo "--- last 40 lines of $log"
+              tail -40 "$log" || true
+            fi
             echo "lane $lane: $result in ${seconds}s"
-            echo "| $lane | $result | $seconds |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $lane | $result | $seconds |" >> "$rows"
             echo "::endgroup::"
             [ "$code" = 0 ] || echo "::error::C2 lane $lane failed (exit $code); its log is in the evidence artifact"
           done
+          cat "$rows" >> "$GITHUB_STEP_SUMMARY"
           test -z "$failed"
       - name: Keep C2 runtime and tool audit evidence
         if: ${{ always() }}

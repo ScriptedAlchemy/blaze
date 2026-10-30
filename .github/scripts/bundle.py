@@ -311,14 +311,14 @@ def unpack(args):
     (dest / "bundle.json").write_bytes(text)
     if args.github_env:
         with open(args.github_env, "a") as f:
-            f.write(f"BLAZE_BUNDLE={dest / 'bundle.json'}\n")
+            f.write(f"CI_BUNDLE_JSON={dest / 'bundle.json'}\n")
     print(f"bundle {digest[:16]} for {manifest['source']['commit']}: {len(files)} files verified")
 
 
 # test, path ----------------------------------------------------------------------------------
 
 def load_set(name):
-    manifest = json.loads(Path(os.environ["BLAZE_BUNDLE"]).read_text())
+    manifest = json.loads(Path(os.environ["CI_BUNDLE_JSON"]).read_text())
     if name not in manifest["sets"]:
         die(f"no set {name!r} in the bundle (have {sorted(manifest['sets'])})")
     return manifest, manifest["sets"][name]

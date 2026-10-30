@@ -80,7 +80,7 @@ size and mode, and the sets.
 | release ra-jit, cranelift and llvm (`cargo build --locked --release -p ra-jit --bins --features llvm`) | `target/release/{ra-jit,cargo-ra-jit,ra-jit-rustc,ra-jit-rustc-first}` |
 | the owned macro runtime (`owned_macro_server.py --blaze target/release/ra-jit --work $RUNNER_TEMP/owned-runtime`) | `$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv`, `image-pins.json` and the bootstrap's audit records |
 | each set's test executables, the bins and examples they run, dynamic libraries, and the build-script output of local packages | their cargo paths under `target/` |
-| the verified manifest | `$BLAZE_BUNDLE` |
+| the verified manifest | `$CI_BUNDLE_JSON` (never a `BLAZE_*` name: ra-jit takes every `BLAZE_<NAME>` of its environment as its setting `RA_JIT_<NAME>`, and `cargo spec` refuses one it does not know) |
 
 **Sets** (`.github/ci/test-sets.json`, owned entry by entry by the area that runs them): each is
 its own cargo command in the bench shell with `CARGO_PROFILE_DEV_DEBUG=0`,

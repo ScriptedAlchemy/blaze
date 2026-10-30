@@ -60,5 +60,5 @@ def prepare(bundle, base_sha, temp):
 
 
 if __name__ == "__main__":
-    prepare(json.loads(Path(os.environ["BLAZE_BUNDLE"]).read_text()),
+    prepare(json.loads(Path(os.environ["CI_BUNDLE_JSON"]).read_text()),
             os.environ.get("BASE_SHA", ""), Path(os.environ["RUNNER_TEMP"]))

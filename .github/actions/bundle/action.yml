@@ -4,7 +4,9 @@
 # source tree, flake and Cargo.lock it names are the checkout's, its roots are this runner's, and
 # every file unpacked has the digest and size bundle.json gives. Afterwards the release binaries
 # are in target/release, the owned macro runtime in $RUNNER_TEMP/owned-runtime, the sets' files
-# at their cargo paths, and $BLAZE_BUNDLE names the verified bundle.json.
+# at their cargo paths, and $CI_BUNDLE_JSON names the verified bundle.json. (Not BLAZE_*: ra-jit
+# takes every BLAZE_<NAME> of its environment as its own setting RA_JIT_<NAME>, and `cargo spec`
+# refuses a setting it does not know; a consumer's environment must carry none.)
 name: bundle
 description: download, verify and unpack this run's build bundle
 inputs:

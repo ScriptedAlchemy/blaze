@@ -39,7 +39,7 @@ jobs:
           python3 - <<'PYNEGATIVE'
           import json, os, subprocess, sys
           from pathlib import Path
-          manifest = json.loads(Path(os.environ["BLAZE_BUNDLE"]).read_text())
+          manifest = json.loads(Path(os.environ["CI_BUNDLE_JSON"]).read_text())
           executable = Path(manifest["sets"]["serve-server"]["runs"][0]["exe"])
           with executable.open("r+b") as binary:
               original = binary.read(1)
