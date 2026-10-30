@@ -4976,6 +4976,60 @@ fn std_unit(
 /// is linked against.
 static SYSROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
+/// A native library has no Rust start function to bring its allocator shim. Custom
+/// allocators are emitted with their source object; the default is a separate member of
+/// runtime support, so linking two libraries does not define it twice.
+fn library_allocator(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    listed: &Listed,
+) -> anyhow::Result<()> {
+    let mut program = Vec::new();
+    for named in args.crates() {
+        program
+            .extend(crates_named(db, named, args)?.into_iter().map(ide_db::base_db::Crate::from));
+    }
+    let Some(&root) = program.first() else { return Ok(()) };
+    let shim = if hir_ty_codegen::uses_global_allocator(db, &program) {
+        None
+    } else {
+        let contents = content::Contents::default();
+        let mut known = Rejections::default();
+        let resolver = Resolver::of(db, table, args, &known, &contents, listed);
+        let roots = Roots {
+            entries: &[],
+            on_demand: &[],
+            start: None,
+            allocator: Some(root),
+            shared: false,
+            whole: true,
+            kept: &[],
+            offered: &[],
+        };
+        let unit = hir::attach_db(db, || {
+            CodegenUnit::compile(db, &resolver, roots, &Default::default(), &mut known)
+        })?;
+        anyhow::ensure!(unit.skipped.is_empty(), "allocator support has uncompiled functions");
+        for file in unit.apart {
+            std::fs::write(&file.name, file.bytes)
+                .with_context(|| format!("writing {}", file.name))?;
+        }
+        unit.object
+    };
+    if let Some(shim) = shim {
+        let runtime = args.prebuilt.as_deref().map(std::fs::read).transpose()?;
+        let archive = link::split::with_allocator(runtime.as_deref(), shim)?;
+        let path = args.out.with_extension("std.a");
+        replace(&path, &archive)?;
+        let object = args.out.with_extension("std.o");
+        if args.prebuilt.as_deref() == Some(object.as_path()) {
+            std::fs::remove_file(object)?;
+        }
+    }
+    Ok(())
+}
+
 /// Links the executable of a build with nothing of rustc's: `--out` and the standard
 /// library's object, with the native libraries the crates ask for.
 fn link_executable(
@@ -5242,7 +5296,15 @@ fn build(
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some() || in_harness(db, *it)),
-        allocator: args.exe.as_ref().and_then(|_| local.first().copied()).map(Into::into),
+        allocator: (args.exe.is_some()
+            || (args.link_plan.is_some()
+                && !args.library
+                && hir_ty_codegen::uses_global_allocator(
+                    db,
+                    &local.iter().copied().map(Into::into).collect::<Vec<_>>(),
+                )))
+        .then(|| local.first().copied().map(Into::into))
+        .flatten(),
         shared: args.shared,
         whole: local.iter().all(|&krate| resolver.own_crate_id(krate.into()).is_some()),
         kept: &kept,
@@ -9222,6 +9284,9 @@ fn run_holding(
                 }
             }
             if let Some(path) = &args.link_plan {
+                if args.exe.is_none() && !args.shared {
+                    library_allocator(&db, &table, &args, &listed)?;
+                }
                 let mut program = Vec::new();
                 for named in args.crates() {
                     program.extend(crates_named(&db, named, &args)?);

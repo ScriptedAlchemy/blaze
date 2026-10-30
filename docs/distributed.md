@@ -895,9 +895,13 @@ between the executable plan's `before` and `after` arguments. Requirements come
 from the same source `#[link]` attributes, producer directives and target rules as
 an owned executable link; consumers do not maintain a second system-library list.
 Split ELF runtime archives carry an index for ordinary archive extraction, including
-TLS symbol types on cross-member references. The compiler admits the exact native
-arguments against bound source, producer and platform inputs and finishes that
-validation before publishing the record. Process environments remain in memory;
+TLS symbol types on cross-member references. A library's default allocator shim is
+an independently extractable member of that same support archive, so several Rust
+objects can share one default shim and its references back into std resolve through
+ordinary archive extraction. A custom allocator's shims stay with its source object;
+the native consumer does not replace them with a default allocator.
+The compiler admits the exact native arguments against bound source, producer and
+platform inputs and finishes that validation before publishing the record. Process environments remain in memory;
 they are not part of the native link record.
 
 ## 0. Phase 0: blaze builds tracedecay

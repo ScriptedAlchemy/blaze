@@ -629,8 +629,8 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
-    /// The crate whose independently linked executable needs allocator shims, even when
-    /// `#![no_main]` supplies the C entry point instead of Rust's start function.
+    /// The crate whose independently linked output needs allocator shims, even when
+    /// `#![no_main]` supplies the C entry point or this unit contains only those shims.
     pub allocator: Option<Crate>,
     /// The object is linked into a shared library of its own, which has the allocator shim
     /// a program's `start` otherwise brings.
@@ -705,7 +705,7 @@ impl CodegenUnit {
                 false => OwnStatics::new(
                     db,
                     symbols,
-                    all().map(|root| root.krate(db)).collect(),
+                    all().map(|root| root.krate(db)).chain(roots.allocator).collect(),
                     known.theirs.clone(),
                     known.unknown.clone(),
                     !roots.on_demand.is_empty(),
@@ -829,7 +829,7 @@ impl CodegenUnit {
         let mut own_statics = OwnStatics::new(
             db,
             symbols,
-            all().map(|root| root.krate(db)).collect(),
+            all().map(|root| root.krate(db)).chain(roots.allocator).collect(),
             std::mem::take(theirs),
             std::mem::take(unknown),
             !roots.on_demand.is_empty(),
@@ -4416,6 +4416,13 @@ fn declares_global_allocator(db: &dyn HirDatabase, krate: Crate) -> bool {
     })
 }
 
+/// Whether the linked source graph supplies a custom global allocator.
+pub fn uses_global_allocator(db: &dyn HirDatabase, roots: &[Crate]) -> bool {
+    linked_crates(db, roots.iter().copied())
+        .into_iter()
+        .any(|krate| declares_global_allocator(db, krate))
+}
+
 /// The symbol a static of an `extern` block links to.
 fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -5476,7 +5483,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if !program.contains(&boxed.krate(db)) {
             return Ok(());
         }
-        let declared = program.into_iter().any(|it| declares_global_allocator(db, it));
+        let declared = uses_global_allocator(db, &program.into_iter().collect::<Vec<_>>());
         let to = |default, declared_one| if declared { declared_one } else { default };
         let entries = [
             ("__rust_alloc", to("__rdl_alloc", "__ra_jit_global_alloc"), 2, true),

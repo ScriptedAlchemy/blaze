@@ -185,12 +185,35 @@ def no_rpath_control(runner, name, files, env, cwd):
         assert not any(marker in text for marker in ("(RPATH)", "(RUNPATH)", "LC_RPATH")), (file, text)
 
 
-def workspace_libraries(root):
+def workspace_libraries(root, custom_allocator=False):
     write(root, "Cargo.toml", '[workspace]\nmembers=["a","b"]\nresolver="2"\n')
     for name, value in (("a", 41), ("b", 1)):
         package = "saved-doc-" + name
         write(root, name + "/Cargo.toml", '[package]\nname=' + json.dumps(package) + '\nversion="0.1.0"\nedition="2021"\n')
-        write(root, name + "/src/lib.rs", '/// ```\n/// assert_eq!(saved_doc_' + name + '::answer(), ' + str(value) + ');\n/// ```\n#[no_mangle]\npub extern "C" fn saved_' + name + '() -> u32 { answer() }\npub fn answer() -> u32 { ' + str(value) + ' }\n')
+        source = ('/// ```\n/// assert_eq!(saved_doc_' + name + '::answer(), ' + str(value) + ');\n/// ```\n'
+                  '#[no_mangle]\npub extern "C" fn saved_' + name + '(input: u32) -> u32 {\n'
+                  'let mut values = Vec::with_capacity(1);\nvalues.push(input + answer());\nvalues[0]\n}\n'
+                  'pub fn answer() -> u32 { ' + str(value) + ' }\n')
+        if custom_allocator and name == "b":
+            source += '''use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+struct Counting;
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
+#[global_allocator] static ALLOCATOR: Counting = Counting;
+#[no_mangle] pub extern "C" fn saved_alloc_count() -> usize {
+    ALLOCATIONS.load(Ordering::SeqCst)
+}
+'''
+        write(root, name + "/src/lib.rs", source)
     write(root, "Cargo.lock", 'version=4\n[[package]]\nname="saved-doc-a"\nversion="0.1.0"\n[[package]]\nname="saved-doc-b"\nversion="0.1.0"\n')
 
 
@@ -329,14 +352,45 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     _, _, actual = roundtrip("workspace-libraries", project, ["build", "--workspace", *profile], check_stdout=False)
     artifacts = json.loads(actual)["artifacts"]
     assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
-    caller = write(work, "workspace-caller.c", "extern unsigned saved_a(void), saved_b(void);\nint main(void) { return saved_a() + saved_b() == 42 ? 0 : 1; }\n")
-    binary = work / "workspace-caller"
-    support = list(dict.fromkeys(item["runtime"] for item in artifacts if item.get("runtime")))
-    plans = [native_link_arguments(item) for item in artifacts]
-    before = [word for leading, _ in plans for word in leading]
-    after = [word for _, trailing in plans for word in trailing]
-    runner.run("workspace-native-link", [compiler, *before, caller, *[item["artifact"] for item in artifacts], *support, *after, "-o", binary], env, hostile)
-    runner.run("workspace-native-run", [binary], env, hostile)
+
+    def native_consumer(name, selected, source):
+        caller = write(work, name + ".c", source)
+        binary = work / name
+        support = list(dict.fromkeys(item["runtime"] for item in selected if item.get("runtime")))
+        plans = [native_link_arguments(item) for item in selected]
+        before = [word for leading, _ in plans for word in leading]
+        after = [word for _, trailing in plans for word in trailing]
+        runner.run(name + "-link", [compiler, *before, caller, *[item["artifact"] for item in selected], *support, *after, "-o", binary], env, hostile)
+        runner.run(name + "-run", [binary], env, hostile)
+
+    native_consumer("workspace-native", artifacts,
+                    "extern unsigned saved_a(unsigned), saved_b(unsigned);\n"
+                    "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
+                    "return saved_a(input) + saved_b(input) == 42 ? 0 : 1; }\n")
+
+    project = work / "workspace-allocator"
+    workspace_libraries(project, custom_allocator=True)
+    _, _, actual = roundtrip("workspace-allocator", project, ["build", "--workspace", *profile], check_stdout=False)
+    artifacts = json.loads(actual)["artifacts"]
+    assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
+    custom = [item for item in artifacts if item["crate"] == "saved_doc_b"]
+    assert len(custom) == 1, artifacts
+    native_consumer("custom-allocator-native", custom,
+                    "#include <stddef.h>\nextern unsigned saved_b(unsigned);\n"
+                    "extern size_t saved_alloc_count(void);\n"
+                    "int main(int argc, char **argv) { size_t before = saved_alloc_count(); "
+                    "if (saved_b((unsigned)(argc + 40)) != 42) return 1; "
+                    "return saved_alloc_count() > before ? 0 : 2; }\n")
+    source = ("#include <stddef.h>\nextern unsigned saved_a(unsigned), saved_b(unsigned);\n"
+              "extern size_t saved_alloc_count(void);\n"
+              "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
+              "size_t before = saved_alloc_count(); unsigned a = saved_a(input); "
+              "if (saved_alloc_count() <= before) return 1; before = saved_alloc_count(); "
+              "unsigned b = saved_b(input); if (saved_alloc_count() <= before) return 2; "
+              "return a + b == 42 ? 0 : 3; }\n")
+    for name, selected in [("default-first", sorted(artifacts, key=lambda item: item["crate"])),
+                           ("custom-first", sorted(artifacts, key=lambda item: item["crate"], reverse=True))]:
+        native_consumer("mixed-allocator-" + name, selected, source)
 
     project = work / "workspace-doctests"
     workspace_libraries(project)
@@ -640,7 +694,7 @@ def main():
         project = work / "library"
         write(project, "Cargo.toml", '[package]\nname="saved-library"\nversion="0.1.0"\nedition="2021"\n')
         write(project, "Cargo.lock", 'version=4\n[[package]]\nname="saved-library"\nversion="0.1.0"\n')
-        write(project, "src/lib.rs", '#[no_mangle]\npub extern "C" fn saved_answer() -> u32 { 42 }\n')
+        write(project, "src/lib.rs", '#[no_mangle]\npub extern "C" fn saved_answer(input: u32) -> u32 {\nlet mut values = Vec::with_capacity(2);\nvalues.push(input);\nvalues.push(2);\nvalues[0] + values[1]\n}\n')
         if args.linker_library_path:
             write(project, ".cargo/config.toml", "[env]\nLD_LIBRARY_PATH={value="
                   + json.dumps(args.linker_library_path) + ",force=true}\n")
@@ -652,7 +706,7 @@ def main():
                                hostile_env, hostile)
         objects = json.loads(actual)["artifacts"]
         assert len(objects) == 1 and objects[0]["kind"] == "object", objects
-        caller = write(work, "library-caller.c", "extern unsigned saved_answer(void);\nint main(void) { return saved_answer() == 42 ? 0 : 1; }\n")
+        caller = write(work, "library-caller.c", "extern unsigned saved_answer(unsigned);\nint main(int argc, char **argv) { return saved_answer((unsigned)(argc + 39)) == 42 ? 0 : 1; }\n")
         native = work / "library-caller"
         runtime = [objects[0]["runtime"]] if objects[0].get("runtime") else []
         before, after = native_link_arguments(objects[0])

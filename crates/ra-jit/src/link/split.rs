@@ -40,6 +40,42 @@ pub(crate) fn is_archive(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
+/// Adds an independently extractable allocator shim to the output's runtime support.
+/// Keeping it in the same archive lets ordinary linkers resolve both directions between
+/// the shim and std, while several libraries can share the first selected default shim.
+pub(crate) fn with_allocator(runtime: Option<&[u8]>, shim: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let kind = match object::FileKind::parse(&*shim)? {
+        object::FileKind::MachO32 | object::FileKind::MachO64 => ArchiveKind::Darwin,
+        object::FileKind::Coff | object::FileKind::CoffBig => ArchiveKind::Coff,
+        _ => ArchiveKind::Gnu,
+    };
+    let mut members = Vec::new();
+    if let Some(runtime) = runtime {
+        if is_archive(runtime) {
+            let archive = object::read::archive::ArchiveFile::parse(runtime)?;
+            for member in archive.members() {
+                let member = member?;
+                members.push(NewArchiveMember::new(
+                    member.data(runtime)?.to_vec(),
+                    &DEFAULT_OBJECT_READER,
+                    String::from_utf8(member.name().to_vec())?,
+                ));
+            }
+        } else {
+            members.push(NewArchiveMember::new(
+                runtime.to_vec(),
+                &DEFAULT_OBJECT_READER,
+                "std.o".into(),
+            ));
+        }
+    }
+    members.push(NewArchiveMember::new(shim, &DEFAULT_OBJECT_READER, "allocator.o".into()));
+    let mut archive = Cursor::new(Vec::new());
+    write_archive_to_stream(&mut archive, &members, kind, false, None)
+        .context("writing runtime support with its allocator")?;
+    Ok(archive.into_inner())
+}
+
 /// The prefixes of the names of the sections that are each a function's or a static's own.
 const SPREAD: [&str; 6] =
     [".text.", ".rodata.", ".data.rel.ro.", ".data.", ".bss.", ".gcc_except_table"];
@@ -669,6 +705,53 @@ mod tests {
         RelocationFlags, RelocationTarget, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
     };
     use rustc_hash::FxHashMap;
+
+    #[test]
+    fn allocator_is_indexed_apart_from_runtime_members() {
+        let object = |format, name: &str| {
+            let mut object = Object::new(format, Architecture::X86_64, Endianness::Little);
+            let section = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+            object.set_section_data(section, vec![0xc3], 1);
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 1,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            });
+            object.write().unwrap()
+        };
+        for format in [BinaryFormat::Elf, BinaryFormat::MachO, BinaryFormat::Coff] {
+            let runtime = object(format, "runtime_entry");
+            let shim = object(format, "__rust_alloc");
+            let split = (format == BinaryFormat::Elf).then(|| super::split(&runtime, 1).unwrap());
+            for input in
+                [None, Some(runtime.as_slice())].into_iter().chain(split.as_deref().map(Some))
+            {
+                let bytes = super::with_allocator(input, shim.clone()).unwrap();
+                let archive = ArchiveFile::parse(bytes.as_slice()).unwrap();
+                let symbols: FxHashMap<_, _> = archive
+                    .symbols()
+                    .unwrap()
+                    .unwrap()
+                    .map(|symbol| {
+                        let symbol = symbol.unwrap();
+                        (symbol.name().to_vec(), symbol.offset().0)
+                    })
+                    .collect();
+                let allocator = symbols.get(b"__rust_alloc".as_slice()).unwrap();
+                let members: Vec<_> = archive.members().map(|member| member.unwrap()).collect();
+                assert_eq!(members.last().unwrap().name(), b"allocator.o");
+                assert_eq!(members.last().unwrap().data(bytes.as_slice()).unwrap(), shim);
+                if input.is_some() {
+                    assert_ne!(symbols.get(b"runtime_entry".as_slice()).unwrap(), allocator);
+                }
+            }
+        }
+    }
 
     /// Where each relocation of an object lands and what it reaches: the section and offset
     /// of the place, and the section and offset of the target, or the name of a symbol no

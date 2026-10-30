@@ -159,6 +159,70 @@ fn fixture() -> (RootDatabase, Vec<FunctionId>, Crate) {
     (db, roots, krate)
 }
 
+#[test]
+fn allocator_only_unit_uses_its_explicit_source_graph() {
+    use object::{Object as _, ObjectSymbol as _};
+    for custom in [false, true] {
+        let source = format!(
+            "//- minicore: sized\n//- /lib.rs crate:case\n\
+             #![feature(lang_items)]\n\
+             #[lang = \"owned_box\"] pub struct Box<T>(T);\n{}",
+            if custom {
+                "#[export_name = \"__ra_jit_global_alloc\"]\n\
+                 pub extern \"C\" fn __ra_jit_global_alloc() -> usize { 0 }\n"
+            } else {
+                ""
+            },
+        );
+        let (db, _) = RootDatabase::with_single_file(&source);
+        let root = *base_db::all_crates(&db)
+            .iter()
+            .find(|krate| krate.data(&db).origin.is_local())
+            .unwrap();
+        hir::attach_db(&db, || {
+            assert_eq!(uses_global_allocator(&db, &[root]), custom);
+            let symbols = Symbols { db: &db, debug: false };
+            let roots = Roots {
+                entries: &[],
+                on_demand: &[],
+                start: None,
+                allocator: Some(root),
+                shared: false,
+                whole: true,
+                kept: &[],
+                offered: &[],
+            };
+            let unit = CodegenUnit::compile(
+                &db,
+                &symbols,
+                roots,
+                &FxHashSet::default(),
+                &mut Rejections::default(),
+            )
+            .unwrap();
+            assert!(unit.skipped.is_empty());
+            let bytes = unit.object.unwrap();
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let names: Vec<_> = object
+                .symbols()
+                .filter_map(|symbol| Some((symbol.name().ok()?.to_owned(), symbol.is_undefined())))
+                .collect();
+            for name in [
+                "__rust_alloc",
+                "__rust_dealloc",
+                "__rust_realloc",
+                "__rust_alloc_zeroed",
+                "__rust_alloc_error_handler",
+                "__rust_no_alloc_shim_is_unstable_v2",
+            ] {
+                assert!(names.contains(&(name.into(), false)), "{names:?}");
+            }
+            let target = if custom { "__ra_jit_global_alloc" } else { "__rdl_alloc" };
+            assert!(names.contains(&(target.into(), true)), "{names:?}");
+        });
+    }
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
