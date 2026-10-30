@@ -34,8 +34,11 @@ pub struct Closure {
 impl Closure {
     /// The bound identity of an input or absent search candidate, without filesystem reads.
     pub fn entry(&self, path: &Path) -> Option<Entry> {
-        if let Some(entry) = self.entry_at(path) {
-            return Some(entry);
+        let nodes = self.nodes();
+        match self.entry_at(&nodes, path) {
+            Lookup::Bound(entry) => return Some(entry),
+            Lookup::Rejected => return None,
+            Lookup::Unanchored => {}
         }
         let mut aliases = BTreeMap::<&Path, Option<&Path>>::new();
         for root in &self.roots {
@@ -63,98 +66,38 @@ impl Closure {
             if !visited.insert(current.clone()) {
                 return None;
             }
-            if let Some(entry) = self.entry_at(&current) {
-                return Some(entry);
+            match self.entry_at(&nodes, &current) {
+                Lookup::Bound(entry) => return Some(entry),
+                Lookup::Rejected => return None,
+                Lookup::Unanchored => {}
             }
         }
         None
     }
 
-    fn entry_at(&self, path: &Path) -> Option<Entry> {
-        for root in &self.roots {
-            let Ok(relative) = path.strip_prefix(&root.tree.root) else { continue };
-            if relative.components().any(|part| matches!(part, Component::ParentDir)) {
-                continue;
-            }
-            if let Some(entry) = root.tree.entry(relative) {
-                return Some(entry.clone());
-            }
-            let mut ancestor = relative.parent();
-            while let Some(parent) = ancestor {
-                if let Some(entry) = root.tree.entry(parent) {
-                    if matches!(entry.kind, Kind::Directory | Kind::Missing) {
-                        return Some(missing());
+    fn entry_at(&self, nodes: &BTreeMap<PathBuf, Option<Node>>, path: &Path) -> Lookup<Entry> {
+        let mut prefix = PathBuf::new();
+        let mut crossed_parent = false;
+        for component in path.components() {
+            prefix.push(component.as_os_str());
+            crossed_parent |= matches!(component, Component::ParentDir);
+            match observed_node(nodes, &prefix) {
+                Lookup::Bound(node) => {
+                    if crossed_parent && !self.roots.iter().any(|root| root.tree.root == prefix) {
+                        return Lookup::Rejected;
                     }
-                    break;
+                    return walk_captured(
+                        nodes,
+                        node.resolved.clone(),
+                        node.entry.clone(),
+                        path.strip_prefix(&prefix).unwrap(),
+                    );
                 }
-                ancestor = parent.parent();
-            }
-        }
-        let nodes = self.nodes();
-        for root in &self.roots {
-            let Some(initial) = root.tree.entry(Path::new("")) else { continue };
-            let physical = root.tree.physical_root();
-            for (prefix, at_physical) in [(Some(root.tree.root.as_path()), false), (physical, true)]
-            {
-                let Some(prefix) = prefix else { continue };
-                let Ok(relative) = path.strip_prefix(prefix) else { continue };
-                let Some(mut current) = physical.map(Path::to_owned) else {
-                    if initial.kind == Kind::Missing {
-                        return Some(missing());
-                    }
-                    continue;
-                };
-                let mut entry = initial.clone();
-                if at_physical {
-                    entry.links.clear();
-                }
-                let mut complete = true;
-                for component in relative.components() {
-                    if entry.kind == Kind::Missing {
-                        return Some(missing());
-                    }
-                    if entry.kind != Kind::Directory {
-                        complete = false;
-                        break;
-                    }
-                    match component {
-                        Component::CurDir => continue,
-                        Component::ParentDir => {
-                            current.pop();
-                            let Some(Some(node)) = nodes.get(&current) else {
-                                complete = false;
-                                break;
-                            };
-                            current.clone_from(&node.resolved);
-                            entry.clone_from(&node.entry);
-                            entry.links.clear();
-                        }
-                        Component::Normal(name) => {
-                            let candidate = current.join(name);
-                            match nodes.get(&candidate) {
-                                Some(Some(node)) => {
-                                    current.clone_from(&node.resolved);
-                                    entry.clone_from(&node.entry);
-                                }
-                                Some(None) => {
-                                    complete = false;
-                                    break;
-                                }
-                                None => return Some(missing()),
-                            }
-                        }
-                        _ => {
-                            complete = false;
-                            break;
-                        }
-                    }
-                }
-                if complete {
-                    return Some(entry);
-                }
+                Lookup::Rejected => return Lookup::Rejected,
+                Lookup::Unanchored => {}
             }
         }
-        None
+        if crossed_parent { Lookup::Rejected } else { Lookup::Unanchored }
     }
 
     fn nodes(&self) -> BTreeMap<PathBuf, Option<Node>> {
@@ -372,6 +315,72 @@ fn frame(hash: &mut Sha256, bytes: &[u8]) {
 struct Node {
     resolved: PathBuf,
     entry: Entry,
+}
+
+enum Lookup<T> {
+    Unanchored,
+    Bound(T),
+    Rejected,
+}
+
+fn observed_node<'a>(nodes: &'a BTreeMap<PathBuf, Option<Node>>, path: &Path) -> Lookup<&'a Node> {
+    let node = match nodes.get(path) {
+        Some(Some(node)) => node,
+        Some(None) => return Lookup::Rejected,
+        None => return Lookup::Unanchored,
+    };
+    for prefix in node.resolved.ancestors() {
+        match nodes.get(prefix) {
+            Some(None) => return Lookup::Rejected,
+            Some(Some(observed)) => {
+                let kind =
+                    if prefix == node.resolved { &node.entry.kind } else { &Kind::Directory };
+                if observed.resolved != prefix || &observed.entry.kind != kind {
+                    return Lookup::Rejected;
+                }
+            }
+            None => {}
+        }
+    }
+    Lookup::Bound(node)
+}
+
+fn walk_captured(
+    nodes: &BTreeMap<PathBuf, Option<Node>>,
+    mut current: PathBuf,
+    mut entry: Entry,
+    suffix: &Path,
+) -> Lookup<Entry> {
+    for component in suffix.components() {
+        if entry.kind == Kind::Missing {
+            return Lookup::Bound(missing());
+        }
+        if entry.kind != Kind::Directory {
+            return Lookup::Rejected;
+        }
+        let node = match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                current.pop();
+                match observed_node(nodes, &current) {
+                    Lookup::Bound(node) if node.entry.kind == Kind::Directory => node,
+                    _ => return Lookup::Rejected,
+                }
+            }
+            Component::Normal(name) => match observed_node(nodes, &current.join(name)) {
+                Lookup::Bound(node) => node,
+                Lookup::Rejected => return Lookup::Rejected,
+                Lookup::Unanchored => return Lookup::Bound(missing()),
+            },
+            _ => return Lookup::Rejected,
+        };
+        current.clone_from(&node.resolved);
+        entry.clone_from(&node.entry);
+        if matches!(component, Component::ParentDir) {
+            entry.links.clear();
+        }
+    }
+    Lookup::Bound(entry)
 }
 
 fn missing() -> Entry {

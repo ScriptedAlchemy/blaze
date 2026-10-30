@@ -289,3 +289,158 @@ fn observed_root_aliases_and_compiler_style_parent_roots_retain_physical_authori
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn nested_sysroot_aliases_retain_canonical_referent_authority() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let sysroot = base.join("toolchain");
+    let sources = base.join("rust-src");
+    fs::create_dir_all(sysroot.join("lib/rustlib/src")).unwrap();
+    fs::create_dir_all(sources.join("library/.cargo")).unwrap();
+    let config = sources.join("library/.cargo/config.toml");
+    fs::write(&config, b"[build]\n").unwrap();
+    symlink(&sources, sysroot.join("lib/rustlib/src/rust")).unwrap();
+    let closure = captured("toolchain/sysroot", &sysroot);
+    let observed = Tree::capture(&config).unwrap();
+    closure.admit(&config, observed.entry(Path::new("")).unwrap()).unwrap();
+    let absent = Entry { links: Vec::new(), kind: Kind::Missing };
+    closure.admit(&sources.join("library/.cargo/absent.toml"), &absent).unwrap();
+    assert!(closure.entry(&base.join("uncaptured/file")).is_none());
+    assert!(closure.entry(&sources.join("../uncaptured/file")).is_none());
+    assert!(closure.entry(&config.join("child")).is_none());
+    fs::write(&config, b"different").unwrap();
+    let changed = Tree::capture(&config).unwrap();
+    assert!(closure.admit(&config, changed.entry(Path::new("")).unwrap()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_referents_traverse_nested_aliases_and_native_parent_rules() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let sysroot = base.join("toolchain");
+    let sources = base.join("rust-src");
+    let external = base.join("external");
+    fs::create_dir_all(sysroot.join("lib/src")).unwrap();
+    fs::create_dir_all(sources.join("library")).unwrap();
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("native.a"), b"native").unwrap();
+    symlink(&sources, sysroot.join("lib/src/rust")).unwrap();
+    symlink(&external, sources.join("library/nested")).unwrap();
+    let closure = captured("sysroot", &sysroot);
+    let path = sources.join("library/nested/native.a");
+    let observed = Tree::capture(&path).unwrap();
+    closure.admit(&path, observed.entry(Path::new("")).unwrap()).unwrap();
+    let missing = Entry { links: Vec::new(), kind: Kind::Missing };
+    for path in [
+        sources.join("library/nested/missing.a"),
+        sources.join("library/absent/../nested/native.a"),
+    ] {
+        assert_eq!(closure.entry(&path), Some(missing.clone()));
+    }
+    assert!(closure.entry(&sources.join("library/nested/native.a/../missing")).is_none());
+    assert!(closure.entry(&sources.join("library/nested/../uncaptured")).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_conflicts_are_terminal_through_logical_roots_and_ancestor_aliases() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let physical = base.join("physical/source");
+    let logical = base.join("logical/source");
+    fs::create_dir_all(&physical).unwrap();
+    symlink(base.join("physical"), base.join("logical")).unwrap();
+    let file = physical.join("file");
+    fs::write(&file, b"first").unwrap();
+    let first = captured("first", &logical).roots.remove(0);
+    fs::write(&file, b"other").unwrap();
+    let second = captured("second", &physical).roots.remove(0);
+    for roots in [vec![first.clone(), second.clone()], vec![second, first]] {
+        let closure = Closure { roots };
+        assert!(closure.entry(&file).is_none());
+        assert!(closure.entry(&logical.join("file")).is_none());
+    }
+}
+
+#[test]
+fn a_poisoned_ancestor_cannot_be_skipped_for_an_indexed_descendant() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("changing");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("file"), b"first").unwrap();
+    let before = captured("before", &path).roots.remove(0);
+    fs::remove_dir_all(&path).unwrap();
+    fs::write(&path, b"now a file").unwrap();
+    let after = captured("after", &path).roots.remove(0);
+    for roots in [vec![before.clone(), after.clone()], vec![after, before]] {
+        let closure = Closure { roots };
+        assert!(closure.entry(&path).is_none());
+        assert!(closure.entry(&path.join("file")).is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_directory_retargeting_with_equal_file_bytes_invalidates_bindings() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("sysroot");
+    fs::create_dir(&root).unwrap();
+    for name in ["first", "second"] {
+        fs::create_dir(base.join(name)).unwrap();
+        fs::write(base.join(name).join("config.toml"), b"same").unwrap();
+    }
+    let alias = root.join("sources");
+    symlink(base.join("first"), &alias).unwrap();
+    let closure = captured("sysroot", &root);
+    let bindings = closure.encode_bindings();
+    fs::remove_file(&alias).unwrap();
+    symlink(base.join("second"), &alias).unwrap();
+    assert!(closure.validate().is_err());
+    assert!(Closure::from_bindings(&bindings).is_err());
+    let changed = base.join("second/config.toml");
+    let observed = Tree::capture(&changed).unwrap();
+    assert!(closure.admit(&changed, observed.entry(Path::new("")).unwrap()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn logical_aliases_cannot_jump_over_rejected_physical_ancestors() {
+    use std::os::unix::fs::symlink;
+    for case in ["conflicting", "file", "redirected"] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let parent = base.join("physical");
+        fs::create_dir(&parent).unwrap();
+        let file = parent.join("file");
+        fs::write(&file, b"same").unwrap();
+        let alias = base.join("logical-file");
+        symlink(&file, &alias).unwrap();
+        let mut roots = captured("logical", &alias).roots;
+        if case == "conflicting" {
+            roots.extend(captured("before", &parent).roots);
+        }
+        fs::remove_dir_all(&parent).unwrap();
+        if case == "redirected" {
+            let other = base.join("other");
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join("file"), b"same").unwrap();
+            symlink(&other, &parent).unwrap();
+        } else {
+            fs::write(&parent, b"now a file").unwrap();
+        }
+        roots.extend(captured("after", &parent).roots);
+        let closure = Closure { roots };
+        assert!(
+            closure.entry(&alias).is_none(),
+            "{case}: retained entry beyond rejected physical ancestor"
+        );
+    }
+}

@@ -376,14 +376,6 @@ impl Tree {
         self.entries.get(&lexical(relative))
     }
 
-    pub(crate) fn physical_root(&self) -> Option<&Path> {
-        let entry = self.entries.get(Path::new(""))?;
-        if !matches!(entry.kind, Kind::Directory | Kind::File { .. }) {
-            return None;
-        }
-        self.locations.get(Path::new("")).map(|(_, resolved)| resolved.as_path())
-    }
-
     pub(crate) fn observations(&self) -> impl Iterator<Item = (&Path, &Path, &Entry)> {
         self.locations.iter().filter_map(|(logical, (requested, resolved))| {
             Some((requested.as_path(), resolved.as_path(), self.entries.get(logical)?))
