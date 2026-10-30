@@ -1103,6 +1103,109 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn saved_raw_reads_require_referenced_frontend_markers() {
+        use blaze_spec::{
+            native::{Closure, Root},
+            native_tree::Tree,
+        };
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        let file = work.path().join("generated.rs");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(&file, "const VALUE: u8 = 42;").unwrap();
+        let closure = Closure {
+            roots: vec![Root {
+                name: "producer/out/0".into(),
+                tree: Tree::capture(&file).unwrap(),
+            }],
+        };
+        let units: std::collections::BTreeMap<_, _> = [0xff, 0xfe]
+            .into_iter()
+            .enumerate()
+            .map(|(id, byte)| {
+                (
+                    id as u32,
+                    blaze_wire::native::Unit {
+                        env: [
+                            (
+                                "RAW".into(),
+                                OsString::from_vec([b"native-value-".as_slice(), &[byte]].concat()),
+                            ),
+                            (
+                                "UNPROJECTED".into(),
+                                OsString::from_vec(b"native-value-\xff".to_vec()),
+                            ),
+                        ]
+                        .into(),
+                        flags: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut project = serde_json::json!({
+            "blaze_spec_inputs": {"root": source, "store": work.path(), "source": vec![0_u8;32]},
+            "blaze_spec_generated_bindings": closure.encode_bindings(),
+            "blaze_spec_requester_names": [],
+            crate::dep_info::TRACE_KEY_FIELD: vec![7_u8;32],
+            blaze_wire::native::UNIT_FIELD: blaze_wire::native::encode_units(&units),
+            "crates": [
+                {"env": {}, "blaze_invalid_env": ["RAW"], "blaze_native_unit": 0},
+                {"env": {}, "blaze_invalid_env": ["RAW"], "blaze_native_unit": 1},
+            ],
+        });
+        let trace = crate::dep_info::ReplayTrace {
+            files: vec![file.to_str().unwrap().into()],
+            env: vec![
+                (
+                    "RAW".into(),
+                    Some([
+                        219, 147, 173, 155, 170, 214, 121, 78, 123, 253, 55, 204, 97, 28, 214, 8,
+                        17, 48, 54, 203, 16, 74, 122, 109, 161, 114, 210, 32, 32, 74, 1, 79,
+                    ]),
+                ),
+                (
+                    "RAW".into(),
+                    Some([
+                        197, 210, 32, 124, 230, 204, 50, 112, 113, 76, 18, 26, 100, 74, 181, 84,
+                        71, 104, 99, 90, 210, 192, 83, 54, 90, 95, 158, 143, 103, 214, 27, 117,
+                    ]),
+                ),
+            ],
+        };
+        admit_trace(&trace, &project).unwrap();
+        let mut unreferenced = project.clone();
+        unreferenced["crates"].as_array_mut().unwrap().pop();
+        assert!(admit_trace(&trace, &unreferenced).is_err());
+        let mut wrong = project.clone();
+        wrong["crates"][1]["blaze_native_unit"] = serde_json::json!(0);
+        assert!(admit_trace(&trace, &wrong).is_err());
+        wrong["crates"][1]["blaze_native_unit"] = serde_json::json!(99);
+        assert!(admit_trace(&trace, &wrong).is_err());
+        let mut missing = project.clone();
+        missing["crates"][0]["blaze_invalid_env"] = serde_json::json!([]);
+        assert!(admit_trace(&trace, &missing).is_err());
+        let mut forged =
+            crate::dep_info::ReplayTrace { files: trace.files.clone(), env: Vec::new() };
+        forged.env = vec![(
+            "UNPROJECTED".into(),
+            Some([
+                219, 147, 173, 155, 170, 214, 121, 78, 123, 253, 55, 204, 97, 28, 214, 8, 17, 48,
+                54, 203, 16, 74, 122, 109, 161, 114, 210, 32, 32, 74, 1, 79,
+            ]),
+        )];
+        assert!(admit_trace(&forged, &project).is_err());
+        forged.env = vec![("RAW".into(), None)];
+        assert!(admit_trace(&forged, &project).is_err());
+        project["crates"].as_array_mut().unwrap().push(serde_json::json!({"env": {}}));
+        admit_trace(&forged, &project).unwrap();
+        let mut key = project.clone();
+        key[crate::dep_info::TRACE_KEY_FIELD] = serde_json::json!(vec![8_u8; 32]);
+        assert!(admit_trace(&trace, &key).is_err());
+    }
+
+    #[test]
     fn requester_absence_and_keyed_values_share_saved_admission() {
         use blaze_spec::{
             native::{Closure, Root},
