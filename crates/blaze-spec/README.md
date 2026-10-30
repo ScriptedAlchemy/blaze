@@ -11,9 +11,10 @@ Each unit carries its own resolved profile, including package and build override
 blaze's backend, LLVM passes and instruction selection, and MIR optimisation.
 
 The native platform probe resolves C/C++ compilers, archivers and linker drivers and
-hashes their executable bytes. Its `native_root` is currently a **proxy**, not a complete
-SDK or sysroot closure: see `src/platform.rs` for the files covered and the unverified
-Linux cases. Do not claim that two arbitrary native input closures are distinguished.
+hashes their executable bytes. Its `native_root` is a proxy for the SDK or sysroot.
+It does not cover the complete native input closure. `src/platform.rs` lists the
+covered files and unverified Linux cases. Two arbitrary native input closures may
+therefore have the same platform identity.
 
 ## CLI
 
@@ -26,7 +27,7 @@ The first command prints a JSON rendering for people, or cargo-shaped unit graph
 `--out` writes canonical CBOR. JSON is not an execution format or an identity input.
 Schema 3 keys the selected workspace root manifest relative to the materialized
 source root. `cwd` remains workspace-relative. Replay locates that manifest first;
-sibling workspaces cannot alias merely because their package metadata matches.
+matching package metadata cannot make sibling workspaces share an identity.
 Both paths are escaped byte components, preserving legal Unix colon/backslash
 names and non-UTF-8 bytes. Generation/decoding use the same validated type; native
 materialization decodes components rather than joining the escaped text. Git API
@@ -52,10 +53,11 @@ Copy both `FILE` and `FILE.inputs/` to replay after deleting the original checko
 Replay materializes the snapshot, reproduces the request offline, compares the complete
 BuildSpec and verifies the execution platform before invoking the owned compiler.
 Config values preserve literal/workspace-relative tags through this process.
-A Cargo home that is neither inside nor around the workspace is kept in the snapshot under
-`.blaze-cargo-home/`, so the layout root, and with it the spec's paths and digests, is the
-workspace's and not an absolute prefix or the Cargo home's place beside it. Absolute path
-dependencies and absolute symlinks are not portable and are refused at capture.
+If the Cargo home is outside the workspace and is not its ancestor, the snapshot
+stores it under `.blaze-cargo-home/`. The workspace then determines the layout
+root, spec paths and digests, independent of the Cargo home's absolute location.
+Capture refuses absolute path dependencies and absolute symlinks because they
+cannot be relocated.
 
 The connected executor builds binaries/examples from source dependencies and supports
 unit/integration test executables. `test --no-run` builds those executables and skips
@@ -67,10 +69,10 @@ private stdin. Every traced application source read is checked against the snaps
 or its authenticated producer generation before execution.
 This is admission after compilation, not a filesystem sandbox.
 
-**Incomplete:** check/doctest/benchmark units, standalone library artifacts, build scripts,
-proc macros, other output types and incompatible per-unit debug settings still need their
-owned execution paths. Application native linking is refused until the native input closure
-is bound. The platform's SDK/sysroot proxy is not complete native closure. Broader C2
+Owned execution is incomplete for check, doctest and benchmark units, standalone
+library artifacts, build scripts, proc macros, other output types and incompatible
+per-unit debug settings. Application native linking is refused until the native
+input closure is bound. The platform's SDK/sysroot proxy is not complete native closure. Broader C2
 differential acceptance and LLVM/macOS execution remain separate from source replay.
 
 ## Tests

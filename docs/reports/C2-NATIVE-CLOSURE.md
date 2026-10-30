@@ -2,9 +2,9 @@
 
 This lane replaces the platform's point-file proxy with complete native trees and
 an explicit input-admission API. It binds file bytes, directory membership,
-missing candidates, native names, executable state and symlink referents; SDK
-root relocation preserves identity. Per-unit native settings use the separate
-shared wire codec and compiler-instance IDs.
+missing candidates, native names, executable state and symlink referents.
+Relocating the SDK root preserves identity. Per-unit native settings use the
+separate shared wire codec and compiler-instance IDs.
 
 Validation ran on ubuntu-main, Linux x86_64, Rust/Cargo 1.99.0, with independent
 4 CPU / 16 GiB caps and private targets. The pinned Nix bench shell used LLVM

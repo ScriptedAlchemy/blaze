@@ -97,7 +97,7 @@ pub struct Context<'a> {
     pub offline: bool,
     /// Where blaze keeps `.crate` files by their sha256, for the resolution.
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
-    /// What the platform is read through: the real machine, or a fake of one.
+    /// Reads platform facts from the machine or a test double.
     pub probe: &'a dyn Probe,
     /// Installed compiler release facts used by dependency resolution; never executes it.
     pub rust_release: Option<&'a blaze_metadata::RustRelease<'a>>,
@@ -147,7 +147,7 @@ pub fn build_spec_with_inputs(
     Ok((resolved.spec, directories, resolved.inputs))
 }
 
-/// A spec and the native source graph from the very same resolution. An executor must
+/// A spec and native source graph produced by one resolution. An executor must
 /// validate the spec before using the graph's filesystem paths.
 pub struct Resolved {
     /// The canonical, schedulable identity.
@@ -551,7 +551,7 @@ fn assemble_with_inputs(
             toolchain,
             workspace_manifest,
         };
-        // Validate the actual wire budget before producing a schedulable identity.
+        // Validate the encoded message budget before producing a schedulable identity.
         blaze_wire::validate_as::<BuildSpec>(
             &blaze_wire::encode(&build),
             &blaze_wire::Limits::DOCUMENTED,

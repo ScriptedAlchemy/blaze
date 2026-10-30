@@ -3175,7 +3175,7 @@ def run_fixture_checks(t):
 
 
 def self_test_source_trees(t, tmp):
-    """Check the materialized reproducers, without starting a fake or a real compiler."""
+    """Check the materialized reproducers without starting a compiler or test double."""
     print("source identity fixtures:")
     ctx = Ctx.__new__(Ctx)  # These filesystem methods need no executor or watchdog.
     ctx.work, ctx.trees = os.path.join(tmp, "source-trees"), {}

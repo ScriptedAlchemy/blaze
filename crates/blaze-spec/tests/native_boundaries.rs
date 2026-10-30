@@ -22,7 +22,7 @@ fn long_escaped_workspace_cwd_and_config_decode_under_default_budget() {
     let root = f.root();
     let long: PathBuf = std::iter::repeat_n("Üñïcödé dir", 170).collect();
     // macOS PATH_MAX is smaller than Linux's. A long logical env path need not
-    // exist; Linux additionally exercises the real long workspace filesystem.
+    // exist; Linux also tests a workspace with a long filesystem path.
     let ws = if cfg!(target_os = "linux") { root.join(&long) } else { root.join("short") };
     std::fs::create_dir_all(ws.join("src")).unwrap();
     std::fs::write(

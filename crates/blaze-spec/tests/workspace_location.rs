@@ -1,4 +1,4 @@
-//! Real workspace resolution and saved-spec validation within a declared source tree.
+//! Resolve workspaces and validate saved specs within a declared source tree.
 mod common;
 
 use blaze_spec::{

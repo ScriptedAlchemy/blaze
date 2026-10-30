@@ -52,7 +52,7 @@ fn check_or_build_mode(mode: CMode, target: &Target) -> CMode {
     match mode {
         CMode::Check { .. } => {
             if target.for_host {
-                // A proc macro is compiled for real: it is run.
+                // Proc macros require compilation because they execute during the build.
                 CMode::Build
             } else {
                 // A regular dependency is not checked with `--test`.

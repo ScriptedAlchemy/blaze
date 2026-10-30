@@ -1,4 +1,4 @@
-//! Real request/configuration/source reproduction, independent of the compiler binary.
+//! Reproduce requests, configuration and source inputs without a compiler binary.
 mod common;
 
 use std::{

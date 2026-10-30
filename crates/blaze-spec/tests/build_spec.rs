@@ -1,4 +1,4 @@
-//! The real manifest/resolver/spec boundary, not the synthetic assemble helper.
+//! BuildSpec generation through manifest loading and dependency resolution.
 
 mod common;
 

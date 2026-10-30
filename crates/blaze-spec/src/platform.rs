@@ -245,7 +245,7 @@ impl Probe for InDirectory<'_> {
     }
 }
 
-/// The real probe: it runs this machine's programs and reads its files.
+/// Probes this machine by running its programs and reading its files.
 pub struct System;
 
 impl Probe for System {

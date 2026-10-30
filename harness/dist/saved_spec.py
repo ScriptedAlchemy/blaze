@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise saved BuildSpec execution with the real owned compiler.
+"""Exercise saved BuildSpec execution with the owned compiler.
 
 The reference Cargo invocation belongs to this harness. Product compiler, Cargo,
 rustdoc and rustup paths are fail/count stand-ins. A source-only fixture is saved,

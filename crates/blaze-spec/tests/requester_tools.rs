@@ -40,7 +40,7 @@ fn native_host() -> Host {
     }
 }
 
-/// The real machine, remembering every program it was asked to run.
+/// Probes the machine and records each requested program invocation.
 #[derive(Default)]
 struct Recording {
     runs: Mutex<Vec<PathBuf>>,
