@@ -147,6 +147,9 @@ impl Prepared {
         let manifest = self.root.join(self.resolved.spec.build.workspace_manifest.to_native()?);
         let workspace = manifest.parent().context("workspace manifest has no parent")?;
         let mut env = BTreeMap::new();
+        if let Some(path) = self.environment.get("PATH") {
+            env.insert("PATH".to_owned(), path.clone());
+        }
         for (name, value) in self.resolved.spec.build.script_env.iter() {
             env.insert(name.clone(), value.materialize(workspace)?);
         }

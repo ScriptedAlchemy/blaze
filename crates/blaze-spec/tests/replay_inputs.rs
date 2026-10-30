@@ -49,6 +49,61 @@ fn prepared(made: &Spec, store: &Path, at: &Path) -> blaze_spec::replay::Prepare
 }
 
 #[test]
+fn replay_execution_keeps_rooted_worker_path_only() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    drop(f);
+    let worker = tempfile::tempdir().unwrap();
+    let path = std::env::join_paths([Path::new("worker-bin"), Path::new("/usr/bin")]).unwrap();
+    let executor =
+        [("PATH".to_owned(), path), ("WORKER_ONLY".to_owned(), OsString::from("excluded"))]
+            .into_iter()
+            .collect();
+    let replay = prepare(
+        &made.build,
+        store.path(),
+        &worker.path().join("source"),
+        &host(false),
+        StoreIdentity([9; 32]),
+        &FakeMachine,
+        Some(&common::rust_release),
+        &executor,
+    )
+    .unwrap();
+    let expected = std::env::join_paths([
+        std::env::current_dir().unwrap().join("worker-bin"),
+        PathBuf::from("/usr/bin"),
+    ])
+    .unwrap();
+    assert_eq!(replay.environment["PATH"], expected);
+    let effective = replay.execution_environment().unwrap();
+    assert_eq!(effective["PATH"], expected);
+    assert!(!effective.contains_key("WORKER_ONLY"));
+    replay.native_closure(&FakeMachine).unwrap();
+}
+
+#[test]
+fn recorded_relative_config_path_overrides_worker_path_after_relocation() {
+    let f = fixture();
+    f.write(".cargo/config.toml", "[env]\nPATH={value='tools',relative=true,force=true}\n");
+    f.write("tools/marker", "captured");
+    let origin = f.root();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Build, &[], store.path());
+    drop(f);
+    assert!(!origin.exists());
+    let worker = tempfile::tempdir().unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("relocated"));
+    assert_eq!(replay.environment["PATH"], "/usr/bin");
+    assert_eq!(
+        replay.execution_environment().unwrap()["PATH"],
+        replay.cwd.join("tools").as_os_str()
+    );
+    replay.native_closure(&FakeMachine).unwrap();
+}
+
+#[test]
 fn foreign_nix_target_flags_do_not_change_the_captured_native_platform() {
     let f = fixture();
     let root = f.root();
