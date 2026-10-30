@@ -603,6 +603,9 @@ struct Runner<'a> {
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
     images: FxHashMap<Package, PathBuf>,
+    /// When the newest run of a script that an image's crates were compiled with wrote its
+    /// output, by the image's library ([`Runner::newest_run`]).
+    image_runs: FxHashMap<PathBuf, SystemTime>,
     /// The leases on the images of a request that names no build: it is retired by nothing, so
     /// the load that asked keeps them, through [`Own::images`], until its proc-macro client
     /// has loaded them and while it serves them.
@@ -688,6 +691,7 @@ impl<'a> Runner<'a> {
             judged: Vec::new(),
             making: Vec::new(),
             images: FxHashMap::default(),
+            image_runs: FxHashMap::default(),
             image_leases: Vec::new(),
             making_images: Vec::new(),
         })
@@ -1139,6 +1143,7 @@ impl<'a> Runner<'a> {
             deps.push((name.replace('-', "_"), self.add(dep, &mut crates, &mut at)?));
         }
         crates[0].deps = deps;
+        let newest_run = self.newest_run(&crates);
         let key = json!([data.id.repr, format!("{host:?}"), self.host_flags, self.rustc]);
         let hash = fresh::hash_bytes(key.to_string().as_bytes());
         let dir = self
@@ -1163,7 +1168,7 @@ impl<'a> Runner<'a> {
         let inputs = dir.join("build-script-build.inputs");
         let record = dir.join("blaze-compile.json");
         if let Some(made) = self.compiled(&exe, &inputs, &record, fingerprint) {
-            return Ok((exe, (fingerprint, made)));
+            return Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))));
         }
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
@@ -1191,7 +1196,31 @@ impl<'a> Runner<'a> {
             .map_err(|it| format!("{}: {it}", record.display()))?;
         let made =
             std::fs::metadata(&exe).and_then(|it| it.modified()).map_err(|it| it.to_string())?;
-        Ok((exe, (fingerprint, made)))
+        Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))))
+    }
+
+    /// When the newest run of a script that one of `crates` is compiled with wrote its output,
+    /// directly or in a producer image they use. Cargo compiles a library again after its
+    /// script ran (`check_filesystem`: a dependency newer than the unit's output), then
+    /// everything compiled with it, so a build script whose build-dependency's script ran again
+    /// is linked again and runs again, whether or not what it was linked from changed (a
+    /// build-dependency with `links` reruns its parent's script so, `edges.py`'s
+    /// `build-dep-counter`). blaze links it again only when what it is compiled from changed;
+    /// the time it gives the script's run to depend on is the newest of the two, which has the
+    /// run judged as cargo judges it.
+    fn newest_run(&self, crates: &[crate::cargo::own_script::Planned]) -> Option<SystemTime> {
+        let ran = |out_dir: &PathBuf| {
+            let done = self.done.values().filter_map(|it| it.as_ref().ok());
+            done.filter(|it| it.out_dir == *out_dir).find_map(|it| it.made)
+        };
+        let image = |library: &PathBuf| self.image_runs.get(library).copied();
+        crates
+            .iter()
+            .flat_map(|it| {
+                [it.out_dir.as_ref().and_then(ran), it.proc_macro.as_ref().and_then(image)]
+            })
+            .flatten()
+            .max()
     }
 
     /// When the script at `exe` was made, when it stands: compiled from `fingerprint`, with
@@ -1262,6 +1291,7 @@ impl<'a> Runner<'a> {
         let result = (|| {
             let mut crates = Vec::new();
             self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+            let newest_run = self.newest_run(&crates);
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
             let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
@@ -1276,10 +1306,14 @@ impl<'a> Runner<'a> {
                     env: &env,
                 },
             )
+            .map(|image| (image, newest_run))
             .map_err(|it| format!("{it:#}"))
         })();
         self.making_images.pop();
-        let image = result?;
+        let (image, newest_run) = result?;
+        if let Some(newest_run) = newest_run {
+            self.image_runs.insert(image.library.clone(), newest_run);
+        }
         // The image is loaded after this pass, by the build that asked for it, or by the load
         // of a request that names no build: there is no build to retire then, and the load
         // holds the lease until its proc-macro client has loaded the image, and while it

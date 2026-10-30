@@ -382,6 +382,20 @@ impl Fixture {
         gen_: &str,
         extra: &[(&str, &str)],
     ) -> Result<Arc<Done>, Attempt> {
+        let script = self.root.join("script.sh");
+        let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
+        self.request_compiled(leases, build, gen_, extra, made)
+    }
+
+    /// `request`, with the script dated `made`, as `Runner::compile` dates it.
+    fn request_compiled(
+        &self,
+        leases: &Leases,
+        build: u64,
+        gen_: &str,
+        extra: &[(&str, &str)],
+        made: SystemTime,
+    ) -> Result<Arc<Done>, Attempt> {
         let mut env = BTreeMap::from([
             (
                 "CARGO_HOME".to_owned(),
@@ -409,7 +423,6 @@ impl Fixture {
         let unit_for = UnitFor::new_normal();
         let profile = runner.profile(self.package, unit_for, &runner.kind(false));
         let script = self.root.join("script.sh");
-        let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
         let said = (|| {
             // As `Runner::make` starts: what the build judged already, else the admission.
             if let Some(judged) = runner.begin(self.package, false, &profile)? {
@@ -889,4 +902,102 @@ fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
         assert!(cfg.iter().any(|it| it == fact));
     }
     assert!(!cfg.iter().any(|it| it == "panic=\"abort\""));
+}
+
+/// A crate of a script's compile, as `Runner::compile` describes it, compiled with what the
+/// script whose output is in `out_dir` said, or with the producer image `proc_macro`.
+#[cfg(unix)]
+fn planned(
+    name: &str,
+    out_dir: Option<PathBuf>,
+    proc_macro: Option<PathBuf>,
+) -> crate::cargo::own_script::Planned {
+    crate::cargo::own_script::Planned {
+        out_dir,
+        workspace_member: true,
+        name: name.to_owned(),
+        root: PathBuf::from(format!("{name}.rs")),
+        edition: "2024".to_owned(),
+        cfg: Vec::new(),
+        codegen_flags: Vec::new(),
+        env: BTreeMap::new(),
+        deps: Vec::new(),
+        proc_macro,
+    }
+}
+
+/// `edges.py`'s `build-dep-counter`: cargo compiles a build-dependency's library again after its
+/// script ran, and links the script compiled with it again, which then runs again. The script is
+/// dated by the newest run of a script one of its crates (or an image they use) was compiled
+/// with, and its run is judged as cargo judges it: again after that dependency's run, and not
+/// again when the dependency did not run since.
+#[cfg(unix)]
+#[test]
+fn a_script_runs_again_after_the_script_of_a_library_it_is_compiled_with_ran_again() {
+    let base = dir("build-dep-rerun");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let asked = Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: None,
+        host_cargo: None,
+    };
+    let mut runner =
+        Runner::new(&leases, &pkg.cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+    let compiled =
+        std::fs::metadata(pkg.root.join("script.sh")).and_then(|it| it.modified()).unwrap();
+    // Cold, then a build with nothing changed: one run.
+    pkg.request(&leases, 1, "a", &[]).unwrap();
+    leases.retire(1);
+    pkg.request(&leases, 2, "a", &[]).unwrap();
+    leases.retire(2);
+    assert_eq!(pkg.runs(), ["a"]);
+    // A crate the script is compiled with, whose script has run since (`native`), and one whose
+    // script has not run in this build (nothing is known of it, so it dates nothing).
+    let dep_out = base.join("native-run").join("out");
+    let ran = SystemTime::now();
+    runner.done.insert(
+        (pkg.package, true),
+        Ok(Arc::new(Done {
+            out_dir: dep_out.clone(),
+            output: blaze_build_script::Output::default(),
+            fingerprint: 0,
+            generation: 0,
+            ran: true,
+            made: Some(ran),
+            links: Some("probe".to_owned()),
+        })),
+    );
+    let crates = [
+        planned("build_script_build", None, None),
+        planned("native", Some(dep_out), None),
+        planned("other", Some(base.join("other-run").join("out")), None),
+    ];
+    assert_eq!(runner.newest_run(&crates), Some(ran));
+    assert_eq!(runner.newest_run(&crates[..1]), None, "a script compiled with no script's output");
+    // A producer image whose crates were compiled with a later run dates the script by that run.
+    let image = base.join("producers").join("libmacro.dylib");
+    let later = ran + Duration::from_secs(1);
+    runner.image_runs.insert(image.clone(), later);
+    let with_image =
+        [planned("build_script_build", None, None), planned("macros", None, Some(image))];
+    assert_eq!(runner.newest_run(&with_image), Some(later));
+    // The script's run depends on the newer of the two: it runs again, once.
+    let made = compiled.max(runner.newest_run(&crates).unwrap());
+    // A file time can lag the clock a run reads by a tick of the kernel's coarse clock.
+    std::thread::sleep(Duration::from_millis(50));
+    pkg.request_compiled(&leases, 3, "a", &[], made).unwrap();
+    leases.retire(3);
+    assert_eq!(pkg.runs(), ["a", "a"], "the dependency's run reruns the script, as under cargo");
+    pkg.request_compiled(&leases, 4, "a", &[], made).unwrap();
+    leases.retire(4);
+    assert_eq!(pkg.runs(), ["a", "a"], "and only once: the dependency did not run again");
+    let _ = std::fs::remove_dir_all(&base);
 }
