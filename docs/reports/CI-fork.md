@@ -60,3 +60,10 @@ Commit `e49779de` reverted it. #29 and its branch were retired for this shared d
 The Nix checker now also rejects Actions store/target/compiler caches in consumers; only
 the bundle producer spends the fork's shared 10 GB. The optional external FlakeHub service
 remains separate from that budget. Its opt-in and every existing Nix gate remain checked.
+
+The redesigned server consumer also runs a negative control on the actual downloaded
+bundle: it flips one byte in a server test executable, requires `bundle.py test` to
+reject its digest before execution, restores the byte in `finally`, then runs the
+unchanged test selections. The benchmark consumer runs nine provenance rejection tests
+before preparing its pair. These are normal CI tests of rejection, so they do not need
+a broken shared-branch push that would cancel the other lanes' measurements.
