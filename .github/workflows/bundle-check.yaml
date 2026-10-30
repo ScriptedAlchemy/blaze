@@ -33,7 +33,7 @@ jobs:
   check:
     name: bundle (${{ inputs.platform }})
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       # The Nix store paths the binaries link against; the cache is the build job's, read only.
@@ -59,5 +59,7 @@ jobs:
           ' "$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv" "$GITHUB_WORKSPACE/target/release/ra-jit"
       - name: Verify execution tracing and audit integrity
         run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
+      # PR18's macOS lanes took 34 to 45 minutes over this step with the compile in it; the
+      # timeout above has room for the tests alone at that.
       - name: Native platform and immutable input contracts
         run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test c2-contracts -- --test-threads=2
