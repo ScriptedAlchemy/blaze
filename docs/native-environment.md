@@ -61,3 +61,18 @@ description lists names and an empty environment, not captured caller values.
 The strict macro witness plants its token in the product environment only and
 scans the target, producer directories, store and live daemon home on each row,
 then again before and after stopping the daemon, before deleting the home.
+
+A proc macro reads its server's environment, as it reads rustc's, which under
+Cargo is the asking process's. Each load a request makes has the proc-macro
+servers of its next generation start with that request's complete snapshot over
+the daemon's environment: a variable the request has otherwise is its native
+value, and one the daemon has that the request lacks is removed. The daemon's
+own (`RA_JIT_*`, `CARGO_TARGET_DIR` and the wrappers) stay the daemon's. A load
+whose variables differ from those the serving generation started with retires
+that generation, so a server started for an earlier request never expands for a
+later one (`proc-macro-api`'s
+`a_generation_starts_with_the_environment_of_its_load`, `inputs.rs`'s
+`macro_servers_start_with_the_complete_snapshot_of_the_request`). The strict
+macro witness's `private-removed` and `private-raw` rows hold this against
+Cargo: a daemon started with `PR15_PRIVATE` set, a request without it and then
+one with a value that is not Unicode, each with the macro edited.
