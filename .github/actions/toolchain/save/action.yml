@@ -1,0 +1,46 @@
+# Writes the sccache directory the toolchain action restored, once a job's builds are done, and
+# deletes the entries it supersedes on the same ref, so that a ref keeps one entry per prefix
+# rather than one per push (the fork's 10 GB cache, docs/reports/CI-fork.md). The job needs
+# `actions: write` for the deletion; without it the entry is still saved.
+name: toolchain-save
+description: save sccache's directory and drop this ref's older entries
+inputs:
+  key:
+    description: the toolchain action's sccache-key output
+    required: true
+  scope:
+    description: the toolchain action's sccache-scope output
+    required: true
+  hit:
+    description: the toolchain action's sccache-hit output
+    required: true
+  token:
+    description: a token with actions write
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - if: inputs.hit != 'true'
+      shell: bash
+      run: |
+        "$SCCACHE_PATH" --show-stats
+        "$SCCACHE_PATH" --stop-server > /dev/null || true
+        du -sh ~/.cache/toolchain-sccache || true
+    - if: inputs.hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/toolchain-sccache
+        key: ${{ inputs.key }}
+    - if: inputs.hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        KEY: ${{ inputs.key }}
+        SCOPE: ${{ inputs.scope }}
+        REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+      run: |
+        gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100&ref=$REF&key=$SCOPE" \
+          --jq ".actions_caches[] | select(.key != \"$KEY\") | .id" |
+          while read -r id; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "deleted superseded cache $id" || echo "could not delete cache $id"
+          done

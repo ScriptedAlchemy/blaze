@@ -1,0 +1,32 @@
+# The build bundle of this run, for a check that consumes it (docs/reports/CI-fork.md): the
+# artifact `bundle-<platform>` the build job uploaded, verified before anything in it is used.
+# It fails unless bundle.json has the digest the build job reported through its job outputs, the
+# source tree, flake and Cargo.lock it names are the checkout's, its roots are this runner's, and
+# every file unpacked has the digest and size bundle.json gives. Afterwards the release binaries
+# are in target/release, the owned macro runtime in $RUNNER_TEMP/owned-runtime, the sets' files
+# at their cargo paths, and $BLAZE_BUNDLE names the verified bundle.json.
+name: bundle
+description: download, verify and unpack this run's build bundle
+inputs:
+  platform:
+    description: linux-x64 or macos-arm64
+    required: true
+  sha256:
+    description: the sha256 of bundle.json, the build job's output
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        [ -n "${{ inputs.sha256 }}" ] || { echo "::error::no bundle digest for ${{ inputs.platform }}: did its build job run?"; exit 1; }
+        command -v zstd > /dev/null || brew install zstd
+    - uses: actions/download-artifact@v8
+      with:
+        name: bundle-${{ inputs.platform }}
+        path: ${{ runner.temp }}/bundle-download
+    - shell: bash
+      run: |
+        python3 -I .github/scripts/bundle.py unpack --platform "${{ inputs.platform }}" \
+          --sha256 "${{ inputs.sha256 }}" --dir "$RUNNER_TEMP/bundle-download"
+        rm -rf "$RUNNER_TEMP/bundle-download"
