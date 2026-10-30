@@ -239,6 +239,19 @@ def raw_compiler_case(runner, blaze, real, work, env, oracle_env):
     assert not prefix.exists(), "native projection created a filesystem mirror"
 
 
+
+def native_link_arguments(artifact):
+    plan = artifact["native_link"]
+    assert plan["version"] == 1 and plan["mode"] == "executable" and plan["target"], plan
+    if plan["encoding"] == "unix-bytes":
+        assert os.name == "posix", plan["encoding"]
+        decode = lambda word: os.fsdecode(bytes(word))
+    else:
+        assert os.name == "nt" and plan["encoding"] == "windows-utf16le", plan["encoding"]
+        decode = lambda word: bytes(word).decode("utf-16-le", "surrogatepass")
+    return [decode(word) for word in plan["before"]], [decode(word) for word in plan["after"]]
+
+
 def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile):
     def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True):
         expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *command, "--locked", "--offline"], reference_env, project, guarded=False)
@@ -319,7 +332,10 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     caller = write(work, "workspace-caller.c", "extern unsigned saved_a(void), saved_b(void);\nint main(void) { return saved_a() + saved_b() == 42 ? 0 : 1; }\n")
     binary = work / "workspace-caller"
     support = list(dict.fromkeys(item["runtime"] for item in artifacts if item.get("runtime")))
-    runner.run("workspace-native-link", [compiler, caller, *[item["artifact"] for item in artifacts], *support, "-o", binary], env, hostile)
+    plans = [native_link_arguments(item) for item in artifacts]
+    before = [word for leading, _ in plans for word in leading]
+    after = [word for _, trailing in plans for word in trailing]
+    runner.run("workspace-native-link", [compiler, *before, caller, *[item["artifact"] for item in artifacts], *support, *after, "-o", binary], env, hostile)
     runner.run("workspace-native-run", [binary], env, hostile)
 
     project = work / "workspace-doctests"
@@ -639,7 +655,8 @@ def main():
         caller = write(work, "library-caller.c", "extern unsigned saved_answer(void);\nint main(void) { return saved_answer() == 42 ? 0 : 1; }\n")
         native = work / "library-caller"
         runtime = [objects[0]["runtime"]] if objects[0].get("runtime") else []
-        runner.run("library-native-link", ["cc", caller, objects[0]["artifact"], *runtime, "-o", native],
+        before, after = native_link_arguments(objects[0])
+        runner.run("library-native-link", ["cc", *before, caller, objects[0]["artifact"], *runtime, *after, "-o", native],
                    env, hostile)
         runner.run("library-native-run", [native], env, hostile)
 

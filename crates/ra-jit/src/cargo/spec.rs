@@ -462,15 +462,22 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     prepared.validate_sources(&store)?;
     producers.bindings.validate()?;
     let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
-    let result = serde_json::json!({
-        "spec": hex(&blaze_wire::digest_of(&given)),
-        "artifacts": programs.iter().map(|program| serde_json::json!({
+    let artifacts = programs.iter().map(|program| -> anyhow::Result<serde_json::Value> {
+        let native_link = if program.output == blaze_spec::execution::Output::Object {
+            let path = program.executable.parent().context("artifact has no directory")?.join("link.cbor");
+            let plan = blaze_wire::native::LinkPlan::decode(&std::fs::read(&path)
+                .context("owned compiler did not report native link requirements")?)?;
+            Some(plan.render())
+        } else { None };
+        Ok(serde_json::json!({
             "unit": program.unit, "crate": program.crate_name,
             "executable": (program.output == blaze_spec::execution::Output::Executable).then_some(&program.executable),
             "artifact": program.executable,
             "runtime": (program.output == blaze_spec::execution::Output::Object)
-                .then(|| program.executable.with_extension("std.a"))
-                .filter(|path| path.is_file()),
+                .then(|| ["std.a", "std.o"].into_iter()
+                    .map(|extension| program.executable.with_extension(extension))
+                    .find(|path| path.is_file())).flatten(),
+            "native_link": native_link,
             "target": given.units[program.unit as usize].target.1,
             "target_kind": given.units[program.unit as usize].target.0,
             "test": native[program.unit as usize].test,
@@ -480,7 +487,11 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
                 blaze_spec::execution::Output::Check => "check",
                 blaze_spec::execution::Output::Doctest => "doctest",
             },
-        })).collect::<Vec<_>>(),
+        }))
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let result = serde_json::json!({
+        "spec": hex(&blaze_wire::digest_of(&given)),
+        "artifacts": artifacts,
     });
     std::fs::write(job.path().join("result.json"), serde_json::to_vec_pretty(&result)?)?;
     // The source copy and paths embedded for CARGO_BIN_EXE_* stay at the same names.
@@ -841,6 +852,8 @@ fn compile_at(
             });
             if output == blaze_spec::execution::Output::Executable {
                 command.arg("--exe").arg(&program.executable);
+            } else {
+                command.arg("--link-plan").arg(dir.join("link.cbor"));
             }
             command.arg("--inputs").arg(dir.join("inputs.cbor"));
             command.arg("--diagnostics").arg(dir.join("diagnostics"));

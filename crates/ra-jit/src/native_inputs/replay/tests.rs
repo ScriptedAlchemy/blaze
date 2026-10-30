@@ -25,6 +25,146 @@ fn words(args: &[&str]) -> Vec<OsString> {
 }
 
 #[test]
+#[cfg(unix)]
+fn exported_plan_requires_admission_and_keeps_source_and_producer_inputs() {
+    use blaze_wire::native::{LinkMode, LinkPlan};
+    use ide_db::{RootDatabase, base_db::salsa::Setter as _};
+    use std::{os::unix::ffi::OsStringExt as _, process::Command};
+    use test_fixture::WithFixture as _;
+
+    const CHILD: &str = "BLAZE_TEST_NATIVE_LINK_PLAN";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_inputs::replay::tests::exported_plan_requires_admission_and_keeps_source_and_producer_inputs",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+
+    let _native = crate::process::enter_native(crate::process::Native::default());
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    write(&out, "libgenerated.a", b"!<arch>\n");
+    let raw_dir = out.join(if cfg!(target_os = "linux") {
+        OsString::from_vec(b"native-\xff space".to_vec())
+    } else {
+        OsString::from("native-λ space")
+    });
+    write(&raw_dir, "libproduced.a", b"!<arch>\n");
+    let object = write(&raw_dir, "producer.o", b"\x7fELFproducer");
+    let unbound = write(dir.path(), "outside.exports", b"_generated\n");
+    let (mut db, _) = RootDatabase::with_single_file(&format!(
+        r#"
+//- /main.rs crate:app cfg:target_vendor=apple,target_arch=aarch64 env:OUT_DIR={}
+#[link(name = "generated", kind = "static")]
+unsafe extern "C" {{ fn generated(); }}
+fn main() {{}}
+"#,
+        out.display()
+    ));
+    ide_db::base_db::set_process_env(&mut db, Default::default());
+    let krate = db.test_crate();
+    let program = [hir::Crate::from(krate)];
+    let target = "aarch64-apple-darwin";
+    let path = dir.path().join("link-plan.cbor");
+    let closure = bindings(&[("producer/out", &out)]);
+    set_replay_bindings(Some(&closure.encode_bindings())).unwrap();
+    let search = format!("cargo:rustc-link-search=native={}\n", out.display());
+    fs::write(
+        dir.path().join("output"),
+        format!("{search}cargo:rustc-link-arg=-Wl,-exported_symbols_list,{}\n", unbound.display()),
+    )
+    .unwrap();
+    let error = crate::link::write_plan(&db, &program, None, target, true, &path).unwrap_err();
+    assert_eq!(error.to_string(), format!("unbound native input {}", unbound.display()));
+    assert!(!path.exists(), "rejected native inputs must not publish a link plan");
+
+    fs::write(dir.path().join("output"), search).unwrap();
+    crate::link::write_plan(&db, &program, None, target, true, &path).unwrap();
+    let source = LinkPlan::decode(&fs::read(&path).unwrap()).unwrap();
+    let mut search_arg = OsString::from("-L");
+    search_arg.push(&out);
+    assert_eq!(source.target, target);
+    assert_eq!(source.mode, LinkMode::Shared);
+    assert_eq!(source.before, words(&["-arch", "arm64"]));
+    assert_eq!(
+        source.after,
+        [
+            vec![search_arg.clone()],
+            words(&["-lgenerated", "-dynamiclib", "-Wl,-dead_strip", "-nodefaultlibs"])
+        ]
+        .concat()
+    );
+    fs::remove_file(&path).unwrap();
+
+    let secret = "native-plan-private-environment-value";
+    let native_secret = OsString::from_vec(b"private-environment-\xfe".to_vec());
+    let mut link_arg = OsString::from("link-arg=");
+    link_arg.push(&object);
+    crate::native_inputs::set_native_units(
+        [(
+            0,
+            crate::native_inputs::NativeUnit {
+                env: [
+                    ("PRIVATE_TOKEN".into(), secret.into()),
+                    ("PRIVATE_NATIVE".into(), native_secret.clone()),
+                ]
+                .into(),
+                flags: vec![
+                    "-L".into(),
+                    out.as_os_str().to_owned(),
+                    "-L".into(),
+                    raw_dir.as_os_str().to_owned(),
+                    "-lstatic=produced".into(),
+                    "-C".into(),
+                    link_arg,
+                ],
+            },
+        )]
+        .into(),
+    )
+    .unwrap();
+    let mut extra = krate.extra_data(&db).clone();
+    extra.blaze_native_unit = Some(0);
+    krate.set_extra_data(&mut db).to(extra);
+    crate::link::write_plan(&db, &program, None, target, false, &path).unwrap();
+    let encoded = fs::read(&path).unwrap();
+    let produced = LinkPlan::decode(&encoded).unwrap();
+    let mut raw_search = OsString::from("-L");
+    raw_search.push(&raw_dir);
+    assert_eq!(produced.target, target);
+    assert_eq!(produced.mode, LinkMode::Executable);
+    assert_eq!(produced.before, source.before);
+    assert_eq!(
+        produced.after,
+        [
+            vec![search_arg, raw_search],
+            words(&["-lgenerated", "-lproduced"]),
+            vec![object.into_os_string()],
+            words(&["-Wl,-dead_strip", "-nodefaultlibs"]),
+        ]
+        .concat()
+    );
+    for value in [secret.as_bytes(), native_secret.as_encoded_bytes()] {
+        assert!(!encoded.windows(value.len()).any(|bytes| bytes == value));
+    }
+}
+
+#[test]
 fn library_search_uses_directory_order_and_all_command_line_search_flags() {
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("first");

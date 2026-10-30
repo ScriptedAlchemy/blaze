@@ -159,6 +159,8 @@ struct Args {
     /// standard library's. Build scripts use Cargo dep-info; saved BuildSpec replay uses
     /// a versioned CBOR trace so legal filenames cannot lose inputs at admission.
     inputs: Option<PathBuf>,
+    /// Versioned native arguments a caller links the emitted object and runtime with.
+    link_plan: Option<PathBuf>,
     /// The build is of the standard library alone ([`std_unit`]): a crate it names is the
     /// library's, not another of that name the program has too.
     library: bool,
@@ -256,6 +258,7 @@ impl Args {
         let mut shared = false;
         let mut dep_info = None;
         let mut inputs = None;
+        let mut link_plan = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
         let mut own_target = false;
@@ -303,6 +306,7 @@ impl Args {
                 "--shared" => shared = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
                 "--inputs" => inputs = Some(PathBuf::from(value()?)),
+                "--link-plan" => link_plan = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
@@ -361,6 +365,7 @@ impl Args {
             shared,
             dep_info,
             inputs,
+            link_plan,
             library: false,
             cfg_test,
             own_target,
@@ -6810,6 +6815,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             shared: args.shared,
             dep_info: None,
             inputs: None,
+            link_plan: None,
             library: args.library,
             cfg_test: args.cfg_test,
             own_target: args.own_target,
@@ -9214,6 +9220,20 @@ fn run_holding(
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
+            }
+            if let Some(path) = &args.link_plan {
+                let mut program = Vec::new();
+                for named in args.crates() {
+                    program.extend(crates_named(&db, named, &args)?);
+                }
+                link::write_plan(
+                    &db,
+                    &program,
+                    SYSROOT.get().and_then(Option::as_deref),
+                    emits.triple(),
+                    args.shared,
+                    path,
+                )?;
             }
             if let Some(path) = &args.inputs {
                 write_inputs(

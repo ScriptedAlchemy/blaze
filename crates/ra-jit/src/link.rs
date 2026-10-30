@@ -209,6 +209,38 @@ pub(crate) fn command(
     command_of(&line, objects, exe, CommandPurpose::WholeLink)
 }
 
+/// Publish the native arguments a consumer needs around the compiled Rust objects.
+pub(crate) fn write_plan(
+    db: &RootDatabase,
+    program: &[Crate],
+    sysroot: Option<&Path>,
+    target: &str,
+    shared: bool,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let line = Line::of(db, program, sysroot, shared)?;
+    if let Some(admission) = crate::native_inputs::before_replay_link(
+        &line.before,
+        &line.after,
+        &line.env,
+        line.apple,
+        &line.generated,
+    )? {
+        admission.finish()?;
+    }
+    let plan = blaze_wire::native::LinkPlan {
+        target: target.to_owned(),
+        mode: if shared {
+            blaze_wire::native::LinkMode::Shared
+        } else {
+            blaze_wire::native::LinkMode::Executable
+        },
+        before: line.before,
+        after: line.after,
+    };
+    std::fs::write(path, plan.encode()).with_context(|| format!("writing {}", path.display()))
+}
+
 /// The native command and its request environment, before compiling the Rust objects. A
 /// native identity includes every user link argument, but not the Rust outputs or the
 /// daemon's mutable output-layout options: its headerpad file may grow during a link.

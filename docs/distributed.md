@@ -876,6 +876,30 @@ What the server keeps on its own disk:
 | `epochs` | namespace | current epoch | by the operator only |
 | `jobs`, `executors`, `work` | execution id, executor id | requests, leases, events, reservations, the work set | in memory, with a log |
 
+### Native link plans for object artifacts
+
+An object result names its Rust object, supporting runtime (`.std.a` or `.std.o`),
+and `native_link`. The latter is the JSON rendering of the compiler's `link.cbor`
+record, produced while its source graph, native unit settings and producer leases
+are still live. Its deterministic CBOR shape is
+`[1, encoding, target, mode, before, after]`: `target` is the emitted target triple,
+`mode` is `0` for an executable consumer or `1` for a shared-library consumer, and
+`before` and `after` are ordered arrays of native argument byte vectors. Encoding is
+`unix-bytes`, `windows-utf16le` or the host's `utf8` fallback. Decoders reject a
+foreign encoding, unknown version/mode, empty target or invalid process argument.
+The JSON rendering spells modes `executable` and `shared` and retains argument
+bytes as integer arrays.
+
+A C executable consumer places its caller, Rust objects and supporting runtimes
+between the executable plan's `before` and `after` arguments. Requirements come
+from the same source `#[link]` attributes, producer directives and target rules as
+an owned executable link; consumers do not maintain a second system-library list.
+Split ELF runtime archives carry an index for ordinary archive extraction, including
+TLS symbol types on cross-member references. The compiler admits the exact native
+arguments against bound source, producer and platform inputs and finishes that
+validation before publishing the record. Process environments remain in memory;
+they are not part of the native link record.
+
 ## 0. Phase 0: blaze builds tracedecay
 
 G0 says blaze does not build tracedecay without cargo on macOS, does not take its edits, and does
