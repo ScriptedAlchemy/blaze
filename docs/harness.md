@@ -341,7 +341,7 @@ verifies the bundle against the build job's digest and its own checkout
 (`.github/actions/bundle`) and runs the recorded tests with `.github/scripts/bundle.py test`,
 which compiles nothing. `bundle (<platform>)` runs the checks that depend on the platform alone
 once (`norustc_test.py`, the C2 contract tests). The bundle job alone writes the Actions cache,
-on pushes to `dist/*` and on a pull request's own ref, one entry per ref.
+on pushes to `dist/main` and `dist/c4-keys` and on a pull request's own ref, one entry per ref.
 
 `.github/workflows/ra-jit.yaml` runs in two tiers. It calls `ra-jit-platform.yaml` once for
 each platform, each on a machine of its own kind.
@@ -442,8 +442,9 @@ central producer owns the release build and macro bootstrap; no check rebuilds t
 the server workflow. `blaze-dist-review.yaml` is called by `pr.yaml` per platform too: the
 protocol tests replay the `dist` set, and the C2 groups (`buildspec.py`'s fixture groups and
 `saved_spec.py` under each backend) run against the bundle's release CLI and owned macro
-runtime. `pr.yaml` has two tiers, like ra-jit.yaml: a pull request (and a push to any other
-`dist/*` branch) runs the **fast tier**, the C2 groups on Linux alone, packed into three jobs;
+runtime. `pr.yaml` has two tiers, like ra-jit.yaml: a pull request (or `gh workflow run pr.yaml
+--ref <branch> -f tier=fast` on a branch without one; a push to any other branch starts nothing)
+runs the **fast tier**, the C2 groups on Linux alone, packed into three jobs;
 the **full tier**, nightly, by hand (`gh workflow run pr.yaml --ref <branch> -f tier=full`)
 and on a push to `dist/main` or `dist/c4-keys`, runs every area and every C2 group on Linux
 (one per job) and macOS (packed into four jobs), and opens an issue when it fails, or adds to

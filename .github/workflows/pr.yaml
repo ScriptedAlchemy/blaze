@@ -7,13 +7,17 @@
 #            compiles: bundle-check.yaml, then each area's own (serve, dist, bench)
 #   ci       whether everything that ran passed
 #
-# Two tiers, as ra-jit.yaml has them. The **fast tier** is a pull request's and a push to any
-# other dist/* branch's: the areas the diff touches, and the C2 runtime groups on Linux alone,
-# packed into three jobs. The **full tier** runs nightly, by hand (`-f tier=full`) and on a push
-# to the integration branches dist/main and dist/c4-keys: every area, and the C2 groups on Linux
-# (one per job) and macOS (packed into four jobs); when it fails it opens an issue, or adds to
-# the one still open (.github/actions/nightly-issue). macOS C2 coverage is the full tier's, not a
-# pull request's: an owner-accepted trade-off for the fork's five macOS runners.
+# Two tiers, as ra-jit.yaml has them. The **fast tier** is a pull request's: the areas the diff
+# touches, and the C2 runtime groups on Linux alone, packed into three jobs. The **full tier**
+# runs nightly, by hand (`-f tier=full`) and on a push to the integration branches dist/main and
+# dist/c4-keys: every area, and the C2 groups on Linux (one per job) and macOS (packed into four
+# jobs); when it fails it opens an issue, or adds to the one still open
+# (.github/actions/nightly-issue). macOS C2 coverage is the full tier's, not a pull request's: an
+# owner-accepted trade-off for the fork's five macOS runners.
+#
+# A push to any other branch starts nothing: a branch with a pull request already runs on the
+# `pull_request` event, and a second run for the same commit on the `push` event doubled the
+# load on the fork's twenty runners. A branch without one runs by hand (`workflow_dispatch`).
 #
 # Workflows called from here run in this run, so they download the bundle artifacts directly;
 # the digest each consumer verifies comes from the build job's outputs, a channel of its own.
@@ -23,7 +27,7 @@ on:
   pull_request:
     branches: [dist/main, dist/c4-keys]
   push:
-    branches: ["dist/**"]
+    branches: [dist/main, dist/c4-keys]
   schedule:
     - cron: "41 5 * * *"
   workflow_dispatch:

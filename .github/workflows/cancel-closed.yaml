@@ -1,0 +1,39 @@
+# A pull request's runs outlive it. GitHub cancels nothing when one is closed or merged, so its
+# queued and running workflows hold the fork's runners (twenty jobs, five of them macOS) for an
+# hour or more; a draft opened to measure and closed the same day left a run queued for hours.
+# This cancels every run still going for the closed pull request: those of its head commit, and
+# those of its head branch (a `pull_request` run names the head branch, a `push` run the branch).
+name: cancel runs of a closed pull request
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+concurrency:
+  group: cancel-closed-${{ github.event.pull_request.number }}
+
+jobs:
+  cancel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+      SELF: ${{ github.run_id }}
+    steps:
+      - run: |
+          for status in queued in_progress waiting pending; do
+            gh api "repos/$REPO/actions/runs?status=$status&per_page=100" \
+              --jq '.workflow_runs[]
+                    | select(.id != ($ENV.SELF | tonumber))
+                    | select(.head_sha == $ENV.HEAD_SHA or .head_branch == $ENV.HEAD_BRANCH)
+                    | "\(.id) \(.name) \(.head_sha[0:8])"'
+          done | sort -u | while read -r id name sha; do
+            echo "cancelling $id ($name at $sha)"
+            gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null || echo "  already finished"
+          done
