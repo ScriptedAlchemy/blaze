@@ -1090,6 +1090,15 @@ def fixtures():
     ]
 
 
+CI_GROUPS = {
+    "basic": ["basic"],
+    "workspace": ["ws"],
+    "commands": ["harness", "failfast", "envcfg"],
+    "profiles-native": ["profiles", "native", "source"],
+    "nested": ["nested"],
+}
+
+
 # --- Running ra-jit under the guard --------------------------------------------------------------
 
 class Run:
@@ -2140,7 +2149,10 @@ def parse_args(argv):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default=DEFAULT_BIN, help="the ra-jit under test (default $RA_JIT_BIN, else target/release/ra-jit)")
     ap.add_argument("--work", help="the work directory (default a new one under /tmp, removed at the end)")
-    ap.add_argument("--only", action="append", default=[], metavar="FIXTURE[/CASE]")
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--only", action="append", default=[], metavar="FIXTURE[/CASE]")
+    selection.add_argument("--ci-group", choices=CI_GROUPS,
+                           help="run one complete fixture group; together the groups cover every case")
     ap.add_argument("--no-local", action="store_true", help="skip arm 9, the local runs")
     ap.add_argument("--no-cargo", action="store_true", help="skip arm 8, the comparison with cargo's unit graph")
     ap.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -2155,7 +2167,10 @@ def parse_args(argv):
     ap.add_argument("--units-with-doctest", action="store_true", help="compare cargo's doctest units too")
     ap.add_argument("--spec-run-in", choices=("root", "cwd"), default="root",
                     help="where `spec run` is run in the checkout: its root (default) or the case's directory")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.ci_group:
+        args.only = CI_GROUPS[args.ci_group]
+    return args
 
 
 def run_harness(args, quiet=False):
@@ -3148,6 +3163,15 @@ def run_fixture_checks(t):
             if c.local and c.expect in ("refused",):
                 problems.append(f"{c.full} is refused and local")
     t.check(not problems, f"{sum(len(f.cases) for f in fixtures())} cases of {len(fixtures())} fixtures are coherent", "; ".join(problems))
+    fixture_list = fixtures()
+    groups = [select_cases(fixture_list, parse_args(["--ci-group", name]).only)
+              for name in CI_GROUPS]
+    selected = [case.full for reported, _ in groups for case in reported]
+    expected = {case.full for fixture in fixture_list for case in fixture.cases}
+    t.check(len(selected) == len(expected) and set(selected) == expected,
+            "CI groups cover every case exactly once", str(selected))
+    t.check(all(reported == needed for reported, needed in groups),
+            "CI groups retain complete fixtures and all comparison prerequisites")
 
 
 def self_test_source_trees(t, tmp):

@@ -61,13 +61,16 @@ jobs:
         run: cargo fmt -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --check
       - name: Test protocol, wire, and immutable build specifications
         run: nix develop .#bench --command cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --test-threads=2
+      - name: Check complete C2 fixture and group coverage
+        run: nix develop .#bench --command python3 -I -B harness/dist/buildspec.py --self-test
 
   c2-runtime:
-    name: C2 runtime (${{ matrix.os }})
+    name: C2 runtime (${{ matrix.os }}, ${{ matrix.lane }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
+        lane: [basic, workspace, commands, profiles-native, nested, saved-cranelift, saved-llvm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     env:
@@ -111,17 +114,19 @@ jobs:
             --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
             > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
       - name: Original C2 generation and local command differential
-        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && !startsWith(matrix.lane, 'saved-') }}
         shell: bash
+        env:
+          C2_GROUP: ${{ matrix.lane }}
         run: |
           nix develop .#bench --command python3 -I harness/dist/buildspec.py \
             --bin "$GITHUB_WORKSPACE/target/release/ra-jit" \
             --work "$RUNNER_TEMP/c2-local" --memory-mib 8192 --timeout 1200 --shared-store \
             --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
-            --json "$RUNNER_TEMP/c2-evidence/local.json" \
+            --ci-group "$C2_GROUP" --json "$RUNNER_TEMP/c2-evidence/local.json" \
             > "$RUNNER_TEMP/c2-evidence/local.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (Cranelift)
-        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && matrix.lane == 'saved-cranelift' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
@@ -130,7 +135,7 @@ jobs:
             --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
             --backend cranelift > "$RUNNER_TEMP/c2-evidence/cranelift.log" 2>&1
       - name: Saved execution with compiler subprocesses blocked (LLVM)
-        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && matrix.lane == 'saved-llvm' }}
         shell: bash
         run: |
           nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
@@ -142,7 +147,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: c2-runtime-${{ matrix.os }}
+          name: c2-runtime-${{ matrix.os }}-${{ matrix.lane }}
           path: |
             ${{ runner.temp }}/c2-evidence
             ${{ runner.temp }}/c2-owned-server/image-pins.json
@@ -160,3 +165,19 @@ jobs:
             ${{ runner.temp }}/c2-llvm/*.exec
             ${{ runner.temp }}/c2-llvm/*.log
           if-no-files-found: warn
+
+  c2-runtime-result:
+    name: C2 runtime (${{ matrix.os }})
+    needs: c2-runtime
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      C2_RESULT: ${{ needs.c2-runtime.result }}
+    steps:
+      - name: Require every C2 lane on both platforms
+        run: test "$C2_RESULT" = success
