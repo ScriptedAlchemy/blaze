@@ -308,8 +308,10 @@ struct State {
     /// it: each has the admission until it is retired.
     executors: HashSet<u64>,
     /// The leases each build holds on the producer images it was given, which its macros are
-    /// loaded from after its scripts are judged: none is collected until it is retired.
-    images: HashMap<u64, Vec<File>>,
+    /// loaded from after its scripts are judged: none is collected until it is retired. A
+    /// request that names no build has none here: the load that serves it keeps them until
+    /// its proc-macro client has loaded the images ([`super::Images`]).
+    images: HashMap<u64, Vec<Arc<File>>>,
 }
 
 /// A watch of a file of another process: which one it is (a thread ends only the registration
@@ -560,8 +562,22 @@ impl Leases {
     }
 
     /// `build` holds `leases` on producer images until it is retired.
-    pub(super) fn keep_images(&self, build: u64, leases: Vec<File>) {
+    pub(super) fn keep_images(&self, build: u64, leases: Vec<Arc<File>>) {
         self.state().images.entry(build).or_default().extend(leases);
+    }
+
+    /// `build` holds `leases` on producer images it was given, until it is retired. A request
+    /// that names no build is retired by nothing: the load that serves it holds them instead,
+    /// until its proc-macro client has loaded the image, and while it serves it. What the
+    /// caller is to hold is returned; a build keeps its own.
+    pub(super) fn image_leases(&self, build: u64, leases: Vec<Arc<File>>) -> Vec<Arc<File>> {
+        match build {
+            0 => leases,
+            build => {
+                self.keep_images(build, leases);
+                Vec::new()
+            }
+        }
     }
 
     /// Ends `build`: its leases and its admission are released and what it judged is forgotten.
@@ -1225,6 +1241,41 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&x);
+    }
+
+    /// The second check's lease finding: a request that names no build is retired by nothing,
+    /// so the load that serves it holds the images it admitted, until its proc-macro client
+    /// has loaded them and while it serves them; a build's images are its own until it is
+    /// retired. Either way the image is collected once the last lease is gone.
+    #[test]
+    fn an_image_of_a_request_that_names_no_build_is_leased_by_its_load_until_it_lets_go() {
+        let root = dir("image-owner");
+        let generation = |name: &str| {
+            let generation = root.join(name);
+            let file = load_cargo::proc_macro_producer_lifetime::lease(&generation).unwrap();
+            std::fs::write(generation.join("library"), b"bytes").unwrap();
+            (generation, Arc::new(file))
+        };
+        let collect = |current: &Path| {
+            load_cargo::proc_macro_producer_lifetime::collect(&root, current).unwrap()
+        };
+        let leases = Leases::default();
+        // A pass that names no build: the leases are the load's, which keeps them.
+        let (first, held) = generation("first");
+        let kept = leases.image_leases(0, vec![held]);
+        assert_eq!(kept.len(), 1, "the load holds what no build can retire");
+        let (second, _) = generation("second");
+        assert!(collect(&second).is_empty(), "a leased image is never collected");
+        assert!(first.join("library").is_file());
+        drop(kept);
+        assert_eq!(collect(&second), [first], "the load let go: the image is collected");
+        // A build's images are its own until it is retired.
+        let (third, held) = generation("third");
+        assert!(leases.image_leases(7, vec![held]).is_empty(), "a build keeps its own");
+        assert!(collect(&second).is_empty(), "a build's image is leased until it is retired");
+        leases.retire(7);
+        assert_eq!(collect(&second), [third], "a retired build lets go of its images");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

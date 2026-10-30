@@ -208,7 +208,7 @@ impl Producers {
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));
         raw.remove(std::ffi::OsStr::new("RUSTC_WRAPPER"));
         raw.remove(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER"));
-        let (outputs, images, world) =
+        let (outputs, images, world, _leases) =
             crate::scripts::run_producers(&cargo, &asked, sysroot.to_owned(), flags, cfgs, &raw)?;
         anyhow::ensure!(
             !failure.exists(),
