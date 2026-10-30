@@ -501,7 +501,7 @@ impl Server {
         headers: &hyper::HeaderMap,
         body: Incoming,
     ) -> Result<HttpResponse<Body>, Error> {
-        let name = unescape(name);
+        let name = unescape_path(name)?;
         let name = name.as_str();
         let object = ObjectName::parse(name)
             .ok_or_else(|| Error::not_found(format!("`{name}` is not an object of this cache")))?;
@@ -834,6 +834,27 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .get(header::CONTENT_LENGTH)
         .and_then(|it| it.to_str().ok())
         .and_then(|it| it.parse().ok())
+}
+
+/// Decode an object path without repairing malformed escapes or invalid UTF-8. Layout
+/// validation runs afterward and rejects decoded separators, dot paths and NUL bytes.
+fn unescape_path(text: &str) -> Result<String, Error> {
+    let mut bytes = text.bytes();
+    let mut out = Vec::with_capacity(text.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let digit = |byte: u8| (byte as char).to_digit(16).map(|it| it as u8);
+            let high = bytes.next().and_then(digit);
+            let low = bytes.next().and_then(digit);
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(Error::malformed("invalid percent escape in object path"));
+            };
+            out.push((high << 4) | low);
+        } else {
+            out.push(byte);
+        }
+    }
+    String::from_utf8(out).map_err(|_| Error::malformed("object path is not UTF-8"))
 }
 
 /// A `%XX` in a query, as its byte.
@@ -1197,6 +1218,104 @@ mod tests {
             409
         );
         assert_eq!(run.request("GET", "/", "", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn failed_listing_pages_release_their_snapshot_slots() {
+        let run = Running::with_config(tempfile::tempdir().unwrap(), |mut config| {
+            config.resources.connections = 1;
+            config.limits.request = 100;
+            config
+        })
+        .await;
+        let long_name = format!("manifests/z{}", "x".repeat(150));
+        for name in ["manifests/a", "deps/a", "deps/b", &long_name] {
+            run.server.store().put_list(name, b"\n", Expect::Any).unwrap();
+        }
+        let header = "X-Blaze-Listing-Version: 1\r\n";
+        // Failure on a new listing must not occupy the only snapshot slot.
+        for _ in 0..2 {
+            assert_eq!(
+                run.request("GET", "/v1/objects?prefix=manifests/z", header, &[]).await.0,
+                413
+            );
+        }
+        let (status, headers, _) =
+            run.request("GET", "/v1/objects?prefix=manifests/&limit=1", header, &[]).await;
+        assert_eq!(status, 200);
+        let cursor =
+            headers.lines().find_map(|it| it.strip_prefix("x-blaze-listing-next: ")).unwrap();
+        // Failure while following an issued cursor must release that lease as well.
+        assert_eq!(
+            run.request(
+                "GET",
+                &format!("/v1/objects?prefix=manifests/&cursor={cursor}"),
+                header,
+                &[],
+            )
+            .await
+            .0,
+            413
+        );
+        let (status, headers, _) =
+            run.request("GET", "/v1/objects?prefix=deps/&limit=1", header, &[]).await;
+        assert_eq!(status, 200);
+        assert!(headers.contains("x-blaze-listing-next:"));
+    }
+
+    #[tokio::test]
+    async fn escaped_project_names_round_trip_through_http_and_listings() {
+        let run = Running::start().await;
+        for (encoded, name) in [
+            ("hello%20world", "hello world"),
+            ("percent%252Fname", "percent%2Fname"),
+            ("caf%C3%A9%3F%23", "café?#"),
+        ] {
+            let path = format!("/v1/list/manifests/{encoded}");
+            assert_eq!(run.request("PUT", &path, "", b"contents\n").await.0, 204);
+            let object = format!("manifests/{name}");
+            assert_eq!(
+                run.server.store().read_small(&object, 100).unwrap(),
+                Some(b"contents\n".to_vec())
+            );
+            let (_, _, listing) = run
+                .request(
+                    "GET",
+                    "/v1/objects?prefix=manifests/",
+                    "X-Blaze-Listing-Version: 1\r\n",
+                    &[],
+                )
+                .await;
+            assert!(listed(&listing).unwrap().iter().any(|(listed, _, _)| listed == &object));
+            let (status, _, bytes) = run.request("GET", &path, "", &[]).await;
+            assert_eq!((status, bytes), (200, b"contents\n".to_vec()));
+            assert_eq!(run.request("DELETE", &path, "", &[]).await.0, 204);
+            assert!(run.server.store().read_small(&object, 100).unwrap().is_none());
+        }
+        assert!(run.server.store().list("manifests/").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_and_traversing_object_paths_are_not_published() {
+        let run = Running::start().await;
+        let valid = "manifests/replacement-�";
+        run.server.store().put_list(valid, b"original\n", Expect::Any).unwrap();
+        // Lossy UTF-8 decoding must not turn an invalid path into a valid object's name.
+        assert_eq!(
+            run.request("PUT", "/v1/list/manifests/replacement-%FF", "", b"replacement\n").await.0,
+            400
+        );
+        assert_eq!(
+            run.server.store().read_small(valid, 100).unwrap(),
+            Some(b"original\n".to_vec())
+        );
+        for name in ["%", "%2", "%GG", "%ff", "%00", "a%2Fb", "a%5Cb", "%2e%2e"] {
+            let (status, _, _) = run
+                .request("PUT", &format!("/v1/list/manifests/{name}"), "", b"must not appear\n")
+                .await;
+            assert!(matches!(status, 400 | 404), "{name}: {status}");
+        }
+        assert_eq!(run.server.store().list("manifests/").unwrap().len(), 1);
     }
 
     #[tokio::test]

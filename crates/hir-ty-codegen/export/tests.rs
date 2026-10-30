@@ -161,6 +161,24 @@ fn fixture() -> (RootDatabase, Vec<FunctionId>, Crate) {
 
 #[test]
 fn allocator_only_unit_uses_its_explicit_source_graph() {
+    const TEST: &str = "export::tests::allocator_only_unit_uses_its_explicit_source_graph";
+    const CHILD: &str = "BLAZE_ALLOCATOR_ONLY_CHILD";
+    // A whole-program compile installs process-wide backend policy. Keep it apart
+    // from export tests that compare their context with a fresh compiler process.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     use object::{Object as _, ObjectSymbol as _};
     for custom in [false, true] {
         let source = format!(
@@ -220,6 +238,145 @@ fn allocator_only_unit_uses_its_explicit_source_graph() {
             let target = if custom { "__ra_jit_global_alloc" } else { "__rdl_alloc" };
             assert!(names.contains(&(target.into(), true)), "{names:?}");
         });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_file_and_debug_paths_rebind_in_another_checkout() {
+    struct Located<'a> {
+        symbols: Symbols<'a>,
+        root: &'a str,
+    }
+    impl Located<'_> {
+        fn file(&self) -> String {
+            Path::new(self.root)
+                .parent()
+                .unwrap()
+                .join("shared/src/lib.rs")
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }
+    }
+    impl SymbolResolver for Located<'_> {
+        fn function(&self, func: FunctionId) -> Option<String> {
+            self.symbols.function(func)
+        }
+        fn static_(&self, id: StaticId) -> Option<String> {
+            self.symbols.static_(id)
+        }
+        fn path(&self, path: &str) -> Option<String> {
+            self.symbols.path(path)
+        }
+        fn item(&self, item: hir_def::ModuleDefId) -> Option<String> {
+            self.symbols.item(item)
+        }
+        fn source_path(&self, _: base_db::FileId) -> Option<String> {
+            Some(self.file())
+        }
+        fn stable_crate_id(&self, krate: Crate) -> Option<u64> {
+            self.symbols.stable_crate_id(krate)
+        }
+        fn content_id(&self, krate: Crate) -> Option<ContentId> {
+            self.symbols.content_id(krate)
+        }
+        fn rustc_built(&self, _: Crate) -> bool {
+            false
+        }
+        fn nothing_of_rustc(&self) -> bool {
+            true
+        }
+        fn debug_directory(&self) -> Option<String> {
+            Some(self.root.to_owned())
+        }
+        fn checkout(&self) -> Option<String> {
+            Some(self.root.to_owned())
+        }
+    }
+    store::compiles_against("1.99.0");
+    let (source_db, source_roots, _) = fixture();
+    let (target_db, target_roots, _) = fixture();
+    let source = Located {
+        symbols: Symbols { db: &source_db, debug: true },
+        root: "/home/producer/repo/workspace",
+    };
+    let target = Located {
+        symbols: Symbols { db: &target_db, debug: true },
+        root: "/srv/deeper/consumer/repo/workspace",
+    };
+    let requested = |db: &RootDatabase, roots: &[FunctionId]| {
+        roots
+            .iter()
+            .copied()
+            .find(|it| FunctionSignature::of(db, *it).name.as_str() == "source_path")
+            .unwrap()
+    };
+    let directory = scratch("checkout-export");
+    let store = store::Store::owned(&directory).unwrap();
+    let receipt = hir::attach_db(&source_db, || {
+        let context = ExportContext::resolved(
+            &source_db,
+            &source,
+            base_db::all_crates(&source_db).iter().copied(),
+            &source_roots,
+            policy(true),
+        )
+        .unwrap();
+        let batch = compile_batch(
+            &context,
+            context.digest(),
+            &[LocalRequest::root(requested(&source_db, &source_roots))],
+            &store,
+        )
+        .unwrap();
+        require_exported(&batch, 1);
+        batch.receipt
+    });
+    let exported = &receipt.entries[0];
+    let stored = store.get_installed(&exported.key).unwrap();
+    assert!(cached::holds(&stored, "/checkout/../shared/src/lib.rs"));
+    assert!(!cached::holds(&stored, &source.file()));
+    let staging = scratch("checkout-import");
+    let local_directory = scratch("checkout-local");
+    hir::attach_db(&target_db, || {
+        let context = ExportContext::resolved(
+            &target_db,
+            &target,
+            base_db::all_crates(&target_db).iter().copied(),
+            &target_roots,
+            policy(true),
+        )
+        .unwrap();
+        assert_eq!(context.digest(), receipt.context);
+        let local_store = store::Store::owned(&local_directory).unwrap();
+        let local = compile_batch(
+            &context,
+            context.digest(),
+            &[LocalRequest::root(requested(&target_db, &target_roots))],
+            &local_store,
+        )
+        .unwrap();
+        require_exported(&local, 1);
+        assert_eq!(local.receipt.entries[0].entry_digest, exported.entry_digest);
+        assert_eq!(local_store.get_installed(&exported.key).unwrap(), stored);
+
+        let imported = import_batch(&context, &receipt, &staging, |name| store.pack(name)).unwrap();
+        let entry = imported.entries(&context).unwrap().get(&exported.work.name).unwrap();
+        assert!(entry.debug.as_ref().unwrap().files.contains(&target.file()));
+        assert!(entry.datas.iter().any(|it| matches!(it, cached::CachedData::Text(parts)
+        if parts == &[
+            cached::CachedTextPart::Text("literal:".into()),
+            cached::CachedTextPart::FilePath(target.file()),
+            cached::CachedTextPart::Text(":tail".into()),
+        ])));
+        let rebound = imported.rebound_entry_bytes(&context, &exported.key).unwrap();
+        assert_eq!(entry.encode().unwrap(), rebound);
+        assert!(!cached::holds(&rebound, &source.file()));
+    });
+    drop(store);
+    for path in [directory, local_directory, staging] {
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
 
@@ -514,6 +671,41 @@ fn imported_receipts_refuse_changed_compiler_settings() {
 }
 
 #[test]
+fn split_future_policy_is_refused_before_batch_compilation() {
+    const TEST: &str = "export::tests::split_future_policy_is_refused_before_batch_compilation";
+    const CHILD: &str = "BLAZE_D0_SPLIT_FUTURES_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("RA_JIT_SPLIT_FUTURES", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let (db, roots, _) = fixture();
+    hir::attach_db(&db, || {
+        let symbols = Symbols { db: &db, debug: false };
+        let why = ExportContext::resolved(
+            &db,
+            &symbols,
+            base_db::all_crates(&db).iter().copied(),
+            &roots,
+            policy(false),
+        )
+        .err()
+        .expect("legacy split-future imports have no batch classifier");
+        assert!(why.contains("RA_JIT_SPLIT_FUTURES"), "{why}");
+    });
+}
+
+#[test]
 fn mismatches_corruption_and_missing_types_never_admit_a_receipt() {
     store::compiles_against("1.99.0");
     let (db, roots, _) = fixture();
@@ -618,6 +810,96 @@ fn caller_environment_and_unknown_import_are_explicitly_local() {
             sig: Signature::new(isa::CallConv::SystemV),
         };
         assert!(context.function(0, &request).is_err());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    });
+}
+
+#[test]
+fn a_provided_function_must_match_the_requested_overflow_policy() {
+    store::compiles_against("1.99.0");
+    let db = RootDatabase::with_files(
+        r#"
+//- minicore: sized
+//- /src/lib.rs crate:case deps:dependency
+pub fn root(a: u32, b: u32) -> u32 { dependency::add(a, b) }
+//- /dep.rs crate:dependency library cfg:overflow_checks
+#[inline]
+pub fn add(a: u32, b: u32) -> u32 { a + b }
+"#,
+    );
+    hir::attach_db(&db, || {
+        let krate =
+            *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).unwrap();
+        let root = hir_def::nameres::crate_def_map(&db, krate)
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations())
+            .find_map(|def| match def {
+                hir_def::ModuleDefId::FunctionId(function) => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let symbols = Symbols { db: &db, debug: false };
+        let mut policy = policy(false);
+        policy.imports.insert(
+            "case_add".into(),
+            Import { declaration: Declaration::Function, provider: Provider::Shipped },
+        );
+        let context = ExportContext::resolved(&db, &symbols, [krate], &[root], policy).unwrap();
+        let compiled = compiled_root(&db, root).as_ref().unwrap();
+        let (at, request) = compiled
+            .requests
+            .funcs
+            .iter()
+            .enumerate()
+            .find(|(_, request)| matches!(request.target, FuncTarget::Instance(..)))
+            .unwrap();
+        let FuncTarget::Instance(instance, env) = &request.target else { unreachable!() };
+        assert!(!instance.checked);
+        assert!(!as_its_crate_compiles(&db, &symbols, instance));
+
+        // The actual object path defines this adjusted instance rather than using the
+        // provided library copy, which was compiled with overflow checks enabled.
+        let rejected = FxHashMap::default();
+        let on_demand = [root].into_iter().collect();
+        let owned = OwnStatics::new(
+            &db,
+            &symbols,
+            [krate].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            true,
+        );
+        let mut object =
+            ObjectCodegen::new(&db, &symbols, &rejected, owned, &on_demand, None, true).unwrap();
+        let callee = object.callee(instance, env, &request.sig).unwrap();
+        assert_ne!(object.module.declarations().get_function_decl(callee).linkage, Linkage::Import);
+        assert!(context.function(at, request).is_err());
+
+        let directory = scratch("provided-overflow");
+        let store = store::Store::owned(&directory).unwrap();
+        let batch =
+            compile_batch(&context, context.digest(), &[LocalRequest::root(root)], &store).unwrap();
+        assert!(matches!(&batch.outcomes[0], Outcome::Local { .. }));
+        assert!(batch.receipt.entries.is_empty());
+
+        // Asking for the same checked copy as the library provides remains exportable.
+        let env =
+            ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
+        let matching = LocalRequest::function_instance(
+            root,
+            GenericArgs::new_from_slice(&[]).store(),
+            env,
+            true,
+        );
+        let batch = compile_batch(&context, context.digest(), &[matching], &store).unwrap();
+        require_exported(&batch, 1);
+        let entry =
+            cached::Entry::decode(&store.get(&batch.receipt.entries[0].key).unwrap()).unwrap();
+        assert!(entry.funcs.iter().any(|it| matches!(
+            &it.target,
+            cached::CachedTarget::Import { symbol, .. } if symbol == "case_add"
+        )));
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     });
@@ -841,6 +1123,41 @@ fn process_child() {
             .unwrap();
         batch.receipt.publish(&context, &store, &directory.join("receipt")).unwrap();
     });
+}
+
+#[test]
+fn different_lowering_policies_have_different_export_contexts() {
+    let mut receipts = Vec::new();
+    for promote in ["1", "0"] {
+        let directory = scratch("promotion-policy");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "export::tests::process_child", "--ignored", "--nocapture"])
+            .env("BLAZE_D0_PROCESS_DIR", &directory)
+            .env("RA_JIT_PROMOTE", promote)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Receipt =
+            postcard::from_bytes(&std::fs::read(directory.join("receipt")).unwrap()).unwrap();
+        receipts.push(receipt);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    let [promoted, slots] = receipts.as_slice() else { unreachable!() };
+    assert_eq!(promoted.producer, slots.producer);
+    assert_eq!(
+        promoted.entries.iter().map(|it| &it.work).collect::<Vec<_>>(),
+        slots.entries.iter().map(|it| &it.work).collect::<Vec<_>>()
+    );
+    assert!(
+        promoted.entries.iter().zip(&slots.entries).any(|(a, b)| a.entry_digest != b.entry_digest),
+        "the real codegen fixture must produce different entries under the two policies"
+    );
+    assert_ne!(promoted.context, slots.context);
 }
 
 #[test]

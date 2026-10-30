@@ -105,7 +105,8 @@ CACHE = [
     ("warm the thread configuration", [], None, ["--test-threads=2"], {}, ALL, True),
     ("a cached pass cannot hide repeated thread options", [], None,
      ["--test-threads=2", "--test-threads=0"], {}, NONE, REJECTED),
-    ("the valid thread configuration stays cached", [], None, ["--test-threads=2"], {}, NONE, True),
+    ("the valid thread configuration reruns after an unsuccessful untracked run", [], None,
+     ["--test-threads=2"], {}, ALL, True),
 ]
 # libtest's own refusal, by the step's name in CACHE: an option given twice, or a value it
 # does not take, which it says as `error: ...` and ends 101 with, before running any test.
@@ -331,6 +332,22 @@ class Harness:
             verdict = "RETRIED"
         self.check("what passed after two attempts is cached", verdict)
         self.check("nothing edited", self.verdict(self.cargo("affected", "flaky", extra=off), NONE, True))
+        # A forced or filtered failure must revoke an older cached pass even though
+        # this invocation did not use affected selection. The attempt counter is not
+        # declared data, as for the fixture's ordinary flaky retry above.
+        for mode, args, expected in (
+            ("all", [], both),
+            ("affected", ["--exact", "tests::flaky_once"], {"tests::flaky_once"}),
+        ):
+            os.remove(attempts)
+            run = self.cargo(mode, "flaky", args,
+                             extra=dict(off, RA_JIT_FLAKY_TEST_ATTEMPTS="1"))
+            self.check(f"{mode} with {args!r} reports the flaky failure",
+                       self.verdict(run, expected, False, failed={"tests::flaky_once"}))
+            self.check("a failure outside affected selection revokes the older pass",
+                       self.verdict(self.cargo("affected", "flaky", extra=off), both, True))
+            self.check("a new pass is reusable after the failed untracked run",
+                       self.verdict(self.cargo("affected", "flaky", extra=off), NONE, True))
         self.edit("flaky/data.txt", "declared", "declared again")
         os.remove(attempts)
         run = self.cargo("affected", "flaky", verbose=True, extra=dict(off, RA_JIT_FLAKY_TEST_ATTEMPTS="1"))
