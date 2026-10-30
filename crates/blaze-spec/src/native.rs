@@ -209,6 +209,9 @@ impl Admission<'_> {
     }
 
     fn entry_at(&self, path: &Path) -> Lookup<Entry> {
+        if let Some(found) = self.parent_spelled_root(path) {
+            return found;
+        }
         let mut prefix = PathBuf::new();
         let mut crossed_parent = false;
         for component in path.components() {
@@ -233,6 +236,36 @@ impl Admission<'_> {
             }
         }
         if crossed_parent { Lookup::Rejected } else { Lookup::Unanchored }
+    }
+
+    /// A path below a root spelled with `..`, as gcc names its search directories
+    /// (`…/gcc/<triple>/12/../../../../<triple>/lib`), is that root's: the walk from the
+    /// shortest prefix would reach a shorter bound directory first and then have to cross the
+    /// `..` through directories no root captured. The longest such root that is a lexical
+    /// prefix of `path` answers; a `..` below it, which could leave it, is refused.
+    fn parent_spelled_root(&self, path: &Path) -> Option<Lookup<Entry>> {
+        let parent = |path: &Path| path.components().any(|it| matches!(it, Component::ParentDir));
+        let root = self
+            .closure
+            .roots
+            .iter()
+            .map(|root| root.tree.root.as_path())
+            .filter(|root| parent(root) && path.starts_with(root))
+            .max_by_key(|root| root.components().count())?;
+        let relative = path.strip_prefix(root).ok()?;
+        if parent(relative) {
+            return Some(Lookup::Rejected);
+        }
+        match observed_node(&self.nodes, root) {
+            Lookup::Bound(node) => Some(walk_captured(
+                &self.nodes,
+                node.resolved.clone(),
+                node.entry.clone(),
+                relative,
+            )),
+            Lookup::Rejected => Some(Lookup::Rejected),
+            Lookup::Unanchored => None,
+        }
     }
 
     /// Require an observed input to match an entry in a complete bound tree.
