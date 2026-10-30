@@ -1509,22 +1509,38 @@ mod tests {
     /// cargo holds its lock on a build directory. A lock this process held would be held as
     /// well by a process another test starts meanwhile, until it runs what it was started for.
     fn held(lock: &Path) -> std::process::Child {
-        let holds = "open(my $f, '<', shift) or die; flock($f, LOCK_EX) or die; $| = 1; print qq(held\n); <STDIN>;";
-        let mut cargo = Command::new("perl")
-            .args(["-MFcntl=:flock", "-e", holds])
-            .arg(lock)
+        let mut cargo = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cargo::script::tests::cargo_directory_lock_holder", "--nocapture"])
+            .env("RA_JIT_TEST_CARGO_LOCK", lock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let mut output = std::io::BufReader::new(cargo.stdout.take().unwrap());
         let mut held = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(cargo.stdout.take().unwrap()),
-            &mut held,
-        )
-        .unwrap();
-        assert_eq!(held, "held\n");
+        loop {
+            held.clear();
+            assert!(
+                std::io::BufRead::read_line(&mut output, &mut held).unwrap() > 0,
+                "lock holder exited before acquiring its lock"
+            );
+            if held.ends_with("cargo directory lock held\n") {
+                break;
+            }
+        }
+        cargo.stdout = Some(output.into_inner());
         cargo
+    }
+
+    #[test]
+    fn cargo_directory_lock_holder() {
+        use std::io::Write as _;
+        let Some(path) = std::env::var_os("RA_JIT_TEST_CARGO_LOCK") else { return };
+        let lock = std::fs::File::open(path).unwrap();
+        lock.lock().unwrap();
+        println!("cargo directory lock held");
+        std::io::stdout().flush().unwrap();
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
     }
 
     #[test]

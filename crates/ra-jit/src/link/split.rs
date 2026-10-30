@@ -742,12 +742,15 @@ mod tests {
                         (symbol.name().to_vec(), symbol.offset().0)
                     })
                     .collect();
-                let allocator = symbols.get(b"__rust_alloc".as_slice()).unwrap();
+                let name = |name: &str| {
+                    if format == BinaryFormat::MachO { format!("_{name}") } else { name.to_owned() }
+                };
+                let allocator = symbols.get(name("__rust_alloc").as_bytes()).unwrap();
                 let members: Vec<_> = archive.members().map(|member| member.unwrap()).collect();
                 assert_eq!(members.last().unwrap().name(), b"allocator.o");
                 assert_eq!(members.last().unwrap().data(bytes.as_slice()).unwrap(), shim);
                 if input.is_some() {
-                    assert_ne!(symbols.get(b"runtime_entry".as_slice()).unwrap(), allocator);
+                    assert_ne!(symbols.get(name("runtime_entry").as_bytes()).unwrap(), allocator);
                 }
             }
         }
