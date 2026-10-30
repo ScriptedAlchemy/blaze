@@ -3074,35 +3074,46 @@ cfgs, environment, dependency renames, target kinds and profiles; the loader can
 or substitute ambient compiler settings. Replay starts the owned compiler directly with compiler
 query fallback, Cargo producer loading, external proc-macro servers and shared publication disabled.
 
-The connected executor admits host Rust libraries as source dependencies of binaries and examples,
-and has explicit paths for unit/integration test executables. `test --no-run` builds the test
-executables without running implicit doctests. It refuses standalone library artifacts,
-check/doctest/benchmark work, build scripts, proc macros, unsupported output types and incompatible
-per-unit debug settings before starting compilation. Expanded application native link inputs are
-refused until their complete closure can be bound. The existing `ExecPlatform.native_root` is still
-a proxy for the language runtime's native inputs, not a complete SDK/library closure. A version-1
-deterministic CBOR trace (`[version, files, [[name, value-or-null], ...]]`, with message-sized text
-budgets) preserves application input paths and environment reads, including filenames that Cargo's
-line-oriented dep-info cannot represent. Replay checks that trace against the snapshot before an
-executable is advertised or run. This is admission after compilation, not a filesystem sandbox.
-The compiler runs with the spec's environment alone, so a variable the program reads with
-`option_env!` reads unset in the replay, never as the worker has it. That is Cargo's answer when the
-requester's process lacked the variable too, and the replay record holds the digests of the names the
-requester's process had (not the names, not the values) to tell: a read of an unset variable the
-requester lacked is admitted, and one it had, which the spec does not carry, is refused as
-undeclared because its value was not kept.
+The connected executor plans executables, standalone library objects, frontend checks,
+unit/integration tests and doctests. `test --no-run` builds the test executables without
+running implicit doctests. Its owned producer scheduler builds scripts and proc-macro images
+in dependency order, applies their cfg/environment/native directives, and retains producer
+generation leases through compilation and input admission. Proc-macro expansion requires an
+explicitly pinned owned runtime. The compiler does not discover producers through Cargo or
+select an external toolchain server.
+
+Native bindings retain observed tools, SDK/sysroot/search trees, source inputs and producer
+outputs. `ExecPlatform.native_root` identifies that captured closure. Linking must admit its
+actual reads against the bindings, including symlink referents and recorded absences; an
+unbound input fails admission. This is an implemented boundary whose full platform coverage
+still needs the runtime gates below, not evidence that every native toolchain is supported.
+Preflight still reports unsupported output types and special extern options, symbol stripping,
+and incompatible per-unit debug/strip/split settings before compilation. Those are remaining
+execution limits, not completed Rust compatibility.
+
+The private version-2 deterministic CBOR trace carries input paths and keyed identities of
+observed environment values, distinguishing absence, empty text and native non-Unicode values.
+Compiler descriptions carry per-canonical-unit native settings over stdin; public project files
+redact those settings. Admission uses the environments of described source units and validates
+file bytes against the authenticated snapshot or owned producer bindings before advertising or
+running artifacts. This is admission after compilation, not a filesystem sandbox. An unset read
+is accepted only when the saved requester-presence information and effective source environment
+justify absence. Invalid Unicode read through `env!` or `option_env!` is a language diagnostic;
+an unread non-Unicode value does not itself reject a build.
 
 A program that `run` or `test` starts gets the environment Cargo gives one, not an empty one: the
 worker's `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG` and `LC_*`; the
 spec's configuration and script values; Cargo's package variables (`CARGO_MANIFEST_DIR`,
 `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`), whose paths are in the replayed tree; and `CARGO`, naming the
-toolchain's cargo. The worker's other variables do not reach it, and the dynamic-library search path
-Cargo extends is not set (programs are linked statically).
+toolchain's cargo. The worker's other variables do not reach it. The runtime extends the platform's
+dynamic-library search path with admitted producer libraries, profile directories and the selected
+sysroot library directory through the same loader-path helper used by ordinary Cargo requests.
 
 `harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
 compiler tools blocked, including removal of the original tree and hostile worker configuration.
 Its result, the broader `buildspec.py` differential, native closure coverage, other platforms and
-the original complete C2 acceptance remain separate gates. C2 stays draft until those gates pass.
+the original complete C2 acceptance remain separate gates. C2 acceptance remains open until those
+gates pass.
 
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's
