@@ -805,7 +805,7 @@ impl<'a> Runner<'a> {
         if let Some(judged) = self.begin(package, for_host, &lib)? {
             return Ok(judged);
         }
-        let (exe, compiled) = self.compile(package).map_err(|why| {
+        let (exe, compiled) = self.compile(package, &data.active_features).map_err(|why| {
             format!("blaze could not compile the build script of `{descr}`: {why}")
         })?;
         // The dependencies whose metadata the script is given, which run before it.
@@ -1067,6 +1067,42 @@ impl<'a> Runner<'a> {
                 .all(|it| self.shares(it.pkg))
     }
 
+    /// What the run of `package`'s script for the profile `lib` is keyed by, which names its
+    /// directory: one run for the host and the target when it is the same for both. Cargo keys
+    /// a run by the profile of the run, which is the library's cut down to what a run is given
+    /// (`get_profile_run_custom_build`), not by the whole library profile, by the features, the
+    /// flags and the compiler, and by the units it depends on (`traverse_and_share`'s
+    /// `dep_hash`): the runs of the dependencies with `links` whose metadata it is given. Two
+    /// runs alike in all else but given different metadata are two runs, whatever their
+    /// debuginfo, which is the same for both when a profile has none.
+    fn run_identity(&self, package: Package, for_host: bool, lib: &Profile) -> u64 {
+        let data = &self.cargo[package];
+        let mut features = data.active_features.clone();
+        features.sort();
+        let (target, flags) = match for_host {
+            true => (self.asked.host, &self.host_flags),
+            false => (self.asked.target, &self.flags),
+        };
+        let debuginfo = self.debuginfo(package, for_host, lib);
+        let run = self.profiles.get_profile_run_custom_build(&Profile { debuginfo, ..lib.clone() });
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let mut links: Vec<u64> = data
+            .dependencies
+            .iter()
+            .filter(|it| it.kind == DepKind::Normal && self.runs(it.pkg))
+            .filter(|it| self.cargo[it.pkg].links.is_some())
+            .map(|it| {
+                let lib = self.profile(it.pkg, unit_for, &self.kind(for_host));
+                self.run_identity(it.pkg, for_host, &lib)
+            })
+            .collect();
+        links.sort_unstable();
+        links.dedup();
+        let key =
+            json!([data.id.repr, features, format!("{run:?}"), flags, target, self.rustc, links]);
+        fresh::hash_bytes(key.to_string().as_bytes())
+    }
+
     /// The description of `package`'s run, as cargo runs it for the profile `lib`.
     fn unit(
         &self,
@@ -1100,11 +1136,7 @@ impl<'a> Runner<'a> {
             runs.push(target);
         }
         artifacts.push(&dir_name);
-        // Cargo keys a run by the profile of the run, which is the library's cut down to what
-        // a run is given (`get_profile_run_custom_build`), not by the whole library profile.
-        let run = self.profiles.get_profile_run_custom_build(&Profile { debuginfo, ..lib.clone() });
-        let key = json!([data.id.repr, features, format!("{run:?}"), flags, target, self.rustc]);
-        let hash = fresh::hash_bytes(key.to_string().as_bytes());
+        let hash = self.run_identity(package, for_host, lib);
         let out_dir = runs
             .join(&dir_name)
             .join("build")
@@ -1190,8 +1222,16 @@ impl<'a> Runner<'a> {
     }
 
     /// The script of `package`, compiled by blaze where it is not as it was: its executable,
-    /// and the hash of what it was compiled from and when, which its run depends on.
-    fn compile(&mut self, package: Package) -> Result<(PathBuf, (u64, SystemTime)), String> {
+    /// and the hash of what it was compiled from and when, which its run depends on. Cargo
+    /// compiles a script for the host, with its build-dependencies as the host has them, but
+    /// with the `features` of the unit it is run for (resolver 2 has a package's features apart
+    /// for the host and the target): a script that reads `cfg!(feature = ...)` is two scripts
+    /// when they differ, each in a directory of its own.
+    fn compile(
+        &mut self,
+        package: Package,
+        features: &[String],
+    ) -> Result<(PathBuf, (u64, SystemTime)), String> {
         if let Some(host_cargo) = self.asked.host_cargo {
             let id = &self.cargo[package].id.repr;
             let package = host_cargo
@@ -1205,7 +1245,7 @@ impl<'a> Runner<'a> {
             runner.host_flags = self.host_flags.clone();
             runner.host_cfgs = self.host_cfgs.clone();
             runner.raw_env = self.raw_env.clone();
-            let compiled = runner.compile(package);
+            let compiled = runner.compile(package, features);
             self.judged.extend(runner.judged);
             self.busy = runner.busy;
             return compiled;
@@ -1219,7 +1259,7 @@ impl<'a> Runner<'a> {
         let script = script.ok_or("the package has no build script")?;
         let host = self.profile(package, UnitFor::new_host(false), &CompileKind::Host);
         let root = PathBuf::from(script.root.as_str());
-        crates.push(self.described(package, "build_script_build", &root, &host, None)?);
+        crates.push(self.described(package, "build_script_build", &root, &host, features, None)?);
         let build_deps: Vec<_> = data
             .dependencies
             .iter()
@@ -1232,13 +1272,7 @@ impl<'a> Runner<'a> {
         }
         crates[0].deps = deps;
         let newest_run = self.newest_run(&crates);
-        let key = json!([data.id.repr, format!("{host:?}"), self.host_flags, self.rustc]);
-        let hash = fresh::hash_bytes(key.to_string().as_bytes());
-        let dir = self
-            .base
-            .join(self.profiles.get_dir_name())
-            .join("build")
-            .join(format!("{}-{hash:016x}", data.name));
+        let dir = self.compile_dir(package, features, &host);
         let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
         let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         let described = crate::cargo::own_script::with_mode(
@@ -1285,6 +1319,20 @@ impl<'a> Runner<'a> {
         let made =
             std::fs::metadata(&exe).and_then(|it| it.modified()).map_err(|it| it.to_string())?;
         Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))))
+    }
+
+    /// Where the script of `package` is compiled with `features` for the host's profile
+    /// `host`: one directory for each set of features it is compiled with.
+    fn compile_dir(&self, package: Package, features: &[String], host: &Profile) -> PathBuf {
+        let data = &self.cargo[package];
+        let mut features = features.to_vec();
+        features.sort();
+        let key = json!([data.id.repr, features, format!("{host:?}"), self.host_flags, self.rustc]);
+        let hash = fresh::hash_bytes(key.to_string().as_bytes());
+        self.base
+            .join(self.profiles.get_dir_name())
+            .join("build")
+            .join(format!("{}-{hash:016x}", data.name))
     }
 
     /// When the newest run of a script that one of `crates` is compiled with wrote its output,
@@ -1456,7 +1504,9 @@ impl<'a> Runner<'a> {
             true => Some(self.script(package, true)?),
             false => None,
         };
-        let mut described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        let features = &self.cargo[package].active_features;
+        let mut described =
+            self.described(package, &name, &root, &host, features, ran.as_deref())?;
         if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true })
             && !described.cfg.iter().any(|cfg| cfg == "proc_macro")
         {
@@ -1493,13 +1543,14 @@ impl<'a> Runner<'a> {
     }
 
     /// A crate of `package` rooted at `root`, as cargo has rustc compile it with the profile
-    /// `profile`, and with what its script said when it has one.
+    /// `profile` and the features `features`, and with what its script said when it has one.
     fn described(
         &self,
         package: Package,
         name: &str,
         root: &Path,
         profile: &Profile,
+        features: &[String],
         ran: Option<&Done>,
     ) -> Result<crate::cargo::own_script::Planned, String> {
         let data = &self.cargo[package];
@@ -1514,8 +1565,7 @@ impl<'a> Runner<'a> {
         let host_cfgs = self.host_cfgs.as_deref().ok_or_else(|| {
             format!("blaze has no built-in cfg answer for build-script host `{}`", self.asked.host)
         })?;
-        let features =
-            data.active_features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
+        let features = features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
         let mut cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
         let package_dir: &Path = data.manifest.parent().as_ref();
         let manifest: &Path = data.manifest.as_ref();
