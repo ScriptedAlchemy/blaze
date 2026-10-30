@@ -29,11 +29,13 @@ Then two scripts that count their runs (the verifier's cases of round 3,
 docs/reports/BUILDSCRIPT.md). Each watches the program's source, so each edit has cargo run it
 once. One generates the count, so each run is another build, which is cargo's; the other keeps
 it beside its `OUT_DIR`, where nothing compiled reads it, so the build stays the daemon's. The
-daemon runs a script in cargo's `OUT_DIR` and records the run as cargo's, so it runs once for an
-edit under `cargo ra-jit` too, whoever builds what it wrote, and a plain cargo build after the
-edits (in a cargo home in which `ra-jit enable` was run) runs it no more than one after cargo
-alone does: after one edit, after two, and after that plain build, the program prints what cargo's
-reference program prints and the script ran as many times as under cargo alone.
+script runs once for an edit under `cargo ra-jit` too, wherever blaze runs it (blaze's own build
+runs it in `target/ra-jit`, which cargo never writes to), whoever builds what it wrote: after one
+edit and after two, the program prints what cargo's reference program prints and the script ran
+as many times as under cargo alone. A plain cargo build after the edits (in a cargo home in which
+`ra-jit enable` was run) starts from cargo's own state of `target`, which blaze's build leaves as
+it was but for the programs it put there, and does what cargo alone does from that same state:
+the same program, and as many runs.
 
 Then the runs cargo makes one after another (`links`): a package with `links` whose script runs
 again, the metadata it prints dropped and printed again (`depmeta`), and the same from a package
@@ -167,6 +169,29 @@ def selftest():
             wrong.append(f"{name}: {len(found)} differences, not {count}: {found}")
     if wrong:
         raise SystemExit("the comparison of the program with cargo's is wrong:\n  " + "\n  ".join(wrong))
+    # Runs are counted wherever the build ran the script: cargo's directory, blaze's own for the
+    # host and for a target, and each of two runs of one package (host and target) as runs.
+    with tempfile.TemporaryDirectory() as target:
+        for at, count in [("debug/build/app-1", 1), ("ra-jit/build-scripts/debug/build/app-2", 2),
+                          ("ra-jit/build-scripts/debug/build/app-3", 3),
+                          ("ra-jit/build-scripts/x86_64-unknown-linux-gnu/debug/build/app-4", 4),
+                          ("ra-jit/build-scripts/debug/build/apple-5", 5), ("debug/build/native-6", 6)]:
+            os.makedirs(os.path.join(target, at, "out"))
+            with open(os.path.join(target, at, "runs"), "w") as out:
+                out.write(str(count))
+        for package, count in [("app", 10), ("native", 6), ("apple", 5), ("*", 21), ("none", 0)]:
+            if runs(target, package) != count:
+                wrong.append(f"runs of {package}: {runs(target, package)}, not {count}")
+        if runs(target, blazes=False) != 7:
+            wrong.append(f"runs in cargo's directory: {runs(target, blazes=False)}, not 7")
+    for how, expected, right in [("daemon", "daemon", True), ("cargo: a script printed something else", "daemon", False),
+                                 ("daemon", "cargo", True), ("cargo: a script printed something else", "cargo", True),
+                                 ("cargo", "cargo", False), ("cargo", "daemon", False),
+                                 ("unchanged: nothing to build", "cargo", False)]:
+        if (not_built_as(how, expected) is None) != right:
+            wrong.append(f"a build {how!r} where {expected!r} is expected is {'wrong' if right else 'right'}")
+    if wrong:
+        raise SystemExit("the count of runs or of who built is wrong:\n  " + "\n  ".join(wrong))
 
 
 def tails(home, lines=40):
@@ -366,9 +391,44 @@ def ran_a_script(out):
     return re.search(r"Running `[^`]*build-script-build", out) is not None
 
 
-def runs(target):
-    """How many times the script ran in `target`, by what it counts beside its `OUT_DIR`."""
-    return sum(int(open(p).read() or 0) for p in glob.glob(os.path.join(target, "debug", "build", "*", "runs")))
+def runs(target, package="*", blazes=True):
+    """How many times the script of `package` (of every package, by default) ran in `target`, by
+    what it counts beside its `OUT_DIR`, wherever the build ran it: in cargo's `debug/build`, and,
+    unless `blazes` is false, in blaze's own build-script directory,
+    `ra-jit/build-scripts/[<triple>/]<profile>/build`, where the owned build runs it and which
+    cargo never writes to. A script that ran in both is counted in both, as two runs are."""
+    found = glob.glob(os.path.join(target, "debug", "build", f"{package}-*", "runs"))
+    if blazes:
+        found += glob.glob(os.path.join(target, "ra-jit", "build-scripts", "**", "build", f"{package}-*", "runs"),
+                           recursive=True)
+    return sum(int(open(p).read() or 0) for p in found)
+
+
+def outputs(target, package):
+    """What the runs of `package`'s script printed, wherever the build ran it (as `runs`)."""
+    found = glob.glob(os.path.join(target, "debug", "build", f"{package}-*", "output"))
+    found += glob.glob(os.path.join(target, "debug", "build", package, "*", "run", "stdout"))
+    found += glob.glob(os.path.join(target, "ra-jit", "build-scripts", "**", "build", f"{package}-*", "output"),
+                       recursive=True)
+    return found
+
+
+def owned_or_loud(how):
+    """Whether a build is blaze's own, or one handed to cargo that says why: a build cargo did
+    without saying so is neither."""
+    return how == "daemon" or how.startswith("cargo: ")
+
+
+def not_built_as(how, expected):
+    """Why a build said to be `how` (`how_built`) is not the one `expected`: "daemon", blaze's own
+    build, or "cargo", a build cargo alone runs more than an edit for (a script that printed
+    something else, a build-dependency's that ran again), which is blaze's own build or a
+    handoff that says why. `None` when it is."""
+    if expected == "daemon" and how != "daemon":
+        return f"built by {how}, expected blaze's build"
+    if expected == "cargo" and not owned_or_loud(how):
+        return f"built by {how}, expected blaze's build or a handoff that says why"
+    return None
 
 
 def counted(bin_dir, name, files, daemon):
@@ -391,11 +451,11 @@ def counted(bin_dir, name, files, daemon):
     reference_program = os.path.join(ws, "target-ref", "debug", name)
     wrong = []
 
-    def compare(step, how):
+    def compare(step, how, against="target-ref", ours=None):
         ran = subprocess.run([program], capture_output=True, timeout=60)
-        theirs = subprocess.run([reference_program], capture_output=True, timeout=60)
+        theirs = subprocess.run([os.path.join(ws, against, "debug", name)], capture_output=True, timeout=60)
         problems = differences(ran, theirs)
-        ours, cargos = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
+        ours, cargos = ours if ours is not None else runs(os.path.join(ws, "target")), runs(os.path.join(ws, against))
         if ours != cargos:
             problems.append(f"the script ran {ours} times, under cargo alone {cargos}")
         wrong.extend((f"{name}: {step}", why) for why in problems)
@@ -421,19 +481,29 @@ def counted(bin_dir, name, files, daemon):
             if daemon and how != "daemon":
                 wrong.append((f"{name}: {step}", f"built by {how}, not the daemon"))
             compare(step, how)
-        # Plain cargo in the directory `cargo ra-jit` built in, once `ra-jit enable` was run:
-        # cargo's units of the package are the ones `cargo ra-jit`'s cargo built, since the
-        # workspace wrapper is part of their hash, and the script ran for both edits. Cargo finds
-        # it run, as cargo alone does in its own directory. (A cargo without the wrapper has units
-        # of its own, which it builds and runs the script for the first time in.)
+        # Plain cargo in the directory `cargo ra-jit` built in, once `ra-jit enable` was run.
+        # blaze's own build runs scripts and keeps what it built in its own directory,
+        # `target/ra-jit`, and never writes cargo's units: plain cargo starts from cargo's own
+        # state of `target`, whatever `cargo ra-jit` handed to cargo (in this table, nothing
+        # but the programs blaze put where cargo would). It has to do what cargo alone does from
+        # that same state: the reference is cargo alone in a copy of `target` without blaze's
+        # directory, outside the package so that nothing the package lists changes, the program
+        # is compared with what that build makes, and the runs of the plain build (those in
+        # cargo's directory, with any the daemon settling it made) with that build's.
         plain_env = cargo_ra_jit.enabled_home(root, env)
+        state = os.path.join(root, "target-plain-ref")
+        shutil.copytree(os.path.join(ws, "target"), state, symlinks=True,
+                        ignore=lambda at, _: ["ra-jit"] if os.path.samefile(at, os.path.join(ws, "target")) else [])
         plain = subprocess.run(["cargo", "build", "-v"], cwd=ws, env=plain_env, capture_output=True, text=True, timeout=7200)
-        _, built = reference.cargo("build", "-v")
+        Side(ws, plain_env, "plain").settled()
+        built = subprocess.run(["cargo", "build", "-v"], cwd=ws, env=dict(env, CARGO_TARGET_DIR=state),
+                               capture_output=True, text=True, timeout=7200)
         if plain.returncode != 0 or built.returncode != 0:
             raise SystemExit(f"a plain cargo build failed: {plain.stderr[-1500:]}{built.stderr[-1500:]}")
         if ran_a_script(plain.stderr) != ran_a_script(built.stderr):
             wrong.append((f"{name}: a plain cargo build", f"ran a build script: {ran_a_script(plain.stderr)}, under cargo alone {ran_a_script(built.stderr)}"))
-        compare("a plain cargo build", "a script ran" if ran_a_script(plain.stderr) else "no script ran")
+        compare("a plain cargo build", "a script ran" if ran_a_script(plain.stderr) else "no script ran",
+                against=state, ours=runs(os.path.join(ws, "target"), blazes=False))
     finally:
         side.cargo("stop")
     if not wrong:
@@ -517,11 +587,27 @@ def inactive_links(bin_dir):
 
 
 def continuation_edit(bin_dir):
-    """An edit at Cargo's stand-in must invalidate a run completed by the daemon."""
+    """An input edited while the script runs, after the build judged it to run and before what it
+    read is compiled, is an edit for the next build, as for cargo, which dates a run by when it
+    began (`invocation_time`): the next build runs the script again and the program is cargo's.
+    The script makes the edit itself, in the build of `cargo ra-jit` asked with `EDIT_DURING_RUN`,
+    a variable it does not say it reads, wherever that build runs it: in blaze's own build, or in
+    cargo's leg through the stand-in where a build is handed to cargo. Cargo alone builds the
+    program at both inputs, the one judged and the one edited, as the two builds of `cargo
+    ra-jit` see them, and runs the script as often."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-cont-", dir="/tmp"))
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
     files = dict(DROPPER)
     files["Cargo.toml"] = files["Cargo.toml"].replace("dropper", "counter")
+    files["build.rs"] = files["build.rs"].replace(
+        '    fs::write(out.join("generated.rs")',
+        '    if env::var_os("EDIT_DURING_RUN").is_some() {\n'
+        '        let main = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/main.rs");\n'
+        '        let text = fs::read_to_string(&main).unwrap();\n'
+        '        assert!(text.contains("    8\\n"));\n'
+        '        fs::write(&main, text.replace("    8\\n", "    9\\n")).unwrap();\n'
+        '    }\n'
+        '    fs::write(out.join("generated.rs")', 1)
     for path, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         with open(os.path.join(ws, path), "w") as out:
@@ -529,6 +615,7 @@ def continuation_edit(bin_dir):
     env = cargo_ra_jit.base_env(home)
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
     env["RA_JIT_CACHE"] = "off"
+    env.pop("EDIT_DURING_RUN", None)
     side, reference = Side(ws, env, True), Side(ws, env, False)
     wrong = []
     try:
@@ -539,60 +626,29 @@ def continuation_edit(bin_dir):
         _, states = wait_warm(side, ws)
         if states != ["ready"]:
             raise SystemExit(f"continuation: not ready: {states}{tails(home)}")
-        wrappers = glob.glob(os.path.join(ws, "target/debug/build/*/build-script-build"))
-        if len(wrappers) != 1:
-            raise SystemExit(f"continuation: expected one stand-in, found {wrappers}")
-        wrapper = wrappers[0]
-        with open(wrapper) as source:
-            lines = source.read()
-        if not lines.startswith("#!/bin/sh\n") or "build-script" not in lines:
-            raise SystemExit(f"continuation: not a script stand-in: {wrapper}")
-        # The stand-in is the file rustc linked, `build_script_build-<hash>`, and cargo makes
-        # `build-script-build` of it again on every build, even of a fresh script: a hard link on
-        # Linux, so an edit of either name is in both, and a copy on macOS (rust-lang/cargo#7821),
-        # which replaces an edit of `build-script-build` before cargo runs it. The edit goes in
-        # the file cargo makes it from.
-        said = [shlex.split(line) for line in lines.splitlines() if line.startswith("RA_JIT_BUILD_SCRIPT=")]
-        real = said[0][0].removeprefix("RA_JIT_BUILD_SCRIPT=") if said else ""
-        linked = real.removesuffix(".real") if real.endswith(".real") else None
-        if not linked or not os.path.isfile(linked):
-            raise SystemExit(f"continuation: no file rustc linked the stand-in at: {lines!r}")
-        # This runs after Cargo chose to invoke the stand-in, immediately before
-        # production consume. It cannot affect the daemon's direct execution.
-        edit = '''if test -n "$RA_JIT_SCRIPT_CONTINUATION"; then
-python3 - <<'PY'
-import os
-from pathlib import Path
-p = Path(os.environ["CARGO_MANIFEST_DIR"]) / "src/main.rs"
-s = p.read_text()
-assert "    8\\n" in s
-p.write_text(s.replace("    8\\n", "    9\\n"))
-PY
-fi
-'''
-        with open(linked, "w") as out:
-            out.write(lines.replace("#!/bin/sh\n", "#!/bin/sh\n" + edit, 1))
         source = os.path.join(ws, "src/main.rs")
         cargo_ra_jit.rewrite(source, "    7\n", "    8\n")
-        # The reference executes once for the intermediate input, as judgment did.
+        # The reference runs once for the input the build judged.
         _, built = reference.cargo("build", "-q")
         if built.returncode:
             raise SystemExit(built.stderr)
-        build(side, "continuation: edit during Cargo's leg", home)
+        _, ran = side.cargo("build", env={"EDIT_DURING_RUN": "1"})
+        if ran.returncode:
+            raise SystemExit(f"continuation: the build whose script edits failed:\n{(ran.stdout + ran.stderr)[-3000:]}{tails(home)}")
         with open(source) as edited:
             if "    9\n" not in edited.read():
-                # Without it the build compared is not the one this is about, and cargo alone,
-                # which runs the script for the dropped watches anyway, is one edit ahead.
-                wrong.append("continuation: cargo did not run the stand-in that edits the program")
+                # Without it the build compared is not the one this is about.
+                wrong.append("continuation: the script did not edit the program while it ran")
                 return wrong
+        how = how_built(build(side, "continuation: the build after the edit", home))
         _, built = reference.cargo("build", "-q")
         ours = subprocess.run([os.path.join(ws, "target/debug/counter")], capture_output=True)
         theirs = subprocess.run([os.path.join(ws, "target-ref/debug/counter")], capture_output=True)
-        wrong += differences(ours, theirs, built)
+        wrong += [f"continuation: {why}" for why in differences(ours, theirs, built)]
         counts = runs(os.path.join(ws, "target")), runs(os.path.join(ws, "target-ref"))
         if counts != (3, 3) or ours.stdout != b"3 9\n":
             wrong.append(f"continuation: runs {counts}, output {ours.stdout!r}, expected (3, 3) and '3 9'")
-        print(f"continuation: input changed at consumption: {ours.stdout!r}/{theirs.stdout!r}, runs {counts}")
+        print(f"continuation: input changed while the script ran: {ours.stdout!r}/{theirs.stdout!r}, runs {counts}, {how}")
     finally:
         side.cargo("stop")
         shutil.rmtree(root, ignore_errors=True)
@@ -729,10 +785,6 @@ fn main() {
     side, reference = Side(ws, env, True), Side(ws, env, False)
     wrong = []
 
-    def count(target, package):
-        found = glob.glob(os.path.join(ws, target, "debug", "build", f"{package}-*", "runs"))
-        return sum(int(open(p).read() or 0) for p in found)
-
     try:
         cold = build(side, f"{kind}: cold", home)
         _, built = reference.cargo("build", "-q")
@@ -759,12 +811,13 @@ fn main() {
             ours = subprocess.run([os.path.join(ws, "target/debug/app")], capture_output=True)
             theirs = subprocess.run([os.path.join(ws, "target-ref/debug/app")], capture_output=True)
             problems = differences(ours, theirs, built)
-            counts = tuple(count(t, p) for p in ("app", name) for t in ("target", "target-ref"))
+            counts = tuple(runs(os.path.join(ws, t), p) for p in ("app", name) for t in ("target", "target-ref"))
             if counts[0] != counts[1] or counts[2] != counts[3]:
                 problems.append(f"runs app {counts[0]}/{counts[1]}, {name} {counts[2]}/{counts[3]} (ours/cargo)")
-            if how.split(":")[0] != expected:
-                problems.append(f"built by {how}, expected {expected}")
-            elif unknown and expected == "cargo" and "no record of" not in how and "outside the workspace" not in how:
+            built_as = not_built_as(how, expected)
+            if built_as:
+                problems.append(built_as)
+            elif unknown and how.startswith("cargo: ") and "no record of" not in how and "outside the workspace" not in how:
                 problems.append(f"built by {how}, not for the run the daemon has no record of")
             wrong.extend(f"{kind}: {step}: {why}" for why in problems)
             print(f"{kind}: {step}: {ours.stdout!r}/{theirs.stdout!r} exit {ours.returncode}/{theirs.returncode}, "
@@ -803,7 +856,7 @@ def main():
     try:
         cold = build(side, "cold", home)
         # What the script's tool said the first time, in what cargo kept: the lines cargo does not read.
-        printed = glob.glob(os.path.join(ws, "target", "debug", "build", "app-*", "output")) + glob.glob(os.path.join(ws, "target", "debug", "build", "app", "*", "run", "stdout"))
+        printed = outputs(os.path.join(ws, "target"), "app")
         said = [open(p, errors="replace").read() for p in printed]
         if not any("bundler: built in" in s for s in said):
             raise SystemExit(f"the script's tool did not talk in the first build, which is what this tests: {printed}{cold[-1500:]}")
