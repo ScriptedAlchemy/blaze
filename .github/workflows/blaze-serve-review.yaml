@@ -32,6 +32,30 @@ jobs:
         with:
           platform: linux-x64
           sha256: ${{ inputs.bundle-linux-x64-sha256 }}
+      - name: Prove a changed test executable is rejected
+        run: |
+          python3 - <<'PYNEGATIVE'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          manifest = json.loads(Path(os.environ["BLAZE_BUNDLE"]).read_text())
+          executable = Path(manifest["sets"]["serve-server"]["runs"][0]["exe"])
+          with executable.open("r+b") as binary:
+              original = binary.read(1)
+              assert original, "empty server test executable"
+              binary.seek(0)
+              binary.write(bytes([original[0] ^ 1]))
+          try:
+              result = subprocess.run([sys.executable, "-I", ".github/scripts/bundle.py",
+                                       "test", "serve-server", "--", "--list"],
+                                      capture_output=True, text=True)
+              print(result.stdout + result.stderr)
+              assert result.returncode != 0, "corrupted test executable was accepted"
+              assert "changed since it was unpacked" in result.stdout + result.stderr, result
+              print(f"Negative control: corrupted executable rejected with exit {result.returncode}")
+          finally:
+              with executable.open("r+b") as binary:
+                  binary.write(original)
+          PYNEGATIVE
       - name: Check server formatting
         run: cargo fmt -p blaze-serve -- --check
       - name: Test the actual server, HTTP routes, and publication races

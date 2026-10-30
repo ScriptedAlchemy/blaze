@@ -41,7 +41,7 @@ jobs:
       # Both binaries were built by the producer with the same compiler, flags
       # and benchmark profile. They are paired on this one runner, as before.
       - name: Check benchmark provenance rejection
-        run: python3 -B .github/scripts/test_bench_pair.py
+        run: python3 -B .github/scripts/test_bench_pair.py -v
       - name: Verify benchmark pair provenance
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
