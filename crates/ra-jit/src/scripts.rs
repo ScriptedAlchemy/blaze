@@ -41,11 +41,11 @@ use blaze_build_script::{
 };
 use blaze_manifest::{
     config::{CompileKind, Config},
-    profiles::{Profile, ProfilePackage, Profiles, UnitFor},
+    profiles::{DebugInfo, Profile, ProfilePackage, Profiles, UnitFor},
 };
 use ide_db::base_db::TargetKind;
 use project_model::{CargoWorkspace, DepKind, Package, ProjectWorkspace, ProjectWorkspaceKind};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::json;
 
 /// Where below the target directory the scripts are compiled and run.
@@ -221,6 +221,11 @@ pub(crate) struct Asked<'a> {
     /// only for the host; `None` for every package, treated as a target package.
     pub(crate) packages: Option<&'a FxHashMap<String, bool>>,
     pub(crate) host_cargo: Option<&'a CargoWorkspace>,
+    /// The packages built for the target that the build builds for the host too, with the same
+    /// features ([`shared_with_the_host`]): cargo runs the script of one of them once for both
+    /// when the profile of its run is the same for both too ([`Runner::shares`]). `None` when
+    /// the build does not say, and every package built for the target is taken for one.
+    pub(crate) shared: Option<&'a FxHashSet<String>>,
 }
 
 /// Whether this process runs the build scripts of what it loads: a whole build's worker.
@@ -290,6 +295,7 @@ impl Own {
             explicit_target: self.explicit_target,
             packages: Some(&self.packages),
             host_cargo: self.host_cargo.as_ref(),
+            shared: None,
         }
     }
 }
@@ -380,6 +386,32 @@ pub(crate) fn run_producers(
 /// or one of them would run twice, once in each pass.
 fn for_the_host_alone(asked: &Asked<'_>, id: &str) -> bool {
     asked.packages.is_some_and(|it| it.get(id) == Some(&false))
+}
+
+/// The packages `asked` builds for the target that `host`, the build's description of what it
+/// builds for the host, has with the same features. Cargo has one unit of a script's run of
+/// such a package when what the run is keyed by is the same for the host and the target
+/// (`traverse_and_share`, which merges a host unit into the target unit it probes for), and
+/// the features are the part of that key the two descriptions of the build give.
+fn shared_with_the_host(
+    cargo: &CargoWorkspace,
+    host: &CargoWorkspace,
+    asked: &Asked<'_>,
+) -> FxHashSet<String> {
+    let features = |cargo: &CargoWorkspace, package: Package| {
+        cargo[package].active_features.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+    };
+    let for_target = |id: &String| asked.packages.is_some_and(|it| it.get(id) == Some(&true));
+    cargo
+        .packages()
+        .filter(|&it| for_target(&cargo[it].id.repr))
+        .filter(|&it| {
+            let id = &cargo[it].id.repr;
+            let at = host.packages().find(|&at| host[at].id.repr == *id);
+            at.is_some_and(|at| features(host, at) == features(cargo, it))
+        })
+        .map(|it| cargo[it].id.repr.clone())
+        .collect()
 }
 
 fn run_with(
@@ -482,6 +514,8 @@ fn pass(
     let sysroot: PathBuf = workspace.sysroot.root().map(|it| PathBuf::from(it.as_str())).context(
         "blaze runs build scripts with the standard library's source, and has no toolchain",
     )?;
+    let shared = asked.host_cargo.map(|host| shared_with_the_host(cargo, host, asked));
+    let asked = &Asked { shared: shared.as_ref().or(asked.shared), ..*asked };
     let mut runner = Runner::new(leases, cargo, asked, sysroot, &workspace.rustc_cfg)?;
     if let Some(failure) = asked.env.get("BLAZE_PRODUCER_PROBE_FAILURE") {
         match std::fs::remove_file(failure) {
@@ -991,6 +1025,48 @@ impl<'a> Runner<'a> {
         path_package_fingerprint(data.manifest.parent().as_ref())
     }
 
+    /// The debuginfo of a run of `package`'s script for the profile `lib`. Cargo defers the
+    /// debuginfo of a host unit and, in a build for the host, settles it once it knows whether
+    /// the target has the same unit (`traverse_and_share`'s probe): the target's, so that the two
+    /// are one unit and run once, or none, for a unit the host alone has.
+    fn debuginfo(&self, package: Package, for_host: bool, lib: &Profile) -> DebugInfo {
+        match for_host && !self.cross && lib.debuginfo.is_deferred() {
+            true if self.shares(package) => lib.debuginfo.finalize(),
+            true => lib.debuginfo.weaken(),
+            false => lib.debuginfo,
+        }
+    }
+
+    /// Whether cargo has one run of `package`'s script for the host and the target, in a build
+    /// for the host: what the run is keyed by is the same for both, the features
+    /// ([`Asked::shared`]) and the profile of the run, and so are the runs of the dependencies
+    /// with `links` it is run after (cargo's unit of a run depends on theirs). A build that does
+    /// not say which packages share has every package of `packages` that is not the host's
+    /// alone share: the producer plan, whose `packages` says so of each, having proved it.
+    fn shares(&self, package: Package) -> bool {
+        let data = &self.cargo[package];
+        if self.cross {
+            return false;
+        }
+        let Some(shared) = self.asked.shared else {
+            return self.asked.packages.is_none_or(|it| it.get(&data.id.repr) != Some(&false));
+        };
+        let run = |for_host: bool| {
+            let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+            let lib = self.profile(package, unit_for, &self.kind(for_host));
+            let lib = Profile { debuginfo: lib.debuginfo.finalize(), ..lib };
+            self.profiles.get_profile_run_custom_build(&lib)
+        };
+        shared.contains(&data.id.repr)
+            && format!("{:?}", run(true)) == format!("{:?}", run(false))
+            && data
+                .dependencies
+                .iter()
+                .filter(|it| it.kind == DepKind::Normal && self.runs(it.pkg))
+                .filter(|it| self.cargo[it.pkg].links.is_some())
+                .all(|it| self.shares(it.pkg))
+    }
+
     /// The description of `package`'s run, as cargo runs it for the profile `lib`.
     fn unit(
         &self,
@@ -1001,16 +1077,7 @@ impl<'a> Runner<'a> {
         dependencies: Vec<unit::Dependency>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
-        // Cargo keeps deferred native host debuginfo only when a target unit
-        // has the same complete key. The source-producer adapter supplies that
-        // sharing proof, not merely package reachability in both domains.
-        let build_only =
-            self.asked.packages.is_some_and(|packages| packages.get(&data.id.repr) == Some(&false));
-        let debuginfo = if for_host && !self.cross && build_only && lib.debuginfo.is_deferred() {
-            lib.debuginfo.weaken()
-        } else {
-            lib.debuginfo
-        };
+        let debuginfo = self.debuginfo(package, for_host, lib);
         let mut features = data.active_features.clone();
         features.sort();
         let dir_name = self.profiles.get_dir_name().to_owned();
@@ -1033,7 +1100,10 @@ impl<'a> Runner<'a> {
             runs.push(target);
         }
         artifacts.push(&dir_name);
-        let key = json!([data.id.repr, features, format!("{lib:?}"), flags, target, self.rustc]);
+        // Cargo keys a run by the profile of the run, which is the library's cut down to what
+        // a run is given (`get_profile_run_custom_build`), not by the whole library profile.
+        let run = self.profiles.get_profile_run_custom_build(&Profile { debuginfo, ..lib.clone() });
+        let key = json!([data.id.repr, features, format!("{run:?}"), flags, target, self.rustc]);
         let hash = fresh::hash_bytes(key.to_string().as_bytes());
         let out_dir = runs
             .join(&dir_name)

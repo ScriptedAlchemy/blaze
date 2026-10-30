@@ -655,6 +655,25 @@ def continuation_edit(bin_dir):
     return wrong
 
 
+# A package the program depends on and its script is compiled with (a dependency and a
+# build-dependency at once), built for the host, whose script counts its runs beside its
+# `OUT_DIR`. Cargo has one unit of that run for both, and runs it once.
+SHARED = {
+    "Cargo.toml": COUNTER["Cargo.toml"].replace("counter", "shared")
+                  + '\n[dependencies]\nboth = { path = "both" }\n\n[build-dependencies]\nboth = { path = "both" }\n',
+    "build.rs": COUNTER["build.rs"].replace(
+        '    fs::write(out.join("../runs"), runs.to_string()).unwrap();\n',
+        '    fs::write(out.join("../runs"), runs.to_string()).unwrap();\n'
+        '    println!("cargo::rustc-env=FROM_BOTH={}", both::value());\n'),
+    "src/main.rs": 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n\nfn number() -> u32 {\n    7\n}\n\n'
+                   'fn main() {\n    println!("{} {} {} {}", RUNS, number(), both::value(), env!("FROM_BOTH"));\n}\n',
+    "both/Cargo.toml": '[package]\nname = "both"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
+    "both/build.rs": LOGGER["build.rs"].replace("src/main.rs", "build.rs").replace(
+        '"pub const RUNS: u32 = 0;\\n"', 'format!("pub const RUNS: u32 = {runs};\\n")'),
+    "both/src/lib.rs": 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n\npub fn value() -> u32 {\n    RUNS\n}\n',
+}
+
+
 def depmeta(bin_dir):
     """A native dependency whose rerun stops printing a `cargo::metadata` key: its parent reruns
     without the `DEP_*` variable it had, as cargo runs it, and the program is the one cargo builds."""
@@ -894,7 +913,7 @@ def main():
     else:
         shutil.rmtree(root, ignore_errors=True)
     for name, files, daemon in [("counter", COUNTER, False), ("logger", LOGGER, True), ("quiet", QUIET, True),
-                                ("dropper", DROPPER, False)]:
+                                ("dropper", DROPPER, False), ("shared", SHARED, False)]:
         wrong += [f"{step}: {why}" for step, why in counted(bin_dir, name, files, daemon)]
     wrong += newly_watched_env(bin_dir)
     wrong += newly_watched_env(bin_dir, "DEP_USER_VALUE", "x")
