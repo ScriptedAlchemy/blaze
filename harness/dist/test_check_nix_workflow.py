@@ -175,6 +175,20 @@ def main() -> int:
         False,
         must_mention="cache allocation belongs to the bundle producer",
     )
+    # A bundle consumer may restore the producer's Nix shell read-only (`cache-save: false`,
+    # literally); any other save policy could write the budget and is refused.
+    case(
+        "consumer composite restores the producer's cache read-only",
+        text.replace("      - uses: actions/checkout@v7", "      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix\n          cache-save: false\n      - uses: actions/checkout@v7", 1),
+        True,
+    )
+    for save in ("true", "${{ github.ref == 'refs/heads/main' }}", "'false'"):
+        case(
+            f"consumer composite with cache-save: {save}",
+            text.replace("      - uses: actions/checkout@v7", f"      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix\n          cache-save: {save}\n      - uses: actions/checkout@v7", 1),
+            save == "'false'",
+            must_mention=None if save == "'false'" else "cache allocation belongs to the bundle producer",
+        )
 
     # A gate that is only mentioned is not a gate. The argument keeps the command's exact
     # spelling, so a substring check would pass it.

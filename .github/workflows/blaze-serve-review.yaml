@@ -28,6 +28,8 @@ jobs:
           components: rustfmt
           llvm: build
           shell: bench
+          cache: nix
+          cache-save: false
       - uses: ./.github/actions/bundle
         with:
           platform: linux-x64
@@ -84,10 +86,12 @@ jobs:
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-syntax -- empty_crate:: --test-threads=2
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- answers:: --test-threads=2
+      # Against the bundle's debug ra-jit (set serve-debug-cli), as before: the dev profile keeps
+      # debug_assertions and overflow checks, which the release CLI drops.
       - name: Verify real probe artifacts with rustc and LLVM
         if: ${{ !cancelled() }}
         run: |
-          python3 -I harness/dist/empty_probe.py --blaze target/release/ra-jit --work target/empty-probe-review
+          python3 -I harness/dist/empty_probe.py --blaze "$(python3 -I .github/scripts/bundle.py path serve-debug-cli ra-jit)" --work target/empty-probe-review
       - name: Test compiler acceptance and constant evaluation
         if: ${{ !cancelled() }}
         run: |
@@ -145,6 +149,8 @@ jobs:
           components: rustfmt
           llvm: build
           shell: bench
+          cache: nix
+          cache-save: false
       - uses: ./.github/actions/bundle
         with:
           platform: linux-x64

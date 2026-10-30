@@ -31,6 +31,41 @@ the executable pins, and compares the pair on one runner. The existing 3-second 
 10% threshold and retry on a slowdown are unchanged. A missing base is a failure unless
 the producer explicitly records that the base lacks `crates/ra-jit-bench`.
 
+What changed on purpose in the server checks, beside where the binaries come from (opus's
+cross-review of 2026-10-30, S1 to S5):
+
+- The empty probe (`harness/dist/empty_probe.py`) used a debug ra-jit the job built
+  (`cargo build -p ra-jit --bin ra-jit`), and still does: the build set `serve-debug-cli` is
+  that build, and the probe takes `bundle.py path serve-debug-cli ra-jit`. The dev profile keeps
+  `debug_assertions` and overflow checks, which the release CLI drops.
+- The saved-source replay used a release ra-jit built without `--features llvm`; it now uses the
+  bundle's llvm-featured binary under `--backend cranelift`. The bundle is one binary with both
+  backends, as the brief fixes it, so a `cfg(feature = "llvm")` difference on the cranelift path
+  is now covered by every check of that binary rather than exercised by a build without it.
+- The server's tests were built by rustup's 1.99.0 outside the Nix shell, against the runner's
+  C toolchain and libc; the bundle builds every set in `.#bench`, so they are built by the
+  flake's 1.99.0 with Nix's cc and glibc. Same compiler release, one build environment for
+  everything a run checks.
+- `serve-syntax`, `serve-server` and `serve-wire` are `cargo test -p <crate>` without a target
+  selector, so those crates' doc-tests run for real in the build job, unfiltered (before, only
+  the doc-tests matching the step's filter ran). Stronger; a doc-test failure in one of them now
+  fails `build linux-x64`.
+- `server-tests`, `saved-spec` and bench's `tango` call the toolchain action with `cache: nix`
+  and `cache-save: false`: they restore the producer's Nix shell entry read-only instead of
+  rebuilding the rust-overlay toolchains (about 75 s each on PR18), and spend no budget.
+  `check_nix_workflow.py` accepts the toolchain action's `cache:` only with `cache-save`
+  literally `false`, and still refuses any cache write in nix-live.
+
+`nix-live.yaml`'s `demo` and `live-edits` jobs still build ra-jit themselves (`cargo test
+--release -p ra-jit-live`, and on macOS `cargo build --release -p ra-jit`), against the rule.
+They are not converted here because nix-live is a run of its own (push to `dist/*`, the nightly
+schedule, by hand), not called by `pr.yaml`, and artifacts do not cross runs: converting them
+means moving the two jobs into a `workflow_call` consumer that `pr.yaml` calls for the `nix`
+area, with a `nix-live` test set (`--release -p ra-jit-live`) in the bundle and the macOS job
+taking the bundle's release ra-jit for `harness/live_e2e.py`, while `unit-graphs`, `nix`,
+`nix-darwin` and `nightly` stay in nix-live; `check_nix_workflow.py`'s expected-job table moves
+with them. That is the next step for the nix area, not done in this change.
+
 Measured baseline, fork PR18 head `e442c970` (2026-10-30):
 
 | Work | Before (seconds) | After |
@@ -102,5 +137,12 @@ saved-cranelift 1151 and saved-llvm 1058 to a failure; basic 5573 to a failure. 
 run 41035852934: 3 h 13 min from start to the aggregates, with the macOS lane jobs waiting up to
 90 min for a runner (the fork runs five macOS jobs at once). Total runner time of the 14 lane
 jobs there: about 18 h.
+
+What changed on purpose: the lane jobs checked out the pull request's head
+(`github.event.pull_request.head.sha`); as bundle consumers they check out the run's default
+ref, the pull request merged into its base, because the bundle is built from that tree and the
+bundle action refuses any other. The C2 lanes therefore test what would be merged, as `protocol`
+already did, and a lane can fail on a change the base made that the head never had; that is the
+intended subject, since it is the commit the merge would produce.
 
 After: pending completed runs of `pr.yaml` on this branch. Negative control: pending.

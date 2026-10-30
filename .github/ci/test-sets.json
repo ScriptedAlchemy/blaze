@@ -68,6 +68,10 @@
     "platforms": ["linux-x64"],
     "build": ["-p", "blaze-metadata", "--example", "metadata"]
   },
+  "serve-debug-cli": {
+    "platforms": ["linux-x64"],
+    "build": ["-p", "ra-jit", "--bin", "ra-jit"]
+  },
   "bench-head": {
     "platforms": ["linux-x64"],
     "bench": ["-p", "ra-jit-bench", "--bench", "store"],
