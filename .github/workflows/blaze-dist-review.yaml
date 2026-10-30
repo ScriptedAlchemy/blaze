@@ -64,8 +64,133 @@ jobs:
       - name: Check complete C2 fixture and group coverage
         run: nix develop .#bench --command python3 -I -B harness/dist/buildspec.py --self-test
 
+  # The C2 runtime matrix below used to repeat, in each of its 14 jobs, the same 20-80 minutes
+  # of lane-independent work: the host's tracing-integrity and platform-contract checks, a
+  # release build of the CLI, and the owned macro runtime's bootstrap. Each now runs once per
+  # OS: the checks in `c2-host`, the build and bootstrap in `c2-compiler`, which publishes what
+  # it built as an artifact with a digest receipt that every lane verifies before it runs.
+  c2-host:
+    name: C2 host contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Verify execution tracing and audit integrity
+        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
+      - name: Validate complete native platform and immutable input contracts
+        run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
+
+  c2-compiler:
+    name: C2 compiler (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Record exact source, host, and pinned compilers
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/c2-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            rustc -vV
+            cargo -V
+            nix develop .#bench --command llvm-config --version
+          } > "$RUNNER_TEMP/c2-evidence/identity.txt"
+      - name: Build the actual CLI with both owned backends
+        run: nix develop .#bench --command cargo build --locked --release -p ra-jit --bins --features llvm
+      - name: Bootstrap a fresh complete owned macro runtime
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
+            > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
+      # The receipt names the compiler and the runtime by digest, at the paths the lanes put
+      # them back at. The runtime's own bootstrap receipt (image-pins.json) pins the compiler
+      # that built it; a lane refuses a compiler that is not that one.
+      - name: Publish the compiler and the owned runtime with a digest receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/c2-stage"
+          out="$RUNNER_TEMP/c2-compiler"
+          mkdir -p "$stage/c2-owned-server" "$out"
+          cp "$GITHUB_WORKSPACE/target/release/ra-jit" "$stage/ra-jit"
+          # The runtime, its bootstrap receipt and the bootstrap's audit: not the bootstrap's
+          # store, home, target and object file, which no lane reads.
+          (cd "$RUNNER_TEMP/c2-owned-server" && find . -maxdepth 1 -type f ! -name server.o -exec cp {} "$stage/c2-owned-server/" \;)
+          (cd "$stage" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs shasum -a 256) > "$out/c2-compiler.sha256"
+          tar -cf "$out/c2-compiler.tar" -C "$stage" ra-jit c2-owned-server
+          (cd "$out" && shasum -a 256 c2-compiler.tar > c2-compiler.tar.sha256)
+          cp "$out/c2-compiler.sha256" "$RUNNER_TEMP/c2-evidence/compiler.sha256"
+          {
+            echo '### C2 compiler (${{ matrix.os }})'
+            echo
+            echo '```'
+            cat "$out/c2-compiler.tar.sha256"
+            grep -E ' (ra-jit|c2-owned-server/blaze-proc-macro-srv)$' "$out/c2-compiler.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -l "$out" "$stage/c2-owned-server"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: c2-compiler-${{ matrix.os }}
+          path: ${{ runner.temp }}/c2-compiler
+          if-no-files-found: error
+          compression-level: 3
+          retention-days: 7
+      - name: Keep bootstrap and tool audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: c2-bootstrap-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/c2-evidence
+            ${{ runner.temp }}/c2-owned-server/image-pins.json
+            ${{ runner.temp }}/c2-owned-server/tool-controls.json
+            ${{ runner.temp }}/c2-owned-server/*.watchdog.json
+            ${{ runner.temp }}/c2-owned-server/*audit.json
+            ${{ runner.temp }}/c2-owned-server/*external-execs.json
+            ${{ runner.temp }}/c2-owned-server/*.exec
+          if-no-files-found: warn
+
   c2-runtime:
     name: C2 runtime (${{ matrix.os }}, ${{ matrix.lane }})
+    needs: c2-compiler
+    # A lane runs whenever its own OS's compiler was published: the other OS's producer
+    # failing must not skip this one. Without the artifact, the download below fails the lane.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -85,9 +210,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: ./.github/actions/toolchain
         with:
-          llvm: build
-      - name: Verify execution tracing and audit integrity
-        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
+          llvm: run
+      - name: Fetch the harness shell
+        run: nix develop .#bench --command true
       - name: Record exact source, host, and pinned compilers
         shell: bash
         run: |
@@ -99,20 +224,39 @@ jobs:
             cargo -V
             nix develop .#bench --command llvm-config --version
           } > "$RUNNER_TEMP/c2-evidence/identity.txt"
-      - name: Validate complete native platform and immutable input contracts
-        run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
-      - name: Build the actual CLI with both owned backends
-        id: replay_cli
-        run: nix develop .#bench --command cargo build --locked --release -p ra-jit --bins --features llvm
-      - name: Bootstrap a fresh complete owned macro runtime
+      - name: Take the compiler and the owned runtime this OS built
+        uses: actions/download-artifact@v8
+        with:
+          name: c2-compiler-${{ matrix.os }}
+          path: ${{ runner.temp }}/c2-compiler
+      - name: Verify the compiler and the owned runtime against their receipt
         id: owned_runtime
-        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
         shell: bash
         run: |
-          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
-            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
-            --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
-            > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
+          set -euo pipefail
+          in="$RUNNER_TEMP/c2-compiler"
+          stage="$RUNNER_TEMP/c2-stage"
+          (cd "$in" && shasum -a 256 -c c2-compiler.tar.sha256)
+          mkdir -p "$stage"
+          tar -xf "$in/c2-compiler.tar" -C "$stage"
+          (cd "$stage" && shasum -a 256 -c "$in/c2-compiler.sha256")
+          mkdir -p "$GITHUB_WORKSPACE/target/release"
+          mv "$stage/ra-jit" "$GITHUB_WORKSPACE/target/release/ra-jit"
+          mv "$stage/c2-owned-server" "$RUNNER_TEMP/c2-owned-server"
+          chmod +x "$GITHUB_WORKSPACE/target/release/ra-jit" "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv"
+          # The runtime's bootstrap receipt must name this very compiler, at its final place.
+          python3 -I - "$RUNNER_TEMP/c2-owned-server" "$GITHUB_WORKSPACE/target/release/ra-jit" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          work, compiler = Path(sys.argv[1]), Path(sys.argv[2])
+          pins = json.loads((work / "image-pins.json").read_text())
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          assert pins["blaze"]["sha256"] == digest(compiler), "the owned runtime was bootstrapped by another compiler"
+          assert pins["server"]["sha256"] == digest(work / "blaze-proc-macro-srv"), "the owned runtime differs from its bootstrap receipt"
+          print("owned runtime", pins["server"]["sha256"], "bootstrapped by compiler", pins["blaze"]["sha256"])
+          PY
+          cp "$in/c2-compiler.sha256" "$RUNNER_TEMP/c2-evidence/compiler.sha256"
+          "$GITHUB_WORKSPACE/target/release/ra-jit" --version
       - name: Original C2 generation and local command differential
         if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && !startsWith(matrix.lane, 'saved-') }}
         shell: bash
@@ -150,12 +294,6 @@ jobs:
           name: c2-runtime-${{ matrix.os }}-${{ matrix.lane }}
           path: |
             ${{ runner.temp }}/c2-evidence
-            ${{ runner.temp }}/c2-owned-server/image-pins.json
-            ${{ runner.temp }}/c2-owned-server/tool-controls.json
-            ${{ runner.temp }}/c2-owned-server/*.watchdog.json
-            ${{ runner.temp }}/c2-owned-server/*audit.json
-            ${{ runner.temp }}/c2-owned-server/*external-execs.json
-            ${{ runner.temp }}/c2-owned-server/*.exec
             ${{ runner.temp }}/c2-local/*.exec
             ${{ runner.temp }}/c2-local/product-tools.log
             ${{ runner.temp }}/c2-cranelift/results.json
@@ -168,7 +306,7 @@ jobs:
 
   c2-runtime-result:
     name: C2 runtime (${{ matrix.os }})
-    needs: c2-runtime
+    needs: [c2-host, c2-compiler, c2-runtime]
     if: ${{ always() }}
     strategy:
       fail-fast: false
@@ -177,7 +315,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
+      C2_HOST: ${{ needs.c2-host.result }}
+      C2_COMPILER: ${{ needs.c2-compiler.result }}
       C2_RESULT: ${{ needs.c2-runtime.result }}
     steps:
-      - name: Require every C2 lane on both platforms
-        run: test "$C2_RESULT" = success
+      - name: Require every C2 host check, compiler, and lane on both platforms
+        run: test "$C2_HOST" = success && test "$C2_COMPILER" = success && test "$C2_RESULT" = success
