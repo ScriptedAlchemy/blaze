@@ -228,7 +228,12 @@ def raw_compiler_case(runner, blaze, real, work, env, oracle_env):
     write(source, "peer/data", "raw sibling")
     root.write_text('mod child;\nfn main() { println!("{}|{}", child::answer(), include_str!("../../../peer/data")); }\n')
     reference = work / "raw-reference"
-    runner.run("raw-filename-reference-build", [real / "bin/rustc", "--edition=2021", "--crate-name", "raw_projection", root, "-o", reference], oracle_env, work, guarded=False)
+    reference_source = root.with_name("reference.rs")
+    reference_source.symlink_to(root.name)
+    try:
+        runner.run("raw-filename-reference-build", [real / "bin/rustc", "--edition=2021", "--crate-name", "raw_projection", reference_source.name, "-o", reference], oracle_env, root.parent, guarded=False)
+    finally:
+        reference_source.unlink()
     expected, _ = runner.run("raw-filename-reference-run", [reference], oracle_env, work, guarded=False)
     assert expected == "42|raw sibling\n", expected
     prefix = work / "raw-logical-namespace"
@@ -253,7 +258,7 @@ def raw_compiler_case(runner, blaze, real, work, env, oracle_env):
                     "deps": [], "cfg": cfg, "env": {}, "is_workspace_member": True,
                     "build": {"label": "raw_projection", "build_file": logical(root), "target_kind": "bin"}}],
     }
-    descriptor = write(work, "raw-rust-project.json", "{}\n")
+    descriptor = write(work, "rust-project.json", "{}\n")
     binary = work / "raw-owned"
     runner.run("raw-filename-owned-build", [blaze, descriptor, "--crate", "raw_projection", "--out", work / "raw.o", "--exe", binary],
                dict(env, RA_JIT_PROJECT_STDIN="1", RA_JIT_PROC_MACRO_SERVER="0"), work,
