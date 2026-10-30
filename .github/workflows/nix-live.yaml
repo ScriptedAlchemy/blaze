@@ -31,6 +31,7 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
+      - ".github/actions/toolchain/**"
   pull_request:
     paths:
       - "flake.nix"
@@ -39,6 +40,7 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
+      - ".github/actions/toolchain/**"
   schedule:
     - cron: "11 5 * * *"
   workflow_dispatch:
@@ -70,13 +72,6 @@ jobs:
           python3 -B harness/dist/test_check_nix_workflow.py
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
       - uses: DeterminateSystems/nix-installer-action@v23
-      # GitHub ref scoping prevents a PR cache from being read by main or another PR.
-      # A fallback restores inputs only: every Nix gate below still executes.
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-${{ github.sha }}
-          restore-prefixes-first-match: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-
-          gc-max-store-size: 6G
       - uses: DeterminateSystems/flakehub-cache-action@v3
         # Off unless the repository opts in (header): an unregistered fork's cache cannot
         # authenticate, and that must never fail a job. The Nix commands below run regardless.
@@ -157,15 +152,19 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-      - uses: Swatinem/rust-cache@v2
+      # The shared action owns Cargo compilation caching (opus PR #31).
+      - uses: ScriptedAlchemy/blaze/.github/actions/toolchain@e82855e00b894267897903979ab01450033d06dc
+        id: toolchain
         with:
-          workspaces: |
-            . -> target
-            demo/life -> target
+          cache: sccache
+          cache-scope: nix-live-${{ github.job }}
       # ra-jit-live is a stub where live edits are not supported, and says so.
       - run: cargo test --release -p ra-jit-live
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
       - run: cargo build --locked
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         working-directory: demo/life
       - name: window opens and stays up
         run: |
@@ -188,11 +187,19 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-      - uses: Swatinem/rust-cache@v2
+      # The shared action owns Cargo compilation caching (opus PR #31).
+      - uses: ScriptedAlchemy/blaze/.github/actions/toolchain@e82855e00b894267897903979ab01450033d06dc
+        id: toolchain
+        with:
+          cache: sccache
+          cache-scope: nix-live-${{ github.job }}
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: cargo test --release -p ra-jit-live
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
       - run: cargo build --release -p ra-jit
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
       - name: edit a running program
         run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
       - name: crash reports
@@ -203,6 +210,8 @@ jobs:
           done
       - name: the demo builds on macOS
         run: cargo build --locked
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         working-directory: demo/life
 
   nightly:

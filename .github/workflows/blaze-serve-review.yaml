@@ -35,6 +35,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/blaze-serve-review.yaml
+      - .github/actions/toolchain/**
   workflow_dispatch:
 
 permissions:
@@ -61,12 +62,19 @@ jobs:
       sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
+      # Pin opus PR #31 while these measurement branches remain independent.
+      - uses: ScriptedAlchemy/blaze/.github/actions/toolchain@e82855e00b894267897903979ab01450033d06dc
+        id: toolchain
         with:
           llvm: build
+          shell: bench
+          cache: nix sccache
+          cache-scope: serve-release
       - name: Build the owned replay CLI in the pinned native environment
         id: replay_cli
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
           {
@@ -131,9 +139,14 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
+      # Pin opus PR #31 while these measurement branches remain independent.
+      - uses: ScriptedAlchemy/blaze/.github/actions/toolchain@e82855e00b894267897903979ab01450033d06dc
+        id: toolchain
         with:
           llvm: build
+          shell: bench
+          cache: nix
+          cache-save: "false"
       - uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.replay-runtime.outputs.artifact-id }}
@@ -180,19 +193,28 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
+      # Pin opus PR #31 while these measurement branches remain independent.
+      - uses: ScriptedAlchemy/blaze/.github/actions/toolchain@e82855e00b894267897903979ab01450033d06dc
+        id: toolchain
         with:
           components: rustfmt
           llvm: build
+          shell: bench
+          cache: nix sccache
+          cache-scope: serve-tests
       - name: Verify execution tracing and audit integrity
         run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
       - name: Check server formatting
         run: cargo fmt -p blaze-serve -- --check
       - name: Test the actual server, HTTP routes, and publication races
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: cargo test --locked -p blaze-serve -- --test-threads=2
       - name: Test remote clients and fetch recovery
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit remote:: -- --test-threads=2
       - name: Test compiler project and replay profile integration
@@ -209,9 +231,13 @@ jobs:
           python3 crates/blaze-metadata/tests/cargo_oracle.py "$PWD/target/debug/examples/metadata"
       - name: Test cleanup control flow with debug assertions
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: cargo test --locked -p hir-ty-codegen --lib fills_normal_block -- --test-threads=2
       - name: Test owned compiler answers and empty-crate proofs
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p syntax empty_crate:: -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit answers:: -- --test-threads=2
@@ -222,6 +248,8 @@ jobs:
           python3 -I harness/dist/empty_probe.py --blaze target/debug/ra-jit --work target/empty-probe-review
       - name: Test compiler acceptance and constant evaluation
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p ide-diagnostics --lib compiler_acceptance_tests -- --test-threads=2
           cargo test --locked -p hir-ide --lib tests::consteval -- --test-threads=2
@@ -239,9 +267,13 @@ jobs:
           python3 -I harness/dist/crossmachine.py --self-test
       - name: Test bootstrap protocol wire compatibility
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: cargo test --locked --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-api --lib -- --test-threads=2
       - name: Test build-script reruns and Cargo fingerprints
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit cargo::script:: -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit cargo::records:: -- --test-threads=2
@@ -256,10 +288,14 @@ jobs:
           if-no-files-found: ignore
       - name: Test affected selection, retries, and native input identities
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p ra-jit --bin ra-jit -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
       - name: Test compiler export and import identities
         if: ${{ !cancelled() }}
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo test --locked -p hir-ty-codegen --lib export:: -- --test-threads=2
       - name: Check harness dispatch without services or credentials
