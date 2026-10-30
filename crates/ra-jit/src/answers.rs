@@ -709,7 +709,7 @@ fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -795,7 +795,7 @@ mod tests {
         );
     }
 
-    pub(super) fn synthetic_toolchain(dir: &Path) -> PathBuf {
+    pub(crate) fn synthetic_toolchain(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let rustlib = dir.join("lib/rustlib");
         std::fs::create_dir_all(&rustlib).unwrap();
