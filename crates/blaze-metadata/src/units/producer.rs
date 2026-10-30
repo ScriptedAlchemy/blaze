@@ -1,6 +1,6 @@
 //! Source units before metadata folds host and target feature domains together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context as _, Result};
 use blaze_resolve::resolver::{CompileKind, FeaturesFor, PackageTargets, ResolvedFeatures};
@@ -38,6 +38,7 @@ pub(crate) fn of_build(
     reads: &FxHashMap<PackageId, Read>,
     targets: &dyn PackageTargets,
     target_kind: CompileKind,
+    root_features: &FxHashMap<PackageId, BTreeSet<String>>,
 ) -> Result<Vec<ResolvedUnit>> {
     let mut graph = BTreeMap::new();
     let mut seen = FxHashSet::default();
@@ -56,7 +57,7 @@ pub(crate) fn of_build(
             && roots.contains(&pkg)
             && read.lib.is_none()
             && !read.bins.iter().any(|required| {
-                required.iter().all(|it| it.contains('/') || on.iter().any(|f| f.as_str() == it))
+                required.iter().all(|it| root_features.get(&pkg).is_some_and(|on| on.contains(it)))
             })
         {
             continue;
@@ -223,6 +224,7 @@ mod tests {
                 &reads,
                 &targets,
                 CompileKind::Target("aarch64-unknown-linux-gnu".into()),
+                &FxHashMap::default(),
             )
             .unwrap();
             for unit in &units {
