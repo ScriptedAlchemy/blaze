@@ -610,3 +610,38 @@ fn driver_responses_expand_before_forwarding_arity() {
     collector.arguments(words(&["-Xlinker", "@driver.rsp"])).unwrap();
     assert_eq!(collector.seen, BTreeSet::from([response]));
 }
+
+/// Debian's `libgcc_s.so` is a script, `GROUP ( libgcc_s.so.1 -lgcc )`, in gcc's directory,
+/// and the library it names is in another. The linker looks for the script's input in its
+/// working directory before the search directories: in a replay that is the directory the
+/// replay made for the unit, which no binding holds. The input's absence there is seen, and
+/// seen again after the link; a file there that no binding holds is refused.
+#[test]
+fn a_script_input_absent_from_the_working_directory_is_seen_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let gcc = dir.path().join("usr/lib/gcc/12");
+    let lib = dir.path().join("lib");
+    let script = write(&gcc, "libgcc_s.so", b"GROUP ( libgcc_s.so.1 -lgcc )\n");
+    let archive = write(&gcc, "libgcc.a", b"!<arch>\ngcc");
+    let shared = write(&lib, "libgcc_s.so.1", b"\x7fELFgcc_s");
+    let cwd = dir.path().join("replay/artifacts/unit-0");
+    fs::create_dir_all(&cwd).unwrap();
+    let closure = bindings(&[("linker/libraries/0", &gcc), ("linker/libraries/1", &lib)]);
+    let mut collector = Collector::new(&closure, cwd.clone(), false);
+    collector.arguments(words(&["-lgcc_s"])).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([script, archive, shared]));
+    let here = cwd.join("libgcc_s.so.1");
+    assert_eq!(collector.absent, BTreeSet::from([here.clone()]));
+
+    let guard = |absent| Guard { bindings: Arc::new(closure.clone()), absent };
+    guard(collector.absent.clone()).finish().unwrap();
+    write(&cwd, "libgcc_s.so.1", b"\x7fELFplanted");
+    let error = guard(collector.absent).finish().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("native input {} appeared during the link", here.display())
+    );
+
+    let error = Collector::new(&closure, cwd, false).arguments(words(&["-lgcc_s"])).unwrap_err();
+    assert_eq!(error.to_string(), format!("unbound native input {}", here.display()));
+}

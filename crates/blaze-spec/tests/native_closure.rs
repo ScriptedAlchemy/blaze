@@ -508,3 +508,49 @@ fn a_new_admission_scope_observes_replaced_and_relocated_roots() {
     assert_eq!(admission.entry(&moved.join("file")), Some(expected));
     assert!(admission.entry(&first.join("file")).is_none());
 }
+
+/// gcc names a search directory below its own with `..` (on Debian
+/// `/usr/lib/gcc/aarch64-linux-gnu/12/../../../../aarch64-linux-gnu/lib/aarch64-linux-gnu/12`,
+/// which need not exist), and binds its own directory too. A path below the `..`-spelled root is
+/// that root's, though the shorter bound directory is a prefix of it as written: a file there is
+/// admitted, and a name missing from it or from a missing root is proven absent. A `..` that
+/// leaves the root is still refused.
+#[test]
+fn a_root_spelled_with_parent_components_answers_below_a_shorter_bound_prefix() {
+    let work = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(work.path()).unwrap();
+    let gcc = base.join("usr/lib/gcc/12");
+    let lib = base.join("usr/lib/triple");
+    fs::create_dir_all(&gcc).unwrap();
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(gcc.join("libgcc.a"), b"gcc").unwrap();
+    let shared = lib.join("libgcc_s.so.1");
+    fs::write(&shared, b"gcc_s").unwrap();
+    fs::write(base.join("usr/lib/outside.a"), b"outside").unwrap();
+    let spelled = gcc.join("../../triple");
+    let absent = gcc.join("../../../absent/triple");
+    let closure = Closure {
+        roots: [&gcc, &spelled, &absent]
+            .iter()
+            .enumerate()
+            .map(|(at, root)| Root {
+                name: format!("linker/libraries/{at}"),
+                tree: Tree::capture(root).unwrap(),
+            })
+            .collect(),
+    };
+    let admission = closure.admission();
+    let below = spelled.join("libgcc_s.so.1");
+    let actual = Tree::capture(&below).unwrap();
+    admission.admit(&below, actual.entry(Path::new("")).unwrap()).unwrap();
+    assert_eq!(admission.entry(&below), admission.entry(&shared));
+    let missing = Some(Entry { links: Vec::new(), kind: Kind::Missing });
+    assert_eq!(admission.entry(&spelled.join("libnone.so")), missing);
+    assert_eq!(admission.entry(&absent.join("libgcc_s.so.1")), missing);
+
+    let escape = spelled.join("../outside.a");
+    assert_eq!(fs::read(&escape).unwrap(), b"outside");
+    assert!(admission.entry(&escape).is_none());
+    let actual = Tree::capture(&escape).unwrap();
+    assert!(admission.admit(&escape, actual.entry(Path::new("")).unwrap()).is_err());
+}

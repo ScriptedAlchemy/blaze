@@ -164,24 +164,36 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         &programs,
         Some(asked),
     )?;
-    let destinations: Vec<_> = programs
+    let hash_of = |program: &blaze_spec::execution::Program| {
+        super::hex(&blaze_wire::digest_of(
+            &prepared.resolved.spec.build.units[program.unit as usize],
+        ))[..16]
+            .to_owned()
+    };
+    // Each program's place, and the copy cargo keeps of it in `deps` where it has one.
+    let places: Vec<_> = programs
         .iter()
         .map(|program| {
             let unit = native[program.unit as usize];
-            destination(
-                &target,
-                options.target.as_deref(),
-                &unit.profile.name,
-                unit.target.kind,
-                &unit.target.name,
-                unit.test,
-                program.output,
-                &super::hex(&blaze_wire::digest_of(
-                    &prepared.resolved.spec.build.units[program.unit as usize],
-                ))[..16],
+            let at = |test| {
+                destination(
+                    &target,
+                    options.target.as_deref(),
+                    &unit.profile.name,
+                    unit.target.kind,
+                    &unit.target.name,
+                    test,
+                    program.output,
+                    &hash_of(program),
+                )
+            };
+            (
+                at(unit.test),
+                kept_in_deps(unit.target.kind, unit.test, program.output).then(|| at(true)),
             )
         })
         .collect();
+    let destinations: Vec<_> = places.iter().map(|(at, _)| at.clone()).collect();
     let binaries: BTreeMap<_, _> = programs
         .iter()
         .zip(&destinations)
@@ -208,7 +220,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
     }
     let mut published_support = false;
     let result = (|| -> anyhow::Result<i32> {
-        for (program, destination) in programs.iter_mut().zip(destinations) {
+        for (program, (destination, kept)) in programs.iter_mut().zip(places) {
             if program.output == Output::Doctest {
                 continue;
             }
@@ -222,6 +234,10 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
                 publish_copy(&program.executable, &destination)?;
             } else {
                 publish(&program.executable, &destination)?;
+            }
+            if let Some(kept) = kept {
+                crate::cargo::state::place(&destination, &kept)
+                    .with_context(|| format!("installing {}", kept.display()))?;
             }
             published_support |= matches!(program.output, Output::Object | Output::Executable);
             if program.output == Output::Object {
@@ -383,6 +399,13 @@ fn destination(
         Output::Check => root.join(format!("{name}-{hash}.checked.json")),
         Output::Doctest => root.join(format!("doctest-{name}-{hash}/checked.json")),
     }
+}
+
+/// Whether cargo keeps a copy in `deps` of the program it puts at the top of a profile: a
+/// bin is built as `deps/<name>-<hash>` (its place as a test, with the unit's own hash) and
+/// `debug/<name>` is that file again. An example's is in `examples`, beside it.
+fn kept_in_deps(kind: TargetKind, test: bool, output: Output) -> bool {
+    kind == TargetKind::Bin && !test && output == Output::Executable
 }
 
 fn profile_root(target: &Path, triple: Option<&str>, profile: &str) -> PathBuf {
@@ -621,6 +644,35 @@ mod tests {
             path("dev", TargetKind::Lib, false, Output::Check),
             PathBuf::from("/target/host/debug/deps/my_bin-identity.checked.json")
         );
+    }
+
+    /// `cargo test` of a package with a library and a bin of one name leaves three programs
+    /// of that name in `deps`: the library's tests, the bin's tests and the bin, whose copy
+    /// is `debug/<name>`. The bin is kept in `deps` under its own unit's hash, beside its
+    /// test's; a test or an example is not copied.
+    #[test]
+    fn a_bin_is_kept_in_deps_beside_its_tests() {
+        assert!(kept_in_deps(TargetKind::Bin, false, Output::Executable));
+        assert!(!kept_in_deps(TargetKind::Bin, true, Output::Executable));
+        assert!(!kept_in_deps(TargetKind::Example, false, Output::Executable));
+        assert!(!kept_in_deps(TargetKind::Lib, false, Output::Object));
+        let at = |test, hash| {
+            destination(
+                Path::new("/target"),
+                None,
+                "dev",
+                TargetKind::Bin,
+                "basic",
+                test,
+                Output::Executable,
+                hash,
+            )
+        };
+        let exe = std::env::consts::EXE_SUFFIX;
+        assert_eq!(at(false, "bin"), PathBuf::from(format!("/target/debug/basic{exe}")));
+        let kept = at(true, "bin");
+        assert_eq!(kept, PathBuf::from(format!("/target/debug/deps/basic-bin{exe}")));
+        assert_ne!(kept, at(true, "bin-test"));
     }
 
     #[test]

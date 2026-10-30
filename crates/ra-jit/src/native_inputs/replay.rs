@@ -23,12 +23,27 @@ pub(crate) fn set_replay_bindings(bytes: Option<&[u8]>) -> anyhow::Result<()> {
 
 pub(crate) struct Guard {
     bindings: Arc<Closure>,
+    /// What the link's working directory was seen not to have.
+    absent: BTreeSet<PathBuf>,
 }
 
 impl Guard {
     pub(crate) fn finish(self) -> anyhow::Result<()> {
-        self.bindings.validate()
+        self.bindings.validate()?;
+        for path in &self.absent {
+            ensure!(
+                matches!(observed(path)?.kind, Kind::Missing),
+                "native input {} appeared during the link",
+                path.display()
+            );
+        }
+        Ok(())
     }
+}
+
+/// What is at `path` now.
+fn observed(path: &Path) -> anyhow::Result<blaze_spec::native_tree::Entry> {
+    Tree::capture(path)?.entry(Path::new("")).cloned().context("native observation is empty")
 }
 
 pub(crate) fn before(
@@ -59,8 +74,9 @@ pub(crate) fn before(
         collector.search = explicit;
     }
     collector.arguments(args)?;
+    let absent = std::mem::take(&mut collector.absent);
     drop(collector);
-    Ok(Some(Guard { bindings: Arc::new(closure) }))
+    Ok(Some(Guard { bindings: Arc::new(closure), absent }))
 }
 
 enum LinkRead {
@@ -82,6 +98,7 @@ struct Collector<'a> {
     frameworks: Vec<PathBuf>,
     active: BTreeSet<PathBuf>,
     seen: BTreeSet<PathBuf>,
+    absent: BTreeSet<PathBuf>,
 }
 
 impl<'a> Collector<'a> {
@@ -110,6 +127,7 @@ impl<'a> Collector<'a> {
             frameworks,
             active: BTreeSet::new(),
             seen: BTreeSet::new(),
+            absent: BTreeSet::new(),
         }
     }
 
@@ -324,6 +342,24 @@ impl<'a> Collector<'a> {
             .with_context(|| format!("unbound native input {}", path.display()))
     }
 
+    /// A script's input as the linker looks for it in its working directory, which in a
+    /// replay is the directory the replay made for the unit or producer it links: a file there
+    /// has to be bound like any other, and one that is not there is seen to be absent, and
+    /// seen again after the link ([`Guard::finish`]). A search directory's absence is never
+    /// observed: an unbound one is refused.
+    fn in_working_directory(
+        &mut self,
+        path: &Path,
+    ) -> anyhow::Result<blaze_spec::native_tree::Entry> {
+        if let Some(entry) = self.admission.entry(path) {
+            return Ok(entry);
+        }
+        let observed = observed(path)?;
+        ensure!(matches!(observed.kind, Kind::Missing), "unbound native input {}", path.display());
+        self.absent.insert(path.to_owned());
+        Ok(observed)
+    }
+
     fn library(&mut self, name: &OsStr, static_only: bool) -> anyhow::Result<()> {
         let candidates: Vec<_> = if let Some(exact) = name.as_encoded_bytes().strip_prefix(b":") {
             vec![native(exact)?]
@@ -415,16 +451,22 @@ impl<'a> Collector<'a> {
                             !input.starts_with('=') && !input.starts_with("$SYSROOT"),
                             "native script sysroot input is not owned: {input}"
                         );
+                        // Each directory, and whether it is the linker's working directory.
                         let mut dirs = Vec::new();
                         if !include {
-                            dirs.push(path.parent().unwrap_or(&self.cwd).to_owned());
+                            dirs.push((path.parent().unwrap_or(&self.cwd).to_owned(), false));
                         }
-                        dirs.push(self.cwd.clone());
-                        dirs.extend(self.search.clone());
+                        dirs.push((self.cwd.clone(), true));
+                        dirs.extend(self.search.iter().map(|dir| (dir.clone(), false)));
                         let mut selected = None;
-                        for dir in dirs {
+                        for (dir, working) in dirs {
                             let candidate = dir.join(&input);
-                            if matches!(self.bound(&candidate)?.kind, Kind::File { .. }) {
+                            let entry = if working {
+                                self.in_working_directory(&candidate)?
+                            } else {
+                                self.bound(&candidate)?
+                            };
+                            if matches!(entry.kind, Kind::File { .. }) {
                                 selected = Some(candidate);
                                 break;
                             }
