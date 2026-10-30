@@ -48,6 +48,21 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 -I .github/scripts/bench_pair.py
+      # The runner's CPU, with the pair's digests, on pass and on fail: on #18 the pair was
+      # bit-identical across seven runs and the one failure ran on another CPU family (EPYC 7763,
+      # Zen 3) than the six passes (EPYC 9V74, 9V45, Xeon 6975P), so the CPU is the variable to
+      # record beside every verdict (docs/reports/CI-fork.md).
+      - name: Record the runner's CPU and the benchmark pair
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/tango"
+          {
+            lscpu | grep -E 'Model name|^CPU\(s\)'
+            grep -m1 '^flags' /proc/cpuinfo || true
+            sha256sum "$RUNNER_TEMP"/bench-* 2>/dev/null || echo "no benchmark pair prepared"
+          } > "$RUNNER_TEMP/tango/cpu.txt"
+          cat "$RUNNER_TEMP/tango/cpu.txt" | tee -a "$RUNNER_TEMP/bench.txt"
+          { echo '### tango: runner CPU and benchmark pair'; echo '```'; grep -v '^flags' "$RUNNER_TEMP/tango/cpu.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Record benchmark context
         if: github.event_name == 'pull_request'
         env:
@@ -83,10 +98,10 @@ jobs:
       - name: Times
         run: |
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
-          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
+          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee -a "$RUNNER_TEMP/bench.txt"
           { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Keep paired benchmark evidence
-        if: always() && github.event_name == 'pull_request'
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: tango-${{ github.run_id }}-${{ github.run_attempt }}
