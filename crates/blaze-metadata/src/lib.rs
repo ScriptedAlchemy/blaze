@@ -6,12 +6,13 @@
 
 mod graph;
 mod registry;
+mod required;
 mod summary;
 mod units;
 
 pub use units::{ResolvedUnit, UnitDependency};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -163,6 +164,15 @@ pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf,
     Ok((json, sources))
 }
 
+/// Build metadata with separate host facts, including host-only dependency features.
+pub fn metadata_with_sources_for_host(
+    asked: &Asked<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
+    let (json, _, sources) = made(asked, Some(host), None)?;
+    Ok((json, sources))
+}
+
 /// Resolve an application's build without folding host and target feature domains.
 /// Target facts are supplied by the owned planner, never queried from a toolchain.
 pub fn build_units(
@@ -179,23 +189,28 @@ pub fn build_units(
 /// graph has them: of each member the build selects, the binaries whose `required-features`
 /// it is built with, or the one target named.
 pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
+    selected_programs(asked, targets, None)
+}
+
+/// Select programs using separate host and target feature domains, as `build_units` does.
+pub fn programs_for_host(
+    asked: &Asked<'_>,
+    targets: Targets<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<Program>)> {
+    selected_programs(asked, targets, Some(host))
+}
+
+fn selected_programs(
+    asked: &Asked<'_>,
+    targets: Targets<'_>,
+    host: Option<&TargetPlatform<'_>>,
+) -> Result<(String, Vec<Program>)> {
     anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
-    let (json, roots, _) = made(asked, None, None)?;
-    let metadata: serde_json::Value = serde_json::from_str(&json)?;
-    let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
-    let features: FxHashMap<&str, Vec<&str>> = nodes
-        .filter_map(|node| {
-            let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
-            Some((node["id"].as_str()?, on.collect()))
-        })
-        .collect();
-    let packages = metadata["packages"].as_array().into_iter().flatten();
+    let (json, selected, _) = made(asked, host, None)?;
     let mut programs = Vec::new();
-    for package in packages {
-        let Some(id) = package["id"].as_str().filter(|id| roots.iter().any(|it| it == id)) else {
-            continue;
-        };
-        let on = features.get(id).map(Vec::as_slice).unwrap_or_default();
+    for Selection { package, features } in selected {
+        let id = package["id"].as_str().context("a selected package's id")?;
         for target in package["targets"].as_array().into_iter().flatten() {
             let of = |key: &str, it: &str| {
                 target[key].as_array().is_some_and(|all| all.iter().any(|kind| kind == it))
@@ -212,10 +227,9 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
                 continue;
             }
             let required = target["required-features"].as_array().into_iter().flatten();
-            // A feature of a dependency (`dep/feature`) is taken to be on.
             let missing: Vec<&str> = required
                 .filter_map(|it| it.as_str())
-                .filter(|it| !it.contains('/') && !on.contains(it))
+                .filter(|it| !features.contains(*it))
                 .collect();
             let asked_for = targets.bin.is_some() || targets.example.is_some();
             if !missing.is_empty() && asked_for {
@@ -240,12 +254,18 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     Ok((json, programs))
 }
 
-/// The metadata of `asked`, and the ids of the members its build selects.
+struct Selection {
+    package: serde_json::Value,
+    features: BTreeSet<String>,
+}
+
+/// The metadata and selected members, including targets with unmet requirements
+/// so an explicit `--bin` can report them even when the build graph is empty.
 fn made(
     asked: &Asked<'_>,
     host: Option<&TargetPlatform<'_>>,
     units: Option<&mut Vec<ResolvedUnit>>,
-) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
+) -> Result<(String, Vec<Selection>, Vec<(PathBuf, Vec<u8>)>)> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start("metadata", asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
@@ -418,6 +438,7 @@ fn made(
     };
     let packages = Packages { reads: &reads, platform: asked.platform.as_ref(), host };
     let mut roots = Vec::new();
+    let mut root_features = FxHashMap::default();
     let mut resolved_units = Vec::new();
     let resolve = match &asked.build {
         None => resolve_graph(&targeted, &member_ids, current, &packages, &kinds)?,
@@ -427,6 +448,20 @@ fn made(
             let features =
                 FeatureResolver::resolve(&packages, &targeted, &member_features, &kinds, opts)?;
             roots = member_features.iter().map(|(it, _)| it.package_id()).collect();
+            for &pkg in &roots {
+                root_features.insert(
+                    pkg,
+                    required::available(
+                        pkg,
+                        &targeted,
+                        &features,
+                        &reads,
+                        build.dev_units,
+                        &packages,
+                        kinds[0],
+                    ),
+                );
+            }
             if units.is_some() {
                 resolved_units = units::of_build(
                     &targeted,
@@ -436,6 +471,7 @@ fn made(
                     &reads,
                     &packages,
                     kinds[0],
+                    &root_features,
                 )?;
             }
             let activated = |platform: &Platform| packages.activates(platform);
@@ -447,6 +483,7 @@ fn made(
                 &reads,
                 &activated,
                 current,
+                &root_features,
             )?
         }
     };
@@ -454,6 +491,15 @@ fn made(
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
     let reached: FxHashMap<PackageId, usize> =
         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
+    let selected = roots
+        .iter()
+        .map(|id| {
+            Ok(Selection {
+                package: serde_json::to_value(&serialized[reached[id]])?,
+                features: root_features.remove(id).unwrap_or_default(),
+            })
+        })
+        .collect::<Result<_>>()?;
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
         let id = ids.iter().find(|id| id.to_spec() == node.id).copied();
@@ -482,7 +528,7 @@ fn made(
         inputs.retain(|(path, _)| path != &lock_path);
         inputs.push((lock_path, text.into_bytes()));
     }
-    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), inputs))
+    Ok((json, selected, inputs))
 }
 
 /// What the resolve graph and the feature resolver read of the packages.
