@@ -1,21 +1,20 @@
 # C4 source producer boundary
 
-This is an independently invocable compiler boundary, not a cold-path switch.
 `ra-jit proc-macro-source <sysroot> <host-plan.json> <exclusive-output-dir>`
-consumes a JSON rendering of `Vec<own_script::Planned>`. The first unit is the
-proc-macro root. Every dependency is a source root with its own edition, cfg,
-codegen flags, environment and renamed edges. No supplied dylib or wrapper
+compiles a producer from a JSON rendering of `Vec<own_script::Planned>`.
+Callers invoke it independently; it does not switch the cold build to owned
+compilation. The first unit is the proc-macro root. Every dependency is a source
+root with its own edition, cfg, codegen flags, environment and renamed edges. No supplied dylib or wrapper
 record is accepted. Empty graphs, relative source roots, cycles and out-of-range
 edges fail before starting the compiler.
 
-The boundary runs blaze itself with `--shared`, the implicit `proc_macro`
-source dependency and complete dep-info. Standard library resolution and query
+The command runs blaze with `--shared`, the implicit `proc_macro` source
+dependency and complete dep-info. Standard library resolution and query
 answers are forced to be owned, including through the `BLAZE_` aliases.
 An unanswered query fails instead of spawning rustc. A store can supply std
 previously compiled by this blaze; this boundary does not acquire a shipped
-std artifact. The output directory is exclusively owned by the caller until
-the child ends. Publication leases and before/after validation are not added
-by this boundary.
+std artifact. The caller exclusively owns the output directory until the child
+ends. This command does not add publication leases or before/after validation.
 
 ## The application-derived host plan
 
@@ -50,8 +49,8 @@ one binary application and library producers. Build-script units are compiled
 and run through the owned runner, with their host feature domain and generated
 cfg, environment and OUT_DIR. `proc-macro-build` still fails before any compiler
 child if a producer closure needs a nested proc macro.
-This is an unfinished scheduler boundary, not a restriction on the intended
-product. No cold path calls it yet.
+Scheduler integration is incomplete. The intended product must support nested
+proc macros, but no cold path calls this adapter yet.
 
 `harness/dist/producer_plan.py` compares native, explicit-native and cross
 plans with an independent Cargo unit graph. It checks disjoint features,
@@ -94,7 +93,7 @@ at cfb74568: changed library source renamed native definitions while callers
 still referenced the old definitions. Commit 64a4bad3 keeps native linkage stable
 across source changes, with current bytes retained in content identity. Both
 16-row witnesses then passed. These are two checkout paths on one Linux host,
-not a physical multi-host result. Captured instances additionally need distinct
+not a physical multi-host result. Captured instances also need distinct
 native namespaces when their source and library name coincide; the independent
 Cargo reduction accepts two packages sharing that source. Non-text file hashes
 also read the active filesystem view; an unreadable input yields no reusable
@@ -170,9 +169,9 @@ validated through a tracked vendor compiler-acceptance query covering active
 signatures, resolved API stability/privacy, dyn compatibility, constant rules
 and borrow checking, combined with existing inference diagnostics. Unsupported
 validation remains an explicit producer error. At head `42abdbad`, all 22 review
-probes matched Rust 1.99, including eight positive cases and a positive script
-E2E witness. A loud undecided refusal does not pass this parity gate. Unknown artifact
-operations and bootstrap feature attributes also record a failure
+probes matched Rust 1.99, including eight positive cases and a successful
+end-to-end script check. An undecided refusal fails this parity gate. Unknown
+artifact operations and bootstrap feature attributes also record a failure
 which the runner checks before publishing successful script output. A script
 cannot swallow an unsupported operation and silently select incomplete cfgs.
 

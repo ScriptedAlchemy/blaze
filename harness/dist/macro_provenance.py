@@ -108,7 +108,7 @@ def main():
                 assert restart["output"] == row["output"], restart
                 return
             if name in ("E", "F"):
-                # The P4 review's real-wrapper repro: Cargo runs outside the workspace,
+                # Cargo runs outside the workspace in this P4 wrapper regression,
                 # but invokes rustc in the workspace root.
                 parent = str(Path(ws).parent)
                 manifest = str(Path(ws).name + "/Cargo.toml")
