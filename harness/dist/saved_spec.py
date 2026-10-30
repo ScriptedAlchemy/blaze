@@ -258,7 +258,9 @@ def raw_compiler_case(runner, blaze, real, work, env, oracle_env):
                     "deps": [], "cfg": cfg, "env": {}, "is_workspace_member": True,
                     "build": {"label": "raw_projection", "build_file": logical(root), "target_kind": "bin"}}],
     }
-    descriptor = write(work, "rust-project.json", "{}\n")
+    # In its own directory: a rust-project.json directly in `work` would become the project
+    # of every later case that builds under `work`.
+    descriptor = write(work / "raw-descriptor", "rust-project.json", "{}\n")
     binary = work / "raw-owned"
     runner.run("raw-filename-owned-build", [blaze, descriptor, "--crate", "raw_projection", "--out", work / "raw.o", "--exe", binary],
                dict(env, RA_JIT_PROJECT_STDIN="1", RA_JIT_PROC_MACRO_SERVER="0"), work,
