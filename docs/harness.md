@@ -89,6 +89,7 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 | `dist/tests.py` | The tests phase of the distributed program ([distributed.md](distributed.md#6-distributed-tests)). `--contract` (unit T1) is Bazel's `cache_test_results=auto` on `harness/dist/fixtures/tests`, edited a step at a time: an unchanged test is skipped; a changed test, declared data file, declared variable or `--test-threads` reruns; `no_cache` and `external` in `blaze-tests.toml` make a test run every time; a failure is never kept, even when the code goes back to what passed; a test that fails once is retried, reported `Flaky` and kept after passing, and with one attempt fails the run; an invocation libtest refuses (an option given twice, a value it does not take) says `error: …`, ends 101 and runs no test, and that is a step's own result, never a failed test and never a kept pass. `--selected-retry` retries a flaky test the command selected itself (`--exact`, a test filter, `--skip` beside it, `--include-ignored`) and requires it to pass on its second attempt. `--before DIR` runs the opt-out and declared-data steps with the ra-jit in `DIR` for what they did before the unit; `--self-test` checks its tables against the fixture with no daemon. Every run has the memory guard and `tracedecay.py`'s watchdog; the no-rustc audit (P0-A) is pending. macOS and Linux (the Linux sandbox steps are not run) |
 | `dist/check_nix_workflow.py` | That the FlakeHub cache in `.github/workflows/nix-live.yaml` is an optional optimization and every required Nix gate is not: it fails when an expected job or command is deleted (including replaced with `echo`), made conditional, or allowed to fail, when `continue-on-error` lands on a step that is not a cache step, or when a cache step stops being gated on `ENABLE_FLAKEHUB_CACHE`, or when a consumer allocates an Actions cache outside the central bundle producer (the fork shares a 10 GB budget). It runs as a step of `unit-graphs`, so the run that still has it reports a dropped gate. This is a structural read of the workflow file, not a Nix run: it proves the commands are present and unconditional and cannot prove they succeed, and a change that deletes this step too is visible only in the diff. `test_check_nix_workflow.py` exercises each of those mutations against the real file |
 | `dist/buildspec.py` | Unit C2's acceptance ([distributed.md](distributed.md), "C2 `BuildSpec` from cargo's resolution"): `ra-jit cargo spec` on small cargo projects the script writes (path dependencies, a `Cargo.lock`, each a git commit with a fixed identity and date). A case is a command (flags, environment, edits of the fixture) with an expectation against another case, each with its reason in cargo's semantics: the spec is `changed` where the flag changes the build (`--no-default-features`, `--all-features`, `-p` and `--exclude`, two `RUSTFLAGS --cfg`, `--ignored`, `--include-ignored`, `--no-run`, `--no-fail-fast`, a `harness = false` test, `[env]` in the configuration, a directory below the root, `[profile.dev.package.X]` and `build-override` changing exactly the units they name, `RA_JIT_MIR_OPT`, the C and C++ compilers and the archiver by their bytes), `same` where it does not (`-v`, `-j`, `-q`, `--color`, `--workspace` in a virtual workspace, `incremental`, `codegen-units`, `RA_JIT_BACKEND=cranelift`, a copy of a tool at another path, the same tree at another path), and refused by name where blaze cannot honour it (`lto` other than off, `opt-level` s and z, `--target`, `-Z`, `--message-format`, `RUSTC_WRAPPER`, `-C target-cpu`, `-C linker`, `CARGO_BUILD_TARGET`). `ra-jit cargo spec --unit-graph` is compared with `cargo --unit-graph` as sets of units keyed by package, target, mode, features, platform and profile, the dependency indexes mapped to those keys; and each local case is run as `ra-jit cargo <command>` in one fresh copy and as `ra-jit cargo spec run <spec.cbor>` in another, which have to build the same programs, run the same tests and doc tests, print the same and exit the same (the spec run is given none of the command's environment). Both runs are under the memory guard and watchdog and the stand-in audit of `tracedecay.py`; the cargo runs the cold build still makes are reported as `cargo dispatched: N` and are not a failure. `--no-local` and `--no-cargo` skip those arms and say so, `--only fixture[/case]`, `--list`, `--json FILE`; `--self-test` runs the script's own logic against a fake `ra-jit` (and, with cargo, checks the fixtures and what the local runs expect against cargo itself). cargo is the oracle of the unit graphs and nowhere else. Linux and macOS |
+| `dist/saved_spec.py` | Saved execution: a source-only `BuildSpec` of a small workspace (an app, a path dependency, a proc macro and a build script) is saved with `ra-jit cargo spec --out`, its tree is deleted and the saved bundle moved, and `ra-jit cargo spec --run` from an unrelated directory, with a hostile cargo configuration above it and rustc, rustdoc, cargo, rustup and the toolchain's macro server replaced by stand-ins that fail and count, must build, run and test the same as the reference cargo did (the reference run is the harness's own, with the real toolchain). A corrupt saved input, or one whose closure the owned executor does not take, must produce no advertised executable. `--backend cranelift` or `llvm` is the backend the replay runs under; `--owned-server` is the macro server `owned_macro_server.py` built with the ra-jit under test, which the replay must use (its digest is checked against `image-pins.json`), and `--work DIR` keeps `results.json` and the logs. Linux (the exec trace) and macOS |
 | `dist/ci/inventory.py`, `dist/ci/compare.py` | The test inventory of unit S2 of [distributed.md](distributed.md): every Rust test tracedecay's Bazel runs at one commit, read from the commit's BUILD files through git (never a working tree), with each test's size and timeout, retries, shard count, resource group, feature set, custom harness, generated fixtures, and the tests that spawn rustc or cargo and so stay on Bazel under the `rustc-tests` gate; `--check COMMIT` regenerates the checked-in `inventory.<commit>.json` and fails on any difference, and `--self-test` proves the BUILD reader on synthetic BUILD files. `compare.py BAZEL_TEST_LOGS BLAZE_EVENTS --inventory FILE` compares a `bazel-testlogs` tree of `test.xml` against a run's event stream and fails on a test missing or extra on either side, a test neither executed nor validly skipped (a skip needs the cached pass's manifest to have held), a test kept on Bazel that Bazel did not run or that blaze did, and a different verdict; `--self-test` runs one synthetic run per violation, and `--self-test --against harness/dist/ci/inventory.d79de82273.json` proves the same rules on the real list |
 | `fuzz/fuzz.py` | Generated programs, see below |
 | `uitest.py <rust checkout>` | rustc's own `tests/ui` run-pass tests. Every file is either run or left out with a counted reason |
@@ -462,3 +463,75 @@ site, and `release.yaml` builds releases from tags, each target through
 the recipe the flake's `dist` runs too. `pgo.yaml` trains the profiles it uses, by hand and on
 pushes to main that change Cargo.lock, a manifest or the toolchain, and pins them in
 `pgo/profiles.json`.
+
+### The C2 checks (the distributed build)
+
+The C2 checks are unit C2's acceptance ([distributed.md](distributed.md), "C2 `BuildSpec` from
+cargo's resolution"), run in CI by `blaze-dist-review.yaml` as seven **groups**, each a job (or a
+packed part of one) that runs against the bundle's release ra-jit and owned macro runtime. Five
+are fixture groups of `dist/buildspec.py` (`--ci-group`), two are `dist/saved_spec.py` under a
+backend:
+
+- `basic`: one package under `cargo test`; which flags change the spec (`--no-default-features`,
+  `--all-features`, `--ignored`, `--no-run`, a feature already on does not), which do not (`-v`,
+  `-j`, `--color`, `-p` naming the only package), and which are refused by name (`--target`,
+  `-Z`, `--message-format`, `RUSTC_WRAPPER`, `-C linker`...).
+- `workspace` (fixture `ws`): a virtual workspace: `--workspace`, `-p` and `--exclude` in every
+  order, and the default members.
+- `commands` (fixtures `harness`, `failfast`, `envcfg`): a test with `harness = false` and the
+  words it gets after `--`; a failing test binary before a passing one and `--no-fail-fast`;
+  `[env]` in the cargo configuration.
+- `profiles-native` (fixtures `profiles`, `native`, `source`): a root package with a build
+  script, a proc macro and two path dependencies under each profile, `[profile.dev.package.X]`
+  and `build-override` changing exactly the units they name, `lto` and `opt-level` s/z refused;
+  the C and C++ compilers and the archiver by their bytes (`CC`, `CXX`, `AR`, a copy at another
+  path is the same); the source identity: an edited tree is another spec, the same tree at
+  another path is the same.
+- `nested`: two cargo workspaces in one Git checkout; a replay from the checkout root selects
+  the one the command was run in.
+- `saved-cranelift`, `saved-llvm`: `saved_spec.py --backend cranelift` and `llvm` (the table
+  above).
+
+Each group runs each of its local cases twice, as `ra-jit cargo <command>` and as `ra-jit cargo
+spec --run` of its saved spec, under the memory guard, the watchdog and the stand-in audit of
+`tracedecay.py`, with the owned macro runtime pinned (`--owned-server`): a compiler or cargo
+dispatched by the product fails the case.
+
+**Locally.** Build the CLI and the runtime the checks use, then run a group:
+
+    cargo +1.99.0 build --release -p ra-jit --bins --features llvm
+    python3 -I harness/dist/owned_macro_server.py --blaze target/release/ra-jit --work /tmp/owned
+    python3 -I harness/dist/buildspec.py --bin target/release/ra-jit --ci-group basic \
+        --owned-server /tmp/owned/blaze-proc-macro-srv --work /tmp/c2-basic --keep --json /tmp/c2-basic.json
+    python3 -I harness/dist/buildspec.py --bin target/release/ra-jit --only ws/build-p-a    # one case
+    python3 -I harness/dist/saved_spec.py --blaze target/release/ra-jit --backend cranelift \
+        --owned-server /tmp/owned/blaze-proc-macro-srv --work /tmp/c2-saved
+
+`buildspec.py --list` names every fixture and case with what it expects; `--only FIXTURE` is
+a fixture group by its own name (`ws`, `harness`...), `--ci-group` one of the five above. CI adds
+`--memory-mib 8192 --timeout 1200 --shared-store`; drop `--shared-store` for independent stores.
+
+**Tiers.** A pull request into `dist/main` or `dist/c4-keys` that touches the dist area's paths
+(`.github/ci/areas.json`) runs the **fast tier**: all seven groups on Linux alone, packed into
+three jobs, `C2 runtime (ubuntu-24.04, basic)`, `(…, commands nested)` and `(…, profiles-native
+workspace saved-cranelift saved-llvm)`. The **full tier** runs every group on Linux, one per
+job, and on macOS packed into four jobs: nightly, on a push to `dist/main` or `dist/c4-keys`, and
+by hand on any branch:
+
+    gh workflow run pr.yaml -R ScriptedAlchemy/blaze --ref <branch> -f tier=full
+
+A full tier that fails (other than by hand) opens the issue "Full tier of pr.yaml failed", or
+comments on it while it is open. The required context is `C2 runtime` (a job of `pr.yaml`):
+the tier's groups on each of its platforms, with that platform's `bundle (<platform>)` check.
+
+**When a group fails.** The job's step `C2 lanes (<groups>)` prints each group's result and
+seconds, in the job summary too, with the tail of the failed group's log; the artifact
+`c2-runtime-<os>-<groups, spaces as dashes>` of that job holds `c2-evidence/`: `local-<group>.log`
+and `local-<group>.json` (every case's result and diff, for a fixture group), `cranelift.log` or
+`llvm.log` (a saved execution), `identity.txt` (the commit, host and compilers), `bundle.json`
+(the bundle it ran against); beside them the local runs' exec traces and `product-tools.log`
+(`c2-local-<group>/`) and the saved executions' `results.json`, traces and logs
+(`c2-cranelift/`, `c2-llvm/`). The owned runtime's bootstrap evidence (`image-pins.json`, the
+tool controls, the audit and the watchdog) is the build job's artifact
+`owned-runtime-evidence-<platform>`. To reproduce, build the same commit as above and run the
+group with `--keep`: its work directory holds every fixture and case as it was run.
