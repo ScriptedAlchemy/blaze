@@ -75,6 +75,11 @@ macro can observe them. See
 [relocate.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/hir-ty-codegen/relocate.rs)
 and [cache.md](cache.md).
 
+Build-script run records and leased proc-macro images are currently local producer caches.
+Their descriptions retain execution paths and environmental inputs, and captured execution
+creates fresh producer generations. A portable producer-result cache still needs logical
+input identities and immutable output bundles; shared compiler packs alone do not provide it.
+
 ## Content-addressed data and mutable discovery
 
 The cache separates immutable data from mutable discovery. Sealed packs, key indexes and
@@ -111,9 +116,13 @@ The gaps are visible in the call graph:
   compiling only the remaining local work.
 
 C2's saved-source executor and native bindings provide relevant inputs for this bridge; they
-do not themselves dispatch function batches remotely. At review time, the saved executor's
-default cache-off behavior and handling of explicitly configured remote-cache settings are
-under active review. Do not claim that every replay already participates in shared caching.
+do not themselves dispatch function batches remotely. The review fixed the ordinary owned
+command's dropped remote-cache service context: an explicitly active RA_JIT_CACHE and configured
+RA_JIT_REMOTE/RA_JIT_PROJECT now reach the existing compiler pull/push hooks. The normalized
+transport settings are installed after producer preparation; forwarding does not rewrite the
+BuildSpec or the source environment already recorded in producer descriptions. Saved replay
+retains its isolated service boundary and does not acquire an ambient worker remote.
+Default cache-off behavior is unchanged; not every replay participates in shared caching.
 The [frontend image](../crates/ra-jit/src/front_image.rs) is an optional prototype over encoded
 dependency parts, not a shared live frontend or proof that each worker's frontend cost is gone.
 
@@ -128,6 +137,10 @@ The changes address concrete interactions needed by that architecture:
   new subscriber cannot revive expired execution state. See Jobs::submit and Coordinator.
 - **HTTP cache:** release listing snapshots after oversized-page failures and avoid consuming
   slots for completed single-page listings; reject malformed manifest-path encodings.
+- **Owned cache configuration:** preserve explicit shared-cache, project, trust, transport and
+  resource policy for ordinary compiler children. Caller-relative service paths are resolved
+  before child directories change. See
+  [cache_service.rs on #18](https://github.com/ScriptedAlchemy/blaze/blob/dist/c2-buildspec/crates/ra-jit/src/cargo/spec/cache_service.rs).
 - **T1 tests:** identify executables and recorded inputs by content/mode, retain symlink text
   and target observations, and revoke old passes after forced or filtered failures. See
   [affected.rs](../crates/ra-jit/src/cargo/affected.rs),
