@@ -1,9 +1,9 @@
-# The front-end image: what a worker starts its build with, and how much of it a file can hold
+# Storing a worker's initial front-end state in a file
 
 2026-10-26, for [#274](https://github.com/indexable-inc/blaze/issues/274) (state as an image) and
 unit D3 of [distributed.md](../distributed.md) (the front-end image), with frozen dependency
-artifacts ([#40](https://github.com/indexable-inc/blaze/issues/40)) as its first slice. Measured on
-a Mac (Apple silicon, 18 cores, 48 GB, shared with other units' builds). This lane starts at
+artifacts ([#40](https://github.com/indexable-inc/blaze/issues/40)) as its first
+implementation. Measured on a Mac (Apple silicon, 18 cores, 48 GB, shared with other units' builds). This lane starts at
 `f863483f` on `dist/main`. The prepared fixtures are the `harness/dist/fixtures.toml`
 pins of ripgrep 15.1.0 and nushell 0.108.0; their measurements are not yet available.
 Each claim is **read** (measured, or read in a source),
@@ -11,8 +11,9 @@ Each claim is **read** (measured, or read in a source),
 
 ## Short version
 
-The first slice maps the existing frozen bytes. It does **not** map decoded def maps,
-macro expansions or bodies. It cannot remove the reported 7.9 GB front-end heap by itself.
+The prototype maps the existing frozen bytes. It still decodes definition maps
+into the heap and does not map macro expansions or bodies. Mapping those bytes
+alone cannot remove the reported 7.9 GB front-end heap.
 The six reported holders below account for 64% of a tracedecay sampled heap, not 64% of
 physical footprint. Their dependency/workspace byte split remains unmeasured.
 
@@ -22,10 +23,11 @@ is evidence for the OS mechanism, not a blaze speedup or a complete #274 impleme
 
 ## 1. What the 64% is
 
-The question: a tracedecay worker held to 16 GiB ran out of memory before `compile_ahead` was
-done, and 64% of its heap at the bound was what the build starts with
-([LOADMEM.md](../reports/LOADMEM.md), section 8, run A3, one run). Which ingredients are that, which
-crates they belong to, and which of them stay what they are once computed?
+A tracedecay worker limited to 16 GiB ran out of memory before `compile_ahead`
+finished. Initial front-end state accounted for 64% of its sampled heap at the
+limit, as reported in [LOADMEM.md](../reports/LOADMEM.md), section 8, run A3.
+This section identifies those structures, the crates they belong to and whether
+they change after computation.
 
 ### What the worker held at the bound (tracedecay)
 

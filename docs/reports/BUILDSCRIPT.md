@@ -23,9 +23,9 @@ LLVM and the complete harness were not rerun for this environment-only change.
 
 ## Review closure, 2026-10-29
 
-The earlier reports and their parking statements describe the revisions they name. The current review inventory
-is based on all PR #5 comments and its three review submissions; there are no inline review
-threads. The latest findings are in
+The earlier reports describe the revisions they name, including decisions to pause
+work on those revisions. This inventory covers every PR #5 comment and its three
+review submissions. The PR has no inline review threads. The latest findings are in
 [the second-check review](https://github.com/ScriptedAlchemy/blaze/pull/5#issuecomment-6488867981).
 
 - **Inactive optional and target-gated `links` edges: fixed.** Declared dependencies are

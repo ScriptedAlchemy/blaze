@@ -6,18 +6,20 @@
 heap-profile`, Cranelift, no LLVM. tracedecay at `d79de82273` plus the one line
 `#![recursion_limit = "256"]` (a detached worktree, `/Users/bytedance/dev/td-u5`), 51 crates,
 760 packages in `Cargo.lock`. The Mac was not quiet: Bazel builds of tracedecay by other
-sessions and another unit's blaze runs shared it (load average 25 to 42 during the runs), so
-every duration here is slow by an unknown amount and every byte count is not affected by it.
+sessions and another unit's blaze runs shared it. Load average was 25 to 42 during
+the runs. That contention slows the reported durations by an unknown amount; it
+does not affect the byte counts.
 Each claim is **read** (measured here, with its run count), **reported** (someone else's
 measurement, named) or **unverified** (our inference). No fix is made here; the fixes are in
 [section 6](#6-fixes-each-names-a-function).
 
 ## Short version
 
-- **The 56 GB is not a leak and not one pathological construct. It is a worker building the
-  whole program, on every core, in one salsa revision, with nothing bounding it, because the
-  daemon cannot patch the executable cargo linked.** After the
-  workspace is loaded and its names resolved, the worker's main thread is in
+- The 56 GB came from a worker compiling the whole program across every core in one
+  salsa revision without a memory bound. The daemon could not patch the executable
+  Cargo linked. The profile attributes this growth to compilation rather than a
+  leak or a single pathological construct. After loading the workspace and resolving
+  its names, the worker's main thread is in
   `run_holding > build_unheld > build > CodegenUnit::compile_or_hold`, and 18 threads of
   `ObjectCodegen::compile_ahead` chase every instance the program reaches. Every
   intermediate stays as a salsa memo: inference, MIR, the monomorphized MIR, layouts, the

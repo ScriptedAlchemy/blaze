@@ -1,14 +1,14 @@
 # Local distributed protocol carrier
 
-This crate is the real Unix IO facade over `blaze-dist::jobs::Jobs`. It is not a
-compiler executor. `Server` owns a nonblocking listener and registry; `Client`
-and `blaze-dist-local` use that same API. No Tokio dependency is needed for this
-bounded single-owner reactor. IO, threads and real clocks stay outside blaze-dist.
+This crate connects Unix sockets to `blaze-dist::jobs::Jobs`. `Server` owns a
+nonblocking listener and registry. `Client` and the `blaze-dist-local` CLI use
+the same API. One reactor owns the bounded connection set without Tokio.
+IO, threads and clocks stay outside `blaze-dist`. The carrier does not compile code.
 
 ## Framing and versions
 
-Each frame is a **four-byte unsigned big-endian body length**, followed by exactly
-one deterministic CBOR value. Zero length, length past `Config.max_frame`,
+Each frame starts with a four-byte unsigned big-endian body length, followed by
+exactly one deterministic CBOR value. Zero length, length past `Config.max_frame`,
 noncanonical CBOR, unknown fields/variants and trailing bytes are rejected.
 Fragmentation and coalescing do not change these boundaries. JSON and hexadecimal
 are human renderings only; the CLI renders the actual CBOR bytes as hex.
@@ -30,13 +30,14 @@ ClientFrame = [0, LocalHello] | [1, Request]
 ServerFrame = [0, LocalWelcome] | [1, Response] | [2, WireError]
 ```
 
-Carrier version is **2**, terminal contract is **2**, and global codec is the
-actual pinned `blaze_wire::VERSION`. All three must match; no older/newer BuildSpec
-decoder or cargo/compiler fallback is attempted. This lane inherits global
-schema1. C2's independent schema3 branch changes global codec/types/digest domains;
-it is not merged here. Combining must select that reviewed codec and update the
-fixtures. A terminal version of2 does not assert global schema2 or a `/v2` digest
-domain. Typed digests use the selected codec's actual domain.
+The carrier and terminal contract are both version 2. The global codec version is
+`blaze_wire::VERSION`. All three must match. A mismatch is refused without trying
+another BuildSpec decoder or invoking Cargo or a compiler.
+
+This branch uses global schema 1. C2's separate schema 3 branch changes the global
+codec, types and digest domains. Integrating it requires selecting its reviewed
+codec and updating the fixtures. Terminal version 2 does not imply global schema 2
+or a `/v2` digest domain. Typed digests use the selected codec's domain.
 
 ### Transport 2: the daemon issues session labels
 
@@ -72,13 +73,14 @@ the supplied content before submission. No source/materialization or resolved
 unit graph is synthesized in this carrier. The compiler/C2 integration is still
 a dependency.
 
-## Actual commands and bindings
+## Commands and bindings
 
-Command discriminants: Submit0, Subscribe1, Resume2, Events3, Cancel4, Join5,
-Lease6, Result7, WorkerEvents8, KillAck9, Terminal10, Release11. All payloads and their
-integer field numbers are in `src/protocol.rs`. All responses are in `Answer`.
+The command discriminants are Submit 0, Subscribe 1, Resume 2, Events 3, Cancel 4,
+Join 5, Lease 6, Result 7, WorkerEvents 8, KillAck 9, Terminal 10 and Release 11.
+All payloads and their integer field numbers are in `src/protocol.rs`. All
+responses are in `Answer`.
 
-- Submit calls `Jobs::submit`, then real admission. Subscribe adds an interest to
+- Submit calls `Jobs::submit`, then admission. Subscribe adds an interest to
   an exact content/execution. Resume returns the same subscription's current
   binding; it does **not** create another subscriber.
 - Events pages contain original `EventItem`s after the supplied sequence.
@@ -99,7 +101,7 @@ Subscription is `{0: content, 1: execution, 2: subscriber}`. Binding is
 and `Client` verifies response kind and payload against the pending command.
 Terminal lookup carries the exact subscription, returns Pending or immutable
 SubscriberTerminalV2, and checks content/subscriber ownership in the registry.
-`terminal_action(binding, terminal, policy)` additionally verifies the exact
+`terminal_action(binding, terminal, policy)` also verifies the exact
 attempt before calling typed `local_action`. Mismatched/pending terminals never
 start fallback. Resume after lead loss; an already-ended subscriber resumes its
 retained terminal attempt even if other subscribers continue on a new attempt.
@@ -118,7 +120,7 @@ renewed by reconnect, and expiry or `Release` returns capacity immediately. The
 live-session cap therefore bounds concurrent sessions, never a lifetime quota of
 identities, and no tombstone set grows with the number of clients served.
 
-Requests have contiguous sequence numbers starting at1. Before executing, the
+Requests have contiguous sequence numbers starting at 1. Before executing, the
 coordinator reserves replay space for a maximum-size response. It journals the
 **exact request and encoded answer**, including a refusal, before socket output.
 The same sequence/bytes returns that same status without repeating any effects.
@@ -134,15 +136,18 @@ unchanged. A new session means **new** requests, not the old idempotency lifetim
 client with an unresolved request must abandon it explicitly rather than replay it
 into a fresh lifetime.
 
-Defaults: frame1MiB, connections32, live sessions32, fixed session300s,1024requests
-and8MiB journal per session;128retained executions,256subscribers each,
-4096events/8MiB public event bytes and8MiB accepted work-result bytes each.
-Event pages request1–256whole events and fit the negotiated frame. Root/grant
-size is bounded to4096 in this initial facade; excessive job work is Busy, not
-silently removed. This is a local transport milestone bound, not a narrower
-compiler language policy.
+The default limits are:
 
-Terminal executions stay at least600s after the reactor observes termination
+- Frames are at most 1 MiB. The server allows 32 connections and 32 live sessions.
+- A session lasts 300 seconds and has a journal of at most 1,024 requests and 8 MiB.
+- The server retains at most 128 executions, each with at most 256 subscribers,
+  4,096 events, 8 MiB of public event bytes and 8 MiB of accepted work-result bytes.
+- An event page contains 1 to 256 whole events and must fit the negotiated frame.
+- A root set or grant contains at most 4,096 items. Excessive job work returns Busy
+  without dropping items. This limit belongs to the local transport and does not
+  restrict the language the compiler accepts.
+
+Terminal executions stay at least 600 seconds after the reactor observes termination
 and **until all assignment stops are acknowledged**. The explicit forget API
 releases core event/terminal/result data only then. Pending stops retain their
 reservation and can exhaust the finite capacity rather than being evicted.
@@ -166,14 +171,14 @@ blaze-dist-local client /private/daemon.sock
 ```
 
 `serve` has no configured worker and no compiler backend; stdin `stop` or EOF
-ends it. The embedding API configures real admission/builders and a holder/agent
+ends it. The embedding API configures admission, builders and a holder/agent
 callback. `client` accepts one hex-rendered CBOR Command per stdin line and prints
-its real CBOR Answer. No fake worker is installed by the CLI. Shutdown cancels
-remaining interests, emits real stops, closes connections and removes only the
+its CBOR Answer. The CLI does not install a test worker. Shutdown cancels remaining
+interests, emits stop effects, closes connections and removes only the
 owned socket inode, never another daemon's replacement.
 
-Tests use real sockets, the compiled CLI, an actual process-stop callback and
-exact Jobs/WorkSet code. Their accepted-work protocol fixture reports a Local
-item; it is **not** a Rust compilation or pack import. The next dependency is a
-real compiler-holder backend and source/store adapter. No two-worker compile,
-HTTP fleet, crash durability or production client-race execution is claimed.
+Tests use Unix sockets, the compiled CLI, a callback that stops a process and
+the production Jobs/WorkSet code. Their accepted-work fixture reports a Local
+item without compiling Rust or importing a pack. Compiler integration requires
+a compiler-holder backend and a source/store adapter. Two-worker compilation,
+HTTP fleet operation, crash durability and production client races are untested.

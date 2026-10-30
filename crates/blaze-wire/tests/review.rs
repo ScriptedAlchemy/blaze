@@ -1,13 +1,7 @@
-//! The C1 verifier's failing cases, kept as regressions.
+//! C1 schema regressions, including malformed encodings the encoder cannot produce.
 //!
-//! Every test here failed against the first cut of the crate, and each asserts the behaviour the
-//! schema is meant to have rather than the bug it had. The suite is the verifier's own scratch
-//! file, reduced to the crate's tests, with two cases that the doc settled the other way: the
-//! `Namespace::Pr` payload is the map `[1, {0: n}]` the code and golden vectors use, and an enum
-//! renders as the wire's two-element array, which is what `json.rs` now documents.
-//!
-//! The tests write bytes by hand where the encoder never writes them, and reach into the crate's
-//! own types where a public API is what the fix is about.
+//! `Namespace::Pr` encodes as `[1, {0: n}]`, matching the golden vectors. JSON renders
+//! enums as the same two-element array, as documented in `json.rs`.
 
 #![allow(missing_docs)]
 
@@ -282,7 +276,7 @@ fn decode_enforces_whole_request_size() {
     assert!(decode::<u64>(&[0], &l).is_err(), "decode ignored request limit");
 }
 
-/// P1: a real 16 MiB blob plus its head is past the default request limit, and decode says so.
+/// A 16 MiB blob plus its CBOR head exceeds the default request limit.
 #[test]
 fn ordinary_decoder_enforces_real_documented_16mib_request_limit() {
     let b = encode(&Bytes::new(vec![0; limits().request as usize]));
@@ -397,7 +391,7 @@ fn every_digest_input_is_the_encoding_the_golden_digest_uses() {
     assert_eq!(<[u8; 32]>::from(Sha256::digest(&expected)), digest_of(&v));
 }
 
-/// P1: the `f8` offence is named, not just refused.
+/// The validator reports the specific `f8` encoding error.
 #[test]
 fn the_reserved_simple_value_offence_is_named() {
     for n in [0u8, 20, 23, 24, 31] {
@@ -796,7 +790,7 @@ fn agent_signature_header_is_not_malleable() {
     );
 }
 
-/// Lower priority: an enum renders as the wire's two-element array, which `json.rs` documents.
+/// JSON renders enums as the protocol's two-element array, as documented in `json.rs`.
 #[test]
 fn json_enum_rendering_agrees_with_public_docs() {
     assert_eq!(
