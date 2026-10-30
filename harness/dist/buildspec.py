@@ -1446,6 +1446,19 @@ def scan_programs(target):
     """The programs a build left under CARGO_TARGET_DIR/<profile>/: `bin:` at the top, `example:` in
     examples/, `exe:` in deps/ (test binaries and the binaries' own copies, the hash dropped, each as
     often as it is there)."""
+    def same_program(a, b):
+        if os.path.samefile(a, b):
+            return True
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as left, open(b, "rb") as right:
+            while True:
+                chunk = left.read(64 * 1024)
+                if chunk != right.read(64 * 1024):
+                    return False
+                if not chunk:
+                    return True
+
     found = collections.Counter()
     if not os.path.isdir(target):
         return []
@@ -1456,6 +1469,7 @@ def scan_programs(target):
             continue
         if profile not in ("debug", "release") and not os.path.isdir(os.path.join(base, "deps")):
             continue
+        published, executables = {}, collections.defaultdict(list)
         for sub, kind in (("", "bin"), ("examples", "example"), ("deps", "exe")):
             directory = os.path.join(base, sub) if sub else base
             if not os.path.isdir(directory):
@@ -1469,13 +1483,13 @@ def scan_programs(target):
                     examples.add(HASH.sub("", name))
                     continue
                 found[f"{kind}:{HASH.sub('', name) if kind == 'exe' else name}"] += 1
-    # Cargo exposes a binary both at the top level and in deps. They are the
-    # same program; a separate test executable with that name remains counted.
-    for key in list(found):
-        if key.startswith("bin:"):
-            duplicate = "exe:" + key.removeprefix("bin:")
-            if found[duplicate]:
-                found[duplicate] -= 1
+                if kind == "bin":
+                    published[name] = path
+                else:
+                    executables[HASH.sub("", name)].append(path)
+        for name, path in published.items():
+            if any(same_program(path, copy) for copy in executables[name]):
+                found["exe:" + name] -= 1
     return sorted([f"{k} x{n}" if n > 1 else k for k, n in found.items() if n] + [f"example:{e}" for e in examples])
 
 
@@ -3119,6 +3133,26 @@ def self_test_parsing(t):
             os.chmod(path, 0o755)
         t.check(scan_programs(tmp) == ["bin:c x2"],
                 "published profile binaries are found without deps while internal files stay excluded")
+    with tempfile.TemporaryDirectory() as tmp:
+        programs = {"debug/basic": b"main", "debug/deps/basic-0123456789abcdef": b"library test",
+                    "debug/deps/basic-fedcba9876543210": b"binary test"}
+        for name, body in programs.items():
+            path = os.path.join(tmp, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as output:
+                output.write(body)
+            os.chmod(path, 0o755)
+        t.check(scan_programs(tmp) == ["bin:basic", "exe:basic x2"],
+                "two distinct same-named test executables survive a top-level binary without a deps copy")
+        shutil.copyfile(os.path.join(tmp, "debug/basic"), os.path.join(tmp, "debug/deps/basic-aaaaaaaaaaaaaaaa"))
+        os.chmod(os.path.join(tmp, "debug/deps/basic-aaaaaaaaaaaaaaaa"), 0o755)
+        t.check(scan_programs(tmp) == ["bin:basic", "exe:basic x2"],
+                "only the byte-identical published binary copy is discounted")
+        os.makedirs(os.path.join(tmp, "release"))
+        shutil.copyfile(os.path.join(tmp, "debug/deps/basic-0123456789abcdef"), os.path.join(tmp, "release/basic"))
+        os.chmod(os.path.join(tmp, "release/basic"), 0o755)
+        t.check(scan_programs(tmp) == ["bin:basic x2", "exe:basic x2"],
+                "published copies are matched within their own profile")
     s = {"tests": [("a", "tests::adds", "ok"), ("a", "tests::slow", "ignored")], "programs": ["bin:basic"], "markers": ["@@bin basic add=3"], "exit": 0}
     t.check(check_lexpect(s, [("test", "adds", "ok"), ("no-test", "slow"), ("program", "bin", "basic"), ("no-program", "bin", "c"),
                               ("line", "add=3"), ("exit", 0)]) == [], "local expectations that hold are not reported")
