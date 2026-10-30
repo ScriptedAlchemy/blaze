@@ -673,6 +673,14 @@ pub(super) fn inline_of(text: &str) -> Option<Arc<Inline>> {
     INLINE.lock().unwrap_or_else(|e| e.into_inner()).get(text).cloned().flatten()
 }
 
+/// Whether assembly blocks may be lowered inline instead of through a wrapper.
+pub(super) fn inline_enabled() -> bool {
+    static ASKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("RA_JIT_INLINE_ASM").is_none_or(|it| it != "0")
+    });
+    *ASKED
+}
+
 /// The block as LLVM's inline assembly, where it is one LLVM takes as rustc's LLVM does:
 /// operands in general registers, of a block that returns and does not unwind, has no labels
 /// nor `sym`s, and asks for no ABI's registers. LLVM ends the process on assembly it rejects,
@@ -686,11 +694,8 @@ pub(super) fn inline(
     offsets: &[Option<u32>],
     clobber_abi: bool,
 ) -> Option<Inline> {
-    static ASKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("RA_JIT_INLINE_ASM").is_none_or(|it| it != "0")
-    });
     let jumps = operands.iter().any(|it| matches!(it, Operand::Label | Operand::Sym));
-    if !*ASKED
+    if !inline_enabled()
         || !matches!(arch, Arch::X86_64 | Arch::Aarch64)
         || jumps
         || clobber_abi
