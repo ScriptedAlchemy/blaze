@@ -143,6 +143,19 @@ the executable pins, and compares the pair on one runner. The existing 3-second 
 10% threshold and retry on a slowdown are unchanged. A missing base is a failure unless
 the producer explicitly records that the base lacks `crates/ra-jit-bench`.
 
+**An open question on `tango`'s repeated failure (2026-10-30).** PR18's `tango` failed
+repeatedly on `store/has_miss` at +48%. A perf writer fetched the pair from seven runs: the
+`bench-base` and `bench-head` binaries were bit-identical across all seven, so the code is
+not the variable. The one failing run whose CPU was recorded ran on an AMD EPYC 7763 (Zen 3);
+the six passing runs ran on EPYC 9V74, EPYC 9V45 and Xeon 6975P. That is a lead, not proof: a
+layout effect of the head binary that shows on one CPU family only, or that family's own noise
+under the 3 s samples. To make it testable, the `tango` job now records the runner's CPU
+(`lscpu`'s model name and count, `/proc/cpuinfo`'s flags) and both binaries' sha256 beside
+every verdict, pass or fail: in the step summary, at the top of `bench.txt`, and in the
+`tango-<run>-<attempt>` artifact (`tango/cpu.txt`), which is now kept on every run. The
+threshold (10%) and the second comparison on a slowdown are unchanged. Open: whether every
+failure lands on Zen 3, and whether the +48% reproduces on a Zen 3 host outside CI.
+
 What changed on purpose in the server checks, beside where the binaries come from (opus's
 cross-review of 2026-10-30, S1 to S5):
 
