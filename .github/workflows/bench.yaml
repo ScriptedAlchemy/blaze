@@ -33,14 +33,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      # sccache serves both builds below: the base's crates, built again for each push to a pull
+      # request, come from the cache, and each crate is still what rustc makes of its inputs, so
+      # the pair stays the same compiler, flags and machine.
+      - id: toolchain
+        uses: ./.github/actions/toolchain
         with:
-          key: bench
+          cache: sccache
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base
         if: github.event_name == 'pull_request'
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           git checkout -q --detach ${{ github.event.pull_request.base.sha }}
           if [ -d crates/ra-jit-bench ]; then
@@ -50,6 +55,8 @@ jobs:
           fi
           git checkout -q --detach ${{ github.sha }}
       - name: Build the change
+        env:
+          RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
         run: |
           cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
@@ -67,6 +74,7 @@ jobs:
             uname -a
             lscpu
             sha256sum "$RUNNER_TEMP"/bench-*
+            "$SCCACHE_PATH" --show-stats
           } > "$RUNNER_TEMP/tango/context.txt"
       - name: Compare with the base
         if: github.event_name == 'pull_request'

@@ -5,6 +5,22 @@
 # build loads (libLLVM, and on Linux Nix's libc) with the LLVM tools the harnesses read with
 # (llvm-dwarfdump) on PATH; `llvm: none` is neither. Windows has no Nix: it takes LLVM's own
 # release of the version the flake pins, which has llvm-pdbutil besides.
+#
+# The caches are opt-in (`cache`) and can only make a step faster: each holds what a step would
+# otherwise fetch or compute from the same inputs, under a key of those inputs, and a job that
+# misses does the work itself. Nothing is cached that the job's checks read as their subject.
+#   nix      the paths of the dev shell (`shell`) that no substituter of the Nix config has: the
+#            Rust toolchains rust-overlay assembles on the runner. Keyed by OS, architecture,
+#            shell and the hash of flake.nix, flake.lock and nix/; an exact key alone is
+#            restored. The paths a job builds itself are the same paths, by Nix's own naming.
+#   sccache  rustc's outputs for the steps that set `RUSTC_WRAPPER` to the `rustc-wrapper`
+#            output, in a local directory saved after the job. sccache keys each compile by the
+#            compiler's own hash, its arguments, every input file and the environment variables
+#            dep-info lists; the restore key adds the flake, the calling workflow and
+#            `cache-scope`. Crates that link (bins, proc macros, dylibs) are never cached.
+# The cargo registry is not: on PR18 a cold download of every crate took 1.2 s.
+# The Actions cache scopes what a run writes to its own ref: a pull request reads its own
+# entries and its base branch's, and nothing else reads a pull request's.
 name: toolchain
 description: Rust 1.99.0 and LLVM 20
 inputs:
@@ -20,6 +36,28 @@ inputs:
   nightly:
     description: an additional nightly toolchain used by a focused harness
     default: ""
+  shell:
+    description: "the flake's dev shell `llvm: build` realizes (`nix develop .#<shell>`)"
+    default: default
+  cache:
+    description: caches to use, space separated, of nix and sccache
+    default: ""
+  cache-save:
+    description: whether this job writes the caches it missed (true or false)
+    default: "true"
+  cache-scope:
+    description: what separates this job's sccache entries from other jobs' (default the job)
+    default: ""
+outputs:
+  rustc-wrapper:
+    description: sccache, for RUSTC_WRAPPER on the steps that should use it (empty without it)
+    value: ${{ steps.sccache-dir.outputs.wrapper }}
+  nix-cache-hit:
+    description: whether the dev shell's paths came from the cache
+    value: ${{ steps.nix-restore.outputs.cache-hit == 'true' }}
+  sccache-key:
+    description: the key sccache's directory is saved under
+    value: ${{ steps.sccache-dir.outputs.key }}
 runs:
   using: composite
   steps:
@@ -38,12 +76,95 @@ runs:
 
     - if: runner.os != 'Windows' && inputs.llvm != 'none'
       uses: DeterminateSystems/nix-installer-action@v23
+    - id: nix-key
+      if: runner.os != 'Windows' && inputs.llvm == 'build' && contains(format(' {0} ', inputs.cache), ' nix ')
+      shell: bash
+      run: |
+        flake=$(cat flake.nix flake.lock $(git ls-files nix) | sha256sum | cut -c1-16)
+        echo "key=nix-shell-v1-$RUNNER_OS-$RUNNER_ARCH-${{ inputs.shell }}-$flake" >> "$GITHUB_OUTPUT"
+    - id: nix-restore
+      if: steps.nix-key.outputs.key
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/toolchain-nix
+        key: ${{ steps.nix-key.outputs.key }}
+    # Unsigned, so the runner user (trusted by the installer) imports them without signatures:
+    # the entry is what a run of this repository wrote under the same key.
+    - if: steps.nix-restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        xargs nix copy --no-check-sigs --from "file://$HOME/.cache/toolchain-nix" < ~/.cache/toolchain-nix/paths
+        rm -rf ~/.cache/toolchain-nix
     - name: LLVM 20 (Nix)
       if: runner.os != 'Windows' && inputs.llvm != 'none'
       shell: bash
       run: |
-        if [ "${{ inputs.llvm }}" = build ]; then nix develop --command true; fi
+        if [ "${{ inputs.llvm }}" = build ]; then nix develop ".#${{ inputs.shell }}" --profile "$RUNNER_TEMP/toolchain-shell" --command true; fi
         echo "$(nix build --no-link --print-out-paths .#llvm)/bin" >> "$GITHUB_PATH"
+    # The shell's paths that no configured substituter has, which is what the step above built.
+    - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+      shell: bash
+      run: |
+        export SUBSTITUTERS=$(nix config show substituters)
+        nix path-info -r "$RUNNER_TEMP/toolchain-shell" | xargs -P 16 -n 1 sh -c '
+          hash=$(basename "$1" | cut -d- -f1)
+          for s in $SUBSTITUTERS; do
+            case "$s" in http*) curl -sfI --retry 3 -o /dev/null "$s/$hash.narinfo" && exit 0;; esac
+          done
+          echo "$1"' sh > "$RUNNER_TEMP/toolchain-nix-paths"
+        echo "$(wc -l < "$RUNNER_TEMP/toolchain-nix-paths") paths to cache"
+        mkdir -p ~/.cache/toolchain-nix
+        xargs nix copy --to "file://$HOME/.cache/toolchain-nix?compression=none" < "$RUNNER_TEMP/toolchain-nix-paths"
+        mv "$RUNNER_TEMP/toolchain-nix-paths" ~/.cache/toolchain-nix/paths
+        du -sh ~/.cache/toolchain-nix
+    - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/toolchain-nix
+        key: ${{ steps.nix-key.outputs.key }}
+    - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+      shell: bash
+      run: rm -rf ~/.cache/toolchain-nix
+
+    - if: contains(format(' {0} ', inputs.cache), ' sccache ')
+      uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        version: v0.18.0
+    # The restore prefix holds what a different flake or workflow could change outside what
+    # sccache hashes; the exact key adds the commit, so each commit saves once.
+    - id: sccache-dir
+      if: contains(format(' {0} ', inputs.cache), ' sccache ')
+      shell: bash
+      env:
+        SCOPE: ${{ inputs.cache-scope || github.job }}
+        WORKFLOW_REF: ${{ github.workflow_ref }}
+      run: |
+        workflow=${WORKFLOW_REF#"$GITHUB_REPOSITORY"/}
+        workflow=${workflow%%@*}
+        inputs=$(cat flake.nix flake.lock "$workflow" | sha256sum | cut -c1-16)
+        prefix="sccache-v1-$SCOPE-$RUNNER_OS-$RUNNER_ARCH-$inputs-"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "key=$prefix$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+        echo "wrapper=$SCCACHE_PATH" >> "$GITHUB_OUTPUT"
+        {
+          echo "SCCACHE_DIR=$HOME/.cache/toolchain-sccache"
+          echo "SCCACHE_CACHE_SIZE=4G"
+          echo "SCCACHE_GHA_ENABLED=false"
+          echo "SCCACHE_IDLE_TIMEOUT=0"
+        } >> "$GITHUB_ENV"
+    # Saved after the job, when it succeeded and missed the exact key.
+    - if: contains(format(' {0} ', inputs.cache), ' sccache ') && inputs.cache-save == 'true'
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/toolchain-sccache
+        key: ${{ steps.sccache-dir.outputs.key }}
+        restore-keys: ${{ steps.sccache-dir.outputs.prefix }}
+    - if: contains(format(' {0} ', inputs.cache), ' sccache ') && inputs.cache-save != 'true'
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/toolchain-sccache
+        key: ${{ steps.sccache-dir.outputs.key }}
+        restore-keys: ${{ steps.sccache-dir.outputs.prefix }}
 
     # The harnesses run the linker themselves, with the environment the compiler has. In Git
     # Bash the `link` of coreutils comes before the linker, so it goes.
