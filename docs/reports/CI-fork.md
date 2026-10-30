@@ -217,17 +217,46 @@ a broken shared-branch push that would cancel the other lanes' measurements.
 
 `blaze-dist-review.yaml` was an entry point whose 14 `C2 runtime (os, lane)` jobs each ran the
 same lane-independent setup before the lane's own differential. It is now a `workflow_call`
-workflow `pr.yaml` calls once per platform with the bundle's digest and the list of lanes each
-job runs: `protocol` (Linux) checks formatting, replays the `dist` set and runs `buildspec.py
---self-test`; a `C2 runtime (os, lanes)` job takes the bundle, records its identity and runs its
-lanes in turn (a lane is a `buildspec.py --ci-group`, or `saved_spec.py` under one backend),
-keeping every lane's log and result, and fails if any lane failed. Linux runs one lane per job;
-macOS packs the seven lanes into four jobs (`basic`, `profiles-native`, `commands`, and
-`workspace nested saved-cranelift saved-llvm`), which with `bundle (macos-arm64)` is the fork's
-five concurrent macOS jobs. The tracing-integrity and platform-contract checks that every lane
-repeated are `bundle-check.yaml`'s, once per platform. The required contexts `C2 runtime
-(ubuntu-24.04)` and `C2 runtime (macos-15)` are jobs of `pr.yaml`: each requires its platform's
-bundle check and every lane of its platform, or the dist area not being selected.
+workflow `pr.yaml` calls per platform with the bundle's digest and the list of groups each job
+runs: `protocol` (Linux) checks formatting, replays the `dist` set and runs `buildspec.py
+--self-test`; a `C2 runtime (os, groups)` job takes the bundle, records its identity and runs
+its groups in turn (a group is a `buildspec.py --ci-group`, or `saved_spec.py` under one
+backend), keeping every group's log and result, and fails if any failed. The tracing-integrity
+and platform-contract checks that every lane repeated are `bundle-check.yaml`'s, once per
+platform.
+
+**Tiers (owner decision, 2026-10-30).** The C2 groups run in two tiers, modelled on
+ra-jit.yaml's:
+
+- The **fast tier**, a pull request's (and any push to a `dist/*` branch other than the
+  integration branches), runs when the diff touches the dist area's paths, on Linux alone, all
+  seven groups packed into three jobs: `basic` | `commands nested` | `profiles-native workspace
+  saved-cranelift saved-llvm`. One job for all seven would run 4 to 5 hours (the measured
+  Linux group times below add up to about 15,600 s, with `basic` and `profiles-native` censored
+  at their failures); the longest group, `basic`, took 93 min alone, so the fast tier's wall
+  clock is at least that, and three is the fewest jobs where no job is longer than it:
+  `commands` + `nested` is 65 + 19 min, and the other four about 45 + 15 + 19 + 18 min.
+  No macOS bundle is built for the dist area on a pull request.
+- The **full tier** runs nightly (`schedule`), by hand (`workflow_dispatch` with `tier=full`,
+  the default) and on a push to `dist/main` or `dist/c4-keys`: every area, and every C2 group on
+  Linux (one per job) and macOS (packed into four jobs, `basic`, `profiles-native`, `commands`,
+  `workspace nested saved-cranelift saved-llvm`, which with `bundle (macos-arm64)` is the
+  fork's five concurrent macOS jobs). A failed full tier opens the issue "Full tier of pr.yaml
+  failed", or comments on it while it is open (`.github/actions/nightly-issue`, which gained a
+  `title` input), except when started by hand, where the person who started it is watching.
+  The schedule fires from the repository's default branch only, so the nightly begins once
+  `pr.yaml` is on it; until then the full tier is the integration pushes' and the dispatched runs'.
+
+macOS C2 coverage is therefore nightly and on push, not per pull request: an owner-accepted
+trade-off for the fork's five macOS runners, where the seven macOS lanes of one pull request
+waited up to 90 min for a runner and one push asked for seven at once.
+
+**Required-check names.** `C2 runtime (ubuntu-24.04)` and `C2 runtime (macos-15)` are gone: a
+pull request no longer reports macOS, so a required macOS context would never be set. The one
+stable context is `C2 runtime`, a job of `pr.yaml`: it passes when the tier's groups passed on
+each of its platforms with that platform's bundle check, or the dist area was not selected.
+Branch rules that named the two old contexts need `C2 runtime` instead; `ci` still covers
+everything that ran.
 
 Measured baseline, fork PR18 (runs [41035852934](https://github.com/ScriptedAlchemy/blaze/actions/runs/41035852934)
 and [41098738023](https://github.com/ScriptedAlchemy/blaze/actions/runs/41098738023), 2026-10-30),
