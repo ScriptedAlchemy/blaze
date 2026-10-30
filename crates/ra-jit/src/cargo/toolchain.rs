@@ -277,6 +277,32 @@ mod tests {
             .unwrap();
             let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(metadata["packages"][0]["name"], "settled-toolchain");
+            let manifest = paths::AbsPathBuf::assert_utf8(cwd.join("Cargo.toml"));
+            let workspace = project_model::CargoWorkspace::new(
+                serde_json::from_str(&json).unwrap(),
+                project_model::ManifestPath::try_from(manifest.clone()).unwrap(),
+                Default::default(),
+                false,
+            );
+            let plan = crate::plan::Plan::own(
+                &workspace,
+                manifest.as_ref(),
+                &crate::plan::Selection::default(),
+                &crate::plan::Asked {
+                    sysroot: Path::new(&std::env::var_os("RUSTC").unwrap())
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap(),
+                    triple: "aarch64-apple-darwin",
+                    cfg: &[],
+                    env: &Default::default(),
+                },
+            )
+            .unwrap();
+            assert!(
+                plan.package(&workspace[workspace.packages().next().unwrap()].id.repr).is_some()
+            );
             return;
         }
 
