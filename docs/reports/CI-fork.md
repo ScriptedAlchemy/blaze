@@ -67,3 +67,40 @@ reject its digest before execution, restores the byte in `finally`, then runs th
 unchanged test selections. The benchmark consumer runs nine provenance rejection tests
 before preparing its pair. These are normal CI tests of rejection, so they do not need
 a broken shared-branch push that would cancel the other lanes' measurements.
+
+## Distributed protocol consumer (fable)
+
+`blaze-dist-review.yaml` was an entry point whose 14 `C2 runtime (os, lane)` jobs each ran the
+same lane-independent setup before the lane's own differential. It is now a `workflow_call`
+workflow `pr.yaml` calls once per platform with the bundle's digest and the list of lanes each
+job runs: `protocol` (Linux) checks formatting, replays the `dist` set and runs `buildspec.py
+--self-test`; a `C2 runtime (os, lanes)` job takes the bundle, records its identity and runs its
+lanes in turn (a lane is a `buildspec.py --ci-group`, or `saved_spec.py` under one backend),
+keeping every lane's log and result, and fails if any lane failed. Linux runs one lane per job;
+macOS packs the seven lanes into four jobs (`basic`, `profiles-native`, `commands`, and
+`workspace nested saved-cranelift saved-llvm`), which with `bundle (macos-arm64)` is the fork's
+five concurrent macOS jobs. The tracing-integrity and platform-contract checks that every lane
+repeated are `bundle-check.yaml`'s, once per platform. The required contexts `C2 runtime
+(ubuntu-24.04)` and `C2 runtime (macos-15)` are jobs of `pr.yaml`: each requires its platform's
+bundle check and every lane of its platform, or the dist area not being selected.
+
+Measured baseline, fork PR18 (runs [41035852934](https://github.com/ScriptedAlchemy/blaze/actions/runs/41035852934)
+and [41098738023](https://github.com/ScriptedAlchemy/blaze/actions/runs/41098738023), 2026-10-30),
+seconds per lane job before its own differential:
+
+| Setup repeated per lane job | ubuntu-24.04 | macos-15 |
+| --- | ---: | ---: |
+| toolchain | 32-46 | 98-144 |
+| tracing integrity (`norustc_test.py`) | 60-95 | 136-255 |
+| platform contracts (`cargo test -p blaze-wire -p blaze-spec`) | 271-645 | 2038-2701 |
+| release build of ra-jit, both backends | 628-1060 | 986-1478 |
+| owned macro runtime bootstrap | 230-426 | 328-403 |
+| total per lane job | 1221-2272 | 3586-4981 |
+
+The lanes themselves (ubuntu-24.04, completed): workspace 869, nested 1131, commands 3877;
+saved-cranelift 1151 and saved-llvm 1058 to a failure; basic 5573 to a failure. Whole workflow on
+run 41035852934: 3 h 13 min from start to the aggregates, with the macOS lane jobs waiting up to
+90 min for a runner (the fork runs five macOS jobs at once). Total runner time of the 14 lane
+jobs there: about 18 h.
+
+After: pending completed runs of `pr.yaml` on this branch. Negative control: pending.

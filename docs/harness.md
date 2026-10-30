@@ -425,7 +425,12 @@ replays the test processes of `.github/ci/test-sets.json` with the original test
 then runs saved-source replay and the probe/oracle harnesses against the shared release CLI.
 Its `server` aggregate requires both server tests and saved-source replay to pass. The
 central producer owns the release build and macro bootstrap; no check rebuilds those in
-the server workflow. `claims.yaml` (all of
+the server workflow. `blaze-dist-review.yaml` is called by `pr.yaml` once per platform too:
+the protocol tests replay the `dist` set, and the C2 lanes (`buildspec.py`'s fixture groups and
+`saved_spec.py` under each backend) run against the bundle's release CLI and owned macro
+runtime, one lane per job on Linux and the seven packed into four jobs on macOS;
+`bundle-check.yaml` carries the tracing-integrity and platform-contract checks once per
+platform, and `C2 runtime (<os>)` in `pr.yaml` requires it beside that platform's lanes. `claims.yaml` (all of
 rustc's `tests/ui`, both backends, and the scoreboard) and `nix-live.yaml` (the flake, the demo
 and live edits, 40 minutes; also on a change to the flake, `nix/` or the dependencies) run
 nightly and open an issue when they fail, like ra-jit.yaml's full tier. `fork-sync.yaml` runs
