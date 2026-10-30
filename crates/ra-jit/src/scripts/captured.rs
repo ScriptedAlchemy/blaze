@@ -55,8 +55,8 @@ pub(crate) struct Prepared {
     pub(crate) native_records: BTreeSet<PathBuf>,
     pub(crate) opaque_native: bool,
     /// The leases on the macro images the prepared units load.
-    images: Vec<File>,
-    _lease: File,
+    images: Vec<load_cargo::proc_macro_producer_lifetime::Lease>,
+    _lease: load_cargo::proc_macro_producer_lifetime::Lease,
     _lock: File,
 }
 

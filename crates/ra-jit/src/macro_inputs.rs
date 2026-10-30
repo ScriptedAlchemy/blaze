@@ -52,7 +52,7 @@ pub(crate) struct ArtifactInputs {
     root: PathBuf,
     identity: String,
     target_directory: PathBuf,
-    _lease: std::fs::File,
+    _lease: load_cargo::proc_macro_producer_lifetime::Lease,
 }
 
 fn artifact_digest(paths: &[PathBuf], context: &[u8], target: &Path) -> anyhow::Result<String> {
@@ -308,7 +308,7 @@ pub(crate) fn generation(
 /// Retain while the workspace is loaded: scripts can still use this generation's OUT_DIR.
 pub(crate) struct Generation {
     path: PathBuf,
-    _lease: std::fs::File,
+    _lease: load_cargo::proc_macro_producer_lifetime::Lease,
     pub(crate) artifacts: Option<ArtifactInputs>,
 }
 

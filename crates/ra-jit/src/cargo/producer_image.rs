@@ -121,7 +121,7 @@ impl Record {
 /// for as long as the build that asked for it may load it.
 pub(crate) struct Image {
     pub(crate) library: PathBuf,
-    pub(crate) leases: Vec<File>,
+    pub(crate) leases: Vec<load_cargo::proc_macro_producer_lifetime::Lease>,
 }
 
 mod native_path {

@@ -1,5 +1,11 @@
 //! Owned producer directories. Builds and loaded libraries hold shared leases.
 //! Collection removes only marked generations with no live lease.
+//!
+//! Every lock here is an flock, which belongs to an open file description. A thread
+//! that forks to spawn a process gives the child a copy of each descriptor until it
+//! execs, so closing a descriptor does not release its lock while such a child
+//! lives. [`Lease`] releases its lock explicitly when dropped, which acts on the
+//! description every copy shares, so a dropped lease is free at once.
 
 use std::{
     fs::File,
@@ -14,6 +20,41 @@ const FORMAT: &str = "blaze producer generation 1\n";
 const INVALID: &str = ".blaze-producer-invalid";
 const PENDING: &str = ".blaze-producer-pending-";
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A held producer lock. Dropping it releases the lock even while a forked child
+/// that has not yet exec'd still holds a copy of its descriptor.
+#[derive(Debug)]
+pub struct Lease(File);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn open_lease(generation: &Path) -> io::Result<File> {
+    File::options().read(true).write(true).create(true).truncate(false).open(generation.join(LEASE))
+}
+
+/// Take a generation's lease exclusively, or report it leased. A holder that died
+/// without releasing leaves the lock to its forked children until they exec, so a
+/// busy lock is retried for about 50 ms before it counts as leased.
+fn try_exclusive(generation: &Path, settle: bool) -> io::Result<Option<Lease>> {
+    let lock = open_lease(generation)?;
+    let mut wait = std::time::Duration::from_micros(100);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(Some(Lease(lock))),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        if !settle || wait > std::time::Duration::from_millis(50) {
+            return Ok(None);
+        }
+        std::thread::sleep(wait);
+        wait *= 2;
+    }
+}
 
 /// Retire under the root lock before recursive removal can destroy the marker. A crash
 /// halfway through removal then leaves only a pending name, never a blocked content id.
@@ -45,19 +86,19 @@ fn ordinary(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn locked_root(root: &Path) -> io::Result<File> {
+fn locked_root(root: &Path) -> io::Result<Lease> {
     ordinary(root)?;
     std::fs::create_dir_all(root)?;
     let path = root.join(".blaze-producer-collection");
     ordinary(&path)?;
     let lock = File::options().read(true).write(true).create(true).truncate(false).open(path)?;
     lock.lock()?;
-    Ok(lock)
+    Ok(Lease(lock))
 }
 
 /// Claim a newly created directory, or lease one already carrying our format.
 /// The root lock serializes claim/lease with collection; it is not a build lock.
-pub fn lease(generation: &Path) -> io::Result<File> {
+pub fn lease(generation: &Path) -> io::Result<Lease> {
     let root = generation.parent().ok_or_else(|| io::Error::other("producer without root"))?;
     let _root = locked_root(root)?;
     ordinary(generation)?;
@@ -107,26 +148,16 @@ pub fn lease(generation: &Path) -> io::Result<File> {
     ordinary(&generation.join(INVALID))?;
     if generation.join(INVALID).try_exists()? {
         // Retain OUT_DIR paths of older consumers. Retry is possible when they retire.
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(generation.join(LEASE))?;
-        lock.try_lock()
-            .map_err(|_| io::Error::other("invalid producer generation still leased"))?;
+        let Some(_lock) = try_exclusive(generation, true)? else {
+            return Err(io::Error::other("invalid producer generation still leased"));
+        };
         std::fs::remove_dir_all(retire(generation)?)?;
         drop(_root);
         return lease(generation);
     }
-    let lock = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(generation.join(LEASE))?;
+    let lock = open_lease(generation)?;
     lock.lock_shared()?;
-    Ok(lock)
+    Ok(Lease(lock))
 }
 
 /// A failed build keeps its directory for live OUT_DIR consumers, but it is never reused.
@@ -137,7 +168,7 @@ pub fn invalidate(generation: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn lease_for_library(library: &Path) -> io::Result<Vec<File>> {
+pub(crate) fn lease_for_library(library: &Path) -> io::Result<Vec<Lease>> {
     let generations: Vec<_> =
         library.ancestors().filter(|generation| generation.join(MARKER).is_file()).collect();
     // Acquire outer leases first: collection of an enclosing generation must
@@ -176,15 +207,8 @@ pub fn collect(root: &Path, current: &Path) -> io::Result<Vec<PathBuf>> {
             ordinary(&generation.join(MARKER))?;
             ordinary(&generation.join(LEASE))?;
             // A complete old marker without a lease is unleased, not a fatal GC error.
-            let lock = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(generation.join(LEASE))?;
-            if lock.try_lock().is_err() {
-                return Ok(false);
-            }
+            // A generation still leased waits for a later collection, so no settling here.
+            let Some(_lock) = try_exclusive(&generation, false)? else { return Ok(false) };
             let pending = if pending { generation.clone() } else { retire(&generation)? };
             std::fs::remove_dir_all(pending)?;
             Ok::<_, io::Error>(true)
@@ -330,5 +354,79 @@ mod tests {
         assert!(lease(&root.path().join("link")).is_err());
         assert!(collect(root.path(), &root.path().join("current")).unwrap().is_empty());
         assert!(foreign.path().exists());
+    }
+
+    /// Spawning threads hold copies of every descriptor from fork until exec. Each
+    /// round holds its leases until a fork has started, and each child waits 20 ms
+    /// before exec, so the leases are released while a child still holds copies.
+    #[cfg(unix)]
+    #[test]
+    fn released_leases_are_free_while_other_threads_fork() {
+        use std::{
+            os::unix::process::CommandExt,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+            time::Duration,
+        };
+        let root = stdx::tempfile::NamedTempDir::new("producer-lease-fork").unwrap();
+        let current = root.path().join("current");
+        // Apart from `root`, whose collections expect exactly the round's generation.
+        let invalids = stdx::tempfile::NamedTempDir::new("producer-lease-fork-invalid").unwrap();
+        let stop = AtomicBool::new(false);
+        let started = AtomicUsize::new(0);
+        // Returns once a child forked after the caller's leases were opened.
+        let fork_holds_copies = || {
+            let seen = started.load(Ordering::SeqCst);
+            while started.load(Ordering::SeqCst) == seen {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::SeqCst) {
+                        let mut child = std::process::Command::new("true");
+                        // SAFETY: the child only sleeps (nanosleep) before it execs.
+                        unsafe {
+                            child.pre_exec(|| {
+                                std::thread::sleep(Duration::from_millis(20));
+                                Ok(())
+                            })
+                        };
+                        started.fetch_add(1, Ordering::SeqCst);
+                        assert!(child.status().unwrap().success());
+                    }
+                });
+            }
+            let check = || {
+                for round in 0..50 {
+                    let old = root.path().join(format!("old-{round}"));
+                    let build = lease(&old)?;
+                    let consumer = lease_for_library(&old.join("library"))?;
+                    fork_holds_copies();
+                    drop(build);
+                    if !collect(root.path(), &current)?.is_empty() {
+                        return Err(io::Error::other(format!("round {round}: leased removed")));
+                    }
+                    drop(consumer);
+                    if collect(root.path(), &current)? != [old.clone()] {
+                        return Err(io::Error::other(format!("round {round}: released kept")));
+                    }
+                    let invalid = invalids.path().join(format!("invalid-{round}"));
+                    let held = lease(&invalid)?;
+                    invalidate(&invalid)?;
+                    fork_holds_copies();
+                    drop(held);
+                    drop(lease(&invalid)?);
+                    if invalid.join(INVALID).exists() {
+                        return Err(io::Error::other(format!("round {round}: not recreated")));
+                    }
+                }
+                Ok::<_, io::Error>(())
+            };
+            let checked = check();
+            stop.store(true, Ordering::SeqCst);
+            checked.unwrap();
+        });
     }
 }

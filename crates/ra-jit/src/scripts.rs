@@ -106,7 +106,7 @@ pub(crate) type World = Vec<(PathBuf, u64)>;
 /// ([`Own`]) for as long as the database loaded from it serves their macros: a request that
 /// names no build is retired by nothing, and its images are loaded by the proc-macro client
 /// of the database, after the pass that admitted them.
-pub(crate) type Images = Vec<Arc<std::fs::File>>;
+pub(crate) type Images = Vec<Arc<load_cargo::proc_macro_producer_lifetime::Lease>>;
 
 /// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
 /// stays as cargo has it.

@@ -311,7 +311,7 @@ struct State {
     /// loaded from after its scripts are judged: none is collected until it is retired. A
     /// request that names no build has none here: the load that serves it keeps them until
     /// its proc-macro client has loaded the images ([`super::Images`]).
-    images: HashMap<u64, Vec<Arc<File>>>,
+    images: HashMap<u64, super::Images>,
 }
 
 /// A watch of a file of another process: which one it is (a thread ends only the registration
@@ -535,7 +535,7 @@ impl Leases {
     }
 
     /// `build` holds `leases` on producer images until it is retired.
-    pub(super) fn keep_images(&self, build: u64, leases: Vec<Arc<File>>) {
+    pub(super) fn keep_images(&self, build: u64, leases: super::Images) {
         self.state().images.entry(build).or_default().extend(leases);
     }
 
@@ -543,7 +543,7 @@ impl Leases {
     /// that names no build is retired by nothing: the load that serves it holds them instead,
     /// until its proc-macro client has loaded the image, and while it serves it. What the
     /// caller is to hold is returned; a build keeps its own.
-    pub(super) fn image_leases(&self, build: u64, leases: Vec<Arc<File>>) -> Vec<Arc<File>> {
+    pub(super) fn image_leases(&self, build: u64, leases: super::Images) -> super::Images {
         match build {
             0 => leases,
             build => {

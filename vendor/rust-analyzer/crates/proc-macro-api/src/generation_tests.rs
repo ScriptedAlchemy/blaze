@@ -12,6 +12,25 @@ use std::{
 
 use crate::{MacroDylib, ProcMacroClient, ServerError, process::ProcessExit};
 
+/// Spawn a server script the test just wrote. A thread that forked while the script was
+/// open for writing leaves its child a writable copy until that child execs, and Linux
+/// refuses to exec a file open for writing (ETXTBSY) until then.
+fn spawn_written(server: &paths::AbsPath) -> ProcMacroClient {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match ProcMacroClient::spawn(server, std::iter::empty::<(&str, &Option<String>)>(), None, 1)
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            spawned => return spawned.unwrap(),
+        }
+    }
+}
+
 struct ExitCounter(Arc<AtomicUsize>);
 
 #[test]
@@ -217,9 +236,7 @@ fn actual_server_process_is_killed_and_waited_when_generation_retires() {
     std::fs::write(&source, b"generation").unwrap();
     let server = paths::AbsPathBuf::assert_utf8(script);
     let source = paths::AbsPathBuf::assert_utf8(source);
-    let client =
-        ProcMacroClient::spawn(&server, std::iter::empty::<(&str, &Option<String>)>(), None, 1)
-            .unwrap();
+    let client = spawn_written(&server);
     let alive = |pid: &str| {
         std::process::Command::new("ps")
             .args(["-p", pid, "-o", "pid="])
@@ -260,10 +277,7 @@ fn distinct_paths_share_epoch_reload_retains_consumers_and_reports_crash() {
     )).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let server = paths::AbsPathBuf::assert_utf8(script);
-    let client =
-        ProcMacroClient::spawn(&server, std::iter::empty::<(&str, &Option<String>)>(), None, 1)
-            .unwrap()
-            .with_snapshot_root(Some(dir.path().to_owned()));
+    let client = spawn_written(&server).with_snapshot_root(Some(dir.path().to_owned()));
     let mut handles = Vec::new();
     for index in 0..20 {
         let path = paths::AbsPathBuf::assert_utf8(dir.path().join(format!("lib{index}")));
