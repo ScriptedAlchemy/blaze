@@ -329,6 +329,19 @@ For a CI failure, the last line of the harness step lists which scripts failed.
 
 ## CI
 
+On the fork (ScriptedAlchemy/blaze), whose pull requests go to `dist/*`, `pr.yaml` is the
+entry point instead, built on one rule: a commit's ra-jit is built once per platform, and every
+check consumes that build ([reports/CI-fork.md](reports/CI-fork.md)). `changes` picks the areas a
+diff touches (`.github/ci/areas.json`); `bundle.yaml` builds, once per platform, the release
+ra-jit with both backends, the owned macro runtime and every test set of
+`.github/ci/test-sets.json`, and uploads them with `bundle.json`, which gives each file's
+sha256 and the source tree it was built from; each area is a `workflow_call` workflow that
+verifies the bundle against the build job's digest and its own checkout
+(`.github/actions/bundle`) and runs the recorded tests with `.github/scripts/bundle.py test`,
+which compiles nothing. `bundle (<platform>)` runs the checks that depend on the platform alone
+once (`norustc_test.py`, the C2 contract tests). The bundle job alone writes the Actions cache,
+on pushes to `dist/*` and on a pull request's own ref, one entry per ref.
+
 `.github/workflows/ra-jit.yaml` runs in two tiers. It calls `ra-jit-platform.yaml` once for
 each platform, each on a machine of its own kind.
 

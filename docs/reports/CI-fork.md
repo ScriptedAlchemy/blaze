@@ -1,23 +1,133 @@
-# CI on the fork
+# CI on the fork: one build per platform, every check consumes it (2026-10-30)
 
-`pr.yaml` is the shared caller. It builds `bundle-linux-x64` and, for areas that
-need it, `bundle-macos-arm64`. Each contains the release CLI, its compiler-owned
-macro runtime, and the executables selected in `.github/ci/test-sets.json`.
+What upstream's CI does is in [harness.md](../harness.md#ci) and [CI.md](CI.md). This is the
+fork's (ScriptedAlchemy/blaze), whose integration branches are `dist/*` and whose pull requests
+go to `dist/c4-keys`: what I measured, the design that follows from it, and the contract the
+checks are written against.
 
-Consumers use `.github/actions/bundle` with the producer's manifest digest from
-the job-output channel. `bundle.json` binds the source tree, flake, lockfile,
-toolchain, roots and individual file digests. The verifier rejects a mismatched
-checkout or changed file before a test can use it. `bundle.py test` replays the
-processes Cargo recorded, including its working directory and environment; it
-never compiles a test in a consumer. `bundle-check.yaml` runs tracing/audit and
-native-contract checks once per platform. The caller's `ci` includes all selected
-areas, and its top-level `server` preserves the old required-check name.
+## What I measured before
 
-The schema and producer implementation live in `.github/scripts/bundle.py`.
-The central build job owns Actions-cache writes within the fork's 10 GB budget;
-consumer workflows cannot create their own store, compiler or Cargo-target caches.
+On PR18 (head e442c970, runs of 2026-10-30), and the fork's Actions settings:
 
-## Server, benchmark and Nix consumers (astra)
+- **Every check built its own ra-jit.** `blaze-dist-review.yaml` ran 7 C2 lanes on Linux and
+  macOS, 14 jobs, and each job did the same 20 to 30 minutes before its own differential: the
+  toolchain (32 to 40 s), `norustc_test.py` (63 to 77 s, most of it the first `nix develop
+  .#bench`), `cargo test -p blaze-wire -p blaze-spec` (271 to 434 s), the release build of
+  ra-jit (628 to 888 s, `CARGO_BUILD_JOBS=2`, no cache) and the owned macro runtime's bootstrap
+  (230 to 380 s). `blaze-serve-review.yaml` built the release CLI again (about 14 minutes) and
+  bootstrapped the runtime again (about 6), and compiled its test crates in debug besides;
+  `bench.yaml` built its benchmark twice (148 s base, 122 s head, run 41098738519).
+- **The first `nix develop .#bench` of a job took about 75 s**, all of it building the Rust
+  toolchains rust-overlay assembles on the runner (stable and the nightly with its docs), which
+  no substituter has. The toolchain action's own `nix develop` of the default shell, which those
+  jobs never used, took another 18.6 s.
+- **The registry is not worth caching**: `Updating crates.io index` and the download of all 165
+  crates took 1.2 s.
+- **The fork is on the free plan**: 20 concurrent jobs, 5 of them macOS. macOS jobs sat about
+  20 minutes unassigned and were cancelled; one push of PR18 asked for 7 macOS jobs at once.
+- **The Actions cache was full and useless across pull requests**: 11.0 GB in 36 entries, all of
+  them on `refs/pull/*/merge` (rust-cache entries of `bench`, `demo` and `live-edits`, one per
+  push), none on `dist/*`. A pull request's entries are read by that pull request alone, and
+  upstream's workflows write their sccache and rust-cache on `main`, which the fork never
+  builds, so every build was cold.
+
+## The design
+
+`pr.yaml` is the one entry point of a pull request into `dist/main` or `dist/c4-keys`, and of a
+push to `dist/*`:
+
+```
+changes ─▶ build linux-x64 ──▶ bundle (linux-x64) ─┐
+        │                  └─▶ area checks ─────────┤
+        └▶ build macos-arm64 ─▶ bundle (macos-arm64)┼─▶ ci
+                           └─▶ area checks ─────────┘
+```
+
+- `changes` reads the diff against `.github/ci/areas.json` and says which areas run; macOS is
+  built only when an area with macOS checks runs. A change to the CI runs everything.
+- `build` (`bundle.yaml`, one job per platform) is the only place ra-jit is compiled. It builds
+  the release binaries, bootstraps the owned macro runtime with them, compiles every test set
+  the checks need, and uploads the bundle.
+- Each area is a `workflow_call` workflow. Called workflows run inside the caller's run, so they
+  download the bundle artifact directly; artifacts do not cross separate runs, which is why the
+  areas stop being entry points.
+- `bundle (<platform>)` (`bundle-check.yaml`) runs what depends on the platform alone, once per
+  platform: the bundle's verification, the runtime's pin against this ra-jit, `norustc_test.py`
+  and the C2 contract tests. Areas do not repeat them.
+- `ci` says whether everything that ran passed.
+
+## The build bundle (contract v1)
+
+The pull request that introduced it (ScriptedAlchemy/blaze#32) carries the same contract.
+
+**Artifact** `bundle-<platform>` (`linux-x64`, `macos-arm64`): `bundle.json` and
+`bundle.tar.zst`. The build job's output `sha256` is the sha256 of `bundle.json`, passed to each
+consumer as an input: the digest travels through job outputs, not through the artifact it
+vouches for.
+
+**bundle.json** names the source (`commit`, `tree` = `HEAD^{tree}`, `flake` = sha256 of
+`flake.nix` and `flake.lock`, `cargo_lock`), the toolchain (`rustc -vV`, `cargo -V`,
+`llvm-config --version` in `nix develop .#bench`), the features (`llvm`), the two roots
+(`$GITHUB_WORKSPACE`, `$RUNNER_TEMP`), every file as `workspace/…` or `temp/…` with its sha256,
+size and mode, and the sets.
+
+**Contents and where they land:**
+
+| what | path |
+|---|---|
+| release ra-jit, cranelift and llvm (`cargo build --locked --release -p ra-jit --bins --features llvm`) | `target/release/{ra-jit,cargo-ra-jit,ra-jit-rustc,ra-jit-rustc-first}` |
+| the owned macro runtime (`owned_macro_server.py --blaze target/release/ra-jit --work $RUNNER_TEMP/owned-runtime`) | `$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv`, `image-pins.json` and the bootstrap's audit records |
+| each set's test executables, the bins and examples they run, dynamic libraries, and the build-script output of local packages | their cargo paths under `target/` |
+| the verified manifest | `$BLAZE_BUNDLE` |
+
+**Sets** (`.github/ci/test-sets.json`, owned entry by entry by the area that runs them): each is
+its own cargo command in the bench shell with `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_INCREMENTAL=0`, so its feature resolution is the one the
+command alone has.
+
+- `test`: `cargo test --locked <args>` with a cargo `runner` (`bundle.py _record`) that writes
+  down each process cargo would start (executable, arguments, working directory and the
+  environment cargo adds) and starts nothing. Doc-tests, which stable cargo runs through rustdoc
+  and not through the runner, run for real in the build job. A set that records no process
+  fails the build.
+- `build`: `cargo build --locked <args>`; `bench`: `cargo bench --locked --no-run <args>`. Their
+  executables are listed by name.
+- `source: base` builds the set from the pull request's base commit (a detached worktree, a
+  target directory of its own) with the same shell, toolchain and environment as the head, and
+  records the base's identity. `requires: <path>` makes a set `absent`, with its reason, when the
+  path does not exist in its source.
+
+**Verifying** (`.github/actions/bundle`): the job fails unless sha256(`bundle.json`) is the
+build job's output, `source.tree`, `source.flake` and `source.cargo_lock` are the checkout's,
+the roots are this runner's, the tar has nothing unlisted, and every file unpacked has its
+sha256 and size. `bundle.py test <set> -- <libtest args>` checks the executable's digest again
+and replays the set's processes in cargo's order with their recorded directory and
+environment over the job's own, stopping at the first failure with its status, as `cargo test`
+does without `--no-fail-fast`. `bundle.py path <set> <name>` prints an executable's path. Neither
+runs cargo or rustc.
+
+## Cache policy
+
+The bundle job alone writes the Rust and Nix caches. It writes them on a push to `dist/*`,
+which every pull request into that branch reads, and on a pull request's own ref, which that
+pull request's later pushes read. After saving, it deletes the entries of the same kind,
+platform and ref that it superseded (`.github/actions/toolchain/save`, `actions: write`), so a
+ref holds one entry per platform and kind, not one per push.
+
+- **sccache**, a local directory capped at 3 GB, keyed
+  `sccache-v1-bundle-<OS>-<arch>-<flake hash>-<commit>` and restored by the prefix without the
+  commit. sccache keys each compile by the compiler's hash, its arguments, its input files and
+  the environment variables dep-info lists; crates that link (bins, proc macros) are never
+  cached, so `ra-jit`'s own crate always compiles.
+- **Nix**: only the paths of the bench shell that no substituter has, keyed
+  `nix-shell-v1-<OS>-<arch>-bench-<hash of flake.nix, flake.lock, nix/>`, exact match only.
+  Consumers restore it read-only (`cache: nix`, `cache-save: false`).
+- A hit only makes the build faster. What is checked is fixed by `source.tree` in `bundle.json`,
+  which every consumer verifies against its checkout.
+
+## The areas' consumers
+
+### Server, benchmark and Nix consumers (astra)
 
 The old server job serialized the release build and owned macro bootstrap before replay
 and the remaining tests. The consumer keeps all 23 original Cargo test selections as
@@ -103,7 +213,7 @@ unchanged test selections. The benchmark consumer runs nine provenance rejection
 before preparing its pair. These are normal CI tests of rejection, so they do not need
 a broken shared-branch push that would cancel the other lanes' measurements.
 
-## Distributed protocol consumer (fable)
+### Distributed protocol consumer (fable)
 
 `blaze-dist-review.yaml` was an entry point whose 14 `C2 runtime (os, lane)` jobs each ran the
 same lane-independent setup before the lane's own differential. It is now a `workflow_call`
@@ -146,3 +256,7 @@ already did, and a lane can fail on a change the base made that the head never h
 intended subject, since it is the commit the merge would produce.
 
 After: pending completed runs of `pr.yaml` on this branch. Negative control: pending.
+
+## Measured after
+
+(filled in from the runs on ScriptedAlchemy/blaze#32)
