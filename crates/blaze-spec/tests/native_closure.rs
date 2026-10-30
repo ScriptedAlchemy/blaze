@@ -444,3 +444,67 @@ fn logical_aliases_cannot_jump_over_rejected_physical_ancestors() {
         );
     }
 }
+
+#[test]
+fn an_admission_scope_checks_a_sequence_against_captured_values() {
+    let root = tempfile::tempdir().unwrap();
+    let tree = Tree::from_files(
+        root.path(),
+        (0..512).map(|i| (format!("entry-{i}").into(), b"abc".to_vec())),
+    )
+    .unwrap();
+    let closure = Closure { roots: vec![Root { name: "source".into(), tree }] };
+    let admission = closure.admission();
+    let expected = Entry {
+        links: Vec::new(),
+        kind: Kind::File {
+            digest: [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ],
+            len: 3,
+            executable: false,
+        },
+    };
+    for i in 0..512 {
+        let path = root.path().join(format!("entry-{i}"));
+        assert_eq!(admission.entry(&path), Some(expected.clone()));
+        admission.admit(&path, &expected).unwrap();
+        assert!(admission.admit(&path, &Entry { links: vec![], kind: Kind::Missing }).is_err());
+    }
+    assert_eq!(
+        admission.entry(&root.path().join("absent")),
+        Some(Entry { links: vec![], kind: Kind::Missing })
+    );
+    assert!(admission.entry(&root.path().join("../outside")).is_none());
+}
+
+#[test]
+fn a_new_admission_scope_observes_replaced_and_relocated_roots() {
+    let work = tempfile::tempdir().unwrap();
+    let first = work.path().join("first");
+    let moved = work.path().join("moved");
+    fs::create_dir(&first).unwrap();
+    fs::write(first.join("file"), b"old").unwrap();
+    let mut closure = captured("source", &first);
+    let admission = closure.admission();
+    let old = admission.entry(&first.join("file")).unwrap();
+    fs::write(first.join("file"), b"new").unwrap();
+    let new = Tree::capture(&first.join("file")).unwrap();
+    assert!(admission.admit(&first.join("file"), new.entry(Path::new("")).unwrap()).is_err());
+    assert_eq!(admission.entry(&first.join("file")), Some(old));
+    drop(admission);
+    closure.roots[0].tree = Tree::capture(&first).unwrap();
+    let digest = closure.digest();
+    let admission = closure.admission();
+    let expected = admission.entry(&first.join("file")).unwrap();
+    admission.admit(&first.join("file"), new.entry(Path::new("")).unwrap()).unwrap();
+    drop(admission);
+    fs::rename(&first, &moved).unwrap();
+    closure.roots[0].tree = Tree::capture(&moved).unwrap();
+    assert_eq!(closure.digest(), digest);
+    let admission = closure.admission();
+    assert_eq!(admission.entry(&moved.join("file")), Some(expected));
+    assert!(admission.entry(&first.join("file")).is_none());
+}

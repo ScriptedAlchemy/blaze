@@ -32,14 +32,8 @@ pub struct Closure {
 }
 
 impl Closure {
-    /// The bound identity of an input or absent search candidate, without filesystem reads.
-    pub fn entry(&self, path: &Path) -> Option<Entry> {
-        let nodes = self.nodes();
-        match self.entry_at(&nodes, path) {
-            Lookup::Bound(entry) => return Some(entry),
-            Lookup::Rejected => return None,
-            Lookup::Unanchored => {}
-        }
+    /// Prepare an immutable query scope reused across multiple native reads.
+    pub fn admission(&self) -> Admission<'_> {
         let mut aliases = BTreeMap::<&Path, Option<&Path>>::new();
         for root in &self.roots {
             for (alias, resolved) in root.tree.ancestor_aliases() {
@@ -53,51 +47,12 @@ impl Closure {
                     .or_insert(Some(resolved));
             }
         }
-        let mut current = path.to_owned();
-        let mut visited = BTreeSet::from([current.clone()]);
-        while let Some((alias, resolved)) = aliases
-            .iter()
-            .filter(|(alias, _)| current.starts_with(alias))
-            .max_by_key(|(alias, _)| alias.components().count())
-        {
-            let resolved = (*resolved)?;
-            let relative = current.strip_prefix(alias).ok()?;
-            current = resolved.join(relative);
-            if !visited.insert(current.clone()) {
-                return None;
-            }
-            match self.entry_at(&nodes, &current) {
-                Lookup::Bound(entry) => return Some(entry),
-                Lookup::Rejected => return None,
-                Lookup::Unanchored => {}
-            }
-        }
-        None
+        Admission { closure: self, nodes: self.nodes(), aliases }
     }
 
-    fn entry_at(&self, nodes: &BTreeMap<PathBuf, Option<Node>>, path: &Path) -> Lookup<Entry> {
-        let mut prefix = PathBuf::new();
-        let mut crossed_parent = false;
-        for component in path.components() {
-            prefix.push(component.as_os_str());
-            crossed_parent |= matches!(component, Component::ParentDir);
-            match observed_node(nodes, &prefix) {
-                Lookup::Bound(node) => {
-                    if crossed_parent && !self.roots.iter().any(|root| root.tree.root == prefix) {
-                        return Lookup::Rejected;
-                    }
-                    return walk_captured(
-                        nodes,
-                        node.resolved.clone(),
-                        node.entry.clone(),
-                        path.strip_prefix(&prefix).unwrap(),
-                    );
-                }
-                Lookup::Rejected => return Lookup::Rejected,
-                Lookup::Unanchored => {}
-            }
-        }
-        if crossed_parent { Lookup::Rejected } else { Lookup::Unanchored }
+    /// The bound identity of an input or absent search candidate, without filesystem reads.
+    pub fn entry(&self, path: &Path) -> Option<Entry> {
+        self.admission().entry(path)
     }
 
     fn nodes(&self) -> BTreeMap<PathBuf, Option<Node>> {
@@ -154,10 +109,7 @@ impl Closure {
     /// Require an observed input to match an entry in a complete bound tree.
     /// No library name or filename extension confers authority.
     pub fn admit(&self, path: &Path, observed: &Entry) -> anyhow::Result<()> {
-        if self.entry(path).as_ref() == Some(observed) {
-            return Ok(());
-        }
-        anyhow::bail!("unbound native input {}", path.display())
+        self.admission().admit(path, observed)
     }
 
     /// Encode root locations and identities in the existing deterministic CBOR format.
@@ -215,6 +167,81 @@ impl Closure {
             );
         }
         Ok(())
+    }
+}
+
+/// Reusable reads against one immutable captured closure, without filesystem access.
+pub struct Admission<'a> {
+    closure: &'a Closure,
+    nodes: BTreeMap<PathBuf, Option<Node>>,
+    aliases: BTreeMap<&'a Path, Option<&'a Path>>,
+}
+
+impl Admission<'_> {
+    /// The bound identity of an input or absent search candidate, without filesystem reads.
+    pub fn entry(&self, path: &Path) -> Option<Entry> {
+        match self.entry_at(path) {
+            Lookup::Bound(entry) => return Some(entry),
+            Lookup::Rejected => return None,
+            Lookup::Unanchored => {}
+        }
+        let mut current = path.to_owned();
+        let mut visited = BTreeSet::from([current.clone()]);
+        while let Some((alias, resolved)) = self
+            .aliases
+            .iter()
+            .filter(|(alias, _)| current.starts_with(alias))
+            .max_by_key(|(alias, _)| alias.components().count())
+        {
+            let resolved = (*resolved)?;
+            let relative = current.strip_prefix(alias).ok()?;
+            current = resolved.join(relative);
+            if !visited.insert(current.clone()) {
+                return None;
+            }
+            match self.entry_at(&current) {
+                Lookup::Bound(entry) => return Some(entry),
+                Lookup::Rejected => return None,
+                Lookup::Unanchored => {}
+            }
+        }
+        None
+    }
+
+    fn entry_at(&self, path: &Path) -> Lookup<Entry> {
+        let mut prefix = PathBuf::new();
+        let mut crossed_parent = false;
+        for component in path.components() {
+            prefix.push(component.as_os_str());
+            crossed_parent |= matches!(component, Component::ParentDir);
+            match observed_node(&self.nodes, &prefix) {
+                Lookup::Bound(node) => {
+                    if crossed_parent
+                        && !self.closure.roots.iter().any(|root| root.tree.root == prefix)
+                    {
+                        return Lookup::Rejected;
+                    }
+                    return walk_captured(
+                        &self.nodes,
+                        node.resolved.clone(),
+                        node.entry.clone(),
+                        path.strip_prefix(&prefix).unwrap(),
+                    );
+                }
+                Lookup::Rejected => return Lookup::Rejected,
+                Lookup::Unanchored => {}
+            }
+        }
+        if crossed_parent { Lookup::Rejected } else { Lookup::Unanchored }
+    }
+
+    /// Require an observed input to match an entry in a complete bound tree.
+    /// No library name or filename extension confers authority.
+    pub fn admit(&self, path: &Path, observed: &Entry) -> anyhow::Result<()> {
+        if self.entry(path).as_ref() == Some(observed) {
+            return Ok(());
+        }
+        anyhow::bail!("unbound native input {}", path.display())
     }
 }
 

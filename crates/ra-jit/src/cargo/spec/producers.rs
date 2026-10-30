@@ -26,6 +26,7 @@ pub(super) struct Producers {
 
 impl Producers {
     pub(super) fn admit_inputs(&self) -> anyhow::Result<()> {
+        let admission = self.bindings.admission();
         for path in self
             .prepared
             .inputs
@@ -37,8 +38,9 @@ impl Producers {
             let current = blaze_spec::native_tree::Tree::capture(&path)?;
             let entry =
                 current.entry(Path::new("")).context("producer input has no observed root")?;
-            self.bindings.admit(&path, entry).with_context(|| format!("producer input {} is outside authenticated source, runtime and generated inputs", path.display()))?;
+            admission.admit(&path, entry).with_context(|| format!("producer input {} is outside authenticated source, runtime and generated inputs", path.display()))?;
         }
+        drop(admission);
         self.bindings.validate()
     }
 }

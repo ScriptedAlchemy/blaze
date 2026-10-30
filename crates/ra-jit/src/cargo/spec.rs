@@ -1028,6 +1028,7 @@ pub(crate) fn admit_trace(
         }
         None => blaze_spec::native::Closure::default(),
     };
+    let admission = generated.admission();
     for path in &inputs.files {
         let physical = crate::compiler_json::physical_path(project, Path::new(path))?;
         let path = physical.canonicalize()?;
@@ -1048,7 +1049,7 @@ pub(crate) fn admit_trace(
                 "compiler input {} is not a generated file",
                 physical.display()
             );
-            generated.admit(&physical, entry).with_context(|| {
+            admission.admit(&physical, entry).with_context(|| {
                 format!(
                     "compiler read {} outside authenticated source and producer inputs",
                     physical.display()
@@ -1056,6 +1057,7 @@ pub(crate) fn admit_trace(
             })?;
         }
     }
+    drop(admission);
     generated.validate()?;
     let environments = crate::compiler_json::source_environments(project)?;
     let trace_key = crate::dep_info::replay_key(project)?;

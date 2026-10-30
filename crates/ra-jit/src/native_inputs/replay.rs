@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context as _, bail, ensure};
 use blaze_spec::{
-    native::{Closure, Root},
+    native::{Admission, Closure, Root},
     native_tree::{Kind, Tree},
 };
 
@@ -59,6 +59,7 @@ pub(crate) fn before(
         collector.search = explicit;
     }
     collector.arguments(args)?;
+    drop(collector);
     Ok(Some(Guard { bindings: Arc::new(closure) }))
 }
 
@@ -74,7 +75,7 @@ enum LinkRead {
 }
 
 struct Collector<'a> {
-    bindings: &'a Closure,
+    admission: Admission<'a>,
     cwd: PathBuf,
     apple: bool,
     search: Vec<PathBuf>,
@@ -102,7 +103,7 @@ impl<'a> Collector<'a> {
             }
         }
         Self {
-            bindings,
+            admission: bindings.admission(),
             cwd,
             apple,
             search,
@@ -318,7 +319,7 @@ impl<'a> Collector<'a> {
     }
 
     fn bound(&self, path: &Path) -> anyhow::Result<blaze_spec::native_tree::Entry> {
-        self.bindings
+        self.admission
             .entry(path)
             .with_context(|| format!("unbound native input {}", path.display()))
     }
@@ -385,7 +386,7 @@ impl<'a> Collector<'a> {
         }
         self.active.insert(path.to_owned());
         let current = Tree::capture(path)?;
-        self.bindings
+        self.admission
             .admit(path, current.entry(Path::new("")).context("native observation is empty")?)?;
         if inspect {
             let bytes = std::fs::read(path)?;
