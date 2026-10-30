@@ -275,9 +275,12 @@ for its final compiler processes. Set both `RA_JIT_CACHE` and `RA_JIT_REMOTE`; t
 executor's default remains cache-off. Relative store, directory-remote and signing-key paths
 are resolved from the command's working directory before compiler children change directories.
 The compiler pulls before compilation and publishes sealed packs after a successful one-shot
-build. Cache limits, project, lazy/read-only mode and manifest trust/signing policy are applied
-to these compiler processes after producer preparation. This forwarding does not alter the
-saved BuildSpec or the source environment already recorded in producer descriptions.
+build. A `build` or `run` that sets both is therefore not the daemon's whole build, whose
+workers use the daemon's store and publish on its schedule after the command returns: it
+starts no daemon, and returns with its packs published. Cache limits, project, lazy/read-only
+mode and manifest trust/signing policy are applied to these compiler processes after producer
+preparation. This forwarding does not alter the saved BuildSpec or the source environment
+already recorded in producer descriptions.
 
 An explicitly selected S3 transport receives the caller's `AWS_*` SDK configuration and
 credential-provider settings. Explicit config, credential and token-file paths work without

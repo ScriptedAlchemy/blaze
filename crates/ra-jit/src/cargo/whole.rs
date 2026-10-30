@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -39,6 +40,15 @@ pub(super) fn asked_for(asked: &Invocation) -> bool {
         && (!flags.selects_targets || named)
         && !flags.cargos_plan
         && flags.targets.len() <= 1
+}
+
+/// Whether the daemon builds what `asked` asks for, with the process environment `env`: a
+/// whole build, unless the command names a store and a remote of its own. The daemon's
+/// workers use the daemon's store, would read relative paths from the checkout, and publish
+/// on the daemon's schedule after the command has returned; the daemon then outlives the
+/// command. The one-shot owned build pulls, compiles and publishes before it returns.
+pub(super) fn by_daemon(asked: &Invocation, env: &BTreeMap<String, OsString>) -> bool {
+    asked_for(asked) && !super::spec::cache_service::selected(env)
 }
 
 /// A program of the build, as cargo plans it.
@@ -530,6 +540,42 @@ mod tests {
     /// The file a whole build of `args` links its program into, before it places it where
     /// cargo has it. Two builds whose program differs in what it compiles must not share it:
     /// the one of the second would be placed from a file the first linked.
+    /// A command that names its own store and remote is the one-shot owned build's: the
+    /// daemon's workers would use the daemon's store, read the relative paths from the
+    /// checkout and publish after the command had returned, from a daemon that outlives it.
+    #[test]
+    fn a_build_with_its_own_cache_service_is_not_the_daemons() {
+        let invocation = |subcommand: &str| match Asked::parse(vec![
+            subcommand.to_owned(),
+            "--manifest-path".to_owned(),
+            "../Cargo.toml".to_owned(),
+        ]) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, OsString> {
+            pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).into())).collect()
+        };
+        let service = env(&[
+            ("RA_JIT_CACHE", "../writer-store"),
+            ("RA_JIT_REMOTE", "../../owned-remote"),
+            ("RA_JIT_PROJECT", "owned-cache"),
+            ("RA_JIT_REMOTE_LAZY", "1"),
+        ]);
+        for subcommand in ["run", "build"] {
+            let asked = invocation(subcommand);
+            assert!(!by_daemon(&asked, &service), "{subcommand} with its own store and remote");
+            // Without a remote, or with the store off, nothing is published: the daemon's.
+            assert!(by_daemon(&asked, &env(&[])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_CACHE", "../writer-store")])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_REMOTE", "../../owned-remote")])));
+            let off = env(&[("RA_JIT_CACHE", "off"), ("RA_JIT_REMOTE", "../../owned-remote")]);
+            assert!(by_daemon(&asked, &off));
+            let empty = env(&[("RA_JIT_CACHE", "../writer-store"), ("RA_JIT_REMOTE", "")]);
+            assert!(by_daemon(&asked, &empty));
+        }
+    }
+
     #[test]
     fn a_build_links_into_a_directory_of_its_own() {
         let target = Path::new("/ws/target");

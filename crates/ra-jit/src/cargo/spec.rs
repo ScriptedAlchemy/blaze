@@ -17,7 +17,7 @@ use blaze_spec::{
 use blaze_wire::{BuildSpec, Namespace, ProfileSpec, RootRef, SourceRef, StoreIdentity};
 use sha2::{Digest as _, Sha256};
 
-mod cache_service;
+pub(super) mod cache_service;
 pub(super) mod direct;
 mod producers;
 mod runtime;

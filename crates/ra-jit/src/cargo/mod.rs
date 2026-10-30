@@ -69,13 +69,10 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     let code = match asked {
         Asked::Build(asked) => match asked.only_cargo() {
-            _ if matches!(asked.subcommand, Subcommand::Test | Subcommand::Check)
-                || !whole::asked_for(&asked) =>
-            {
-                spec::direct::command(&asked)?
+            None if whole::by_daemon(&asked, &blaze_spec::environment::native_process()) => {
+                build(&asked)?
             }
-            Some(_) => spec::direct::command(&asked)?,
-            None => build(&asked)?,
+            _ => spec::direct::command(&asked)?,
         },
         Asked::Cargo(args) => plain_cargo(args)?,
         Asked::Cache(args) => cache(args)?,
