@@ -34,7 +34,9 @@ On PR18 (head e442c970, runs of 2026-10-30), and the fork's Actions settings:
 ## The design
 
 `pr.yaml` is the one entry point of a pull request into `dist/main` or `dist/c4-keys`, and of a
-push to `dist/*`:
+push to either of those two branches (a push to any other branch starts nothing: its pull
+request's run is the one that counts, and a second run per commit on the `push` event doubled
+the load on the fork's twenty runners):
 
 ```
 changes ─▶ build linux-x64 ──▶ bundle (linux-x64) ─┐
@@ -108,8 +110,8 @@ runs cargo or rustc.
 
 ## Cache policy
 
-The bundle job alone writes the Rust and Nix caches. It writes them on a push to `dist/*`,
-which every pull request into that branch reads, and on a pull request's own ref, which that
+The bundle job alone writes the Rust and Nix caches. It writes them on a push to `dist/main` or
+`dist/c4-keys`, which every pull request into that branch reads, and on a pull request's own ref, which that
 pull request's later pushes read. After saving, it deletes the entries of the same kind,
 platform and ref that it superseded (`.github/actions/toolchain/save`, `actions: write`), so a
 ref holds one entry per platform and kind, not one per push.
@@ -228,8 +230,8 @@ platform.
 **Tiers (owner decision, 2026-10-30).** The C2 groups run in two tiers, modelled on
 ra-jit.yaml's:
 
-- The **fast tier**, a pull request's (and any push to a `dist/*` branch other than the
-  integration branches), runs when the diff touches the dist area's paths, on Linux alone, all
+- The **fast tier**, a pull request's (and `workflow_dispatch -f tier=fast` on a branch without
+  one), runs when the diff touches the dist area's paths, on Linux alone, all
   seven groups packed into three jobs: `basic` | `commands nested` | `profiles-native workspace
   saved-cranelift saved-llvm`. One job for all seven would run 4 to 5 hours (the measured
   Linux group times below add up to about 15,600 s, with `basic` and `profiles-native` censored
