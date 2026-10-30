@@ -7,6 +7,7 @@ mod answers;
 mod borrowck;
 mod cargo;
 mod check;
+mod child;
 mod compiler_json;
 mod content;
 mod dep_info;

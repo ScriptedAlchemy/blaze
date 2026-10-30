@@ -741,15 +741,10 @@ fn execute_inner(
             runtime::install_environment(&mut description, &runtime_env);
             let described = crate::compiler_json::write(&project, &description)?;
             command.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped());
-            let mut child = command.spawn()?;
-            if let Err(error) =
-                child.stdin.take().context("doctest project pipe")?.write_all(&described)
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error).context("sending owned doctest project");
-            }
-            super::run::exit_code(child.wait()?)
+            let child = command.spawn()?;
+            let output =
+                crate::child::feed(child, &described).context("sending owned doctest project")?;
+            super::run::exit_code(output.status)
         } else {
             super::run::exit_code(command.status()?)
         };
