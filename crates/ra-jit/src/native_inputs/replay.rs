@@ -62,6 +62,17 @@ pub(crate) fn before(
     Ok(Some(Guard { bindings: Arc::new(closure) }))
 }
 
+enum LinkRead {
+    Search(PathBuf),
+    FrameworkSearch(PathBuf),
+    Library(OsString),
+    Framework(OsString),
+    File(PathBuf, bool),
+    Static(bool),
+    Push,
+    Pop,
+}
+
 struct Collector<'a> {
     bindings: &'a Closure,
     cwd: PathBuf,
@@ -102,72 +113,107 @@ impl<'a> Collector<'a> {
     }
 
     fn arguments(&mut self, args: Vec<OsString>) -> anyhow::Result<()> {
-        let mut expanded = Vec::new();
-        self.expand(args, &mut expanded, 0)?;
-        let mut explicit = Vec::new();
-        let mut frameworks = Vec::new();
-        let mut at = 0;
-        while at < expanded.len() {
-            let bytes = expanded[at].as_encoded_bytes();
-            if bytes == b"-L" || bytes == b"-F" {
-                let directory = expanded.get(at + 1).context("native search flag needs a path")?;
-                if bytes == b"-L" {
-                    explicit.push(self.cwd.join(directory));
-                } else {
-                    frameworks.push(self.cwd.join(directory));
+        let mut driver = Vec::new();
+        self.expand_driver_responses(args, &mut driver, 0)?;
+        let mut linker = Vec::new();
+        let mut args = driver.into_iter();
+        while let Some((arg, depth)) = args.next() {
+            let bytes = arg.as_encoded_bytes();
+            match bytes {
+                b"-B" | b"-isysroot" | b"--sysroot" => {
+                    let (value, _) = args.next().context("native driver flag needs a path")?;
+                    self.bound(&self.cwd.join(value))?;
                 }
-                at += 2;
-            } else if let Some(path) = bytes.strip_prefix(b"-L") {
-                explicit.push(self.cwd.join(native(path)?));
-                at += 1;
-            } else if let Some(path) = bytes.strip_prefix(b"-F") {
-                frameworks.push(self.cwd.join(native(path)?));
-                at += 1;
-            } else {
-                at += 1;
+                b"-arch" => {
+                    args.next().context("native driver flag needs a value")?;
+                }
+                b"-L" | b"-F" | b"-l" | b"-framework" | b"-weak_framework" => {
+                    linker.push(arg);
+                    linker.push(args.next().context("native driver flag needs a value")?.0);
+                }
+                b"-Xlinker" => {
+                    let (value, value_depth) = args.next().context("-Xlinker needs an argument")?;
+                    self.expand_linker(vec![value], &mut linker, value_depth + 1)?;
+                }
+                b"-static" => linker.push("-Bstatic".into()),
+                b"-nodefaultlibs" | b"-nostdlib" | b"-nostartfiles" | b"-pie" | b"-shared"
+                | b"-dynamiclib" | b"-m64" | b"-m32" | b"-pthread" | b"-rdynamic" | b"-s" => {}
+                _ if bytes.starts_with(b"-B") => {
+                    self.bound(&self.cwd.join(native(&bytes[2..])?))?;
+                }
+                _ if bytes.starts_with(b"-Wl,") => {
+                    let words = bytes[4..]
+                        .split(|b| *b == b',')
+                        .map(native)
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    self.expand_linker(words, &mut linker, depth + 1)?;
+                }
+                _ if bytes.starts_with(b"-L")
+                    || bytes.starts_with(b"-F")
+                    || bytes.starts_with(b"-l")
+                    || !bytes.starts_with(b"-") =>
+                {
+                    linker.push(arg)
+                }
+                _ if bytes.starts_with(b"-fuse-ld=") => {}
+                _ => bail!("native driver input rule is not owned for {}", arg.to_string_lossy()),
             }
         }
-        explicit.append(&mut self.search);
-        self.search = explicit;
+        let reads = self.linker_arguments(linker)?;
+        let mut search = Vec::new();
+        let mut frameworks = Vec::new();
+        for read in &reads {
+            match read {
+                LinkRead::Search(path) => search.push(path.clone()),
+                LinkRead::FrameworkSearch(path) => frameworks.push(path.clone()),
+                _ => {}
+            }
+        }
+        search.append(&mut self.search);
+        self.search = search;
         frameworks.append(&mut self.frameworks);
         self.frameworks = frameworks;
         let mut static_only = false;
         let mut modes = Vec::new();
-        let mut at = 0;
-        while at < expanded.len() {
-            let arg = &expanded[at];
-            at += 1;
-            let bytes = arg.as_encoded_bytes();
-            let mut value = || -> anyhow::Result<OsString> {
-                let value = expanded.get(at).context("native linker flag needs a value")?.clone();
-                at += 1;
-                Ok(value)
-            };
-            match bytes {
-                b"-L" | b"-F" => {
-                    value()?;
-                }
-                b"-l" => {
-                    self.library(&value()?, static_only)?;
-                }
-                b"-framework" | b"-weak_framework" => {
-                    self.framework(&value()?)?;
-                }
-                b"-Bstatic" | b"-static" => static_only = true,
-                b"-Bdynamic" => static_only = false,
-                b"--push-state" => modes.push(static_only),
-                b"--pop-state" => {
+        for read in reads {
+            match read {
+                LinkRead::Search(_) | LinkRead::FrameworkSearch(_) => {}
+                LinkRead::Library(name) => self.library(&name, static_only)?,
+                LinkRead::Framework(name) => self.framework(&name)?,
+                LinkRead::File(path, inspect) => self.file(&path, inspect)?,
+                LinkRead::Static(value) => static_only = value,
+                LinkRead::Push => modes.push(static_only),
+                LinkRead::Pop => {
                     static_only = modes.pop().context("native linker state stack is empty")?
                 }
-                b"-T" | b"--script" => {
-                    self.file(&self.cwd.join(value()?), true)?;
-                }
+            }
+        }
+        ensure!(modes.is_empty(), "native linker state stack is not balanced");
+        Ok(())
+    }
+
+    fn linker_arguments(&self, args: Vec<OsString>) -> anyhow::Result<Vec<LinkRead>> {
+        let mut reads = Vec::new();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let bytes = arg.as_encoded_bytes();
+            let mut value = || args.next().context("native linker flag needs a value");
+            match bytes {
+                b"-L" => reads.push(LinkRead::Search(self.cwd.join(value()?))),
+                b"-F" => reads.push(LinkRead::FrameworkSearch(self.cwd.join(value()?))),
+                b"-l" => reads.push(LinkRead::Library(value()?)),
+                b"-framework" | b"-weak_framework" => reads.push(LinkRead::Framework(value()?)),
+                b"-Bstatic" | b"-static" => reads.push(LinkRead::Static(true)),
+                b"-Bdynamic" => reads.push(LinkRead::Static(false)),
+                b"--push-state" => reads.push(LinkRead::Push),
+                b"--pop-state" => reads.push(LinkRead::Pop),
+                b"-T" | b"--script" => reads.push(LinkRead::File(self.cwd.join(value()?), true)),
                 b"--version-script"
                 | b"--dynamic-list"
                 | b"-exported_symbols_list"
                 | b"-unexported_symbols_list"
                 | b"-order_file" => {
-                    self.file(&self.cwd.join(value()?), false)?;
+                    reads.push(LinkRead::File(self.cwd.join(value()?), false));
                 }
                 b"-arch"
                 | b"-z"
@@ -187,87 +233,67 @@ impl<'a> Collector<'a> {
                 b"-isysroot" | b"--sysroot" => {
                     self.bound(&self.cwd.join(value()?))?;
                 }
-                b"-B" => {
-                    self.bound(&self.cwd.join(value()?))?;
-                }
-                b"--as-needed"
+                b"-Bsymbolic"
+                | b"-Bsymbolic-functions"
+                | b"--as-needed"
                 | b"--no-as-needed"
                 | b"--whole-archive"
                 | b"--no-whole-archive"
                 | b"--gc-sections"
                 | b"--eh-frame-hdr"
                 | b"-dead_strip"
-                | b"-nodefaultlibs"
-                | b"-nostdlib"
-                | b"-nostartfiles"
-                | b"-pie"
-                | b"-shared"
-                | b"-dynamiclib"
-                | b"-m64"
-                | b"-m32"
-                | b"-pthread"
-                | b"-rdynamic"
                 | b"-s" => {}
-                _ if bytes.starts_with(b"-L") || bytes.starts_with(b"-F") => {}
-                _ if bytes.starts_with(b"-l") => {
-                    self.library(&native(&bytes[2..])?, static_only)?
+                _ if bytes.starts_with(b"-L") => {
+                    reads.push(LinkRead::Search(self.cwd.join(native(&bytes[2..])?)))
                 }
-                _ if bytes.starts_with(b"-B") => {
-                    self.bound(&self.cwd.join(native(&bytes[2..])?))?;
+                _ if bytes.starts_with(b"-F") => {
+                    reads.push(LinkRead::FrameworkSearch(self.cwd.join(native(&bytes[2..])?)))
+                }
+                _ if bytes.starts_with(b"-l") => {
+                    reads.push(LinkRead::Library(native(&bytes[2..])?))
                 }
                 _ if bytes.starts_with(b"--version-script=")
                     || bytes.starts_with(b"--dynamic-list=") =>
                 {
                     let path = bytes.splitn(2, |b| *b == b'=').nth(1).unwrap();
-                    self.file(&self.cwd.join(native(path)?), false)?;
+                    reads.push(LinkRead::File(self.cwd.join(native(path)?), false));
                 }
                 _ if bytes.starts_with(b"--script=") => {
-                    self.file(&self.cwd.join(native(&bytes[9..])?), true)?;
+                    reads.push(LinkRead::File(self.cwd.join(native(&bytes[9..])?), true))
                 }
-                _ if bytes.starts_with(b"-fuse-ld=") => {}
                 _ if !bytes.starts_with(b"-") => {
-                    self.file(&self.cwd.join(arg), true)?;
+                    reads.push(LinkRead::File(self.cwd.join(arg), true))
                 }
                 _ => bail!("native linker input rule is not owned for {}", arg.to_string_lossy()),
             }
         }
-        ensure!(modes.is_empty(), "native linker state stack is not balanced");
-        Ok(())
+        Ok(reads)
     }
 
-    fn expand(
+    fn response(&mut self, path: &[u8]) -> anyhow::Result<Vec<OsString>> {
+        let path = self.cwd.join(native(path)?);
+        self.file(&path, false)?;
+        let bytes = std::fs::read(&path)?;
+        shlex::bytes::split(&bytes)
+            .context("invalid native linker response file")?
+            .into_iter()
+            .map(|word| native(&word))
+            .collect()
+    }
+
+    fn expand_driver_responses(
         &mut self,
         args: Vec<OsString>,
-        out: &mut Vec<OsString>,
+        out: &mut Vec<(OsString, usize)>,
         depth: usize,
     ) -> anyhow::Result<()> {
         ensure!(depth < 64, "native linker response nesting is too deep");
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            let bytes = arg.as_encoded_bytes();
-            if bytes == b"-Xlinker" {
-                self.expand_linker(
-                    vec![args.next().context("-Xlinker needs an argument")?],
-                    out,
-                    depth + 1,
-                )?;
-            } else if let Some(path) = bytes.strip_prefix(b"@") {
-                let path = self.cwd.join(native(path)?);
-                self.file(&path, false)?;
-                let bytes = std::fs::read(&path)?;
-                let words =
-                    shlex::bytes::split(&bytes).context("invalid native linker response file")?;
-                let args =
-                    words.into_iter().map(|word| native(&word)).collect::<anyhow::Result<_>>()?;
-                self.expand(args, out, depth + 1)?;
-            } else if let Some(words) = bytes.strip_prefix(b"-Wl,") {
-                self.expand_linker(
-                    words.split(|b| *b == b',').map(native).collect::<anyhow::Result<Vec<_>>>()?,
-                    out,
-                    depth + 1,
-                )?;
+        for arg in args {
+            if let Some(path) = arg.as_encoded_bytes().strip_prefix(b"@") {
+                let words = self.response(path)?;
+                self.expand_driver_responses(words, out, depth + 1)?;
             } else {
-                out.push(arg);
+                out.push((arg, depth));
             }
         }
         Ok(())
@@ -282,14 +308,8 @@ impl<'a> Collector<'a> {
         ensure!(depth < 64, "native linker response nesting is too deep");
         for arg in args {
             if let Some(path) = arg.as_encoded_bytes().strip_prefix(b"@") {
-                let path = self.cwd.join(native(path)?);
-                self.file(&path, false)?;
-                let bytes = std::fs::read(&path)?;
-                let words =
-                    shlex::bytes::split(&bytes).context("invalid native linker response file")?;
-                let args =
-                    words.into_iter().map(|word| native(&word)).collect::<anyhow::Result<_>>()?;
-                self.expand_linker(args, out, depth + 1)?;
+                let words = self.response(path)?;
+                self.expand_linker(words, out, depth + 1)?;
             } else {
                 out.push(arg);
             }

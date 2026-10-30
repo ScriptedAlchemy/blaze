@@ -212,10 +212,9 @@ fn static_mode_is_scoped_by_push_pop_and_verbatim_names_are_not_prefixed() {
     let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
     collector
         .arguments(words(&[
-            "--push-state",
-            "-Bstatic",
+            "-Wl,--push-state,-Bstatic",
             "-lchoice",
-            "--pop-state",
+            "-Wl,--pop-state",
             "-lchoice",
             "-l:odd-name.object",
         ]))
@@ -223,12 +222,12 @@ fn static_mode_is_scoped_by_push_pop_and_verbatim_names_are_not_prefixed() {
     assert_eq!(collector.seen, BTreeSet::from([shared, archive, exact]));
     assert!(
         Collector::new(&closure, dir.path().to_owned(), false)
-            .arguments(words(&["--pop-state"]))
+            .arguments(words(&["-Wl,--pop-state"]))
             .is_err()
     );
     assert!(
         Collector::new(&closure, dir.path().to_owned(), false)
-            .arguments(words(&["--push-state"]))
+            .arguments(words(&["-Wl,--push-state"]))
             .is_err()
     );
 }
@@ -247,7 +246,7 @@ fn linker_script_group_input_include_and_library_references_admit_each_actual_fi
     );
     let closure = bindings(&[("source", dir.path())]);
     let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
-    collector.arguments(words(&["-Llib", "-T", "main.ld"])).unwrap();
+    collector.arguments(words(&["-Llib", "-Wl,-T,main.ld"])).unwrap();
     assert_eq!(collector.seen, BTreeSet::from([a, b, library, nested, script]));
 }
 
@@ -463,4 +462,151 @@ fn linker_paths_do_not_lexically_erase_symlink_parent_traversal() {
     assert!(collector.seen.contains(&actual));
     assert_eq!(fs::read(&actual).unwrap(), fs::read(&selected).unwrap());
     assert_ne!(fs::read(&actual).unwrap(), fs::read(&ignored).unwrap());
+}
+
+#[test]
+fn driver_prefixes_and_linker_controls_have_distinct_meanings() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["symbolic", "static", "dynamic", "-Wl,-Bsymbolic"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let symbolic = dir.path().join("symbolic");
+    let static_dir = dir.path().join("static");
+    let dynamic = dir.path().join("dynamic");
+    let wrapper = dir.path().join("-Wl,-Bsymbolic");
+    let closure = bindings(&[
+        ("symbolic", &symbolic),
+        ("static", &static_dir),
+        ("dynamic", &dynamic),
+        ("wrapper", &wrapper),
+    ]);
+    for name in ["symbolic", "static", "dynamic", "-Wl,-Bsymbolic"] {
+        for args in [vec![OsString::from(format!("-B{name}"))], words(&["-B", name])] {
+            Collector::new(&closure, dir.path().to_owned(), false).arguments(args).unwrap();
+        }
+    }
+    for args in [words(&["-Bmissing"]), words(&["-B", "missing"])] {
+        assert!(Collector::new(&closure, dir.path().to_owned(), false).arguments(args).is_err());
+    }
+    for args in [
+        words(&["-Wl,-Bsymbolic,-Bsymbolic-functions"]),
+        words(&["-Xlinker", "-Bsymbolic", "-Xlinker", "-Bsymbolic-functions"]),
+    ] {
+        Collector::new(&closure, dir.path().to_owned(), false).arguments(args).unwrap();
+    }
+}
+
+#[test]
+fn forwarding_pairs_across_driver_flags_and_response_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("prefix")).unwrap();
+    let script = write(dir.path(), "script.ld", b"INPUT ( object.o )\n");
+    let object = write(dir.path(), "object.o", b"\x7fELFobject");
+    let driver = write(dir.path(), "driver.rsp", b"-Xlinker -T @driver2.rsp\n");
+    let driver2 = write(dir.path(), "driver2.rsp", b"-Bprefix -Xlinker @link.rsp\n");
+    let linker = write(dir.path(), "link.rsp", b"@link2.rsp\n");
+    let linker2 = write(dir.path(), "link2.rsp", b"script.ld\n");
+    let closure = bindings(&[("source", dir.path())]);
+    let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
+    collector.arguments(words(&["@driver.rsp"])).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([script, object, driver, driver2, linker, linker2]));
+}
+
+#[test]
+fn linker_operands_do_not_become_search_roots_and_static_selection_is_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let decoy = write(dir.path(), "decoy/libfoo.so", b"\x7fELFdecoy");
+    let shared = write(dir.path(), "real/libfoo.so", b"\x7fELFshared");
+    let archive = write(dir.path(), "real/libfoo.a", b"!<arch>\narchive");
+    let closure = bindings(&[("source", dir.path())]);
+    let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
+    collector
+        .arguments(words(&["-Wl,-soname,-Ldecoy", "-lfoo", "-Lreal", "-Wl,-Bstatic", "-lfoo"]))
+        .unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([shared, archive]));
+    assert!(!collector.seen.contains(&decoy));
+}
+
+#[test]
+fn malformed_and_changed_forwarded_inputs_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = write(dir.path(), "link.rsp", b"-T script.ld\n");
+    write(dir.path(), "script.ld", b"INPUT ( object.o )\n");
+    write(dir.path(), "object.o", b"\x7fELFobject");
+    write(dir.path(), "bad.rsp", b"'unterminated\n");
+    for n in 0..65 {
+        write(dir.path(), &format!("deep{n}.rsp"), format!("@deep{}.rsp", n + 1).as_bytes());
+    }
+    write(dir.path(), "deep65.rsp", b"");
+    let closure = bindings(&[("source", dir.path())]);
+    for args in [
+        words(&["-B"]),
+        words(&["-Xlinker"]),
+        words(&["-Wl,-T"]),
+        words(&["-Wl,--unknown"]),
+        words(&["-unknown"]),
+        words(&["@bad.rsp"]),
+        words(&["@deep0.rsp"]),
+        words(&["-Wl,--pop-state"]),
+        words(&["-Wl,--push-state"]),
+        words(&["-Wl,-T,missing.ld"]),
+    ] {
+        assert!(Collector::new(&closure, dir.path().to_owned(), false).arguments(args).is_err());
+    }
+    fs::write(response, b"-T changed.ld\n").unwrap();
+    assert!(
+        Collector::new(&closure, dir.path().to_owned(), false)
+            .arguments(words(&["-Wl,@link.rsp"]))
+            .is_err()
+    );
+}
+
+#[test]
+fn positional_files_named_like_linker_modes_are_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["symbolic", "static", "dynamic"]
+        .into_iter()
+        .map(|name| write(dir.path(), name, b"\x7fELFobject"))
+        .collect();
+    let closure = bindings(&[("source", dir.path())]);
+    let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
+    collector.arguments(words(&["symbolic", "static", "dynamic"])).unwrap();
+    assert_eq!(collector.seen, paths.into_iter().collect());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linker_response_preserves_native_bytes_and_rejects_driver_wrappers() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join(OsString::from_vec(b"libraw-\xff.a".to_vec()));
+    fs::write(&library, b"!<arch>\nraw").unwrap();
+    let response = write(dir.path(), "link.rsp", b"-L. '-l:libraw-\xff.a'\n");
+    write(dir.path(), "bad-link.rsp", b"-Wl,-Bsymbolic\n");
+    let closure = bindings(&[("source", dir.path())]);
+    let mut collector = Collector::new(&closure, dir.path().to_owned(), false);
+    collector.arguments(words(&["-Xlinker", "@link.rsp"])).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([library, response]));
+    assert!(
+        Collector::new(&closure, dir.path().to_owned(), false)
+            .arguments(words(&["-Wl,@bad-link.rsp"]))
+            .is_err()
+    );
+}
+
+#[test]
+fn driver_responses_expand_before_forwarding_arity() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = write(dir.path(), "driver.rsp", b"-Bsymbolic -Bstatic\n");
+    let prefix = dir.path().join("static");
+    fs::create_dir(&prefix).unwrap();
+    let unbound = bindings(&[("response", &response)]);
+    let error = Collector::new(&unbound, dir.path().to_owned(), false)
+        .arguments(words(&["-Xlinker", "@driver.rsp"]))
+        .unwrap_err();
+    assert!(error.to_string().contains("static"), "{error:#}");
+    let bound = bindings(&[("response", &response), ("prefix", &prefix)]);
+    let mut collector = Collector::new(&bound, dir.path().to_owned(), false);
+    collector.arguments(words(&["-Xlinker", "@driver.rsp"])).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([response]));
 }
