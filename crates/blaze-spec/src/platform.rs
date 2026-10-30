@@ -451,7 +451,25 @@ fn discover(
         let root = blaze_manifest::paths::normalize_path(root);
         root.canonicalize().unwrap_or(root)
     });
-    let scoped = InDirectory { probe, cwd: machine.cwd, env: machine.env, requester };
+    // A bound platform is read in the environment a replay has, so that capture, the save's
+    // own replay check and the executor all read the same one: `PATH` and the variables a
+    // spec carries. Compiler queries run with nothing else, and anything else the requester has
+    // (`HOME`, `TMPDIR`, a nix shell's other variables) is not the spec's.
+    let bound;
+    let env = if bind_native {
+        bound = machine
+            .env
+            .iter()
+            .filter(|(name, _)| {
+                *name == "PATH" || crate::environment::is_script_var(name, machine.triple)
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        &bound
+    } else {
+        machine.env
+    };
+    let scoped = InDirectory { probe, cwd: machine.cwd, env, requester };
     let probe: &dyn Probe = &scoped;
     let os = probe
         .os()
@@ -459,7 +477,6 @@ fn discover(
     let family = Family::of_os(&os).ok_or_else(|| {
         Refusal::new(os.clone(), "blaze names the native side of macOS and Linux")
     })?;
-    let env = machine.env;
     let linker_value = machine.linker.map(str::trim).filter(|it| !it.is_empty()).unwrap_or("cc");
     let linker = resolve(probe, env, std::ffi::OsStr::new(linker_value)).ok_or_else(|| {
         Refusal::new(linker_value, "the linker cannot be resolved: a build cannot link without it")

@@ -25,6 +25,9 @@ struct Fake {
     queries: std::cell::RefCell<
         Vec<(BTreeMap<String, std::ffi::OsString>, PathBuf, Vec<std::ffi::OsString>)>,
     >,
+    /// A variable that, when a header query has it, adds a directory to its search list, as
+    /// clang's `CCC_OVERRIDE_OPTIONS` or a compiler wrapper's own variables can.
+    env_headers: Option<(String, String)>,
 }
 
 impl Fake {
@@ -59,6 +62,14 @@ impl Probe for Fake {
         args: &[std::ffi::OsString],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
         self.queries.borrow_mut().push((env.clone(), program.to_owned(), args.to_vec()));
+        if let Some((name, directory)) = &self.env_headers
+            && env.contains_key(name)
+            && args.first().is_some_and(|it| it == "-E")
+        {
+            let listing =
+                format!("#include <...> search starts here:\n {directory}\nEnd of search list.\n");
+            return Some((Vec::new(), listing.into_bytes()));
+        }
         self.outputs
             .get(&(program.to_owned(), args.to_vec()))
             .cloned()
@@ -213,6 +224,32 @@ fn macos_platform() {
     );
     assert_eq!(platform.ar, Some(("ar".to_owned(), String::new(), digest(AR))));
     assert!(platform.native_root.is_some());
+}
+
+/// A bound platform is read in the environment a replay has: `PATH` and the variables a spec
+/// carries. A requester's other variables (`HOME`, a nix shell's own) never reach a compiler
+/// query, or a save would bind trees its own replay check cannot find again.
+#[test]
+fn bound_platforms_are_read_in_the_environment_a_replay_has() {
+    let fake = Fake {
+        env_headers: Some(("CCC_OVERRIDE_OPTIONS".to_owned(), "/requester/include".to_owned())),
+        ..macos()
+    }
+    .file("/requester/include/only.h", b"header");
+    let carried = macos_env();
+    let mut requester = carried.clone();
+    requester.insert("HOME".to_owned(), "/Users/requester".into());
+    requester.insert("CCC_OVERRIDE_OPTIONS".to_owned(), "+-I/requester/include".into());
+    let captured = exec_platform(&macos_machine(&requester, None), &fake).unwrap();
+    for (env, program, args) in fake.queries.borrow().iter() {
+        assert!(
+            env.keys().all(|name| carried.contains_key(name) || name == "LC_ALL"),
+            "{program:?} {args:?} ran with {:?}",
+            env.keys().collect::<Vec<_>>()
+        );
+    }
+    let replayed = exec_platform(&macos_machine(&carried, None), &fake).unwrap();
+    assert_eq!(captured, replayed);
 }
 
 #[test]
