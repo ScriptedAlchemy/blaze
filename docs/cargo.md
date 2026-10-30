@@ -342,7 +342,13 @@ A single build goes to cargo when:
   build script reads has changed since cargo last built (a source a build script makes newer
   before cargo runs rustc on it, as biome's do, has not). Cargo builds, and the daemon loads
   the workspace again afterwards. On a large workspace that reload is long: 36 to 51 s on
-  nushell;
+  nushell. A file a script reads is not that when the daemon can run the script itself: it
+  runs it as cargo would, in its `OUT_DIR` and under cargo's lock on the build directory, when
+  cargo's own records say cargo would run it again, and records the run as cargo records its own,
+  so cargo's next build does not run it again. The build stays the daemon's when the script
+  prints the same lines cargo reads (`cargo:` and `cargo::`; what a tool the script runs says is
+  not read) and writes the same files as the run the build had. While a cargo is building in that
+  directory the run is left to it;
 - rust-analyzer finds an error in the source. The daemon refuses it, cargo runs, and you get
   rustc's diagnostics and cargo's exit status. This costs 0.1 to 0.5 s over cargo alone.
   Errors rust-analyzer does not find are not caught here; see "Known problems";

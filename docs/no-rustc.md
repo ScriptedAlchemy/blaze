@@ -936,6 +936,51 @@ is a proc macro is refused with the reason; `harness/scriptedits.py` holds the r
 `harness/tracedecay.py --predicate P0-A --whole` counts the rustc and cargo runs of a whole build
 ([reports/SCRIPTEDITS.md](reports/SCRIPTEDITS.md), "blaze runs the scripts").
 
+#### A build-dependency's script that ran again
+
+A build script whose package has a build-dependency with `links` is handed to cargo when that
+dependency's script runs again (`cargo/script.rs` `judge_locked_inner`: "has a
+build-dependency, `native`, whose script ran again, so cargo builds this script again"). Cargo
+1.99 gives the parent's run no edge to a build-dependency's run, but that run makes cargo build
+the dependency's library again, and with it the parent's script, which it then runs. The daemon
+judges a script by running the executable rustc linked, and compiles none: a run of the old
+executable is not cargo's run of the new one, and a script that counts its runs or reads what
+the library generated would print something else (`harness/edges.py`, `build-dep-counter`: the
+daemon's own judgment printed `none1 7` where cargo prints `none2 7`). So the daemon keeps the
+dependency's run for cargo's leg, which uses it and compiles and runs the parent's script once,
+and the program is cargo's (`edges.py` `build-dep` and `build-dep-counter`, every step equal).
+Owning it needs the hybrid build's judgment to compile the parent's script itself when a library
+it links was built again, as the whole build does (`own_script::link_planned`, step I), with
+cargo 1.99's rule for when the script's compile is fresh (its dep-info and the fingerprints of
+the libraries it links), and the new executable then judged and run here as any other. Only a
+build-dependency with `links` is followed this way; one without is not (not measured).
+
+#### A links dependency whose run the daemon does not know
+
+A build script built after the run of a package with `links` is handed to cargo when the daemon
+cannot take that run's metadata from cargo's own record of it (`cargo/script.rs` `edges` and
+`judge_locked_inner`: "is built after the run of a package with `links` whose run the daemon has
+no record of, so cargo runs it", and "is built after the run of `native`, outside the workspace,
+which cargo runs again"). Cargo gives the parent's script a `DEP_<links>_<key>` variable for each
+`cargo::metadata` line that run printed, and keeps each such run in its record of the parent's
+run, keyed by the package's id: the hash of its name for a path package, and of its name, version
+and source for any other (`DepFingerprint::new`; measured with cargo 1.99.0: `probe-sys` 0.1.3,
+vendored over crates.io, is `813625565111490420`). The daemon takes the runs of this build from
+cargo's messages, the workspace's and the others', so a registry crate or a path dependency
+outside the workspace is one of them, and reads each one's metadata from cargo's record of it. A
+run made without one of them would not be cargo's, and before this the daemon made it and
+recorded it as cargo's, which cargo then took as its own: a program that embedded `unset` where
+cargo's embeds the dependency's value, with exit 0. So every unit of cargo's record but the
+script's compile has to be a run the daemon read, and a run made here is recorded as cargo's only
+once the build has checked it is the run it had; cargo's leg takes one that is not only when it
+runs the script with what it was run with. The handoff is when that run is not written down (the
+script of a package outside the workspace that rustc compiled, which runs without the stand-in),
+is two runs of one package, or is of a package outside the workspace that cargo would run again:
+the daemon judges such a package's run but does not make one. Owning it needs the daemon to run
+the scripts of packages outside the workspace as it runs the workspace's, with what each reads
+from cargo's home (`registry`, `git`) known not to change, and its own compile of every script
+(step I).
+
 **J. Proc macros compiled and loaded by ra-jit.** ([#90](https://github.com/indexable-inc/ra-jit/issues/90)) The proc-macro crate and its dependencies are
 compiled by ra-jit into a library that rust-analyzer's proc-macro server, running inside ra-jit,
 loads. `proc_macro` is ra-jit's from F, so the bridge matches the server, which is built from the

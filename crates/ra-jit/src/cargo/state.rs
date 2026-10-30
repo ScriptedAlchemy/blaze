@@ -16,6 +16,7 @@ use cargo_metadata::{
     Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, Package, Target,
     TargetKind,
 };
+use cargo_util_schemas::core::PackageIdSpec;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,9 @@ use super::{
 /// The state of one build of a checkout: one command with one set of flags.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct State {
+    /// Executions of this request, not persisted freshness for another invocation.
+    #[serde(skip)]
+    pub(crate) completed: Vec<script::Completed>,
     /// The version of the ra-jit that wrote it. Another one reads nothing of it.
     version: String,
     pub(crate) key: String,
@@ -177,25 +181,67 @@ enum Guard {
         written: Option<u128>,
     },
     /// A build script that cargo runs again when one of `reruns_for` does not hold, and
-    /// that the daemon then runs itself: the build is cargo's when the script prints or
-    /// writes something else than it did.
+    /// that the daemon then runs itself, as cargo would: the build is cargo's when the script
+    /// prints or writes something else than `built`, the run cargo built with.
     Script {
         package: String,
         out_dir: PathBuf,
         reruns_for: Vec<Guard>,
         checked_at: u128,
+        built: script::Run,
+        /// The package's targets, which what cargo takes of what the script prints depends on.
+        #[serde(default)]
+        targets: Vec<blaze_build_script::unit::Target>,
+        #[serde(default)]
+        dependencies: Vec<script::Dependency>,
     },
 }
 
 impl Guard {
-    /// What changed, when something did.
-    fn broken(&mut self, built_at: u128) -> Option<String> {
-        match self {
-            Guard::Script { package, out_dir, reruns_for, checked_at } => {
+    /// What changed, when something did. `configured` is the `[env]` of cargo's configuration.
+    fn broken(
+        &mut self,
+        built_at: u128,
+        configured: &[Configured],
+        completed: &mut Vec<script::Completed>,
+    ) -> Result<Option<String>, String> {
+        Ok(match self {
+            Guard::Script {
+                package,
+                out_dir,
+                reruns_for,
+                checked_at,
+                built,
+                targets,
+                dependencies,
+            } => {
                 let since = built_at.max(*checked_at);
-                reruns_for.iter_mut().find_map(|it| it.broken(since))?;
+                let mut changed = false;
+                for guard in reruns_for {
+                    if guard.broken(since, configured, completed)?.is_some() {
+                        changed = true;
+                        break;
+                    }
+                }
+                if !changed && script::alone(out_dir, dependencies) {
+                    return Ok(None);
+                }
                 let now = stamp_now();
-                match script::rerun_is_same(out_dir) {
+                let env = |name: &str| as_cargo_has(name, configured);
+                let env_names: Vec<String> = std::env::vars_os()
+                    .filter_map(|(name, _)| name.into_string().ok())
+                    .chain(configured.iter().map(|it| it.name.clone()))
+                    .collect();
+                let cargo =
+                    script::Cargo { env: &env, env_names: &env_names, targets, dependencies };
+                let run = match script::judge_for(out_dir, &cargo, completed) {
+                    Ok(run) => Ok(run),
+                    Err(script::JudgementError::Unavailable(what)) => Err(what),
+                    Err(script::JudgementError::Failed(what)) => {
+                        return Err(format!("the build script of `{package}` {what}"));
+                    }
+                };
+                match run.and_then(|it| it.same_as(built)) {
                     Ok(()) => {
                         *checked_at = now;
                         None
@@ -209,7 +255,8 @@ impl Guard {
                         Ok(written) => !was_there || stamp_of(written) > built_at,
                         Err(_) => *was_there,
                     }
-                })?;
+                });
+                let Some(changed) = changed else { return Ok(None) };
                 Some(format!("{what} {} changed", changed.0.display()))
             }
             Guard::Read { what, files } => {
@@ -217,7 +264,8 @@ impl Guard {
                     files.iter().find(|(file, was_there, read_at)| match written_at(file) {
                         Some(written) => !was_there || written > read_at.unwrap_or(built_at),
                         None => *was_there,
-                    })?;
+                    });
+                let Some(changed) = changed else { return Ok(None) };
                 Some(format!("{what} {} changed", changed.0.display()))
             }
             Guard::BesideTests { files, cargo } => {
@@ -227,12 +275,12 @@ impl Guard {
                         (Some(now), Some((then, print))) if *then <= built_at && now > built_at => {
                             match without_tests(file).as_ref() == Some(print) {
                                 true => tests_only = tests_only.max(Some(now)),
-                                false => return None,
+                                false => return Ok(None),
                             }
                         }
                         (None, None) => {}
                         (Some(now), Some(_)) if now <= built_at => {}
-                        _ => return None,
+                        _ => return Ok(None),
                     }
                 }
                 for file in cargo.iter().filter(|it| written_at(it) < tests_only) {
@@ -242,7 +290,7 @@ impl Guard {
                 None
             }
             Guard::Tree { what, dir } => {
-                let changed = newer_in(dir, built_at)?;
+                let Some(changed) = newer_in(dir, built_at) else { return Ok(None) };
                 Some(format!("{what} and {} changed", changed.display()))
             }
             Guard::AsLeft { file, written } => {
@@ -250,7 +298,7 @@ impl Guard {
             }
             Guard::Env { name, value } => (std::env::var(&*name).ok() != *value)
                 .then(|| format!("the environment variable {name} changed")),
-        }
+        })
     }
 
     fn files(what: &str, files: impl IntoIterator<Item = PathBuf>) -> Guard {
@@ -470,8 +518,9 @@ impl Built {
     pub(crate) fn by_cargo(
         asked: &Invocation,
         ahead: Option<&daemon::Ahead>,
+        completed: &[script::Completed],
     ) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, None, ahead)
+        Built::by(asked, None, ahead, completed)
     }
 
     /// The same, with rustc building of the crates rooted at `staged` only what stands in
@@ -480,13 +529,14 @@ impl Built {
         asked: &Invocation,
         staged: &Staged,
     ) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, Some(staged), staged.ahead.as_ref())
+        Built::by(asked, Some(staged), staged.ahead.as_ref(), &[])
     }
 
     fn by(
         asked: &Invocation,
         staged: Option<&Staged>,
         ahead: Option<&daemon::Ahead>,
+        completed: &[script::Completed],
     ) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
@@ -496,6 +546,7 @@ impl Built {
         };
         cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
         as_built(&mut cargo)?;
+        let _continuation = script::Continuation::for_command(&mut cargo, completed)?;
         if let Some(staged) = staged {
             cargo.env(switch::VARIABLE, switch::first_wrapper_path()?);
             cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
@@ -547,6 +598,9 @@ impl Built {
         drop(tell);
         let _ = telling.join();
         let status = cargo.wait()?;
+        if let Some(continuation) = &_continuation {
+            continuation.finish(completed)?;
+        }
         if !status.success() {
             super::toolchain::note_failed();
         }
@@ -654,8 +708,25 @@ impl State {
     }
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
-    pub(crate) fn broken_guard(&mut self) -> Option<String> {
-        self.guards.iter_mut().find_map(|it| it.broken(self.built_at))
+    pub(crate) fn broken_guard(&mut self) -> Result<Option<String>, String> {
+        let (built_at, configured) = (self.built_at, &self.configured);
+        // A build script is run last, when nothing else sends the build to cargo: a run is
+        // recorded as cargo's, and cargo's build would make it then.
+        let (scripts, others): (Vec<_>, Vec<_>) =
+            self.guards.iter_mut().partition(|it| matches!(it, Guard::Script { .. }));
+        for guard in others.into_iter().chain(scripts) {
+            if let Some(why) = guard.broken(built_at, configured, &mut self.completed)? {
+                return Ok(Some(why));
+            }
+        }
+        // Each script's run is the one the build had: a run made for it is cargo's now, and
+        // cargo's next build does not make it again.
+        for done in &self.completed {
+            if let Err(why) = done.record() {
+                return Ok(Some(format!("a build script's run was not recorded: {why}")));
+            }
+        }
+        Ok(None)
     }
 
     /// Why the next build is cargo's: a program the daemon is never asked for has new
@@ -834,6 +905,7 @@ impl State {
         let used = used_by(&artifacts, &records);
 
         let mut state = State {
+            completed: Vec::new(),
             version: daemon::version(),
             key: key.to_owned(),
             root: root.clone(),
@@ -983,7 +1055,8 @@ impl State {
         let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
         state.doc_tests =
             metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards =
+            guards(cwd, &metadata, &used, &built.scripts, &built.artifacts, &state.checkouts);
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -1339,11 +1412,21 @@ pub(super) fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String
     env
 }
 
+/// The variable `name` as a cargo has it with `configured`, the `[env]` of its configuration:
+/// a value there that is `force`d or that the environment has none for, or else the
+/// environment's (`GlobalContext::env_config`, then `std::env::var`).
+fn as_cargo_has(name: &str, configured: &[Configured]) -> Option<String> {
+    match configured.iter().find(|it| it.name == name) {
+        Some(it) if it.force || std::env::var_os(name).is_none() => Some(it.value.clone()),
+        _ => std::env::var(name).ok(),
+    }
+}
+
 /// The `[env]` of cargo's configuration as cargo reads it in `cwd`: from the `.cargo`
 /// directory of each directory up from it, the nearest first, then from cargo's home. Of two
 /// files in one directory cargo reads `config`, not `config.toml`. A `relative` value is a
 /// path from the directory its `.cargo` is in.
-pub(super) fn configured_env(cwd: &Path) -> Vec<Configured> {
+pub(crate) fn configured_env(cwd: &Path) -> Vec<Configured> {
     let in_dir = |dir: &Path| {
         ["config", "config.toml"].map(|it| dir.join(it)).into_iter().find(|it| it.is_file())
     };
@@ -1391,6 +1474,7 @@ fn guards(
     metadata: &Metadata,
     used: &[Record],
     scripts: &[BuildScript],
+    artifacts: &[Artifact],
     checkouts: &[Checkout],
 ) -> Vec<Guard> {
     let root = metadata.workspace_root.as_std_path();
@@ -1437,9 +1521,16 @@ fn guards(
         guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
     }
     let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
+    let dependencies = script_dependencies(metadata, scripts, artifacts);
     for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
-        guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
+        let mut found = package.map(|it| rerun_guards(it, script)).unwrap_or_default();
+        for guard in &mut found {
+            if let Guard::Script { dependencies: edges, .. } = guard {
+                *edges = dependencies.clone();
+            }
+        }
+        guards.extend(found);
     }
     let linked = checkouts.iter().flat_map(|it| &it.programs);
     let mut linked: Vec<PathBuf> = linked.flat_map(|it| it.linked_as_built.clone()).collect();
@@ -1450,6 +1541,69 @@ fn guards(
     let cargo = built.flat_map(Record::cargo_dep_info).collect();
     guards.push(Guard::beside_tests(linked, cargo));
     guards
+}
+
+/// Candidates for Cargo's run-unit edges: every run of a script of a package with `links` in
+/// this build, the workspace's and the others', from cargo's own messages, as the metadata is
+/// `--no-deps`. Script judgment selects among them by Cargo's recorded fingerprint, which keys
+/// each by its package's id, so an optional, target-gated or dev-dependency this run did not
+/// use is not one of its edges. The `links` of a package outside the workspace is what cargo set
+/// its script running with, and its targets are those cargo built of it.
+fn script_dependencies(
+    metadata: &Metadata,
+    scripts: &[BuildScript],
+    artifacts: &[Artifact],
+) -> Vec<script::Dependency> {
+    scripts
+        .iter()
+        .filter_map(|run| {
+            let out_dir = run.out_dir.clone().into_std_path_buf();
+            let member = metadata.packages.iter().find(|it| it.id == run.package_id);
+            let (name, links, targets) = match member {
+                Some(package) => {
+                    let targets = package.targets.iter().map(target_of).collect();
+                    (package.name.to_string(), package.links.clone()?, targets)
+                }
+                None => {
+                    let spec = PackageIdSpec::parse(&run.package_id.repr).ok()?;
+                    let built = artifacts.iter().filter(|it| it.package_id == run.package_id);
+                    let mut targets: Vec<_> = built.map(|it| target_of(&it.target)).collect();
+                    targets.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
+                    targets.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
+                    (spec.name().to_owned(), script::links_of(&out_dir)?, targets)
+                }
+            };
+            let parents = |kind| {
+                metadata
+                    .packages
+                    .iter()
+                    .filter(|parent| {
+                        parent.dependencies.iter().any(|dep| dep.kind == kind && *dep.name == name)
+                    })
+                    .flat_map(|parent| scripts.iter().filter(move |it| it.package_id == parent.id))
+                    .map(|it| it.out_dir.clone().into_std_path_buf())
+                    .collect()
+            };
+            Some(script::Dependency {
+                id: Some(run.package_id.repr.clone()),
+                outside: member.is_none(),
+                links,
+                out_dir,
+                parents: parents(DependencyKind::Normal),
+                build_parents: parents(DependencyKind::Build),
+                targets,
+                package: name,
+            })
+        })
+        .collect()
+}
+
+fn target_of(target: &Target) -> blaze_build_script::unit::Target {
+    blaze_build_script::unit::Target {
+        name: target.name.clone(),
+        kind: target.kind.iter().map(ToString::to_string).collect(),
+        crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
+    }
 }
 
 /// The files named one of `names` in `dir` and in every directory above it, there or not.
@@ -1511,9 +1665,26 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
         files.push(Guard::Tree { what, dir });
     }
     let out_dir = script.out_dir.clone().into_std_path_buf();
-    if script::can_rerun(&out_dir) {
+    // What the run cargo built with printed and wrote, which a run after it is compared with.
+    if script::can_rerun(&out_dir)
+        && let Ok(built) = script::Run::of(&out_dir)
+    {
+        let targets = package.targets.iter().map(|it| blaze_build_script::unit::Target {
+            name: it.name.clone(),
+            kind: it.kind.iter().map(ToString::to_string).collect(),
+            crate_types: it.crate_types.iter().map(ToString::to_string).collect(),
+        });
+        let targets = targets.collect();
         let package = package.name.to_string();
-        files = vec![Guard::Script { package, out_dir, reruns_for: files, checked_at: 0 }];
+        files = vec![Guard::Script {
+            package,
+            out_dir,
+            reruns_for: files,
+            checked_at: 0,
+            built,
+            targets,
+            dependencies: Vec::new(),
+        }];
     }
     files.extend(variables);
     files
@@ -1522,6 +1693,100 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's metadata is `--no-deps`, with no resolved graph: the run-unit edge from a
+    /// package to the member with `links` it depends on is read from the declared dependencies.
+    #[test]
+    fn a_links_dependency_edge_is_found_without_a_resolved_graph() {
+        let package = |name: &str, links: Option<&str>, depends_on: &[&str]| {
+            serde_json::json!({
+                "name": name, "version": "0.1.0", "id": format!("path+file:///w/{name}#0.1.0"),
+                "license": null, "license_file": null, "description": null, "source": null,
+                "dependencies": depends_on.iter().map(|it| serde_json::json!({
+                    "name": it, "source": null, "req": "*", "kind": null, "rename": null,
+                    "optional": false, "uses_default_features": true, "features": [],
+                    "target": null, "registry": null, "path": format!("/w/{it}"),
+                })).collect::<Vec<_>>(),
+                "targets": [], "features": {}, "manifest_path": format!("/w/{name}/Cargo.toml"),
+                "metadata": null, "publish": null, "authors": [], "categories": [],
+                "keywords": [], "readme": null, "repository": null, "homepage": null,
+                "documentation": null, "edition": "2021", "links": links, "default_run": null,
+                "rust_version": null,
+            })
+        };
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [package("parent", None, &["native"]), package("native", Some("probe"), &[])],
+            "workspace_members": ["path+file:///w/parent#0.1.0", "path+file:///w/native#0.1.0"],
+            "workspace_default_members": ["path+file:///w/parent#0.1.0"],
+            "resolve": null, "target_directory": "/w/target", "build_directory": "/w/target",
+            "version": 1, "workspace_root": "/w", "metadata": null,
+        }))
+        .unwrap();
+        let run = |name: &str| -> BuildScript {
+            serde_json::from_value(serde_json::json!({
+                "linked_libs": [], "linked_paths": [], "cfgs": [], "env": [],
+                "out_dir": format!("/w/target/debug/build/{name}-0/out"),
+                "package_id": format!("path+file:///w/{name}#0.1.0"),
+            }))
+            .unwrap()
+        };
+        let edges = script_dependencies(&metadata, &[run("parent"), run("native")], &[]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!((edges[0].package.as_str(), edges[0].links.as_str()), ("native", "probe"));
+        assert_eq!(edges[0].parents, [PathBuf::from("/w/target/debug/build/parent-0/out")]);
+    }
+
+    #[test]
+    fn a_links_dependency_outside_the_workspace_is_found_by_cargos_messages() {
+        // `--no-deps` lists the workspace's packages alone; `probe-sys` is a registry's, and its
+        // `links` is what cargo ran its script with.
+        let dir = std::env::temp_dir().join(format!("ra-jit-outside-links-{}", std::process::id()));
+        let out_dir = dir.join("target/debug/build/probe-sys-0/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let ran = serde_json::json!({
+            "real": "/w/script", "cwd": "/r/probe-sys", "env": [["CARGO_MANIFEST_LINKS", "probe"]],
+        });
+        std::fs::write(dir.join("target/debug/build/probe-sys-0/ra-jit-ran.json"), ran.to_string())
+            .unwrap();
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [{
+                "name": "parent", "version": "0.1.0", "id": "path+file:///w/parent#0.1.0",
+                "license": null, "license_file": null, "description": null, "source": null,
+                "dependencies": [{
+                    "name": "probe-sys", "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "req": "^0.1", "kind": null, "rename": null, "optional": false,
+                    "uses_default_features": true, "features": [], "target": null, "registry": null,
+                }],
+                "targets": [], "features": {}, "manifest_path": "/w/parent/Cargo.toml",
+                "metadata": null, "publish": null, "authors": [], "categories": [],
+                "keywords": [], "readme": null, "repository": null, "homepage": null,
+                "documentation": null, "edition": "2021", "links": null, "default_run": null,
+                "rust_version": null,
+            }],
+            "workspace_members": ["path+file:///w/parent#0.1.0"],
+            "workspace_default_members": ["path+file:///w/parent#0.1.0"],
+            "resolve": null, "target_directory": "/w/target", "build_directory": "/w/target",
+            "version": 1, "workspace_root": "/w", "metadata": null,
+        }))
+        .unwrap();
+        let run = |id: &str, out_dir: &Path| -> BuildScript {
+            serde_json::from_value(serde_json::json!({
+                "linked_libs": [], "linked_paths": [], "cfgs": [], "env": [],
+                "out_dir": out_dir, "package_id": id,
+            }))
+            .unwrap()
+        };
+        let registry = "registry+https://github.com/rust-lang/crates.io-index#probe-sys@0.1.3";
+        let parent = Path::new("/w/target/debug/build/parent-0/out");
+        let runs = [run("path+file:///w/parent#0.1.0", parent), run(registry, &out_dir)];
+        let edges = script_dependencies(&metadata, &runs, &[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!((edges[0].package.as_str(), edges[0].links.as_str()), ("probe-sys", "probe"));
+        assert!(edges[0].outside);
+        assert_eq!(edges[0].pkg_id(), 813625565111490420);
+        assert_eq!(edges[0].parents, [parent.to_owned()]);
+    }
 
     #[test]
     fn a_program_is_run_with_the_libraries_cargo_runs_it_with() {

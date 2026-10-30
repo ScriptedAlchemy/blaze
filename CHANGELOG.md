@@ -864,6 +864,35 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- The daemon runs a build script again as cargo does, in the `OUT_DIR` cargo left, and
+  compares the lines cargo reads, not every byte it printed. A script that keeps what it built
+  in `OUT_DIR` and runs a tool that talks, as tracedecay's CLI embeds a frontend, ran the tool
+  into an empty directory and printed its lines, which cargo's last run (in the directory with
+  the bundle) did not have: "the build script printed something else", and 18 of 18 edit builds
+  of tracedecay's CLI were cargo's. `harness/scriptrerun.py` holds it
+  (`docs/reports/BUILDSCRIPT.md`). The run is in cargo's own directory, not a copy: a copy loses
+  what a script can read there (times, links to links, hard links, extended attributes), and two
+  reviews found it kept old generated files where cargo made new ones. The script is run only when
+  cargo 1.99's own records of its last run say cargo would run it again, and the run is recorded
+  as cargo records its own (`crates/ra-jit/src/cargo/records.rs`): the fingerprint's hash emptied
+  before it, `invoked.timestamp`, `output` with the time the run began, `stderr`, `root-output`,
+  and the fingerprint, hashed as cargo hashes it, after it. Cargo's next build finds the script
+  run and does not run it again, so a script that counts its runs runs once for an edit, as under
+  cargo; before, it ran twice (`3 8` where cargo alone printed `2 8`). It takes cargo 1.99's locks
+  first, `.cargo-build-lock` in the build directory, which `build.build-dir` sets apart, and
+  `.cargo-lock` there shared; while a cargo holds them, neither its records nor its output
+  directory are read. Baseline capture holds the same locks and requires a completed
+  fingerprint. A script that prints no
+  `rerun-if-*` line is rerun in place when Cargo's package fingerprint changes.
+  Optional and target-gated native dependencies are selected from Cargo's recorded run graph.
+  A completed run is reused during the same hybrid build only while its inputs still match.
+  A run is compared with a record of the run the build had, taken when cargo built and when
+  the daemon loaded, so a run that left the directory otherwise stays a difference. A link in
+  `OUT_DIR` is read as what it leads to. The
+  lines cargo reads are picked from the bytes, as cargo's `BuildOutput::parse` does: a line that
+  is not UTF-8 is skipped whole, so `KEY=\xff` no longer equals `KEY=U+FFFD`. The harness runs
+  cargo's reference program itself and compares its exit status, standard output and standard
+  error byte for byte, and fails when the reference build failed.
 - A whole build (`RA_JIT_WHOLE_BUILD=1`) links each program into a directory of its own
   build under `target/ra-jit/whole/`, not one directory for every build of the checkout, so
   a build with other features, another profile, another target or other flags is the program
