@@ -234,7 +234,7 @@ def main():
     real = Path(norustc.real_toolchain())  # reference-only toolchain query
     reference = oracle(plan, real, work)
     theirs = expansions(real / "libexec" / "rust-analyzer-proc-macro-srv", reference, work)
-    # Loading and expansion belong to the product slice too. The reference server runs
+    # The product audit covers loading and expansion too. The reference server runs
     # separately without the stand-ins; its compilation is never subtracted from an audit.
     server = args.owned_server.resolve()
     before = len(norustc.runs(str(audit_log)))

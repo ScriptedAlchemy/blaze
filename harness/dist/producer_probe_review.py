@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P8 review's 22 compiler probes: real oracle parity, including accepted probes.
+"""Compare all 22 P8 compiler probes with the oracle, including accepted probes.
 
 The cases are unchanged from Claude Opus 5.5's premerge-pr15-62f2fb91
 review. The harness owns its Python rustc oracle. A refusal is an explicit
@@ -110,7 +110,7 @@ def main():
 
 
 def swallowed_probe_build(work, blaze, real, env, product, audit_log):
-    """The review's four API probes must not publish wrong cfgs when errors are swallowed."""
+    """Swallowed errors in the four API probes must not publish incorrect cfgs."""
     def write(path, text):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)

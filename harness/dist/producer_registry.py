@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require token producer compilation and expansion with real registry defaults.
+"""Require token producer compilation and expansion with registry default features.
 
 The sources and macro body are source_macro's existing fixture. Cargo/rustc are
 reference-only. All product compilation and expansion use the owned compiler
@@ -27,7 +27,7 @@ def fixture(work, host=None):
     (derive / "Cargo.toml").write_text(text)
     (derive / "src/lib.rs").write_text((source_macro.FIXTURE / "derive.rs").read_text())
     # Pin the closure already used by source_macro rather than resolve newer
-    # cached versions. These are real registry dependencies with defaults on.
+    # cached versions. Registry dependencies keep their default features.
     with (derive / "Cargo.toml").open("a") as out:
         for name in ("proc-macro2", "unicode-ident"):
             out.write(f'{name} = "={source_macro.VERSIONS[name]}"\n')

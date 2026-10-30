@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the P67 reviewer's nine-package fixture against the Cargo oracle.
+"""Compare the P67 nine-package producer fixture with the Cargo oracle.
 
 Pass --review-fixture pointing to evidence/premerge-pr15-a31441f8/scripts/attack.py.
 Its fixture definition is used unchanged. Cargo/rustc are reference-only.
