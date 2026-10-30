@@ -438,12 +438,18 @@ replays the test processes of `.github/ci/test-sets.json` with the original test
 then runs saved-source replay and the probe/oracle harnesses against the shared release CLI.
 Its `server` aggregate requires both server tests and saved-source replay to pass. The
 central producer owns the release build and macro bootstrap; no check rebuilds those in
-the server workflow. `blaze-dist-review.yaml` is called by `pr.yaml` once per platform too:
-the protocol tests replay the `dist` set, and the C2 lanes (`buildspec.py`'s fixture groups and
+the server workflow. `blaze-dist-review.yaml` is called by `pr.yaml` per platform too: the
+protocol tests replay the `dist` set, and the C2 groups (`buildspec.py`'s fixture groups and
 `saved_spec.py` under each backend) run against the bundle's release CLI and owned macro
-runtime, one lane per job on Linux and the seven packed into four jobs on macOS;
-`bundle-check.yaml` carries the tracing-integrity and platform-contract checks once per
-platform, and `C2 runtime (<os>)` in `pr.yaml` requires it beside that platform's lanes. `claims.yaml` (all of
+runtime. `pr.yaml` has two tiers, like ra-jit.yaml: a pull request (and a push to any other
+`dist/*` branch) runs the **fast tier**, the C2 groups on Linux alone, packed into three jobs;
+the **full tier**, nightly, by hand (`gh workflow run pr.yaml --ref <branch> -f tier=full`)
+and on a push to `dist/main` or `dist/c4-keys`, runs every area and every C2 group on Linux
+(one per job) and macOS (packed into four jobs), and opens an issue when it fails, or adds to
+the one still open. macOS C2 coverage is therefore nightly and on push, not per pull request:
+an owner-accepted trade-off for the fork's five macOS runners. `bundle-check.yaml` carries the
+tracing-integrity and platform-contract checks once per platform, and the required context
+`C2 runtime` in `pr.yaml` requires it beside the tier's groups. `claims.yaml` (all of
 rustc's `tests/ui`, both backends, and the scoreboard) and `nix-live.yaml` (the flake, the demo
 and live edits, 40 minutes; also on a change to the flake, `nix/` or the dependencies) run
 nightly and open an issue when they fail, like ra-jit.yaml's full tier. `fork-sync.yaml` runs

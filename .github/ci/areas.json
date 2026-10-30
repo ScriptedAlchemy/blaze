@@ -1,5 +1,5 @@
 {
-  "_doc": "Which checks a change runs (pr.yaml, job changes): an area runs when a changed file matches one of its `paths` and none of its `ignore` (fnmatch, where * crosses /). Changes to the CI itself run every area. The area that owns a check owns its entry. Contract: docs/reports/CI-fork.md.",
+  "_doc": "Which checks a change runs (pr.yaml, job changes): an area runs when a changed file matches one of its `paths` and none of its `ignore` (fnmatch, where * crosses /). Changes to the CI itself, and the full tier, run every area. `macos` marks an area with macOS checks in the fast tier; the full tier builds macOS anyway (the dist area's macOS C2 groups are the full tier's alone). The area that owns a check owns its entry. Contract: docs/reports/CI-fork.md.",
   "ci": {
     "paths": [
       ".github/workflows/pr.yaml",
@@ -41,8 +41,7 @@
       "nix/**",
       ".github/actions/toolchain/**",
       ".github/workflows/blaze-dist-review.yaml"
-    ],
-    "macos": true
+    ]
   },
   "serve": {
     "paths": [

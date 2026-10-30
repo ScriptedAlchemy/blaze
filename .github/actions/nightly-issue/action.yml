@@ -3,6 +3,10 @@
 # The job that uses it needs `issues: write`.
 name: nightly issue
 description: Open or add to the issue of a failed nightly run
+inputs:
+  title:
+    description: the issue's title; one title keeps one issue open across runs
+    default: ""
 runs:
   using: composite
   steps:
@@ -10,8 +14,9 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        TITLE: ${{ inputs.title }}
       run: |
-        title="Nightly $GITHUB_WORKFLOW failed"
+        title="${TITLE:-Nightly $GITHUB_WORKFLOW failed}"
         failed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
           --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url)): \(.conclusion)"')
         body=$(printf '%s at %s (%s):\n\n%s\n' "$RUN" "${GITHUB_SHA:0:10}" "$(date -u +%F)" "${failed:-no job failed by name; see the run}")

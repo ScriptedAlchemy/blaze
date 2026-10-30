@@ -8,10 +8,11 @@
 # bundle-check.yaml's, once per platform; the `C2 runtime (<os>)` aggregates in pr.yaml require
 # them beside the lanes here.
 #
-# A C2 lane job runs a list of lanes: one lane per job on Linux, where runners are plenty, and
-# packed on macOS so the fan-out stays within the fork's 5 concurrent macOS jobs (the list is
-# pr.yaml's, per platform). A lane is a fixture group of harness/dist/buildspec.py (the local
-# command differential against cargo) or a saved-spec execution under one backend.
+# A C2 lane job runs a list of lanes (the list is pr.yaml's, per platform and tier): on a pull
+# request, Linux alone, the seven packed into three jobs; in the full tier (nightly, by hand, a
+# push to an integration branch) one per job on Linux and packed into four on macOS, within the
+# fork's 5 concurrent macOS jobs. A lane is a fixture group of harness/dist/buildspec.py (the
+# local command differential against cargo) or a saved-spec execution under one backend.
 name: distributed protocol regressions
 
 on:
