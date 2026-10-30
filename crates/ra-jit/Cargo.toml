@@ -36,6 +36,7 @@ disabled-strategies = ["quick-install"]
 fn-cache = { package = "ra-jit-cache", path = "../ra-jit-cache" }
 memchr = "2"
 anyhow.workspace = true
+ar_archive_writer = "0.5.3"
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true

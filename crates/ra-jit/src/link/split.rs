@@ -1,5 +1,6 @@
-//! The standard library's object as an archive of several, which the link reads with
-//! `--whole-archive`. lld does most of its work on an input file by itself, one file to a
+//! The standard library's object as an indexed archive of several. Owned executable links
+//! read every member with `--whole-archive`; native library consumers use its symbol index.
+//! lld does most of its work on an input file by itself, one file to a
 //! thread: one object of every function of the standard library had it parse, scan and
 //! demote 140,000 sections on one thread (0.12 s of the 0.16 s link of hello), where rustc's
 //! standard library is many objects.
@@ -10,7 +11,11 @@
 //! symbol, or a section, that another part refers to becomes a hidden global of its part, and
 //! the other part refers to it by name: the program links the same.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io::Cursor};
+
+use ar_archive_writer::{
+    ArchiveKind, DEFAULT_OBJECT_READER, NewArchiveMember, write_archive_to_stream,
+};
 
 use anyhow::{Context, bail};
 use object::elf;
@@ -249,12 +254,18 @@ pub(crate) fn split(object: &[u8], parts: usize) -> anyhow::Result<Vec<u8>> {
             .collect();
         built.into_iter().map(|it| it.join().expect("a part panicked")).collect()
     });
-    let mut archive = MAGIC.to_vec();
-    for (part, object) in objects.into_iter().enumerate() {
-        let object = object.with_context(|| format!("writing part {part}"))?;
-        member(&mut archive, &format!("std.{part}.o"), &object);
-    }
-    Ok(archive)
+    let members = objects
+        .into_iter()
+        .enumerate()
+        .map(|(part, object)| {
+            let object = object.with_context(|| format!("writing part {part}"))?;
+            Ok(NewArchiveMember::new(object, &DEFAULT_OBJECT_READER, format!("std.{part}.o")))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut archive = Cursor::new(Vec::new());
+    write_archive_to_stream(&mut archive, &members, ArchiveKind::Gnu, false, None)
+        .context("writing the standard library archive")?;
+    Ok(archive.into_inner())
 }
 
 /// An entry of the unwind table: a common entry, or a function's, which names its common
@@ -628,25 +639,6 @@ fn scope_of(bind: u8, st_other: u8) -> SymbolScope {
     }
 }
 
-/// Appends a member to an archive: a name of at most 15 bytes, no symbol index, as the link
-/// reads every member.
-fn member(archive: &mut Vec<u8>, name: &str, bytes: &[u8]) {
-    let header = format!(
-        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-        format!("{name}/"),
-        0,
-        0,
-        0,
-        644,
-        bytes.len()
-    );
-    archive.extend_from_slice(header.as_bytes());
-    archive.extend_from_slice(bytes);
-    if bytes.len() % 2 == 1 {
-        archive.push(b'\n');
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use object::read::archive::ArchiveFile;
@@ -822,6 +814,8 @@ mod tests {
         let a = symbol(&mut object, "a", sections[0], SymbolScope::Dynamic);
         let b = symbol(&mut object, "local_b", sections[1], SymbolScope::Compilation);
         let c = symbol(&mut object, "hidden_c", sections[2], SymbolScope::Linkage);
+        let weak = symbol(&mut object, "weak_d", sections[3], SymbolScope::Dynamic);
+        object.symbol_mut(weak).weak = true;
         let memcpy = object.add_symbol(Symbol {
             name: b"memcpy".to_vec(),
             value: 0,
@@ -873,5 +867,20 @@ mod tests {
         assert!(names.contains(&"a".to_owned()) && names.contains(&"hidden_c".to_owned()));
         assert!(names.iter().any(|it| it.starts_with("local_b.part")));
         assert!(names.windows(2).all(|it| it[0] != it[1]), "{names:?}");
+        let symbols =
+            archive_file.symbols().unwrap().expect("native linkers need an archive index");
+        let mut indexed = Vec::new();
+        for symbol in symbols {
+            let symbol = symbol.unwrap();
+            let member = archive_file.member(symbol.offset()).unwrap();
+            let file = object::File::parse(member.data(&*archive).unwrap()).unwrap();
+            assert!(file.symbols().any(|it| {
+                !it.is_undefined() && !it.is_local() && it.name_bytes().unwrap() == symbol.name()
+            }));
+            indexed.push(std::str::from_utf8(symbol.name()).unwrap().to_owned());
+        }
+        indexed.sort();
+        assert_eq!(indexed, names);
+        assert!(indexed.contains(&"weak_d".to_owned()));
     }
 }

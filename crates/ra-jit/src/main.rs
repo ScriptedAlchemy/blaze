@@ -4872,7 +4872,7 @@ fn std_unit(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit standard library 2");
+    field(b"ra-jit standard library 3");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // An object of one section is linked whole, with what the program never reaches.
     if !hir_ty_codegen::sections_of_their_own() {
