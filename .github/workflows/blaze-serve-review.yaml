@@ -44,16 +44,140 @@ concurrency:
   group: serve-review-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "0"
+
 jobs:
-  server:
+  replay-runtime:
+    name: Build owned replay runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      RUST_BACKTRACE: "0"
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Build the owned replay CLI in the pinned native environment
+        id: replay_cli
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            nix develop .#bench --command rustc -vV
+            nix develop .#bench --command cargo -V
+          } > "$RUNNER_TEMP/saved-spec-evidence/identity.txt"
+          nix develop .#bench --command cargo build --locked --release -p ra-jit --bins
+          git rev-parse HEAD > target/release/BUILT_FROM
+      - name: Bootstrap a fresh complete owned replay runtime
+        id: owned_runtime
+        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/saved-spec-owned-server" --memory-mib 8192 --timeout 1800 \
+            > "$RUNNER_TEMP/saved-spec-evidence/bootstrap.log" 2>&1
+      # Tar preserves executable permissions; the digest travels through job outputs,
+      # independently of the immutable artifact. No cross-run artifact lookup is allowed.
+      - name: Pack the compiler and its owned runtime
+        id: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/replay-bundle/bin" "$RUNNER_TEMP/replay-bundle/owned"
+          for bin in ra-jit cargo-blaze cargo-ra-jit ra-jit-rustc ra-jit-rustc-first; do
+            cp "target/release/$bin" "$RUNNER_TEMP/replay-bundle/bin/"
+          done
+          cp target/release/BUILT_FROM "$RUNNER_TEMP/replay-bundle/"
+          cp "$RUNNER_TEMP/saved-spec-owned-server/blaze-proc-macro-srv" \
+             "$RUNNER_TEMP/saved-spec-owned-server/image-pins.json" "$RUNNER_TEMP/replay-bundle/owned/"
+          tar -C "$RUNNER_TEMP/replay-bundle" -cf "$RUNNER_TEMP/replay-runtime.tar" .
+          digest=$(sha256sum "$RUNNER_TEMP/replay-runtime.tar" | cut -d ' ' -f 1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+          echo "Replay runtime SHA-256: $digest; source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        id: upload
+        with:
+          name: replay-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/replay-runtime.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: Save bootstrap evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: saved-buildspec-bootstrap
+          path: |
+            ${{ runner.temp }}/saved-spec-evidence
+            ${{ runner.temp }}/saved-spec-owned-server/image-pins.json
+            ${{ runner.temp }}/saved-spec-owned-server/tool-controls.json
+            ${{ runner.temp }}/saved-spec-owned-server/*.watchdog.json
+            ${{ runner.temp }}/saved-spec-owned-server/*audit.json
+            ${{ runner.temp }}/saved-spec-owned-server/*external-execs.json
+            ${{ runner.temp }}/saved-spec-owned-server/*.exec
+          if-no-files-found: warn
+
+  saved-spec:
+    name: Saved source replay
+    needs: replay-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.replay-runtime.outputs.artifact-id }}
+          path: ${{ runner.temp }}/replay-download
+          merge-multiple: true
+      - name: Verify and unpack this run's runtime
+        env:
+          EXPECTED_SHA256: ${{ needs.replay-runtime.outputs.sha256 }}
+        run: |
+          cd "$RUNNER_TEMP/replay-download"
+          echo "$EXPECTED_SHA256  replay-runtime.tar" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/replay-bundle" "$RUNNER_TEMP/saved-spec-evidence"
+          tar -C "$RUNNER_TEMP/replay-bundle" -xf replay-runtime.tar
+          test "$(cat "$RUNNER_TEMP/replay-bundle/BUILT_FROM")" = "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          python3 - <<'PYVERIFY'
+          import hashlib, json, os
+          from pathlib import Path
+          bundle = Path(os.environ["RUNNER_TEMP"]) / "replay-bundle"
+          pins = json.loads((bundle / "owned/image-pins.json").read_text())
+          for name, relative in [("blaze", "bin/ra-jit"), ("server", "owned/blaze-proc-macro-srv")]:
+              assert hashlib.sha256((bundle / relative).read_bytes()).hexdigest() == pins[name]["sha256"], name
+          PYVERIFY
+      - name: Execute saved source with compiler subprocesses blocked
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$RUNNER_TEMP/replay-bundle/bin/ra-jit" \
+            --work "$RUNNER_TEMP/saved-spec-review" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/replay-bundle/owned/blaze-proc-macro-srv" \
+            --backend cranelift > "$RUNNER_TEMP/saved-spec-evidence/replay.log" 2>&1
+      - name: Save immutable replay evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: saved-buildspec-execution
+          path: |
+            ${{ runner.temp }}/saved-spec-evidence
+            ${{ runner.temp }}/saved-spec-review/results.json
+            ${{ runner.temp }}/saved-spec-review/*.log
+            ${{ runner.temp }}/saved-spec-review/*.exec
+          if-no-files-found: warn
+
+  server-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -77,52 +201,6 @@ jobs:
           cargo test --locked -p project-model --lib -- --test-threads=2
           cargo test --locked -p ra-jit --bin ra-jit cargo::spec:: -- --test-threads=2
           python3 -I harness/tracedecay_test.py
-      - name: Build the owned replay CLI in the pinned native environment
-        id: replay_cli
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/saved-spec-evidence"
-          {
-            git rev-parse HEAD
-            uname -a
-            nix develop .#bench --command rustc -vV
-            nix develop .#bench --command cargo -V
-          } > "$RUNNER_TEMP/saved-spec-evidence/identity.txt"
-          nix develop .#bench --command cargo build --locked --release -p ra-jit --bins
-          git rev-parse HEAD > target/release/BUILT_FROM
-      - name: Bootstrap a fresh complete owned replay runtime
-        id: owned_runtime
-        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
-        run: |
-          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
-            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
-            --work "$RUNNER_TEMP/saved-spec-owned-server" --memory-mib 8192 --timeout 1800 \
-            > "$RUNNER_TEMP/saved-spec-evidence/bootstrap.log" 2>&1
-      - name: Execute saved source with compiler subprocesses blocked
-        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' }}
-        run: |
-          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
-            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
-            --work "$RUNNER_TEMP/saved-spec-review" --memory-mib 8192 --timeout 1200 \
-            --owned-server "$RUNNER_TEMP/saved-spec-owned-server/blaze-proc-macro-srv" \
-            --backend cranelift > "$RUNNER_TEMP/saved-spec-evidence/replay.log" 2>&1
-      - name: Save immutable replay evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: saved-buildspec-execution
-          path: |
-            ${{ runner.temp }}/saved-spec-evidence
-            ${{ runner.temp }}/saved-spec-review/results.json
-            ${{ runner.temp }}/saved-spec-review/*.log
-            ${{ runner.temp }}/saved-spec-review/*.exec
-            ${{ runner.temp }}/saved-spec-owned-server/image-pins.json
-            ${{ runner.temp }}/saved-spec-owned-server/tool-controls.json
-            ${{ runner.temp }}/saved-spec-owned-server/*.watchdog.json
-            ${{ runner.temp }}/saved-spec-owned-server/*audit.json
-            ${{ runner.temp }}/saved-spec-owned-server/*external-execs.json
-            ${{ runner.temp }}/saved-spec-owned-server/*.exec
-          if-no-files-found: warn
       - name: Test owned dependency resolution and Cargo lock parity
         if: ${{ !cancelled() }}
         run: |
@@ -187,3 +265,21 @@ jobs:
       - name: Check harness dispatch without services or credentials
         if: ${{ !cancelled() }}
         run: python3 -I harness/remote.py --selftest
+
+  # Preserve the original required check: success means every old gate still passed.
+  server:
+    needs: [server-tests, replay-runtime, saved-spec]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every server and replay check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYGATE'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          assert not failed, failed
+          PYGATE

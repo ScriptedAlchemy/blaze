@@ -43,6 +43,9 @@ on:
     - cron: "11 5 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: nix-live-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -50,6 +53,7 @@ concurrency:
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: "0"
 
 jobs:
   unit-graphs:
@@ -58,20 +62,27 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/flakehub-cache-action@v3
-        # Off unless the repository opts in (header): an unregistered fork's cache cannot
-        # authenticate, and that must never fail a job. The Nix commands below run regardless.
-        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
-        continue-on-error: true
-      - run: python3 nix/unit_graph.py
       # Fails when a gate is deleted or made conditional, and when the checker stops catching
       # that (harness/dist/check_nix_workflow.py, test_check_nix_workflow.py).
       - name: the cache is optional and every required command is present
         run: |
           python3 harness/dist/check_nix_workflow.py
           python3 -B harness/dist/test_check_nix_workflow.py
+      # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
+      - uses: DeterminateSystems/nix-installer-action@v23
+      # GitHub ref scoping prevents a PR cache from being read by main or another PR.
+      # A fallback restores inputs only: every Nix gate below still executes.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-${{ github.sha }}
+          restore-prefixes-first-match: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-
+          gc-max-store-size: 6G
+      - uses: DeterminateSystems/flakehub-cache-action@v3
+        # Off unless the repository opts in (header): an unregistered fork's cache cannot
+        # authenticate, and that must never fail a job. The Nix commands below run regardless.
+        if: vars.ENABLE_FLAKEHUB_CACHE == 'true'
+        continue-on-error: true
+      - run: python3 nix/unit_graph.py
       - name: nix/units is what unit_graph.py writes
         run: |
           git diff --stat -- nix/units
@@ -84,6 +95,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
+      # GitHub ref scoping prevents a PR cache from being read by main or another PR.
+      # A fallback restores inputs only: every Nix gate below still executes.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-${{ github.sha }}
+          restore-prefixes-first-match: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-
+          gc-max-store-size: 6G
       - uses: DeterminateSystems/flakehub-cache-action@v3
         # Off unless the repository opts in (header): an unregistered fork's cache cannot
         # authenticate, and that must never fail a job. The Nix commands below run regardless.
@@ -113,6 +131,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
+      # GitHub ref scoping prevents a PR cache from being read by main or another PR.
+      # A fallback restores inputs only: every Nix gate below still executes.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-${{ github.sha }}
+          restore-prefixes-first-match: nix-live-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('flake.lock') }}-
+          gc-max-store-size: 6G
       - uses: DeterminateSystems/flakehub-cache-action@v3
         # Off unless the repository opts in (header): an unregistered fork's cache cannot
         # authenticate, and that must never fail a job. The Nix commands below run regardless.
@@ -132,7 +157,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -146,7 +171,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb libgl1-mesa-dri libglx-mesa0 libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 libwayland-client0
-          export LIBGL_ALWAYS_SOFTWARE=1 RUST_BACKTRACE=1
+          export LIBGL_ALWAYS_SOFTWARE=1
           status=0
           timeout 15 xvfb-run -a --server-args="-screen 0 1280x800x24" demo/life/target/debug/life > life.log 2>&1 || status=$?
           cat life.log
@@ -163,7 +188,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - uses: ./.github/actions/toolchain
       - uses: Swatinem/rust-cache@v2
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: cargo test --release -p ra-jit-live
