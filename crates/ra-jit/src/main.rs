@@ -3372,8 +3372,16 @@ fn workspace_at(
             &cargo_config.extra_env,
         )?;
         let triple = triple.first().context("no target to build for")?;
-        let plan_asked =
-            plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
+        let plan_asked = plan::Asked {
+            sysroot: workspace
+                .sysroot
+                .root()
+                .context("owned planner has no source toolchain")?
+                .as_ref(),
+            triple,
+            cfg: &workspace.rustc_cfg,
+            env: &cargo_config.extra_env,
+        };
         let whole = scripts::own();
         let plan =
             plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?;

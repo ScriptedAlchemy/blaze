@@ -132,6 +132,8 @@ pub(crate) struct Built {
 
 /// What a build is for and who asks for it.
 pub(crate) struct Asked<'a> {
+    /// The workspace's resolved source toolchain.
+    pub(crate) sysroot: &'a Path,
     /// The triple built for.
     pub(crate) triple: &'a str,
     /// What `rustc --print cfg` says of the triple.
@@ -468,14 +470,10 @@ impl Plan {
             blaze_manifest::metadata::root_manifest(Some(&root.join("Cargo.toml")), &ctx)?;
         let ws = blaze_manifest::Workspace::new(&root_manifest, &ctx)?;
         let native = selection.target.is_none();
-        let compiler = crate::answers::toolchain_rustc_of(std::ffi::OsStr::new("rustc"))
-            .context("owned planner has no toolchain; Cargo was not executed")?;
+        let sysroot = asked.sysroot;
+        let compiler = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
         let host = crate::answers::host_tuple(&compiler)
             .context("owned planner has no host facts; Cargo was not executed")?;
-        let sysroot = compiler
-            .parent()
-            .and_then(Path::parent)
-            .context("owned planner has no sysroot; Cargo was not executed")?;
         env.insert("RUSTUP_TOOLCHAIN".into(), sysroot.display().to_string());
         let mut resolved_selection = selection.clone();
         if resolved_selection.asked_in.is_none() {
