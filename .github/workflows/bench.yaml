@@ -1,8 +1,3 @@
-# Microbenchmarks of the store's hot paths (crates/ra-jit-bench), run by tango in pairs: on a
-# pull request the binary of the change against the binary of its base, interleaved on one
-# runner, so that the runner's own drift cancels out. A benchmark fails the run only when it
-# is slower beyond doubt (tango's z-score) and by more than NOISE percent, twice in a row.
-# On main they are run alone, for the times.
 name: bench
 on:
   push:
@@ -59,16 +54,36 @@ jobs:
           cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
             | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
+      - name: Record benchmark context
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tango"
+          {
+            git rev-parse HEAD "$BASE_SHA"
+            rustc -vV
+            cargo --version
+            uname -a
+            lscpu
+            sha256sum "$RUNNER_TEMP"/bench-*
+          } > "$RUNNER_TEMP/tango/context.txt"
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
           [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
-          compare() { "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" -t "$TIME" --noise-threshold "$NOISE" -o | tee -a "$RUNNER_TEMP/bench.txt"; }
+          attempt=0
+          compare() {
+            attempt=$((attempt + 1))
+            "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" \
+              -t "$TIME" --noise-threshold "$NOISE" -o -v \
+              --dump "$RUNNER_TEMP/tango/compare-$attempt" | tee -a "$RUNNER_TEMP/bench.txt"
+          }
           { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           status=0
           compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
           { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$status" = 0 ] || echo "::error::a benchmark is over ${NOISE}% slower than on the base, twice"
+          [ "$status" = 0 ] || echo "::error::both benchmark comparisons report a slowdown over ${NOISE}%"
           exit "$status"
       # On main, and on a pull request whose base has no benchmarks.
       - name: Times
@@ -76,3 +91,12 @@ jobs:
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
           "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
           { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep paired benchmark evidence
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v6
+        with:
+          name: tango-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/tango
+            ${{ runner.temp }}/bench.txt
+          retention-days: 7
