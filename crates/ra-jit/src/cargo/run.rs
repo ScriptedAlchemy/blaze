@@ -298,6 +298,11 @@ pub(crate) fn tests(
                 passed.failed(names.as_deref(), failures.as_deref())
             }
             Pick::Some { passed, .. } => passed.passed(),
+            Pick::Asked if !success => {
+                if let Some(dir) = state.plan_dir(test) {
+                    affected::forget_passes_at(dir).context("forgetting prior test passes")?;
+                }
+            }
             Pick::Asked => {}
         }
         if !success {

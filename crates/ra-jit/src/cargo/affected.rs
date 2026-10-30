@@ -94,6 +94,15 @@ pub(crate) fn forget(state: &State) {
     }
 }
 
+/// A failed run outside affected selection cannot leave an earlier success reusable.
+/// Without a complete outcome list, every test of this target must run again.
+pub(crate) fn forget_passes_at(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(PASSED)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 /// What of a program of tests this command runs.
 pub(crate) enum Pick {
     /// What the command asks, every test unless it names some: nothing is known of what an
@@ -183,8 +192,10 @@ pub(crate) fn pick(
         .map(|(identity, name)| (name, identity))
         .collect();
     let manifest = Manifest::read(&state.root);
-    let given = manifest.given(&state.root, &asked.trailing, command);
-    let programs = format!("{}{}", programs_run_by(state, test), given.as_deref().unwrap_or(""));
+    let given = manifest.given(&state.root, &asked.trailing, command).and_then(|given| {
+        programs_run_by(state, test).map(|programs| format!("{programs}{given}"))
+    });
+    let programs = given.as_deref().unwrap_or("");
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new(), 0);
@@ -279,24 +290,39 @@ fn plain(trailing: &[String]) -> bool {
 }
 
 /// What stands for the programs an integration test of `test`'s package runs, which cargo
-/// gives it as `CARGO_BIN_EXE_<name>`: their sizes and times, which a build changes. Empty
-/// for a unit test.
-fn programs_run_by(state: &State, test: &Program) -> String {
+/// gives it as `CARGO_BIN_EXE_<name>`: their contents and executable modes. A copied or
+/// restored artifact can change without changing its size or modification time.
+fn programs_run_by(state: &State, test: &Program) -> Result<String, String> {
     if !matches!(test.kind, Kind::Test | Kind::Bench) {
-        return String::new();
+        return Ok(String::new());
     }
     let mut hash = Sha256::new();
+    hash.update(b"test programs 2\0");
     let runs = |it: &&Program| it.package == test.package && it.kind == Kind::Bin && !it.test;
     for program in state.programs.iter().filter(runs) {
-        hash.update(program.executable.as_os_str().as_encoded_bytes());
-        let meta = std::fs::metadata(&program.executable).ok();
-        let at = meta.as_ref().and_then(|it| it.modified().ok());
-        let at = at.and_then(|it| it.duration_since(std::time::UNIX_EPOCH).ok());
-        hash.update(meta.map_or(0, |it| it.len()).to_le_bytes());
-        hash.update(at.map_or(0, |it| it.as_nanos()).to_le_bytes());
+        let program = &program.executable;
+        let path = program.as_os_str().as_encoded_bytes();
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path);
+        let mut read = || -> std::io::Result<()> {
+            let meta = std::fs::metadata(program)?;
+            if !meta.is_file() {
+                return Err(std::io::Error::other("not a regular executable"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                hash.update((meta.permissions().mode() & 0o7777).to_le_bytes());
+            }
+            hash.update(crate::native_inputs::output_digest(program)?);
+            Ok(())
+        };
+        read().map_err(|error| {
+            format!("test program `{}` can't be read ({error})", program.display())
+        })?;
     }
     let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
-    format!("-{hex}")
+    Ok(format!("-{hex}"))
 }
 
 /// What the owner wrote in [`MANIFEST`], or why it can't be read.
@@ -387,8 +413,12 @@ impl Manifest {
             hash.update(digest);
         }
         let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
-        let mut names: Vec<&str> =
-            declared.env.iter().map(String::as_str).chain(passed.split(',')).collect();
+        let mut names: Vec<&str> = declared
+            .env
+            .iter()
+            .map(String::as_str)
+            .chain(passed.split(',').map(str::trim))
+            .collect();
         names.retain(|it| !it.trim().is_empty());
         names.sort_unstable();
         names.dedup();
@@ -555,6 +585,85 @@ impl Attempts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_programs(dir: &Path) -> (State, Program) {
+        let program = |kind, test, name: &str| {
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "package": "test-package",
+                "test": test,
+                "source": dir.join("src.rs"),
+                "package_dir": dir,
+                "executable": dir.join(name),
+                "cargos": dir.join(format!("{name}.cargo")),
+                "asked_as": null,
+                "left_to_cargo": null,
+                "inputs": [],
+                "env": [],
+            })
+        };
+        let test = program("Test", true, "integration");
+        let state = serde_json::from_value(serde_json::json!({
+            "version": "test",
+            "key": "test",
+            "root": dir,
+            "built_at": 0,
+            "profile": "debug",
+            "programs": [program("Bin", false, "tool"), test.clone()],
+            "guards": [],
+            "checkouts": [],
+            "refusal": null,
+            "doc_tests": false,
+            "counts": {"served": 0, "cargo": {}},
+        }))
+        .unwrap();
+        (state, serde_json::from_value(test).unwrap())
+    }
+
+    #[test]
+    fn cargo_binary_contents_are_inputs_even_when_size_and_mtime_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"first").unwrap();
+        let stamp = std::fs::metadata(&tool).unwrap().modified().unwrap();
+        let (state, test) = test_programs(dir.path());
+        let before = programs_run_by(&state, &test);
+        assert_eq!(before, programs_run_by(&state, &test));
+        std::fs::write(&tool, b"other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        assert_ne!(before, programs_run_by(&state, &test));
+        std::fs::write(&tool, b"first").unwrap();
+        assert_eq!(before, programs_run_by(&state, &test));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_binary_permission_changes_invalidate_test_passes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"tool").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (state, test) = test_programs(dir.path());
+        let before = programs_run_by(&state, &test);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_ne!(before, programs_run_by(&state, &test));
+    }
+
+    #[test]
+    fn missing_or_non_file_cargo_binaries_cannot_certify_a_test_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, test) = test_programs(dir.path());
+        assert!(programs_run_by(&state, &test).is_err());
+        std::fs::create_dir(dir.path().join("tool")).unwrap();
+        assert!(programs_run_by(&state, &test).is_err());
+    }
 
     fn of(args: &[&str]) -> bool {
         plain(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())

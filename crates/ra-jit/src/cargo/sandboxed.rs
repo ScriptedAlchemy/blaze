@@ -224,19 +224,18 @@ impl Kept {
     pub(crate) fn changed(&mut self, name: &str) -> Option<Option<String>> {
         let Some(paths) = self.tests.get(name) else { return Some(None) };
         for (path, stat_then, digest_then) in paths {
-            let (stat_now, digest_now) = match self.seen.get(path) {
+            let (_, digest_now) = match self.seen.get(path) {
                 Some(it) => it.clone(),
                 None => {
-                    let stat_now = stat(Path::new(path));
-                    let digest_now = match &stat_now == stat_then {
-                        true => digest_then.clone(),
-                        false => digest(Path::new(path)),
+                    let before = (stat_then.clone(), digest_then.clone());
+                    let Ok(now) = observed(Path::new(path), Some(&before)) else {
+                        return Some(Some(path.clone()));
                     };
-                    self.seen.insert(path.clone(), (stat_now.clone(), digest_now.clone()));
-                    (stat_now, digest_now)
+                    self.seen.insert(path.clone(), now.clone());
+                    now
                 }
             };
-            if stat_now != *stat_then && digest_now != *digest_then {
+            if digest_now != *digest_then {
                 return Some(Some(path.clone()));
             }
         }
@@ -252,13 +251,9 @@ impl Kept {
             known.entry(path.clone()).or_insert_with(|| (stat.clone(), digest.clone()));
         }
         let mut now = |path: &str| {
-            let stat_now = stat(Path::new(path));
-            if let Some((stat, digest)) = known.get(path).filter(|(stat, _)| *stat == stat_now) {
-                return (stat.clone(), digest.clone());
-            }
-            let digest_now = digest(Path::new(path));
-            known.insert(path.to_owned(), (stat_now.clone(), digest_now.clone()));
-            (stat_now, digest_now)
+            let now = observed(Path::new(path), known.get(path))?;
+            known.insert(path.to_owned(), now.clone());
+            Ok::<_, std::io::Error>(now)
         };
         self.tests.retain(|name, _| passed.contains_key(name));
         for name in &self.ran {
@@ -274,10 +269,15 @@ impl Kept {
             let paths = text
                 .lines()
                 .map(|path| {
-                    let (stat, digest) = now(path);
-                    (path.to_owned(), stat, digest)
+                    let (stat, digest) = now(path)?;
+                    Ok((path.to_owned(), stat, digest))
                 })
-                .collect();
+                .collect::<std::io::Result<Vec<_>>>();
+            let Ok(paths) = paths else {
+                passed.remove(name);
+                self.tests.remove(name);
+                continue;
+            };
             self.tests.insert(name.clone(), paths);
         }
         let mut text = String::new();
@@ -296,29 +296,101 @@ impl Kept {
     }
 }
 
-/// What is quick to tell of what is at `path`: whether it is there, its size and its last
-/// change. Where that is the same, what is there is taken to be.
-fn stat(path: &Path) -> String {
-    let Ok(meta) = std::fs::metadata(path) else { return "-".to_owned() };
+/// A content-cache stamp includes Unix change time: restoring a file's mtime does not
+/// restore its ctime. Permission changes also invalidate the stamp and the input digest.
+/// A symlink needs both its own stamp and its target's: either can change what was read.
+fn stat(path: &Path) -> std::io::Result<String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("-".to_owned()),
+        Err(error) => return Err(error),
+    };
+    let stamp = metadata_stamp(&meta);
+    if !meta.is_symlink() {
+        return Ok(stamp);
+    }
+    let target = match std::fs::metadata(path) {
+        Ok(meta) => metadata_stamp(&meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "-".to_owned(),
+        Err(error) => return Err(error),
+    };
+    Ok(format!("link:{stamp}:{target}"))
+}
+
+fn metadata_stamp(meta: &std::fs::Metadata) -> String {
     let at = meta.modified().ok().and_then(|it| it.duration_since(std::time::UNIX_EPOCH).ok());
     #[cfg(unix)]
-    let node = std::os::unix::fs::MetadataExt::ino(&meta);
+    let node = {
+        use std::os::unix::fs::MetadataExt as _;
+        format!(
+            "{}:{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+            meta.mode()
+        )
+    };
     #[cfg(not(unix))]
     let node = 0;
     format!("{}:{}:{node}", meta.len(), at.map_or(0, |it| it.as_nanos()))
 }
 
-/// What is at `path`: nothing, a file's bytes, a directory's names, or something else (a
-/// device, a socket), by a hash.
-fn digest(path: &Path) -> String {
-    let Ok(meta) = std::fs::metadata(path) else { return "-".to_owned() };
+/// Never keep a partial read or a digest observed while its input changed. Platforms
+/// without a change-time stamp read the content each time instead of trusting mtime.
+fn observed(path: &Path, before: Option<&(String, String)>) -> std::io::Result<(String, String)> {
+    let stamp = stat(path)?;
+    if cfg!(unix)
+        && let Some((before, digest)) = before
+        && *before == stamp
+    {
+        return Ok((stamp, digest.clone()));
+    }
+    let digest = digest(path)?;
+    if stat(path)? != stamp {
+        return Err(std::io::Error::other("test input changed while it was being read"));
+    }
+    Ok((stamp, digest))
+}
+
+/// What is at `path`: nothing, a file's bytes, or a directory's names, by a hash. A symlink
+/// also includes the raw text readlink returns, even when another spelling has the same target.
+fn digest(path: &Path) -> std::io::Result<String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("-".to_owned()),
+        Err(error) => return Err(error),
+    };
+    if !meta.is_symlink() {
+        return followed_digest(path);
+    }
+    let link = std::fs::read_link(path)?;
+    let bytes = link.as_os_str().as_encoded_bytes();
     let mut hash = Sha256::new();
+    hash.update(b"link\0");
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+    hash.update(followed_digest(path)?.as_bytes());
+    Ok(hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect())
+}
+
+/// Following the path keeps target contents in the key and refuses cyclic links.
+fn followed_digest(path: &Path) -> std::io::Result<String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("-".to_owned()),
+        Err(error) => return Err(error),
+    };
+    let mut hash = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        hash.update((meta.permissions().mode() & 0o7777).to_le_bytes());
+    }
     if meta.is_dir() {
-        let mut names: Vec<_> = std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .filter_map(|it| it.ok().map(|it| it.file_name()))
-            .collect();
+        let mut names: Vec<_> = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|it| it.file_name()))
+            .collect::<std::io::Result<_>>()?;
         names.sort();
         hash.update(b"d");
         for name in names {
@@ -327,12 +399,164 @@ fn digest(path: &Path) -> String {
         }
     } else if meta.is_file() {
         hash.update(b"f");
-        match std::fs::File::open(path) {
-            Ok(mut file) => _ = std::io::copy(&mut file, &mut hash),
-            Err(_) => hash.update(b"unreadable"),
-        }
+        std::io::copy(&mut std::fs::File::open(path)?, &mut hash)?;
     } else {
-        hash.update(b"o");
+        return Err(std::io::Error::other("not a regular file or directory"));
     }
-    hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect()
+    Ok(hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect())
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn remember(dir: &Path, input: &Path) -> BTreeMap<String, String> {
+        let mut kept = Kept::read(dir);
+        std::fs::create_dir_all(&kept.records).unwrap();
+        std::fs::write(
+            kept.records.join(sandbox::record_name("test")),
+            input.display().to_string(),
+        )
+        .unwrap();
+        kept.ran.insert("test".to_owned());
+        let mut passed = BTreeMap::from([("test".to_owned(), "code".to_owned())]);
+        kept.settle(&mut passed);
+        passed
+    }
+
+    #[test]
+    fn recorded_inputs_detect_same_size_and_mtime_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"first").unwrap();
+        let stamp = std::fs::metadata(&input).unwrap().modified().unwrap();
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::write(&input, b"other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        std::fs::write(&input, b"first").unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_inputs_include_file_and_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        for directory in [false, true] {
+            let input = dir.path().join(if directory { "directory" } else { "tool" });
+            if directory {
+                std::fs::create_dir(&input).unwrap();
+            } else {
+                std::fs::write(&input, b"tool").unwrap();
+            }
+            std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(remember(dir.path(), &input).contains_key("test"));
+            std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                Kept::read(dir.path()).changed("test"),
+                Some(Some(input.display().to_string()))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_symlinks_include_raw_target_spelling() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        std::fs::write(dir.path().join("target"), b"contents").unwrap();
+        symlink("target", &input).unwrap();
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::remove_file(&input).unwrap();
+        symlink("./target", &input).unwrap();
+        assert_eq!(
+            std::fs::read_link(&input).unwrap().into_os_string(),
+            std::ffi::OsString::from("./target")
+        );
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_symlinks_detect_target_content_changes() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"first").unwrap();
+        symlink("target", &input).unwrap();
+        let stamp = std::fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::write(&target, b"other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        std::fs::write(&target, b"first").unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_dangling_symlinks_include_target_text_and_presence() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        symlink("missing", &input).unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::remove_file(&input).unwrap();
+        symlink("./missing", &input).unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::write(dir.path().join("missing"), b"present").unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unobservable_inputs_cannot_keep_a_sandboxed_pass() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"readable").unwrap();
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        std::fs::remove_file(&input).unwrap();
+        symlink("input", &input).unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+        assert!(remember(dir.path(), &input).is_empty());
+        std::fs::remove_file(&input).unwrap();
+        symlink("other", &input).unwrap();
+        symlink("input", dir.path().join("other")).unwrap();
+        assert!(remember(dir.path(), &input).is_empty());
+        assert!(remember(dir.path(), Path::new("/dev/null")).is_empty());
+    }
+
+    #[test]
+    fn recorded_missing_inputs_are_distinct_from_present_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        assert!(remember(dir.path(), &input).contains_key("test"));
+        assert_eq!(Kept::read(dir.path()).changed("test"), None);
+        std::fs::write(&input, b"").unwrap();
+        assert_eq!(Kept::read(dir.path()).changed("test"), Some(Some(input.display().to_string())));
+    }
 }
