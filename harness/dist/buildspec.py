@@ -1496,7 +1496,9 @@ def scan_programs(target):
 def saved_programs(results):
     found = collections.Counter()
     for result in results:
-        for artifact in json.load(open(result))["artifacts"]:
+        with open(result) as source:
+            artifacts = json.load(source)["artifacts"]
+        for artifact in artifacts:
             if not artifact.get("executable"):
                 continue
             if not os.path.isfile(artifact["executable"]):
@@ -1835,19 +1837,39 @@ class Ctx:
         offset = self.audit_offset()
         saved = len(args) == 4 and args[:3] == ["cargo", "spec", "--run"]
         outputs = args[3] + ".outputs" if saved else None
-        before = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) if outputs else set()
+        def replays():
+            return {path for path in glob.glob(os.path.join(glob.escape(outputs), "replay-*"))
+                    if os.path.isdir(path) and not os.path.islink(path)} if outputs else set()
+        before = replays()
         run = self.blaze.run(args, copy_root, env, merge=True)
         if self.audit and not run.watchdog:
             norustc.settle(self.audit[0], limit=60)
         self.blaze.stop(home, copy_root, env)
         dispatched = count_dispatched(self.audit, offset)
-        summary = summarize(run.out, target, run.code)
-        if outputs:
-            results = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) - before
-            if run.code == 0 and not results:
-                raise HarnessError("saved replay succeeded without a completed result")
-            summary["programs"] = saved_programs(sorted(results))
-        return summary, run, dispatched
+        try:
+            summary = summarize(run.out, target, run.code)
+            if outputs:
+                results = [os.path.join(path, "result.json") for path in replays() - before
+                           if os.path.isfile(os.path.join(path, "result.json"))]
+                if run.code == 0 and not results:
+                    raise HarnessError("saved replay succeeded without a completed result")
+                summary["programs"] = saved_programs(sorted(results))
+            return summary, run, dispatched
+        finally:
+            # Saved replay ignores CARGO_TARGET_DIR: its (large) artifacts live beside the
+            # CBOR, not under `local`. Once inspected and stopped, release only this run's
+            # directories, including incomplete failures. Keep the saved inputs for the
+            # later foreign-checkout replay, and small result manifests with the evidence.
+            if outputs and not self.args.keep:
+                for path in sorted(replays() - before):
+                    result = os.path.join(path, "result.json")
+                    if os.path.isfile(result):
+                        report_dir = os.path.dirname(os.path.abspath(self.args.json)) if self.args.json else self.work
+                        evidence = os.path.join(report_dir, "replay-results")
+                        os.makedirs(evidence, exist_ok=True)
+                        name = os.path.basename(args[3]) + "-" + os.path.basename(path) + ".json"
+                        shutil.copyfile(result, os.path.join(evidence, name))
+                    shutil.rmtree(path)
 
     def run_local(self, case):
         res = self.results[case.full]
@@ -3316,6 +3338,10 @@ def environment(**kw):
 
 def self_test(args):
     t = SelfTest()
+    cleanup = subprocess.run([sys.executable, "-I", os.path.join(HERE, "test_buildspec_cleanup.py")],
+                             capture_output=True, text=True)
+    t.check(cleanup.returncode == 0, "saved replay scratch is released only after inspection",
+            cleanup.stdout + cleanup.stderr)
     self_test_spec_reading(t)
     self_test_units(t)
     self_test_parsing(t)
