@@ -181,6 +181,25 @@ def produced(messages):
     return files, executables
 
 
+# Keep the C2 comparison's code-layout policy in the build job, not in a
+# consumer that is forbidden to recompile. Both sides inherit the same flags.
+BENCH_ALIGNMENT_FLAGS = ["-C", "llvm-args=-align-all-functions=6",
+                         "-C", "llvm-args=-align-all-nofallthru-blocks=5"]
+
+
+def benchmark_environment(parent):
+    env = dict(parent)
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        encoded = env["CARGO_ENCODED_RUSTFLAGS"]
+        inherited = encoded.split("\x1f") if encoded else []
+    else:
+        inherited = env.get("RUSTFLAGS", "").split()
+    flags = inherited + BENCH_ALIGNMENT_FLAGS
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
+    env.pop("RUSTFLAGS", None)
+    return env, flags
+
+
 def build(args):
     base = roots()
     sets = json.loads(Path(args.sets).read_text())
@@ -222,6 +241,7 @@ def build(args):
             (temp / f"{name}.env.json").write_text(json.dumps(env))
             command = ["cargo", "test", "--locked", "--message-format=json-render-diagnostics", *spec[kind]]
         elif kind == "bench":
+            env, entry["rustflags"] = benchmark_environment(env)
             command = ["cargo", "bench", "--locked", "--no-run", "--message-format=json-render-diagnostics", *spec[kind]]
         else:
             command = ["cargo", "build", "--locked", "--message-format=json-render-diagnostics", *spec[kind]]

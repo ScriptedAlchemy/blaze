@@ -31,6 +31,7 @@ class PairTest(unittest.TestCase):
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
             self.bundle["sets"][name] = {
+                "rustflags": ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"],
                 "kind": "bench", "args": ["-p", "ra-jit-bench", "--bench", "store"],
                 "executables": [{"name": "store", "kind": ["bench"], "path": str(path)}],
                 "source": name.removeprefix("bench-"), "identity": {"commit": name, "tree": "tree-" + name},
@@ -57,6 +58,21 @@ class PairTest(unittest.TestCase):
     def test_different_profile_rejected(self):
         self.bundle["sets"]["bench-base"]["args"].extend(["--profile", "dev"])
         with self.assertRaisesRegex(AssertionError, "different flags"):
+            self.prepare()
+
+    def test_effective_rustflags_must_match(self):
+        self.bundle["sets"]["bench-base"]["rustflags"].append("--cfg=other")
+        with self.assertRaisesRegex(AssertionError, "different Rust flags"):
+            self.prepare()
+
+    def test_missing_rustflags_are_not_provenance(self):
+        del self.bundle["sets"]["bench-head"]["rustflags"]
+        with self.assertRaisesRegex(AssertionError, "Rust flags"):
+            self.prepare()
+
+    def test_invalid_rustflags_are_rejected(self):
+        self.bundle["sets"]["bench-head"]["rustflags"] = "-C different"
+        with self.assertRaisesRegex(AssertionError, "Rust flags"):
             self.prepare()
 
     def test_missing_base_is_not_solo(self):

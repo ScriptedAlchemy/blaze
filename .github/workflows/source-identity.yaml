@@ -1,0 +1,38 @@
+name: Compiler source identity regressions
+on:
+  pull_request:
+    paths:
+      - crates/ra-jit/build.rs
+      - harness/source_identity_test.py
+      - .github/workflows/source-identity.yaml
+  push:
+    branches: [main, dist/main]
+    paths:
+      - crates/ra-jit/build.rs
+      - harness/source_identity_test.py
+      - .github/workflows/source-identity.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: source-identity-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  identity:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+      - name: Exercise the actual source fingerprint build script
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 crates/ra-jit/build.rs -o "$RUNNER_TEMP/blaze-source-identity"
+          BLAZE_BUILD_SCRIPT="$RUNNER_TEMP/blaze-source-identity" python3 -I harness/source_identity_test.py -v

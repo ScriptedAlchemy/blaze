@@ -32,6 +32,8 @@ def prepare(bundle, base_sha, temp):
     assert head["kind"] == "bench" and head["source"] == "head"
     expected_args = ["-p", "ra-jit-bench", "--bench", "store"]
     assert head["args"] == expected_args, "head benchmark build configuration changed"
+    flags = head.get("rustflags")
+    assert isinstance(flags, list) and all(isinstance(flag, str) for flag in flags), "head Rust flags were not recorded"
     temp.mkdir(parents=True, exist_ok=True)
     for name in ("bench-base", "bench-head"):
         (temp / name).unlink(missing_ok=True)
@@ -49,6 +51,7 @@ def prepare(bundle, base_sha, temp):
             assert not base.get("executables"), "absent benchmark has an executable"
         else:
             assert base["kind"] == head["kind"], "benchmark pair uses different Cargo modes"
+            assert base.get("rustflags") == flags, "benchmark pair uses different Rust flags"
             shutil.copy2(executable(bundle, "bench-base"), temp / "bench-base")
     else:
         assert base is None or (base.get("absent") and base.get("reason") == "no base commit (not a pull request)" and not base.get("executables")), "non-PR run unexpectedly contains a base benchmark"

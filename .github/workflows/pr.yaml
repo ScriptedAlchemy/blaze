@@ -24,8 +24,8 @@
 name: pr
 
 on:
+  # Stacked PRs are tested against their actual base too, not only dist/main.
   pull_request:
-    branches: [dist/main, dist/c4-keys]
   push:
     branches: [dist/main, dist/c4-keys]
   schedule:
@@ -42,8 +42,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Cancel obsolete PR builds, never an integration push awaiting full acceptance.
+  group: pr-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -72,6 +73,7 @@ jobs:
           python3 -I .github/scripts/test_bundle_integrity.py
           python3 -I .github/scripts/test_bundle_transport.py
           python3 -I .github/scripts/test_bench_pair.py
+          python3 -I .github/scripts/test_benchmark_build.py
           python3 -I .github/scripts/test_bench_verdict.py
       - id: areas
         env:

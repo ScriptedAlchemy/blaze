@@ -18,15 +18,24 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_WORKSPACE_DIR");
     let Some(root) = std::env::var_os("CARGO_WORKSPACE_DIR").map(PathBuf::from) else { return };
-    let (lock, crates, vendor) =
-        (root.join("Cargo.lock"), root.join("crates"), root.join("vendor"));
+    let (lock, crates) = (root.join("Cargo.lock"), root.join("crates"));
     if !lock.is_file() || !crates.is_dir() {
         return;
     }
+    // A partial source scan must never certify two compiler builds as compatible.
+    // Omitting this variable selects the store's existing executable-byte identity.
+    match source_identity(&root) {
+        Ok(hex) => println!("cargo:rustc-env=RA_JIT_SOURCES={hex}"),
+        Err(error) => println!("cargo:warning=source cache identity unavailable: {error}"),
+    }
+}
+
+fn source_identity(root: &Path) -> std::io::Result<String> {
     let mut files = Vec::new();
-    for top in [&crates, &vendor] {
+    let mut ancestors = std::collections::BTreeSet::new();
+    for top in [root.join("crates"), root.join("vendor")] {
         println!("cargo:rerun-if-changed={}", top.display());
-        listed(top, &mut files);
+        listed(&top, &mut files, &mut ancestors)?;
     }
     // `harness/toolchain` is compiled in (`cargo/state.rs`).
     for file in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "harness/toolchain"] {
@@ -40,37 +49,72 @@ fn main() {
         hash.update(&(bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     };
+    field(b"blaze-source-identity-v2");
     for path in &files {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        let name = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let bytes = std::fs::read(path)?;
+        let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
+        // Normalize separators, not characters in names: on Unix a backslash is
+        // a real filename character, not the separator of a nested directory.
+        let name = relative
+            .components()
+            .map(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("non-Unicode source path"))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?
+            .join("/");
         field(name.as_bytes());
         field(&bytes);
     }
-    let mut features: Vec<String> =
-        std::env::vars().map(|it| it.0).filter(|it| it.starts_with("CARGO_FEATURE_")).collect();
+    // An unrelated native environment value need not be Unicode. Feature names
+    // are Cargo's ASCII names; inspecting them must not decode every value.
+    let mut features: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with("CARGO_FEATURE_"))
+        .collect();
     features.sort();
     field(features.join(" ").as_bytes());
     field(std::env::var("TARGET").unwrap_or_default().as_bytes());
     field(&[u8::from(std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some())]);
-    let hex: String = hash.finish().iter().map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=RA_JIT_SOURCES={hex}");
+    Ok(hash.finish().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Every file below `dir`, but in hidden directories and in what cargo and npm build into.
-fn listed(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+/// Walk the source spelling, including directory aliases, without silently dropping
+/// unreadable entries or traversing a symlink cycle. Two aliases hash under both names.
+fn listed(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    ancestors: &mut std::collections::BTreeSet<PathBuf>,
+) -> std::io::Result<()> {
+    let physical = std::fs::canonicalize(dir)?;
+    if !ancestors.insert(physical.clone()) {
+        return Err(std::io::Error::other("cycle in compiler source directories"));
+    }
+    // Track external referents too: a directory alias can point outside the workspace.
+    println!("cargo:rerun-if-changed={}", physical.display());
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
-        let Ok(kind) = entry.file_type() else { continue };
+        // A worktree/submodule uses a .git file rather than a directory. Neither
+        // spelling is source or should key an otherwise identical compiler.
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let kind = std::fs::metadata(&path)?;
         if kind.is_dir() {
-            let built = name == "target" || name == "node_modules";
-            if !name.to_string_lossy().starts_with('.') && !built {
-                listed(&entry.path(), files);
+            if name != "target" && name != "node_modules" {
+                listed(&path, files, ancestors)?;
             }
+        } else if kind.is_file() {
+            files.push(path);
         } else {
-            files.push(entry.path());
+            return Err(std::io::Error::other("non-file in compiler source tree"));
         }
     }
+    ancestors.remove(&physical);
+    Ok(())
 }
 
 /// SHA-256 (FIPS 180-4).
