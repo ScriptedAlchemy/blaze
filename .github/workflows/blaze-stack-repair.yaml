@@ -3,11 +3,15 @@ name: Blaze stack repair
 on:
   push:
     branches: [repair/blaze-stack-20261030]
-    paths: [.github/workflows/blaze-stack-repair.yaml]
+    paths: [.github/workflows/blaze-stack-repair.yaml, '.github/repair/**']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: blaze-stack-repair
+  cancel-in-progress: true
 
 jobs:
   prepare:
