@@ -175,15 +175,18 @@ impl Body {
             is_gen_fn,
             maps,
         );
+        db.depend_on_included_inputs(def.module(db).krate(db));
         Some((Arc::new(body), source_map))
     }
 
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
-        match Self::relative(db, def) {
+        let body = match Self::relative(db, def) {
             Some((body, _)) => body.clone(),
             None => Self::with_source_map(db, def).0.clone(),
-        }
+        };
+        db.depend_on_included_inputs(def.module(db).krate(db));
+        body
     }
 }
 

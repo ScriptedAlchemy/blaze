@@ -23,15 +23,11 @@ struct Node {
 /// or binaries that need features it lacks, has no units.
 fn builds_anything(
     pkg: PackageId,
-    features: &ResolvedFeatures,
+    root_features: &FxHashMap<PackageId, BTreeSet<String>>,
     reads: &FxHashMap<PackageId, Read>,
 ) -> bool {
     let Some(read) = reads.get(&pkg) else { return false };
-    let on =
-        features.activated_features_unverified(pkg, FeaturesFor::NormalOrDev).unwrap_or_default();
-    // A feature of a dependency (`dep/feature`) is taken to be on.
-    let has =
-        |required: &String| required.contains('/') || on.iter().any(|it| it.as_str() == required);
+    let has = |required: &String| root_features.get(&pkg).is_some_and(|on| on.contains(required));
     read.lib.is_some() || read.bins.iter().any(|it| it.iter().all(has))
 }
 
@@ -47,12 +43,13 @@ pub(crate) fn of_build(
     reads: &FxHashMap<PackageId, Read>,
     activated: &dyn Fn(&Platform) -> bool,
     root: Option<PackageId>,
+    root_features: &FxHashMap<PackageId, BTreeSet<String>>,
 ) -> Result<MetadataResolve> {
     let mut nodes: BTreeMap<PackageId, Node> = BTreeMap::new();
     let mut seen = FxHashSet::default();
     let mut queue = Vec::new();
     for &member in roots {
-        if !dev_units && !builds_anything(member, features, reads) {
+        if !dev_units && !builds_anything(member, root_features, reads) {
             continue;
         }
         queue.push((member, FeaturesFor::NormalOrDev));

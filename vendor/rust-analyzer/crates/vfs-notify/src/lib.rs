@@ -206,11 +206,10 @@ impl NotifyActor {
                         let abs_paths: Vec<AbsPathBuf> = event
                             .paths
                             .into_iter()
-                            .filter_map(|path| {
-                                Some(
-                                    AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).ok()?)
-                                        .expect("path is absolute"),
-                                )
+                            .flat_map(|path| {
+                                [front_path(&path, false), front_path(&path, true)]
+                                    .into_iter()
+                                    .flatten()
                             })
                             .collect();
 
@@ -251,7 +250,8 @@ impl NotifyActor {
                                     return Some((path, None));
                                 }
 
-                                let meta = fs::metadata(&path).ok()?;
+                                let native = paths::native::resolve(path.as_ref()).ok()?;
+                                let meta = fs::metadata(native).ok()?;
                                 if meta.file_type().is_dir()
                                     && self
                                         .watched_dir_entries
@@ -299,8 +299,12 @@ impl NotifyActor {
 
                 for root in &dirs.include {
                     send_message(root.clone());
-                    let walkdir =
-                        WalkDir::new(root).follow_links(true).into_iter().filter_entry(|entry| {
+                    let projected = paths::native::is_projected(root.as_ref());
+                    let Ok(native_root) = paths::native::resolve(root.as_ref()) else { continue };
+                    let walkdir = WalkDir::new(native_root)
+                        .follow_links(true)
+                        .into_iter()
+                        .filter_entry(|entry| {
                             if !entry.file_type().is_dir() {
                                 return true;
                             }
@@ -311,8 +315,9 @@ impl NotifyActor {
                             }
 
                             // We want to filter out subdirectories that are roots themselves, because they will be visited separately.
-                            dirs.exclude.iter().all(|it| it != path)
-                                && (root == path || dirs.include.iter().all(|it| it != path))
+                            let Some(path) = front_path(path, projected) else { return false };
+                            dirs.exclude.iter().all(|it| it != &path)
+                                && (root == &path || dirs.include.iter().all(|it| it != &path))
                         });
 
                     let files = walkdir.filter_map(|it| it.ok()).filter_map(|entry| {
@@ -320,10 +325,7 @@ impl NotifyActor {
                         let is_dir = entry.file_type().is_dir();
                         let is_file = entry.file_type().is_file();
                         let is_symlink = entry.path_is_symlink();
-                        let abs_path = AbsPathBuf::try_from(
-                            Utf8PathBuf::from_path_buf(entry.into_path()).ok()?,
-                        )
-                        .ok()?;
+                        let abs_path = front_path(&entry.into_path(), projected)?;
                         if depth < 2 && is_dir {
                             send_message(abs_path.clone());
                         }
@@ -354,7 +356,9 @@ impl NotifyActor {
 
     fn watch(&mut self, path: &Path) {
         if let Some((watcher, _)) = &mut self.watcher {
-            log_notify_error(watcher.watch(path, RecursiveMode::Recursive));
+            if let Ok(native) = paths::native::resolve(path) {
+                log_notify_error(watcher.watch(&native, RecursiveMode::Recursive));
+            }
         }
     }
 
@@ -365,7 +369,15 @@ impl NotifyActor {
 }
 
 fn read(path: &AbsPath) -> Option<Vec<u8>> {
-    std::fs::read(path).ok()
+    std::fs::read(paths::native::resolve(path.as_ref()).ok()?).ok()
+}
+
+fn front_path(path: &Path, projected: bool) -> Option<AbsPathBuf> {
+    if projected {
+        paths::native::encode(path).ok()
+    } else {
+        AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path.to_owned()).ok()?).ok()
+    }
 }
 
 fn log_notify_error<T>(res: notify::Result<T>) -> Option<T> {

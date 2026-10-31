@@ -7,16 +7,19 @@ mod answers;
 mod borrowck;
 mod cargo;
 mod check;
+mod compiler_json;
 mod content;
 mod dep_info;
 mod deps;
 mod doctest;
+mod env_identity;
 mod errors;
 mod front_image;
 mod frozen;
 mod inputs;
 mod link;
 mod live;
+mod macro_inputs;
 mod macro_list;
 mod memory;
 mod mirdump;
@@ -258,6 +261,7 @@ impl Args {
         let mut no_default_features = false;
         let (mut packages, mut workspace) = (Vec::new(), false);
         let mut all_features = false;
+        let (mut locked, mut offline) = (false, false);
         let mut profile = None;
         let mut config = Vec::new();
         let (mut excludes, mut unstable) = (Vec::new(), Vec::new());
@@ -310,6 +314,12 @@ impl Args {
                 "--exclude" => excludes.push(value()?),
                 "-Z" => unstable.push(value()?),
                 "--all-features" => all_features = true,
+                "--locked" => locked = true,
+                "--offline" => offline = true,
+                "--frozen" => {
+                    locked = true;
+                    offline = true;
+                }
                 "--release" | "--profile" if profile.is_some() => {
                     bail!("the profile is given twice")
                 }
@@ -355,6 +365,8 @@ impl Args {
                 features,
                 no_default_features,
                 all_features,
+                locked,
+                offline,
                 packages,
                 workspace,
                 excludes,
@@ -610,10 +622,16 @@ fn source_path(
 ) -> Option<String> {
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);
-    let path = source_root.path_for_file(&file)?.as_path()?.to_string();
-    let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
-    let relative = Path::new(&path).strip_prefix(root).ok().or(base);
-    Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
+    let logical = source_root.path_for_file(&file)?.as_path()?.to_string();
+    let path = paths::native::resolve(Path::new(&logical)).ok()?;
+    let root = paths::native::resolve(root).ok()?;
+    let base = base.and_then(|base| paths::native::resolve(base).ok());
+    let base = base.as_deref().and_then(|base| path.strip_prefix(base).ok());
+    // Cargo names source-replaced registry files absolutely even when vendor/
+    // happens to live below the workspace. Only workspace files are relative.
+    let relative =
+        (!source_root.is_library).then(|| path.strip_prefix(&root).ok().or(base)).flatten();
+    Some(relative.unwrap_or(&path).to_string_lossy().into_owned())
 }
 
 impl<'a> Resolver<'a> {
@@ -972,8 +990,14 @@ impl Resolver<'_> {
         }
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
-        let place = crate_place(&root, self.inside(&root), home.as_deref());
-        let named = format!("ra-jit crate {} {place}", name.crate_name());
+        let place = crate_place(&root, self.inside(&root), home.as_deref(), &self.root);
+        let mut named = format!("ra-jit crate {} {place}", name.crate_name());
+        if let Some(unit) = krate.extra_data(self.db).blaze_native_unit {
+            // Captured compiler instances can share source and library name while
+            // carrying different cfg, environment or native options. Their stable
+            // graph IDs distinguish linkage without renaming it on a source edit.
+            named.push_str(&format!(" compiler unit {unit}"));
+        }
         Some(short_hash(&named))
     }
 
@@ -1498,8 +1522,9 @@ impl SymbolResolver for Resolver<'_> {
                 self.db,
                 krate,
                 &root,
+                &self.root,
                 &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
-                &|krate| process_reads(self.db, krate),
+                &|krate| environment_reads(self.db, krate),
             ));
         }
         self.contents.id(
@@ -1507,11 +1532,14 @@ impl SymbolResolver for Resolver<'_> {
             places,
             krate,
             &|krate| self.stable_crate_id(krate),
-            // Every body of the crate has been looked through once it is listed, so that
-            // every variable it asks for is known.
+            // Keep local crates registered with the build's listing. Contents discovers
+            // all expression owners before asking for reads, including outside crates
+            // reached only through a dependency's environment identity.
             &|krate| {
-                self.listed.of(self.db, krate.into());
-                process_reads(self.db, krate)
+                if krate.data(self.db).origin.is_local() {
+                    self.listed.of(self.db, krate.into());
+                }
+                environment_reads(self.db, krate)
             },
         )
     }
@@ -1522,6 +1550,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn library_sources(&self) -> Option<hir_ty_codegen::LibrarySources> {
         self.contents.library_sources(self.db)
+    }
+
+    fn checkout(&self) -> Option<String> {
+        self.root.to_str().map(str::to_owned)
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -1714,16 +1746,26 @@ fn is_in_body(db: &RootDatabase, module: Module) -> bool {
 
 /// What names the crate whose root is `root` in the id ra-jit gives it, the same on every
 /// machine: its path in the checkout (`inside`), or below where cargo keeps what it fetched
-/// (`cargo_home`), or else where it is.
-fn crate_place(root: &Path, inside: Option<&Path>, cargo_home: Option<&str>) -> String {
+/// (`cargo_home`), or beside the checkout by the path that reaches it from there (`path =
+/// "../shared"` is one crate wherever the repository is), or else where it is.
+fn crate_place(
+    root: &Path,
+    inside: Option<&Path>,
+    cargo_home: Option<&str>,
+    checkout: &Path,
+) -> String {
     if let Some(inside) = inside {
         return inside.display().to_string();
     }
     let fetched = root.to_str().zip(cargo_home);
-    match fetched
+    if let Some(moved) = fetched
         .and_then(|(root, home)| hir_ty_codegen::moved(root, home, hir_ty_codegen::CARGO_HOME))
     {
-        Some(moved) => moved,
+        return moved;
+    }
+    let beside = root.to_str().zip(checkout.to_str());
+    match beside.and_then(|(root, checkout)| hir_ty_codegen::stored_as(root, checkout)) {
+        Some(beside) => beside,
         None => root.display().to_string(),
     }
 }
@@ -2100,6 +2142,16 @@ fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode)
 /// example of the same name.
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
     let mut found = crates_called(db, krate, args);
+    if !args.library
+        && krate == args.krate
+        && std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && let Some(unit) =
+            crate::compiler_json::source_unit(&crate::compiler_json::read(&args.project)?)?
+    {
+        found.retain(|krate| {
+            ide_db::base_db::Crate::from(*krate).extra_data(db).blaze_native_unit == Some(unit)
+        });
+    }
     if args.library {
         found.retain(|it| ide_db::base_db::Crate::from(*it).data(db).origin.is_lang());
     }
@@ -2331,17 +2383,20 @@ fn load(
         debug: Vec::new(),
         beside,
         scripts_said,
+        macro_generations: FxHashMap::default(),
     };
+    if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
+        checkouts.loaded.set_proc_macro_snapshot_root(Some(cargo::daemon::home()?));
+    }
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs, load_owner(), None, &Sharing::Open)?;
     Ok((db, vfs, checkouts))
 }
 
-/// A file of a checkout that was compared with the one it is in a loaded checkout: the size
-/// and the time of the last write of both, and whether the two were alike. They are not read
-/// again until one is written.
-type Compared = std::sync::Mutex<FxHashMap<PathBuf, ((u64, SystemTime), (u64, SystemTime), bool)>>;
+/// Content digests of a checkout pair and whether they were alike. Bytes are read again
+/// before reusing a comparison: restored metadata is not evidence of unchanged inputs.
+type Compared = std::sync::Mutex<FxHashMap<PathBuf, ([u8; 32], [u8; 32], bool)>>;
 
 /// The checkouts the daemon has loaded.
 struct Checkouts {
@@ -2368,6 +2423,7 @@ struct Checkouts {
     beside: Option<Beside>,
     /// The same of a build of the first checkout that is over, a line of cargo's each.
     scripts_said: Option<Vec<String>>,
+    macro_generations: FxHashMap<PathBuf, macro_inputs::Generation>,
 }
 
 impl Checkouts {
@@ -2513,6 +2569,7 @@ impl Checkouts {
             self.loaded.replace(at, self.split(base, &over, &own));
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
+        self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
     }
 
@@ -2687,7 +2744,7 @@ impl Checkouts {
             // (`env`), and the process whose build started the worker for its first load.
             let build = owner;
             let load_env = env.cloned().unwrap_or_else(scripts::load_env);
-            let (workspace, told, own) = workspace_at(
+            let (workspace, told, own, generation) = workspace_at(
                 project,
                 &self.cargo_config,
                 &self.load_config,
@@ -2698,9 +2755,8 @@ impl Checkouts {
                 Some((&load_env, build)),
             )?;
             debug.push(told);
-            // The checkouts after the first run their build scripts where the first did. A
-            // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
-            // crate for all.
+            // Non-producer workspaces retain the existing shared script target. Producer
+            // workspaces select and lease their own content generation in workspace_at.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
                 && !matches!(
                     self.cargo_config.target_dir_config,
@@ -2714,6 +2770,9 @@ impl Checkouts {
                 );
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
+            if let Some(generation) = generation {
+                self.macro_generations.insert(root.clone(), generation);
+            }
             world.extend(own.iter().flat_map(|it| it.world.iter().cloned()));
             watched.push((root.clone(), workspace.clone(), self.cargo_config.clone(), build, own));
             roots.push((dunce::canonicalize(project)?, root));
@@ -2725,10 +2784,13 @@ impl Checkouts {
         world.sort();
         world.dedup();
         let _reading = scripts::pin(owner, &world).map_err(anyhow::Error::new)?;
+        self.loaded.set_proc_macro_env(self.macro_env());
+        self.refresh_macro_image_identities();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         for (root, workspace, config, build, own) in watched {
             self.inputs.watch(&root, &workspace, &config, &FxHashMap::default(), build, own);
         }
+        self.collect_macro_generations();
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
@@ -2832,8 +2894,9 @@ impl Checkouts {
         for &at in stale {
             loaded.push(self.loaded_again(at, env, build)?);
         }
-        for (&at, (workspace, debug, config, given, own)) in stale.iter().zip(loaded) {
-            self.place(at, workspace, debug, &config, &given, build, own);
+        self.loaded.set_proc_macro_env(self.macro_env());
+        for (&at, (workspace, debug, config, given, own, generation)) in stale.iter().zip(loaded) {
+            self.place(at, workspace, debug, &config, &given, build, own, generation);
         }
         pause_mid_reload();
         let mut failed = Ok(());
@@ -2845,8 +2908,8 @@ impl Checkouts {
             let over = self.roots[at].1.clone();
             if !self.builds_alike(&self.roots[base].1, &over) {
                 match self.loaded_again(at, env, build) {
-                    Ok((workspace, debug, config, given, own)) => {
-                        self.place(at, workspace, debug, &config, &given, build, own);
+                    Ok((workspace, debug, config, given, own, generation)) => {
+                        self.place(at, workspace, debug, &config, &given, build, own, generation);
                         continue;
                     }
                     // Not the fallback: it is a world nothing was loaded from. This one stays
@@ -2863,8 +2926,63 @@ impl Checkouts {
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
             self.debug[at] = self.debug[base];
         }
+        self.refresh_macro_image_identities();
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.collect_macro_generations();
         failed
+    }
+
+    /// The variables the proc-macro servers of a load for the request this thread serves
+    /// start with: its complete snapshot over the daemon's, not those of a process that asked
+    /// before, so one it has not is removed and a value that is not Unicode is its own. Not the
+    /// cargo configuration's: those are for the commands cargo runs (and name this machine's
+    /// own server), which no server reads, and a kept expansion is keyed on these.
+    fn macro_env(&self) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+        inputs::server_env(&process::native())
+    }
+
+    /// Has the expanders of the database expand with the variables of the request this
+    /// thread serves ([`Self::macro_env`]) when the servers have others: an edit of a macro's
+    /// caller alone makes nothing stale, and its new expansion must not read the variables of
+    /// the request before it. Every library is loaded again, into servers that have this
+    /// request's, and the database is given those expanders. `false` when they had them.
+    fn refresh_macro_env(
+        &mut self,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<bool> {
+        if !self.loaded.set_proc_macro_env(self.macro_env()) || self.loaded.workspaces().is_empty()
+        {
+            return Ok(false);
+        }
+        eprintln!("macros: the request's variables differ from the servers', loading them again");
+        self.refresh_macro_image_identities();
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.collect_macro_generations();
+        Ok(true)
+    }
+
+    fn collect_macro_generations(&self) {
+        for generation in self.macro_generations.values() {
+            match generation.collect() {
+                Ok(removed) if !removed.is_empty() => {
+                    eprintln!("macro producers: collected {} retired generations", removed.len())
+                }
+                Err(error) => eprintln!("macro producers: collection deferred: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn refresh_macro_image_identities(&mut self) {
+        let images = self
+            .macro_generations
+            .values()
+            .filter_map(|generation| generation.artifacts.as_ref())
+            .flat_map(|artifacts| artifacts.libraries.iter())
+            .map(|(path, content)| (AbsPathBuf::assert_utf8(path.clone()), *content))
+            .collect();
+        self.loaded.set_proc_macro_image_identities(images);
     }
 
     /// The workspace of the checkout at `at` as cargo has it now for a process with the
@@ -2881,6 +2999,7 @@ impl Checkouts {
         CargoConfig,
         FxHashMap<String, Option<String>>,
         Option<scripts::Own>,
+        Option<macro_inputs::Generation>,
     )> {
         let (project, root) = self.roots[at].clone();
         let mut config = self.cargo_config.clone();
@@ -2893,7 +3012,7 @@ impl Checkouts {
         };
         let asked: BTreeMap<String, String> =
             env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
-        let (workspace, debug, own) = workspace_at(
+        let (workspace, debug, own, generation) = workspace_at(
             &project,
             &config,
             &self.load_config,
@@ -2909,7 +3028,7 @@ impl Checkouts {
             }
             own
         });
-        Ok((workspace, debug, config, given, own))
+        Ok((workspace, debug, config, given, own, generation))
     }
 
     /// Has the checkout at `at` be `workspace`, loaded in full with `config`, of which `given`
@@ -2923,8 +3042,13 @@ impl Checkouts {
         given: &FxHashMap<String, Option<String>>,
         build: u64,
         own: Option<scripts::Own>,
+        generation: Option<macro_inputs::Generation>,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
+        self.macro_generations.remove(&root);
+        if let Some(generation) = generation {
+            self.macro_generations.insert(root.clone(), generation);
+        }
         self.unloaded.remove(&at);
         self.inputs.watch(&root, &workspace, config, given, build, own);
         self.loaded.replace(at, workspace);
@@ -2994,6 +3118,7 @@ fn package_alike(
     nested: &FxHashSet<&Path>,
     compared: &Compared,
 ) -> bool {
+    use sha2::Digest as _;
     let Ok(inside) = dir.strip_prefix(base) else { return true };
     let theirs = over.join(inside);
     let skipped = |inside: &Path, name: &std::ffi::OsStr| {
@@ -3004,7 +3129,10 @@ fn package_alike(
     let names = |inside: &Path| {
         let mut names: Vec<_> = std::fs::read_dir(inside)
             .ok()?
-            .filter_map(|it| Some(it.ok()?.file_name()))
+            .map(|it| it.map(|it| it.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .ok()?
+            .into_iter()
             .filter(|name| !skipped(inside, name))
             .collect();
         names.sort_unstable();
@@ -3017,32 +3145,26 @@ fn package_alike(
             if path.is_dir() {
                 return package_alike(&path, base, over, nested, compared);
             }
-            let written = |path: &Path| {
-                let file = std::fs::metadata(path).ok()?;
-                Some((file.len(), file.modified().ok()?))
-            };
-            let (Some(ours), Some(theirs)) = (written(&path), written(&their)) else {
+            let (Ok(our_bytes), Ok(their_bytes)) = (std::fs::read(&path), std::fs::read(&their))
+            else {
                 return false;
             };
-            if ours.0 != theirs.0 {
+            if our_bytes.len() != their_bytes.len() {
                 return false;
             }
+            let ours: [u8; 32] = sha2::Sha256::digest(&our_bytes).into();
+            let theirs: [u8; 32] = sha2::Sha256::digest(&their_bytes).into();
             let known = compared.lock().unwrap_or_else(|e| e.into_inner()).get(&their).copied();
             if let Some((_, _, alike)) = known.filter(|it| (it.0, it.1) == (ours, theirs)) {
                 return alike;
             }
-            let alike = match (std::fs::read(&path), std::fs::read(&their)) {
-                (Ok(ours), Ok(theirs)) => {
-                    // Code that asks where its package is does not say the same in two
-                    // checkouts.
-                    let asks = path.extension().is_some_and(|it| it == "rs")
-                        && memchr::memmem::find_iter(&ours, b"env!(").any(|at| {
-                            ours[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
-                        });
-                    ours == theirs && !asks
-                }
-                _ => false,
-            };
+            // Content, not metadata, determines whether the cached comparison
+            // remains applicable after an equal-size/restored-mtime edit.
+            let asks = path.extension().is_some_and(|it| it == "rs")
+                && memchr::memmem::find_iter(&our_bytes, b"env!(").any(|at| {
+                    our_bytes[at + 5..].trim_ascii_start().starts_with(b"\"CARGO_MANIFEST_DIR\"")
+                });
+            let alike = our_bytes == their_bytes && !asks;
             compared.lock().unwrap_or_else(|e| e.into_inner()).insert(their, (ours, theirs, alike));
             alike
         })
@@ -3053,8 +3175,11 @@ fn package_alike(
 fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
     let Ok(inside) = dir.strip_prefix(base) else { return true };
     let names = |dir: &Path| {
-        let mut names: Vec<_> =
-            std::fs::read_dir(dir).ok()?.filter_map(|it| Some(it.ok()?.file_name())).collect();
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .ok()?
+            .map(|it| it.map(|it| it.file_name()))
+            .collect::<std::io::Result<_>>()
+            .ok()?;
         names.sort_unstable();
         Some(names)
     };
@@ -3066,7 +3191,10 @@ fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
             if path.is_dir() {
                 tree_alike(&path, base, over)
             } else {
-                std::fs::read(&path).ok() == std::fs::read(theirs.join(name)).ok()
+                match (std::fs::read(&path), std::fs::read(theirs.join(name))) {
+                    (Ok(ours), Ok(theirs)) => ours == theirs,
+                    _ => false,
+                }
             }
         })
 }
@@ -3219,10 +3347,36 @@ fn workspace_at(
     said: Option<Vec<String>>,
     ready: Option<WorkspaceBuildScripts>,
     asked: Option<(&BTreeMap<String, String>, u64)>,
-) -> anyhow::Result<(ProjectWorkspace, plan::Whole, Option<scripts::Own>)> {
+) -> anyhow::Result<(
+    ProjectWorkspace,
+    plan::Whole,
+    Option<scripts::Own>,
+    Option<macro_inputs::Generation>,
+)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
-    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut config = cargo_config.clone();
+    let mut workspace = if std::env::var_os("RA_JIT_PROJECT_STDIN").is_some()
+        && matches!(manifest, ProjectManifest::ProjectJson(_))
+    {
+        let private = crate::compiler_json::read(project)?;
+        crate::compiler_json::install_native(&private)?;
+        let source_root = crate::compiler_json::source_root(&private)?;
+        let data: project_model::ProjectJsonData = serde_json::from_value(private)
+            .map_err(|_| anyhow::anyhow!("invalid owned project transport"))?;
+        let json = project_model::ProjectJson::new(
+            Some(manifest.manifest_path().to_owned()),
+            source_root.as_deref().unwrap_or_else(|| manifest.manifest_path().parent()),
+            data,
+        );
+        ProjectWorkspace::load_inline(json, &config, &|_| {})?
+    } else {
+        ProjectWorkspace::load(manifest.clone(), &config, &|_| {})?
+    };
+    // Discover the actual producer closure on both cold and reload paths before
+    // choosing the existing compile-time producer operation's output directory.
+    let mut generation = macro_inputs::Generation::prepare(&workspace, &mut config)?;
+    let cargo_config = &config;
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
@@ -3250,41 +3404,38 @@ fn workspace_at(
             &cargo_config.extra_env,
         )?;
         let triple = triple.first().context("no target to build for")?;
-        let plan_asked =
-            plan::Asked { triple, cfg: &workspace.rustc_cfg, env: &cargo_config.extra_env };
-        let whole = scripts::own();
-        let plan = match whole {
-            // The whole build asks no cargo for its plan either.
-            true => {
-                plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?
-            }
-            false => plan::Plan::of(manifest.manifest_path().as_ref(), selection, &plan_asked)?,
+        let plan_asked = plan::Asked {
+            sysroot: workspace
+                .sysroot
+                .root()
+                .context("owned planner has no source toolchain")?
+                .as_ref(),
+            triple,
+            cfg: &workspace.rustc_cfg,
+            env: &cargo_config.extra_env,
         };
+        let whole = scripts::own();
+        let plan =
+            plan::Plan::own(cargo, manifest.manifest_path().as_ref(), selection, &plan_asked)?;
         debug = plan.whole()?;
         let mut sources = cargo.sources().to_vec();
         sources.extend_from_slice(plan.sources());
         cargo.set_sources(sources);
         let packages: Vec<_> = cargo.packages().collect();
-        // A proc macro of the build is still built by cargo's check of the load (step J), which
-        // then runs the scripts too: blaze runs them where the build has none.
-        let built = |it: &&project_model::Package| plan.package(&cargo[**it].id.repr).is_some();
-        let is_macro = |it: &&project_model::Package| {
-            cargo[**it].targets.iter().any(|&target| {
-                matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
-            })
-        };
-        let proc_macro = packages.iter().filter(built).find(is_macro);
-        if whole && let Some(found) = proc_macro {
-            eprintln!(
-                "build scripts: the build has the proc macro `{}`, which blaze does not build \
-                 without cargo's check yet (no-rustc step J): the check runs the scripts",
-                cargo[*found].name
+        if whole || (beside.is_none() && said.is_none()) {
+            let mut env = asked.map(|it| it.0.clone()).unwrap_or_else(|| process::vars().collect());
+            let producer_dir = cargo.target_directory().join("blaze-owned-producers");
+            std::fs::create_dir_all(&producer_dir)?;
+            let probe = producer_dir.join("producer-rustc");
+            crate::answers::producer_launcher(probe.as_ref())?;
+            env.insert("RUSTC".into(), probe.to_string());
+            env.insert("RUSTDOC".into(), probe.to_string());
+            env.remove("RUSTC_WRAPPER");
+            env.remove("RUSTC_WORKSPACE_WRAPPER");
+            env.insert(
+                "BLAZE_PRODUCER_PROBE_FAILURE".into(),
+                producer_dir.join("unsupported-probe").to_string(),
             );
-        }
-        if whole
-            && proc_macro.is_none()
-            && let Some((env, _)) = asked
-        {
             let host = project_model::toolchain_info::target_tuple::get(
                 project_model::toolchain_info::QueryConfig::Rustc(&workspace.sysroot, dir.as_ref()),
                 None,
@@ -3292,7 +3443,8 @@ fn workspace_at(
             )?;
             let ids = packages.iter().map(|&it| &cargo[it].id.repr);
             own = Some(scripts::Own {
-                env: env.clone(),
+                env,
+                native_env: process::native(),
                 profile: selection.profile.clone(),
                 config: selection.config.clone(),
                 host: host.first().context("no host to run build scripts on")?.clone(),
@@ -3301,7 +3453,9 @@ fn workspace_at(
                 packages: ids
                     .filter_map(|id| plan.package(id).map(|it| (id.clone(), it.for_target)))
                     .collect(),
+                host_cargo: plan.host_cargo().cloned(),
                 world: Vec::new(),
+                images: Vec::new(),
             });
         }
         if let Some(beside) = beside {
@@ -3311,6 +3465,10 @@ fn workspace_at(
             // is what the crates that need no more are read with.
             let (lines, _) = beside.said.so_far();
             beside.applied = lines.len();
+            let artifacts = macro_inputs::validate_artifacts(project, selection, &lines)?;
+            if let Some(generation) = &mut generation {
+                generation.artifacts = artifacts;
+            }
             scripts =
                 Some(WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str)));
         }
@@ -3339,26 +3497,29 @@ fn workspace_at(
             // Cargo's build that is over said it all: the scripts it ran said what they did,
             // and it built the proc macros where they are.
             (None, ProjectWorkspaceKind::Cargo { cargo, .. }, Some(said)) => {
+                let artifacts = macro_inputs::validate_artifacts(project, selection, &said)?;
+                if let Some(generation) = &mut generation {
+                    generation.artifacts = artifacts;
+                }
                 WorkspaceBuildScripts::of_messages(cargo, said.iter().map(String::as_str))
             }
             // The whole build's scripts are blaze's to compile and run, with no cargo.
             (None, _, _) if own.is_some() => {
                 let ask = own.as_ref().expect("the whole build's ask");
                 let build = asked.map_or(0, |it| it.1);
-                let (said, world) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
+                let (said, world, images) = scripts::run(&workspace, &ask.asked(&ask.env, build))?;
                 if let Some(own) = own.as_mut() {
                     own.world = world;
+                    // The images are loaded after this pass, by the database's proc-macro
+                    // client: the load holds them until it has, and while it serves them.
+                    own.images = images;
                 }
                 said
             }
-            (None, kind, _) => {
-                if let ProjectWorkspaceKind::Cargo { cargo, .. } = kind
-                    && cargo_config.target_dir_config == TargetDirectoryConfig::UseSubdirectory
-                {
-                    seed_own_target(cargo.target_directory().as_ref());
-                }
-                workspace.run_build_scripts(cargo_config, &|_| {})?
+            (None, ProjectWorkspaceKind::Cargo { .. }, _) => {
+                anyhow::bail!("owned producer scheduling was not established for this load")
             }
+            (None, _, _) => WorkspaceBuildScripts::default(),
         };
         // A crate whose script did not run is read without what it writes: thiserror's
         // `include!` of its `OUT_DIR` then leaves every derived `Error` unimplemented, and a
@@ -3368,7 +3529,7 @@ fn workspace_at(
         }
         workspace.set_build_scripts(build_scripts);
     }
-    Ok((workspace, debug, own))
+    Ok((workspace, debug, own, generation))
 }
 
 /// Starts ra-jit's own target directory from what cargo built in `target`, so that the build
@@ -3710,7 +3871,7 @@ struct ListedCrate {
     main: Option<FunctionId>,
 }
 
-fn is_bodiless_intrinsic(db: &RootDatabase, id: FunctionId) -> bool {
+fn is_bodiless_intrinsic(db: &dyn HirDatabase, id: FunctionId) -> bool {
     let signature = hir_def::signatures::FunctionSignature::of(db, id);
     signature.flags.contains(hir_def::signatures::FnFlags::RUSTC_INTRINSIC) && !signature.has_body()
 }
@@ -4039,6 +4200,44 @@ impl Listed {
     }
 }
 
+use hir::input_owners::{current_input_paths, discover_current_inputs};
+
+/// The common path reads tracked observations only. Current-owner discovery is
+/// needed to disambiguate live from obsolete reads only when something is missing.
+fn missing_required_input(
+    observations: Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)>,
+    current: impl FnOnce() -> Vec<AbsPathBuf>,
+) -> Option<AbsPathBuf> {
+    let missing: Vec<_> = observations
+        .into_iter()
+        .filter_map(|(path, bytes)| bytes.is_none().then_some(path))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let required = current();
+    missing.into_iter().find(|path| required.contains(path))
+}
+
+fn missing_input_of(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Option<AbsPathBuf> {
+    missing_required_input(db.included_by(krate), || current_input_paths(db, krate))
+}
+
+fn prepare_changed_input_owners(db: &RootDatabase, files: &[vfs::FileId]) {
+    let mut crates: FxHashSet<_> = files
+        .iter()
+        .flat_map(|&file| ide_db::base_db::relevant_crates(db, file).iter().copied())
+        .collect();
+    for krate in crates.clone() {
+        crates.extend(krate.transitive_rev_deps(db));
+    }
+    for krate in crates {
+        // The tracked discovery query observes source/cfg/macro inputs and covers
+        // every expression owner. Untouched builds never enter this preparation.
+        discover_current_inputs(db, krate);
+    }
+}
+
 fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
     let start = Instant::now();
     // The first thing asked of a crate after an edit: name resolution is redone here.
@@ -4346,7 +4545,7 @@ struct Declared {
 }
 
 impl Declared {
-    fn in_modules(&mut self, db: &RootDatabase, krate: Crate) {
+    fn in_modules(&mut self, db: &dyn HirDatabase, krate: Crate) {
         let mut modules: Vec<Module> = vec![krate.root_module(db)];
         while let Some(module) = modules.pop() {
             modules.extend(module.children(db));
@@ -4355,8 +4554,45 @@ impl Declared {
         }
     }
 
-    fn in_scope(&mut self, db: &RootDatabase, scope: &ItemScope) {
+    fn in_scope(&mut self, db: &dyn HirDatabase, scope: &ItemScope) {
         for def in scope.declarations() {
+            // Input discovery must cover all three ExpressionStoreOwnerId families:
+            // bodies (including discriminants), signatures (generic defaults, array
+            // lengths/type const arguments), and ADT fields. Lowering just callable
+            // bodies leaves lazy const expressions out of content identities.
+            let generic = match def {
+                ModuleDefId::FunctionId(id) => Some(id.into()),
+                ModuleDefId::ConstId(id) => Some(id.into()),
+                ModuleDefId::StaticId(id) => Some(id.into()),
+                ModuleDefId::AdtId(id) => Some(id.into()),
+                ModuleDefId::TraitId(id) => Some(id.into()),
+                ModuleDefId::TypeAliasId(id) => Some(id.into()),
+                _ => None,
+            };
+            if let Some(generic) = generic {
+                self.signature(db, generic);
+            }
+            if let ModuleDefId::AdtId(adt) = def {
+                match adt {
+                    hir_def::AdtId::EnumId(id) => {
+                        for &(variant, _) in id.enum_variants(db).variants.values() {
+                            self.body(variant.into());
+                            self.expression_store(
+                                db,
+                                hir_def::ExpressionStoreOwnerId::VariantFields(variant.into()),
+                            );
+                        }
+                    }
+                    other => {
+                        self.expression_store(
+                            db,
+                            hir_def::ExpressionStoreOwnerId::VariantFields(
+                                hir_def::VariantId::from_non_enum(other).unwrap(),
+                            ),
+                        );
+                    }
+                }
+            }
             match def {
                 // A function declared in an `extern` block has no body to compile, nor has an
                 // intrinsic declared without one: every call to it is the compiler's own code.
@@ -4376,8 +4612,9 @@ impl Declared {
                         match item {
                             AssocItemId::FunctionId(id) => self.provided.push(id.into()),
                             AssocItemId::ConstId(id) => self.provided.push(id.into()),
-                            AssocItemId::TypeAliasId(_) => {}
+                            AssocItemId::TypeAliasId(id) => self.signature(db, id.into()),
                         }
+                        self.signature(db, item.into());
                     }
                 }
                 _ => {}
@@ -4387,12 +4624,27 @@ impl Declared {
             self.body(id.into());
         }
         for imp in scope.impls() {
+            self.signature(db, imp.into());
             for &(_, item) in imp.impl_items(db).items.iter() {
+                self.signature(db, item.into());
                 match item {
                     AssocItemId::FunctionId(id) => self.function(id),
                     AssocItemId::ConstId(id) => self.body(id.into()),
                     AssocItemId::TypeAliasId(_) => {}
                 }
+            }
+        }
+    }
+
+    fn signature(&mut self, db: &dyn HirDatabase, id: hir_def::GenericDefId) {
+        self.expression_store(db, hir_def::ExpressionStoreOwnerId::Signature(id));
+    }
+
+    fn expression_store(&mut self, db: &dyn HirDatabase, owner: hir_def::ExpressionStoreOwnerId) {
+        let store = hir_def::expr_store::ExpressionStore::of(db, owner);
+        for (_, def_map) in store.blocks(db) {
+            for (_, module) in def_map.modules(db) {
+                self.in_scope(db, module.scope(db));
             }
         }
     }
@@ -4741,7 +4993,7 @@ fn write_dep_info(
     path: &Path,
 ) -> anyhow::Result<()> {
     let krates = crates_named(db, &args.krate, args)?;
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, false)
 }
 
 /// Writes to `path` the dep-info of every crate `exe` links but those of the standard library:
@@ -4766,7 +5018,7 @@ fn write_inputs(
             krates.push(krate);
         }
     }
-    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path)
+    write_dep_info_of(db, &krates, &args.krate, vfs, exe, path, true)
 }
 
 /// The dep-info of `krates`, the files of their modules and what `include!` and its kin read,
@@ -4775,53 +5027,33 @@ fn write_dep_info_of(
     db: &RootDatabase,
     krates: &[Crate],
     asked: &str,
-    vfs: &vfs::Vfs,
+    _vfs: &vfs::Vfs,
     exe: &Path,
     path: &Path,
+    private: bool,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    for &krate in krates {
-        let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
-        files.extend(modules.map(|it| it.original_file(db).file_id(db)));
-        let included = hir_def::include_macro_invoc(db, krate.into()).iter();
-        files.extend(included.map(|(_, file)| file.file_id(db)));
+    let dep_info::DepInfo { files: paths, env } =
+        dep_info::DepInfo::from_crates(db, krates, asked)?;
+    if private && let Some(key) = dep_info::installed_replay_key() {
+        let inputs = dep_info::DepInfo { files: paths, env };
+        let trace = dep_info::ReplayTrace::from_inputs(&inputs, key);
+        return std::fs::write(path, trace.encode())
+            .with_context(|| format!("writing {}", path.display()));
     }
-    let named = |id: &vfs::FileId| Some(vfs.file_path(*id).as_path()?.to_string());
-    let mut paths: Vec<String> = Vec::new();
-    // What `include_str!` and `include_bytes!` read from outside the VFS, as rustc names it.
-    let read = krates.iter().flat_map(|it| db.included_by((*it).into()));
-    let read: Vec<String> = read.map(|(path, _)| path.to_string()).collect();
-    for path in files.iter().filter_map(named).chain(read) {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    anyhow::ensure!(!paths.is_empty(), "no file of `{asked}` was loaded");
     let escaped: Vec<String> = paths.iter().map(|it| dep_info::escaped(it)).collect();
     let target = dep_info::escaped(&exe.display().to_string());
     let mut text = format!("{target}: {}\n\n", escaped.join(" "));
     for file in &escaped {
         text += &format!("{file}:\n");
     }
-    // The variables `env!` and `option_env!` read, with what each was, so that cargo builds
-    // again when one changes.
-    let mut env: Vec<(String, Option<String>)> = db
-        .env_read()
-        .into_iter()
-        .filter(|(krate, _)| krates.iter().any(|it| ide_db::base_db::Crate::from(*it) == *krate))
-        .map(|(krate, key)| {
-            let value = krate.env(db).get(&key);
-            let value = value.or_else(|| ide_db::base_db::process_env_var(db, &key));
-            (key, value)
-        })
-        .collect();
-    env.sort_unstable();
-    env.dedup();
+    // Ordinary Cargo dep-info carries source-observed values; private producer
+    // identities use keyed values below.
     if !env.is_empty() {
         text.push('\n');
     }
-    for (key, value) in env {
+    for (key, value) in &env {
         let key = dep_info::escaped_variable(&key);
+        let value = if private { env_identity::value(value.as_deref())? } else { value.clone() };
         match value {
             Some(value) => {
                 text += &format!("# env-dep:{key}={}\n", dep_info::escaped_variable(&value))
@@ -5770,21 +6002,36 @@ fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     built
 }
 
-/// The variables of the process the build is for that `env!` and `option_env!` in `krate` have
-/// asked for and that are set, sorted. Those the crate's own variables answer are not asked of
-/// the process.
-fn process_reads(db: &RootDatabase, krate: ide_db::base_db::Crate) -> Vec<(String, String)> {
+/// Effective values observed by `env!` and `option_env!`, including authoritative
+/// crate overlays. Missing and non-Unicode inputs must not alias an empty string.
+fn environment_reads(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+) -> content::EnvironmentReads {
+    use content::EnvironmentValue;
     let env = krate.env(db);
-    let mut reads: Vec<(String, String)> = db
+    let mut reads: Vec<_> = db
         .env_read()
         .into_iter()
-        .filter(|(of, key)| *of == krate && !env.contains_key(key))
-        .filter_map(|(_, key)| {
-            let value = ide_db::base_db::process_env_var(db, &key)?;
-            Some((key, value))
+        .filter(|(of, _)| *of == krate)
+        .map(|(_, key)| {
+            let (value, non_unicode) = if env.contains_key(&key) {
+                (env.get(&key), env.is_non_unicode(&key))
+            } else {
+                (
+                    ide_db::base_db::process_env_var(db, &key),
+                    ide_db::base_db::process_env_is_non_unicode(db, &key),
+                )
+            };
+            let value = match (value, non_unicode) {
+                (_, true) => EnvironmentValue::NonUnicode,
+                (Some(value), false) => EnvironmentValue::Text(value),
+                (None, false) => EnvironmentValue::Unset,
+            };
+            (key, value)
         })
         .collect();
-    reads.sort_unstable();
+    reads.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     reads
 }
 
@@ -5889,6 +6136,12 @@ fn selected(args: &Args) -> Vec<String> {
     for config in &selection.config {
         selected.extend(["--config".to_owned(), config.clone()]);
     }
+    if selection.locked {
+        selected.push("--locked".to_owned());
+    }
+    if selection.offline {
+        selected.push("--offline".to_owned());
+    }
     selected
 }
 
@@ -5902,7 +6155,10 @@ fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// What cargo said of every crate when the checkouts were last loaded.
-struct CratesAsLoaded(FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>);
+struct CratesAsLoaded {
+    crates: FxHashMap<ide_db::base_db::Crate, CrateAsLoaded>,
+    macros: FxHashMap<ide_db::base_db::Crate, triomphe::Arc<hir::CrateProcMacros>>,
+}
 
 type CrateAsLoaded = (
     ide_db::base_db::BuiltCrateData,
@@ -5914,7 +6170,13 @@ type CrateAsLoaded = (
 impl CratesAsLoaded {
     fn of(db: &RootDatabase) -> CratesAsLoaded {
         let crates = ide_db::base_db::all_crates(db);
-        CratesAsLoaded(crates.iter().map(|&it| (it, Self::said(db, it))).collect())
+        let macros = hir::ProcMacros::try_get(db)
+            .map(|macros| macros.by_crate(db).clone())
+            .unwrap_or_default();
+        CratesAsLoaded {
+            crates: crates.iter().map(|&it| (it, Self::said(db, it))).collect(),
+            macros,
+        }
     }
 
     fn said(db: &RootDatabase, krate: ide_db::base_db::Crate) -> CrateAsLoaded {
@@ -5929,8 +6191,23 @@ impl CratesAsLoaded {
     /// The crates of `db` that cargo says something else of now, or that were not there.
     fn changed(&self, db: &RootDatabase) -> Vec<ide_db::base_db::Crate> {
         let crates = ide_db::base_db::all_crates(db);
-        let same = |krate| self.0.get(&krate).is_some_and(|was| *was == Self::said(db, krate));
-        crates.iter().copied().filter(|&it| !same(it)).collect()
+        let now = hir::ProcMacros::try_get(db)
+            .map(|macros| macros.by_crate(db).clone())
+            .unwrap_or_default();
+        let mut changed: FxHashSet<_> = crates
+            .iter()
+            .copied()
+            .filter(|&krate| {
+                !self.crates.get(&krate).is_some_and(|was| *was == Self::said(db, krate))
+                    || self.macros.get(&krate) != now.get(&krate)
+            })
+            .collect();
+        // A changed macro generation is an input change of its expansion users,
+        // even though cargo's crate description has not changed.
+        for krate in changed.clone() {
+            changed.extend(krate.transitive_rev_deps(db));
+        }
+        changed.into_iter().collect()
     }
 }
 
@@ -6114,7 +6391,7 @@ fn unparsed(
         if let Some(error) = parse.errors().first() {
             let text = db.file_text(file).text(db);
             // A file that is included where an expression goes is not one of items.
-            if syntax::ast::Expr::parse(text, edition).errors().is_empty() {
+            if check::expression_input(text, edition) {
                 continue;
             }
             let range = syntax::TextRange::empty(error.range().start());
@@ -6186,6 +6463,19 @@ fn broken_in(
     within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
     lints: bool,
 ) -> Option<errors::Said> {
+    broken_in_except(db, edited, watched, root, within, lints, &[])
+}
+
+/// [`broken_in`], but for the errors whose codes are `except`.
+fn broken_in_except(
+    db: &RootDatabase,
+    edited: &[vfs::FileId],
+    watched: &Sources,
+    root: &Path,
+    within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
+    lints: bool,
+    except: &[&str],
+) -> Option<errors::Said> {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let refuse_borrowck = std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0");
@@ -6232,6 +6522,7 @@ fn broken_in(
                                     let expanded =
                                         it.main_node.is_some_and(|it| it.file_id.is_macro());
                                     it.severity == ide_db::Severity::Error
+                                        && !except.contains(&code)
                                         && (SURE.contains(&code)
                                             || refuse_borrowck && BORROWCK.contains(&code)
                                             || lints
@@ -6435,6 +6726,9 @@ impl WatchedFile {
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
                 mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
             });
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!("included-watch: registered {path}");
+            }
             changed |= db.reload_included_file(&path);
         }
         changed
@@ -6832,6 +7126,7 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    native_env: process::Native,
     /// The build of the daemon's the request is for: a build is one request to the daemon and
     /// may be several to a worker. A request that names none has a number of its own
     /// ([`Client::of`]), which it holds the output of the scripts under until it is dropped.
@@ -6855,6 +7150,7 @@ impl Client {
             0 => Client {
                 stream,
                 env,
+                native_env: process::native(),
                 build: scripts::anonymous(),
                 own_build: true,
                 pin: None,
@@ -6864,6 +7160,7 @@ impl Client {
             build => Client {
                 stream,
                 env,
+                native_env: process::native(),
                 build,
                 own_build: false,
                 pin: None,
@@ -7469,7 +7766,7 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
     let mut stream =
         socket::connect(socket).with_context(|| format!("no daemon at {}", socket.display()))?;
     let target = target.map(|it| it.fields()).unwrap_or_default();
-    let env = process::encode(&process::own());
+    let env = process::encode_native(&process::native(), 0);
     stream.write_all(format!("{}{target}\n{env}\n", request.name()).as_bytes())?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
@@ -7552,6 +7849,14 @@ fn requested(stream: UnixStream) -> Option<Event> {
             return None;
         }
     };
+    let (native_env, build) = match process::decode_native(&env) {
+        Ok(env) => env,
+        Err(why) => {
+            let _ = writeln!(&stream, "failed: {why}");
+            return None;
+        }
+    };
+    let _native = process::enter_native(native_env.clone());
     trace::arrived();
     let (name, rest) = request.split_once('\t').unwrap_or((&request, ""));
     eprintln!("request: {name} at_us={}", live::epoch_us());
@@ -7573,7 +7878,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let (env, build) = process::decode_request(&env);
+        let env = native_env.unicode();
         let client = Client::of(stream, env, build);
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
@@ -7582,7 +7887,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let (env, build) = process::decode_request(&env);
+        let env = native_env.unicode();
         let client = Client::of(stream, env, build);
         return Some(Event::Asked((request, target, client)));
     }
@@ -7738,9 +8043,21 @@ fn main() -> anyhow::Result<()> {
         return cargo::script::command(std::env::args_os().skip(2));
     }
     match std::env::args().nth(1).as_deref() {
+        Some("producer-rustc") => {
+            return answers::producer_probe(std::env::args_os().skip(2).collect());
+        }
         Some("rustc-wrapper") => return cargo::wrapper::command(std::env::args_os().skip(2)),
         Some(cargo::own_macro::COMMAND) => {
             return cargo::own_macro::command(std::env::args_os().skip(2));
+        }
+        Some(cargo::own_macro::SOURCE_COMMAND) => {
+            return cargo::own_macro::source_command(std::env::args_os().skip(2));
+        }
+        Some(cargo::producer_plan::COMMAND) => {
+            return cargo::producer_plan::command(std::env::args_os().skip(2), false);
+        }
+        Some(cargo::producer_plan::BUILD_COMMAND) => {
+            return cargo::producer_plan::command(std::env::args_os().skip(2), true);
         }
         Some("cargo") => return cargo::command(std::env::args().skip(2)),
         Some("enable" | "disable" | "status" | "stop") => {
@@ -7753,6 +8070,16 @@ fn main() -> anyhow::Result<()> {
         let dir = std::env::args().nth(2).context("--spare needs a directory")?;
         trace::install();
         return spare(Path::new(&dir));
+    }
+    // Read exactly one load line before end_with_input can consume stdin. Keep it
+    // for scripts::load_env and run_holding, whose load happens later.
+    if std::env::var_os(cargo::daemon::LOAD_ENV).is_some() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let (env, _) = process::decode_native(line.trim_end()).map_err(anyhow::Error::msg)?;
+        scripts::set_load_env(env);
+        // SAFETY: the worker has not started any thread yet.
+        unsafe { std::env::remove_var(cargo::daemon::LOAD_ENV) };
     }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);
@@ -7954,9 +8281,17 @@ fn cargo_config(args: &Args) -> CargoConfig {
 
 /// How a workspace is loaded, whichever it is.
 fn load_config() -> LoadCargoConfig {
+    let disabled = matches!(
+        std::env::var_os(cargo::own_macro::SERVER).as_deref().and_then(|it| it.to_str()),
+        Some("0" | "off")
+    );
     LoadCargoConfig {
         load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+        with_proc_macro_server: if disabled {
+            ProcMacroServerChoice::None
+        } else {
+            ProcMacroServerChoice::Sysroot
+        },
         prefill_caches: false,
         num_worker_threads: 1,
         proc_macro_processes: 1,
@@ -8057,6 +8392,10 @@ impl Held {
 pub(crate) struct Told {
     pub(crate) args: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) native_env: Option<process::Native>,
+    #[serde(default)]
+    pub(crate) load_env: Option<process::Native>,
     pub(crate) cwd: PathBuf,
     /// The build is one cargo has only started: these are the workspace and its crates, and
     /// what cargo wrote is in the arguments of the line that follows.
@@ -8318,11 +8657,22 @@ fn follow_cargo(
         let (now, all) = beside.ready(cargo, &lines);
         let all = all || ended;
         if lines.len() > beside.applied && (now != ready || all && !all_applied) {
+            let artifacts = macro_inputs::validate_artifacts(
+                &checkouts.roots[beside.at].0,
+                &checkouts.selection,
+                &lines,
+            )?;
+            if let Some(generation) =
+                checkouts.macro_generations.get_mut(&checkouts.roots[beside.at].1)
+            {
+                generation.artifacts = artifacts;
+            }
             let scripts =
                 WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
             let mut workspace = workspace.clone();
             workspace.set_build_scripts(scripts);
             checkouts.loaded.replace(beside.at, workspace);
+            checkouts.refresh_macro_image_identities();
             let Checkouts { loaded, cargo_config, load_config, .. } = checkouts;
             loaded.add(Vec::new(), &cargo_config.extra_env, load_config, vfs, db)?;
             beside.applied = lines.len();
@@ -8385,6 +8735,20 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
     let held = Held::load(dir).inspect_err(|why| eprintln!("spare: nothing held: {why:#}")).ok();
     let Some(line) = input_line() else { return Ok(()) };
     let told: Told = serde_json::from_str(&line).context("what the spare worker is told")?;
+    if let Some(env) = &told.native_env {
+        // SAFETY: same quiescent spare boundary as the configuration variables below.
+        unsafe {
+            for (name, _) in std::env::vars_os() {
+                std::env::remove_var(name);
+            }
+            for (name, value) in env.vars() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    if let Some(env) = told.load_env {
+        scripts::set_load_env(env);
+    }
     for (name, value) in &told.env {
         // SAFETY: the threads that loaded the library have ended, and the ones that remain
         // wait for files to change or for a proc macro to expand: none reads a variable.
@@ -8431,6 +8795,8 @@ fn run_holding(
 ) -> anyhow::Result<()> {
     // A build that links the program itself, a whole build's worker among them, runs the
     // build scripts of the workspace it loads itself.
+    let native = scripts::load_native_env();
+    let _native = process::enter_native(native);
     scripts::set_own(args.exe.is_some());
     // As cargo does: the flag, then the environment, then the host.
     if args.selection.target.is_none() {
@@ -8598,6 +8964,11 @@ fn run_holding(
         // A crate listed beside cargo's build was listed without what they declare.
         listed.touch(&db, None);
     }
+    if nothing_of_rustc && let Some(error) = check::syntax(&db, &args, &files)? {
+        let said = errors::Said::one(error);
+        errors_for_the_daemon(&args, &said)?;
+        anyhow::bail!("{said}");
+    }
     // A tests' program starts in ra-jit's harness, which what rustc linked does not have.
     let texts = harnesses(&db, [&args], None);
     let harnessed = !texts.is_empty();
@@ -8729,6 +9100,7 @@ fn run_holding(
             harnessed,
         );
     }
+    let image_native = args.inputs.as_ref().and_then(|_| native_inputs::image_before(&db, &args));
     let cold = match rustcs_to_patch(&args, written.is_empty() && !harnessed) {
         Some(rustcs) => {
             let start = Instant::now();
@@ -8801,8 +9173,17 @@ fn run_holding(
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
-                if let Some(path) = &args.inputs {
-                    write_inputs(&db, &args, tree.vfs(), exe, path)?;
+            }
+            if let Some(path) = &args.inputs {
+                write_inputs(
+                    &db,
+                    &args,
+                    tree.vfs(),
+                    args.exe.as_deref().unwrap_or(&args.out),
+                    path,
+                )?;
+                if let Some(native) = image_native {
+                    native.write(&path.with_extension("native.json"))?;
                 }
             }
             // The first program is compiled and linked: a process no daemon's build started
@@ -8959,7 +9340,9 @@ fn run_holding(
     let mut placed = Placed::default();
     // The programs whose tests ra-jit's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
+    let mut current_native = process::native();
     loop {
+        let _current_native = process::enter_native(current_native.clone());
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
         }
@@ -9047,6 +9430,7 @@ fn run_holding(
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    let _native = process::enter_native(stream.native_env.clone());
                     // What a client asks of is the executable on disk: the splices that wait
                     // for the edits to stop are done first.
                     for binary in splicer::flush() {
@@ -9172,12 +9556,13 @@ fn run_holding(
                         }
                     }
                     // One build is for one process: its variables are what `env!` reads.
-                    if process::differs(&db, &stream.env) {
+                    if process::differs(&db, &stream.env) || current_native != stream.native_env {
                         if !clients.is_empty() {
                             later.push((request, asked, stream));
                             continue;
                         }
                         builds.settle(&mut db, &mut programs)?;
+                        current_native = stream.native_env.clone();
                         let reading = process::turn(&mut db, stream.env.clone());
                         if !reading.is_empty() {
                             for program in &mut programs {
@@ -9186,6 +9571,32 @@ fn run_holding(
                             }
                             listed.touch(&db, Some(&reading));
                             lock(&as_built).clear();
+                        }
+                        // A macro reads its server's variables as it reads rustc's: servers
+                        // started for another request are replaced, with what this one has,
+                        // though nothing of the checkout is stale.
+                        let read_from = SystemTime::now();
+                        let before = CratesAsLoaded::of(&db);
+                        match checkouts.refresh_macro_env(&mut db, tree.vfs()) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                                let new = before.changed(&db);
+                                hydrate_includes(&mut db, &mut tree, &mut files, |db| {
+                                    resolve_names(db, &new)
+                                });
+                                for program in &mut programs {
+                                    program.known.touch(&db, None);
+                                    program.unbuilt.stale = true;
+                                }
+                                listed.touch(&db, None);
+                                lock(&as_built).clear();
+                            }
+                            Err(error) => {
+                                let _ =
+                                    writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
+                                continue;
+                            }
                         }
                     }
                     // Read native inputs with the admitted request's environment too.
@@ -9535,6 +9946,7 @@ fn run_holding(
                         for &at in &owners {
                             let Some(mut client) = Client::nobody() else { continue };
                             client.env = env.clone();
+                            client.native_env = current_native.clone();
                             client._recovering = Some(recovery.clone());
                             let target = (at != 0).then(|| Target::of(&programs[at].args));
                             builds.waiting.push_back((Request::Sync, target, client));
@@ -9554,12 +9966,14 @@ fn run_holding(
                     edited.client.env = ide_db::base_db::ProcessEnv::try_get(&db)
                         .map(|it| it.vars(&db).clone())
                         .unwrap_or_default();
+                    edited.client.native_env = current_native.clone();
                     // Asked as a client of each would: one interrupted asks again.
                     let target = |at: usize| (at != 0).then(|| Target::of(&programs[at].args));
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client::of(stream, edited.client.env.clone(), 0);
+                            let mut client = Client::of(stream, edited.client.env.clone(), 0);
+                            client.native_env = edited.client.native_env.clone();
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
@@ -9637,6 +10051,11 @@ fn run_holding(
             }
             false => std::thread::sleep(Duration::from_millis(5)),
         }
+        // The accepted batch has one environment, just like its Unicode source view.
+        // Keep it through command construction; detached commands own their snapshot.
+        let _native = clients
+            .first()
+            .map(|(_, (_, _, client))| process::enter_native(client.native_env.clone()));
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
         let mut switched = Vec::new();
@@ -9697,7 +10116,7 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db).added {
+            for (file, path) in tree.added(&mut db)?.added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,
@@ -9710,6 +10129,12 @@ fn run_holding(
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
                     if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
                         touched.remove(&index);
+                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                    } else if matches!(file.file, Watched::Included(_))
+                        && file.mtime != SystemTime::UNIX_EPOCH
+                    {
+                        file.mtime = SystemTime::UNIX_EPOCH;
+                        touched.insert(index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
                     continue;
@@ -9871,12 +10296,30 @@ fn run_holding(
             });
         }
         // Asked after the change: a file can have joined a crate with it.
-        if !included.is_empty() {
-            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
-            listed.touch(&db, None);
+        let included_changed = !included.is_empty();
+        let changed_inputs: FxHashSet<_> = included.iter().cloned().collect();
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("included-watch: changed={}, sources={}", included.len(), sources.len());
         }
         for path in included {
             db.reload_included_file(&path);
+        }
+        // Invalidate memoized code/listings only after the tracked input revision
+        // advances, so patch bases cannot recapture the old included bytes.
+        if included_changed {
+            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+            listed.touch(&db, None);
+            // An external input is not an edited Rust file. Attribute it to the
+            // crate that read it so the ordinary edit/reach machinery also sees
+            // the change (checks, retained roots and dependent callers).
+            for &krate in ide_db::base_db::all_crates(&db).iter() {
+                if db.included_by(krate).iter().any(|(path, _)| changed_inputs.contains(path)) {
+                    let root = krate.data(&db).root_file_id;
+                    if !sources.contains(&root) {
+                        sources.push(root);
+                    }
+                }
+            }
         }
         // Asked of every file before any is noted: noting one forgets the functions listed.
         for program in &mut programs {
@@ -9995,6 +10438,7 @@ fn run_holding(
                     (solving::Handle::of(&db), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
                 let done = Arc::new(AtomicBool::new(false));
+                let native = process::native();
                 if own_base && let Some(budget) = own_base_budget() {
                     let (done, sender) = (done.clone(), sender.clone());
                     let krate = program.args.krate.clone();
@@ -10018,6 +10462,7 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    let _native = process::enter_native(native);
                     LINK_FOR.with_borrow_mut(|it| it.clone_from(&consumes));
                     for build in consumes {
                         scripts::barrier::hold("consume", build);
@@ -10064,7 +10509,9 @@ fn run_holding(
                         let wanted = outputs.get(&at);
                         let reads: Vec<u64> =
                             clients.iter().filter(|it| it.0 == at).map(|it| it.1.2.build).collect();
+                        let native = process::native();
                         let build = scope.spawn(move || {
+                            let _native = process::enter_native(native);
                             for build in reads {
                                 scripts::barrier::hold("consume", build);
                             }
@@ -10618,6 +11065,23 @@ impl Program {
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
+        hir::attach_db(db, || prepare_changed_input_owners(db, &edited));
+        // Missing external inputs are compilation errors even when an old patch
+        // base can still execute. Never advertise that old executable as a new
+        // successful build.
+        for name in args.crates() {
+            for krate in crates_named(db, name, args).unwrap_or_default() {
+                let mut closure = ide_db::base_db::Crate::from(krate).transitive_deps(db);
+                closure.push(krate.into());
+                for dependency in closure {
+                    if let Some(path) = missing_input_of(db, dependency) {
+                        let said =
+                            errors::of_none(&format!("could not read included input `{path}`"));
+                        return Ok(Err(Refused::Error(errors::Said::one(said))));
+                    }
+                }
+            }
+        }
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
         // Neither is what no crate that is built reads: an example, or a test.
         edited.retain(|&file| listed.sees(db, file));
@@ -10955,6 +11419,23 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn direct_builds_preserve_lockfile_policy_for_owned_loads() {
+        for (flag, locked, offline) in
+            [("--locked", true, false), ("--offline", false, true), ("--frozen", true, true)]
+        {
+            let args = Args::parse(
+                ["project", "--crate", "app", "--out", "app.o", flag]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!((args.selection.locked, args.selection.offline), (locked, offline));
+            let forwarded = selected(&args);
+            assert_eq!(forwarded.iter().any(|arg| arg == "--locked"), locked);
+            assert_eq!(forwarded.iter().any(|arg| arg == "--offline"), offline);
+        }
+    }
+    #[test]
     fn pressure_in_second_tier_build_does_not_publish_or_escape_the_reply_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let patch = dir.path().join("patch.o");
@@ -11204,16 +11685,37 @@ fn main() { let _ = LOGGER + RUNS; }
     #[test]
     fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {
         let fetched = "registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs";
+        let ws = Path::new("/home/one/repo/ws");
         let at =
-            |home: &str| crate_place(Path::new(&format!("{home}/{fetched}")), None, Some(home));
+            |home: &str| crate_place(Path::new(&format!("{home}/{fetched}")), None, Some(home), ws);
         assert_eq!(at("/home/one/.cargo"), at("/Users/other/.cargo"));
         assert_eq!(at("/home/one/.cargo"), format!("/cargo/{fetched}"));
         let elsewhere = Path::new("/opt/crates/lib.rs");
-        assert_eq!(crate_place(elsewhere, None, Some("/home/one/.cargo")), "/opt/crates/lib.rs");
+        assert_eq!(
+            crate_place(elsewhere, None, Some("/home/one/.cargo"), ws),
+            "/opt/crates/lib.rs"
+        );
         let inside = Path::new("/ws/app/src/main.rs");
         assert_eq!(
-            crate_place(inside, Some(Path::new("app/src/main.rs")), None),
+            crate_place(inside, Some(Path::new("app/src/main.rs")), None, Path::new("/ws")),
             "app/src/main.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_crate_beside_the_checkout_is_named_the_same_wherever_the_repository_is() {
+        let at = |repo: &str| {
+            let root = format!("{repo}/shared/src/lib.rs");
+            crate_place(Path::new(&root), None, None, Path::new(&format!("{repo}/ws")))
+        };
+        assert_eq!(at("/home/one/repo"), at("/private/tmp/m/b/x/repo"));
+        assert_eq!(at("/home/one/repo"), "/checkout/../shared/src/lib.rs");
+        // Where nothing is shared with the checkout the crate is only where it is.
+        let far = Path::new("/opt/shared/src/lib.rs");
+        assert_eq!(
+            crate_place(far, None, None, Path::new("/home/one/repo/ws")),
+            "/opt/shared/src/lib.rs"
         );
     }
 
@@ -11482,4 +11984,276 @@ fn main() {}
         *lock(&held) += 1;
         assert_eq!(*lock(&held), 2);
     }
+}
+#[test]
+fn missing_input_fast_path_does_not_discover_current_owners_without_a_candidate() {
+    let path = AbsPathBuf::assert_utf8(PathBuf::from("/fixture/payload.bin"));
+    let calls = std::cell::Cell::new(0);
+    let discover = || {
+        calls.set(calls.get() + 1);
+        vec![path.clone()]
+    };
+    assert_eq!(missing_required_input(vec![], discover), None);
+    assert_eq!(missing_required_input(vec![(path.clone(), Some(vec![1].into()))], discover), None);
+    assert_eq!(calls.get(), 0);
+    assert_eq!(missing_required_input(vec![(path.clone(), None)], discover), Some(path.clone()));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(missing_required_input(vec![(path, None)], Vec::new), None);
+}
+#[test]
+#[cfg(unix)]
+fn unreadable_trees_cannot_share_a_loaded_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    let over = root.path().join("over");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(&over).unwrap();
+    for dir in [&base, &over] {
+        std::os::unix::fs::symlink("missing", dir.join("input")).unwrap();
+    }
+    assert!(!tree_alike(&base, &base, &over));
+    assert!(!package_alike(&base, &base, &over, &FxHashSet::default(), &Compared::default()));
+    for dir in [&base, &over] {
+        std::fs::write(dir.join("missing"), b"same bytes").unwrap();
+    }
+    assert!(tree_alike(&base, &base, &over));
+    assert!(package_alike(&base, &base, &over, &FxHashSet::default(), &Compared::default()));
+}
+
+#[test]
+#[ignore = "bounded same-session full-read cost observation"]
+fn input_comparison_full_read_cost() {
+    let root = std::env::temp_dir().join(format!("c4-read-cost-{}", std::process::id()));
+    let (base, over) = (root.join("base"), root.join("over"));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&over).unwrap();
+    let bytes = vec![b'x'; 4096];
+    for index in 0..128 {
+        let name = format!("input-{index}.txt");
+        std::fs::write(base.join(&name), &bytes).unwrap();
+        std::fs::write(over.join(name), &bytes).unwrap();
+    }
+    let compared = Compared::default();
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let began = Instant::now();
+        assert!(package_alike(&base, &base, &over, &FxHashSet::default(), &compared));
+        samples.push(began.elapsed().as_secs_f64() * 1000.0);
+    }
+    let stamp_samples = crate::inputs::measure_full_read_cost(&base, 7);
+    println!(
+        "full_read_cost files=128 bytes_per_side=524288 runs=7 package_ms={samples:?} stamp_ms={stamp_samples:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "production cold workspace-loader control with a copied proc-macro fixture"]
+fn cold_macro_loader_uses_content_and_rejects_input_io() {
+    let root = PathBuf::from(std::env::var_os("C4_COLD_MACRO_FIXTURE").unwrap());
+    let project = root.join("app");
+    let config = CargoConfig {
+        sysroot: Some(project_model::RustLibSource::Discover),
+        only_manifest_package: true,
+        ..Default::default()
+    };
+    let selection = plan::Selection { packages: vec!["app".into()], ..Default::default() };
+    let source = root.join("derive/src/lib.rs");
+    let original = std::fs::read(&source).unwrap();
+    let time = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let (first_workspace, _, _, first) =
+        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+            .unwrap();
+    let first = first.unwrap();
+    let first_path = first.path().to_owned();
+    let macro_libraries = |workspace: &ProjectWorkspace| {
+        let mut ids = FxHashMap::default();
+        let (_, paths) = workspace.to_crate_graph(
+            &mut |path| {
+                let next = vfs::FileId::from_raw(ids.len() as u32);
+                Some(*ids.entry(path.to_owned()).or_insert(next))
+            },
+            &FxHashMap::default(),
+        );
+        paths.into_values().map(|path| path.unwrap().1).collect::<Vec<_>>()
+    };
+    let first_libraries = macro_libraries(&first_workspace);
+    assert!(!first_libraries.is_empty());
+    assert!(
+        first_libraries.iter().all(|path| AsRef::<Path>::as_ref(path).starts_with(&first_path))
+    );
+    let first_bytes: Vec<_> =
+        first_libraries.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    let replacement =
+        String::from_utf8(original.clone()).unwrap().replace("was described", "got described");
+    assert_eq!(original.len(), replacement.len());
+    std::fs::write(&source, replacement).unwrap();
+    std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
+    // No preceding Inputs::watch or manual Generation::prepare. This is the
+    // production cold request ordering, with an existing producer target.
+    let (second_workspace, _, _, second) =
+        workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+            .unwrap();
+    let second = second.unwrap();
+    assert_ne!(first_path, second.path());
+    let second_libraries = macro_libraries(&second_workspace);
+    assert!(
+        second_libraries.iter().all(|path| AsRef::<Path>::as_ref(path).starts_with(second.path()))
+    );
+    let second_bytes: Vec<_> =
+        second_libraries.iter().map(|path| std::fs::read(path).unwrap()).collect();
+    assert_ne!(
+        first_bytes, second_bytes,
+        "actual producer body changed, not just its directory key"
+    );
+    assert!(first_path.is_dir(), "the old workspace still leases its producer");
+    assert!(second.collect().unwrap().is_empty());
+    drop(first);
+    assert_eq!(second.collect().unwrap(), [first_path]);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("absent-input"), root.join("derive/src/broken-input"))
+            .unwrap();
+        let error =
+            workspace_at(&project, &config, &load_config(), &selection, None, None, None, None)
+                .err()
+                .expect("an unreadable producer must not use a default target");
+        assert!(format!("{error:#}").contains("reading macro producer inputs"));
+        std::fs::remove_file(root.join("derive/src/broken-input")).unwrap();
+    }
+    std::fs::write(&source, original).unwrap();
+    drop(second);
+}
+
+#[test]
+#[ignore = "cargo oracle reproduction on a copied proc-macro fixture"]
+fn supplied_macro_artifact_rejects_same_size_restored_mtime() {
+    let root = PathBuf::from(std::env::var_os("C4_SAID_MACRO_FIXTURE").unwrap());
+    let project = root.join("app");
+    let config = CargoConfig {
+        sysroot: Some(project_model::RustLibSource::Discover),
+        only_manifest_package: true,
+        ..Default::default()
+    };
+    let selection = plan::Selection { packages: vec!["app".into()], ..Default::default() };
+    let source = root.join("derive/src/lib.rs");
+    let original = std::fs::read(&source).unwrap();
+    let time = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let inputs = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
+    // Only the Python harness invokes the reference compiler. No Rust source starts cargo.
+    let cargo_build = || {
+        let oracle = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/dist/supplied_macro_oracle.py");
+        let out = std::process::Command::new("python3").arg(oracle).arg(&root).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let messages: Vec<cargo_metadata::Message> =
+            cargo_metadata::Message::parse_stream(std::io::Cursor::new(out.stdout))
+                .map(Result::unwrap)
+                .collect();
+        let artifacts: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                cargo_metadata::Message::CompilerArtifact(artifact)
+                    if artifact.target.is_proc_macro() =>
+                {
+                    Some(artifact.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let lines = messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    cargo_metadata::Message::BuildScriptExecuted(_)
+                        | cargo_metadata::Message::CompilerArtifact(_)
+                )
+            })
+            .map(|message| serde_json::to_string(message).unwrap())
+            .collect::<Vec<_>>();
+        (lines, artifacts)
+    };
+    let load_said = |lines| {
+        workspace_at(&project, &config, &load_config(), &selection, None, Some(lines), None, None)
+    };
+    let (first, artifacts) = cargo_build();
+    assert!(!artifacts.is_empty() && artifacts.iter().all(|artifact| !artifact.fresh));
+    assert!(load_said(first.clone()).is_err(), "pre-record targets must refuse warmth");
+    for artifact in &artifacts {
+        inputs.record(artifact).unwrap();
+    }
+    assert!(load_said(first).is_ok(), "stable fresh:false artifacts must be accepted");
+    let replacement =
+        String::from_utf8(original.clone()).unwrap().replace("was described", "got described");
+    assert_eq!(original.len(), replacement.len());
+    assert_ne!(original, replacement.as_bytes());
+    std::fs::write(&source, &replacement).unwrap();
+    std::fs::File::options().write(true).open(&source).unwrap().set_modified(time).unwrap();
+    let (stale, artifacts) = cargo_build();
+    assert!(artifacts.iter().all(|artifact| artifact.fresh), "cargo must reproduce the mtime gap");
+    for artifact in &artifacts {
+        let path = artifact
+            .filenames
+            .iter()
+            .find(|path| matches!(path.extension(), Some("so" | "dylib" | "dll")))
+            .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(memchr::memmem::find(&bytes, b"was described").is_some());
+        assert!(memchr::memmem::find(&bytes, b"got described").is_none());
+        inputs.record(artifact).unwrap();
+    }
+    let error = load_said(stale.clone()).err().expect("stale supplied artifact must fail closed");
+    assert!(format!("{error:#}").contains("no matching producer record"));
+    let said = Arc::new(Said::default());
+    said.lines.lock().unwrap().said = stale;
+    let mut beside = Beside {
+        said,
+        at: 0,
+        awaited: FxHashSet::default(),
+        built: FxHashSet::default(),
+        applied: 0,
+    };
+    let error = workspace_at(
+        &project,
+        &config,
+        &load_config(),
+        &selection,
+        Some(&mut beside),
+        None,
+        None,
+        None,
+    )
+    .err()
+    .expect("streamed artifact must also fail closed");
+    assert!(format!("{error:#}").contains("no matching producer record"));
+    // A producer operation that completes after an edit must invalidate its output id.
+    let manifest =
+        ProjectManifest::discover_single(&AbsPathBuf::assert_utf8(project.clone())).unwrap();
+    let workspace = ProjectWorkspace::load(manifest, &config, &|_| {}).unwrap();
+    let mut build_config = config.clone();
+    let generation =
+        macro_inputs::Generation::prepare(&workspace, &mut build_config).unwrap().unwrap();
+    let generation_path = generation.path().to_owned();
+    std::fs::write(generation_path.join("compiled-during-edit"), b"untrusted output").unwrap();
+    std::fs::write(&source, &original).unwrap();
+    assert!(generation.verify(&workspace, &build_config).is_err());
+    std::fs::write(&source, &replacement).unwrap();
+    assert!(macro_inputs::Generation::prepare(&workspace, &mut build_config).is_err());
+    drop(generation);
+    let clean = macro_inputs::Generation::prepare(&workspace, &mut build_config).unwrap().unwrap();
+    assert!(!clean.path().join("compiled-during-edit").exists());
+    drop(clean);
+    // A build straddling an edit must not publish even a fresh:false message for the new id.
+    let edited = macro_inputs::ArtifactInputs::capture(&project, &selection).unwrap().unwrap();
+    std::fs::write(&source, &original).unwrap();
+    for mut artifact in artifacts {
+        artifact.fresh = false;
+        edited.record(&artifact).unwrap();
+    }
+    std::fs::write(&source, replacement).unwrap();
+    assert!(
+        macro_inputs::validate_artifacts(&project, &selection, &beside.said.so_far().0).is_err()
+    );
+    std::fs::write(&source, original).unwrap();
 }

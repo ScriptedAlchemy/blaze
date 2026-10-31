@@ -208,6 +208,59 @@ fn main() {
 }
 
 #[test]
+fn non_unicode_process_environment_is_an_error_for_both_macros() {
+    super::check_with_setup(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! env {() => {}}
+#[rustc_builtin_macro]
+macro_rules! option_env {() => {}}
+fn main() {
+    env!("NATIVE_VALUE");
+    option_env!("NATIVE_VALUE");
+}
+"#,
+        expect![[r#"
+#[rustc_builtin_macro]
+macro_rules! env {() => {}}
+#[rustc_builtin_macro]
+macro_rules! option_env {() => {}}
+fn main() {
+    /* error: environment variable `NATIVE_VALUE` is not a valid Unicode string */;
+    /* error: environment variable `NATIVE_VALUE` is not a valid Unicode string */;
+}
+"#]],
+        |db| {
+            let mut env = base_db::Env::default();
+            env.set_non_unicode("NATIVE_VALUE");
+            base_db::set_process_env(db, env);
+        },
+    );
+}
+
+#[test]
+fn unicode_crate_environment_overrides_non_unicode_process_environment() {
+    super::check_with_setup(
+        r#"
+//- /main.rs env:NATIVE_VALUE=crate-value
+#[rustc_builtin_macro]
+macro_rules! env {() => {}}
+fn main() { env!("NATIVE_VALUE"); }
+"#,
+        expect![[r#"
+#[rustc_builtin_macro]
+macro_rules! env {() => {}}
+fn main() { "crate-value"; }
+"#]],
+        |db| {
+            let mut env = base_db::Env::default();
+            env.set_non_unicode("NATIVE_VALUE");
+            base_db::set_process_env(db, env);
+        },
+    );
+}
+
+#[test]
 fn test_file_expand() {
     check(
         r#"

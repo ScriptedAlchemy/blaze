@@ -190,6 +190,8 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         target: "aarch64-unknown-linux-gnu",
         explicit_target: true,
         packages: Some(&packages),
+        host_cargo: None,
+        shared: None,
     };
     // The installed toolchain's identity selects checked-in cfg answers. No executable is
     // present in this fixture, so obtaining host cfgs cannot rely on a compiler process.
@@ -213,7 +215,23 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         },
     ];
     let leases = Leases::default();
+    #[cfg(unix)]
+    let _native = {
+        use std::os::unix::ffi::OsStringExt as _;
+        crate::process::enter_native(crate::process::Native::of([
+            ("BYTE_VALUE".into(), OsString::from_vec(vec![0xff, 0xfe])),
+            ("CLIENT_ONLY".into(), "request".into()),
+        ]))
+    };
     let mut runner = Runner::new(&leases, &cargo, &asked, sysroot, &target_cfg).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let child = runner.child_env();
+        assert_eq!(child[std::ffi::OsStr::new("BYTE_VALUE")].as_bytes(), &[0xff, 0xfe]);
+        assert_eq!(child[std::ffi::OsStr::new("CLIENT_ONLY")], "request");
+        assert_eq!(child[std::ffi::OsStr::new("SDKROOT")], root.join("unused-sdk").as_os_str());
+    }
     let profile = runner.profile(package, UnitFor::new_normal(), &runner.kind(false));
     let target = runner.unit(package, false, &profile, root.join("script"), Vec::new()).unwrap();
     let profile = runner.profile(package, UnitFor::new_host(false), &runner.kind(true));
@@ -365,6 +383,20 @@ impl Fixture {
         gen_: &str,
         extra: &[(&str, &str)],
     ) -> Result<Arc<Done>, Attempt> {
+        let script = self.root.join("script.sh");
+        let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
+        self.request_compiled(leases, build, gen_, extra, made)
+    }
+
+    /// `request`, with the script dated `made`, as `Runner::compile` dates it.
+    fn request_compiled(
+        &self,
+        leases: &Leases,
+        build: u64,
+        gen_: &str,
+        extra: &[(&str, &str)],
+        made: SystemTime,
+    ) -> Result<Arc<Done>, Attempt> {
         let mut env = BTreeMap::from([
             (
                 "CARGO_HOME".to_owned(),
@@ -385,13 +417,14 @@ impl Fixture {
             target: HOST,
             explicit_target: false,
             packages: Some(&packages),
+            host_cargo: None,
+            shared: None,
         };
         let mut runner =
             Runner::new(leases, &self.cargo, &asked, self.sysroot.clone(), &self.cfg).unwrap();
         let unit_for = UnitFor::new_normal();
         let profile = runner.profile(self.package, unit_for, &runner.kind(false));
         let script = self.root.join("script.sh");
-        let made = std::fs::metadata(&script).and_then(|it| it.modified()).unwrap();
         let said = (|| {
             // As `Runner::make` starts: what the build judged already, else the admission.
             if let Some(judged) = runner.begin(self.package, false, &profile)? {
@@ -820,4 +853,502 @@ fn host_overflow_and_panic_flags_change_the_effective_script_profile() {
     let effective = crate::plan::Profile::for_script(&profile, &asked).unwrap();
     assert!(!effective.overflow_checks);
     assert_eq!(effective.panic.name(), "unwind");
+}
+
+#[test]
+fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
+    let base = [
+        "unix",
+        "target_arch=\"x86_64\"",
+        "target_pointer_width=\"64\"",
+        "debug_assertions",
+        "overflow_checks",
+        "panic=\"unwind\"",
+    ]
+    .map(str::to_owned);
+    let flags = [
+        "-Cdebug-assertions=off",
+        "-Coverflow-checks=off",
+        "-Cpanic=abort",
+        "--cfg",
+        "custom_host",
+    ]
+    .map(str::to_owned);
+    let profile =
+        crate::plan::Profile::for_script(&blaze_manifest::profiles::Profile::default(), &flags)
+            .unwrap();
+    let cfg =
+        source_cfgs(&base, &["feature=\"selected\"".into()], &profile, &apply_flags(&flags).cfgs);
+    for fact in [
+        "unix",
+        "target_arch=\"x86_64\"",
+        "target_pointer_width=\"64\"",
+        "feature=\"selected\"",
+        "custom_host",
+        "panic=\"abort\"",
+    ] {
+        assert!(cfg.iter().any(|it| it == fact), "missing {fact}: {cfg:?}");
+    }
+    for absent in ["debug_assertions", "overflow_checks", "panic=\"unwind\""] {
+        assert!(!cfg.iter().any(|it| it == absent), "stale profile cfg {absent}: {cfg:?}");
+    }
+    let flags =
+        ["-Cdebug-assertions=on", "-Coverflow-checks=on", "-Cpanic=unwind"].map(str::to_owned);
+    let profile =
+        crate::plan::Profile::for_script(&blaze_manifest::profiles::Profile::default(), &flags)
+            .unwrap();
+    let cfg = source_cfgs(&["unix".into(), "panic=\"abort\"".into()], &[], &profile, &[]);
+    for fact in ["unix", "debug_assertions", "overflow_checks", "panic=\"unwind\""] {
+        assert!(cfg.iter().any(|it| it == fact));
+    }
+    assert!(!cfg.iter().any(|it| it == "panic=\"abort\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
+    let base = dir("macro-root-cfg");
+    let root = base.join("pkg");
+    std::fs::create_dir_all(root.join("helper")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\npath = \"lib.rs\"\nproc-macro = true\n\
+         [dependencies]\nhelper = { path = \"helper\" }\n\
+         [features]\nselected = []\n[workspace]\nmembers = [\"helper\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("helper/lib.rs"), "").unwrap();
+    let pkg = Fixture::at(&base);
+    let env = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), base.join("home").display().to_string()),
+        ("RUSTFLAGS".to_owned(), "--cfg custom_host -Cpanic=abort".to_owned()),
+    ]);
+    let config = Config::load(&root, env.clone(), &[]).unwrap();
+    let cx = blaze_manifest::Context::new(config);
+    let manifest = root.join("Cargo.toml");
+    let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+    let mut metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let packages = metadata["packages"].as_array().unwrap();
+    let id = |name: &str| packages.iter().find(|p| p["name"] == name).unwrap()["id"].clone();
+    let macro_id = id("macros");
+    let helper_id = id("helper");
+    metadata["resolve"] = serde_json::json!({"root": macro_id, "nodes": [
+        {"id": macro_id, "dependencies": [helper_id], "deps": [
+            {"name": "helper", "pkg": helper_id, "dep_kinds": [{"kind": null, "target": null}]}
+        ], "features": ["selected"]},
+        {"id": helper_id, "dependencies": [], "deps": [], "features": []}
+    ]});
+    let manifest =
+        project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest)).unwrap();
+    let cargo = CargoWorkspace::new(
+        serde_json::from_value(metadata).unwrap(),
+        manifest,
+        ide_db::base_db::Env::default(),
+        false,
+    );
+    let package = cargo.packages().find(|&p| cargo[p].name == "macros").unwrap();
+    let asked = Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: None,
+        host_cargo: None,
+        shared: None,
+    };
+    let leases = Leases::default();
+    let mut runner = Runner::new(&leases, &cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+    runner.done.insert(
+        (package, true),
+        Ok(Arc::new(Done {
+            out_dir: base.join("out"),
+            output: blaze_build_script::Output::default(),
+            fingerprint: 0,
+            generation: 0,
+            ran: false,
+            made: None,
+            links: None,
+        })),
+    );
+    let mut leaves = Vec::new();
+    let index = runner.add_source_leaf(package, &mut leaves).unwrap();
+    assert!(leaves[index].cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let described = crate::cargo::own_script::planned_description(&pkg.sysroot, leaves);
+    let described: serde_json::Value = serde_json::from_str(&described).unwrap();
+    assert!(
+        described["crates"][index]["cfg"].as_array().unwrap().iter().any(|cfg| cfg == "proc_macro")
+    );
+    let mut crates = Vec::new();
+    runner.add_source(package, &mut crates, &mut FxHashMap::default()).unwrap();
+    let root = crates.iter().find(|krate| krate.name == "macros").unwrap();
+    for fact in ["proc_macro", "unix", "custom_host", "panic=\"abort\"", "feature=\"selected\""] {
+        assert!(root.cfg.iter().any(|cfg| cfg == fact), "missing {fact}: {:?}", root.cfg);
+    }
+    let helper = crates.iter().find(|krate| krate.name == "helper").unwrap();
+    assert!(!helper.cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let profile = runner.profile(package, UnitFor::new_host(true), &CompileKind::Host);
+    let features = runner.cargo[package].active_features.clone();
+    let script = runner
+        .described(package, "build_script_build", &base.join("build.rs"), &profile, &features, None)
+        .unwrap();
+    assert!(!script.cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A crate of a script's compile, as `Runner::compile` describes it, compiled with what the
+/// script whose output is in `out_dir` said, or with the producer image `proc_macro`.
+#[cfg(unix)]
+fn planned(
+    name: &str,
+    out_dir: Option<PathBuf>,
+    proc_macro: Option<PathBuf>,
+) -> crate::cargo::own_script::Planned {
+    crate::cargo::own_script::Planned {
+        out_dir,
+        workspace_member: true,
+        name: name.to_owned(),
+        root: PathBuf::from(format!("{name}.rs")),
+        edition: "2024".to_owned(),
+        cfg: Vec::new(),
+        codegen_flags: Vec::new(),
+        env: BTreeMap::new(),
+        deps: Vec::new(),
+        proc_macro,
+    }
+}
+
+/// `edges.py`'s `build-dep-counter`: cargo compiles a build-dependency's library again after its
+/// script ran, and links the script compiled with it again, which then runs again. The script is
+/// dated by the newest run of a script one of its crates (or an image they use) was compiled
+/// with, and its run is judged as cargo judges it: again after that dependency's run, and not
+/// again when the dependency did not run since.
+#[cfg(unix)]
+#[test]
+fn a_script_runs_again_after_the_script_of_a_library_it_is_compiled_with_ran_again() {
+    let base = dir("build-dep-rerun");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let asked = Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: None,
+        host_cargo: None,
+        shared: None,
+    };
+    let mut runner =
+        Runner::new(&leases, &pkg.cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+    let compiled =
+        std::fs::metadata(pkg.root.join("script.sh")).and_then(|it| it.modified()).unwrap();
+    // Cold, then a build with nothing changed: one run.
+    pkg.request(&leases, 1, "a", &[]).unwrap();
+    leases.retire(1);
+    pkg.request(&leases, 2, "a", &[]).unwrap();
+    leases.retire(2);
+    assert_eq!(pkg.runs(), ["a"]);
+    // A crate the script is compiled with, whose script has run since (`native`), and one whose
+    // script has not run in this build (nothing is known of it, so it dates nothing).
+    let dep_out = base.join("native-run").join("out");
+    let ran = SystemTime::now();
+    runner.done.insert(
+        (pkg.package, true),
+        Ok(Arc::new(Done {
+            out_dir: dep_out.clone(),
+            output: blaze_build_script::Output::default(),
+            fingerprint: 0,
+            generation: 0,
+            ran: true,
+            made: Some(ran),
+            links: Some("probe".to_owned()),
+        })),
+    );
+    let crates = [
+        planned("build_script_build", None, None),
+        planned("native", Some(dep_out), None),
+        planned("other", Some(base.join("other-run").join("out")), None),
+    ];
+    assert_eq!(runner.newest_run(&crates), Some(ran));
+    assert_eq!(runner.newest_run(&crates[..1]), None, "a script compiled with no script's output");
+    // A producer image whose crates were compiled with a later run dates the script by that run.
+    let image = base.join("producers").join("libmacro.dylib");
+    let later = ran + Duration::from_secs(1);
+    runner.image_runs.insert(image.clone(), later);
+    let with_image =
+        [planned("build_script_build", None, None), planned("macros", None, Some(image))];
+    assert_eq!(runner.newest_run(&with_image), Some(later));
+    // The script's run depends on the newer of the two: it runs again, once.
+    let made = compiled.max(runner.newest_run(&crates).unwrap());
+    // A file time can lag the clock a run reads by a tick of the kernel's coarse clock.
+    std::thread::sleep(Duration::from_millis(50));
+    pkg.request_compiled(&leases, 3, "a", &[], made).unwrap();
+    leases.retire(3);
+    assert_eq!(pkg.runs(), ["a", "a"], "the dependency's run reruns the script, as under cargo");
+    pkg.request_compiled(&leases, 4, "a", &[], made).unwrap();
+    leases.retire(4);
+    assert_eq!(pkg.runs(), ["a", "a"], "and only once: the dependency did not run again");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The host pass of a whole build runs the scripts of the packages it builds for the host alone.
+/// One built for the target alone runs once, for the target, as cargo has no host unit of it:
+/// before, every package's script ran for the host too, in a directory of its own, so each ran
+/// twice in a build and one that reads its `links` dependency's metadata, which the host's
+/// description of a target package does not have, failed (`scriptrerun.py`'s `counter` and
+/// `links`).
+#[cfg(unix)]
+#[test]
+fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
+    let base = dir("host-pass");
+    let pkg = Fixture::at(&base);
+    let id = pkg.cargo[pkg.package].id.repr.clone();
+    let env = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), base.join("home").display().to_string()),
+        ("COUNTER".to_owned(), pkg.counter().display().to_string()),
+        ("GEN".to_owned(), "a".to_owned()),
+    ]);
+    let for_target = FxHashMap::from_iter([(id.clone(), true)]);
+    let for_host = FxHashMap::from_iter([(id.clone(), false)]);
+    let asked = |packages| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages,
+        host_cargo: None,
+        shared: None,
+    };
+    assert!(!for_the_host_alone(&asked(Some(&for_target)), &id));
+    assert!(for_the_host_alone(&asked(Some(&for_host)), &id));
+    assert!(
+        !for_the_host_alone(&asked(None), &id),
+        "every package is the target's when none is said"
+    );
+    assert!(
+        !for_the_host_alone(&asked(Some(&for_host)), "another"),
+        "nor one the build does not have"
+    );
+    // A package for the target alone: the host pass neither compiles nor runs its script.
+    let host_cfgs = vec!["unix".to_owned()];
+    let ran = run_producers(
+        &pkg.cargo,
+        &asked(Some(&for_target)),
+        pkg.sysroot.clone(),
+        Vec::new(),
+        host_cfgs,
+        &BTreeMap::new(),
+        &|id| for_the_host_alone(&asked(Some(&for_target)), id),
+    )
+    .unwrap();
+    assert!(ran.0.is_empty(), "no host output of a package built for the target alone");
+    assert!(ran.2.is_empty(), "and no run judged");
+    assert!(pkg.runs().is_empty());
+    // Nor of a build that says no packages, whose target pass runs the script for the target.
+    let ran = run_producers(
+        &pkg.cargo,
+        &asked(None),
+        pkg.sysroot.clone(),
+        Vec::new(),
+        vec!["unix".to_owned()],
+        &BTreeMap::new(),
+        &|id| for_the_host_alone(&asked(None), id),
+    )
+    .unwrap();
+    assert!(ran.0.is_empty() && ran.2.is_empty(), "a build that says none runs none for the host");
+    assert!(pkg.runs().is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A package the build has for the target and, with the same features, for the host (a
+/// dependency and a build-dependency at once, in a build for the host): cargo has one unit of
+/// its script's run for both (`traverse_and_share` settles the host's deferred debuginfo to the
+/// target's, and the two units are one), so the script runs once. Before, the host's run was
+/// keyed by its whole library profile, deferred debuginfo and all, and ran again in a directory
+/// of its own. One the host has with other features is the host's alone: its debuginfo is
+/// none, as cargo weakens it, in a directory of its own.
+#[cfg(unix)]
+#[test]
+fn a_package_built_for_the_host_and_the_target_alike_has_one_run() {
+    let base = dir("shared-run");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let id = pkg.cargo[pkg.package].id.repr.clone();
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let packages = FxHashMap::from_iter([(id.clone(), true)]);
+    let alike = FxHashSet::from_iter([id.clone()]);
+    let unlike = FxHashSet::default();
+    let asked = |shared| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: Some(&packages),
+        host_cargo: None,
+        shared,
+    };
+    let run = |asked: &Asked<'_>, for_host: bool| {
+        let runner =
+            Runner::new(&leases, &pkg.cargo, asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let lib = runner.profile(pkg.package, unit_for, &runner.kind(for_host));
+        let unit = runner.unit(pkg.package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        (unit.out_dir, unit.profile.debuginfo)
+    };
+    let shared = asked(Some(&alike));
+    let (host, target) = (run(&shared, true), run(&shared, false));
+    assert_eq!(host, target, "one run, with the target's debuginfo");
+    assert!(target.1, "a dev build's");
+    let apart = asked(Some(&unlike));
+    let (host, target) = (run(&apart, true), run(&apart, false));
+    assert_ne!(host.0, target.0, "a run for each");
+    assert!(!host.1 && target.1, "the host's alone has none");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The review's workspace (resolver 2, `debug = 0`): `app` depends on `parent` and on `native`
+/// with its `target-extra` feature, and its script is compiled with `parent`; `parent` depends
+/// on `native`, which has `links` and prints its features as metadata. `parent` has the same
+/// features for the host and the target, but the `native` it is given metadata by does not, so
+/// cargo has two units of `parent`'s run (`traverse_and_share`'s `dep_hash`): the target's
+/// `DEP_NATIVE_MODE` is "target" and the host's "host". Before, the key named `parent`'s own
+/// features, profile and flags alone, and with no debuginfo either way the two were one run, the
+/// host's, whose metadata the target's consumer was given. With `native` alike for both, the
+/// two are one run, as cargo has it. And `native`'s script, which reads its feature, is compiled
+/// once for each set of features, where blaze compiled the host's alone and ran it for both.
+#[cfg(unix)]
+#[test]
+fn runs_given_metadata_by_different_runs_of_a_links_dependency_are_two() {
+    let base = dir("links-identity");
+    let toolchain = Fixture::at(&base);
+    let root = base.join("ws");
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"parent\", \"native\"]\n\
+         [profile.dev]\ndebug = 0\n",
+    );
+    let package = |name: &str, rest: &str| {
+        write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 build = \"build.rs\"\n{rest}"
+            ),
+        );
+        write(&format!("{name}/build.rs"), "fn main() {}\n");
+        write(&format!("{name}/src/lib.rs"), "");
+    };
+    package(
+        "app",
+        "[dependencies]\nparent = { path = \"../parent\" }\n\
+         native = { path = \"../native\", features = [\"target-extra\"] }\n\
+         [build-dependencies]\nparent = { path = \"../parent\" }\n",
+    );
+    package("parent", "[dependencies]\nnative = { path = \"../native\" }\n");
+    package("native", "links = \"native\"\n[features]\ntarget-extra = []\n");
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let config = Config::load(&root, env.clone(), &[]).unwrap();
+    let cx = blaze_manifest::Context::new(config);
+    let manifest = root.join("Cargo.toml");
+    let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+    let metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let id = |name: &str| {
+        let packages = metadata["packages"].as_array().unwrap();
+        packages.iter().find(|it| it["name"] == name).unwrap()["id"].as_str().unwrap().to_owned()
+    };
+    let (app, parent, native) = (id("app"), id("parent"), id("native"));
+    let normal = json!([{ "kind": null, "target": null }]);
+    let both = json!([{ "kind": null, "target": null }, { "kind": "build", "target": null }]);
+    // As the build of each has it: `native` the target's with its feature, or the host's without.
+    let workspace = |native_features: &[&str]| {
+        let mut metadata = metadata.clone();
+        metadata["resolve"] = json!({ "root": null, "nodes": [
+            { "id": app, "dependencies": [parent, native], "features": [], "deps": [
+                { "name": "parent", "pkg": parent, "dep_kinds": both },
+                { "name": "native", "pkg": native, "dep_kinds": normal },
+            ] },
+            { "id": parent, "dependencies": [native], "features": [], "deps": [
+                { "name": "native", "pkg": native, "dep_kinds": normal },
+            ] },
+            { "id": native, "dependencies": [], "features": native_features, "deps": [] },
+        ] });
+        let manifest =
+            project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest.clone()))
+                .unwrap();
+        let metadata = serde_json::from_value(metadata).unwrap();
+        CargoWorkspace::new(metadata, manifest, ide_db::base_db::Env::default(), false)
+    };
+    let target_ws = workspace(&["target-extra"]);
+    let host_ws = workspace(&[]);
+    let packages = FxHashMap::from_iter([app, parent.clone(), native.clone()].map(|it| (it, true)));
+    let leases = Leases::default();
+    let asked = |shared| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: Some(&packages),
+        host_cargo: None,
+        shared,
+    };
+    // `parent`'s run for the host, in the build of the host's workspace, and for the target.
+    let run = |cargo: &CargoWorkspace, asked: &Asked<'_>, for_host: bool| {
+        let runner =
+            Runner::new(&leases, cargo, asked, toolchain.sysroot.clone(), &toolchain.cfg).unwrap();
+        let package = cargo.packages().find(|&it| cargo[it].id.repr == parent).unwrap();
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let lib = runner.profile(package, unit_for, &runner.kind(for_host));
+        let unit = runner.unit(package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        (unit.out_dir, unit.profile.debuginfo)
+    };
+    // `shared_with_the_host` has `parent` and not `native`, whose features differ.
+    let alone = FxHashSet::from_iter([parent.clone()]);
+    let apart = asked(Some(&alone));
+    let (host, target) = (run(&host_ws, &apart, true), run(&target_ws, &apart, false));
+    assert_eq!((host.1, target.1), (false, false), "no debuginfo either way, at debug = 0");
+    assert_ne!(host.0, target.0, "a run for each, as `native`'s differ");
+    // With `native` alike for both, both share, and `parent` has one run.
+    let alike = FxHashSet::from_iter([parent.clone(), native.clone()]);
+    let shared = asked(Some(&alike));
+    let (host, target) = (run(&target_ws, &shared, true), run(&target_ws, &shared, false));
+    assert_eq!(host, target, "one run when the runs of `native` are one");
+    // `native`'s script is compiled for the host either way, but with the features of the run
+    // it is for, which `cfg!(feature = "target-extra")` reads: two executables, as cargo has.
+    let runner =
+        Runner::new(&leases, &host_ws, &apart, toolchain.sysroot.clone(), &toolchain.cfg).unwrap();
+    let package = host_ws.packages().find(|&it| host_ws[it].id.repr == native).unwrap();
+    let profile = runner.profile(package, UnitFor::new_host(false), &CompileKind::Host);
+    let dir = |features: &[&str]| {
+        let features: Vec<String> = features.iter().map(|it| (*it).to_owned()).collect();
+        runner.compile_dir(package, &features, &profile)
+    };
+    assert_ne!(dir(&[]), dir(&["target-extra"]), "a compile for each set of features");
+    assert_eq!(dir(&["target-extra"]), dir(&["target-extra"]));
+    let _ = std::fs::remove_dir_all(&base);
 }

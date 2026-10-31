@@ -75,8 +75,8 @@ commit measured, with `pnpm install --frozen-lockfile` run in it for the dashboa
 Tools (T):
     cargo         cargo with the toolchain the project pins (nightly-2026-10-18), as its developers run it
     cargo199      cargo with rustc 1.99.0, the compiler blaze builds with
-    blaze         `blaze build`: cargo builds first with blaze's wrapper, then the daemon takes over
-    blaze-whole   `BLAZE_WHOLE_BUILD=1`: blaze builds the program itself, with no cargo build
+    blaze         `blaze build`: eligible programs use the owned whole build by default
+    blaze-whole   the historical whole-build label; now the same owned route as blaze
     blaze-nightly `BLAZE_OTHER_TOOLCHAIN=1`: blaze builds with the project's own toolchain
 
 Each tool builds into a directory of its own below the tracedecay checkout's `target/`, the one
@@ -232,8 +232,6 @@ class Ctx:
             e.pop("RUSTUP_TOOLCHAIN", None)  # blaze names 1.99.0 itself
             if self.bootstrap:
                 e["RUSTC_BOOTSTRAP"] = "1"
-            if tool == "blaze-whole":
-                e["BLAZE_WHOLE_BUILD"] = "1"
             if tool == "blaze-nightly":
                 e["BLAZE_OTHER_TOOLCHAIN"] = "1"
         return e
@@ -279,7 +277,9 @@ def ps_table(env=True):
     The wide form costs about 20 ms more than a plain `ps` on this Mac, which is why the
     one-second sampler asks without it."""
     flags = ["-Eww" if env else "-ww", "-Ao"] if platform.system() == "Darwin" else (["eww", "-Ao"] if env else ["-Ao"])
-    out = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="]).stdout
+    # `ps` appends raw environment bytes. A non-Unicode variable must not blind
+    # the memory guard while exercising the product's OsString environment.
+    out = sh(["ps"] + flags + ["pid=,ppid=,rss=,command="], errors="replace").stdout
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 3)
@@ -1006,7 +1006,7 @@ def compiler_count(rec):
 def predicate_a(ctx, a):
     """P0-A, no rustc: the build, the program, the test binary and the doctests with 0 compiler
     execs in the tree. Section 0's positive fixture; the negative ones are P0.2's. With
-    `--whole`, the whole build's (`BLAZE_WHOLE_BUILD=1`), which builds and runs programs only:
+    `--whole`, the default owned build, which builds and runs programs only:
     the build and the program, with 0 compiler execs and 0 cargo execs."""
     if a.whole:
         return predicate_a_whole(ctx, a)
@@ -1217,7 +1217,7 @@ def predicate_d(ctx, a):
 
 
 def predicate_e(ctx, a):
-    """P0-E, the whole build on macOS: BLAZE_WHOLE_BUILD=1 builds the projects and their programs
+    """P0-E, the default owned build on macOS: blaze builds the projects and their programs
     print what cargo's do, with 0 `without a rustc symbol`."""
     r = Report("P0-E", "the whole build builds the projects, their programs print what cargo's do, 0 `without a rustc symbol`")
     projects = [(ctx.td, a.package)]
@@ -1634,7 +1634,7 @@ def parse_args(argv):
                    help="P0-A builds and runs the doctests too (the default; --no-doc leaves them out "
                         "for a package that has no library)")
     p.add_argument("--whole", action="store_true",
-                   help="P0-A of the whole build (BLAZE_WHOLE_BUILD=1): the build and the program, 0 compiler and 0 cargo execs")
+                   help="P0-A of the default owned build: the build and the program, 0 compiler and 0 cargo execs")
     p.add_argument("--whole-edit", nargs=3, action="append", metavar=("FILE", "OLD", "NEW"),
                    help="with --whole: an edit built after the cold build (FILE relative to --td); may be repeated")
     p.add_argument("--pairs", type=int, default=20, help="P0-C's edit/undo pairs (20)")

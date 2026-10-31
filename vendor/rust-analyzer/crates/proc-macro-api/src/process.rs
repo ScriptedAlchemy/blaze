@@ -229,6 +229,12 @@ impl ProcMacroServerProcess {
 
     /// Returns the server error if the process has exited.
     pub(crate) fn exited(&self) -> Option<&ServerError> {
+        if self.exited.get().is_none()
+            && let Ok(mut state) = self.state.try_lock()
+            && let Some(error) = state.process.exit_err()
+        {
+            self.exited.get_or_init(|| AssertUnwindSafe(error));
+        }
         self.exited.get().map(|it| &it.0)
     }
 
@@ -404,6 +410,34 @@ impl Process {
     }
 }
 
+/// Every variable a server at `path` started with `extra_env` over this process's has, a
+/// `None` removing one, with what the launcher sets for itself: the one map a server is
+/// started with and its environment is named by ([`crate::ProcMacro::environment_identity`]).
+pub(crate) fn child_environment<'a>(
+    path: &AbsPath,
+    extra_env: impl IntoIterator<
+        Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+    >,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut vars: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    for (key, value) in extra_env {
+        let key = key.as_ref().to_owned();
+        match value {
+            Some(value) => vars.insert(key, value.as_ref().to_owned()),
+            None => vars.remove(&key),
+        };
+    }
+    vars.insert("RUST_ANALYZER_INTERNALS_DO_NOT_USE".into(), "this is unstable".into());
+    if cfg!(windows) {
+        let mut path_var = std::ffi::OsString::new();
+        path_var.push(path.parent().unwrap().parent().unwrap());
+        path_var.push("\\bin;");
+        path_var.push(vars.get(std::ffi::OsStr::new("PATH")).cloned().unwrap_or_default());
+        vars.insert("PATH".into(), path_var);
+    }
+    vars
+}
+
 /// Creates and configures a new child process for the proc-macro server.
 fn mk_child<'a>(
     path: &AbsPath,
@@ -414,26 +448,11 @@ fn mk_child<'a>(
 ) -> io::Result<Child> {
     #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(path);
-    for env in extra_env {
-        match env {
-            (key, Some(val)) => cmd.env(key, val),
-            (key, None) => cmd.env_remove(key),
-        };
-    }
+    cmd.env_clear().envs(child_environment(path, extra_env));
     if let Some(format) = format {
         cmd.arg("--format");
         cmd.arg(format);
     }
-    cmd.env("RUST_ANALYZER_INTERNALS_DO_NOT_USE", "this is unstable")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    if cfg!(windows) {
-        let mut path_var = std::ffi::OsString::new();
-        path_var.push(path.parent().unwrap().parent().unwrap());
-        path_var.push("\\bin;");
-        path_var.push(std::env::var_os("PATH").unwrap_or_default());
-        cmd.env("PATH", path_var);
-    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
     cmd.spawn()
 }

@@ -7,13 +7,15 @@ pub(crate) mod wrapper;
 mod affected;
 mod ancestor;
 mod cli;
-mod client;
+pub(crate) mod client;
 mod messages;
 pub(crate) mod metadata;
 pub(crate) mod own_macro;
 pub(crate) mod own_script;
 mod package;
 pub(crate) mod plan;
+pub(crate) mod producer_image;
+pub(crate) mod producer_plan;
 mod records;
 pub(crate) mod run;
 mod sandboxed;
@@ -35,6 +37,10 @@ use daemon::{Checkout, NotBuilt, Reply, Request};
 pub(crate) use state::configured_env;
 use state::{Built, Counts, Held, Staged, State};
 pub(crate) use units::Record;
+
+pub(crate) fn producer_env_in(env: &[(String, String)]) -> BTreeMap<String, String> {
+    cli::producer_env_in(env)
+}
 
 /// `ra-jit cargo ...`: runs the command and ends with the status cargo would end with.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -229,6 +235,9 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     note("client start", CLIENT, crate::trace::began());
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
+    if let Some(code) = state::owned(asked)? {
+        return Ok(code);
+    }
     let key = asked.key(&cwd);
     let finished = |state: &State| {
         let took = started.elapsed().as_secs_f64();
@@ -269,11 +278,6 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             }
         }
         Err(unread) => {
-            if whole::asked_for(asked)
-                && let Some(code) = whole::build(asked)?
-            {
-                return Ok(code);
-            }
             if let Some(why) = unread {
                 say::cargo_builds(why, "building with cargo", say::COLD);
             }
@@ -607,10 +611,66 @@ fn asking(checkout: &Checkout) -> Checkout {
             || name == "RA_JIT_STATS"
             || name == "RA_JIT_TRACE"
     };
-    let mut env: BTreeMap<String, String> =
-        std::env::vars().filter(|(name, _)| !wraps(name)).collect();
-    env.extend(checkout.env.clone());
-    Checkout { env, ..checkout.clone() }
+    let native_env = crate::process::Native::of(
+        crate::process::native()
+            .vars()
+            .filter(|(name, _)| name.to_str().is_none_or(|name| !wraps(name))),
+    )
+    .over(checkout.env.iter().map(|(k, v)| (k.into(), v.into())));
+    let env = crate::process::unicode(native_env.vars()).collect();
+    Checkout { env, native_env: Some(native_env), ..checkout.clone() }
+}
+
+#[cfg(all(test, unix))]
+mod request_tests {
+    use super::*;
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    #[test]
+    fn native_requests_do_not_restore_filtered_wrapper_variables() {
+        let control = [wrapper::DRIVEN, switch::VARIABLE, "RA_JIT_STATS", "RA_JIT_TRACE"];
+        let byte_value = OsString::from_vec(vec![0xff, b'v']);
+        let byte_name = OsString::from_vec(vec![0xff, b'k']);
+        let _scope = crate::process::enter_native(crate::process::Native::of(
+            control.iter().map(|name| ((*name).into(), "control".into())).chain([
+                ("PLAIN".into(), "caller".into()),
+                ("EMPTY".into(), OsString::new()),
+                ("BYTE_VALUE".into(), byte_value.clone()),
+                (byte_name.clone(), "native-key".into()),
+            ]),
+        ));
+        let checkout = Checkout {
+            key: String::new(),
+            generation: 0,
+            built_at: 0,
+            config: daemon::WorkerConfig {
+                repository: Default::default(),
+                project: Default::default(),
+                cfg_test: false,
+                selection: Default::default(),
+                env: BTreeMap::new(),
+                whole: false,
+            },
+            root: Default::default(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            env: BTreeMap::from([("PLAIN".into(), "checkout".into())]),
+            native_env: None,
+            scripts: None,
+        };
+        let request = asking(&checkout);
+        let native: BTreeMap<_, _> = request.native_env.unwrap().vars().collect();
+        for name in control {
+            assert!(!request.env.contains_key(name));
+            assert!(!native.contains_key(std::ffi::OsStr::new(name)), "restored {name}");
+        }
+        assert_eq!(request.env["PLAIN"], "checkout");
+        assert_eq!(native[std::ffi::OsStr::new("PLAIN")], "checkout");
+        assert_eq!(native[std::ffi::OsStr::new("EMPTY")], "");
+        assert_eq!(native[std::ffi::OsStr::new("BYTE_VALUE")], byte_value);
+        assert_eq!(native[&byte_name], "native-key");
+        assert!(!request.env.contains_key("BYTE_VALUE"));
+    }
 }
 
 /// Tells the daemon to load `checkout` as cargo just built it, starting one when there is

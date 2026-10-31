@@ -400,8 +400,9 @@ pub fn skip_slow_tests() -> bool {
     if should_skip {
         eprintln!("ignoring slow test");
     } else {
-        let path = target_dir().join(".slow_tests_cookie");
-        fs::write(path, ".").unwrap();
+        let target = target_dir();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(".slow_tests_cookie"), ".").unwrap();
     }
     should_skip
 }

@@ -87,7 +87,15 @@ fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
     expect.assert_eq(&errors);
 }
 
-fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, mut expect: Expect) {
+fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+    check_with_setup(ra_fixture, expect, |_| {});
+}
+
+fn check_with_setup(
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    mut expect: Expect,
+    setup: impl FnOnce(&mut TestDB),
+) {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
 
     let extra_proc_macros = vec![(
@@ -106,7 +114,8 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         },
     )];
 
-    let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
+    let mut db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
+    setup(&mut db);
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let source = def_map.module(&db, def_map.root).definition_source(&db);

@@ -1059,6 +1059,29 @@ impl StoreDir {
         Ok(verified)
     }
 
+    /// The digest of every value of every sealed pack, with its key on disk and its length, in
+    /// the order of the keys: what two stores are compared by. A key two stores both hold with
+    /// one digest holds the same entry in both; a key in one only is a key the other's build
+    /// did not make; a key with two digests is code that is not the same. Changes nothing.
+    pub fn digests(&self) -> io::Result<Vec<([u8; KEY], u32, [u8; 32])>> {
+        let mut all = Vec::new();
+        for name in self.names()? {
+            if !is_pack(&name) {
+                continue;
+            }
+            let pack = self.read(&name)?;
+            let index = Pack::verify(&name, &pack).map_err(io::Error::other)?;
+            let blocks = index.unpack_all(&pack).map_err(io::Error::other)?;
+            for entry in &index.entries {
+                let value = entry.value(&blocks);
+                all.push((entry.key, entry.len, Sha256::digest(value).into()));
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        Ok(all)
+    }
+
     /// Collects garbage: seals what ended daemons left open, removes what never got its
     /// name, makes one pack of the many small ones, and removes the packs that have gone
     /// unused the longest until the rest take no more than `limit` bytes.
@@ -1416,10 +1439,6 @@ impl Store {
 
     pub fn producer(&self) -> [u8; KEY] {
         self.identity.0
-    }
-
-    pub fn disk_key(&self, key: &[u8; KEY]) -> [u8; KEY] {
-        self.identity.key(key)
     }
 
     /// Publication barrier after every compiler writer has joined. Errors remain
@@ -1802,6 +1821,12 @@ impl Store {
         }
     }
 
+    /// The key `key` is kept under on disk: the one `insert` and `get` use, with this store's
+    /// identity in it. Two machines of one build agree on it exactly when they agree on `key`.
+    pub fn disk_key(&self, key: &[u8; KEY]) -> [u8; KEY] {
+        self.identity.key(key)
+    }
+
     /// How many functions were found, and how many were not, since the last call.
     pub fn take_counts(&self) -> (usize, usize) {
         (self.hits.swap(0, Ordering::Relaxed), self.misses.swap(0, Ordering::Relaxed))
@@ -2134,6 +2159,25 @@ mod tests {
         assert!(files(&dir, Kind::Open).is_empty());
         assert!(files(&dir, Kind::Temporary).is_empty());
         assert_eq!(open(&dir, EAGER).get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn digests_name_values_and_refuse_corrupt_packs() {
+        let dir = scratch("digests");
+        let store = open(&dir, EAGER);
+        store.insert(&[1; KEY], b"one");
+        store.insert(&[2; KEY], b"two");
+        store.flush();
+        let mut expected = vec![
+            (store.disk_key(&[1; KEY]), 3, Sha256::digest(b"one").into()),
+            (store.disk_key(&[2; KEY]), 3, Sha256::digest(b"two").into()),
+        ];
+        expected.sort_unstable();
+        assert_eq!(StoreDir::at(&dir).digests().unwrap(), expected);
+        let pack = files(&dir, Kind::Pack).remove(0);
+        change(&pack, |bytes| bytes[0] ^= 1);
+        assert!(StoreDir::at(&dir).digests().is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

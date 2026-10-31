@@ -37,6 +37,18 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool;
+
+    /// Content identity of the loaded producer, when the loader can supply it.
+    /// Consumers must not substitute an mtime or erase machine-observable inputs.
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// The digest of the whole environment of the process that expands, which a macro can
+    /// read without asking: what it expands to is kept only under it. `None` when unknown.
+    fn environment_identity(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 impl PartialEq for dyn ProcMacroExpander {

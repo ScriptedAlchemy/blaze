@@ -32,6 +32,7 @@ intern.workspace = true
 postcard.workspace = true
 semver.workspace = true
 rayon.workspace = true
+sha2 = "0.10"
 
 [features]
 in-rust-tree = ["proc-macro-srv", "proc-macro-srv/in-rust-tree"]

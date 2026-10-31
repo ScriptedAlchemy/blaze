@@ -7,7 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeMap, ffi::OsString};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+};
 
 use anyhow::{Context, bail};
 use hir::Crate;
@@ -21,14 +24,24 @@ pub(crate) mod split;
 /// The request's linker environment, captured once per operation. Clearing the command's
 /// environment also honors variables absent in a request; process-global mutation would
 /// race detached links and scripts.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+
+impl std::fmt::Debug for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Environment").field("names", &self.0.keys().collect::<Vec<_>>()).finish()
+    }
+}
 
 impl Environment {
     pub(crate) fn of(db: &RootDatabase) -> Self {
         let vars = match base_db::ProcessEnv::try_get(db) {
-            Some(env) => env.vars(db).iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            None => std::env::vars_os().collect(),
+            Some(env) => crate::process::native()
+                .vars()
+                .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
+                .chain(env.vars(db).iter().map(|(k, v)| (k.into(), v.into())))
+                .collect(),
+            None => crate::process::native().vars().collect(),
         };
         Self(vars)
     }
@@ -47,6 +60,46 @@ mod environment_tests {
     use super::*;
 
     #[test]
+    fn command_diagnostics_never_render_request_environment_values() {
+        let secret = "not-a-real-token-c4-regression";
+        let env = Environment(
+            [("PRIVATE_TOKEN".into(), secret.into()), ("PATH".into(), "/private/path".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut command = Command::new("cc");
+        env.apply(&mut command);
+        command.args(["-o", "/output/program", "/input/object.o"]);
+        let shown = diagnostic_command(&command);
+        assert!(shown.contains("cc") && shown.contains("/input/object.o"));
+        assert!(!shown.contains(secret) && !shown.contains("/private/path"));
+        assert!(!format!("{env:?}").contains(secret));
+        assert!(format!("{env:?}").contains("PRIVATE_TOKEN"));
+        assert_eq!(
+            command.get_envs().find(|(name, _)| *name == "PRIVATE_TOKEN").unwrap().1,
+            Some(std::ffi::OsStr::new(secret)),
+            "redaction must not change the child environment"
+        );
+    }
+
+    #[test]
+    fn described_native_environment_is_complete_and_keeps_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"/producer/out-\xff".to_vec());
+        let unit = crate::native_inputs::NativeUnit {
+            env: [("OUT_DIR".into(), raw)].into(),
+            flags: Vec::new(),
+        };
+        let env = Environment(unit.env.clone());
+        let mut command = crate::process::printenv_for_test();
+        command.env("BLAZE_LINK_LEAK", "worker");
+        env.apply(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"OUT_DIR=/producer/out-\xff\n");
+    }
+
+    #[test]
     fn a_link_command_retains_its_request_and_unsets_worker_variables() {
         let mut db = RootDatabase::default();
         let request =
@@ -56,13 +109,48 @@ mod environment_tests {
         base_db::set_process_env(&mut db, request("b"));
         let second = Environment::of(&db);
         for (env, want) in [(first, "a"), (second, "b")] {
-            let mut command = Command::new("/usr/bin/printenv");
+            let mut command = crate::process::printenv_for_test();
             command.env("BLAZE_LINK_LEAK", "worker");
             env.apply(&mut command);
             let output = command.output().unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("LIBRARY_PATH={want}\n"));
         }
+    }
+
+    #[test]
+    fn detached_link_snapshots_keep_native_bytes_after_the_operation_turns() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut db = RootDatabase::default();
+        base_db::set_process_env(
+            &mut db,
+            [("SOURCE".to_owned(), "same".to_owned())].into_iter().collect(),
+        );
+        let capture = |byte| {
+            let _native = crate::process::enter_native(crate::process::Native::of([(
+                "BYTE_VALUE".into(),
+                OsString::from_vec(vec![0xff, byte]),
+            )]));
+            Environment::of(&db)
+        };
+        let first = capture(b'a');
+        let second = capture(b'b');
+        std::thread::scope(|scope| {
+            for (env, byte) in [(first, b'a'), (second, b'b')] {
+                scope.spawn(move || {
+                    let mut command = crate::process::printenv_for_test();
+                    env.apply(&mut command);
+                    command.env("SOURCE", "same");
+                    let output = command.output().unwrap();
+                    let want = [
+                        b'B', b'Y', b'T', b'E', b'_', b'V', b'A', b'L', b'U', b'E', b'=', 0xff,
+                        byte, b'\n',
+                    ];
+                    assert!(output.status.success());
+                    assert!(output.stdout.windows(want.len()).any(|it| it == want));
+                });
+            }
+        });
     }
 }
 
@@ -83,18 +171,20 @@ pub(crate) fn executable(
     let mut listed = exe.as_os_str().to_owned();
     listed.push(".exports");
     let listed = PathBuf::from(listed);
-    let (text, arg) = if line.apple {
+    let (text, flag) = if line.apple {
         let text: String = exports.iter().map(|it| format!("_{it}\n")).collect();
-        (text, format!("-Wl,-exported_symbols_list,{}", listed.display()))
+        (text, "-exported_symbols_list")
     } else {
         let text: String = exports.iter().map(|it| format!("  {it};\n")).collect();
-        (
-            format!("{{\n global:\n{text} local: *;\n}};\n"),
-            format!("-Wl,--version-script={}", listed.display()),
-        )
+        (format!("{{\n global:\n{text} local: *;\n}};\n"), "--version-script")
     };
     std::fs::write(&listed, text).with_context(|| format!("writing {}", listed.display()))?;
-    line.after.push(arg);
+    line.after.extend([
+        OsString::from("-Xlinker"),
+        OsString::from(flag),
+        OsString::from("-Xlinker"),
+        listed.as_os_str().to_owned(),
+    ]);
     let took = line.link(objects, exe);
     _ = std::fs::remove_file(&listed);
     took
@@ -126,8 +216,9 @@ pub(crate) fn native_command(
     program: &[Crate],
     sysroot: Option<&Path>,
     exe: &Path,
+    shared: bool,
 ) -> anyhow::Result<(String, Environment)> {
-    let line = Line::of(db, program, sysroot, false)?;
+    let line = Line::of(db, program, sysroot, shared)?;
     let command = command_of(&line, &[], exe, CommandPurpose::NativeInputs)?;
     Ok((command, line.env))
 }
@@ -143,16 +234,23 @@ fn command_of(
     exe: &Path,
     purpose: CommandPurpose,
 ) -> anyhow::Result<String> {
-    let mut args = vec!["cc".to_owned()];
+    anyhow::ensure!(
+        std::iter::once(exe.as_os_str())
+            .chain(objects.iter().map(|path| path.as_os_str()))
+            .chain(line.before.iter().chain(&line.after).map(OsString::as_os_str))
+            .all(|arg| arg.to_str().is_some()),
+        "the legacy shell link command cannot represent a native argument"
+    );
+    let mut args = vec![OsString::from("cc")];
     args.extend(line.before.iter().cloned());
     for &object in objects {
-        let path = object.display().to_string();
+        let path = object.as_os_str().to_owned();
         // An object the build has yet to write is none.
         if object.exists() && split::is_archive(&leading_bytes(object)?) {
             args.extend([
-                "-Wl,--whole-archive".to_owned(),
+                OsString::from("-Wl,--whole-archive"),
                 path,
-                "-Wl,--no-whole-archive".to_owned(),
+                OsString::from("-Wl,--no-whole-archive"),
             ]);
         } else {
             args.push(path);
@@ -162,16 +260,21 @@ fn command_of(
     if let CommandPurpose::WholeLink = purpose {
         let splices = crate::cargo::plan::whole_link_args(line.apple, exe)
             .with_context(|| format!("writing what the link of {} asks for", exe.display()))?;
-        args.extend(splices);
+        args.extend(splices.into_iter().map(OsString::from));
     }
-    args.extend(["-o".to_owned(), exe.display().to_string()]);
-    shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
+    args.extend([OsString::from("-o"), exe.as_os_str().to_owned()]);
+    let args = args
+        .iter()
+        .map(|arg| arg.to_str())
+        .collect::<Option<Vec<_>>>()
+        .context("the legacy shell link command cannot represent a native argument")?;
+    shlex::try_join(args).context("a link argument has a NUL in it")
 }
 
 /// The arguments `cc` links the program of some crates with, around its objects.
 pub(crate) struct Line {
-    before: Vec<String>,
-    after: Vec<String>,
+    before: Vec<OsString>,
+    after: Vec<OsString>,
     apple: bool,
     env: Environment,
 }
@@ -189,21 +292,30 @@ impl Line {
         if !target.apple
             && let Some(gcc_ld) = sysroot.and_then(lld_dir)
         {
-            before.extend([format!("-B{}", gcc_ld.display()), "-fuse-ld=lld".to_owned()]);
+            let mut directory = OsString::from("-B");
+            directory.push(gcc_ld);
+            before.extend([directory, OsString::from("-fuse-ld=lld")]);
         }
-        before.extend(target.leading());
-        let native = native(db, program, &target);
+        before.extend(target.leading().into_iter().map(OsString::from));
+        let native = native(db, program, &target)?;
         let mut after = native.search;
         for lib in &native.libs {
-            after.extend(target.lib(lib));
+            after.extend(target.lib(lib).into_iter().map(OsString::from));
         }
         after.extend(native.args);
-        after.extend(target.trailing());
-        Ok(Line { before, after, apple: target.apple, env: Environment::of(db) })
+        after.extend(target.trailing().into_iter().map(OsString::from));
+        Ok(Line {
+            before,
+            after,
+            apple: target.apple,
+            env: match crate::native_inputs::native_unit_for_crate(db, first.into())? {
+                Some(unit) => Environment(unit.env.clone()),
+                None => Environment::of(db),
+            },
+        })
     }
 
-    /// Links `objects` into the executable `exe`. How long `cc` took.
-    pub(crate) fn link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
+    fn invocation(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Command> {
         let mut cmd = Command::new("cc");
         self.env.apply(&mut cmd);
         cmd.args(&self.before);
@@ -215,20 +327,35 @@ impl Line {
             }
         }
         cmd.args(&self.after).arg("-o").arg(exe);
-        eprintln!("link line: {cmd:?}");
+        Ok(cmd)
+    }
+
+    /// Links `objects` into the executable `exe`. How long `cc` took.
+    pub(crate) fn link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
+        let mut cmd = self.invocation(objects, exe)?;
+        let shown = diagnostic_command(&cmd);
+        eprintln!("link line: {shown}");
         let start = Instant::now();
-        let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+        let ran = cmd.output().with_context(|| format!("running {shown}"))?;
         if !ran.status.success() {
             bail!(
-                "the link of {} failed ({}):\n{:?}\n{}",
+                "the link of {} failed ({}):\n{}\n{}",
                 exe.display(),
                 ran.status,
-                cmd,
+                shown,
                 String::from_utf8_lossy(&ran.stderr)
             );
         }
         Ok(start.elapsed())
     }
+}
+
+/// Command's Debug includes all explicitly supplied environment values. A link
+/// diagnostic needs its argv, not credentials from the calling build request.
+fn diagnostic_command(command: &Command) -> String {
+    let mut argv = Command::new(command.get_program());
+    argv.args(command.get_args());
+    format!("{argv:?}")
 }
 
 /// The first bytes of the file at `path`, which tell an archive from an object.
@@ -270,16 +397,16 @@ pub(crate) fn lld_dir(sysroot: &Path) -> Option<PathBuf> {
 #[derive(Default)]
 struct Native {
     /// Where the libraries are looked for: `-L` and `-F`.
-    search: Vec<String>,
+    search: Vec<OsString>,
     libs: Vec<NativeLib>,
     /// What the build scripts of the program's packages give the linker as it is.
-    args: Vec<String>,
+    args: Vec<OsString>,
 }
 
 /// The native libraries of the crates `program` links, as rustc orders them: a crate's before
 /// those of the crates it depends on, each crate's in the order written and then those its
 /// build script asked for, and each library last where it is asked for more than once.
-fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
+fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> anyhow::Result<Native> {
     let mut seen = FxHashSet::default();
     let mut order = Vec::new();
     let unlinked = crate::unlinked_panic_runtime(db, program);
@@ -294,7 +421,7 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
             .flat_map(|(_, module)| module.scope(db).extern_blocks())
             .flat_map(|block| AttrFlags::native_libs(db, block).iter().cloned());
         native.libs.extend(attributes.collect::<Vec<_>>());
-        let asked = asked_by_script(db, krate, target);
+        let asked = asked_by_script(db, krate, target)?;
         native.libs.extend(asked.libs);
         native.search.extend(asked.search);
         // As cargo has it: a script's arguments are for its own package's targets.
@@ -308,24 +435,31 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
     native.libs.reverse();
     let mut searched = FxHashSet::default();
     native.search.retain(|it| searched.insert(it.clone()));
-    native
+    Ok(native)
 }
 
 /// What the build script of `krate`'s package printed for the link, as cargo passes it to
 /// rustc: `rustc-link-lib`, `rustc-link-search`, `rustc-flags` and `rustc-link-arg`.
-fn asked_by_script(db: &RootDatabase, krate: base_db::Crate, target: &Target) -> Native {
+fn asked_by_script(
+    db: &RootDatabase,
+    krate: base_db::Crate,
+    target: &Target,
+) -> anyhow::Result<Native> {
+    if let Some(unit) = crate::native_inputs::native_unit_for_crate(db, krate)? {
+        return native_flags(&unit.flags, target);
+    }
     let mut asked = Native::default();
-    let Some(out_dir) = krate.env(db).get("OUT_DIR") else { return asked };
+    let Some(out_dir) = krate.env(db).get("OUT_DIR") else { return Ok(asked) };
     let printed = crate::cargo::script::printed(Path::new(&out_dir));
-    let Some(Ok(printed)) = printed.map(std::fs::read_to_string) else { return asked };
+    let Some(Ok(printed)) = printed.map(std::fs::read_to_string) else { return Ok(asked) };
     for line in printed.lines() {
         let Some(line) = line.strip_prefix("cargo:") else { continue };
         let line = line.strip_prefix(':').unwrap_or(line);
         let Some((key, value)) = line.split_once('=') else { continue };
         match key {
             "rustc-link-lib" => asked.libs.extend(lib_of(value)),
-            "rustc-link-search" => asked.search.extend(target.search(value)),
-            "rustc-link-arg" | "rustc-link-arg-bins" => asked.args.push(value.to_owned()),
+            "rustc-link-search" => asked.search.extend(target.search(value).map(OsString::from)),
+            "rustc-link-arg" | "rustc-link-arg-bins" => asked.args.push(value.into()),
             "rustc-flags" => {
                 let mut flags = value.split_whitespace();
                 while let Some(flag) = flags.next() {
@@ -333,7 +467,7 @@ fn asked_by_script(db: &RootDatabase, krate: base_db::Crate, target: &Target) ->
                     let rest = if rest.is_empty() { flags.next().unwrap_or("") } else { rest };
                     match kind {
                         "-l" => asked.libs.extend(lib_of(rest)),
-                        "-L" => asked.search.extend(target.search(rest)),
+                        "-L" => asked.search.extend(target.search(rest).map(OsString::from)),
                         _ => {}
                     }
                 }
@@ -341,7 +475,65 @@ fn asked_by_script(db: &RootDatabase, krate: base_db::Crate, target: &Target) ->
             _ => {}
         }
     }
-    asked
+    Ok(asked)
+}
+
+fn native_flags(flags: &[OsString], target: &Target) -> anyhow::Result<Native> {
+    let mut asked = Native::default();
+    let mut at = 0;
+    while at < flags.len() {
+        let bytes = flags[at].as_encoded_bytes();
+        at += 1;
+        let mut value = |prefix: &[u8]| -> anyhow::Result<OsString> {
+            let rest = &bytes[prefix.len()..];
+            if !rest.is_empty() {
+                return native_argument(rest);
+            }
+            let value = flags.get(at).context("native Rust flag needs a value")?.clone();
+            at += 1;
+            Ok(value)
+        };
+        if bytes.starts_with(b"-L") {
+            asked.search.extend(target.search_native(&value(b"-L")?)?);
+        } else if bytes.starts_with(b"-l") {
+            let value = value(b"-l")?;
+            let value = value.to_str().context("native library name is not UTF-8")?;
+            asked
+                .libs
+                .push(lib_of(value).with_context(|| {
+                    format!("unsupported native library specification {value}")
+                })?);
+        } else if bytes.starts_with(b"-C") {
+            let value = value(b"-C")?;
+            let option = value.as_encoded_bytes();
+            let option = option.strip_prefix(b"=").unwrap_or(option);
+            if let Some(value) = option.strip_prefix(b"link-arg=") {
+                asked.args.push(native_argument(value)?);
+            } else if let Some(value) = option.strip_prefix(b"link-args=") {
+                asked.args.extend(
+                    value
+                        .split(u8::is_ascii_whitespace)
+                        .filter(|word| !word.is_empty())
+                        .map(native_argument)
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                );
+            }
+        }
+    }
+    Ok(asked)
+}
+
+fn native_argument(bytes: &[u8]) -> anyhow::Result<OsString> {
+    anyhow::ensure!(!bytes.contains(&0), "native link argument contains a NUL");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(String::from_utf8(bytes.to_vec())?.into())
+    }
 }
 
 /// The library `-l` names: `[KIND[:MODIFIERS]=]NAME[:RENAME]`.
@@ -481,6 +673,30 @@ impl Target {
         }
     }
 
+    fn search_native(&self, spec: &OsStr) -> anyhow::Result<Option<OsString>> {
+        let bytes = spec.as_encoded_bytes();
+        let (kind, path) = match bytes.iter().position(|byte| *byte == b'=') {
+            Some(at)
+                if matches!(
+                    &bytes[..at],
+                    b"dependency" | b"crate" | b"native" | b"framework" | b"all"
+                ) =>
+            {
+                (&bytes[..at], &bytes[at + 1..])
+            }
+            _ => (b"all".as_slice(), bytes),
+        };
+        let prefix = match kind {
+            b"native" | b"all" => "-L",
+            b"framework" if self.apple => "-F",
+            b"framework" => "-L",
+            _ => return Ok(None),
+        };
+        let mut arg = OsString::from(prefix);
+        arg.push(native_argument(path)?);
+        Ok(Some(arg))
+    }
+
     /// The rest of rustc's arguments: what is not reached is left out, and nothing is linked
     /// that the crates did not ask for.
     fn trailing(&self) -> Vec<String> {
@@ -514,6 +730,94 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn native_flags_reach_the_link_command_without_text_projection() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let target = Target { apple: false, arch: "x86_64".into(), shared: false };
+        let raw = OsString::from_vec(b"/producer/out-\xff, space".to_vec());
+        let mut link_arg = OsString::from("link-arg=");
+        link_arg.push(&raw);
+        let flags = vec![
+            "-L".into(),
+            raw.clone(),
+            "-lstatic=one".into(),
+            "-l".into(),
+            "two".into(),
+            "-C".into(),
+            link_arg,
+        ];
+        let native = native_flags(&flags, &target).unwrap();
+        let mut after = native.search;
+        for library in native.libs {
+            after.extend(target.lib(&library).into_iter().map(OsString::from));
+        }
+        after.extend(native.args);
+        let line = Line {
+            before: Vec::new(),
+            after,
+            apple: false,
+            env: Environment([("OUT_DIR".into(), raw.clone())].into()),
+        };
+        let command = line.invocation(&[], Path::new("program")).unwrap();
+        let args: Vec<_> = command.get_args().map(OsStr::as_bytes).collect();
+        assert_eq!(
+            args,
+            vec![
+                b"-L/producer/out-\xff, space".as_slice(),
+                b"-Wl,-Bstatic",
+                b"-lone",
+                b"-Wl,-Bdynamic",
+                b"-ltwo",
+                raw.as_bytes(),
+                b"-o",
+                b"program"
+            ]
+        );
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            vec![(OsStr::new("OUT_DIR"), Some(raw.as_os_str()))]
+        );
+        assert!(
+            command_of(&line, &[], Path::new("program"), CommandPurpose::NativeInputs).is_err()
+        );
+    }
+
+    #[test]
+    fn frontend_flags_do_not_change_the_native_library_order() {
+        let target = Target { apple: false, arch: "x86_64".into(), shared: false };
+        let flags: Vec<OsString> = [
+            "--cfg",
+            "feature=\"demo\"",
+            "-Copt-level=2",
+            "-Lnative=/one",
+            "-L",
+            "dependency=/rust-only",
+            "-l",
+            "static=first",
+            "-ldylib=second",
+            "-Clink-arg=-Wl,--as-needed",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let native = native_flags(&flags, &target).unwrap();
+        assert_eq!(native.search, vec![OsString::from("-L/one")]);
+        assert_eq!(
+            native.libs.iter().map(|library| library.name.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(native.args, vec![OsString::from("-Wl,--as-needed")]);
+    }
+
+    #[test]
+    fn invalid_exact_native_flags_do_not_disappear() {
+        let target = Target { apple: false, arch: "x86_64".into(), shared: false };
+        for flags in [vec!["-L".into()], vec!["-lunknown-kind=library".into()], vec!["-C".into()]] {
+            assert!(native_flags(&flags, &target).is_err());
+        }
+    }
 
     #[test]
     fn a_scripts_libraries_are_read_as_rustc_reads_them() {

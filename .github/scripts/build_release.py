@@ -43,8 +43,8 @@ With `--server` the ra-jit just built builds blaze's proc-macro server (`vendor/
 docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
 proc-macro libraries ra-jit links, found beside ra-jit (`RA_JIT_PROC_MACRO_SERVER=1`). It is
 built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so it speaks the
-bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
-toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
+bridge of the libraries that ra-jit compiles. Its protocol uses public Serde visitors, and
+bootstrap disables expansion servers rather than borrowing a previous server.
 Linux only, where ra-jit links proc-macro libraries so far.
 
 On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
@@ -297,11 +297,19 @@ def proc_macro_server(ra_jit, out):
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
         env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_CACHE=str(Path(work) / "store"),
-                   RA_JIT_STD_FROM="off", RUST_BACKTRACE="0")
+                   RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0")
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
-        run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
-             "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env)
+        built = run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
+                     "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env,
+                    capture_output=True, text=True)
+        sys.stdout.write(built.stdout)
+        sys.stderr.write(built.stderr)
+        missing = re.findall(r"^linked .* in \S+, (\d+) functions in it ra-jit could not compile$",
+                             built.stderr, re.M)
+        if not missing or any(int(count) != 0 for count in missing):
+            exe.unlink(missing_ok=True)
+            sys.exit("error: build_release: the owned proc-macro server is not completely compiled")
     said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
                           env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
     print(f"build_release: {said.stdout.strip()} as {exe}, built by ra-jit in {time.monotonic() - start:.1f} s",

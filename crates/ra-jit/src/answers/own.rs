@@ -2,7 +2,7 @@
 //! the targets that release has: no rustc runs. The data of each release is what that rustc
 //! printed for every target ra-jit has (`harness/answers.py --write`), and the cfgs that follow
 //! from the arguments are added here, as rustc adds them. A question this does not understand
-//! whole is answered `None`, and rustc is asked.
+//! whole is answered `None`, and the caller reports a named gap without running rustc.
 
 use std::{
     collections::BTreeMap,
@@ -64,21 +64,54 @@ impl Toolchain {
     fn of(rustc: &Path) -> Option<Toolchain> {
         let sysroot = rustc.parent()?.parent()?.to_owned();
         let lib = sysroot.join("lib");
-        let has_driver = std::fs::read_dir(&lib).ok()?.flatten().any(|it| {
-            it.file_name().to_str().is_some_and(|name| name.starts_with("librustc_driver-"))
-        });
-        if !has_driver {
+        if !is_compiler(rustc) {
             return None;
         }
         let rustlib = lib.join("rustlib");
-        let host = std::fs::read_dir(&rustlib).ok()?.flatten().find_map(|it| {
-            it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
-        })?;
-        let manifest =
-            std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml")).ok()?;
-        let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
-        let (version, _) = rest.split_once('"')?;
-        let release = releases().iter().find(|it| it.version == version)?;
+        let entries =
+            std::fs::read_dir(&rustlib).ok()?.collect::<std::io::Result<Vec<_>>>().ok()?;
+        let mut hosts: Vec<_> = entries
+            .iter()
+            .filter_map(|it| {
+                it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
+            })
+            .collect();
+        if hosts.is_empty() {
+            // Component-composed installations can omit rustup's channel files.
+            // rust-lld belongs to the compiler's host component, not target std.
+            hosts = entries
+                .iter()
+                .filter(|it| {
+                    it.path().join("bin/rust-lld").is_file()
+                        || it.path().join("bin/rust-lld.exe").is_file()
+                })
+                .filter_map(|it| it.file_name().into_string().ok())
+                .collect();
+        }
+        let [host] = hosts.as_slice() else { return None };
+        let host = host.clone();
+        let release = match std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml"))
+        {
+            Ok(manifest) => {
+                let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
+                let (version, _) = rest.split_once('"')?;
+                releases().iter().find(|it| it.version == version)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let info =
+                    std::fs::read_to_string(sysroot.join("share/doc/rust/html/version_info.html"))
+                        .ok()?;
+                releases().iter().find(|it| {
+                    let Some((version, revision)) = it.version.split_once(" (") else {
+                        return false;
+                    };
+                    let Some((commit, _)) = revision.split_once(' ') else { return false };
+                    info.contains(&format!("Rust</a> {version}</span>"))
+                        && info.contains(&format!(">{commit}</a>"))
+                })?
+            }
+            Err(_) => return None,
+        };
         Some(Toolchain { sysroot, host, release })
     }
 }
@@ -252,8 +285,76 @@ pub(crate) fn target_cfg(
     cfgs(target, &given, nightly)
 }
 
-pub(super) fn host_tuple(rustc: &Path) -> Option<String> {
+/// Whether `rustc` is a compiler: one with its driver library in the sysroot beside it,
+/// which is how rustc finds its sysroot. A launcher or a proxy has none.
+pub(super) fn is_compiler(rustc: &Path) -> bool {
+    let Some(lib) = rustc.parent().and_then(Path::parent).map(|sysroot| sysroot.join("lib")) else {
+        return false;
+    };
+    std::fs::read_dir(lib).is_ok_and(|entries| {
+        entries.flatten().any(|it| {
+            it.file_name().to_str().is_some_and(|name| name.starts_with("librustc_driver-"))
+        })
+    })
+}
+
+pub(crate) fn host_tuple(rustc: &Path) -> Option<String> {
     Some(Toolchain::of(rustc)?.host)
+}
+
+/// The target facts needed to write an LLVM module. An empty module still needs
+/// the correct data layout and deployment-version triple, even though it has no
+/// machine instructions or referenced symbols.
+pub(super) struct LlvmTarget {
+    pub triple: String,
+    pub data_layout: String,
+    pub has_std: bool,
+}
+
+pub(super) fn llvm_target(
+    sysroot: &Path,
+    tuple: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<LlvmTarget> {
+    let toolchain = Toolchain::of(&sysroot.join("bin/rustc"))?;
+    let target = toolchain.release.targets.get(tuple)?;
+    let spec: serde_json::Value =
+        serde_json::from_str(target.target_spec_json.get(&toolchain.host)?).ok()?;
+    let mut triple = spec["llvm-target"].as_str()?.to_owned();
+    if tuple.ends_with("-apple-darwin") {
+        // The recorded target spec deliberately has no deployment version. The
+        // release's macOS minimum is 10.12 on x86_64 and 11.0 on arm64, and rustc
+        // clamps a lower requested deployment version to that target minimum.
+        let minimum = match spec["arch"].as_str()? {
+            "x86_64" => [10, 12, 0],
+            "aarch64" => [11, 0, 0],
+            _ => return None,
+        };
+        let version = match var("MACOSX_DEPLOYMENT_TARGET") {
+            None => minimum,
+            Some(value) => macos_version(value.to_str()?)?.max(minimum),
+        };
+        triple += &format!("{}.{}.{}", version[0], version[1], version[2]);
+    }
+    Some(LlvmTarget {
+        triple,
+        data_layout: spec["data-layout"].as_str()?.to_owned(),
+        has_std: spec["metadata"]["std"].as_bool()?,
+    })
+}
+
+fn macos_version(value: &str) -> Option<[u16; 3]> {
+    let mut version = [0; 3];
+    for (index, part) in value.split('.').enumerate() {
+        *version.get_mut(index)? = part.parse().ok()?;
+    }
+    Some(version)
+}
+
+/// The release of `rustc` as the first line of its `-V` has it, `1.99.0`, from the
+/// toolchain's records, not from executing it.
+pub(super) fn release(rustc: &Path) -> Option<String> {
+    Some(Toolchain::of(rustc)?.release.version.split_whitespace().next()?.to_owned())
 }
 
 /// Cargo's release version from the installed channel manifest, not from executing it.
@@ -324,17 +425,47 @@ fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>
     Some(cfgs)
 }
 
-/// The variables rustc reads for a question that ra-jit answers only when unset.
-const UNSET: [&str; 8] = [
+/// Overrides not yet modelled by the owned query answers. SDKROOT and a valid
+/// MACOSX_DEPLOYMENT_TARGET do not alter release, cfg, filename or spec prints.
+/// Deployment-sensitive code generation and `--print deployment-target` stay
+/// separately modelled operations, never compiler-query fallbacks.
+const UNSET: [&str; 6] = [
     "RUSTC_OVERRIDE_VERSION_STRING",
     "RUST_TARGET_PATH",
-    "SDKROOT",
-    "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
     "TVOS_DEPLOYMENT_TARGET",
     "WATCHOS_DEPLOYMENT_TARGET",
     "XROS_DEPLOYMENT_TARGET",
 ];
+
+/// rustc validates a Darwin deployment version when constructing the target, but
+/// version-only requests do not construct a target. Never echo the variable's value.
+pub(super) fn deployment_error(
+    rustc: &Path,
+    args: &[OsString],
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<String> {
+    let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
+    let given = Given::of(&args)?;
+    if given.prints.is_empty() {
+        return None;
+    }
+    let toolchain = Toolchain::of(rustc)?;
+    if !given.target.unwrap_or(&toolchain.host).ends_with("-apple-darwin") {
+        return None;
+    }
+    let value = var("MACOSX_DEPLOYMENT_TARGET")?;
+    let value = value.to_str()?;
+    for part in value.splitn(3, '.') {
+        if let Err(error) = part.parse::<u16>() {
+            return Some(format!(
+                "error: failed to parse deployment target specified in MACOSX_DEPLOYMENT_TARGET: {error}\n\n\
+                 error: aborting due to 1 previous error\n\n"
+            ));
+        }
+    }
+    None
+}
 
 /// The cfgs rustc sets itself, which it refuses as `--cfg`, by name or by what it starts with.
 const BUILTIN_CFGS: [&str; 13] = [
@@ -382,6 +513,9 @@ pub(super) fn answer(
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<Vec<u8>> {
     if UNSET.iter().any(|it| var(it).is_some()) {
+        return None;
+    }
+    if deployment_error(rustc, args, var).is_some() {
         return None;
     }
     let nightly = match var("RUSTC_BOOTSTRAP") {
@@ -465,6 +599,34 @@ pub(super) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llvm_targets_use_owned_layouts_and_macos_deployment_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::answers::tests::synthetic_toolchain(dir.path());
+        for (tuple, base, default) in [
+            ("x86_64-apple-darwin", "x86_64-apple-macosx", "10.12.0"),
+            ("aarch64-apple-darwin", "arm64-apple-macosx", "11.0.0"),
+        ] {
+            let target = llvm_target(dir.path(), tuple, &|_| None).unwrap();
+            assert_eq!(target.triple, format!("{base}{default}"));
+            assert!(target.has_std);
+            assert!(target.data_layout.starts_with("e-m:o-"));
+            for (value, expected) in [("10.7", default), ("14", "14.0.0"), ("14.2.1", "14.2.1")] {
+                let var = |name: &str| (name == "MACOSX_DEPLOYMENT_TARGET").then(|| value.into());
+                let target = llvm_target(dir.path(), tuple, &var).unwrap();
+                assert_eq!(target.triple, format!("{base}{expected}"));
+            }
+            for value in ["", "bad", "14.2.3.4", "65536", "14."] {
+                let var = |name: &str| (name == "MACOSX_DEPLOYMENT_TARGET").then(|| value.into());
+                assert!(llvm_target(dir.path(), tuple, &var).is_none(), "{value}");
+            }
+        }
+        let target = llvm_target(dir.path(), "x86_64-unknown-linux-gnu", &|_| None).unwrap();
+        assert_eq!(target.triple, "x86_64-unknown-linux-gnu");
+        assert!(target.data_layout.starts_with("e-m:e-"));
+        assert!(llvm_target(dir.path(), "missing-target", &|_| None).is_none());
+    }
 
     #[test]
     fn cfgs_given() {

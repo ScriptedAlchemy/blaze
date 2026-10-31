@@ -150,6 +150,8 @@ pub(super) struct StableNames<'a, 'db> {
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
+    /// The checkout's directory here, which [`super::CHECKOUT`] stands for.
+    checkout: Option<String>,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
     /// The crates by what a name starts with, and what the ones asked about declare.
     listings: Listings,
@@ -181,6 +183,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
             by_content,
             cargo_home: symbols.cargo_home(),
             library: symbols.library_sources(),
+            checkout: symbols.checkout(),
             files: RefCell::default(),
             listings: Listings::default(),
             crate_names: RefCell::default(),
@@ -397,21 +400,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     /// The name of a file as every machine has it: one of the standard library is where it
-    /// was built, and one that cargo fetched is under [`super::CARGO_HOME`] whoever fetched
-    /// it. `None` for a file that is already named so and is not one of those.
+    /// was built, one that cargo fetched is under [`super::CARGO_HOME`] whoever fetched it, and
+    /// one below the checkout or beside it is under [`super::CHECKOUT`]. `None` for a file that
+    /// is already named so and is not one of those.
     fn stored(&self, path: String) -> Option<String> {
         if let Some(built) = self.library.as_ref().and_then(|it| it.stored(&path)) {
             return Some(built);
         }
-        let home = self.cargo_home.as_deref();
-        if home == Some(super::CARGO_HOME) {
-            return Some(path);
-        }
-        if super::moved(&path, super::CARGO_HOME, "").is_some() {
-            return None;
-        }
-        let there = home.and_then(|home| super::moved(&path, home, super::CARGO_HOME));
-        Some(there.unwrap_or(path))
+        super::relocate::stored_path(&path, self.cargo_home.as_deref(), self.checkout.as_deref())
     }
 
     fn miss<T>(&self, why: &'static str) -> Option<T> {

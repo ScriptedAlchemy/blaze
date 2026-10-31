@@ -949,6 +949,7 @@ fn included_bytes<'db>(
     call_id: MacroCallId,
     path: &str,
 ) -> Option<&'db [u8]> {
+    use salsa::Accumulator as _;
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
     // A file of the VFS that is not UTF-8 is read from disk like one outside it.
@@ -957,7 +958,16 @@ fn included_bytes<'db>(
     {
         return Some(db.file_text(file).text(db).as_bytes());
     }
-    db.included_file(call_id.loc(db).krate, path)?.bytes(db).as_deref()
+    let krate = call_id.loc(db).krate;
+    let file = db.included_file(krate, path)?;
+    // The path is anchored as the input reader resolves it, including files
+    // outside VFS. Accumulate before reading so missing inputs are live too.
+    let root = db.file_source_root(anchor).source_root_id(db);
+    let sources = db.source_root(root).source_root(db);
+    let absolute =
+        paths::native::absolutize(sources.path_for_file(&anchor)?.as_path()?.parent()?, path.path)?;
+    base_db::CurrentIncludedInput { krate, path: absolute }.accumulate(db);
+    file.bytes(db).as_deref()
 }
 
 fn include_str_expand(
@@ -994,6 +1004,29 @@ fn get_env_inner(db: &dyn SourceDatabase, arg_id: MacroCallId, key: &Symbol) -> 
     krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
 }
 
+fn non_unicode_env(
+    db: &dyn SourceDatabase,
+    arg_id: MacroCallId,
+    key: &Symbol,
+    span: Span,
+) -> Option<ExpandError> {
+    let krate = arg_id.loc(db).krate;
+    let env = krate.env(db);
+    let non_unicode = if env.contains_key(key.as_str()) {
+        env.is_non_unicode(key.as_str())
+    } else {
+        base_db::process_env_is_non_unicode(db, key.as_str())
+    };
+    if !non_unicode {
+        return None;
+    }
+    db.env_is_read(krate, key.as_str());
+    Some(ExpandError::other(
+        span,
+        format!("environment variable `{key}` is not a valid Unicode string"),
+    ))
+}
+
 fn env_expand(
     db: &dyn SourceDatabase,
     arg_id: MacroCallId,
@@ -1010,6 +1043,12 @@ fn env_expand(
         }
     };
 
+    if let Some(error) = non_unicode_env(db, arg_id, &key, span) {
+        return ExpandResult::new(
+            tt::TopSubtree::empty(DelimSpan { open: span, close: span }),
+            error,
+        );
+    }
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
         db.env_is_unset(arg_id.loc(db).krate, key.as_str());
@@ -1048,6 +1087,12 @@ fn option_env_expand(
             );
         }
     };
+    if let Some(error) = non_unicode_env(db, arg_id, &key, span) {
+        return ExpandResult::new(
+            tt::TopSubtree::empty(DelimSpan { open: call_site, close: call_site }),
+            error,
+        );
+    }
     let dollar_crate = dollar_crate(call_site);
     let expanded = match get_env_inner(db, arg_id, &key) {
         None => quote! {call_site => #dollar_crate::option::Option::None::<&str> },

@@ -38,10 +38,11 @@ pins ([which LLVM](contributing.md#llvm-for---features-llvm)); with it the crate
 so. `cargo build -p ra-jit --release` is the quicker build the harnesses and CI use while
 working on blaze; it is not what ships.
 
-`cargo blaze` builds with Rust 1.99.0, the release blaze compiles, whatever toolchain the
+`cargo blaze` builds against Rust 1.99.0, the release blaze compiles, whatever toolchain the
 project names (a `rust-toolchain.toml`, `rustup override`, `+toolchain`, `RUSTUP_TOOLCHAIN` or
-rustup's default): it runs cargo, rustc and the daemon under 1.99.0 by naming it in
-`RUSTUP_TOOLCHAIN` and `CARGO`. Rust 1.99.0 builds what older releases built, so a project on
+rustup's default). Eligible Build/Run requests use the default owned compiler route described
+below, reading the installed sysroot and source without executing compiler tools. Remaining
+wrapper paths select 1.99.0 through `RUSTUP_TOOLCHAIN` and `CARGO`. Rust 1.99.0 builds what older releases built, so a project on
 an older stable builds as it is. Code only the project's own toolchain builds (a nightly's
 `#![feature]`, a newer release's library) fails with rustc's error and a note naming both
 releases. Plain `cargo` still builds with the project's toolchain, in the same target
@@ -100,7 +101,74 @@ other subcommand is passed to cargo as typed.
 
 ## What a build does
 
-The first build of a workspace is cargo's own, run with ra-jit as the
+### Program builds
+
+`build` and `run` use blaze's owned whole build by default, for cold builds and edits
+([no-rustc.md](no-rustc.md), step K). This covers default program selection or a named
+`--bin` or `--example`, for at most one target, after the CLI's Cargo-only argument checks.
+Each selected program is built whole, every crate it depends on compiled by blaze over the shipped standard
+library and linked by blaze, and put where cargo puts it (`target/debug/<name>`,
+`target/release/<name>`, `examples/` for an example). No `cargo build` runs. A function the
+program can reach that blaze cannot compile yet fails the build, which says which and why;
+nothing is handed to cargo:
+
+        Building kapp v0.3.1 (/src/k/app)
+        Finished `dev` profile [ra-jit] target(s) in 18.40s
+
+        Building kuses v0.1.0 (/src/k/uses)
+    error: `kuses` can reach functions blaze could not compile, so it is not built:
+      `khalf::halved`: unsupported: f16 and f128
+
+Build scripts are compiled and run by blaze itself (`crates/ra-jit/src/scripts.rs`), with
+no cargo and no rustc: each script and its build dependencies are compiled by blaze from source,
+and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the environment cargo
+1.99 gives it. Host producers, including proc macros and their build dependencies, are
+compiled from the owned source graph. Compiler probes the owned checker cannot decide
+fail the producer build; they do not select a different implementation by reporting a
+negative feature result. A probe is a "no" only for an error rustc certainly reports.
+A type error rust-analyzer finds is one only for a literal where a type written out in the
+source wants a scalar the literal cannot be; any other type error, and any error that rests on
+the types it inferred (a method, field or trait it did not find through them, a match it found
+not exhaustive), may be a coercion or an inference it does not model, so it leaves the probe
+undecided. So does an error of the owned borrow checker, which still reports some rustc does
+not, and a body it did not check, because MIR lowering does not support something in it or an
+error kept the check from being made. An undecided probe is
+refused loudly, naming the probe and why; the producer it belongs to is not built, since no
+answer but rustc's is right. `harness/dist/accepted_probes.py` holds valid probes, with
+coercions, closures, trait objects and generic inference, that rustc accepts and blaze must
+never answer with a "no". Empty library probes, including `autocfg`'s initial standard-library
+check, can emit a real LLVM IR module after complete syntax and attribute validation.
+Nonempty source probes still need the remaining compiler acceptance checks; this empty
+case does not establish general probe or proc-macro-server bootstrap parity.
+A script runs again when cargo 1.99 would run it: for a file it named
+with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
+every build), for a variable it named whose value is another (unset, empty and set are three), for
+any file of its package when it named nothing, for a change to the script, its modules or a
+package it is built with (a file, or a variable `env!` or `option_env!` read there), for the
+output of its last run being gone, and once more for having said other than it did the run before.
+It is run once for a build, with the variables of the process that asks; two builds at once are two. `harness/scriptedits.py` holds
+that to cargo ([harness.md](harness.md)).
+The build is the daemon's: its worker loads the workspace, builds and links the programs, and
+answers once they are linked. The next build asks the same worker, which builds what was
+edited since on what it loaded and links the programs again; a changed manifest or lock file
+has a new worker load the workspace. Each build links its programs into a directory of its own
+under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
+checkout of it, so a build with other features, another profile, another target or other
+flags is the program cargo would have built, not the one another build linked before.
+The worker resolves the build from the original invocation directory, including relative
+`--manifest-path` arguments, not from the workspace root. These linked directories stay until
+the target directory is cleaned while no build uses it; a directory's age does not say whether
+another client is still reading or placing its output.
+
+The former `RA_JIT_WHOLE_BUILD` and `BLAZE_WHOLE_BUILD` switches no longer choose this
+route. Setting either to `0` does not restore a Cargo first build. Library-only builds,
+`test`, `check` and CLI requests outside the program-build selection retain their existing
+paths; the default program route does not establish acceptance for those paths or for all
+programs and platforms.
+
+### Remaining wrapper builds
+
+On the remaining wrapper path, the first build of a workspace is cargo's own, run with ra-jit as the
 `RUSTC_WORKSPACE_WRAPPER`. The wrapper runs rustc exactly as cargo asked and records, for
 each crate of the workspace, the arguments, the files rustc wrote and, for a program, the
 line the linker was run with. Diagnostics, progress and the exit status are cargo's.
@@ -126,46 +194,6 @@ a build took:
     Finished `dev` profile [ra-jit] target(s) in 0.24s
 
 `[ra-jit]` means the daemon built it. A cargo build prints cargo's usual line.
-
-With `RA_JIT_WHOLE_BUILD=1` (or `BLAZE_WHOLE_BUILD=1`), `build` and `run` from nothing are
-blaze's own instead of cargo's ([no-rustc.md](no-rustc.md), step K): each program the build
-asks for is built whole, every crate it depends on compiled by blaze over the shipped standard
-library and linked by blaze, and put where cargo puts it (`target/debug/<name>`,
-`target/release/<name>`, `examples/` for an example). No `cargo build` runs. A function the
-program can reach that blaze cannot compile yet fails the build, which says which and why;
-nothing is handed to cargo:
-
-       Compiling kapp v0.3.1 (/src/k/app)
-        Finished `dev` profile [ra-jit] target(s) in 18.40s
-
-       Compiling kuses v0.1.0 (/src/k/uses)
-    error: `kuses` can reach functions blaze could not compile, so it is not built:
-      `khalf::halved`: unsupported: f16 and f128
-
-Build scripts are compiled and run by blaze itself (`crates/ra-jit/src/scripts.rs`), with
-no cargo and no rustc: each script and its build dependencies are compiled by blaze from source,
-and the script runs in an `OUT_DIR` below `target/ra-jit/build-scripts` with the environment cargo
-1.99 gives it. A build whose graph has a proc macro still has the daemon's load build it with
-cargo's check (`target/rust-analyzer`), which then runs the scripts too (no-rustc step J). A script runs again when cargo 1.99 would run it: for a file it named
-with `rerun-if-changed` that is newer than its last run or is not there (cargo runs such a script
-every build), for a variable it named whose value is another (unset, empty and set are three), for
-any file of its package when it named nothing, for a change to the script, its modules or a
-package it is built with (a file, or a variable `env!` or `option_env!` read there), for the
-output of its last run being gone, and once more for having said other than it did the run before.
-It is run once for a build, with the variables of the process that asks; two builds at once are two. `harness/scriptedits.py` holds
-that to cargo ([harness.md](harness.md)). A build of libraries alone and `test` are as without the
-setting.
-The build is the daemon's: its worker loads the workspace, builds and links the programs, and
-answers once they are linked. The next build asks the same worker, which builds what was
-edited since on what it loaded and links the programs again; a changed manifest or lock file
-has a new worker load the workspace. Each build links its programs into a directory of its own
-under `target/ra-jit/whole/<key>`, `<key>` being the build's own as the daemon names the
-checkout of it, so a build with other features, another profile, another target or other
-flags is the program cargo would have built, not the one another build linked before.
-The worker resolves the build from the original invocation directory, including relative
-`--manifest-path` arguments, not from the workspace root. These linked directories stay until
-the target directory is cleaned while no build uses it; a directory's age does not say whether
-another client is still reading or placing its output.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
@@ -460,7 +488,7 @@ workspace's crates once, and share the dependencies.
 ## Environment variables
 
 These are read by `cargo ra-jit` and passed to the worker it starts. They are part of which
-build a command line is, so changing one starts from a cargo build again.
+build a command line is, so changing one selects a different worker configuration.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -469,7 +497,6 @@ build a command line is, so changing one starts from a cargo build again.
 | `RA_JIT_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `RA_JIT_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `RA_JIT_SPLICE` | `0` links in full after every edit instead of splicing | splice |
-| `RA_JIT_WHOLE_BUILD` | `1` has `build` and `run` from nothing build each program whole with blaze, with no `cargo build` ([above](#what-a-build-does)) | cargo builds first |
 | `RA_JIT_OTHER_TOOLCHAIN` | `1` builds with the project's toolchain when it is not 1.99.0, rather than with 1.99.0, for a project pinned to a nightly near it ([support.md](support.md#toolchain)) | not set |
 
 `RA_JIT_TESTS` is read by each `cargo ra-jit test` alone and is not part of which build it

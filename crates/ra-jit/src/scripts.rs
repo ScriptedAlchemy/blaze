@@ -1,5 +1,5 @@
-//! Build scripts compiled, run and judged by blaze in the whole build (`RA_JIT_WHOLE_BUILD=1`;
-//! docs/no-rustc.md, step I; docs/reports/SCRIPTEDITS.md, "blaze runs the scripts"). The load
+//! Build scripts compiled, run and judged by blaze in the default owned whole build
+//! (docs/no-rustc.md, step I; docs/reports/SCRIPTEDITS.md, "blaze runs the scripts"). The load
 //! of the whole build asks no cargo for them: each script of the build is compiled by blaze
 //! with its build dependencies, every crate from source over the standard library's unit
 //! (`own_script::link_planned`), run as cargo 1.99 runs it (`blaze_build_script::run`, in its
@@ -41,11 +41,11 @@ use blaze_build_script::{
 };
 use blaze_manifest::{
     config::{CompileKind, Config},
-    profiles::{Profile, ProfilePackage, Profiles, UnitFor},
+    profiles::{DebugInfo, Profile, ProfilePackage, Profiles, UnitFor},
 };
 use ide_db::base_db::TargetKind;
 use project_model::{CargoWorkspace, DepKind, Package, ProjectWorkspace, ProjectWorkspaceKind};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::json;
 
 /// Where below the target directory the scripts are compiled and run.
@@ -101,6 +101,12 @@ pub(crate) fn operation(build: u64) -> Operation {
 /// The scripts a database was loaded from: the run directory of each, with the generation of
 /// the run it was loaded from ([`generation_of`]).
 pub(crate) type World = Vec<(PathBuf, u64)>;
+
+/// The leases on the producer images a load admitted, held by the value the load keeps
+/// ([`Own`]) for as long as the database loaded from it serves their macros: a request that
+/// names no build is retired by nothing, and its images are loaded by the proc-macro client
+/// of the database, after the pass that admitted them.
+pub(crate) type Images = Vec<Arc<load_cargo::proc_macro_producer_lifetime::Lease>>;
 
 /// What a run directory's generation is written to: beside `out/`, so not in `OUT_DIR`, which
 /// stays as cargo has it.
@@ -214,6 +220,12 @@ pub(crate) struct Asked<'a> {
     /// The packages the build has and whether they are built for the target, rather than
     /// only for the host; `None` for every package, treated as a target package.
     pub(crate) packages: Option<&'a FxHashMap<String, bool>>,
+    pub(crate) host_cargo: Option<&'a CargoWorkspace>,
+    /// The packages built for the target that the build builds for the host too, with the same
+    /// features ([`shared_with_the_host`]): cargo runs the script of one of them once for both
+    /// when the profile of its run is the same for both too ([`Runner::shares`]). `None` when
+    /// the build does not say, and every package built for the target is taken for one.
+    pub(crate) shared: Option<&'a FxHashSet<String>>,
 }
 
 /// Whether this process runs the build scripts of what it loads: a whole build's worker.
@@ -229,17 +241,23 @@ pub(crate) fn own() -> bool {
     OWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The variables of the process whose build started this worker, which its load runs the
-/// scripts with (`daemon::LOAD_ENV`); this process's own when none is said.
+static LOAD_ENV: std::sync::OnceLock<crate::process::Native> = std::sync::OnceLock::new();
+
+pub(crate) fn set_load_env(env: crate::process::Native) {
+    assert!(LOAD_ENV.set(env).is_ok(), "load environment already set");
+}
+
+pub(crate) fn load_native_env() -> crate::process::Native {
+    LOAD_ENV.get().cloned().unwrap_or_else(crate::process::native)
+}
+
+/// The load snapshot is in memory before loading starts. Lazy readers never open a file.
 pub(crate) fn load_env() -> BTreeMap<String, String> {
-    let told = std::env::var_os(crate::cargo::daemon::LOAD_ENV);
-    match told.and_then(|it| std::fs::read_to_string(it).ok()) {
-        Some(line) => crate::process::decode(line.trim_end_matches('\n'))
-            .iter()
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-            .collect(),
-        None => std::env::vars().collect(),
-    }
+    load_native_env()
+        .unicode()
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
 }
 
 /// What a whole build's load asked its scripts for, owned, for the builds after it to ask
@@ -248,14 +266,20 @@ pub(crate) fn load_env() -> BTreeMap<String, String> {
 pub(crate) struct Own {
     /// The variables of the process the load was for.
     pub(crate) env: BTreeMap<String, String>,
+    pub(crate) native_env: crate::process::Native,
     pub(crate) profile: String,
     pub(crate) config: Vec<String>,
     pub(crate) host: String,
     pub(crate) target: String,
     pub(crate) explicit_target: bool,
     pub(crate) packages: FxHashMap<String, bool>,
+    pub(crate) host_cargo: Option<CargoWorkspace>,
     /// The scripts the workspace was loaded from, with the token of each run: set when it is.
     pub(crate) world: World,
+    /// The leases on the producer images the load admitted, held for as long as the database
+    /// loaded from it serves their macros: a request that names no build is retired by nothing,
+    /// and its proc-macro client loads them after the pass that admitted them.
+    pub(crate) images: Images,
 }
 
 impl Own {
@@ -270,6 +294,8 @@ impl Own {
             target: &self.target,
             explicit_target: self.explicit_target,
             packages: Some(&self.packages),
+            host_cargo: self.host_cargo.as_ref(),
+            shared: None,
         }
     }
 }
@@ -283,15 +309,116 @@ impl Own {
 pub(crate) fn run(
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World, Images)> {
     run_with(&LEASES, workspace, asked)
+}
+
+/// Run the host projection of an owned producer plan, without folding target features
+/// into its scripts. The caller keeps this build's leases through producer compilation.
+/// `host_unit` says which packages' scripts run for the host whether or not a producer or a
+/// script compiled for it needs them: cargo runs a script for the host only for a package it
+/// builds for the host, and the script of a package it builds for the target alone runs once,
+/// in that package's target unit. The others run when what is compiled for the host needs them.
+pub(crate) fn run_producers(
+    cargo: &CargoWorkspace,
+    asked: &Asked<'_>,
+    sysroot: PathBuf,
+    flags: Vec<String>,
+    cfgs: Vec<String>,
+    raw_env: &BTreeMap<OsString, OsString>,
+    host_unit: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<(
+    BTreeMap<String, (PathBuf, blaze_build_script::Output)>,
+    BTreeMap<String, PathBuf>,
+    World,
+    Images,
+)> {
+    retrying(asked.build, false, || {
+        let result = (|| {
+            let mut runner = Runner::new(&LEASES, cargo, asked, sysroot.clone(), &[])?;
+            runner.host_flags = flags.clone();
+            runner.host_cfgs = Some(cfgs.clone());
+            runner.raw_env = raw_env.clone();
+            let mut outputs = BTreeMap::new();
+            for package in cargo.packages() {
+                if asked.packages.is_some_and(|it| !it.contains_key(&cargo[package].id.repr)) {
+                    continue;
+                }
+                if cargo[package].targets.iter().any(|&target| {
+                    matches!(cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+                }) {
+                    runner.producer(package).map_err(|why| Attempt::of(runner.busy.take(), why))?;
+                }
+                if runner.runs(package) && host_unit(&cargo[package].id.repr) {
+                    let done = runner
+                        .script(package, true)
+                        .map_err(|why| Attempt::of(runner.busy.take(), why))?;
+                    outputs.insert(
+                        cargo[package].id.repr.clone(),
+                        (done.out_dir.clone(), done.output.clone()),
+                    );
+                }
+            }
+            let images = runner
+                .images
+                .iter()
+                .map(|(&package, path)| (cargo[package].id.repr.clone(), path.clone()))
+                .collect();
+            let leases = std::mem::take(&mut runner.image_leases);
+            Ok((outputs, images, runner.judged, leases))
+        })();
+        if matches!(result, Err(Attempt::Busy(_))) {
+            LEASES.yield_world(asked.build);
+        } else if !LEASES.in_operation(asked.build) {
+            LEASES.release_admission(asked.build);
+        }
+        result
+    })
+}
+
+/// Whether the build `asked` builds the package `id` for the host alone, as a build-dependency
+/// or a proc macro, or what is compiled with one, and not for the target: its script runs for
+/// the host whatever needs it, and its outputs are the host's. A package built for the target
+/// too has its script run for the target, and for the host only when a script or producer
+/// compiled for the host needs it, as cargo has no host unit of a package it builds for the
+/// target alone. A build that says none has every package built for the target, as the
+/// target pass has it ([`Asked::packages`]): the host pass runs none of their scripts up front,
+/// or one of them would run twice, once in each pass.
+fn for_the_host_alone(asked: &Asked<'_>, id: &str) -> bool {
+    asked.packages.is_some_and(|it| it.get(id) == Some(&false))
+}
+
+/// The packages `asked` builds for the target that `host`, the build's description of what it
+/// builds for the host, has with the same features. Cargo has one unit of a script's run of
+/// such a package when what the run is keyed by is the same for the host and the target
+/// (`traverse_and_share`, which merges a host unit into the target unit it probes for), and
+/// the features are the part of that key the two descriptions of the build give.
+fn shared_with_the_host(
+    cargo: &CargoWorkspace,
+    host: &CargoWorkspace,
+    asked: &Asked<'_>,
+) -> FxHashSet<String> {
+    let features = |cargo: &CargoWorkspace, package: Package| {
+        cargo[package].active_features.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+    };
+    let for_target = |id: &String| asked.packages.is_some_and(|it| it.get(id) == Some(&true));
+    cargo
+        .packages()
+        .filter(|&it| for_target(&cargo[it].id.repr))
+        .filter(|&it| {
+            let id = &cargo[it].id.repr;
+            let at = host.packages().find(|&at| host[at].id.repr == *id);
+            at.is_some_and(|at| features(host, at) == features(cargo, it))
+        })
+        .map(|it| cargo[it].id.repr.clone())
+        .collect()
 }
 
 fn run_with(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World)> {
+) -> anyhow::Result<(project_model::WorkspaceBuildScripts, World, Images)> {
     let deferrable = DEFERRABLE.load(std::sync::atomic::Ordering::SeqCst);
     retrying(asked.build, deferrable, || attempt(leases, workspace, asked))
 }
@@ -355,7 +482,7 @@ fn attempt(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World, Images), Attempt> {
     let said = pass(leases, workspace, asked);
     if matches!(said, Err(Attempt::Busy(_))) {
         // A build that waits holds nothing that is not read: what it holds, a build that has
@@ -372,9 +499,9 @@ fn pass(
     leases: &Leases,
     workspace: &ProjectWorkspace,
     asked: &Asked<'_>,
-) -> Result<(project_model::WorkspaceBuildScripts, World), Attempt> {
+) -> Result<(project_model::WorkspaceBuildScripts, World, Images), Attempt> {
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
-        return Ok((project_model::WorkspaceBuildScripts::default(), World::new()));
+        return Ok((project_model::WorkspaceBuildScripts::default(), World::new(), Images::new()));
     };
     let target: &Path = cargo.target_directory().as_ref();
     // A request that names no build judges and runs inside one critical section, as one that
@@ -387,8 +514,69 @@ fn pass(
     let sysroot: PathBuf = workspace.sysroot.root().map(|it| PathBuf::from(it.as_str())).context(
         "blaze runs build scripts with the standard library's source, and has no toolchain",
     )?;
+    let shared = asked.host_cargo.map(|host| shared_with_the_host(cargo, host, asked));
+    let asked = &Asked { shared: shared.as_ref().or(asked.shared), ..*asked };
     let mut runner = Runner::new(leases, cargo, asked, sysroot, &workspace.rustc_cfg)?;
+    if let Some(failure) = asked.env.get("BLAZE_PRODUCER_PROBE_FAILURE") {
+        match std::fs::remove_file(failure) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        }
+    }
     let mut lines = Vec::new();
+    if let Some(host_cargo) = asked.host_cargo {
+        let host_ask = Asked { host_cargo: None, target: asked.host, ..*asked };
+        let (outputs, images, world, leases) = run_producers(
+            host_cargo,
+            &host_ask,
+            runner.sysroot.clone(),
+            runner.host_flags.clone(),
+            runner.host_cfgs.clone().context("no host cfg for owned producers")?,
+            &runner.child_env(),
+            &|id| for_the_host_alone(asked, id),
+        )?;
+        runner.judged.extend(world);
+        runner.image_leases.extend(leases);
+        for (package, (out_dir, output)) in outputs {
+            // Host-only packages, including proc macros, use these host outputs.
+            if asked.packages.is_some_and(|it| it.get(&package) == Some(&false)) {
+                lines.push(json!({
+                    "reason": "build-script-executed", "package_id": package,
+                    "linked_libs": output.library_links,
+                    "linked_paths": output.library_paths.iter().map(|it| it.path().display().to_string()).collect::<Vec<_>>(),
+                    "cfgs": output.cfgs, "env": output.env, "out_dir": out_dir,
+                }).to_string());
+            }
+        }
+        for (id, image) in images {
+            let package = cargo
+                .packages()
+                .find(|&it| cargo[it].id.repr == id)
+                .context("owned producer missing from loaded workspace")?;
+            let target = cargo[package]
+                .targets
+                .iter()
+                .map(|&it| &cargo[it])
+                .find(|it| matches!(it.kind, TargetKind::Lib { is_proc_macro: true }))
+                .context("owned producer has no macro target")?;
+            lines.push(
+                json!({
+                    "reason": "compiler-artifact", "package_id": id,
+                    "manifest_path": cargo[package].manifest.to_string(),
+                    "target": { "name": target.name, "kind": ["proc-macro"],
+                        "crate_types": ["proc-macro"], "src_path": target.root.to_string(),
+                        "edition": cargo[package].edition.to_string(),
+                        "doc": false, "doctest": false, "test": false },
+                    "profile": { "opt_level": "0", "debuginfo": 0,
+                        "debug_assertions": false, "overflow_checks": false, "test": false },
+                    "features": cargo[package].active_features,
+                    "filenames": [image], "executable": null, "fresh": false,
+                })
+                .to_string(),
+            );
+        }
+    }
     for package in cargo.packages() {
         if !runner.runs(package) {
             continue;
@@ -417,7 +605,7 @@ fn pass(
     }
     let said =
         project_model::WorkspaceBuildScripts::of_messages(cargo, lines.iter().map(String::as_str));
-    Ok((said, runner.judged.clone()))
+    Ok((said, runner.judged.clone(), std::mem::take(&mut runner.image_leases)))
 }
 
 /// A script that ran, or whose last run stands.
@@ -452,6 +640,10 @@ struct Runner<'a> {
     cross: bool,
     /// `[env]`, as it applies.
     config_env: BTreeMap<String, String>,
+    /// Byte-valued environment supplied by the source-producer caller. Unicode
+    /// projection is for source/configuration only, never a child process boundary.
+    raw_env: BTreeMap<OsString, OsString>,
+    env_identity: crate::env_identity::Identity,
     target_cfgs: Vec<String>,
     host_cfgs: Option<Vec<String>>,
     /// What `rustc -vV` says, which every fingerprint has.
@@ -462,6 +654,15 @@ struct Runner<'a> {
     judged: World,
     /// The scripts being made, which a dependency cycle reaches again.
     making: Vec<(Package, bool)>,
+    images: FxHashMap<Package, PathBuf>,
+    /// When the newest run of a script that an image's crates were compiled with wrote its
+    /// output, by the image's library ([`Runner::newest_run`]).
+    image_runs: FxHashMap<PathBuf, SystemTime>,
+    /// The leases on the images of a request that names no build: it is retired by nothing, so
+    /// the load that asked keeps them, through [`Own::images`], until its proc-macro client
+    /// has loaded them and while it serves them.
+    image_leases: Images,
+    making_images: Vec<Package>,
 }
 
 impl<'a> Runner<'a> {
@@ -534,11 +735,17 @@ impl<'a> Runner<'a> {
             host_flags,
             cross,
             config_env,
+            raw_env: crate::process::native().vars().collect(),
+            env_identity: crate::env_identity::Identity::load()?,
             profiles,
             rustc,
             done: FxHashMap::default(),
             judged: Vec::new(),
             making: Vec::new(),
+            images: FxHashMap::default(),
+            image_runs: FxHashMap::default(),
+            image_leases: Vec::new(),
+            making_images: Vec::new(),
         })
     }
 
@@ -555,6 +762,13 @@ impl<'a> Runner<'a> {
     /// process's.
     fn value(&self, name: &str) -> Option<String> {
         self.config_env.get(name).or_else(|| self.asked.env.get(name)).cloned()
+    }
+
+    fn child_env(&self) -> BTreeMap<OsString, OsString> {
+        let mut env = self.raw_env.clone();
+        env.extend(self.asked.env.iter().map(|(key, value)| (key.into(), value.into())));
+        env.extend(self.config_env.iter().map(|(key, value)| (key.into(), value.into())));
+        env
     }
 
     fn profile(&self, package: Package, unit_for: UnitFor, kind: &CompileKind) -> Profile {
@@ -591,7 +805,7 @@ impl<'a> Runner<'a> {
         if let Some(judged) = self.begin(package, for_host, &lib)? {
             return Ok(judged);
         }
-        let (exe, compiled) = self.compile(package).map_err(|why| {
+        let (exe, compiled) = self.compile(package, &data.active_features).map_err(|why| {
             format!("blaze could not compile the build script of `{descr}`: {why}")
         })?;
         // The dependencies whose metadata the script is given, which run before it.
@@ -691,9 +905,12 @@ impl<'a> Runner<'a> {
             deps: std::iter::once(("build-script-build".to_owned(), compiled.0))
                 .chain(deps.iter().map(|(name, hash, _)| (name.clone(), *hash)))
                 .collect(),
-            local: fresh::local(said.as_ref(), &package_dir, &|name| self.value(name), &|| {
-                self.package_fingerprint(package)
-            }),
+            local: fresh::local(
+                said.as_ref(),
+                &package_dir,
+                &|name| self.value_identity(name),
+                &|| self.package_fingerprint(package),
+            ),
         };
         let was: Option<Fingerprint> =
             std::fs::read(&record).ok().and_then(|it| serde_json::from_slice(&it).ok());
@@ -702,8 +919,7 @@ impl<'a> Runner<'a> {
                 .chain(deps.iter().map(|(name, _, made)| (name.clone(), *made)))
                 .collect();
         let stale = fresh::stale(was.as_ref(), &now, &output_file, &made, &package_dir);
-        let cargo_env: Vec<(OsString, OsString)> =
-            self.asked.env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let cargo_env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
         let cx = output::Context::of(&unit, &cargo_env);
         let mut writer = None;
         let mut generation = 0;
@@ -729,6 +945,14 @@ impl<'a> Runner<'a> {
                     .and_then(|env| run::run(&unit, run::Invocation::of(&unit, env).command()))
                     .map_err(|it| it.0)
                     .and_then(|ran| {
+                        if let Some(path) = self.value("BLAZE_PRODUCER_PROBE_FAILURE")
+                            && Path::new(&path).exists()
+                        {
+                            return Err(format!(
+                                "blaze could not compile a producer's compiler probe: {}",
+                                std::fs::read_to_string(path).unwrap_or_default()
+                            ));
+                        }
                         ran.finish(&unit, &cx).map_err(|failed| {
                             let logged =
                                 failed.log_messages.iter().map(|(_, it)| format!("{it}\n"));
@@ -748,7 +972,8 @@ impl<'a> Runner<'a> {
                     files: printed.rerun_if_changed.clone(),
                     env: printed.rerun_if_env_changed.clone(),
                 };
-                let after = fresh::after_run(&now, &reads, &package_dir, &|name| self.value(name));
+                let after =
+                    fresh::after_run(&now, &reads, &package_dir, &|name| self.value_identity(name));
                 let json = serde_json::to_vec(&after).map_err(|it| it.to_string())?;
                 std::fs::write(&record, json)
                     .map_err(|it| format!("{}: {it}", record.display()))?;
@@ -800,6 +1025,84 @@ impl<'a> Runner<'a> {
         path_package_fingerprint(data.manifest.parent().as_ref())
     }
 
+    /// The debuginfo of a run of `package`'s script for the profile `lib`. Cargo defers the
+    /// debuginfo of a host unit and, in a build for the host, settles it once it knows whether
+    /// the target has the same unit (`traverse_and_share`'s probe): the target's, so that the two
+    /// are one unit and run once, or none, for a unit the host alone has.
+    fn debuginfo(&self, package: Package, for_host: bool, lib: &Profile) -> DebugInfo {
+        match for_host && !self.cross && lib.debuginfo.is_deferred() {
+            true if self.shares(package) => lib.debuginfo.finalize(),
+            true => lib.debuginfo.weaken(),
+            false => lib.debuginfo,
+        }
+    }
+
+    /// Whether cargo has one run of `package`'s script for the host and the target, in a build
+    /// for the host: what the run is keyed by is the same for both, the features
+    /// ([`Asked::shared`]) and the profile of the run, and so are the runs of the dependencies
+    /// with `links` it is run after (cargo's unit of a run depends on theirs). A build that does
+    /// not say which packages share has every package of `packages` that is not the host's
+    /// alone share: the producer plan, whose `packages` says so of each, having proved it.
+    fn shares(&self, package: Package) -> bool {
+        let data = &self.cargo[package];
+        if self.cross {
+            return false;
+        }
+        let Some(shared) = self.asked.shared else {
+            return self.asked.packages.is_none_or(|it| it.get(&data.id.repr) != Some(&false));
+        };
+        let run = |for_host: bool| {
+            let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+            let lib = self.profile(package, unit_for, &self.kind(for_host));
+            let lib = Profile { debuginfo: lib.debuginfo.finalize(), ..lib };
+            self.profiles.get_profile_run_custom_build(&lib)
+        };
+        shared.contains(&data.id.repr)
+            && format!("{:?}", run(true)) == format!("{:?}", run(false))
+            && data
+                .dependencies
+                .iter()
+                .filter(|it| it.kind == DepKind::Normal && self.runs(it.pkg))
+                .filter(|it| self.cargo[it.pkg].links.is_some())
+                .all(|it| self.shares(it.pkg))
+    }
+
+    /// What the run of `package`'s script for the profile `lib` is keyed by, which names its
+    /// directory: one run for the host and the target when it is the same for both. Cargo keys
+    /// a run by the profile of the run, which is the library's cut down to what a run is given
+    /// (`get_profile_run_custom_build`), not by the whole library profile, by the features, the
+    /// flags and the compiler, and by the units it depends on (`traverse_and_share`'s
+    /// `dep_hash`): the runs of the dependencies with `links` whose metadata it is given. Two
+    /// runs alike in all else but given different metadata are two runs, whatever their
+    /// debuginfo, which is the same for both when a profile has none.
+    fn run_identity(&self, package: Package, for_host: bool, lib: &Profile) -> u64 {
+        let data = &self.cargo[package];
+        let mut features = data.active_features.clone();
+        features.sort();
+        let (target, flags) = match for_host {
+            true => (self.asked.host, &self.host_flags),
+            false => (self.asked.target, &self.flags),
+        };
+        let debuginfo = self.debuginfo(package, for_host, lib);
+        let run = self.profiles.get_profile_run_custom_build(&Profile { debuginfo, ..lib.clone() });
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let mut links: Vec<u64> = data
+            .dependencies
+            .iter()
+            .filter(|it| it.kind == DepKind::Normal && self.runs(it.pkg))
+            .filter(|it| self.cargo[it.pkg].links.is_some())
+            .map(|it| {
+                let lib = self.profile(it.pkg, unit_for, &self.kind(for_host));
+                self.run_identity(it.pkg, for_host, &lib)
+            })
+            .collect();
+        links.sort_unstable();
+        links.dedup();
+        let key =
+            json!([data.id.repr, features, format!("{run:?}"), flags, target, self.rustc, links]);
+        fresh::hash_bytes(key.to_string().as_bytes())
+    }
+
     /// The description of `package`'s run, as cargo runs it for the profile `lib`.
     fn unit(
         &self,
@@ -810,6 +1113,7 @@ impl<'a> Runner<'a> {
         dependencies: Vec<unit::Dependency>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
+        let debuginfo = self.debuginfo(package, for_host, lib);
         let mut features = data.active_features.clone();
         features.sort();
         let dir_name = self.profiles.get_dir_name().to_owned();
@@ -832,8 +1136,7 @@ impl<'a> Runner<'a> {
             runs.push(target);
         }
         artifacts.push(&dir_name);
-        let key = json!([data.id.repr, features, format!("{lib:?}"), flags, target, self.rustc]);
-        let hash = fresh::hash_bytes(key.to_string().as_bytes());
+        let hash = self.run_identity(package, for_host, lib);
         let out_dir = runs
             .join(&dir_name)
             .join("build")
@@ -869,7 +1172,7 @@ impl<'a> Runner<'a> {
                 name: self.asked.profile.to_owned(),
                 release: lib.root == blaze_manifest::profiles::ProfileRoot::Release,
                 opt_level: lib.opt_level.to_string(),
-                debuginfo: lib.debuginfo.is_turned_on(),
+                debuginfo: debuginfo.is_turned_on(),
                 debug_assertions: lib.debug_assertions,
             },
             target: target.to_owned(),
@@ -919,8 +1222,34 @@ impl<'a> Runner<'a> {
     }
 
     /// The script of `package`, compiled by blaze where it is not as it was: its executable,
-    /// and the hash of what it was compiled from and when, which its run depends on.
-    fn compile(&mut self, package: Package) -> Result<(PathBuf, (u64, SystemTime)), String> {
+    /// and the hash of what it was compiled from and when, which its run depends on. Cargo
+    /// compiles a script for the host, with its build-dependencies as the host has them, but
+    /// with the `features` of the unit it is run for (resolver 2 has a package's features apart
+    /// for the host and the target): a script that reads `cfg!(feature = ...)` is two scripts
+    /// when they differ, each in a directory of its own.
+    fn compile(
+        &mut self,
+        package: Package,
+        features: &[String],
+    ) -> Result<(PathBuf, (u64, SystemTime)), String> {
+        if let Some(host_cargo) = self.asked.host_cargo {
+            let id = &self.cargo[package].id.repr;
+            let package = host_cargo
+                .packages()
+                .find(|&it| host_cargo[it].id.repr == *id)
+                .ok_or_else(|| format!("host script package {id} is absent"))?;
+            let asked = Asked { host_cargo: None, ..*self.asked };
+            let mut runner =
+                Runner::new(self.leases, host_cargo, &asked, self.sysroot.clone(), &[])
+                    .map_err(|it| it.to_string())?;
+            runner.host_flags = self.host_flags.clone();
+            runner.host_cfgs = self.host_cfgs.clone();
+            runner.raw_env = self.raw_env.clone();
+            let compiled = runner.compile(package, features);
+            self.judged.extend(runner.judged);
+            self.busy = runner.busy;
+            return compiled;
+        }
         let mut crates = Vec::new();
         let mut at: FxHashMap<Package, usize> = FxHashMap::default();
         let cargo = self.cargo;
@@ -930,7 +1259,7 @@ impl<'a> Runner<'a> {
         let script = script.ok_or("the package has no build script")?;
         let host = self.profile(package, UnitFor::new_host(false), &CompileKind::Host);
         let root = PathBuf::from(script.root.as_str());
-        crates.push(self.described(package, "build_script_build", &root, &host, None)?);
+        crates.push(self.described(package, "build_script_build", &root, &host, features, None)?);
         let build_deps: Vec<_> = data
             .dependencies
             .iter()
@@ -942,14 +1271,18 @@ impl<'a> Runner<'a> {
             deps.push((name.replace('-', "_"), self.add(dep, &mut crates, &mut at)?));
         }
         crates[0].deps = deps;
-        let key = json!([data.id.repr, format!("{host:?}"), self.host_flags, self.rustc]);
-        let hash = fresh::hash_bytes(key.to_string().as_bytes());
-        let dir = self
-            .base
-            .join(self.profiles.get_dir_name())
-            .join("build")
-            .join(format!("{}-{hash:016x}", data.name));
-        let described = crate::cargo::own_script::planned_description(&self.sysroot, crates);
+        let newest_run = self.newest_run(&crates);
+        let dir = self.compile_dir(package, features, &host);
+        let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
+        let env: Vec<(OsString, OsString)> = self.child_env().into_iter().collect();
+        let described = crate::cargo::own_script::with_mode(
+            crate::cargo::own_script::planned_description(&self.sysroot, crates),
+            crate::cargo::own_script::SourceMode::Cargo {
+                root: self.cargo.workspace_root().as_ref(),
+                members: &members,
+                env: &env,
+            },
+        )?;
         let fingerprint = fresh::hash_bytes(
             json!([described, self.host_flags, self.rustc]).to_string().as_bytes(),
         );
@@ -957,23 +1290,12 @@ impl<'a> Runner<'a> {
         let inputs = dir.join("build-script-build.inputs");
         let record = dir.join("blaze-compile.json");
         if let Some(made) = self.compiled(&exe, &inputs, &record, fingerprint) {
-            return Ok((exe, (fingerprint, made)));
+            return Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))));
         }
         _ = std::fs::remove_file(&record);
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         let began = SystemTime::now();
-        let mut env: Vec<(String, String)> =
-            self.asked.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        env.extend(self.config_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         crate::cargo::own_script::link_planned(&described, &dir, &exe, &inputs, &env)?;
-        if let Some(line) = std::fs::read_to_string(dir.join("ra-jit.log"))
-            .unwrap_or_default()
-            .lines()
-            .find(|it| it.contains(" functions in it ra-jit could not compile"))
-            && !line.ends_with(", 0 functions in it ra-jit could not compile")
-        {
-            return Err(format!("it calls functions blaze could not compile ({line})"));
-        }
         // What was read is dated when the compile began, as cargo dates its dep-info: a file
         // written while it compiled is a change for the next build.
         std::fs::File::options()
@@ -983,14 +1305,58 @@ impl<'a> Runner<'a> {
             .map_err(|it| format!("{}: {it}", inputs.display()))?;
         let read =
             crate::dep_info::DepInfo::parse(&std::fs::read_to_string(&inputs).unwrap_or_default());
-        let env: Vec<(String, Option<String>)> =
-            read.env.iter().filter(|(name, _)| !set_for_crates(name)).cloned().collect();
+        let env: Vec<(String, Option<String>)> = read
+            .env
+            .iter()
+            .filter(|(name, _)| !set_for_crates(name))
+            .map(|(name, _)| {
+                (name.clone(), self.env_identity.value(self.compiled_with(name).as_deref()))
+            })
+            .collect();
         let record_json = json!({ "fingerprint": fingerprint, "env": env });
         std::fs::write(&record, record_json.to_string())
             .map_err(|it| format!("{}: {it}", record.display()))?;
         let made =
             std::fs::metadata(&exe).and_then(|it| it.modified()).map_err(|it| it.to_string())?;
-        Ok((exe, (fingerprint, made)))
+        Ok((exe, (fingerprint, made.max(newest_run.unwrap_or(made)))))
+    }
+
+    /// Where the script of `package` is compiled with `features` for the host's profile
+    /// `host`: one directory for each set of features it is compiled with.
+    fn compile_dir(&self, package: Package, features: &[String], host: &Profile) -> PathBuf {
+        let data = &self.cargo[package];
+        let mut features = features.to_vec();
+        features.sort();
+        let key = json!([data.id.repr, features, format!("{host:?}"), self.host_flags, self.rustc]);
+        let hash = fresh::hash_bytes(key.to_string().as_bytes());
+        self.base
+            .join(self.profiles.get_dir_name())
+            .join("build")
+            .join(format!("{}-{hash:016x}", data.name))
+    }
+
+    /// When the newest run of a script that one of `crates` is compiled with wrote its output,
+    /// directly or in a producer image they use. Cargo compiles a library again after its
+    /// script ran (`check_filesystem`: a dependency newer than the unit's output), then
+    /// everything compiled with it, so a build script whose build-dependency's script ran again
+    /// is linked again and runs again, whether or not what it was linked from changed (a
+    /// build-dependency with `links` reruns its parent's script so, `edges.py`'s
+    /// `build-dep-counter`). blaze links it again only when what it is compiled from changed;
+    /// the time it gives the script's run to depend on is the newest of the two, which has the
+    /// run judged as cargo judges it.
+    fn newest_run(&self, crates: &[crate::cargo::own_script::Planned]) -> Option<SystemTime> {
+        let ran = |out_dir: &PathBuf| {
+            let done = self.done.values().filter_map(|it| it.as_ref().ok());
+            done.filter(|it| it.out_dir == *out_dir).find_map(|it| it.made)
+        };
+        let image = |library: &PathBuf| self.image_runs.get(library).copied();
+        crates
+            .iter()
+            .flat_map(|it| {
+                [it.out_dir.as_ref().and_then(ran), it.proc_macro.as_ref().and_then(image)]
+            })
+            .flatten()
+            .max()
     }
 
     /// When the script at `exe` was made, when it stands: compiled from `fingerprint`, with
@@ -1010,15 +1376,23 @@ impl<'a> Runner<'a> {
         let made = std::fs::metadata(exe).and_then(|it| it.modified()).ok()?;
         let began = std::fs::metadata(inputs).and_then(|it| it.modified()).ok()?;
         let read = crate::dep_info::DepInfo::parse(&std::fs::read_to_string(inputs).ok()?);
+        let project: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(inputs.parent()?.join("rust-project.json")).ok()?,
+        )
+        .ok()?;
         for file in &read.files {
-            let written = std::fs::metadata(file).and_then(|it| it.modified()).ok()?;
+            let file = crate::compiler_json::physical_path(&project, Path::new(file)).ok()?;
+            let written = std::fs::metadata(&file).and_then(|it| it.modified()).ok()?;
             if written > began {
                 return None;
             }
         }
         let env: Vec<(String, Option<String>)> =
             serde_json::from_value(record["env"].clone()).ok()?;
-        if env.iter().any(|(name, was)| self.compiled_with(name) != *was) {
+        if env
+            .iter()
+            .any(|(name, was)| self.env_identity.value(self.compiled_with(name).as_deref()) != *was)
+        {
             return None;
         }
         Some(made)
@@ -1033,8 +1407,60 @@ impl<'a> Runner<'a> {
         if theirs { None } else { self.value(name) }
     }
 
+    fn value_identity(&self, name: &str) -> Option<String> {
+        self.env_identity.value(self.value(name).as_deref())
+    }
+
     /// Adds the library of `package` and what it links to `crates`, as a build script's
     /// dependencies are compiled: for the host.
+    fn producer(&mut self, package: Package) -> Result<PathBuf, String> {
+        if let Some(path) = self.images.get(&package) {
+            return Ok(path.clone());
+        }
+        if self.making_images.contains(&package) {
+            return Err(format!(
+                "a producer/build-script cycle reaches `{}`",
+                self.cargo[package].name
+            ));
+        }
+        self.making_images.push(package);
+        let result = (|| {
+            let mut crates = Vec::new();
+            self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+            let newest_run = self.newest_run(&crates);
+            let dir = self.base.join("producers").join(format!("{package:?}"));
+            let env = self.child_env().into_iter().collect::<Vec<_>>();
+            let members = crates.iter().map(|krate| krate.workspace_member).collect::<Vec<_>>();
+            crate::cargo::producer_image::link(
+                &self.sysroot,
+                crates,
+                &dir,
+                &env,
+                crate::cargo::own_script::SourceMode::Cargo {
+                    root: self.cargo.workspace_root().as_ref(),
+                    members: &members,
+                    env: &env,
+                },
+                self.cargo.target_directory().as_ref(),
+            )
+            .map(|image| (image, newest_run))
+            .map_err(|it| format!("{it:#}"))
+        })();
+        self.making_images.pop();
+        let (image, newest_run) = result?;
+        if let Some(newest_run) = newest_run {
+            self.image_runs.insert(image.library.clone(), newest_run);
+        }
+        // The image is loaded after this pass, by the build that asked for it, or by the load
+        // of a request that names no build: there is no build to retire then, and the load
+        // holds the lease until its proc-macro client has loaded the image, and while it
+        // serves it.
+        let leases: Images = image.leases.into_iter().map(Arc::new).collect();
+        self.image_leases.extend(self.leases.image_leases(self.asked.build, leases));
+        self.images.insert(package, image.library.clone());
+        Ok(image.library)
+    }
+
     fn add(
         &mut self,
         package: Package,
@@ -1044,6 +1470,23 @@ impl<'a> Runner<'a> {
         if let Some(&it) = at.get(&package) {
             return Ok(it);
         }
+        if self.cargo[package].targets.iter().any(|&target| {
+            matches!(self.cargo[target].kind, TargetKind::Lib { is_proc_macro: true })
+        }) {
+            let image = self.producer(package)?;
+            let index = self.add_source_leaf(package, crates)?;
+            crates[index].proc_macro = Some(image);
+            at.insert(package, index);
+            return Ok(index);
+        }
+        self.add_source(package, crates, at)
+    }
+
+    fn add_source_leaf(
+        &mut self,
+        package: Package,
+        crates: &mut Vec<crate::cargo::own_script::Planned>,
+    ) -> Result<usize, String> {
         let cargo = self.cargo;
         let data = &cargo[package];
         let lib = data
@@ -1053,25 +1496,39 @@ impl<'a> Runner<'a> {
             .find(|it| matches!(it.kind, TargetKind::Lib { .. }));
         let lib =
             lib.ok_or_else(|| format!("`{}`, which it is built with, has no library", data.name))?;
-        if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true }) {
-            return Err(format!(
-                "it is built with the proc macro `{}`, which blaze does not compile for a build script yet",
-                data.name
-            ));
-        }
         let name = lib.name.replace('-', "_");
         let root = PathBuf::from(lib.root.as_str());
-        let host = self.profile(package, UnitFor::new_host(false), &CompileKind::Host);
+        let host = self.profile(package, UnitFor::new_host(true), &CompileKind::Host);
         // A library with a script of its own is compiled with what that script said.
         let ran = match self.runs(package) {
             true => Some(self.script(package, true)?),
             false => None,
         };
-        let described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        let features = &self.cargo[package].active_features;
+        let mut described =
+            self.described(package, &name, &root, &host, features, ran.as_deref())?;
+        if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true })
+            && !described.cfg.iter().any(|cfg| cfg == "proc_macro")
+        {
+            described.cfg.push("proc_macro".to_owned());
+        }
         let index = crates.len();
         crates.push(described);
+        Ok(index)
+    }
+
+    fn add_source(
+        &mut self,
+        package: Package,
+        crates: &mut Vec<crate::cargo::own_script::Planned>,
+        at: &mut FxHashMap<Package, usize>,
+    ) -> Result<usize, String> {
+        if let Some(&index) = at.get(&package) {
+            return Ok(index);
+        }
+        let index = self.add_source_leaf(package, crates)?;
         at.insert(package, index);
-        let normal: Vec<_> = cargo[package]
+        let normal: Vec<_> = self.cargo[package]
             .dependencies
             .iter()
             .filter(|it| it.kind == DepKind::Normal)
@@ -1086,19 +1543,17 @@ impl<'a> Runner<'a> {
     }
 
     /// A crate of `package` rooted at `root`, as cargo has rustc compile it with the profile
-    /// `profile`, and with what its script said when it has one.
+    /// `profile` and the features `features`, and with what its script said when it has one.
     fn described(
         &self,
         package: Package,
         name: &str,
         root: &Path,
         profile: &Profile,
+        features: &[String],
         ran: Option<&Done>,
     ) -> Result<crate::cargo::own_script::Planned, String> {
         let data = &self.cargo[package];
-        let mut cfg: Vec<String> =
-            data.active_features.iter().map(|it| format!("feature={it:?}")).collect();
-        cfg.sort();
         // Host flags follow the profile's arguments, just as they do on rustc's command
         // line. Overflow and panic settings must reach MIR/codegen, not only fingerprints.
         let applied = apply_flags(&self.host_flags);
@@ -1107,18 +1562,11 @@ impl<'a> Runner<'a> {
         }
         let effective = crate::plan::Profile::for_script(profile, &self.host_flags)
             .map_err(|error| format!("the profile of {name}: {error:#}"))?;
-        if effective.debug_assertions {
-            cfg.push("debug_assertions".to_owned());
-        }
-        if effective.overflow_checks {
-            cfg.push("overflow_checks".to_owned());
-        }
-        cfg.push(format!("panic={:?}", effective.panic.name()));
-        for extra in applied.cfgs {
-            if !cfg.contains(&extra) {
-                cfg.push(extra);
-            }
-        }
+        let host_cfgs = self.host_cfgs.as_deref().ok_or_else(|| {
+            format!("blaze has no built-in cfg answer for build-script host `{}`", self.asked.host)
+        })?;
+        let features = features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
+        let mut cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
         let package_dir: &Path = data.manifest.parent().as_ref();
         let manifest: &Path = data.manifest.as_ref();
         let version = &data.version;
@@ -1158,6 +1606,8 @@ impl<'a> Runner<'a> {
             cfg.extend(ran.output.cfgs.iter().cloned());
         }
         Ok(crate::cargo::own_script::Planned {
+            out_dir: ran.map(|ran| ran.out_dir.clone()),
+            workspace_member: data.is_member,
             name: name.to_owned(),
             root: root.to_owned(),
             edition: data.edition.to_string(),
@@ -1167,8 +1617,37 @@ impl<'a> Runner<'a> {
                 .collect(),
             env,
             deps: Vec::new(),
+            proc_macro: None,
         })
     }
+}
+
+fn source_cfgs(
+    host: &[String],
+    features: &[String],
+    profile: &crate::plan::Profile,
+    user: &[String],
+) -> Vec<String> {
+    let mut cfg: Vec<_> = host
+        .iter()
+        .filter(|cfg| {
+            let key = cfg.split_once('=').map_or(cfg.as_str(), |(key, _)| key).trim();
+            !matches!(key, "debug_assertions" | "overflow_checks" | "panic")
+        })
+        .cloned()
+        .collect();
+    cfg.extend_from_slice(features);
+    if profile.debug_assertions {
+        cfg.push("debug_assertions".into());
+    }
+    if profile.overflow_checks {
+        cfg.push("overflow_checks".into());
+    }
+    cfg.push(format!("panic={:?}", profile.panic.name()));
+    cfg.extend_from_slice(user);
+    cfg.sort();
+    cfg.dedup();
+    cfg
 }
 
 /// What the flags for rustc a crate is compiled with say that blaze's compile applies.
@@ -1410,6 +1889,8 @@ impl ProfilePackage for Named<'_> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod captured;
 
 pub(crate) mod barrier;
 mod leases;

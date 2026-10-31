@@ -73,15 +73,34 @@ workspace again does not run them again (`crates/ra-jit-expand`). The key is a S
 the macro library's content, the macro's name and kind, its input with each span replaced
 by its place in the call's table of spans, that table (each span's byte range within the
 item it is anchored to, and which of the call's anchors and hygiene contexts it has), the
-environment and the current directory the macro is given. The output is kept with its spans
+crate's environment and the current directory the macro is given, and the digest of every
+variable of the proc-macro server that expands it. The output is kept with its spans
 written the same way, so tokens the macro made from a string at the call site come back
 anchored where the next call is. An expansion is not kept when it failed, when it asked
 rust-analyzer anything while it ran (a span's text, file or line), or when its output has a
 span anchored where no span of its input is.
 
-A macro that reads a file or an environment variable by itself is pure to the key and is
-not: name it in `RA_JIT_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to
-expand it every time. `RA_JIT_PROC_MACRO_CACHE=all` keeps function-like macros too, which
+The server's variables are in the key because a macro reads any of them by itself
+(`std::env::var`), as it reads rustc's, without asking: with only a variable changed and the
+input the same byte for byte, rustc expands again, and an expansion read back from before
+would be a wrong build. The server is started with the request's variables and no other
+([native-environment.md](native-environment.md)) but the one the launcher sets for itself
+(`RUST_ANALYZER_INTERNALS_DO_NOT_USE`), and the digest is of that same map, so the key is of
+what the request carried, not of the daemon's machine (not its discovered server, home or
+path); two machines whose requests carry the same variables share a key. A macro of a server
+with other variables is another expander to the database too, so an expansion it remembers is
+not reused for a call whose input did not change.
+That is the trade-off: requests that differ in any variable, `HOME`, `PATH` or `USER` among
+them, share no expansion, and a missed hit is a slower build where a stale one would be a
+wrong one. The keys log (`RA_JIT_KEYS_LOG`) names this part of a call's key `senv=`, and
+`harness/dist/crossmachine.py` reports a call two machines keyed differently by it as differing
+by the macro server's environment. Keying on the variables a macro actually reads, by having
+the server track its macros' reads, is the follow-up that would restore sharing between
+requests whose environments differ.
+
+A macro that reads a file by itself is pure to the key and is not: name it in
+`RA_JIT_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to expand it every
+time. `RA_JIT_PROC_MACRO_CACHE=all` keeps function-like macros too, which
 are off by default because they are the ones that read outside their input (`sqlx::query!`,
 `include_dir!`). `RA_JIT_PROC_MACRO_CACHE=check` expands every call anyway and says which
 macro expanded otherwise than it was kept. `RA_JIT_PROC_MACRO_CACHE=off` keeps nothing. The
@@ -89,6 +108,47 @@ daemon's log has a line per load: how many expansions ran and in how long, how m
 from the store, and why the rest were not kept. rustc's own cache, `-Zcache-proc-macros`,
 keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)).
 `harness/expansions.py` tests it.
+
+### Two machines and one commit
+
+A store is shared between machines only if each key in it is a function of what it is the key of,
+and the bytes under it do not name the machine that made them. `harness/dist/crossmachine.py`
+(unit C4 of [distributed.md](distributed.md)) builds one commit on two machines made on one
+host, each with its own `HOME`, cargo home, checkout path, target directory, store and daemon, and
+sets the stores against each other. `ra-jit cache digests` lists a line for each value in the
+sealed packs, `KEY LENGTH SHA256`, and two machines agree when those lines are the same.
+`RA_JIT_KEYS_LOG=FILE` lists the entries a build adds with their stable names, and the proc-macro
+calls with the part of their key that differs (library, input, environment, current directory),
+so that a difference says what it is. Environment diagnostics name variables and fingerprint
+their values; raw values are not written to the log.
+
+What names a place of the machine, and what stands for it in the store:
+
+| Place | In a key and in a stored value | Where |
+|---|---|---|
+| the cargo home (`registry/src/...`, `git/checkouts/...`) | `/cargo` | `hir-ty-codegen` `moved`, `Entry::leave` and `arrived` |
+| the standard library's sources | `/rustc/<commit>` | `LibrarySources` |
+| the checkout, a file below it that is not a workspace member's | `/checkout/<path>` | `hir-ty-codegen/relocate.rs` |
+| a crate or a file beside the checkout (`path = "../shared"`) | `/checkout/../shared/...`, if the two share two directories | `relocate.rs`, `crate_place`, `Contents::library` |
+| `CARGO_MANIFEST_DIR`, `OUT_DIR` and the macro's current directory | raw paths remain in keys and diagnostic hashes | `ra-jit-expand/src/lib.rs` |
+
+A file of a workspace member is named by its place in the workspace, as rustc names it, which is the
+same on every machine. A path that is neither below the checkout nor beside it is kept as it is: no
+other machine has it, so no other machine finds an entry that names it. Code with the checkout's
+place in its data is not shared.
+Proc-macro keys are not yet content-only. Removing a path from a key is unsafe even when the
+output does not contain it: a macro can branch on the path's length or read a file below it.
+The harness diagnoses this gap rather than allowing it as a pending success.
+
+Registry source replacements are not assumed immutable. Library identities also hash loaded
+source bytes and their dependency closure, so a changed vendored body cannot reuse the old
+code just because its package name, version and relative path are unchanged. The
+`vendor-edit` negative arm changes a body and its cargo checksum on B and compares B's fed
+program with B's changed oracle. Literal suffixes in `concat!(file!(), ...)` are text: only
+the relocation's leading traversal is interpreted, never dots or slashes in that suffix.
+Library body lowering discovers out-of-VFS `include_bytes!` and `include_str!` inputs before
+memoizing the identity. Those observed bytes are hashed too. `vendor-payload` changes only
+a binary payload and its checksum; the library and a dependent caller must print B's values.
 
 ## The disk store
 

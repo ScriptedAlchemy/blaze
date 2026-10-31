@@ -28,6 +28,7 @@ syntax.workspace = true
 vfs.workspace = true
 span.workspace = true
 intern.workspace = true
+paths.workspace = true
 
 [features]
 default = []

@@ -23,6 +23,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{Args, Program, RootDatabase};
 
+mod units;
+pub(crate) use units::{NativeUnit, for_crate as native_unit_for_crate, set_native_units};
+
 type Digest = [u8; 32];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Linked {
@@ -61,7 +64,7 @@ impl OutputStamp {
 static OUTPUT_DIGESTS: LazyLock<Mutex<BTreeMap<PathBuf, (OutputStamp, Digest)>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Inputs {
     directives: Vec<Vec<u8>>,
     paths: BTreeSet<PathBuf>,
@@ -160,7 +163,7 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
     let sysroot = crate::SYSROOT.get().and_then(Option::as_deref);
     // Use the real native link builder, including attribute-declared libraries and ordering.
     // Rust objects and the daemon's mutable layout options are outputs, not native inputs.
-    let (command, env) = crate::link::native_command(db, &roots, sysroot, binary)?;
+    let (command, env) = crate::link::native_command(db, &roots, sysroot, binary, args.shared)?;
     inputs.link_inputs_env(&command, &cwd, &out_dirs, &env);
     for name in ["LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH"] {
         let mut field = name.as_bytes().to_vec();
@@ -411,6 +414,43 @@ pub(crate) fn forget_binary(binary: &Path) {
 
 pub(crate) fn begin(db: &RootDatabase, args: &Args) -> Option<Pending> {
     collect(db, args).map(|(binary, inputs)| pending(binary, inputs))
+}
+
+/// Native image inputs are captured before compilation and verified after the link.
+/// Opaque rules produce no admission record, never a weaker input identity.
+pub(crate) fn image_before(db: &RootDatabase, args: &Args) -> Option<Image> {
+    let (_, inputs) = collect(db, args)?;
+    let before = inputs.digest().ok()?;
+    Some(Image { inputs, before })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Image {
+    inputs: Inputs,
+    before: Digest,
+}
+
+impl Image {
+    pub(crate) fn write(self, path: &Path) -> anyhow::Result<()> {
+        if self.inputs.digest().ok() != Some(self.before) {
+            bail!("producer native inputs changed during compilation");
+        }
+        fs::write(path, serde_json::to_vec(&self)?)?;
+        Ok(())
+    }
+}
+
+/// The record of an image that links nothing native, for tests of the image store.
+#[cfg(test)]
+pub(crate) fn write_empty_image(path: &Path) -> anyhow::Result<()> {
+    let inputs = Inputs::default();
+    let before = inputs.digest()?;
+    Image { inputs, before }.write(path)
+}
+
+pub(crate) fn image_still(path: &Path) -> bool {
+    let image = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Image>(&bytes).ok());
+    image.is_some_and(|it| it.inputs.digest().ok() == Some(it.before))
 }
 
 fn pending(binary: PathBuf, inputs: Inputs) -> Pending {

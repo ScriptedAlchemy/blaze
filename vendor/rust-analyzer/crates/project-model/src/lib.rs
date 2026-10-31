@@ -283,16 +283,19 @@ impl CfgOverrides {
 }
 
 fn parse_cfg(s: &str) -> Result<cfg::CfgAtom, String> {
-    let res = match s.split_once('=') {
+    // Cargo's cfg display includes spaces around `=`. Only whitespace outside
+    // the quoted value is insignificant; spaces within it are part of the cfg.
+    let res = match s.trim().split_once('=') {
         Some((key, value)) => {
-            if !(value.starts_with('"') && value.ends_with('"')) {
+            let Some(value) = value.trim().strip_prefix('"').and_then(|it| it.strip_suffix('"'))
+            else {
                 return Err(format!("Invalid cfg ({s:?}), value should be in quotes"));
-            }
-            let key = intern::Symbol::intern(key);
-            let value = intern::Symbol::intern(&value[1..value.len() - 1]);
+            };
+            let key = intern::Symbol::intern(key.trim());
+            let value = intern::Symbol::intern(value);
             cfg::CfgAtom::KeyValue { key, value }
         }
-        None => cfg::CfgAtom::Flag(intern::Symbol::intern(s)),
+        None => cfg::CfgAtom::Flag(intern::Symbol::intern(s.trim())),
     };
     Ok(res)
 }

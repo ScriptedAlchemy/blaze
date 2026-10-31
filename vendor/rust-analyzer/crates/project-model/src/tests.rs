@@ -1,6 +1,6 @@
 use std::env::temp_dir;
 
-use base_db::{CrateGraphBuilder, ProcMacroPaths};
+use base_db::{CrateGraphBuilder, ProcMacroPaths, TargetKind};
 use cargo_metadata::Metadata;
 use cfg::{CfgAtom, CfgDiff};
 use expect_test::{ExpectFile, expect_file};
@@ -54,9 +54,13 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
 
 fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let data = get_test_json_file(file);
+    to_crate_graph(rust_project_workspace(data), &mut Default::default())
+}
+
+fn rust_project_workspace(data: ProjectJsonData) -> ProjectWorkspace {
     let project = rooted_project_json(data);
     let sysroot = Sysroot::empty();
-    let project_workspace = ProjectWorkspace {
+    ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
         sysroot,
         rustc_cfg: Vec::new(),
@@ -65,8 +69,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
         cfg_overrides: Default::default(),
         extra_includes: Vec::new(),
         set_test: true,
-    };
-    to_crate_graph(project_workspace, &mut Default::default())
+    }
 }
 
 fn get_test_json_file<T: DeserializeOwned>(file: &str) -> T {
@@ -119,6 +122,14 @@ fn to_crate_graph(
     project_workspace: ProjectWorkspace,
     file_map: &mut FxHashMap<AbsPathBuf, FileId>,
 ) -> (CrateGraphBuilder, ProcMacroPaths) {
+    to_crate_graph_with_env(project_workspace, file_map, &Default::default())
+}
+
+fn to_crate_graph_with_env(
+    project_workspace: ProjectWorkspace,
+    file_map: &mut FxHashMap<AbsPathBuf, FileId>,
+    extra_env: &FxHashMap<String, Option<String>>,
+) -> (CrateGraphBuilder, ProcMacroPaths) {
     project_workspace.to_crate_graph(
         &mut {
             |path| {
@@ -126,7 +137,7 @@ fn to_crate_graph(
                 Some(*file_map.entry(path.to_path_buf()).or_insert(FileId::from_raw(len as u32)))
             }
         },
-        &Default::default(),
+        extra_env,
     )
 }
 
@@ -175,6 +186,39 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
 }
 
 #[test]
+fn cargo_proc_macro_cfg_is_confined_to_its_target() {
+    let mut meta: serde_json::Value = get_test_json_file("hello-world-metadata.json");
+    let target = &mut meta["packages"][0]["targets"][0];
+    target["kind"] = serde_json::json!(["proc-macro"]);
+    target["crate_types"] = serde_json::json!(["proc-macro"]);
+    let meta: Metadata = serde_json::from_value(meta).unwrap();
+    let manifest =
+        ManifestPath::try_from(AbsPathBuf::try_from(meta.workspace_root.clone()).unwrap()).unwrap();
+    let cargo = CargoWorkspace::new(meta, manifest, Default::default(), false);
+    let mut workspace = load_workspace_from_metadata("hello-world-metadata.json");
+    if let ProjectWorkspaceKind::Cargo { cargo: current, .. } = &mut workspace.kind {
+        *current = cargo;
+    } else {
+        unreachable!();
+    }
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let mut macros = 0;
+    let mut others = 0;
+    for id in graph.iter() {
+        let krate = &graph[id];
+        let is_macro = krate.basic.target_kind.is_proc_macro();
+        assert_eq!(krate.cfg_options.check_atom(&CfgAtom::Flag(sym::proc_macro)), is_macro);
+        if is_macro {
+            macros += 1;
+        } else {
+            others += 1;
+        }
+    }
+    assert_eq!(macros, 1);
+    assert!(others > 0);
+}
+
+#[test]
 fn cargo_hello_world_project_model() {
     let (crate_graph, _proc_macros) = load_cargo("hello-world-metadata.json");
     check_crate_graph(
@@ -194,8 +238,235 @@ fn rust_project_hello_world_project_model() {
 
 #[test]
 fn rust_project_labeled_project_model() {
-    // This just needs to parse.
-    _ = load_rust_project("labeled-project.json");
+    let (crate_graph, _) = load_rust_project("labeled-project.json");
+    let krate = &crate_graph[crate_graph.iter().next().unwrap()];
+    assert_eq!(krate.basic.target_kind, TargetKind::Bin);
+    assert!(krate.cfg_options.check_atom(&CfgAtom::Flag(sym::rust_analyzer)));
+    assert!(krate.cfg_options.check_atom(&CfgAtom::Flag(sym::test)));
+}
+
+fn compiler_project() -> serde_json::Value {
+    let mut crates = Vec::new();
+    for (name, kind, is_proc_macro, cfg) in [
+        ("program", "bin", false, vec!["saved", "panic=\"abort\""]),
+        ("tests", "test", false, vec!["saved", "test", "panic=\"unwind\""]),
+        ("library", "lib", false, vec![]),
+        ("macros", "lib", true, vec!["saved", "proc_macro"]),
+    ] {
+        crates.push(serde_json::json!({
+            "display_name": name,
+            "root_module": format!("{name}.rs"),
+            "edition": "2021",
+            "deps": [],
+            "cfg": cfg,
+            "codegen_flags": ["-Copt-level=3"],
+            "env": {"DECLARED": "saved", "CARGO_UNSTABLE_CHECKSUM_FRESHNESS": "captured"},
+            "is_workspace_member": true,
+            "is_proc_macro": is_proc_macro,
+            "build": {"label": name, "build_file": "BUILD", "target_kind": kind},
+        }));
+    }
+    serde_json::json!({"compiler_mode": true, "crates": crates})
+}
+
+#[test]
+fn compiler_unit_identity_preserves_distinct_instances_of_the_same_source() {
+    let mut json = compiler_project();
+    let mut shared = json["crates"][2].clone();
+    shared["root_module"] = "common.rs".into();
+    json["crates"] = serde_json::Value::Array(
+        (0..3)
+            .map(|id| {
+                let mut krate = shared.clone();
+                krate["blaze_native_unit"] = id.into();
+                krate
+            })
+            .collect(),
+    );
+    let workspace = rust_project_workspace(serde_json::from_value(json).unwrap());
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let units: Vec<_> = graph.iter().map(|id| graph[id].extra.blaze_native_unit).collect();
+    assert_eq!(units, [Some(0), Some(1), Some(2)]);
+    let files: std::collections::HashSet<_> =
+        graph.iter().map(|id| graph[id].basic.root_file_id).collect();
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn compiler_project_preserves_exact_cfg_env_and_target_kinds() {
+    let mut json = compiler_project();
+    // Compiler cfgs are already complete for this target. Loading the graph must
+    // not ask another compiler for a replacement target configuration.
+    json["crates"][2]["target"] = "saved-target-with-no-external-query".into();
+    for set_test in [false, true] {
+        let mut workspace = rust_project_workspace(serde_json::from_value(json.clone()).unwrap());
+        workspace.set_test = set_test;
+        workspace.rustc_cfg = ["panic=\"unwind\"", "debug_assertions", "overflow_checks"]
+            .map(|cfg| crate::parse_cfg(cfg).unwrap())
+            .into();
+        workspace.cfg_overrides = CfgOverrides {
+            global: CfgDiff::new(
+                vec![crate::parse_cfg("editor_global").unwrap()],
+                vec![crate::parse_cfg("saved").unwrap()],
+            ),
+            selective: FxHashMap::from_iter([(
+                "program".into(),
+                CfgDiff::new(vec![crate::parse_cfg("editor_selective").unwrap()], vec![]),
+            )]),
+        };
+        let extra_env = FxHashMap::from_iter([
+            ("DECLARED".into(), Some("editor override".into())),
+            ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), Some("false".into())),
+            ("EDITOR_ONLY".into(), Some("not a source input".into())),
+        ]);
+        let (graph, _) = to_crate_graph_with_env(workspace, &mut Default::default(), &extra_env);
+        assert_eq!(graph.iter().count(), 4);
+        for id in graph.iter() {
+            let krate = &graph[id];
+            let name = krate.extra.display_name.as_ref().unwrap().canonical_name().as_str();
+            let (kind, cfg): (_, &[_]) = match name {
+                "program" => (TargetKind::Bin, &["saved", "panic=\"abort\""]),
+                "tests" => (TargetKind::Test, &["saved", "test", "panic=\"unwind\""]),
+                "library" => (TargetKind::Lib { is_proc_macro: false }, &[]),
+                "macros" => (TargetKind::Lib { is_proc_macro: true }, &["saved", "proc_macro"]),
+                _ => unreachable!(),
+            };
+            let expected = cfg.iter().map(|it| crate::parse_cfg(it).unwrap()).collect();
+            assert_eq!(krate.cfg_options, expected, "{name}");
+            assert_eq!(krate.basic.target_kind, kind, "{name}");
+            assert_eq!(krate.basic.codegen_flags, ["-Copt-level=3"], "{name}");
+            assert_eq!(krate.env.get("DECLARED").as_deref(), Some("saved"), "{name}");
+            assert_eq!(
+                krate.env.get("CARGO_UNSTABLE_CHECKSUM_FRESHNESS").as_deref(),
+                Some("captured"),
+                "{name}"
+            );
+            assert!(!krate.env.contains_key("EDITOR_ONLY"), "{name}");
+        }
+    }
+}
+
+#[test]
+fn compiler_project_preserves_non_unicode_environment_as_present_but_not_text() {
+    let mut json = compiler_project();
+    json["crates"][0]["blaze_invalid_env"] = serde_json::json!(["NATIVE_VALUE"]);
+    let (graph, _) = to_crate_graph(
+        rust_project_workspace(serde_json::from_value(json).unwrap()),
+        &mut Default::default(),
+    );
+    let root = graph
+        .iter()
+        .find(|&id| {
+            graph[id].extra.display_name.as_ref().unwrap().canonical_name().as_str() == "program"
+        })
+        .unwrap();
+    let env = &graph[root].env;
+    assert!(env.contains_key("NATIVE_VALUE"));
+    assert!(env.is_non_unicode("NATIVE_VALUE"));
+    assert_eq!(env.get("NATIVE_VALUE"), None);
+    assert!(!env.is_non_unicode("ABSENT"));
+    let mut overlaid = env.clone();
+    overlaid.set("NATIVE_VALUE", "text override");
+    assert!(!overlaid.is_non_unicode("NATIVE_VALUE"));
+    assert_eq!(overlaid.get("NATIVE_VALUE").as_deref(), Some("text override"));
+    assert_ne!(format!("{env:?}"), format!("{:?}", base_db::Env::default()));
+}
+
+#[test]
+fn compiler_project_accepts_cargo_cfg_whitespace() {
+    let mut json = compiler_project();
+    json["crates"][0]["cfg"] = serde_json::json!([
+        "target_abi = \"\"",
+        " \ttarget_os\t=\t\"linux\" \n",
+        "custom = \" a = b \"",
+        " \tunix \n",
+    ]);
+    let data: ProjectJsonData = serde_json::from_value(json).unwrap();
+    let roundtrip = serde_json::to_value(&data).unwrap();
+    assert_eq!(
+        roundtrip["crates"][0]["cfg"],
+        serde_json::json!(["target_abi=\"\"", "target_os=\"linux\"", "custom=\" a = b \"", "unix"]),
+    );
+    assert_eq!(serde_json::from_value::<ProjectJsonData>(roundtrip).unwrap(), data);
+    let (graph, _) = to_crate_graph(rust_project_workspace(data), &mut Default::default());
+    let program = graph.iter().find(|&id| graph[id].basic.target_kind == TargetKind::Bin).unwrap();
+    let expected = ["target_abi=\"\"", "target_os=\"linux\"", "custom=\" a = b \"", "unix"]
+        .map(|cfg| crate::parse_cfg(cfg).unwrap())
+        .into_iter()
+        .collect();
+    assert_eq!(graph[program].cfg_options, expected);
+}
+
+#[test]
+fn compiler_project_rejects_malformed_cfg_values() {
+    for cfg in [
+        "target_abi = ",
+        "target_abi = \"",
+        "target_abi=\"",
+        "target_abi = linux",
+        "target_abi = \"linux",
+        "target_abi = linux\"",
+        "target_abi = \"linux\" trailing",
+    ] {
+        let mut json = compiler_project();
+        json["crates"][0]["cfg"] = serde_json::json!([cfg]);
+        let error = serde_json::from_value::<ProjectJsonData>(json).unwrap_err();
+        assert!(error.to_string().contains("value should be in quotes"), "{cfg}: {error}");
+    }
+}
+
+#[test]
+fn analyzer_project_retains_cfg_and_environment_overrides() {
+    let mut json = compiler_project();
+    json.as_object_mut().unwrap().remove("compiler_mode");
+    let mut workspace = rust_project_workspace(serde_json::from_value(json).unwrap());
+    workspace.rustc_cfg = vec![crate::parse_cfg("target_default").unwrap()];
+    workspace.cfg_overrides.global = CfgDiff::new(
+        vec![crate::parse_cfg("editor_global").unwrap()],
+        vec![crate::parse_cfg("saved").unwrap()],
+    );
+    let extra_env = FxHashMap::from_iter([("DECLARED".into(), Some("editor override".into()))]);
+    let (graph, _) = to_crate_graph_with_env(workspace, &mut Default::default(), &extra_env);
+    for id in graph.iter() {
+        let krate = &graph[id];
+        for flag in ["rust_analyzer", "test", "target_default", "editor_global"] {
+            assert!(krate.cfg_options.check_atom(&crate::parse_cfg(flag).unwrap()), "{flag}");
+        }
+        assert!(!krate.cfg_options.check_atom(&crate::parse_cfg("saved").unwrap()));
+        assert_eq!(krate.env.get("DECLARED").as_deref(), Some("editor override"));
+    }
+}
+
+#[test]
+fn compiler_project_rejects_missing_or_inconsistent_compiler_intent() {
+    for missing in ["cfg", "build"] {
+        let mut json = compiler_project();
+        json["crates"][0].as_object_mut().unwrap().remove(missing);
+        let error = serde_json::from_value::<ProjectJsonData>(json.clone()).unwrap_err();
+        assert!(error.to_string().contains("compiler_mode"), "{error}");
+        json["compiler_mode"] = false.into();
+        let legacy: ProjectJsonData = serde_json::from_value(json).unwrap();
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized["crates"][0]["cfg"].is_array());
+        assert_eq!(serde_json::from_value::<ProjectJsonData>(serialized).unwrap(), legacy);
+    }
+    let mut json = compiler_project();
+    json["crates"][0]["cfg_groups"] = serde_json::json!(["unresolved"]);
+    assert!(serde_json::from_value::<ProjectJsonData>(json).is_err());
+    let mut json = compiler_project();
+    json["crates"][0]["build"].as_object_mut().unwrap().remove("target_kind");
+    assert!(serde_json::from_value::<ProjectJsonData>(json).is_err());
+    for kind in ["bin", "test"] {
+        let mut json = compiler_project();
+        json["crates"][3]["build"]["target_kind"] = kind.into();
+        let error = serde_json::from_value::<ProjectJsonData>(json).unwrap_err();
+        assert!(error.to_string().contains("proc-macro"), "{error}");
+    }
+    let json = compiler_project();
+    let data: ProjectJsonData = serde_json::from_value(json).unwrap();
+    let roundtrip = serde_json::to_value(&data).unwrap();
+    assert_eq!(roundtrip["compiler_mode"], true);
+    assert_eq!(serde_json::from_value::<ProjectJsonData>(roundtrip).unwrap(), data);
 }
 
 #[test]

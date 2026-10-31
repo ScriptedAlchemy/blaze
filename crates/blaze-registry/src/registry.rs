@@ -194,12 +194,12 @@ impl Registry {
         }
     }
 
-    /// The versions of `name` that match `req`, as cargo's `query_inner`: offline, those whose
-    /// `.crate` is on disk when there are any, and all of them when there are none.
+    /// The versions of `name` that match `req`, as cargo's `query_inner`: offline remote
+    /// registries prefer available archives, while local registries return all versions.
     pub fn query(&self, name: &str, req: &VersionReq) -> anyhow::Result<Vec<IndexLine>> {
         let summaries = self.summaries(name)?;
         let lines: Vec<IndexLine> = summaries.matching(req).collect();
-        if !self.context.net.offline {
+        if !self.context.net.offline || self.is_local() {
             return Ok(lines);
         }
         let on_disk: Vec<IndexLine> = lines

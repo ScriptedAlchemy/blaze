@@ -114,6 +114,8 @@ mod handlers {
 }
 
 #[cfg(test)]
+mod compiler_acceptance_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::LazyLock;

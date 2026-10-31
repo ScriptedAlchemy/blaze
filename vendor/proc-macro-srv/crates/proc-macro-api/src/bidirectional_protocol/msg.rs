@@ -8,7 +8,6 @@ use std::{
 };
 
 use paths::Utf8PathBuf;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     ProcMacroKind,
@@ -16,7 +15,8 @@ use crate::{
     transport::postcard,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_enum! {
+#[derive(Debug)]
 pub enum SubRequest {
     FilePath {
         file_id: u32,
@@ -67,8 +67,10 @@ pub enum SubRequest {
         ctx_second: u32,
     },
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_enum! {
+#[derive(Debug)]
 pub enum SubResponse {
     FilePathResult {
         name: String,
@@ -104,8 +106,10 @@ pub enum SubResponse {
         reason: String,
     },
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ParentSpan {
     pub file_id: u32,
     pub ast_id: u32,
@@ -113,81 +117,100 @@ pub struct ParentSpan {
     pub end: u32,
     pub ctx: u32,
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct SpanJoin {
     pub ast_id: u32,
     pub start: u32,
     pub end: u32,
     pub ctx: u32,
 }
+}
 
+wire_enum! {
 #[expect(clippy::large_enum_variant)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum BidirectionalMessage {
     Request(Request),
     Response(Response),
     SubRequest(SubRequest),
     SubResponse(SubResponse),
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_enum! {
+#[derive(Debug)]
 pub enum Request {
     ListMacros(ListMacros),
     ExpandMacro(Box<ExpandMacro>),
     ApiVersionCheck(ApiVersionCheck),
     SetConfig(ServerConfig),
 }
+}
 
+wire_enum! {
 #[expect(clippy::large_enum_variant)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum Response {
     ListMacros(Result<Vec<(String, ProcMacroKind)>, String>),
     ApiVersionCheck(u32),
     SetConfig(ServerConfig),
     ExpandMacro(Result<ExpandMacroResponse, PanicMessage>),
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ListMacros {
     pub dylib_path: Utf8PathBuf,
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ApiVersionCheck {}
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ExpandMacro {
     pub lib: Utf8PathBuf,
     pub env: Vec<(String, String)>,
     pub current_dir: Option<String>,
     pub data: ExpandMacroData,
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ExpandMacroResponse {
     pub tree: FlatTree,
     pub span_data_table: Vec<u32>,
     pub tracked_env_vars: HashMap<Box<str>, Option<Box<str>>>,
     pub tracked_paths: HashSet<Box<str>>,
 }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Debug)]
 pub struct ExpandMacroData {
     pub macro_body: FlatTree,
     pub macro_name: String,
     pub attributes: Option<FlatTree>,
-    #[serde(default)]
-    pub has_global_spans: ExpnGlobals,
-    #[serde(default)]
-    pub span_data_table: Vec<u32>,
+    pub has_global_spans: ExpnGlobals = Default::default(),
+    pub span_data_table: Vec<u32> = Default::default(),
+}
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+wire_struct! {
+#[derive(Clone, Copy, Default, Debug)]
 pub struct ExpnGlobals {
     pub def_site: usize,
     pub call_site: usize,
     pub mixed_site: usize,
+}
 }
 
 impl Message for BidirectionalMessage {
