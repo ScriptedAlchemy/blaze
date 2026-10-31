@@ -2,7 +2,7 @@ name: Blaze deep repair verification
 on:
   push:
     branches: [repair/blaze-runtime-20261031]
-    paths: [.github/workflows/blaze-deep-review.yaml, .github/repair/deep-child.patch]
+    paths: [.github/workflows/blaze-deep-review.yaml, '.github/repair/**']
 permissions:
   contents: write
 concurrency:
@@ -61,13 +61,50 @@ jobs:
           git -C "$checked" add crates/ra-jit/src/child.rs crates/ra-jit/src/cargo/spec.rs
           git -C "$checked" diff --cached > "$RUNNER_TEMP/child-verified.patch"
           git -C "$checked" commit -m 'Drain compiler output while streaming private project input' -m 'Send stdin on a scoped writer while wait_with_output drains stdout and stderr. Reuse the SIGPIPE-safe helper for saved replay. A real subprocess regression deadlocks before the fix and passes afterward; verbose early rejection, successful early exit and default SIGPIPE are also covered.'
-          candidate=$(git -C "$checked" rev-parse HEAD)
-          git push origin "$candidate:refs/heads/repair/deep-child-$GITHUB_RUN_ID"
-          printf '{"candidate":"%s","base":"2d3292ec71b37e4dd9d50c3b4c7ad4bc8ea5465a"}\n' "$candidate" > "$RUNNER_TEMP/child-receipt.json"
-          git update-ref refs/heads/snapshot-ci 89d814aa7e7102f8285697091a89de0b5d053f7c
-          git update-ref refs/heads/snapshot-c2 937c36922a87ae1360ea10ca1e54b7f7aee92a1f
-          git update-ref refs/heads/snapshot-child "$candidate"
-          git bundle create "$RUNNER_TEMP/blaze-deep-review.bundle" refs/heads/snapshot-ci refs/heads/snapshot-c2 refs/heads/snapshot-child
+          git -C "$checked" rev-parse HEAD > "$RUNNER_TEMP/child-sha"
+      - name: Integrate and verify both exact PR candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v zstd
+          shared=$(cat "$RUNNER_TEMP/child-sha")
+          ci="$RUNNER_TEMP/deep-ci"
+          c2="$RUNNER_TEMP/deep-c2"
+          git config user.name 'Blaze repair'
+          git config user.email 'noreply@openai.com'
+          git worktree add --detach "$ci" 89d814aa7e7102f8285697091a89de0b5d053f7c
+          git -C "$ci" merge --no-ff "$shared" -m 'Merge verified compiler pipe repair into shared-build CI'
+          python3 .github/repair/apply_deep_ci.py "$ci"
+          git worktree add --detach "$c2" 937c36922a87ae1360ea10ca1e54b7f7aee92a1f
+          git -C "$c2" merge --no-ff "$shared" -m 'Merge verified compiler pipe repair into saved replay'
+          export CI_TREE="$ci" C2_TREE="$c2"
+          python3 - <<'PY'
+          import os, pathlib
+          marker = '      - name: Test compiler export and import identities\n'
+          commands = {
+              'CI_TREE': 'nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- child:: --test-threads=2',
+              'C2_TREE': 'cargo test --locked -p ra-jit --bin ra-jit -- child:: --test-threads=2',
+          }
+          for key, command in commands.items():
+              file = pathlib.Path(os.environ[key]) / '.github/workflows/blaze-serve-review.yaml'
+              text = file.read_text()
+              assert text.count(marker) == 1, key
+              step = '      - name: Test compiler subprocess input and output\n        if: ${{ !cancelled() }}\n        run: ' + command + '\n'
+              file.write_text(text.replace(marker, step + marker))
+          PY
+          (cd "$ci"; for test in test_changes.py test_bundle_integrity.py test_bundle_transport.py test_bench_pair.py test_bench_verdict.py; do python3 -I ".github/scripts/$test"; done; python3 -I harness/dist/test_buildspec_cleanup.py; python3 -I harness/dist/test_check_nix_workflow.py; python3 -I harness/dist/test_saved_spec_nix_rpath.py; git diff --check) 2>&1 | tee "$RUNNER_TEMP/ci-deep-checks.log"
+          (cd "$c2"; python3 -I harness/dist/test_buildspec_cleanup.py; python3 -I harness/dist/test_check_nix_workflow.py; python3 -I harness/dist/test_saved_spec_nix_rpath.py; git diff --check) 2>&1 | tee "$RUNNER_TEMP/c2-deep-checks.log"
+          git -C "$ci" add .github/ci/areas.json .github/scripts .github/workflows/bench.yaml .github/workflows/pr.yaml .github/workflows/blaze-serve-review.yaml
+          git -C "$ci" commit -m 'Fix CI coverage, benchmark verdicts and bundle transport fidelity' -m 'Include compiler dependencies and rename origins in runtime selection. Reject incomplete or duplicate benchmark evidence and abnormal process exits. Preserve removed Cargo environment variables, dereference packed hardlinks, drain valid tar padding and verify executable mode. Exercise the helper regressions before expensive builds and wire the compiler pipe tests into consumers.'
+          git -C "$c2" add .github/workflows/blaze-serve-review.yaml
+          git -C "$c2" commit -m 'Run compiler pipe regressions in the saved replay gate'
+          ci_sha=$(git -C "$ci" rev-parse HEAD)
+          c2_sha=$(git -C "$c2" rev-parse HEAD)
+          git push origin "$ci_sha:refs/heads/repair/deep-ci-$GITHUB_RUN_ID" "$c2_sha:refs/heads/repair/deep-c2-$GITHUB_RUN_ID"
+          printf '{"shared":"%s","ci":"%s","c2":"%s","ci_base":"89d814aa7e7102f8285697091a89de0b5d053f7c","c2_base":"937c36922a87ae1360ea10ca1e54b7f7aee92a1f"}\n' "$shared" "$ci_sha" "$c2_sha" > "$RUNNER_TEMP/deep-receipt.json"
+          git update-ref refs/heads/snapshot-ci "$ci_sha"
+          git update-ref refs/heads/snapshot-c2 "$c2_sha"
+          git bundle create "$RUNNER_TEMP/blaze-deep-review.bundle" refs/heads/snapshot-ci refs/heads/snapshot-c2
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -76,6 +113,7 @@ jobs:
             ${{ runner.temp }}/blaze-deep-review.bundle
             ${{ runner.temp }}/child-*.log
             ${{ runner.temp }}/child-verified.patch
-            ${{ runner.temp }}/child-receipt.json
+            ${{ runner.temp }}/deep-receipt.json
+            ${{ runner.temp }}/*-deep-checks.log
           retention-days: 1
           if-no-files-found: warn

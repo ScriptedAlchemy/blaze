@@ -1,0 +1,11 @@
+{
+  ".github/ci/areas.json": "5e3a756235b4f2c0d072d434786c3c2b91f43cf67603a00b2a91821d4dcf2d24",
+  ".github/scripts/bundle.py": "3ad7e3628012b6792992faf8dbd891dacc5b2b8d1459a6e913ba5d417b6eac03",
+  ".github/scripts/bench_verdict.py": "05e6012338a397388ff60e2703c200fd13ee4b20527ce309f2bf6366adb6f12c",
+  ".github/scripts/test_bench_verdict.py": "26783f390106414c6742e9f5f44efab4ef8acaa4bb9a57d794f60faf0f100c3b",
+  ".github/scripts/changes.py": "048d52d82374d1d98142c3ea1c10d5853cfdeee47ac6e64e0d88c01509ce7605",
+  ".github/scripts/test_changes.py": "f5c70dde1993d9327c82eb35aece5fb723b4b87f23d71936ca2cde72898d0e39",
+  ".github/scripts/test_bundle_transport.py": "eaf8de6285a16578773932daa58126980ab4a8210d8a085d71267a18e0da3213",
+  ".github/workflows/bench.yaml": "cc8ae53465a3fde46ed36c7e0b590ffc8f438819f7f8d8a59f109f36c739c9a1",
+  ".github/workflows/pr.yaml": "203c3c9ec113177030fd2ba29c57f3b20517a40b78b4294647e17fe46d07ce0d"
+}
