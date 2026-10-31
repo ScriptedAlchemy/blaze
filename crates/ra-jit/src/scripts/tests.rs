@@ -963,6 +963,7 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
         explicit_target: false,
         packages: None,
         host_cargo: None,
+        shared: None,
     };
     let leases = Leases::default();
     let mut runner = Runner::new(&leases, &cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
