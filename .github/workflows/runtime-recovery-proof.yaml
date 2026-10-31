@@ -1,0 +1,96 @@
+name: Runtime result and remote recovery proof
+on:
+  push:
+    branches: [repair/runtime-result-recovery-20261031]
+    paths:
+      - .github/workflows/runtime-recovery-proof.yaml
+      - .github/repair/apply_runtime_recovery.py
+permissions:
+  contents: write
+concurrency:
+  group: runtime-result-recovery-proof
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "0"
+defaults:
+  run:
+    shell: bash
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+          llvm: none
+      - name: Reproduce subprocess bugs, then prepare their repairs
+        run: python3 -I .github/repair/apply_runtime_recovery.py
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Test the actual CLI runner, selection and remote implementations
+        run: |
+          cargo test --locked -p ra-jit --bin ra-jit -- cargo::run:: cargo::affected:: remote:: --test-threads=2 2>&1 | tee "$RUNNER_TEMP/runtime-proof/integrated-after.log"
+      - name: Prove cache revocation and remote recovery regressions fail before repair
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          out = Path(os.environ['RUNNER_TEMP']) / 'runtime-proof'
+          original = json.loads((out / 'baseline.json').read_text())
+          repaired = json.loads((out / 'repaired-sources.json').read_text())
+          try:
+              for path, text in original.items():
+                  if path.endswith('/cargo/run.rs'):
+                      text += '\n#[cfg(test)]\n#[path = "run/output_tests.rs"]\nmod output_tests;\n#[cfg(all(test, unix))]\n#[path = "run/policy_tests.rs"]\nmod policy_tests;\n'
+                  elif path.endswith('/remote/keeper.rs'):
+                      text += '\n#[cfg(test)]\n#[path = "keeper/recovery_tests.rs"]\nmod recovery_tests;\n'
+                  elif path.endswith('/remote.rs'):
+                      marker = '    async fn pull_as_set(&self)'
+                      shim = '    async fn pull_and_remember(&self, observed: Option<Digest>) -> anyhow::Result<String> {\n        self.asked.see(observed);\n        self.pull_as_set().await\n    }\n\n'
+                      assert text.count(marker) == 1
+                      text = text.replace(marker, shim + marker)
+                  Path(path).write_text(text)
+              cmd = ['cargo', 'test', '--locked', '-p', 'ra-jit', '--bin', 'ra-jit', '--', 'cargo::run::policy_tests::', 'remote::keeper::recovery_tests::', '--test-threads=2']
+              result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (out / 'integrated-before.log').write_text(result.stdout)
+              print(result.stdout, flush=True)
+              assert result.returncode == 101, result.returncode
+              expected = ['crashes_never_become_flaky_successes_or_partial_cached_passes', 'command_construction_error_revokes_earlier_passes', 'failed_retry_spawn_revokes_earlier_passes', 'unchanged_manifest_is_retried_after_an_eager_pull_fails', 'failed_initial_pull_does_not_suppress_the_keepers_next_look', 'unavailable_lazy_index_is_not_a_successful_partial_refresh', 'a_failed_lazy_refresh_preserves_the_previous_lookup']
+              for name in expected:
+                  assert any(line.startswith('test ') and name + ' ... FAILED' in line for line in result.stdout.splitlines()), name
+          finally:
+              for path, text in repaired.items():
+                  Path(path).write_text(text)
+          PY
+      - name: Recheck the final repaired source and formatting
+        run: |
+          cargo test --locked -p ra-jit --bin ra-jit -- cargo::run:: cargo::affected:: remote:: --test-threads=2 2>&1 | tee "$RUNNER_TEMP/runtime-proof/integrated-final.log"
+          cargo fmt -p ra-jit -- --check
+          git diff --check
+          python3 harness/rustcsites.py
+          git diff -- crates/ra-jit/src > "$RUNNER_TEMP/runtime-proof/verified.patch"
+      - name: Publish only the verified source changes to the repair branch
+        run: |
+          git config user.name 'Blaze repair'
+          git config user.email 'noreply@openai.com'
+          git add crates/ra-jit/src/cargo/run.rs crates/ra-jit/src/cargo/affected.rs crates/ra-jit/src/cargo/run/output_tests.rs crates/ra-jit/src/cargo/run/policy_tests.rs crates/ra-jit/src/remote.rs crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git commit -m 'Preserve test-result integrity and retry failed remote refreshes' -m 'Reject abnormal exits and incomplete failure summaries before retries or partial caching. Revoke older passes on command and spawn errors. Remember remote manifests only after successful pulls and preserve existing lazy indexes when a refresh is incomplete. Regressions failed before repair and passed afterward against the actual CLI modules.'
+          git push origin HEAD:refs/heads/repair/runtime-result-recovery-20261031
+          git rev-parse HEAD > "$RUNNER_TEMP/runtime-proof/verified-head.txt"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: runtime-result-recovery-proof
+          path: |
+            ${{ runner.temp }}/runtime-proof/*.log
+            ${{ runner.temp }}/runtime-proof/*.patch
+            ${{ runner.temp }}/runtime-proof/verified-head.txt
+          if-no-files-found: warn
+          retention-days: 7
