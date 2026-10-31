@@ -86,11 +86,26 @@ jobs:
               -t "$TIME" --noise-threshold "$NOISE" -o -v \
               --dump "$RUNNER_TEMP/tango/compare-$attempt" | tee -a "$RUNNER_TEMP/bench.txt"
           }
+          # The base against itself: what the runner alone makes of the same code. A slowdown
+          # the change shows twice is judged only where this stays under the threshold; a runner
+          # that moves the same binary by more than that cannot tell the change's effect apart.
+          control() {
+            "$RUNNER_TEMP/bench-base" --color never compare "$RUNNER_TEMP/bench-base" \
+              -t "$TIME" --noise-threshold "$NOISE" -o -v \
+              --dump "$RUNNER_TEMP/tango/control" | tee -a "$RUNNER_TEMP/bench.txt"
+          }
           { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           status=0
           compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
+          if [ "$status" != 0 ]; then
+            echo "The base against itself, to tell the runner's noise from the change's:" | tee -a "$RUNNER_TEMP/bench.txt"
+            if ! control; then
+              echo "::warning::the runner is too noisy to judge: the base against itself moved over ${NOISE}%; the comparison is not judged (its tables are in the summary)"
+              status=0
+            fi
+          fi
           { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$status" = 0 ] || echo "::error::both benchmark comparisons report a slowdown over ${NOISE}%"
+          [ "$status" = 0 ] || echo "::error::both benchmark comparisons report a slowdown over ${NOISE}% while the base against itself stays under"
           exit "$status"
       # On main, and on a pull request whose base has no benchmarks.
       - name: Times
