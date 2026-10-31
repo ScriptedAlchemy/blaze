@@ -102,6 +102,13 @@ pub(crate) fn operation(build: u64) -> Operation {
 /// the run it was loaded from ([`generation_of`]).
 pub(crate) type World = Vec<(PathBuf, u64)>;
 
+/// The immutable typed directives of the generations this database was loaded from.
+/// The caller keeps its World pin while collecting and using them.
+pub(crate) fn runtime_outputs(
+    world: &World,
+) -> anyhow::Result<Vec<(PathBuf, blaze_build_script::Output)>> {
+    LEASES.runtime_outputs(world)
+}
 /// The leases on the producer images a load admitted, held by the value the load keeps
 /// ([`Own`]) for as long as the database loaded from it serves their macros: a request that
 /// names no build is retired by nothing, and its images are loaded by the proc-macro client
@@ -826,8 +833,38 @@ impl<'a> Runner<'a> {
                 deps.push((format!("run of {}", dep_data.name), ran.fingerprint, ran.made));
             }
         }
-        let unit = self.unit(package, for_host, &lib, exe, dependencies)?;
+        let plugin_search = self.plugin_search(package)?;
+        let unit = self.unit(package, for_host, &lib, exe, dependencies, plugin_search)?;
         self.judge(package, unit, compiled, &deps)
+    }
+
+    /// What the scripts of the packages the script of `package` is compiled with (its build
+    /// dependencies and theirs, as the host has them) added with `rustc-link-search`, in the
+    /// order cargo runs them: where the script's run finds a shared library one of them built
+    /// (`add_plugin_deps`).
+    fn plugin_search(&mut self, package: Package) -> Result<Vec<PathBuf>, String> {
+        let cargo = self.cargo;
+        let mut queue: Vec<Package> = cargo[package]
+            .dependencies
+            .iter()
+            .filter(|it| it.kind == DepKind::Build)
+            .map(|it| it.pkg)
+            .collect();
+        queue.reverse();
+        let mut seen = FxHashSet::default();
+        let mut paths = Vec::new();
+        while let Some(dep) = queue.pop() {
+            if !seen.insert(dep) {
+                continue;
+            }
+            if self.runs(dep) {
+                let ran = self.script(dep, true)?;
+                paths.extend(ran.output.library_paths.iter().map(|it| it.path().to_owned()));
+            }
+            let normal = cargo[dep].dependencies.iter().filter(|it| it.kind == DepKind::Normal);
+            queue.extend(normal.map(|it| it.pkg).rev());
+        }
+        Ok(paths)
     }
 
     /// Where a build's judgment of the script of `package` starts: what the build judged already,
@@ -841,7 +878,7 @@ impl<'a> Runner<'a> {
         for_host: bool,
         lib: &Profile,
     ) -> Result<Option<Arc<Done>>, String> {
-        let probe = self.unit(package, for_host, lib, PathBuf::new(), Vec::new())?;
+        let probe = self.unit(package, for_host, lib, PathBuf::new(), Vec::new(), Vec::new())?;
         let run_dir = blaze_build_script::run::run_dir(&probe).to_owned();
         let build = self.asked.build;
         match self.leases.decision(build, &run_dir) {
@@ -1111,6 +1148,7 @@ impl<'a> Runner<'a> {
         lib: &Profile,
         script: PathBuf,
         dependencies: Vec<unit::Dependency>,
+        plugin_search: Vec<PathBuf>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
         let debuginfo = self.debuginfo(package, for_host, lib);
@@ -1215,7 +1253,9 @@ impl<'a> Runner<'a> {
                 host_root: Some(target_dir.join(&dir_name)),
                 host_deps: vec![target_dir.join(&dir_name).join("deps")],
                 sysroot_libdir: self.sysroot.join("lib/rustlib").join(self.asked.host).join("lib"),
-                plugin_search: Vec::new(),
+                plugin_search,
+                // Blaze's scripts write below its own directory of the target directory.
+                plugin_root: Some(target_dir.to_owned()),
             },
             jobserver: None,
         })
@@ -1598,12 +1638,23 @@ impl<'a> Runner<'a> {
         );
         set("CARGO_PKG_README", data.readme.as_ref().map(ToString::to_string).unwrap_or_default());
         set("CARGO_CRATE_NAME", name.to_owned());
+        // What the script asked the linker for goes on the line of its library, as cargo has
+        // it on rustc's (`-L` and `-l`), which the link of a program of the crate reads back
+        // from the unit's flags; a script's link arguments are for its own package's programs,
+        // which a described library is not.
+        let mut link_flags = Vec::new();
         if let Some(ran) = ran {
             set("OUT_DIR", ran.out_dir.display().to_string());
             for (key, value) in &ran.output.env {
                 set(key, value.clone());
             }
             cfg.extend(ran.output.cfgs.iter().cloned());
+            for path in &ran.output.library_paths {
+                link_flags.extend(["-L".to_owned(), path.path().display().to_string()]);
+            }
+            for library in &ran.output.library_links {
+                link_flags.extend(["-l".to_owned(), library.clone()]);
+            }
         }
         Ok(crate::cargo::own_script::Planned {
             out_dir: ran.map(|ran| ran.out_dir.clone()),
@@ -1614,6 +1665,7 @@ impl<'a> Runner<'a> {
             cfg,
             codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
                 .chain(self.host_flags.iter().cloned())
+                .chain(link_flags)
                 .collect(),
             env,
             deps: Vec::new(),

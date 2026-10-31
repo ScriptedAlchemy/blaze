@@ -1760,21 +1760,32 @@ impl Enc<'_> {
                 self.u8(9);
                 self.ast_id(*ast)?;
                 self.mod_path(path)?;
-                match err {
-                    ExpandErrorKind::ProcMacroAttrExpansionDisabled => self.u8(0),
-                    ExpandErrorKind::MissingProcMacroExpander(krate) => {
-                        self.u8(1);
-                        self.krate(*krate)?;
-                    }
-                    ExpandErrorKind::MacroDisabled => self.u8(2),
-                    ExpandErrorKind::MacroDefinition => self.u8(3),
-                    ExpandErrorKind::RecursionOverflow => self.u8(4),
-                    ExpandErrorKind::Other(message) => {
-                        self.u8(5);
-                        self.str(message)?;
-                    }
-                    _ => return Err(format!("a macro error: {err:?}")),
-                }
+                self.macro_error(err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn macro_error(&mut self, err: &ExpandErrorKind) -> R {
+        match err {
+            ExpandErrorKind::ProcMacroAttrExpansionDisabled => self.u8(0),
+            ExpandErrorKind::MissingProcMacroExpander(krate) => {
+                self.u8(1);
+                self.krate(*krate)?;
+            }
+            ExpandErrorKind::MacroDisabled => self.u8(2),
+            ExpandErrorKind::MacroDefinition => self.u8(3),
+            ExpandErrorKind::RecursionOverflow => self.u8(4),
+            ExpandErrorKind::Other(message) => {
+                self.u8(5);
+                self.str(message)?;
+            }
+            ExpandErrorKind::NonUnicodeEnv(key) => {
+                self.u8(6);
+                self.symbol(key)?;
+            }
+            ExpandErrorKind::Mbe(_) | ExpandErrorKind::ProcMacroPanic(_) => {
+                return Err(format!("a macro error: {err:?}"));
             }
         }
         Ok(())
@@ -2845,20 +2856,25 @@ impl Dec<'_> {
             9 => {
                 let ast = self.ast_id()?;
                 let path = self.mod_path()?;
-                let err = match self.u8()? {
-                    0 => ExpandErrorKind::ProcMacroAttrExpansionDisabled,
-                    1 => ExpandErrorKind::MissingProcMacroExpander(self.krate()?),
-                    2 => ExpandErrorKind::MacroDisabled,
-                    3 => ExpandErrorKind::MacroDefinition,
-                    4 => ExpandErrorKind::RecursionOverflow,
-                    5 => ExpandErrorKind::Other(self.str()?.into()),
-                    it => return Err(format!("macro error {it}")),
-                };
+                let err = self.macro_error()?;
                 DefDiagnosticKind::MacroError { ast, path, err }
             }
             it => return Err(format!("diagnostic {it}")),
         };
         Ok(DefDiagnostic { in_module, kind })
+    }
+
+    fn macro_error(&mut self) -> R<ExpandErrorKind> {
+        Ok(match self.u8()? {
+            0 => ExpandErrorKind::ProcMacroAttrExpansionDisabled,
+            1 => ExpandErrorKind::MissingProcMacroExpander(self.krate()?),
+            2 => ExpandErrorKind::MacroDisabled,
+            3 => ExpandErrorKind::MacroDefinition,
+            4 => ExpandErrorKind::RecursionOverflow,
+            5 => ExpandErrorKind::Other(self.str()?.into()),
+            6 => ExpandErrorKind::NonUnicodeEnv(self.symbol()?),
+            it => return Err(format!("macro error {it}")),
+        })
     }
 
     fn def_map(&mut self) -> R<DefMap> {
@@ -2977,6 +2993,33 @@ mod tests {
 
     use super::*;
     use crate::test_db::TestDB;
+
+    #[test]
+    fn macro_error_tags_round_trip_and_reject_unknown() {
+        let db = TestDB::with_files(FIXTURE);
+        let krate = crate_named(&db, "main");
+        let cases = [
+            (0, ExpandErrorKind::ProcMacroAttrExpansionDisabled),
+            (1, ExpandErrorKind::MissingProcMacroExpander(krate)),
+            (2, ExpandErrorKind::MacroDisabled),
+            (3, ExpandErrorKind::MacroDefinition),
+            (4, ExpandErrorKind::RecursionOverflow),
+            (5, ExpandErrorKind::Other("old error".into())),
+            (6, ExpandErrorKind::NonUnicodeEnv(Symbol::intern("CFLAGS"))),
+        ];
+        for (tag, kind) in cases {
+            let mut enc = Enc::new(&db, krate);
+            enc.macro_error(&kind).unwrap();
+            assert_eq!(enc.out[0], tag);
+            let mut dec = Dec::new(&db, krate, &enc.out);
+            assert_eq!(dec.macro_error().unwrap(), kind);
+            assert_eq!(dec.at, enc.out.len());
+        }
+        let mut dec = Dec::new(&db, krate, &[255]);
+        assert!(dec.macro_error().is_err());
+        let mut enc = Enc::new(&db, krate);
+        assert!(enc.macro_error(&ExpandErrorKind::ProcMacroPanic("unsupported".into())).is_err());
+    }
 
     #[test]
     fn byte_views_have_content_identity_and_checked_ranges() {

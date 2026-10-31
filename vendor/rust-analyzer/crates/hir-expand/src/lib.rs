@@ -150,6 +150,7 @@ pub enum ExpandErrorKind {
     MacroDefinition,
     Mbe(mbe::ExpandErrorKind),
     RecursionOverflow,
+    NonUnicodeEnv(intern::Symbol),
     Other(Box<str>),
     ProcMacroPanic(Box<str>),
 }
@@ -215,6 +216,11 @@ impl ExpandErrorKind {
                 message: "overflow expanding the original macro".to_owned(),
                 error: true,
                 kind: RenderedExpandError::GENERAL_KIND,
+            },
+            ExpandErrorKind::NonUnicodeEnv(key) => RenderedExpandError {
+                message: format!("environment variable `{key}` is not a valid Unicode string"),
+                error: true,
+                kind: "non-unicode-env",
             },
             ExpandErrorKind::Other(e) => RenderedExpandError {
                 message: (**e).to_owned(),

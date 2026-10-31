@@ -86,6 +86,7 @@ ra-jit-store = { path = "crates/ra-jit-store" }
 blaze-build-script = { path = "crates/blaze-build-script" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-spec = { path = "crates/blaze-spec" }
 blaze-wire = { path = "crates/blaze-wire" }
 blaze-serve = { path = "crates/blaze-serve" }
 blaze-dist = { path = "crates/blaze-dist" }

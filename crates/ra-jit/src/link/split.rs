@@ -1,5 +1,6 @@
-//! The standard library's object as an archive of several, which the link reads with
-//! `--whole-archive`. lld does most of its work on an input file by itself, one file to a
+//! The standard library's object as an indexed archive of several. Owned executable links
+//! read every member with `--whole-archive`; native library consumers use its symbol index.
+//! lld does most of its work on an input file by itself, one file to a
 //! thread: one object of every function of the standard library had it parse, scan and
 //! demote 140,000 sections on one thread (0.12 s of the 0.16 s link of hello), where rustc's
 //! standard library is many objects.
@@ -10,7 +11,11 @@
 //! symbol, or a section, that another part refers to becomes a hidden global of its part, and
 //! the other part refers to it by name: the program links the same.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io::Cursor};
+
+use ar_archive_writer::{
+    ArchiveKind, DEFAULT_OBJECT_READER, NewArchiveMember, write_archive_to_stream,
+};
 
 use anyhow::{Context, bail};
 use object::elf;
@@ -35,6 +40,42 @@ pub(crate) fn is_archive(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
+/// Adds an independently extractable allocator shim to the output's runtime support.
+/// Keeping it in the same archive lets ordinary linkers resolve both directions between
+/// the shim and std, while several libraries can share the first selected default shim.
+pub(crate) fn with_allocator(runtime: Option<&[u8]>, shim: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let kind = match object::FileKind::parse(&*shim)? {
+        object::FileKind::MachO32 | object::FileKind::MachO64 => ArchiveKind::Darwin,
+        object::FileKind::Coff | object::FileKind::CoffBig => ArchiveKind::Coff,
+        _ => ArchiveKind::Gnu,
+    };
+    let mut members = Vec::new();
+    if let Some(runtime) = runtime {
+        if is_archive(runtime) {
+            let archive = object::read::archive::ArchiveFile::parse(runtime)?;
+            for member in archive.members() {
+                let member = member?;
+                members.push(NewArchiveMember::new(
+                    member.data(runtime)?.to_vec(),
+                    &DEFAULT_OBJECT_READER,
+                    String::from_utf8(member.name().to_vec())?,
+                ));
+            }
+        } else {
+            members.push(NewArchiveMember::new(
+                runtime.to_vec(),
+                &DEFAULT_OBJECT_READER,
+                "std.o".into(),
+            ));
+        }
+    }
+    members.push(NewArchiveMember::new(shim, &DEFAULT_OBJECT_READER, "allocator.o".into()));
+    let mut archive = Cursor::new(Vec::new());
+    write_archive_to_stream(&mut archive, &members, kind, false, None)
+        .context("writing runtime support with its allocator")?;
+    Ok(archive.into_inner())
+}
+
 /// The prefixes of the names of the sections that are each a function's or a static's own.
 const SPREAD: [&str; 6] =
     [".text.", ".rodata.", ".data.rel.ro.", ".data.", ".bss.", ".gcc_except_table"];
@@ -48,6 +89,12 @@ struct Section<'data> {
     data: Cow<'data, [u8]>,
     part: usize,
     relocations: Vec<Relocation>,
+}
+
+impl Section<'_> {
+    fn alias_type(&self) -> u8 {
+        if self.sh_flags & u64::from(elf::SHF_TLS) != 0 { elf::STT_TLS } else { elf::STT_NOTYPE }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -249,12 +296,18 @@ pub(crate) fn split(object: &[u8], parts: usize) -> anyhow::Result<Vec<u8>> {
             .collect();
         built.into_iter().map(|it| it.join().expect("a part panicked")).collect()
     });
-    let mut archive = MAGIC.to_vec();
-    for (part, object) in objects.into_iter().enumerate() {
-        let object = object.with_context(|| format!("writing part {part}"))?;
-        member(&mut archive, &format!("std.{part}.o"), &object);
-    }
-    Ok(archive)
+    let members = objects
+        .into_iter()
+        .enumerate()
+        .map(|(part, object)| {
+            let object = object.with_context(|| format!("writing part {part}"))?;
+            Ok(NewArchiveMember::new(object, &DEFAULT_OBJECT_READER, format!("std.{part}.o")))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut archive = Cursor::new(Vec::new());
+    write_archive_to_stream(&mut archive, &members, ArchiveKind::Gnu, false, None)
+        .context("writing the standard library archive")?;
+    Ok(archive.into_inner())
 }
 
 /// An entry of the unwind table: a common entry, or a function's, which names its common
@@ -542,36 +595,38 @@ impl Input<'_, '_> {
         }
         for (at, _) in self.sections.iter().enumerate().filter(|it| it.1.part == part) {
             if self.named_section[at] {
+                let st_type = self.sections[at].alias_type();
                 object.add_symbol(write::Symbol {
                     name: section_name(at),
                     value: 0,
                     size: 0,
-                    kind: SymbolKind::Label,
+                    kind: kind_of(st_type),
                     scope: SymbolScope::Linkage,
                     weak: false,
                     section: write::SymbolSection::Section(ids[&at]),
                     flags: SymbolFlags::Elf {
-                        st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                        st_info: (elf::STB_GLOBAL << 4) | st_type,
                         st_other: elf::STV_HIDDEN,
                     },
                 });
             }
         }
         let mut referred: FxHashMap<Vec<u8>, write::SymbolId> = FxHashMap::default();
-        let mut refer = |object: &mut write::Object<'_>, name: Vec<u8>, st_info: u8| {
-            *referred.entry(name.clone()).or_insert_with(|| {
-                object.add_symbol(write::Symbol {
-                    name,
-                    value: 0,
-                    size: 0,
-                    kind: SymbolKind::Unknown,
-                    scope: SymbolScope::Unknown,
-                    weak: st_info >> 4 == elf::STB_WEAK,
-                    section: write::SymbolSection::Undefined,
-                    flags: SymbolFlags::Elf { st_info, st_other: elf::STV_DEFAULT },
+        let mut refer =
+            |object: &mut write::Object<'_>, name: Vec<u8>, st_info: u8, st_other: u8| {
+                *referred.entry(name.clone()).or_insert_with(|| {
+                    object.add_symbol(write::Symbol {
+                        name,
+                        value: 0,
+                        size: 0,
+                        kind: kind_of(st_info & 0xf),
+                        scope: SymbolScope::Unknown,
+                        weak: st_info >> 4 == elf::STB_WEAK,
+                        section: write::SymbolSection::Undefined,
+                        flags: SymbolFlags::Elf { st_info, st_other },
+                    })
                 })
-            })
-        };
+            };
         for (at, section) in self.sections.iter().enumerate().filter(|it| it.1.part == part) {
             for relocation in &section.relocations {
                 let target = relocation.target;
@@ -580,15 +635,28 @@ impl Input<'_, '_> {
                     Some(&id) => id,
                     None if symbol.st_type() == elf::STT_SECTION => {
                         let home = symbol.section.expect("a section symbol is of a section");
-                        refer(&mut object, section_name(home), elf::STB_GLOBAL << 4)
+                        refer(
+                            &mut object,
+                            section_name(home),
+                            (elf::STB_GLOBAL << 4) | self.sections[home].alias_type(),
+                            elf::STV_HIDDEN,
+                        )
                     }
-                    None if self.named_symbol[target] => {
-                        refer(&mut object, self.named(target), elf::STB_GLOBAL << 4)
-                    }
+                    None if self.named_symbol[target] => refer(
+                        &mut object,
+                        self.named(target),
+                        (elf::STB_GLOBAL << 4) | symbol.st_type(),
+                        (symbol.st_other & !3) | elf::STV_HIDDEN,
+                    ),
                     None => {
                         let weak = symbol.section.is_none() && symbol.bind() == elf::STB_WEAK;
                         let bind = if weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
-                        refer(&mut object, symbol.name.to_vec(), bind << 4)
+                        refer(
+                            &mut object,
+                            symbol.name.to_vec(),
+                            (bind << 4) | symbol.st_type(),
+                            symbol.st_other,
+                        )
                     }
                 };
                 object.add_relocation(
@@ -628,25 +696,6 @@ fn scope_of(bind: u8, st_other: u8) -> SymbolScope {
     }
 }
 
-/// Appends a member to an archive: a name of at most 15 bytes, no symbol index, as the link
-/// reads every member.
-fn member(archive: &mut Vec<u8>, name: &str, bytes: &[u8]) {
-    let header = format!(
-        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-        format!("{name}/"),
-        0,
-        0,
-        0,
-        644,
-        bytes.len()
-    );
-    archive.extend_from_slice(header.as_bytes());
-    archive.extend_from_slice(bytes);
-    if bytes.len() % 2 == 1 {
-        archive.push(b'\n');
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use object::read::archive::ArchiveFile;
@@ -656,6 +705,56 @@ mod tests {
         RelocationFlags, RelocationTarget, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
     };
     use rustc_hash::FxHashMap;
+
+    #[test]
+    fn allocator_is_indexed_apart_from_runtime_members() {
+        let object = |format, name: &str| {
+            let mut object = Object::new(format, Architecture::X86_64, Endianness::Little);
+            let section = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+            object.set_section_data(section, vec![0xc3], 1);
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 1,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            });
+            object.write().unwrap()
+        };
+        for format in [BinaryFormat::Elf, BinaryFormat::MachO, BinaryFormat::Coff] {
+            let runtime = object(format, "runtime_entry");
+            let shim = object(format, "__rust_alloc");
+            let split = (format == BinaryFormat::Elf).then(|| super::split(&runtime, 1).unwrap());
+            for input in
+                [None, Some(runtime.as_slice())].into_iter().chain(split.as_deref().map(Some))
+            {
+                let bytes = super::with_allocator(input, shim.clone()).unwrap();
+                let archive = ArchiveFile::parse(bytes.as_slice()).unwrap();
+                let symbols: FxHashMap<_, _> = archive
+                    .symbols()
+                    .unwrap()
+                    .unwrap()
+                    .map(|symbol| {
+                        let symbol = symbol.unwrap();
+                        (symbol.name().to_vec(), symbol.offset().0)
+                    })
+                    .collect();
+                let name = |name: &str| {
+                    if format == BinaryFormat::MachO { format!("_{name}") } else { name.to_owned() }
+                };
+                let allocator = symbols.get(name("__rust_alloc").as_bytes()).unwrap();
+                let members: Vec<_> = archive.members().map(|member| member.unwrap()).collect();
+                assert_eq!(members.last().unwrap().name(), b"allocator.o");
+                assert_eq!(members.last().unwrap().data(bytes.as_slice()).unwrap(), shim);
+                if input.is_some() {
+                    assert_ne!(symbols.get(name("runtime_entry").as_bytes()).unwrap(), allocator);
+                }
+            }
+        }
+    }
 
     /// Where each relocation of an object lands and what it reaches: the section and offset
     /// of the place, and the section and offset of the target, or the name of a symbol no
@@ -822,6 +921,8 @@ mod tests {
         let a = symbol(&mut object, "a", sections[0], SymbolScope::Dynamic);
         let b = symbol(&mut object, "local_b", sections[1], SymbolScope::Compilation);
         let c = symbol(&mut object, "hidden_c", sections[2], SymbolScope::Linkage);
+        let weak = symbol(&mut object, "weak_d", sections[3], SymbolScope::Dynamic);
+        object.symbol_mut(weak).weak = true;
         let memcpy = object.add_symbol(Symbol {
             name: b"memcpy".to_vec(),
             value: 0,
@@ -873,5 +974,125 @@ mod tests {
         assert!(names.contains(&"a".to_owned()) && names.contains(&"hidden_c".to_owned()));
         assert!(names.iter().any(|it| it.starts_with("local_b.part")));
         assert!(names.windows(2).all(|it| it[0] != it[1]), "{names:?}");
+        let symbols =
+            archive_file.symbols().unwrap().expect("native linkers need an archive index");
+        let mut indexed = Vec::new();
+        for symbol in symbols {
+            let symbol = symbol.unwrap();
+            let member = archive_file.member(symbol.offset()).unwrap();
+            let file = object::File::parse(member.data(&*archive).unwrap()).unwrap();
+            assert!(file.symbols().any(|it| {
+                !it.is_undefined() && !it.is_local() && it.name_bytes().unwrap() == symbol.name()
+            }));
+            indexed.push(std::str::from_utf8(symbol.name()).unwrap().to_owned());
+        }
+        indexed.sort();
+        assert_eq!(indexed, names);
+        assert!(indexed.contains(&"weak_d".to_owned()));
+    }
+
+    #[test]
+    fn cross_part_tls_symbols_keep_type_binding_and_visibility() {
+        let mut object = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let data = object.add_section(Vec::new(), b".tdata.value".to_vec(), SectionKind::Tls);
+        object.set_section_data(data, vec![0; 16], 8);
+        let bss =
+            object.add_section(Vec::new(), b".tbss.local".to_vec(), SectionKind::UninitializedTls);
+        object.append_section_bss(bss, 16, 8);
+        let text = object.add_section(Vec::new(), b".text.probe".to_vec(), SectionKind::Text);
+        object.set_section_data(text, vec![0; 64], 16);
+        let mut tls = |name: &str, section, scope, weak, flags| {
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 8,
+                kind: SymbolKind::Tls,
+                scope,
+                weak,
+                section,
+                flags,
+            })
+        };
+        let global = tls(
+            "tls_global",
+            SymbolSection::Section(data),
+            SymbolScope::Dynamic,
+            false,
+            SymbolFlags::Elf {
+                st_info: (elf::STB_GLOBAL << 4) | elf::STT_TLS,
+                st_other: elf::STV_PROTECTED,
+            },
+        );
+        let local = tls(
+            "tls_local",
+            SymbolSection::Section(bss),
+            SymbolScope::Compilation,
+            false,
+            SymbolFlags::None,
+        );
+        let weak = tls(
+            "tls_weak_external",
+            SymbolSection::Undefined,
+            SymbolScope::Unknown,
+            true,
+            SymbolFlags::None,
+        );
+        let external = tls(
+            "tls_external",
+            SymbolSection::Undefined,
+            SymbolScope::Unknown,
+            false,
+            SymbolFlags::None,
+        );
+        let section = object.section_symbol(data);
+        for (at, symbol) in [global, local, weak, external, section].into_iter().enumerate() {
+            object
+                .add_relocation(
+                    text,
+                    Relocation {
+                        offset: (at * 8) as u64,
+                        symbol,
+                        addend: 0,
+                        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_TLSGD },
+                    },
+                )
+                .unwrap();
+        }
+        let archive = super::split(&object.write().unwrap(), 1).unwrap();
+        let file = ArchiveFile::parse(&*archive).unwrap();
+        let (mut definitions, mut references) = (0, 0);
+        for member in file.members() {
+            let member = member.unwrap();
+            let object = object::File::parse(member.data(&*archive).unwrap()).unwrap();
+            for symbol in object.symbols() {
+                let name = symbol.name().unwrap();
+                if !name.starts_with("tls_") && !name.starts_with("ra-jit.part.section.") {
+                    continue;
+                }
+                let SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
+                    panic!("ELF symbol");
+                };
+                assert_eq!(st_info & 0xf, elf::STT_TLS, "{name}");
+                assert_eq!(symbol.kind(), SymbolKind::Tls, "{name}");
+                let binding =
+                    if name == "tls_weak_external" { elf::STB_WEAK } else { elf::STB_GLOBAL };
+                assert_eq!(st_info >> 4, binding, "{name}");
+                let visibility =
+                    if name.starts_with("tls_local") || name.starts_with("ra-jit.part.section.") {
+                        elf::STV_HIDDEN
+                    } else if name == "tls_global" {
+                        elf::STV_PROTECTED
+                    } else {
+                        elf::STV_DEFAULT
+                    };
+                assert_eq!(st_other & 3, visibility, "{name}");
+                if symbol.is_undefined() {
+                    references += 1;
+                } else {
+                    definitions += 1;
+                }
+            }
+        }
+        assert_eq!((definitions, references), (3, 5));
     }
 }

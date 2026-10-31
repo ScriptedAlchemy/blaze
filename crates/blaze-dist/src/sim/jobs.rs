@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_wire::{
     Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobEvent, JobRequest, LocalPolicy,
-    Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourceRef, Stage,
-    StoreIdentity, WorkersEventsRequest,
+    Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, SourcePath, SourceRef,
+    Stage, StoreIdentity, WorkersEventsRequest,
 };
 
 use super::{Rng, Violation};
@@ -760,6 +760,8 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         split_debuginfo: 0,
         backend: 0,
         mir_opt: 0,
+        backend_opt: 0,
+        backend_emit: 0,
     };
     BuildSpec {
         source: SourceRef::Root(blaze_wire::RootRef { root: [i as u8; 32] }),
@@ -771,9 +773,10 @@ fn spec(platform: Digest, i: u64) -> BuildSpec {
         rustflags: Vec::new(),
         config_env: blaze_wire::Set::new(Vec::new()),
         script_env: blaze_wire::Set::new(Vec::new()),
-        cwd: String::new(),
+        cwd: SourcePath::new(".".into()).unwrap(),
         command: Command::Build,
         toolchain: StoreIdentity([2; 32]),
+        workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
     }
 }
 

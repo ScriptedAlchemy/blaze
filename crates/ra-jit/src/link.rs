@@ -179,6 +179,7 @@ pub(crate) fn executable(
         (format!("{{\n global:\n{text} local: *;\n}};\n"), "--version-script")
     };
     std::fs::write(&listed, text).with_context(|| format!("writing {}", listed.display()))?;
+    line.generated.push(listed.clone());
     line.after.extend([
         OsString::from("-Xlinker"),
         OsString::from(flag),
@@ -206,6 +207,38 @@ pub(crate) fn command(
 ) -> anyhow::Result<String> {
     let line = Line::of(db, program, sysroot, false)?;
     command_of(&line, objects, exe, CommandPurpose::WholeLink)
+}
+
+/// Publish the native arguments a consumer needs around the compiled Rust objects.
+pub(crate) fn write_plan(
+    db: &RootDatabase,
+    program: &[Crate],
+    sysroot: Option<&Path>,
+    target: &str,
+    shared: bool,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let line = Line::of(db, program, sysroot, shared)?;
+    if let Some(admission) = crate::native_inputs::before_replay_link(
+        &line.before,
+        &line.after,
+        &line.env,
+        line.apple,
+        &line.generated,
+    )? {
+        admission.finish()?;
+    }
+    let plan = blaze_wire::native::LinkPlan {
+        target: target.to_owned(),
+        mode: if shared {
+            blaze_wire::native::LinkMode::Shared
+        } else {
+            blaze_wire::native::LinkMode::Executable
+        },
+        before: line.before,
+        after: line.after,
+    };
+    std::fs::write(path, plan.encode()).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The native command and its request environment, before compiling the Rust objects. A
@@ -277,6 +310,7 @@ pub(crate) struct Line {
     after: Vec<OsString>,
     apple: bool,
     env: Environment,
+    generated: Vec<PathBuf>,
 }
 
 impl Line {
@@ -312,6 +346,7 @@ impl Line {
                 Some(unit) => Environment(unit.env.clone()),
                 None => Environment::of(db),
             },
+            generated: Vec::new(),
         })
     }
 
@@ -332,6 +367,13 @@ impl Line {
 
     /// Links `objects` into the executable `exe`. How long `cc` took.
     pub(crate) fn link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
+        let admission = crate::native_inputs::before_replay_link(
+            &self.before,
+            &self.after,
+            &self.env,
+            self.apple,
+            &self.generated,
+        )?;
         let mut cmd = self.invocation(objects, exe)?;
         let shown = diagnostic_command(&cmd);
         eprintln!("link line: {shown}");
@@ -345,6 +387,9 @@ impl Line {
                 shown,
                 String::from_utf8_lossy(&ran.stderr)
             );
+        }
+        if let Some(admission) = admission {
+            admission.finish()?;
         }
         Ok(start.elapsed())
     }
@@ -416,12 +461,13 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> anyhow::Resu
     }
     let mut native = Native::default();
     for &krate in order.iter().rev() {
-        let attributes = hir_def::nameres::crate_def_map(db, krate)
+        let attributes: Vec<_> = hir_def::nameres::crate_def_map(db, krate)
             .modules(db)
             .flat_map(|(_, module)| module.scope(db).extern_blocks())
-            .flat_map(|block| AttrFlags::native_libs(db, block).iter().cloned());
-        native.libs.extend(attributes.collect::<Vec<_>>());
+            .flat_map(|block| AttrFlags::native_libs(db, block).iter().cloned())
+            .collect();
         let asked = asked_by_script(db, krate, target)?;
+        native.libs.extend(attributes);
         native.libs.extend(asked.libs);
         native.search.extend(asked.search);
         // As cargo has it: a script's arguments are for its own package's targets.
@@ -449,8 +495,8 @@ fn asked_by_script(
         return native_flags(&unit.flags, target);
     }
     let mut asked = Native::default();
-    let Some(out_dir) = krate.env(db).get("OUT_DIR") else { return Ok(asked) };
-    let printed = crate::cargo::script::printed(Path::new(&out_dir));
+    let Some(out_dir) = crate::cargo::script::out_dir_of(db, krate) else { return Ok(asked) };
+    let printed = crate::cargo::script::printed(&out_dir);
     let Some(Ok(printed)) = printed.map(std::fs::read_to_string) else { return Ok(asked) };
     for line in printed.lines() {
         let Some(line) = line.strip_prefix("cargo:") else { continue };
@@ -759,6 +805,7 @@ mod tests {
             after,
             apple: false,
             env: Environment([("OUT_DIR".into(), raw.clone())].into()),
+            generated: Vec::new(),
         };
         let command = line.invocation(&[], Path::new("program")).unwrap();
         let args: Vec<_> = command.get_args().map(OsStr::as_bytes).collect();
@@ -782,6 +829,50 @@ mod tests {
         assert!(
             command_of(&line, &[], Path::new("program"), CommandPurpose::NativeInputs).is_err()
         );
+    }
+
+    /// A script's `cargo:rustc-env=OUT_DIR=...` renames the variable its crate's code sees, as
+    /// it does under cargo; what the script printed for the link is still found beside the
+    /// directory the script wrote to, which the crate graph records.
+    #[test]
+    fn a_script_that_renamed_out_dir_still_gives_the_link_its_libraries() {
+        let run = tempfile::tempdir().unwrap();
+        let out = run.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(
+            run.path().join("output"),
+            "cargo:rustc-link-search=native=/producer/lib\ncargo:rustc-link-lib=dylib=saved_dynamic\n\
+             cargo:rustc-env=OUT_DIR=/native-script-marker\n",
+        )
+        .unwrap();
+        let mut db = RootDatabase::default();
+        let mut graph = base_db::CrateGraphBuilder::default();
+        let mut env = base_db::Env::default();
+        env.set("OUT_DIR", "/native-script-marker");
+        let krate = graph.add_crate_root(
+            vfs::FileId::from_raw(7),
+            syntax::Edition::Edition2021,
+            Some(base_db::CrateDisplayName::from_canonical_name("native")),
+            None,
+            Default::default(),
+            None,
+            env,
+            CrateOrigin::Local { repo: None, name: None },
+            Vec::new(),
+            base_db::TargetKind::Lib { is_proc_macro: false },
+            triomphe::Arc::new(paths::AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+            triomphe::Arc::new(base_db::CrateWorkspaceData {
+                target: Err("fixture".into()),
+                toolchain: None,
+            }),
+        );
+        graph.set_build_script_out_dir(krate, Some(paths::AbsPathBuf::assert_utf8(out)));
+        let krate = graph.set_in_db(&mut db)[&krate];
+        let target = Target { apple: false, arch: "x86_64".into(), shared: false };
+        let asked = asked_by_script(&db, krate, &target).unwrap();
+        assert_eq!(asked.search, vec![OsString::from("-L/producer/lib")]);
+        let libs: Vec<_> = asked.libs.iter().map(|it| target.lib(it)).collect();
+        assert_eq!(libs, vec![vec!["-lsaved_dynamic".to_owned()]]);
     }
 
     #[test]

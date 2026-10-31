@@ -42,6 +42,7 @@ impl Fixture {
 
     fn asked<'a>(&'a self, features: &'a [String]) -> Asked<'a> {
         Asked {
+            cargo_home: None,
             cwd: &self.0,
             env: vec![("CARGO_HOME".into(), self.0.join("home").to_str().unwrap().into())],
             manifest_path: None,
@@ -67,6 +68,24 @@ impl Fixture {
         assert_eq!(!units.is_empty(), selected);
         let (_, programs) = blaze_metadata::programs(&asked, Targets::default()).unwrap();
         assert_eq!(programs.len(), usize::from(selected));
+        let mut canonical = self.asked(features);
+        canonical.platform = Some(TargetPlatform { triple: host.triple, cfg: host.cfg });
+        let graph = blaze_metadata::units::unit_graph(&blaze_metadata::units::UnitsAsked {
+            asked: &canonical,
+            command: blaze_metadata::units::Command::Build,
+            targets: &blaze_metadata::units::TargetFilter::default(),
+            profile: None,
+        })
+        .unwrap();
+        assert_eq!(
+            graph
+                .units
+                .iter()
+                .filter(|unit| unit.package.name == "app"
+                    && unit.target.kind == blaze_metadata::units::TargetKind::Bin)
+                .count(),
+            usize::from(selected)
+        );
     }
 }
 
@@ -102,6 +121,19 @@ fn explicit_target_reports_missing_dependency_features_even_without_any_build_un
     let error =
         blaze_metadata::programs(&fixture.asked(&[]), Targets { bin: Some("app"), example: None })
             .unwrap_err();
+    assert!(error.to_string().contains("requires the features: `dep/extra`"), "{error:#}");
+    let mut asked = fixture.asked(&[]);
+    asked.platform = Some(TargetPlatform { triple: "x86_64-unknown-linux-gnu", cfg: &[] });
+    let error = blaze_metadata::units::unit_graph(&blaze_metadata::units::UnitsAsked {
+        asked: &asked,
+        command: blaze_metadata::units::Command::Build,
+        targets: &blaze_metadata::units::TargetFilter {
+            bins: Some(vec!["app".into()]),
+            ..Default::default()
+        },
+        profile: None,
+    })
+    .unwrap_err();
     assert!(error.to_string().contains("requires the features: `dep/extra`"), "{error:#}");
 }
 

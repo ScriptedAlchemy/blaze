@@ -431,7 +431,8 @@ pub fn compile_batch(
         store,
         context.symbols.cargo_home(),
         context.symbols.library_sources(),
-    );
+    )
+    .in_checkout(context.symbols.checkout());
     let mut outcomes = Vec::new();
     let mut discovered = Vec::new();
     let mut entries = Vec::new();
@@ -857,7 +858,8 @@ impl Imported {
             context.policy.program,
             context.symbols.cargo_home(),
             context.symbols.library_sources(),
-        ))
+        )
+        .in_checkout(context.symbols.checkout()))
     }
 }
 

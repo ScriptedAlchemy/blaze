@@ -161,6 +161,35 @@ def main() -> int:
         True,
     )
 
+    # Consumers must not evict the shared build cache with full store/target snapshots.
+    for action in c.ACTIONS_CACHE_ACTIONS:
+        case(
+            f"consumer Actions cache rejected: {action}",
+            text.replace("      - uses: actions/checkout@v7", f"      - uses: {action}@v1\n      - uses: actions/checkout@v7", 1),
+            False,
+            must_mention="outside the bundle producer",
+        )
+    case(
+        "consumer composite cannot allocate a cache",
+        text.replace("      - uses: actions/checkout@v7", "      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix sccache\n      - uses: actions/checkout@v7", 1),
+        False,
+        must_mention="cache allocation belongs to the bundle producer",
+    )
+    # A bundle consumer may restore the producer's Nix shell read-only (`cache-save: false`,
+    # literally); any other save policy could write the budget and is refused.
+    case(
+        "consumer composite restores the producer's cache read-only",
+        text.replace("      - uses: actions/checkout@v7", "      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix\n          cache-save: false\n      - uses: actions/checkout@v7", 1),
+        True,
+    )
+    for save in ("true", "${{ github.ref == 'refs/heads/main' }}", "'false'"):
+        case(
+            f"consumer composite with cache-save: {save}",
+            text.replace("      - uses: actions/checkout@v7", f"      - uses: ./.github/actions/toolchain\n        with:\n          cache: nix\n          cache-save: {save}\n      - uses: actions/checkout@v7", 1),
+            save == "'false'",
+            must_mention=None if save == "'false'" else "cache allocation belongs to the bundle producer",
+        )
+
     # A gate that is only mentioned is not a gate. The argument keeps the command's exact
     # spelling, so a substring check would pass it.
     case(

@@ -112,7 +112,7 @@ fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Opt
     let at = u32::from(offset);
     let row = starts.partition_point(|&start| start <= at).checked_sub(1)?;
     let written = text.get(starts[row] as usize..at as usize)?;
-    let column = written.chars().map(column_width).sum::<usize>() as u32;
+    let column = written.chars().count() as u32;
     Some(Place::Anchored { row: row as u32, column })
 }
 

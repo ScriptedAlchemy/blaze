@@ -23,7 +23,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{Args, Program, RootDatabase};
 
+mod replay;
 mod units;
+pub(crate) use replay::{before as before_replay_link, set_replay_bindings};
 pub(crate) use units::{NativeUnit, for_crate as native_unit_for_crate, set_native_units};
 
 type Digest = [u8; 32];
@@ -129,9 +131,9 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
         let root: ide_db::base_db::Crate = root.into();
         for krate in std::iter::once(root).chain(root.transitive_deps(db)) {
             if !krate.data(db).origin.is_lang()
-                && let Some(out) = krate.env(db).get("OUT_DIR")
+                && let Some(out) = crate::cargo::script::out_dir_of(db, krate)
             {
-                out_dirs.insert(PathBuf::from(out));
+                out_dirs.insert(out);
             }
         }
     }
@@ -790,6 +792,22 @@ fn script_inputs(text: &str) -> io::Result<Vec<(String, bool)>> {
     let mut at = 0;
     while at < tokens.len() {
         match tokens[at].as_str() {
+            "OUTPUT_FORMAT" | "OUTPUT_ARCH" | "TARGET" | "ENTRY" | "EXTERN" => {
+                at += 1;
+                if tokens.get(at).map(String::as_str) != Some("(") {
+                    return Err(bad());
+                }
+                at += 1;
+                let mut depth = 1;
+                while depth != 0 {
+                    match tokens.get(at).ok_or_else(bad)?.as_str() {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    at += 1;
+                }
+            }
             "INCLUDE" => {
                 at += 1;
                 let file = tokens.get(at).ok_or_else(bad)?;

@@ -1,0 +1,29 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+extra = ["shared/on-extra"]
+opt = ["dep:optional-dep"]
+weak = ["optional-dep?/fast"]
+both = ["opt", "weak"]
+
+[dependencies]
+shared = { path = "../shared", features = ["on-target"] }
+macros = { path = "../macros" }
+optional-dep = { path = "../optional-dep", optional = true }
+
+[build-dependencies]
+shared = { path = "../shared", features = ["on-host"] }
+
+[dev-dependencies]
+shared = { path = "../shared", features = ["on-dev"] }
+
+[target.'cfg(unix)'.dependencies]
+leaf = { path = "../leaf" }
+
+[target.'cfg(windows)'.dependencies]
+winonly = { path = "../winonly" }

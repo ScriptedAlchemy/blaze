@@ -1,0 +1,33 @@
+[workspace]
+members = ["app", "b", "pm"]
+exclude = ["bonly"]
+resolver = "2"
+
+[profile.dev.package.b]
+opt-level = 1
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.dev.build-override]
+opt-level = 2
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+
+[profile.release.package.pm]
+opt-level = 2
+
+[profile.fast]
+inherits = "release"
+opt-level = 2
+debug = 1
+strip = "debuginfo"
+codegen-units = 16
+
+[profile.test]
+opt-level = 1
+
+[profile.dev.package.bonly]
+overflow-checks = false

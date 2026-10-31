@@ -48,7 +48,11 @@ pub(crate) const ATTEMPTS: &str = "RA_JIT_FLAKY_TEST_ATTEMPTS";
 
 /// Additional inherited variables the owner declares for the sandboxed test environment.
 pub(crate) fn declared_env(state: &State) -> Vec<String> {
-    Manifest::read(&state.root).0.map(|it| it.env).unwrap_or_default()
+    declared_env_at(&state.root)
+}
+
+pub(crate) fn declared_env_at(root: &Path) -> Vec<String> {
+    Manifest::read(root).0.map(|it| it.env).unwrap_or_default()
 }
 
 /// The attempts of a test marked `flaky`, as Bazel gives it.
@@ -182,7 +186,41 @@ pub(crate) fn pick(
     if !on() || !asked.positional.is_empty() || !plain(&asked.trailing) {
         return Pick::Asked;
     }
-    let Some(dir) = state.plan_dir(test) else { return Pick::Asked };
+    let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+    let context = TestContext {
+        root: &state.root,
+        directory: state.plan_dir(test),
+        package: &test.package,
+        programs: programs_run_by(state, test),
+        enabled: on(),
+        passed_env: &passed,
+        inherit_env: true,
+    };
+    pick_for(asked, &context, sandbox, command)
+}
+
+/// The inputs of one test target, independent of the daemon's persisted build state.
+pub(crate) struct TestContext<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) directory: Option<&'a Path>,
+    pub(crate) package: &'a str,
+    pub(crate) programs: Result<String, String>,
+    pub(crate) enabled: bool,
+    pub(crate) passed_env: &'a str,
+    /// False for owned commands whose environment was cleared and reconstructed.
+    pub(crate) inherit_env: bool,
+}
+
+pub(crate) fn pick_for(
+    asked: &Invocation,
+    context: &TestContext<'_>,
+    sandbox: Option<&str>,
+    command: &Command,
+) -> Pick {
+    if !context.enabled || !asked.positional.is_empty() || !plain(&asked.trailing) {
+        return Pick::Asked;
+    }
+    let Some(dir) = context.directory else { return Pick::Asked };
     let Ok(reach) = std::fs::read_to_string(dir.join(plan::REACH)) else { return Pick::Asked };
     let file = dir.join(PASSED);
     let before = std::fs::read_to_string(&file).unwrap_or_default();
@@ -191,10 +229,16 @@ pub(crate) fn pick(
         .filter_map(|it| it.split_once('\t'))
         .map(|(identity, name)| (name, identity))
         .collect();
-    let manifest = Manifest::read(&state.root);
-    let given = manifest.given(&state.root, &asked.trailing, command).and_then(|given| {
-        programs_run_by(state, test).map(|programs| format!("{programs}{given}"))
-    });
+    let manifest = Manifest::read(context.root);
+    let given = manifest
+        .given_with(context.root, &asked.trailing, command, context.passed_env, context.inherit_env)
+        .and_then(|given| {
+            context
+                .programs
+                .as_ref()
+                .map(|programs| format!("{programs}{given}"))
+                .map_err(Clone::clone)
+        });
     let programs = given.as_deref().unwrap_or("");
     let mut kept = sandbox.map(|_| sandboxed::Kept::read(dir));
     let (mut names, mut tests, mut always, mut apart, mut total) =
@@ -206,7 +250,8 @@ pub(crate) fn pick(
             return Pick::Asked;
         }
         total += 1;
-        let why = manifest.opts_out(&test.package, name).or_else(|| given.as_ref().err().cloned());
+        let why =
+            manifest.opts_out(context.package, name).or_else(|| given.as_ref().err().cloned());
         if let Some(why) = why {
             names.push(name.to_owned());
             always.push(Always { name: name.to_owned(), why, path: None });
@@ -296,11 +341,20 @@ fn programs_run_by(state: &State, test: &Program) -> Result<String, String> {
     if !matches!(test.kind, Kind::Test | Kind::Bench) {
         return Ok(String::new());
     }
-    let mut hash = Sha256::new();
-    hash.update(b"test programs 2\0");
     let runs = |it: &&Program| it.package == test.package && it.kind == Kind::Bin && !it.test;
-    for program in state.programs.iter().filter(runs) {
-        let program = &program.executable;
+    programs_identity(
+        state.programs.iter().filter(runs).map(|it| (it.name.as_str(), it.executable.as_path())),
+    )
+}
+
+pub(crate) fn programs_identity<'a>(
+    programs: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(b"test programs 3\0");
+    for (name, program) in programs {
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
         let path = program.as_os_str().as_encoded_bytes();
         hash.update((path.len() as u64).to_le_bytes());
         hash.update(path);
@@ -383,7 +437,20 @@ impl Manifest {
     /// contents of the files of `data` (and which are not there), and the value of each
     /// variable of `env` and of [`sandboxed::PASS`]. A pass was under it, and a test whose
     /// pass was under another runs.
+    #[cfg(test)]
     fn given(&self, root: &Path, trailing: &[String], command: &Command) -> Result<String, String> {
+        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
+        self.given_with(root, trailing, command, &passed, true)
+    }
+
+    fn given_with(
+        &self,
+        root: &Path,
+        trailing: &[String],
+        command: &Command,
+        passed: &str,
+        inherit_env: bool,
+    ) -> Result<String, String> {
         let declared = self.0.as_ref().map_err(Clone::clone)?;
         let mut hash = Sha256::new();
         hash.update(b"test inputs 2\0threads\0");
@@ -395,7 +462,7 @@ impl Manifest {
             None => hash.update(b"unset"),
         }
         hash.update([0]);
-        match environment(command, "RUST_TEST_THREADS") {
+        match environment(command, "RUST_TEST_THREADS", inherit_env) {
             Some(value) => {
                 hash.update(b"set\0");
                 hash.update(value.as_encoded_bytes());
@@ -412,7 +479,6 @@ impl Manifest {
             })?;
             hash.update(digest);
         }
-        let passed = std::env::var(sandboxed::PASS).unwrap_or_default();
         let mut names: Vec<&str> = declared
             .env
             .iter()
@@ -426,7 +492,7 @@ impl Manifest {
         for name in names {
             hash.update(name.as_bytes());
             hash.update([0]);
-            match environment(command, name) {
+            match environment(command, name, inherit_env) {
                 Some(value) => {
                     hash.update(b"set\0");
                     hash.update(value.as_encoded_bytes());
@@ -475,11 +541,11 @@ fn test_threads(trailing: &[String]) -> Option<&str> {
 }
 
 /// The value the test receives, including Cargo's configured overrides and removals.
-fn environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
-    command
-        .get_envs()
-        .find(|(key, _)| *key == name)
-        .map_or_else(|| std::env::var_os(name), |(_, value)| value.map(|it| it.to_owned()))
+fn environment(command: &Command, name: &str, inherit_env: bool) -> Option<std::ffi::OsString> {
+    command.get_envs().find(|(key, _)| *key == name).map_or_else(
+        || inherit_env.then(|| std::env::var_os(name)).flatten(),
+        |(_, value)| value.map(|it| it.to_owned()),
+    )
 }
 
 /// Each child has its own digest: file bytes cannot impersonate the next directory entry.
@@ -549,8 +615,12 @@ pub(crate) struct Attempts {
 }
 
 pub(crate) fn attempts(state: &State) -> Attempts {
-    let all = std::env::var(ATTEMPTS).ok().and_then(|it| it.trim().parse().ok());
-    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(&state.root) }
+    attempts_at(&state.root, std::env::var(ATTEMPTS).ok().as_deref())
+}
+
+pub(crate) fn attempts_at(root: &Path, override_value: Option<&str>) -> Attempts {
+    let all = override_value.and_then(|it| it.trim().parse().ok());
+    Attempts { all: all.filter(|&it| it >= 1), manifest: Manifest::read(root) }
 }
 
 impl Attempts {
@@ -585,6 +655,108 @@ impl Attempts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_test_context_reuses_passes_and_invalidates_code_and_program_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = match crate::cargo::cli::Asked::parse(vec!["test".to_owned()]) {
+            crate::cargo::cli::Asked::Build(asked) => *asked,
+            _ => panic!("expected a test invocation"),
+        };
+        let mut context = TestContext {
+            root: dir.path(),
+            directory: Some(dir.path()),
+            package: "test-package",
+            programs: Ok("program-a".into()),
+            enabled: true,
+            passed_env: "",
+            inherit_env: false,
+        };
+        let mut command = Command::new("owned-test");
+        command.env_clear();
+        std::fs::write(dir.path().join(plan::REACH), "code-a\tfirst\n").unwrap();
+        let Pick::Some { names: None, passed, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("a test without a pass must run");
+        };
+        passed.passed();
+        let Pick::Some { names: Some(names), .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("the unchanged owned target must reuse its pass");
+        };
+        assert!(names.is_empty());
+        forget_passes_at(dir.path()).unwrap();
+        let Pick::Some { names: None, passed, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("a failed untracked run must revoke the older pass");
+        };
+        passed.passed();
+        std::fs::write(dir.path().join(plan::REACH), "code-b\tfirst\n").unwrap();
+        assert!(matches!(
+            pick_for(&asked, &context, None, &command),
+            Pick::Some { names: None, .. }
+        ));
+        std::fs::write(dir.path().join(plan::REACH), "code-a\tfirst\n").unwrap();
+        context.programs = Ok("program-b".into());
+        assert!(matches!(
+            pick_for(&asked, &context, None, &command),
+            Pick::Some { names: None, .. }
+        ));
+        context.programs = Err("missing auxiliary executable".into());
+        let Pick::Some { names: None, always, .. } = pick_for(&asked, &context, None, &command)
+        else {
+            panic!("unverified auxiliary inputs must run");
+        };
+        assert_eq!(always.len(), 1);
+        context.enabled = false;
+        assert!(matches!(pick_for(&asked, &context, None, &command), Pick::Asked));
+    }
+
+    #[test]
+    fn owned_test_policy_uses_explicit_environment_and_retry_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = manifest("env = [\"PATH\", \"RUST_TEST_THREADS\"]\n");
+        let mut exact = Command::new("owned-test");
+        exact.env_clear();
+        let mut removed = Command::new("owned-test");
+        removed.env_remove("PATH").env_remove("RUST_TEST_THREADS");
+        assert_eq!(
+            declared.given_with(dir.path(), &[], &exact, "", false),
+            declared.given_with(dir.path(), &[], &removed, "", true),
+            "an env_clear command cannot inherit the worker's PATH or test-thread setting"
+        );
+        exact.env("PATH", "recorded-path");
+        assert_ne!(
+            declared.given_with(dir.path(), &[], &exact, "", false),
+            declared.given_with(dir.path(), &[], &removed, "", true)
+        );
+        std::fs::write(dir.path().join(MANIFEST), "flaky = [\"first\"]\n").unwrap();
+        assert_eq!(attempts_at(dir.path(), None).of("test-package", "first"), 3);
+        assert_eq!(attempts_at(dir.path(), Some("1")).of("test-package", "first"), 1);
+        assert_eq!(attempts_at(dir.path(), Some("2")).of("test-package", "other"), 2);
+    }
+
+    #[test]
+    fn passed_environment_names_match_the_sandbox_with_whitespace_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data"), "same").unwrap();
+        let declared = manifest("data = [\"data\"]\n");
+        let mut command = Command::new("owned-test");
+        command.env_clear().env("T1_PASSED", "one");
+        let padded = " T1_PASSED, ,T1_PASSED ";
+        let before = declared.given_with(dir.path(), &[], &command, padded, false).unwrap();
+        assert_eq!(
+            before,
+            declared.given_with(dir.path(), &[], &command, "T1_PASSED", false).unwrap(),
+            "the cache must identify the variable that the sandbox actually forwards"
+        );
+        command.env("T1_PASSED", "two");
+        assert_ne!(
+            before,
+            declared.given_with(dir.path(), &[], &command, padded, false).unwrap(),
+            "declared data cannot hide a changed explicitly passed environment value"
+        );
+    }
 
     fn test_programs(dir: &Path) -> (State, Program) {
         let program = |kind, test, name: &str| {

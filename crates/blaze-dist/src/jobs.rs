@@ -1168,7 +1168,9 @@ impl Jobs {
 mod retention_tests {
     use super::*;
     use crate::admission::AdmissionConfig;
-    use blaze_wire::{BuildSpec, Command, PrNamespace, ProfileSpec, RootRef, Set, StoreIdentity};
+    use blaze_wire::{
+        BuildSpec, Command, PrNamespace, ProfileSpec, RootRef, Set, SourcePath, StoreIdentity,
+    };
 
     fn request(pr: u64, source: u8) -> JobRequest {
         JobRequest {
@@ -1188,14 +1190,17 @@ mod retention_tests {
                     split_debuginfo: 0,
                     backend: 0,
                     mir_opt: 0,
+                    backend_opt: 0,
+                    backend_emit: 0,
                 },
                 platform: [1; 32],
                 rustflags: Vec::new(),
                 config_env: Set::new(Vec::new()),
                 script_env: Set::new(Vec::new()),
-                cwd: String::new(),
+                cwd: SourcePath::new(".".into()).unwrap(),
                 command: Command::Build,
                 toolchain: StoreIdentity([2; 32]),
+                workspace_manifest: SourcePath::new("Cargo.toml".into()).unwrap(),
             },
             namespace: Namespace::Pr(PrNamespace { n: pr }),
             deadline_ms: 100_000,

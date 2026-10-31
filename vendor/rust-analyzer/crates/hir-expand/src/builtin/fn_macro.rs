@@ -1021,10 +1021,7 @@ fn non_unicode_env(
         return None;
     }
     db.env_is_read(krate, key.as_str());
-    Some(ExpandError::other(
-        span,
-        format!("environment variable `{key}` is not a valid Unicode string"),
-    ))
+    Some(ExpandError::new(span, crate::ExpandErrorKind::NonUnicodeEnv(key.clone())))
 }
 
 fn env_expand(

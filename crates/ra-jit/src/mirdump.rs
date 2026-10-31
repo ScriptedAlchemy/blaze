@@ -59,6 +59,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         args.selection.clone(),
         None,
         None,
+        args.project_origin,
     )?;
     let Parts { root, base, members, debug, .. } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);

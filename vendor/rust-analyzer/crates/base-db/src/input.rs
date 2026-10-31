@@ -423,6 +423,8 @@ pub type BuiltCrateData = CrateData<Crate>;
 pub struct ExtraCrateData {
     /// Compiler-description unit identity for native settings, never an environment value.
     pub blaze_native_unit: Option<u32>,
+    /// The producer output directory, independently of an overridable OUT_DIR variable.
+    pub blaze_build_script_out_dir: Option<AbsPathBuf>,
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
     /// its `[package].name` can be different for other project types or even
@@ -626,6 +628,7 @@ impl CrateGraphBuilder {
             },
             extra: ExtraCrateData {
                 blaze_native_unit: None,
+                blaze_build_script_out_dir: None,
                 version,
                 display_name,
                 potential_cfg_options,
@@ -664,6 +667,10 @@ impl CrateGraphBuilder {
 
     pub fn set_native_unit(&mut self, krate: CrateBuilderId, unit: Option<u32>) {
         self.arena[krate].extra.blaze_native_unit = unit;
+    }
+
+    pub fn set_build_script_out_dir(&mut self, krate: CrateBuilderId, out_dir: Option<AbsPathBuf>) {
+        self.arena[krate].extra.blaze_build_script_out_dir = out_dir;
     }
 
     pub fn set_in_db(self, db: &mut dyn SourceDatabase) -> CratesIdMap {

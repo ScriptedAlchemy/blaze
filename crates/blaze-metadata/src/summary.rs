@@ -15,6 +15,136 @@ use url::Url;
 
 const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
 
+#[cfg(test)]
+mod native_pin_tests {
+    #[test]
+    fn native_dependency_source_matches_previous_locked_json_rule() {
+        use blaze_manifest::manifest::{EitherManifest, read_manifest};
+        use blaze_manifest::{Config, Context};
+        let root =
+            std::env::temp_dir().join(format!("blaze-native-summary-pin-{}", std::process::id()));
+        assert!(!root.exists());
+        std::fs::create_dir_all(root.join("a/src")).unwrap();
+        std::fs::create_dir_all(root.join("b/src")).unwrap();
+        std::fs::write(root.join("a/Cargo.toml"),"[package]\nname='a'\nversion='0.1.0'\nedition='2021'\nrust-version='1.90'\n[dependencies]\nb={path='../b'}\n").unwrap();
+        std::fs::write(root.join("a/src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("b/Cargo.toml"),
+            "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b/src/lib.rs"), "").unwrap();
+        let url = url::Url::parse("file:///native-pin-fixture").unwrap();
+        let manifest_source = blaze_manifest::source::SourceId::for_git(
+            &url,
+            cargo_util_schemas::core::GitReference::Branch("fixture".into()),
+        );
+        let config = Config::load(
+            &root,
+            vec![("CARGO_HOME".to_owned(), root.join("home").to_str().unwrap().to_owned())],
+            &[],
+        )
+        .unwrap();
+        let ctx = Context::new(config);
+        let path = root.join("a/Cargo.toml");
+        let EitherManifest::Real(manifest) = read_manifest(&path, manifest_source, &ctx).unwrap()
+        else {
+            panic!("real manifest")
+        };
+        let locked = "git+file:///native-pin-fixture?branch=fixture#0123456789012345678901234567890123456789";
+        let native = super::native_manifest(&manifest, Some(locked)).unwrap();
+        let mut exported = blaze_manifest::metadata::export_package(&path, &manifest);
+        exported.set_source(locked.to_owned());
+        let previous = super::read(&serde_json::to_value(exported).unwrap()).unwrap();
+        assert!(native.summary.source_id().full_eq(previous.summary.source_id()));
+        assert_eq!(native.summary.rust_version(), previous.summary.rust_version());
+        assert_eq!(native.summary.rust_version().unwrap().to_string(), "1.90");
+        let actual = native.summary.dependencies()[0].source_id();
+        let expected = previous.summary.dependencies()[0].source_id();
+        assert_eq!(actual, expected, "ordinary equality may ignore precise");
+        let strict = actual.full_eq(expected);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            strict,
+            "native dependency precise source must match prior set_source boundary: actual={actual:?}, expected={expected:?}"
+        );
+    }
+}
+
+/// Resolver inputs from the native manifest model, not a JSON rendering of filesystem paths.
+/// Cargo metadata JSON requires UTF-8 paths; resolution itself must not inherit that restriction.
+pub(crate) fn native_manifest(
+    m: &blaze_manifest::manifest::Manifest,
+    source: Option<&str>,
+) -> Result<Read> {
+    let source_id =
+        SourceId::from_url(source.unwrap_or(&m.package_id.source_id.as_url().to_string()))?;
+    let id = blaze_resolve::PackageId::try_new(
+        &m.package_id.name,
+        &m.package_id.version.to_string(),
+        source_id,
+    )?;
+    let deps = m
+        .dependencies
+        .iter()
+        .map(|dep| {
+            // Match SerializedPackage::set_source: dependencies inside this fetched
+            // Git repository are pinned with the package, not only ordinary-equal
+            // to its unpinned manifest source.
+            let source = if let Some(locked) = source
+                && dep.source_id == m.package_id.source_id
+                && !dep.source_id.is_path()
+            {
+                SourceId::from_url(locked)?
+            } else {
+                SourceId::from_url(&dep.source_id.as_url().to_string())?
+            };
+            let req = dep.req.as_ref().map(ToString::to_string);
+            let mut d = Dependency::parse(&dep.name, req.as_deref(), source)?;
+            d.set_kind(match dep.kind {
+                blaze_manifest::dependency::DepKind::Normal => DepKind::Normal,
+                blaze_manifest::dependency::DepKind::Development => DepKind::Development,
+                blaze_manifest::dependency::DepKind::Build => DepKind::Build,
+            });
+            if let Some(rename) = &dep.explicit_name_in_toml {
+                d.set_explicit_name_in_toml(rename);
+            }
+            d.set_optional(dep.optional);
+            d.set_default_features(dep.default_features);
+            d.set_features(dep.features.iter().map(String::as_str));
+            d.set_platform(dep.platform.clone());
+            Ok(d)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let features = m
+        .features
+        .iter()
+        .map(|(k, v)| {
+            (
+                InternedString::new(k),
+                v.iter().map(|value| InternedString::new(&value.to_string())).collect(),
+            )
+        })
+        .collect();
+    let rust_version =
+        m.metadata.rust_version.as_ref().map(|version| version.to_string().parse()).transpose()?;
+    let summary = Summary::new(id, deps, &features, m.metadata.links.as_deref(), rust_version)?;
+    let lib = m.targets.iter().find(|t| t.is_lib());
+    Ok(Read {
+        summary,
+        lib: lib.map(|t| InternedString::new(&t.name.replace('-', "_"))),
+        proc_macro_lib: lib.is_some_and(|t| t.proc_macro),
+        any_proc_macro: m.targets.iter().any(|t| t.proc_macro),
+        build_script: m.targets.iter().any(|t| t.is_custom_build()),
+        bins: m
+            .targets
+            .iter()
+            .filter(|t| t.is_bin())
+            .map(|t| t.required_features.clone().unwrap_or_default())
+            .collect(),
+    })
+}
+
 fn str_of<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().ok_or_else(|| anyhow!("no `{key}` in a package"))
 }

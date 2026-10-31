@@ -1,0 +1,272 @@
+//! A replay runs no program the requester shipped: the platform is read by the digest of a tool
+//! inside the snapshot, and only a tool of the worker itself is run.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+mod common;
+
+use std::{
+    ffi::OsString,
+    os::unix::fs::PermissionsExt as _,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+
+use blaze_spec::{
+    assemble::Host,
+    flags::{Request, Subcommand},
+    platform::{Probe, System},
+    replay::{Saved, capture, prepare},
+};
+use blaze_wire::StoreIdentity;
+use common::{Fixture, context};
+use sha2::{Digest as _, Sha256};
+
+fn native_host() -> Host {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let triple = if cfg!(target_os = "macos") {
+        format!("{arch}-apple-darwin")
+    } else {
+        let abi = if cfg!(target_env = "musl") { "musl" } else { "gnu" };
+        format!("{arch}-unknown-linux-{abi}")
+    };
+    Host {
+        triple,
+        cfg: ["unix".to_owned(), format!("target_os=\"{os}\""), format!("target_arch=\"{arch}\"")]
+            .iter()
+            .map(|value| value.parse().unwrap())
+            .collect(),
+        cpu: arch.to_owned(),
+        llvm: false,
+    }
+}
+
+/// Probes the machine and records each requested program invocation.
+#[derive(Default)]
+struct Recording {
+    runs: Mutex<Vec<PathBuf>>,
+}
+
+impl Recording {
+    fn ran(&self, program: &Path) {
+        self.runs.lock().unwrap().push(program.to_owned());
+    }
+
+    fn ran_below(&self, root: &Path) -> Vec<PathBuf> {
+        let root = root.canonicalize().unwrap();
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|run| run.canonicalize().unwrap_or_else(|_| (*run).clone()).starts_with(&root))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Probe for Recording {
+    fn native_tree(&self, path: &Path) -> std::io::Result<blaze_spec::native_tree::Tree> {
+        System.native_tree(path)
+    }
+    fn native_trees(
+        &self,
+        paths: &[PathBuf],
+    ) -> std::io::Result<Vec<blaze_spec::native_tree::Tree>> {
+        System.native_trees(paths)
+    }
+    fn run_output_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+        program: &Path,
+        args: &[OsString],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.ran(program);
+        System.run_output_in(cwd, env, program, args)
+    }
+    fn which_native(&self, name: &std::ffi::OsStr, path: &std::ffi::OsStr) -> Option<PathBuf> {
+        System.which_native(name, path)
+    }
+    fn run_native(&self, program: &Path, args: &[OsString]) -> Option<String> {
+        self.ran(program);
+        System.run_native(program, args)
+    }
+    fn run_path(&self, program: &Path, args: &[OsString]) -> Option<Vec<u8>> {
+        self.ran(program);
+        System.run_path(program, args)
+    }
+    fn which(&self, name: &str, path: &str) -> Option<PathBuf> {
+        System.which(name, path)
+    }
+    fn run(&self, program: &Path, args: &[&str]) -> Option<String> {
+        self.ran(program);
+        System.run(program, args)
+    }
+    fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        System.read(path)
+    }
+    fn os(&self) -> Option<String> {
+        System.os()
+    }
+    fn which_native_in(
+        &self,
+        cwd: &Path,
+        name: &std::ffi::OsStr,
+        path: &std::ffi::OsStr,
+    ) -> Option<PathBuf> {
+        System.which_native_in(cwd, name, path)
+    }
+    fn which_in(&self, cwd: &Path, name: &str, path: &str) -> Option<PathBuf> {
+        System.which_in(cwd, name, path)
+    }
+    fn run_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+        program: &Path,
+        args: &[&str],
+    ) -> Option<String> {
+        self.ran(program);
+        System.run_in(cwd, env, program, args)
+    }
+    fn run_native_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+        program: &Path,
+        args: &[OsString],
+    ) -> Option<String> {
+        self.ran(program);
+        System.run_native_in(cwd, env, program, args)
+    }
+    fn run_path_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+        program: &Path,
+        args: &[OsString],
+    ) -> Option<Vec<u8>> {
+        self.ran(program);
+        System.run_path_in(cwd, env, program, args)
+    }
+    fn os_in(
+        &self,
+        cwd: &Path,
+        env: &std::collections::BTreeMap<String, OsString>,
+    ) -> Option<String> {
+        System.os_in(cwd, env)
+    }
+}
+
+/// A repository that ships a `cc`, which records every run of it in `marker`.
+fn repository(marker: &Path) -> Fixture {
+    let f = Fixture::with_root("[package]\nname='shipped'\nversion='0.1.0'\nedition='2021'\n");
+    f.write("src/main.rs", "fn main() {}\n");
+    f.write(
+        "Cargo.lock",
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"shipped\"\nversion = \"0.1.0\"\n",
+    );
+    for path in ["tools/cc", "cc"] {
+        f.write(
+            path,
+            &format!("#!/bin/sh\necho ran >> '{}'\nprintf 'shipped cc\\n'\n", marker.display()),
+        );
+        std::fs::set_permissions(f.root().join(path), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    f
+}
+
+fn worker_path() -> OsString {
+    std::env::var_os("PATH").unwrap()
+}
+
+#[test]
+fn a_cc_the_repository_puts_first_on_path_is_identified_and_never_run() {
+    let ran = tempfile::tempdir().unwrap();
+    let marker = ran.path().join("ran");
+    let f = repository(&marker);
+    let system = worker_path().into_string().unwrap();
+    // The repository's own configuration puts its tools first, and forces it.
+    f.write(
+        ".cargo/config.toml",
+        &format!("[env]\nPATH = {{ value = \"tools:{system}\", force = true }}\n"),
+    );
+    let shipped = Sha256::digest(std::fs::read(f.root().join("tools/cc")).unwrap());
+    let host = native_host();
+    let env = f.env();
+    let root = f.root();
+    let probe = Recording::default();
+    let mut ctx = context(&f, &env, &host, &root);
+    ctx.probe = &probe;
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &ctx, store.path(), &[]).unwrap();
+    assert_eq!(made.platform.linker.2, <[u8; 32]>::from(shipped), "the linker is the shipped cc");
+    assert_eq!(made.platform.linker.1, "", "a shipped tool is named by its bytes");
+    assert!(!marker.exists(), "capture ran the shipped cc");
+    drop(f);
+
+    let worker = tempfile::tempdir().unwrap();
+    let probe = Recording::default();
+    let prepared = prepare(
+        &Saved::of(&made).unwrap(),
+        store.path(),
+        &worker.path().join("source"),
+        &host,
+        StoreIdentity([9; 32]),
+        &probe,
+        Some(&common::rust_release),
+        &[("PATH".to_owned(), worker_path())].into_iter().collect(),
+    )
+    .unwrap();
+    assert_eq!(prepared.resolved.spec.platform, made.platform);
+    assert!(
+        probe.ran_below(&prepared.root).is_empty(),
+        "replay ran {:?}",
+        probe.ran_below(&prepared.root)
+    );
+    assert!(!marker.exists(), "replay ran the shipped cc before any input was compiled");
+}
+
+#[test]
+fn an_empty_entry_of_the_workers_path_does_not_reach_into_the_snapshot() {
+    let ran = tempfile::tempdir().unwrap();
+    let marker = ran.path().join("ran");
+    let f = repository(&marker);
+    let host = native_host();
+    let mut env = f.env();
+    // The requester's own `cc` is the machine's.
+    env.insert("PATH".to_owned(), worker_path().into_string().unwrap());
+    let root = f.root();
+    let ctx = {
+        let mut ctx = context(&f, &env, &host, &root);
+        ctx.probe = &System;
+        ctx
+    };
+    let request = Request::parse(Subcommand::Build, &[]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let made = capture(&request, &[], &ctx, store.path(), &[]).unwrap();
+    assert!(!marker.exists());
+    drop(f);
+
+    // A worker whose PATH starts with an empty entry: cargo on the worker would look in its own
+    // process directory, and never in the replayed request's.
+    let mut path = OsString::from(":");
+    path.push(worker_path());
+    let worker = tempfile::tempdir().unwrap();
+    let probe = Recording::default();
+    let prepared = prepare(
+        &Saved::of(&made).unwrap(),
+        store.path(),
+        &worker.path().join("source"),
+        &host,
+        StoreIdentity([9; 32]),
+        &probe,
+        Some(&common::rust_release),
+        &[("PATH".to_owned(), path)].into_iter().collect(),
+    )
+    .unwrap();
+    assert_eq!(prepared.resolved.spec.platform, made.platform);
+    assert!(!marker.exists(), "replay ran the shipped cc");
+    assert!(probe.ran_below(&prepared.root).is_empty());
+}

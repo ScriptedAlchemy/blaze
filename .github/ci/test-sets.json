@@ -1,0 +1,86 @@
+{
+  "_doc": "Test and build sets the build bundle (.github/workflows/pr.yaml, job build) compiles once per platform; checks run them with `bundle.py test <set> -- <libtest args>` or use their executables. Each set is its own cargo command, so its feature resolution is the one the command alone has. The area that runs a set owns its entry. Contract: docs/reports/CI-fork.md.",
+  "dist": {
+    "platforms": ["linux-x64", "macos-arm64"],
+    "test": ["-p", "blaze-dist", "-p", "blaze-dist-local", "-p", "blaze-wire", "-p", "blaze-spec"]
+  },
+  "c2-contracts": {
+    "platforms": ["linux-x64", "macos-arm64"],
+    "test": ["-p", "blaze-wire", "-p", "blaze-spec"]
+  },
+  "serve-server": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "blaze-serve"]
+  },
+  "serve-cli": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "ra-jit", "--bin", "ra-jit"]
+  },
+  "serve-project": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "project-model", "--lib"]
+  },
+  "serve-resolve": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "blaze-metadata", "-p", "blaze-registry", "-p", "blaze-resolve", "--all-targets"]
+  },
+  "serve-codegen": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "hir-ty-codegen", "--lib"]
+  },
+  "serve-syntax": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "syntax"]
+  },
+  "serve-diagnostics": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "ide-diagnostics", "--lib"]
+  },
+  "serve-hir-ide": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "hir-ide", "--lib"]
+  },
+  "serve-proc-macro": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "proc-macro-api", "--features", "span/salsa", "--lib"]
+  },
+  "serve-cfg": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "cfg", "--lib"]
+  },
+  "serve-paths": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "paths", "--lib"]
+  },
+  "serve-hir-def": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "hir-def", "--lib"]
+  },
+  "serve-wire": {
+    "platforms": ["linux-x64"],
+    "test": ["-p", "blaze-wire"]
+  },
+  "serve-bootstrap": {
+    "platforms": ["linux-x64"],
+    "test": ["--manifest-path", "vendor/proc-macro-srv/Cargo.toml", "-p", "proc-macro-api", "--lib"]
+  },
+  "serve-metadata": {
+    "platforms": ["linux-x64"],
+    "build": ["-p", "blaze-metadata", "--example", "metadata"]
+  },
+  "serve-debug-cli": {
+    "platforms": ["linux-x64"],
+    "build": ["-p", "ra-jit", "--bin", "ra-jit"]
+  },
+  "bench-head": {
+    "platforms": ["linux-x64"],
+    "bench": ["-p", "ra-jit-bench", "--bench", "store"],
+    "source": "head"
+  },
+  "bench-base": {
+    "platforms": ["linux-x64"],
+    "bench": ["-p", "ra-jit-bench", "--bench", "store"],
+    "source": "base",
+    "requires": "crates/ra-jit-bench"
+  }
+}

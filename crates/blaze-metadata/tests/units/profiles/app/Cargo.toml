@@ -1,0 +1,12 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+b = { path = "../b" }
+pm = { path = "../pm" }
+bonly = { path = "../bonly" }
+
+[build-dependencies]
+b = { path = "../b" }

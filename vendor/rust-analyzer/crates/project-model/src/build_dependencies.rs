@@ -393,7 +393,6 @@ impl WorkspaceBuildScripts {
                         }
                         acc
                     };
-                    data.envs.extend(message.env.drain(..));
                     // cargo_metadata crate returns default (empty) path for
                     // older cargos, which is not absolute, so work around that.
                     let out_dir = mem::take(&mut message.out_dir);
@@ -404,6 +403,7 @@ impl WorkspaceBuildScripts {
                         data.out_dir = Some(out_dir);
                         data.cfgs = cfgs;
                     }
+                    data.envs.extend(message.env.drain(..));
                 });
             }
             Message::CompilerArtifact(message) => {

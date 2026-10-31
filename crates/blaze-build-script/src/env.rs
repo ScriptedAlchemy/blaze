@@ -59,6 +59,22 @@ impl Explicit {
     }
 }
 
+/// The variable programs on this machine find dynamic libraries by: `LD_LIBRARY_PATH` on
+/// Linux, `DYLD_FALLBACK_LIBRARY_PATH` on macOS, `PATH` on Windows.
+pub fn host_dylib_var() -> &'static str {
+    if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else if cfg!(target_os = "aix") {
+        "LIBPATH"
+    } else if cfg!(target_os = "haiku") {
+        "LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
 /// What the machine that runs the script is, as far as its environment goes: cargo decides
 /// these by what it was built for, which is the host.
 struct HostOs {
@@ -405,7 +421,8 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     if let Some(host_root) = &search.host_root {
         let mut search_path =
             cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-        search_path.extend(below(&search.plugin_search, host_root));
+        let plugin_root = search.plugin_root.as_deref().unwrap_or(host_root);
+        search_path.extend(below(&search.plugin_search, plugin_root));
         cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
     }
     // The jobserver's `Client::configure`.
