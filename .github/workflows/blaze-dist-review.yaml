@@ -132,6 +132,8 @@ jobs:
             exit 1
           fi
           echo "no BLAZE_* or RA_JIT_* in the environment"
+      - name: Verify target-salted Nix run-path controls
+        run: python3 -I harness/dist/test_saved_spec_nix_rpath.py
       - name: C2 lanes (${{ matrix.lanes }})
         if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
         env:

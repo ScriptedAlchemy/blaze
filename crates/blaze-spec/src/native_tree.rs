@@ -52,7 +52,7 @@ pub struct Tree {
     pub entries: BTreeMap<PathBuf, Entry>,
     resolved_root: Option<PathBuf>,
     ancestor_links: BTreeMap<PathBuf, PathBuf>,
-    raw_links: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>>,
+    raw_links: BTreeMap<PathBuf, Vec<Link>>,
     locations: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
 }
 
@@ -163,7 +163,7 @@ impl Tree {
                 let Some(raw) = self.raw_links.get(path) else { return Ok(None) };
                 raw.clone()
             };
-            let links = tree.visible_links(raw.clone());
+            let links = Self::visible_links(raw.clone());
             tree.raw_links.insert(relative.to_owned(), raw);
             let location = if relative.as_os_str().is_empty() {
                 (root.to_owned(), resolved.path.clone())
@@ -386,19 +386,8 @@ impl Tree {
         self.ancestor_links.iter().map(|(alias, resolved)| (alias.as_path(), resolved.as_path()))
     }
 
-    fn visible_links(&self, links: Vec<(PathBuf, PathBuf)>) -> Vec<PathBuf> {
-        links
-            .into_iter()
-            .filter_map(|(at, target)| {
-                let ancestor = self.ancestor_links.contains_key(&at)
-                    || (at != self.root && self.root.starts_with(&at))
-                    || self
-                        .resolved_root
-                        .as_ref()
-                        .is_some_and(|root| at != *root && root.starts_with(&at));
-                (!ancestor).then_some(target)
-            })
-            .collect()
+    fn visible_links(links: Vec<Link>) -> Vec<PathBuf> {
+        links.into_iter().filter_map(|link| (!link.ancestor).then_some(link.target)).collect()
     }
 
     fn walk(
@@ -411,7 +400,7 @@ impl Tree {
         let Resolved { path, links, kind, .. } = resolved;
         self.locations.insert(logical.to_owned(), (requested.to_owned(), path.clone()));
         self.raw_links.insert(logical.to_owned(), links.clone());
-        let links = self.visible_links(links);
+        let links = Self::visible_links(links);
         let stamp = match &kind {
             ResolvedKind::File(metadata) | ResolvedKind::Directory(metadata) => {
                 Some(Stamp::of(metadata)?)
@@ -480,7 +469,7 @@ impl Tree {
             _ => None,
         };
         if after.path != path
-            || self.visible_links(after.links) != links
+            || Self::visible_links(after.links) != links
             || !same_kind(&after.kind, &kind)
             || after_stamp != stamp
         {
@@ -528,9 +517,18 @@ fn names(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     Ok(names)
 }
 
+/// Whether a traversal precedes the captured node belongs to the occurrence, not the
+/// symlink's pathname: a file's target can traverse an ancestor alias again (Debian's
+/// libm.so points through /lib, which is itself a symlink).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Link {
+    target: PathBuf,
+    ancestor: bool,
+}
+
 struct Resolved {
     path: PathBuf,
-    links: Vec<(PathBuf, PathBuf)>,
+    links: Vec<Link>,
     ancestors: BTreeMap<PathBuf, PathBuf>,
     kind: ResolvedKind,
 }
@@ -558,7 +556,7 @@ fn resolve(path: &Path) -> io::Result<Resolved> {
 fn resolve_path(
     path: &Path,
     active: &mut BTreeSet<PathBuf>,
-    links: &mut Vec<(PathBuf, PathBuf)>,
+    links: &mut Vec<Link>,
     ancestors: &mut BTreeMap<PathBuf, PathBuf>,
     ancestor: Option<bool>,
 ) -> io::Result<(PathBuf, ResolvedKind)> {
@@ -609,11 +607,11 @@ fn resolve_path(
                     if Stamp::of(&fs::symlink_metadata(&current)?)? != Stamp::of(&found)? {
                         return Err(changed(&current));
                     }
-                    links.push((current.clone(), target.clone()));
-                    let destination = current.parent().unwrap_or(Path::new("/")).join(target);
                     // Prefix expansions precede the captured root. The final root's
                     // own symlink chain remains part of its identity.
                     let is_ancestor = ancestor.unwrap_or_else(|| components.peek().is_some());
+                    links.push(Link { target: target.clone(), ancestor: is_ancestor });
+                    let destination = current.parent().unwrap_or(Path::new("/")).join(target);
                     let result =
                         resolve_path(&destination, active, links, ancestors, Some(is_ancestor))?;
                     if is_ancestor {
