@@ -47,6 +47,8 @@ jobs:
         with:
           platform: ${{ inputs.platform }}
           sha256: ${{ inputs.bundle-sha256 }}
+      - name: Verify bundle extraction and executable integrity boundaries
+        run: python3 -I .github/scripts/test_bundle_integrity.py
       - name: The owned macro runtime is this ra-jit's
         run: |
           python3 -I -c '

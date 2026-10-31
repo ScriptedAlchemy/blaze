@@ -191,6 +191,15 @@ def without_nix_rpath(env):
     both legs link without it.
     """
     out = dict(env)
+    # Nix's bintools wrapper keys the RPATH switch by its target triple.
+    # The unsuffixed NIX_DONT_SET_RPATH used by older wrappers is ignored by
+    # current nixpkgs, even when all explicit -rpath tokens were stripped.
+    # Discover the wrapper's salt from its own exported target marker instead
+    # of guessing the host triple (cross-compilers may use another one).
+    for name in env:
+        for prefix in ("NIX_BINTOOLS_WRAPPER_TARGET_HOST_", "NIX_CC_WRAPPER_TARGET_HOST_"):
+            if name.startswith(prefix):
+                out["NIX_DONT_SET_RPATH_" + name[len(prefix):]] = "1"
     for name, value in env.items():
         if not name.startswith("NIX_LDFLAGS"):
             continue

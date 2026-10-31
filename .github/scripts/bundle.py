@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 SCHEMA = 1
 HERE = Path(__file__).resolve()
@@ -84,9 +85,29 @@ def to_key(path, base):
 
 def from_key(key, base):
     name, _, rest = key.partition("/")
-    if name not in base or not rest or rest.startswith("/") or ".." in rest.split("/"):
+    pieces = rest.split("/")
+    if name not in base or not rest or any(part in ("", ".", "..") for part in pieces):
         die(f"refusing path {key!r}")
-    return os.path.join(base[name], *rest.split("/"))
+    root = os.path.realpath(base[name])
+    path = os.path.join(root, *pieces)
+    # The checkout may contain symlinks, and the tar may have been prepared on
+    # another machine. Never let unpack follow one outside the assigned root.
+    if os.path.commonpath([root, os.path.realpath(path)]) != root:
+        die(f"refusing path outside {name}: {key!r}")
+    return path
+
+
+def allowed_bundle_key(key):
+    """CI bundles contain build products, never checkout sources or arbitrary runner files."""
+    return key.startswith("workspace/target/") or key.startswith("temp/owned-runtime/")
+
+
+def verified_executable(path, key, manifest):
+    """Every consumer, including `path`, validates a binary before using it."""
+    want = manifest["files"].get(key)
+    if not want or not os.path.isfile(path) or sha256_file(path) != want["sha256"]:
+        die(f"{path} changed since it was unpacked")
+    return path
 
 
 def host_triple():
@@ -218,6 +239,8 @@ def pack(args):
     keys = sorted(set(keys))
     files = {}
     for key in keys:
+        if not allowed_bundle_key(key):
+            die(f"refusing non-build artifact {key!r}")
         path = from_key(key, base)
         if not os.path.isfile(path):
             die(f"{key} was not built")
@@ -282,25 +305,52 @@ def unpack(args):
     seen = set()
     zstd = subprocess.Popen(["zstd", "-d", "-c", "-q", str(src / "bundle.tar.zst")],
                             stdout=subprocess.PIPE)
-    with tarfile.open(fileobj=zstd.stdout, mode="r|") as tar:
-        for member in tar:
-            want = files.get(member.name)
-            if want is None or not member.isfile() or member.name in seen:
-                die(f"unlisted or repeated member {member.name!r}")
-            path = from_key(member.name, base)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            content = hashlib.sha256()
-            size = 0
-            with tar.extractfile(member) as data, open(path, "wb") as out:
-                for block in iter(lambda: data.read(1 << 20), b""):
-                    content.update(block)
-                    size += len(block)
-                    out.write(block)
-            if content.hexdigest() != want["sha256"] or size != want["size"]:
-                die(f"{member.name} does not match bundle.json")
-            if want["executable"]:
-                os.chmod(path, 0o755)
-            seen.add(member.name)
+    try:
+        with tarfile.open(fileobj=zstd.stdout, mode="r|") as tar:
+            for member in tar:
+                if not allowed_bundle_key(member.name):
+                    die(f"refusing non-build artifact {member.name!r}")
+                want = files.get(member.name)
+                if want is None or not member.isfile() or member.name in seen:
+                    die(f"unlisted or repeated member {member.name!r}")
+                path = from_key(member.name, base)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                # Do not truncate a previously present hardlink or follow a final
+                # symlink. A corrupt/truncated tar leaves the old file untouched.
+                # The manifest's expected byte count is the limit, not a global
+                # artifact size cap.
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=os.path.dirname(path),
+                                                     prefix=".blaze-bundle-", delete=False) as out:
+                        temp_path = out.name
+                        content = hashlib.sha256()
+                        size = 0
+                        with tar.extractfile(member) as data:
+                            for block in iter(lambda: data.read(1 << 20), b""):
+                                size += len(block)
+                                if size > want["size"]:
+                                    die(f"{member.name} exceeds its declared size")
+                                content.update(block)
+                                out.write(block)
+                    if content.hexdigest() != want["sha256"] or size != want["size"]:
+                        die(f"{member.name} does not match bundle.json")
+                    if want["executable"]:
+                        os.chmod(temp_path, 0o755)
+                    # Recheck in case a concurrent process changed a parent link.
+                    from_key(member.name, base)
+                    os.replace(temp_path, path)
+                    temp_path = None
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                seen.add(member.name)
+    finally:
+        # A failed member verification must not leak the decompressor or its pipe.
+        zstd.stdout.close()
+        if zstd.poll() is None:
+            zstd.terminate()
+        zstd.wait()
     if zstd.wait() != 0:
         die("zstd failed")
     missing = sorted(set(files) - seen)
@@ -331,8 +381,7 @@ def test(args):
     extra = args.libtest[1:] if args.libtest[:1] == ["--"] else args.libtest
     for run in entry["runs"]:
         key = to_key(run["exe"], manifest["roots"])
-        if sha256_file(run["exe"]) != manifest["files"][key]["sha256"]:
-            die(f"{run['exe']} changed since it was unpacked")
+        verified_executable(run["exe"], key, manifest)
         command = [run["exe"], *run["args"], *extra]
         print(f"     Running {os.path.relpath(run['exe'], manifest['roots']['workspace'])}", flush=True)
         code = subprocess.run(command, cwd=run["cwd"], env={**os.environ, **run["env"]}).returncode
@@ -342,14 +391,16 @@ def test(args):
 
 
 def path(args):
-    _, entry = load_set(args.set)
+    manifest, entry = load_set(args.set)
     if entry.get("absent"):
         print("")
         return
     found = [e["path"] for e in entry["executables"] if e["name"] == args.target]
     if len(found) != 1:
         die(f"set {args.set} built {len(found)} executables named {args.target}")
-    print(found[0])
+    executable = found[0]
+    verified_executable(executable, to_key(executable, manifest["roots"]), manifest)
+    print(executable)
 
 
 def main():
