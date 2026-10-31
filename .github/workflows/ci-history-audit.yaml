@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      AUDIT_OUT: ${{ runner.temp }}/ci-history
+      AUDIT_OUT: ci-history
     steps:
       - uses: actions/checkout@v7
         with:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ci-history-inventory
-          path: ${{ runner.temp }}/ci-history/*.json
+          path: ci-history/*.json
           retention-days: 7
           if-no-files-found: error
       - name: Search all retained attempts and diagnostic archives
@@ -43,7 +43,7 @@ jobs:
         if: ${{ always() }}
         with:
           name: ci-history-search
-          path: ${{ runner.temp }}/ci-history
+          path: ci-history
           retention-days: 7
           if-no-files-found: error
       - name: Archive current reviewed source without credentials
