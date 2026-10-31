@@ -859,7 +859,6 @@ fn host_overflow_and_panic_flags_change_the_effective_script_profile() {
 fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
     let base = [
         "unix",
-        "proc_macro",
         "target_arch=\"x86_64\"",
         "target_pointer_width=\"64\"",
         "debug_assertions",
@@ -882,7 +881,6 @@ fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
         source_cfgs(&base, &["feature=\"selected\"".into()], &profile, &apply_flags(&flags).cfgs);
     for fact in [
         "unix",
-        "proc_macro",
         "target_arch=\"x86_64\"",
         "target_pointer_width=\"64\"",
         "feature=\"selected\"",
@@ -904,6 +902,105 @@ fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
         assert!(cfg.iter().any(|it| it == fact));
     }
     assert!(!cfg.iter().any(|it| it == "panic=\"abort\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
+    let base = dir("macro-root-cfg");
+    let root = base.join("pkg");
+    std::fs::create_dir_all(root.join("helper")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\npath = \"lib.rs\"\nproc-macro = true\n\
+         [dependencies]\nhelper = { path = \"helper\" }\n\
+         [features]\nselected = []\n[workspace]\nmembers = [\"helper\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("helper/lib.rs"), "").unwrap();
+    let pkg = Fixture::at(&base);
+    let env = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), base.join("home").display().to_string()),
+        ("RUSTFLAGS".to_owned(), "--cfg custom_host -Cpanic=abort".to_owned()),
+    ]);
+    let config = Config::load(&root, env.clone(), &[]).unwrap();
+    let cx = blaze_manifest::Context::new(config);
+    let manifest = root.join("Cargo.toml");
+    let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+    let mut metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let packages = metadata["packages"].as_array().unwrap();
+    let id = |name: &str| packages.iter().find(|p| p["name"] == name).unwrap()["id"].clone();
+    let macro_id = id("macros");
+    let helper_id = id("helper");
+    metadata["resolve"] = serde_json::json!({"root": macro_id, "nodes": [
+        {"id": macro_id, "dependencies": [helper_id], "deps": [
+            {"name": "helper", "pkg": helper_id, "dep_kinds": [{"kind": null, "target": null}]}
+        ], "features": ["selected"]},
+        {"id": helper_id, "dependencies": [], "deps": [], "features": []}
+    ]});
+    let manifest =
+        project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest)).unwrap();
+    let cargo = CargoWorkspace::new(
+        serde_json::from_value(metadata).unwrap(),
+        manifest,
+        ide_db::base_db::Env::default(),
+        false,
+    );
+    let package = cargo.packages().find(|&p| cargo[p].name == "macros").unwrap();
+    let asked = Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: None,
+        host_cargo: None,
+        shared: None,
+    };
+    let leases = Leases::default();
+    let mut runner = Runner::new(&leases, &cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+    runner.done.insert(
+        (package, true),
+        Ok(Arc::new(Done {
+            out_dir: base.join("out"),
+            output: blaze_build_script::Output::default(),
+            fingerprint: 0,
+            generation: 0,
+            ran: false,
+            made: None,
+            links: None,
+        })),
+    );
+    let mut leaves = Vec::new();
+    let index = runner.add_source_leaf(package, &mut leaves).unwrap();
+    assert!(leaves[index].cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let described = crate::cargo::own_script::planned_description(&pkg.sysroot, leaves);
+    let described: serde_json::Value = serde_json::from_str(&described).unwrap();
+    assert!(
+        described["crates"][index]["cfg"].as_array().unwrap().iter().any(|cfg| cfg == "proc_macro")
+    );
+    let mut crates = Vec::new();
+    runner.add_source(package, &mut crates, &mut FxHashMap::default()).unwrap();
+    let root = crates.iter().find(|krate| krate.name == "macros").unwrap();
+    for fact in ["proc_macro", "unix", "custom_host", "panic=\"abort\"", "feature=\"selected\""] {
+        assert!(root.cfg.iter().any(|cfg| cfg == fact), "missing {fact}: {:?}", root.cfg);
+    }
+    let helper = crates.iter().find(|krate| krate.name == "helper").unwrap();
+    assert!(!helper.cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let profile = runner.profile(package, UnitFor::new_host(true), &CompileKind::Host);
+    let script = runner
+        .described(package, "build_script_build", &base.join("build.rs"), &profile, None)
+        .unwrap();
+    assert!(!script.cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A crate of a script's compile, as `Runner::compile` describes it, compiled with what the

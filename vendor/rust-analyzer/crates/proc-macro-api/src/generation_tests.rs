@@ -265,6 +265,68 @@ fn actual_server_process_is_killed_and_waited_when_generation_retires() {
     assert!(!alive(&baseline));
 }
 
+/// A macro reads its server's environment as it would read rustc's. A server started for a
+/// load whose process had a variable must not expand for a later load whose process has it
+/// not (PR15_PRIVATE: set, build; unset, edit the macro, build), nor with a value changed.
+#[test]
+fn a_generation_starts_with_the_environment_of_its_load() {
+    use std::os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _};
+    let dir = stdx::tempfile::NamedTempDir::new("generation-env-test").unwrap();
+    let script = dir.path().join("server");
+    let seen = dir.path().join("seen");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"${{PR15_PRIVATE-absent}}\" >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*ApiVersionCheck*) echo '{{\"ApiVersionCheck\":0}}';;\n*ListMacros*) echo '{{\"ListMacros\":{{\"Ok\":[[\"Macro\",\"CustomDerive\"]]}}}}';;\nesac\ndone\n",
+        seen.display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = paths::AbsPathBuf::assert_utf8(script);
+    let source = paths::AbsPathBuf::assert_utf8(dir.path().join("library"));
+    std::fs::write(&source, b"macro one").unwrap();
+    let given = [("PR15_PRIVATE", Some("old-private-value".to_owned()))];
+    let client = loop {
+        match ProcMacroClient::spawn(&server, given.iter().map(|(k, v)| (k, v)), None, 1) {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            spawned => break spawned.unwrap(),
+        }
+    };
+    let lines = || {
+        std::fs::read(&seen)
+            .unwrap()
+            .split(|it| *it == b'\n')
+            .filter(|it| !it.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+    };
+    let first = client.load_dylib(MacroDylib::new(source.clone())).unwrap();
+    assert_eq!(lines(), [b"old-private-value".to_vec()]);
+
+    // The same variables again: the serving epoch stays.
+    client.set_generation_env(given.iter().map(|(k, v)| (k, v)));
+    let same = client.load_dylib(MacroDylib::new(source.clone())).unwrap();
+    assert!(Arc::ptr_eq(&same[0].pool, &first[0].pool));
+    drop(same);
+
+    // The variable removed from the next request, and the macro edited.
+    client.set_generation_env([("PR15_PRIVATE", &None::<String>)]);
+    client.begin_load_epoch();
+    std::fs::write(&source, b"macro two").unwrap();
+    let second = client.load_dylib(MacroDylib::new(source.clone())).unwrap();
+    assert!(!Arc::ptr_eq(&second[0].pool, &first[0].pool));
+    assert_eq!(lines().last().unwrap(), b"absent", "the removed variable is absent");
+    assert!(first[0].pool.exited().is_none(), "the earlier consumer keeps its epoch");
+
+    // A value that is not Unicode, changed with no edit: a new generation has it.
+    let raw = Some(std::ffi::OsString::from_vec(b"raw-\xff-value".to_vec()));
+    client.set_generation_env([("PR15_PRIVATE", &raw)]);
+    let third = client.load_dylib(MacroDylib::new(source.clone())).unwrap();
+    assert!(!Arc::ptr_eq(&third[0].pool, &second[0].pool));
+    assert_eq!(lines().last().unwrap(), b"raw-\xff-value");
+    assert_eq!(lines().len(), 3, "one server for each environment");
+    drop((first, second, third));
+}
+
 #[test]
 fn distinct_paths_share_epoch_reload_retains_consumers_and_reports_crash() {
     use std::os::unix::fs::PermissionsExt;

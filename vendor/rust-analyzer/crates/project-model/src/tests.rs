@@ -186,6 +186,39 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
 }
 
 #[test]
+fn cargo_proc_macro_cfg_is_confined_to_its_target() {
+    let mut meta: serde_json::Value = get_test_json_file("hello-world-metadata.json");
+    let target = &mut meta["packages"][0]["targets"][0];
+    target["kind"] = serde_json::json!(["proc-macro"]);
+    target["crate_types"] = serde_json::json!(["proc-macro"]);
+    let meta: Metadata = serde_json::from_value(meta).unwrap();
+    let manifest =
+        ManifestPath::try_from(AbsPathBuf::try_from(meta.workspace_root.clone()).unwrap()).unwrap();
+    let cargo = CargoWorkspace::new(meta, manifest, Default::default(), false);
+    let mut workspace = load_workspace_from_metadata("hello-world-metadata.json");
+    if let ProjectWorkspaceKind::Cargo { cargo: current, .. } = &mut workspace.kind {
+        *current = cargo;
+    } else {
+        unreachable!();
+    }
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let mut macros = 0;
+    let mut others = 0;
+    for id in graph.iter() {
+        let krate = &graph[id];
+        let is_macro = krate.basic.target_kind.is_proc_macro();
+        assert_eq!(krate.cfg_options.check_atom(&CfgAtom::Flag(sym::proc_macro)), is_macro);
+        if is_macro {
+            macros += 1;
+        } else {
+            others += 1;
+        }
+    }
+    assert_eq!(macros, 1);
+    assert!(others > 0);
+}
+
+#[test]
 fn cargo_hello_world_project_model() {
     let (crate_graph, _proc_macros) = load_cargo("hello-world-metadata.json");
     check_crate_graph(

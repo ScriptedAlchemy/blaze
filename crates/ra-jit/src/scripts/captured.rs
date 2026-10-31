@@ -482,7 +482,7 @@ pub(crate) fn run_with_context(
             }
             if node.kind == Kind::ProcMacro {
                 let crates = graph.closure(action, &prepared.units)?;
-                let before = producer_image::snapshot(sysroot, &crates)?;
+                let before = producer_image::snapshot(sysroot, &crates, work)?;
                 prepared.observe(before.paths().cloned(), &runtime_paths, &generation);
                 let native = graph.native_closure(action, &prepared)?;
                 let members: Vec<_> = graph
@@ -513,10 +513,14 @@ pub(crate) fn run_with_context(
                         bindings: bound.as_ref(),
                         naming: naming.as_ref(),
                     },
+                    work,
                 )?;
                 ensure!(
-                    producer_image::snapshot(sysroot, &graph.closure(action, &prepared.units)?)?
-                        == before,
+                    producer_image::snapshot(
+                        sysroot,
+                        &graph.closure(action, &prepared.units)?,
+                        work
+                    )? == before,
                     "captured macro source changed during compilation"
                 );
                 prepared.images.extend(image.leases);
@@ -540,7 +544,7 @@ pub(crate) fn run_with_context(
         let at = action - graph.units.len();
         let run = &graph.runs[at];
         let crates = graph.closure(run.compiler, &prepared.units)?;
-        let before = producer_image::snapshot(sysroot, &crates)?;
+        let before = producer_image::snapshot(sysroot, &crates, work)?;
         prepared.observe(before.paths().cloned(), &runtime_paths, &generation);
         let dir = generation.join(format!("script-{at}"));
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
@@ -581,7 +585,7 @@ pub(crate) fn run_with_context(
         )
         .map_err(anyhow::Error::msg)?;
         ensure!(
-            producer_image::snapshot(sysroot, &crates)? == before,
+            producer_image::snapshot(sysroot, &crates, work)? == before,
             "captured script source changed during compilation"
         );
         prepared.observe(read_inputs(&inputs)?, &runtime_paths, &generation);

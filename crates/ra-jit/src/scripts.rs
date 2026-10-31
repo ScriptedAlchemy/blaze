@@ -1400,6 +1400,7 @@ impl<'a> Runner<'a> {
                     members: &members,
                     env: &env,
                 },
+                self.cargo.target_directory().as_ref(),
             )
             .map(|image| (image, newest_run))
             .map_err(|it| format!("{it:#}"))
@@ -1462,7 +1463,12 @@ impl<'a> Runner<'a> {
             true => Some(self.script(package, true)?),
             false => None,
         };
-        let described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        let mut described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true })
+            && !described.cfg.iter().any(|cfg| cfg == "proc_macro")
+        {
+            described.cfg.push("proc_macro".to_owned());
+        }
         let index = crates.len();
         crates.push(described);
         Ok(index)

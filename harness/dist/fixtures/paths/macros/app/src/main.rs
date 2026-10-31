@@ -1,6 +1,6 @@
-use derive::{Describe, Embedded, ManifestLength, note};
+use derive::{Describe, Embedded, ManifestLength, Private, note};
 
-#[derive(Describe, Embedded)]
+#[derive(Describe, Embedded, Private)]
 struct Widget {
     _size: u32,
 }
@@ -18,4 +18,5 @@ fn main() {
     println!("{}", Widget::embedded());
     println!("{} / {}", greet(), greet_note());
     println!("manifest length {}", Gadget::manifest_length());
+    println!("private {}", Widget::private());
 }
