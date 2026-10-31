@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: {fetch-depth: 0}
-      - name: Prepare the reviewed runtime regressions on the verified identity
+      - name: Prepare exact reviewed source and real store-key regression fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -50,15 +50,19 @@ jobs:
           from pathlib import Path
           parent=Path('crates/ra-jit/src/remote/keeper/recovery_tests.rs')
           child=parent.with_suffix('')/'lazy_download_tests.rs'
-          text=parent.read_text()
-          assert text.count('mod lazy_download_tests;')==1
-          parent.write_text(text.replace('mod lazy_download_tests;', 'mod lazy_download_tests {\n'+child.read_text()+'\n}'))
+          text=child.read_text()
+          needle='source.insert(&key, b"a remotely compiled function");'
+          assert text.count(needle)==1
+          text=text.replace(needle,needle+'\n    let key = source.disk_key(&key);')
+          original=parent.read_text()
+          assert original.count('mod lazy_download_tests;')==1
+          parent.write_text(original.replace('mod lazy_download_tests;', 'mod lazy_download_tests {\n'+text+'\n}'))
           child.unlink()
           child.parent.rmdir()
           PY
       - uses: ./.github/actions/toolchain
         with: {components: rustfmt, llvm: build}
-      - name: Format complete candidate and save the exact repaired source
+      - name: Reproduce all three failures against the original keeper
         shell: bash
         run: |
           set -euo pipefail
@@ -67,11 +71,6 @@ jobs:
           cp crates/ra-jit/src/remote/keeper.rs "$out/keeper-after.rs"
           cp crates/ra-jit/src/remote/keeper/recovery_tests.rs "$out/recovery-after.rs"
           git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
-      - name: Reproduce publication and lazy-recovery failures on the original keeper
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/holistic-proof"
           set +e
           nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote::keeper::recovery_tests:: -- --test-threads=2 --nocapture > "$out/recovery-before.log" 2>&1
           status=$?
@@ -91,7 +90,7 @@ jobs:
           cargo fmt --all -- --check
           git diff --check
           git diff > "$out/verified.patch"
-      - name: Publish two focused runtime commits on the verified identity stack
+      - name: Publish two focused source-only runtime commits
         shell: bash
         run: |
           set -euo pipefail
