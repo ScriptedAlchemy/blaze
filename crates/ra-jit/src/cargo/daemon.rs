@@ -2003,7 +2003,7 @@ mod tests {
             socket: dir.path().join("unused.sock"),
             log: dir.path().join("log"),
             env: crate::process::Native::own(),
-            child: Mutex::new(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+            child: Mutex::new(Command::new("sleep").arg("30").spawn().unwrap()),
             checkouts: Mutex::new(FxHashMap::from_iter([(
                 checkout.key.clone(),
                 Loaded {

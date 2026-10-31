@@ -308,6 +308,16 @@ pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
     reading
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn printenv_for_test() -> Command {
+    let path = std::env::var_os("PATH").expect("test environment has a PATH");
+    let program = std::env::split_paths(&path)
+        .map(|directory| directory.join("printenv"))
+        .find(|program| program.is_file())
+        .expect("printenv is available in the test environment");
+    Command::new(program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,7 +380,7 @@ mod tests {
         assert_eq!(env.unicode().get("EMPTY"), Some(String::new()));
         assert_eq!(env.unicode().get("BYTE_VALUE"), None);
         assert!(env.unicode().is_non_unicode("BYTE_VALUE"));
-        let mut command = Command::new("/usr/bin/printenv");
+        let mut command = crate::process::printenv_for_test();
         command.env("DAEMON_ONLY", "must-not-leak");
         env.apply(&mut command);
         let output = command.output().unwrap();
