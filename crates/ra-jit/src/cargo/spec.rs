@@ -948,11 +948,10 @@ fn compile_at(
         command.args(["--cfg-test", "--crate"]).arg(Path::new(library).join("test/src/lib.rs"));
     }
     let mut child = command.spawn().context("starting the owned replay compiler")?;
-    if let Err(error) = child.stdin.take().context("owned project pipe")?.write_all(&described) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).context("sending owned project");
-    }
+    // The compiler may reject the project before consuming the whole stdin
+    // description. Always reap it and collect its stderr before reporting a
+    // broken pipe: the compiler failure is the cause, not the failed write.
+    let sent = child.stdin.take().context("owned project pipe")?.write_all(&described);
     let output = child.wait_with_output()?;
     std::fs::write(dir.join("compiler.log"), &output.stderr)?;
     let said = String::from_utf8_lossy(&output.stderr);
@@ -961,6 +960,7 @@ fn compile_at(
             .with_context(|| format!("owned compiler failed:\n{said}"))?;
         return Err(CompilerFailure(diagnostics).into());
     }
+    sent.context("sending owned project")?;
     ensure!(
         !said.lines().any(|line| line.contains(" functions in it ra-jit could not compile")
             && !line.ends_with(", 0 functions in it ra-jit could not compile")),

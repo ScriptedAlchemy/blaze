@@ -50,7 +50,9 @@ pub(crate) fn producer_env_in(env: &[(String, String)]) -> BTreeMap<String, Stri
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
     if let Some(rest) = args.strip_prefix(&["spec".to_owned()]) {
-        crate::end_with_reader();
+        // Saved replay writes compiler descriptions to child stdin. A child can
+        // reject a project before reading it: keep SIGPIPE ignored so that
+        // write_all reports EPIPE and the compiler's diagnostics survive.
         std::process::exit(spec::command(rest)?);
     }
     if let [word, cargo, rest @ ..] = args.as_slice()
