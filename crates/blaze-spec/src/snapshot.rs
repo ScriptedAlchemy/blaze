@@ -610,11 +610,11 @@ impl Capture<'_> {
     }
 }
 
-fn hash(bytes: &[u8]) -> Digest {
+pub(crate) fn hash(bytes: &[u8]) -> Digest {
     *blake3::hash(bytes).as_bytes()
 }
 
-fn name(digest: &Digest) -> String {
+pub(crate) fn name(digest: &Digest) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -624,7 +624,7 @@ fn get(store: &Path, digest: &Digest) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn put(store: &Path, bytes: &[u8]) -> anyhow::Result<Digest> {
+pub(crate) fn put(store: &Path, bytes: &[u8]) -> anyhow::Result<Digest> {
     use std::io::Write as _;
     fs::create_dir_all(store)?;
     let digest = hash(bytes);

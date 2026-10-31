@@ -14,7 +14,7 @@ use blaze_spec::{
     assemble::{Context, Host, Spec},
     flags::{Request, Subcommand},
 };
-use blaze_wire::{BuildSpec, Namespace, ProfileSpec, RootRef, SourceRef, StoreIdentity};
+use blaze_wire::{Namespace, ProfileSpec, RootRef, SourceRef, StoreIdentity};
 use sha2::{Digest as _, Sha256};
 
 pub(super) mod direct;
@@ -213,9 +213,10 @@ pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
     if let Some(out) = &out {
         // Blobs are immutable and atomically installed before this final publication.
         // Replacing a spec leaves the previous spec's blobs usable by concurrent readers.
+        // The file names the replay record by its digest, as the spec names the sources.
         let mut writing =
             tempfile::NamedTempFile::new_in(out.parent().context("--out has no parent")?)?;
-        writing.write_all(&blaze_wire::encode(&made.build))?;
+        writing.write_all(&blaze_wire::encode(&blaze_spec::replay::Saved::of(&made)?))?;
         writing.as_file().sync_all()?;
         writing.persist(out).map_err(|error| error.error)?;
     }
@@ -355,8 +356,10 @@ fn unit_graph(request: &Request, ctx: &Context<'_>) -> anyhow::Result<serde_json
 
 fn replay(file: &Path) -> anyhow::Result<i32> {
     let file = file.canonicalize()?;
-    let given: BuildSpec =
-        blaze_wire::decode(&std::fs::read(&file)?, &blaze_wire::Limits::DOCUMENTED)?;
+    let saved: blaze_spec::replay::Saved =
+        blaze_wire::decode(&std::fs::read(&file)?, &blaze_wire::Limits::DOCUMENTED)
+            .context("not a spec saved by this version of `cargo spec --out`")?;
+    let given = &saved.build;
     let (host, identity, sysroot) = host()?;
     let store = companion(&file, "inputs");
     let outputs = companion(&file, "outputs");
@@ -369,7 +372,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     })?;
     let executor = blaze_spec::environment::native_process();
     let prepared = blaze_spec::replay::prepare(
-        &given,
+        &saved,
         &store,
         &job.path().join("source"),
         &host,
@@ -474,7 +477,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     }
     prepared.validate_sources(&store)?;
     producers.bindings.validate()?;
-    let native = blaze_spec::assemble::canonical_units(&given, &prepared.resolved.graph)?;
+    let native = blaze_spec::assemble::canonical_units(given, &prepared.resolved.graph)?;
     let artifacts = programs.iter().map(|program| -> anyhow::Result<serde_json::Value> {
         let native_link = if program.output == blaze_spec::execution::Output::Object {
             let path = program.executable.parent().context("artifact has no directory")?.join("link.cbor");
@@ -503,7 +506,7 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         }))
     }).collect::<anyhow::Result<Vec<_>>>()?;
     let result = serde_json::json!({
-        "spec": hex(&blaze_wire::digest_of(&given)),
+        "spec": hex(&blaze_wire::digest_of(given)),
         "artifacts": artifacts,
     });
     std::fs::write(job.path().join("result.json"), serde_json::to_vec_pretty(&result)?)?;

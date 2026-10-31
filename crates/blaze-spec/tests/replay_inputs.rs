@@ -10,7 +10,7 @@ use blaze_spec::{
     assemble::Spec,
     flags::{Request, Subcommand},
     platform::Probe,
-    replay::{capture, prepare},
+    replay::{Saved, capture, prepare},
 };
 use blaze_wire::{SourceRef, StoreIdentity};
 use common::{FakeMachine, Fixture, context, host};
@@ -36,7 +36,7 @@ fn saved(f: &Fixture, command: Subcommand, args: &[&str], store: &Path) -> Spec 
 
 fn prepared(made: &Spec, store: &Path, at: &Path) -> blaze_spec::replay::Prepared {
     prepare(
-        &made.build,
+        &Saved::of(made).unwrap(),
         store,
         at,
         &host(false),
@@ -61,7 +61,7 @@ fn replay_execution_keeps_rooted_worker_path_only() {
             .into_iter()
             .collect();
     let replay = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("source"),
         &host(false),
@@ -184,7 +184,7 @@ fn resolver_three_uses_installed_release_facts_after_origin_removal() {
     assert_eq!(restored.resolved.spec.build, made.build);
 
     let error = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("unknown-release"),
         &host(false),
@@ -221,6 +221,49 @@ fn worker_ancestor_configuration_cannot_enter_a_saved_replay() {
     )
     .unwrap();
     assert_eq!(plans[0].project["crates"][0]["env"]["MESSAGE"], "captured");
+}
+
+#[test]
+fn manifests_above_the_replay_directory_are_never_read() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Run, &[], store.path());
+    // Every case replays at the same `worker/inner/source`, so its result compares exactly;
+    // `inner` and `worker` may each hold a manifest a walk above the snapshot would read,
+    // claim the replay with, or fail on.
+    let worker = tempfile::tempdir().unwrap();
+    let replayed = |inner: Option<&str>, worker_manifest: Option<&str>| {
+        for entry in std::fs::read_dir(worker.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }
+                .unwrap();
+        }
+        std::fs::create_dir(worker.path().join("inner")).unwrap();
+        if let Some(text) = inner {
+            std::fs::write(worker.path().join("inner/Cargo.toml"), text).unwrap();
+        }
+        if let Some(text) = worker_manifest {
+            std::fs::write(worker.path().join("Cargo.toml"), text).unwrap();
+        }
+        let replay = prepared(&made, store.path(), &worker.path().join("inner/source"));
+        let plans = blaze_spec::execution::programs(
+            &replay,
+            Path::new("/toolchain"),
+            &worker.path().join("artifacts"),
+        )
+        .unwrap();
+        let projects: Vec<_> = plans.iter().map(|plan| plan.project.to_string()).collect();
+        (replay.resolved.spec, replay.cwd, replay.environment, projects)
+    };
+    let empty = replayed(None, None);
+    assert_eq!(empty.0.build, made.build);
+    let broken = "[package\nnot a manifest";
+    let claiming = "[workspace]\nmembers = ['inner/source']\n";
+    for (inner, worker) in
+        [(Some(broken), None), (None, Some(claiming)), (Some(broken), Some(claiming))]
+    {
+        assert!(replayed(inner, worker) == empty, "{inner:?} {worker:?} replays otherwise");
+    }
 }
 
 #[test]
@@ -353,8 +396,8 @@ fn original_profile_inline_and_file_config_and_relative_env_are_reproduced() {
     let effective = replay.execution_environment().unwrap();
     assert_eq!(effective["MESSAGE"], "request override");
     assert_eq!(effective["ASSETS"], replay.cwd.join("assets").as_os_str());
-    let digest: String = made.digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    let record = std::fs::read(store.path().join(format!("replay-{digest}.cbor"))).unwrap();
+    let digest: String = made.record.unwrap().iter().map(|byte| format!("{byte:02x}")).collect();
+    let record = std::fs::read(store.path().join(digest)).unwrap();
     assert!(
         !record
             .windows(b"secret-that-must-not-persist".len())
@@ -405,7 +448,7 @@ fn altered_profile_and_request_fail_before_native_probes() {
             _ => given.units[0].features = blaze_wire::Set::new(vec!["invented".to_owned()]),
         }
         let error = prepare(
-            &given,
+            &Saved { build: given, record: made.record.unwrap() },
             store.path(),
             &worker.path().join(changed),
             &host(false),
@@ -421,6 +464,61 @@ fn altered_profile_and_request_fail_before_native_probes() {
 }
 
 #[test]
+fn a_replay_record_edited_in_place_is_refused_by_name() {
+    let f = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    let made = saved(&f, Subcommand::Run, &[], store.path());
+    let saved = Saved::of(&made).unwrap();
+    let name: String = saved.record.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = store.path().join(&name);
+    let original = std::fs::read(&path).unwrap();
+    let attempt = |at: &str| {
+        prepare(
+            &saved,
+            store.path(),
+            &worker.path().join(at),
+            &host(false),
+            StoreIdentity([9; 32]),
+            &NoProbe,
+            Some(&common::rust_release),
+            &Default::default(),
+        )
+    };
+    // One byte of the record changed: a word of the request, say. Nothing of it is read, and
+    // nothing is materialized.
+    let mut edited = original.clone();
+    let last = edited.len() - 1;
+    edited[last] ^= 1;
+    std::fs::write(&path, &edited).unwrap();
+    let error = attempt("edited").err().expect("an edited record must be refused");
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "the saved replay record {name} does not match its digest: it was changed after the save"
+        )
+    );
+    assert!(!worker.path().join("edited").exists());
+    // The saved file names the record, not the spec: a record under the old by-spec name is
+    // never looked for.
+    std::fs::remove_file(&path).unwrap();
+    let digest: String = made.digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(store.path().join(format!("replay-{digest}.cbor")), &original).unwrap();
+    let error = attempt("renamed").err().expect("a record not at its digest is missing");
+    assert_eq!(format!("{error}"), format!("the saved replay record {name} is missing"));
+    // The unedited record replays.
+    std::fs::write(&path, &original).unwrap();
+    let replay = prepared(&made, store.path(), &worker.path().join("unedited"));
+    assert_eq!(replay.resolved.spec.build, made.build);
+    // And the saved file round-trips through its canonical encoding.
+    let bytes = blaze_wire::encode(&saved);
+    assert_eq!(
+        blaze_wire::decode::<Saved>(&bytes, &blaze_wire::Limits::DOCUMENTED).unwrap(),
+        saved
+    );
+}
+
+#[test]
 fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
     let f = fixture();
     let store = tempfile::tempdir().unwrap();
@@ -428,7 +526,7 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
     let made = saved(&f, Subcommand::Build, &[], store.path());
     assert!(
         prepare(
-            &made.build,
+            &Saved::of(&made).unwrap(),
             store.path(),
             &worker.path().join("wrong-toolchain"),
             &host(false),
@@ -444,7 +542,7 @@ fn corrupt_record_and_toolchain_are_rejected_without_native_probes() {
     std::fs::write(store.path().join(name), b"corrupt manifest").unwrap();
     assert!(
         prepare(
-            &made.build,
+            &Saved::of(&made).unwrap(),
             store.path(),
             &worker.path().join("corrupt"),
             &host(false),
@@ -1097,8 +1195,8 @@ fn a_replay_knows_which_variables_the_requester_had_without_holding_their_names(
     // Set for the requester, though no spec carries it: the answer cannot be reproduced.
     assert!(replay.requester_had("PRIVATE_API_TOKEN"));
     assert!(replay.requester_had("PATH"));
-    let digest: String = made.digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    let record = std::fs::read(store.path().join(format!("replay-{digest}.cbor"))).unwrap();
+    let digest: String = made.record.unwrap().iter().map(|byte| format!("{byte:02x}")).collect();
+    let record = std::fs::read(store.path().join(digest)).unwrap();
     for held in [&b"PRIVATE_API_TOKEN"[..], b"secret-that-must-not-persist"] {
         assert!(!record.windows(held.len()).any(|window| window == held));
     }
@@ -1225,7 +1323,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
     let worker = tempfile::tempdir().unwrap();
     let before = probe.calls.get();
     let error = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("wrong"),
         &host,
@@ -1239,7 +1337,7 @@ fn persisted_prepare_has_no_historical_observation_and_authenticates_first() {
     assert!(format!("{error:#}").contains("toolchain differs"));
     assert_eq!(probe.calls.get(), before);
     let error = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("changed"),
         &host,

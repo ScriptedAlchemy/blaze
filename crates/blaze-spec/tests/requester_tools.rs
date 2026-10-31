@@ -14,7 +14,7 @@ use blaze_spec::{
     assemble::Host,
     flags::{Request, Subcommand},
     platform::{Probe, System},
-    replay::{capture, prepare},
+    replay::{Saved, capture, prepare},
 };
 use blaze_wire::StoreIdentity;
 use common::{Fixture, context};
@@ -209,7 +209,7 @@ fn a_cc_the_repository_puts_first_on_path_is_identified_and_never_run() {
     let worker = tempfile::tempdir().unwrap();
     let probe = Recording::default();
     let prepared = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("source"),
         &host,
@@ -256,7 +256,7 @@ fn an_empty_entry_of_the_workers_path_does_not_reach_into_the_snapshot() {
     let worker = tempfile::tempdir().unwrap();
     let probe = Recording::default();
     let prepared = prepare(
-        &made.build,
+        &Saved::of(&made).unwrap(),
         store.path(),
         &worker.path().join("source"),
         &host,

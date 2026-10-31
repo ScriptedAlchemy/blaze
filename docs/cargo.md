@@ -108,8 +108,9 @@ ra-jit cargo spec --out saved.cbor build --bin app
 ra-jit cargo spec --run saved.cbor
 ```
 
-Keep `saved.cbor` together with `saved.cbor.inputs/`. The latter contains verified source blobs
-and the original invocation recipe; the original checkout can then be removed. Replay requires the
+Keep `saved.cbor` together with `saved.cbor.inputs/`. The former holds the BuildSpec and the digest
+of the original invocation's recipe; the latter the verified source blobs and that recipe, each
+named by its content, so an edited one is refused. The original checkout can then be removed. Replay requires the
 same Blaze/toolchain identity and a matching execution platform. It reconstructs the source, resolves
 and checks the entire request, and compiles from an explicit source graph. Successful artifact paths
 are printed and recorded below `saved.cbor.outputs/`. Saving a `run` request also saves its program

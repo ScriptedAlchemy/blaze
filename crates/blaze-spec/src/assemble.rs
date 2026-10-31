@@ -118,6 +118,9 @@ pub struct Spec {
     pub front_end: FrontEndKey,
     /// What retention groups the spec by.
     pub config: ConfigKey,
+    /// The BLAKE3 of the canonical CBOR of the replay record a capture wrote to its store, which
+    /// the saved file names it by ([`crate::replay::Saved`]). None for a spec only assembled.
+    pub record: Option<Digest>,
 }
 
 impl Spec {
@@ -591,7 +594,15 @@ fn assemble_with_inputs(
         let front_end = front_end_key(&build, &flags, &host.triple);
         let config = config_key(&build, kind_of(command));
         Ok(Assembly {
-            spec: Spec { build, platform, platform_digest, digest, front_end, config },
+            spec: Spec {
+                build,
+                platform,
+                platform_digest,
+                digest,
+                front_end,
+                config,
+                record: None,
+            },
             inputs: opened.manifests.sources(),
             observation,
         })
