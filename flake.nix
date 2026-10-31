@@ -52,6 +52,8 @@
             pkgs.zlib
             pkgs.ncurses
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.strace
+            pkgs.procps
             # bevy's audio, input and windowing crates link these.
             pkgs.alsa-lib
             pkgs.udev

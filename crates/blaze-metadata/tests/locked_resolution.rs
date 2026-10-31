@@ -30,6 +30,7 @@ impl Drop for Scratch {
 fn metadata(root: &Path) -> anyhow::Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
     let home = root.join("home");
     let asked = Asked {
+        cargo_home: None,
         cwd: root,
         env: vec![("CARGO_HOME".into(), home.to_str().unwrap().into())],
         manifest_path: None,

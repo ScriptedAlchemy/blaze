@@ -366,11 +366,36 @@ pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
     .ok()?;
     let (_, rest) = manifest.split_once("\n[pkg.cargo]\nversion = \"")?;
     let (version, _) = rest.split_once('"')?;
-    // Cargo's package version (0.100.0) differs from its release version (1.99.0).
-    // The channel's rustc release supplies that prefix; Cargo supplies its own commit/date.
-    let release = toolchain.release.version.split_whitespace().next()?;
-    let (_, commit) = version.split_once(' ')?;
-    Some(format!("cargo {release} {commit}\n").into_bytes())
+    // Cargo 5f94df4789 src/version.rs maps the library's 0.N.P to the CLI's
+    // 1.(N-1).P. Use Cargo's own package facts even if rustc has another release.
+    let (package, commit) = version.split_once(' ')?;
+    let mut parts = package.split('.');
+    let major = parts.next()?.parse::<u8>().ok()?;
+    let minor = parts.next()?.parse::<u8>().ok()?.checked_sub(1)?;
+    let patch = parts.next()?.parse::<u8>().ok()?;
+    if major != 0 || parts.next().is_some() {
+        return None;
+    }
+    let commit = commit.strip_prefix('(')?.strip_suffix(')')?;
+    let (revision, date) = commit.split_once(' ')?;
+    if !(7..=40).contains(&revision.len()) || !revision.bytes().all(|it| it.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?;
+    let month = date_parts.next()?;
+    let day = date_parts.next()?;
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !year.bytes().all(|it| it.is_ascii_digit())
+        || !(1..=12).contains(&month.parse::<u8>().ok()?)
+        || !(1..=31).contains(&day.parse::<u8>().ok()?)
+        || date_parts.next().is_some()
+    {
+        return None;
+    }
+    Some(format!("cargo 1.{minor}.{patch} ({commit})\n").into_bytes())
 }
 
 fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {

@@ -71,21 +71,62 @@ pub(crate) fn env(command: &Command, declared: &[String]) -> Vec<(String, String
     env_from(command, declared, &passed, std::env::vars_os())
 }
 
+/// An owned command already contains its complete environment; the worker's variables
+/// are not inputs of a saved replay.
+pub(crate) fn env_exact(
+    command: &Command,
+    declared: &[String],
+    passed: &str,
+) -> Vec<(String, String)> {
+    env_from(command, declared, passed, std::iter::empty())
+}
+
+/// Retains the caller or saved base environment by the sandbox policy, then applies
+/// authoritative Cargo and configured overlays. An owned command's complete environment
+/// cannot express that distinction after `env_clear` and `envs` have flattened it.
+pub(crate) fn env_owned(
+    command: &Command,
+    declared: &[String],
+    passed: &str,
+    inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut env: BTreeMap<String, std::ffi::OsString> = inherited
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .filter(|(name, _)| keeps(name, declared, passed))
+        .collect();
+    for (name, value) in command.get_envs() {
+        let name = name.to_str().ok_or("sandbox environment name is not UTF-8")?;
+        match value {
+            Some(value) => _ = env.insert(name.to_owned(), value.to_owned()),
+            None => _ = env.remove(name),
+        }
+    }
+    env.into_iter()
+        .map(|(name, value)| {
+            value
+                .into_string()
+                .map(|value| (name.clone(), value))
+                .map_err(|_| format!("sandbox environment value `{name}` is not UTF-8"))
+        })
+        .collect()
+}
+
+fn keeps(name: &str, declared: &[String], passed: &str) -> bool {
+    KEPT.contains(&name)
+        || name.starts_with("LC_")
+        || passed.split(',').any(|it| it.trim() == name)
+        || declared.iter().any(|it| it == name)
+}
+
 fn env_from(
     command: &Command,
     declared: &[String],
     passed: &str,
     inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(String, String)> {
-    let kept = |name: &str| {
-        KEPT.contains(&name)
-            || name.starts_with("LC_")
-            || passed.split(',').any(|it| it.trim() == name)
-            || declared.iter().any(|it| it == name)
-    };
     let mut env: BTreeMap<String, String> = inherited
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(name, _)| kept(name))
+        .filter(|(name, _)| keeps(name, declared, passed))
         .collect();
     for (name, value) in command.get_envs() {
         let Some(name) = name.to_str() else { continue };
@@ -100,6 +141,72 @@ fn env_from(
 #[cfg(test)]
 mod env_tests {
     use super::*;
+
+    #[test]
+    fn owned_commands_do_not_inherit_worker_environment() {
+        let mut command = Command::new("owned-test");
+        command.env_clear();
+        assert!(env_exact(&command, &["PATH".into()], "HOME,USER").is_empty());
+        command.env("PATH", "recorded").env("DECLARED", "value");
+        assert_eq!(
+            env_exact(&command, &["DECLARED".into()], "PATH"),
+            [("DECLARED".into(), "value".into()), ("PATH".into(), "recorded".into())]
+        );
+    }
+
+    #[test]
+    fn owned_sandbox_filters_ambient_values_but_preserves_authoritative_overlays() {
+        let inherited = || {
+            [
+                ("PATH".into(), "recorded-path".into()),
+                ("T1_DECLARED".into(), "recorded-declaration".into()),
+                ("T1_PASSED".into(), "recorded-passed".into()),
+                ("RA_JIT_RUN_ID".into(), "volatile".into()),
+                ("UNDECLARED".into(), "hidden".into()),
+            ]
+            .into_iter()
+        };
+        let mut overlays = Command::new("owned-test");
+        overlays.env("CONFIGURED", "authoritative").env("T1_DECLARED", "override");
+        let env =
+            env_owned(&overlays, &["T1_DECLARED".into()], " T1_PASSED ", inherited()).unwrap();
+        assert_eq!(
+            env,
+            [
+                ("CONFIGURED".into(), "authoritative".into()),
+                ("PATH".into(), "recorded-path".into()),
+                ("T1_DECLARED".into(), "override".into()),
+                ("T1_PASSED".into(), "recorded-passed".into()),
+            ]
+        );
+        overlays.env_remove("T1_PASSED");
+        assert!(
+            !env_owned(&overlays, &[], "T1_PASSED", inherited())
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "T1_PASSED")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_sandbox_cannot_silently_drop_native_values() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let inherited = || {
+            [("T1_NATIVE".into(), std::ffi::OsString::from_vec(b"native-\xff".to_vec()))]
+                .into_iter()
+        };
+        let mut overlays = Command::new("owned-test");
+        assert_eq!(env_owned(&overlays, &[], "", inherited()).unwrap(), []);
+        assert!(env_owned(&overlays, &[], "T1_NATIVE", inherited()).is_err());
+        overlays.env("T1_NATIVE", "configured");
+        assert_eq!(
+            env_owned(&overlays, &[], "T1_NATIVE", inherited()).unwrap(),
+            [("T1_NATIVE".into(), "configured".into())]
+        );
+        overlays.env("T1_NATIVE", std::ffi::OsString::from_vec(b"configured-\xfe".to_vec()));
+        assert!(env_owned(&overlays, &[], "", inherited()).is_err());
+    }
 
     #[test]
     fn declared_inherited_poison_is_forwarded_and_command_override_wins() {
@@ -162,17 +269,29 @@ pub(crate) fn prepare(
     env: Vec<(String, String)>,
     names: &[String],
 ) -> anyhow::Result<()> {
+    prepare_at(&state.root, &test.package_dir, &test.executable, dir, command, env, names)
+}
+
+pub(crate) fn prepare_at(
+    root: &Path,
+    package_dir: &Path,
+    executable: &Path,
+    dir: &Path,
+    command: &mut Command,
+    env: Vec<(String, String)>,
+    names: &[String],
+) -> anyhow::Result<()> {
     let records = dir.join(RECORDS);
     _ = std::fs::remove_dir_all(&records);
     std::fs::create_dir_all(&records)?;
-    let mut overlays = vec![state.root.clone()];
-    if let Some(target) = target_of(dir).filter(|it| !it.starts_with(&state.root)) {
+    let mut overlays = vec![root.to_owned()];
+    if let Some(target) = target_of(dir).filter(|it| !it.starts_with(root)) {
         overlays.push(target.to_owned());
     }
-    let mut not_inputs = vec![test.executable.clone()];
-    not_inputs.extend(std::fs::canonicalize(&test.executable).ok());
+    let mut not_inputs = vec![executable.to_owned()];
+    not_inputs.extend(std::fs::canonicalize(executable).ok());
     let spec =
-        Spec { cwd: test.package_dir.clone(), env, overlays, record: Some(records), not_inputs };
+        Spec { cwd: package_dir.to_owned(), env, overlays, record: Some(records), not_inputs };
     let spec_file = dir.join("tests-sandbox.json");
     std::fs::write(&spec_file, serde_json::to_string(&spec)?)?;
     let exe = std::env::current_exe()?;

@@ -271,6 +271,7 @@ pub(crate) fn of(
         None => manifest.parent().context("the application manifest has no directory")?,
     };
     let asked = blaze_metadata::Asked {
+        cargo_home: None,
         cwd,
         env: env.clone().into_iter().collect(),
         manifest_path: Some(manifest),

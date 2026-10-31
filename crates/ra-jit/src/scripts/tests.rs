@@ -233,9 +233,11 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         assert_eq!(child[std::ffi::OsStr::new("SDKROOT")], root.join("unused-sdk").as_os_str());
     }
     let profile = runner.profile(package, UnitFor::new_normal(), &runner.kind(false));
-    let target = runner.unit(package, false, &profile, root.join("script"), Vec::new()).unwrap();
+    let target =
+        runner.unit(package, false, &profile, root.join("script"), Vec::new(), Vec::new()).unwrap();
     let profile = runner.profile(package, UnitFor::new_host(false), &runner.kind(true));
-    let host = runner.unit(package, true, &profile, root.join("script"), Vec::new()).unwrap();
+    let host =
+        runner.unit(package, true, &profile, root.join("script"), Vec::new(), Vec::new()).unwrap();
     assert_ne!(host.out_dir, target.out_dir, "host and target runs have separate records");
     assert_eq!(target.profile.opt_level, "1");
     assert_eq!(host.profile.opt_level, "0");
@@ -430,8 +432,9 @@ impl Fixture {
             if let Some(judged) = runner.begin(self.package, false, &profile)? {
                 return Ok(judged);
             }
-            let unit =
-                runner.unit(self.package, false, &profile, script.clone(), Vec::new()).unwrap();
+            let unit = runner
+                .unit(self.package, false, &profile, script.clone(), Vec::new(), Vec::new())
+                .unwrap();
             runner.judge(self.package, unit, (1, made), &[])
         })();
         // As `attempt` ends: the admission is let go unless the build waits.
@@ -904,6 +907,100 @@ fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
     assert!(!cfg.iter().any(|it| it == "panic=\"abort\""));
 }
 
+/// `build_script_with_dynamic_native_dependency`: a build dependency's script builds a shared
+/// library and names its directory with `rustc-link-search`; the script compiled with that
+/// library finds it when it runs, through the dynamic library path of its run.
+#[cfg(unix)]
+#[test]
+fn a_script_run_searches_where_the_scripts_of_its_build_dependencies_said() {
+    let base = dir("plugin-search");
+    let root = base.join("pkg");
+    std::fs::create_dir_all(root.join("native")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\npath = \"lib.rs\"\n\
+         [build-dependencies]\nnative = { path = \"native\" }\n[workspace]\nmembers = [\"native\"]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib.rs"), "").unwrap();
+    std::fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.join("native/Cargo.toml"),
+        "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("native/lib.rs"), "").unwrap();
+    std::fs::write(root.join("native/build.rs"), "fn main() {}\n").unwrap();
+    let pkg = Fixture::at(&base);
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let config = Config::load(&root, env.clone(), &[]).unwrap();
+    let cx = blaze_manifest::Context::new(config);
+    let manifest = root.join("Cargo.toml");
+    let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+    let mut metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let packages = metadata["packages"].as_array().unwrap();
+    let id = |name: &str| packages.iter().find(|p| p["name"] == name).unwrap()["id"].clone();
+    let app_id = id("app");
+    let native_id = id("native");
+    metadata["resolve"] = serde_json::json!({"root": app_id, "nodes": [
+        {"id": app_id, "dependencies": [native_id], "deps": [
+            {"name": "native", "pkg": native_id, "dep_kinds": [{"kind": "build", "target": null}]}
+        ], "features": []},
+        {"id": native_id, "dependencies": [], "deps": [], "features": []}
+    ]});
+    let manifest =
+        project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest)).unwrap();
+    let cargo = CargoWorkspace::new(
+        serde_json::from_value(metadata).unwrap(),
+        manifest,
+        ide_db::base_db::Env::default(),
+        false,
+    );
+    let app = cargo.packages().find(|&p| cargo[p].name == "app").unwrap();
+    let native = cargo.packages().find(|&p| cargo[p].name == "native").unwrap();
+    let asked = Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: None,
+        host_cargo: None,
+        shared: None,
+    };
+    let leases = Leases::default();
+    let mut runner = Runner::new(&leases, &cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+    let out = base.join("target/ra-jit/build-scripts/debug/build/native-0123/out");
+    runner.done.insert(
+        (native, true),
+        Ok(Arc::new(Done {
+            out_dir: out.clone(),
+            output: blaze_build_script::Output {
+                library_paths: vec![blaze_build_script::output::LibraryPath::External(out.clone())],
+                library_links: vec!["dylib=saved_dynamic".to_owned()],
+                ..Default::default()
+            },
+            fingerprint: 0,
+            generation: 0,
+            ran: true,
+            made: None,
+            links: None,
+        })),
+    );
+    let search = runner.plugin_search(app).unwrap();
+    assert_eq!(search, [out.clone()]);
+    assert_eq!(runner.plugin_search(native).unwrap(), Vec::<PathBuf>::new());
+    let profile = runner.profile(app, UnitFor::new_host(false), &CompileKind::Host);
+    let unit = runner.unit(app, true, &profile, PathBuf::new(), Vec::new(), search).unwrap();
+    assert_eq!(unit.dylib_search.plugin_search, [out]);
+    let target_dir: &Path = cargo.target_directory().as_ref();
+    assert_eq!(unit.dylib_search.plugin_root.as_deref(), Some(target_dir));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[cfg(unix)]
 #[test]
 fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
@@ -971,7 +1068,15 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
         (package, true),
         Ok(Arc::new(Done {
             out_dir: base.join("out"),
-            output: blaze_build_script::Output::default(),
+            // A script that links a library it built and renames its crate's `OUT_DIR`.
+            output: blaze_build_script::Output {
+                library_paths: vec![blaze_build_script::output::LibraryPath::External(
+                    base.join("out"),
+                )],
+                library_links: vec!["dylib=saved_dynamic".to_owned()],
+                env: vec![("OUT_DIR".to_owned(), "/native-script-marker".to_owned())],
+                ..Default::default()
+            },
             fingerprint: 0,
             generation: 0,
             ran: false,
@@ -982,11 +1087,24 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
     let mut leaves = Vec::new();
     let index = runner.add_source_leaf(package, &mut leaves).unwrap();
     assert!(leaves[index].cfg.iter().any(|cfg| cfg == "proc_macro"));
+    // The library's line carries what its script asked the linker for, as cargo has rustc's;
+    // where the script wrote is described apart from the variable it renamed.
+    let flags = &leaves[index].codegen_flags;
+    let out = base.join("out").display().to_string();
+    assert!(
+        flags.windows(2).any(|it| it == ["-L", out.as_str()])
+            && flags.windows(2).any(|it| it == ["-l", "dylib=saved_dynamic"]),
+        "{flags:?}"
+    );
+    assert_eq!(leaves[index].env["OUT_DIR"], "/native-script-marker");
+    assert_eq!(leaves[index].out_dir.as_deref(), Some(base.join("out").as_path()));
     let described = crate::cargo::own_script::planned_description(&pkg.sysroot, leaves);
     let described: serde_json::Value = serde_json::from_str(&described).unwrap();
     assert!(
         described["crates"][index]["cfg"].as_array().unwrap().iter().any(|cfg| cfg == "proc_macro")
     );
+    assert_eq!(described["crates"][index]["blaze_build_script_out_dir"], serde_json::json!(out));
+    assert_eq!(described["crates"][index]["env"]["OUT_DIR"], "/native-script-marker");
     let mut crates = Vec::new();
     runner.add_source(package, &mut crates, &mut FxHashMap::default()).unwrap();
     let root = crates.iter().find(|krate| krate.name == "macros").unwrap();
@@ -1210,7 +1328,9 @@ fn a_package_built_for_the_host_and_the_target_alike_has_one_run() {
             Runner::new(&leases, &pkg.cargo, asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
         let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
         let lib = runner.profile(pkg.package, unit_for, &runner.kind(for_host));
-        let unit = runner.unit(pkg.package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        let unit = runner
+            .unit(pkg.package, for_host, &lib, PathBuf::new(), Vec::new(), Vec::new())
+            .unwrap();
         (unit.out_dir, unit.profile.debuginfo)
     };
     let shared = asked(Some(&alike));
@@ -1324,7 +1444,8 @@ fn runs_given_metadata_by_different_runs_of_a_links_dependency_are_two() {
         let package = cargo.packages().find(|&it| cargo[it].id.repr == parent).unwrap();
         let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
         let lib = runner.profile(package, unit_for, &runner.kind(for_host));
-        let unit = runner.unit(package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        let unit =
+            runner.unit(package, for_host, &lib, PathBuf::new(), Vec::new(), Vec::new()).unwrap();
         (unit.out_dir, unit.profile.debuginfo)
     };
     // `shared_with_the_host` has `parent` and not `native`, whose features differ.

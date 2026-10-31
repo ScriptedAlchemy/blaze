@@ -520,6 +520,7 @@ mod tests {
             units: None,
             runtime: None,
             bindings: None,
+            naming: None,
         };
         let described = serde_json::json!({"crates": [{"env": {"INPUT": "one"}}]}).to_string();
         let first = own_script::with_mode(described.clone(), mode).unwrap();

@@ -1,0 +1,250 @@
+{
+ "runs": [
+  {
+   "args": [
+    "build",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--no-default-features"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "extra"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "opt"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "weak"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "weak",
+    "-F",
+    "opt"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--features",
+    "both"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--features",
+    "opt,extra"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--no-default-features",
+    "-F",
+    "std"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "shared/on-extra"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "macros/id"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "-F",
+    "nonexistent"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "-F",
+    "extra"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "shared"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "shared",
+    "-F",
+    "on-macro"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "macros"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "--no-default-features"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "-F",
+    "opt"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "app",
+    "-F",
+    "weak"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "app",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "app",
+    "--release"
+   ]
+  }
+ ]
+}

@@ -689,7 +689,20 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             0,
         );
         let location = marks.debug.builder.create_debug_location(self.context, 0, 0, scope, None);
-        marks.debug.builder.insert_declare_at_end(alloca, Some(variable), None, location, block);
+        let expression = marks.debug.builder.create_expression(Vec::new());
+        // LLVM 20 returns a debug record here. Inkwell 0.9 incorrectly treats it as
+        // an instruction; use the record API with this module's metadata and block.
+        use inkwell::{llvm_sys::debuginfo, values::AsValueRef as _};
+        unsafe {
+            debuginfo::LLVMDIBuilderInsertDeclareRecordAtEnd(
+                marks.debug.builder.as_mut_ptr(),
+                alloca.as_value_ref(),
+                variable.as_mut_ptr(),
+                expression.as_mut_ptr(),
+                location.as_mut_ptr(),
+                block.as_mut_ptr(),
+            );
+        }
         Ok(())
     }
 

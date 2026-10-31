@@ -480,9 +480,26 @@ impl<'a> Reader<'a> {
 
     /// A text string.
     pub fn text(&mut self) -> Result<&'a str, Error> {
+        self.text_with_limit(u64::from(self.limits.string))
+    }
+
+    /// Escaped logical paths use the negotiated message budget, not the general string
+    /// budget: escaping valid native bytes can triple their length.
+    pub fn path_text(&mut self) -> Result<&'a str, Error> {
+        self.text_with_limit(u64::from(self.limits.request))
+    }
+
+    /// Environment native bytes are bounded by message size, not the large blob limit.
+    pub fn input_bytes(&mut self) -> Result<&'a [u8], Error> {
+        self.scalar()?;
+        let len = self.length(2, "input bytes", u64::from(self.limits.request))?;
+        self.take(len)
+    }
+
+    fn text_with_limit(&mut self, limit: u64) -> Result<&'a str, Error> {
         self.scalar()?;
         let at = self.pos;
-        let len = self.length(3, "text string", u64::from(self.limits.string))?;
+        let len = self.length(3, "text string", limit)?;
         let bytes = self.take(len)?;
         std::str::from_utf8(bytes).map_err(|_| self.err_at(ErrorKind::BadUtf8, at))
     }
@@ -728,6 +745,8 @@ pub enum ErrorKind {
     },
     /// A text string that is not UTF-8.
     BadUtf8,
+    /// A logical source-relative path that is not normalized or escapes its root.
+    InvalidPath,
     /// Bytes after the one item a message is.
     TrailingBytes,
     /// Nesting past [`MAX_DEPTH`].
@@ -755,6 +774,7 @@ impl ErrorKind {
             ErrorKind::OversizeItem { .. } => "oversize item",
             ErrorKind::UnexpectedType { .. } => "unexpected type",
             ErrorKind::BadUtf8 => "text that is not UTF-8",
+            ErrorKind::InvalidPath => "invalid source-relative path",
             ErrorKind::TrailingBytes => "bytes after the item",
             ErrorKind::TooDeep => "nesting too deep",
         }
@@ -830,20 +850,23 @@ pub fn validate(bytes: &[u8], limits: &Limits) -> Result<(), Error> {
 
 /// Checks the bytes and then reads them as `T`, so a key the type does not have is refused too.
 ///
-/// This is [`decode`]: the validator's pass first, then the schema's, so a message the validator
-/// refuses is never read as a value.
+/// This is [`decode`]: a bounded structural pass, then each field's schema-specific budgets.
+/// Logical paths use the message budget; ordinary strings keep [`Limits::string`].
 pub fn validate_as<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
     decode(bytes, limits)
 }
 
 /// Reads one value of `T` from canonical CBOR, after the validator's pass over the same bytes.
 ///
-/// The pass is what makes the decoder's promise hold: the size limits ([`Limits::request`], the
-/// blob and string limits), the depth rule ([`MAX_DEPTH`]) and the canonical form are all
-/// [`validate`]'s, checked before a schema decoder sees a byte, so [`decode`] never accepts a
-/// message [`validate`] refuses.
+/// Message size, depth and canonical form are checked before schema decoding. The structural
+/// pass allows text within the message budget, because it cannot identify SourcePath.
+/// The typed pass applies ordinary string and logical path budgets independently.
 pub fn decode<T: Wire>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
-    validate(bytes, limits)?;
+    // The structural pass cannot know which text is a logical path. Bound it by
+    // request bytes; typed fields then enforce their own budgets. Bytes-only
+    // validate keeps the ordinary text-string budget.
+    let structural = Limits { string: limits.request, ..*limits };
+    validate(bytes, &structural)?;
     let mut r = Reader::new(bytes, limits);
     let value = T::decode(&mut r)?;
     r.finish()?;
@@ -1144,7 +1167,7 @@ impl Wire for Bytes {
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
-        $name:ident { $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
+        $name:ident { $(validate $validator:path,)? $(sample $repair:path,)? $(lookup [$($lookup:literal),* $(,)?],)? $($key:literal => $field:ident : $ty:ty),* $(,)? }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1179,7 +1202,9 @@ macro_rules! wire_struct {
                     };
                 )*
                 r.map_end()?;
-                Ok($name { $($field),* })
+                let value = $name { $($field),* };
+                $($validator(&value)?;)?
+                Ok(value)
             }
         }
 
@@ -1189,9 +1214,12 @@ macro_rules! wire_struct {
 
         impl $crate::vectors::Sample for $name {
             fn sample(g: &mut $crate::vectors::Gen) -> Self {
-                $name {
+                #[allow(unused_mut)]
+                let mut value = $name {
                     $($field: $crate::vectors::Sample::sample(g)),*
-                }
+                };
+                $($repair(&mut value);)?
+                value
             }
         }
     };

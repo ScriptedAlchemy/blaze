@@ -53,6 +53,8 @@ const FAILED: i32 = 101;
 
 /// A run of the examples of one library, as cargo asks rustdoc for it.
 pub(crate) struct Asked {
+    /// Saved replay uses the owned compiler exclusively.
+    admission: Option<serde_json::Value>,
     crate_name: String,
     /// The root file of the library, as cargo names it from the package's directory.
     source: PathBuf,
@@ -82,6 +84,7 @@ struct Wanted {
     exact: bool,
     /// libtest's `--format=terse`: a character for each example that does not fail.
     terse: bool,
+    ignored: u8,
 }
 
 impl Wanted {
@@ -98,6 +101,9 @@ impl Wanted {
             let mut value = || joined.or_else(|| args.next().map(String::as_str));
             match flag {
                 "--exact" => wanted.exact = true,
+                "--ignored" => wanted.ignored = 1,
+                "--include-ignored" => wanted.ignored = 2,
+                "--nocapture" | "--show-output" => {}
                 "--skip" => wanted.skipped.extend(value().map(str::to_owned)),
                 // The examples run as many at a time as there are processors either way.
                 "--test-threads" => _ = value(),
@@ -125,6 +131,123 @@ impl Wanted {
         let is = |it: &String| if self.exact { name == it } else { name.contains(it.as_str()) };
         (self.filters.is_empty() || self.filters.iter().any(is)) && !self.skipped.iter().any(is)
     }
+}
+
+fn documented_root(project: &serde_json::Value) -> anyhow::Result<&serde_json::Value> {
+    let crates = project["crates"].as_array().context("no doctest crates")?;
+    if let Some(naming) = project.get("blaze_compiler_source_root") {
+        crate::compiler_json::source_root(project)?;
+        let unit =
+            u32::try_from(naming["unit"].as_u64().context("source naming has no root unit")?)?;
+        let mut roots =
+            crates.iter().filter(|krate| krate["blaze_native_unit"] == serde_json::json!(unit));
+        let root = roots.next().context("documented root unit is absent")?;
+        anyhow::ensure!(roots.next().is_none(), "documented root unit is ambiguous");
+        Ok(root)
+    } else {
+        crates
+            .iter()
+            .find(|krate| krate["is_workspace_member"] == true)
+            .context("no documented library")
+    }
+}
+
+/// Run examples from a validated compiler description. This path never invokes
+/// Cargo, rustc or rustdoc, including on invalid examples or compilation failures.
+/// The directory a saved run's doctests are named from, as cargo names them: cargo runs
+/// rustdoc in the workspace root and gives it the file's path from there (`a/src/lib.rs - item
+/// (line 1)` for a member `a`), and the examples themselves run in the package's directory
+/// (`--test-run-directory`). The description names the workspace root as the source naming
+/// root; one without it names from the package's directory, `run_in`.
+fn named_from(project: &serde_json::Value, run_in: &Path) -> anyhow::Result<PathBuf> {
+    Ok(match crate::compiler_json::source_root(project)? {
+        Some(root) => root.into(),
+        None => run_in.to_owned(),
+    })
+}
+
+pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
+    let json = crate::compiler_json::read(project)?;
+    let bytes: Vec<u8> = serde_json::from_value(json["blaze_spec_doctest"].clone())?;
+    let requested: blaze_wire::RunSpec =
+        blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?;
+    let root = documented_root(&json)?;
+    let source = PathBuf::from(root["root_module"].as_str().context("no documented source")?);
+    let manifest = Path::new(root["build"]["build_file"].as_str().context("no doctest manifest")?);
+    let run_in = manifest.parent().context("no doctest package")?.to_owned();
+    let cwd = named_from(&json, &run_in)?;
+    let env = match crate::cargo::spec::runtime_environment(&json)? {
+        Some(env) => env,
+        None => {
+            let mut env: std::collections::BTreeMap<OsString, OsString> =
+                std::env::vars_os().collect();
+            let crate_env: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(root["env"].clone())?;
+            env.extend(crate_env.into_iter().map(|(name, value)| (name.into(), value.into())));
+            env
+        }
+    };
+    let mut wanted = Wanted::parse(&requested.harness_args).map_err(anyhow::Error::msg)?;
+    wanted.filters.extend(requested.filters);
+    wanted.exact = requested.exact;
+    wanted.skipped = requested.skip;
+    wanted.ignored = requested.ignored;
+    let dir = project.parent().context("doctest project has no directory")?.join("examples");
+    std::fs::create_dir_all(&dir)?;
+    let asked = Asked {
+        admission: Some(json.clone()),
+        crate_name: crate_name.to_owned(),
+        source,
+        edition: root["edition"].as_str().context("no doctest edition")?.to_owned(),
+        cwd,
+        run_in,
+        env: env.into_iter().collect(),
+        rustc_args: Vec::new(),
+        target: None,
+        features: Vec::new(),
+        build: None,
+        wanted,
+        dir,
+    };
+    let mut args = crate::Args::parse(
+        [
+            project.to_str().context("non-UTF-8 doctest project")?.to_owned(),
+            "--crate".into(),
+            asked.root_file(),
+            "--out".into(),
+            asked.object().to_str().context("non-UTF-8 doctest artifact")?.to_owned(),
+        ]
+        .into_iter(),
+    )?;
+    crate::process_wide();
+    crate::memory::bound_builds()?;
+    hir_ty_codegen::links_own();
+    let (mut db, _vfs, checkouts) = crate::load(
+        &[project],
+        &crate::cargo_config(&args),
+        crate::load_config(),
+        args.selection.clone(),
+        None,
+        None,
+        args.project_origin,
+    )?;
+    ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    let parts = checkouts.parts(project)?;
+    args.checkout = parts.root;
+    args.base = parts.base;
+    args.members = parts.members;
+    args.debug = parts.debug;
+    args.lints_capped = parts.lints_capped;
+    let table = crate::SymbolTable::load(&[], &args.checkout)?;
+    let listed = crate::Listed::default();
+    crate::resolve_crates(&db, &args, crate::cores())?;
+    let krate =
+        *crate::crates_named(&db, &args.krate, &args)?.first().context("no documented crate")?;
+    let sysroot = json["sysroot"].as_str().map(Path::new);
+    let building = Building { table: &table, args: &args, listed: &listed, sysroot };
+    let target = json["blaze_spec_target"].as_str().context("no doctest target")?;
+    let code = run(&mut db, &building, &asked, krate, target)?;
+    Ok(code)
 }
 
 /// The flags of rustdoc that take a value and are passed on to rustc for every example.
@@ -212,6 +335,7 @@ impl Asked {
             None => None,
         };
         Ok(Asked {
+            admission: None,
             crate_name: crate_name.ok_or("rustdoc is not told the name of the crate")?,
             source: source.ok_or("rustdoc is given no source file")?,
             edition,
@@ -609,6 +733,51 @@ mod recording_tests {
         process::Native,
     };
 
+    /// `workspace-doctests` in saved_spec.py: a member's doctest is `a/src/lib.rs - saved_a
+    /// (line 1)` under cargo, named from the workspace root rustdoc runs in, not the package.
+    #[test]
+    fn saved_doctests_are_named_from_the_workspace_root() {
+        let mut project = serde_json::json!({"compiler_mode":true,
+            "blaze_compiler_source_root":{"version":1,"path":"/workspace","unit":0},
+            "crates":[{"display_name":"saved_a","blaze_native_unit":0,"is_workspace_member":true}]});
+        let run_in = Path::new("/workspace/a");
+        let asked = Asked {
+            admission: None,
+            crate_name: "saved_a".into(),
+            source: "/workspace/a/src/lib.rs".into(),
+            edition: "2021".into(),
+            cwd: named_from(&project, run_in).unwrap(),
+            run_in: run_in.to_owned(),
+            env: Vec::new(),
+            rustc_args: Vec::new(),
+            target: None,
+            features: Vec::new(),
+            build: None,
+            wanted: Wanted::default(),
+            dir: "/scratch".into(),
+        };
+        assert_eq!(asked.shown(Path::new("/workspace/a/src/lib.rs")), "a/src/lib.rs");
+        project.as_object_mut().unwrap().remove("blaze_compiler_source_root");
+        assert_eq!(named_from(&project, run_in).unwrap(), run_in);
+    }
+
+    #[test]
+    fn documented_root_uses_explicit_unit_not_first_workspace_member() {
+        let mut project = serde_json::json!({"compiler_mode":true,
+            "blaze_compiler_source_root":{"version":1,"path":"/workspace","unit":7},
+            "crates":[{"display_name":"binary","blaze_native_unit":2,"is_workspace_member":true},
+                {"display_name":"library","blaze_native_unit":7,"is_workspace_member":true}]});
+        assert_eq!(documented_root(&project).unwrap()["display_name"], "library");
+        project["blaze_compiler_source_root"]["unit"] = serde_json::json!(99);
+        assert!(documented_root(&project).is_err());
+        project["blaze_compiler_source_root"]["unit"] = serde_json::json!(u64::MAX);
+        assert!(documented_root(&project).is_err());
+        project["blaze_compiler_source_root"].as_object_mut().unwrap().remove("unit");
+        assert!(documented_root(&project).is_err());
+        project.as_object_mut().unwrap().remove("blaze_compiler_source_root");
+        assert_eq!(documented_root(&project).unwrap()["display_name"], "binary");
+    }
+
     #[cfg(unix)]
     fn non_unicode() -> OsString {
         use std::os::unix::ffi::OsStringExt as _;
@@ -968,6 +1137,10 @@ struct Test {
 enum Ours {
     /// Nothing, the example being only to compile, and rust-analyzer finds no error in it.
     Checked,
+    /// Frontend diagnostics of an example marked compile_fail.
+    Rejected(Vec<String>),
+    /// An owned compile or admission failure, never a reason to invoke rustc.
+    Failed(String),
     /// Its object and the standard library's unit, to link in `dir` with `line`. A `kept`
     /// directory is the memo's, where the program stays for the next run.
     Compiled { objects: [PathBuf; 2], dir: PathBuf, line: crate::link::Line, kept: bool },
@@ -981,7 +1154,7 @@ impl Ours {
         let (objects, dir, line, kept) = match self {
             Ours::Compiled { objects, dir, line, kept } => (objects, dir, line, *kept),
             Ours::Linked(binary) => return Ok(binary.clone()),
-            Ours::Checked => anyhow::bail!("nothing to link"),
+            Ours::Checked | Ours::Rejected(_) | Ours::Failed(_) => anyhow::bail!("nothing to link"),
         };
         let binary = dir.join("rust_out");
         let linked = line.link(&[&objects[0], &objects[1]], &binary).and_then(|_| {
@@ -1068,12 +1241,33 @@ impl Test {
         target: &str,
         counted: &Counted,
     ) -> anyhow::Result<Ended> {
-        if self.is_ignored(target) {
+        if self.is_ignored(target) && asked.wanted.ignored == 0 {
             return Ok(Ended::Ignored);
         }
         let marks = &self.marks;
         let linked = match ours {
+            Some(Ours::Failed(why)) => return Ok(Ended::Failed(why.clone())),
+            Some(Ours::Rejected(codes)) => {
+                counted.ra_jit.fetch_add(1, Ordering::Relaxed);
+                let missing: Vec<_> =
+                    marks.error_codes.iter().filter(|code| !codes.contains(code)).collect();
+                return Ok(if codes.is_empty() {
+                    Ended::Failed(
+                        "Test compiled successfully, but it's marked `compile_fail`.".into(),
+                    )
+                } else if missing.is_empty() {
+                    Ended::Passed
+                } else {
+                    Ended::Failed(format!(
+                        "Some expected error codes were not found: {missing:?}; observed {codes:?}"
+                    ))
+                });
+            }
             Some(Ours::Checked) => {
+                counted.ra_jit.fetch_add(1, Ordering::Relaxed);
+                return Ok(Ended::Passed);
+            }
+            Some(_) if asked.admission.is_some() && marks.no_run => {
                 counted.ra_jit.fetch_add(1, Ordering::Relaxed);
                 return Ok(Ended::Passed);
             }
@@ -1087,6 +1281,7 @@ impl Test {
                 counted.ra_jit.fetch_add(1, Ordering::Relaxed);
                 binary
             }
+            Err(why) if asked.admission.is_some() => return Err(why),
             Err(_) => {
                 counted.rustc.fetch_add(1, Ordering::Relaxed);
                 match self.compiled(asked, dir)? {
@@ -1228,7 +1423,7 @@ fn document(db: &mut RootDatabase, krate: hir::Crate) {
 
 /// The examples of the library, each as the program rustdoc makes of it, and how many the
 /// arguments leave out.
-fn tests(db: &RootDatabase, asked: &Asked, krate: hir::Crate) -> (Vec<Test>, usize) {
+fn tests(db: &RootDatabase, asked: &Asked, krate: hir::Crate, target: &str) -> (Vec<Test>, usize) {
     let of_the_crate = OfTheCrate::read(db, krate);
     let frame = Frame {
         crate_name: &asked.crate_name,
@@ -1239,6 +1434,9 @@ fn tests(db: &RootDatabase, asked: &Asked, krate: hir::Crate) -> (Vec<Test>, usi
         extract::examples(db, krate).into_iter().map(|it| Test::of(asked, it, &frame)).collect();
     let all = tests.len();
     tests.retain(|it| asked.wanted.has(&it.name));
+    if asked.wanted.ignored == 1 {
+        tests.retain(|it| it.is_ignored(target));
+    }
     tests.sort_by(|a, b| a.name.cmp(&b.name));
     let left_out = all - tests.len();
     (tests, left_out)
@@ -1250,6 +1448,8 @@ enum Plan {
     Rustc,
     /// Not at all: it is only to compile, and rust-analyzer finds no error in it.
     Checked,
+    Rejected(Vec<String>),
+    Failed(String),
     /// By ra-jit, from its crate of this name.
     Ours(String),
 }
@@ -1267,7 +1467,10 @@ fn plan(
 ) -> (Vec<Plan>, Option<PathBuf>) {
     let mut plans: Vec<Plan> = tests.iter().map(|_| Plan::Rustc).collect();
     let wanted: Vec<usize> = (0..tests.len())
-        .filter(|&at| !tests[at].is_ignored(target) && !tests[at].marks.compile_fail)
+        .filter(|&at| {
+            (!tests[at].is_ignored(target) || asked.wanted.ignored != 0)
+                && (asked.admission.is_some() || !tests[at].marks.compile_fail)
+        })
         .collect();
     if wanted.is_empty() {
         return (plans, None);
@@ -1287,6 +1490,17 @@ fn plan(
     for (at, example) in add_crates(db, asked, krate, tests, &wanted) {
         let test = &tests[at];
         let source = &test.program.source;
+        if asked.admission.is_some() {
+            if let Err(why) = admit_example(db, asked, &example.name) {
+                plans[at] = Plan::Failed(format!("{why:#}"));
+                continue;
+            }
+            if test.marks.compile_fail {
+                plans[at] =
+                    Plan::Rejected(error_codes(db, example.root_file, denies_lints(source)));
+                continue;
+            }
+        }
         let names = |name: &String| {
             source.contains(&format!("{name}::")) || source.contains(&format!("crate {name}"))
         };
@@ -1297,7 +1511,7 @@ fn plan(
             );
         } else if has_errors(db, example.root_file, denies_lints(source)) {
             eprintln!("ra-jit: {} is rustc's: rust-analyzer finds an error in it", test.name);
-        } else if test.marks.no_run {
+        } else if test.marks.no_run && asked.admission.is_none() {
             plans[at] = Plan::Checked;
         } else {
             plans[at] = Plan::Ours(example.name);
@@ -1312,16 +1526,27 @@ fn plan(
 /// `#![doc(test(attr(deny(warnings))))]` has it do, a warning or a use of something
 /// deprecated is one too: rustc has lints rust-analyzer does not.
 fn has_errors(db: &RootDatabase, file: vfs::FileId, denies_lints: bool) -> bool {
+    !error_codes(db, file, denies_lints).is_empty()
+}
+
+fn error_codes(db: &RootDatabase, file: vfs::FileId, denies_lints: bool) -> Vec<String> {
     use ide_db::Severity;
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let resolve = ide_db::assists::AssistResolveStrategy::None;
     hir::attach_db(db, || {
         let syntax = ide_diagnostics::syntax_diagnostics(db, &config, file);
         let semantic = ide_diagnostics::semantic_diagnostics(db, &config, &resolve, file);
-        let mut found = syntax.into_iter().chain(semantic);
-        found.any(|it| {
-            it.severity == Severity::Error || denies_lints && it.severity == Severity::Warning
-        }) || denies_lints && uses_deprecated(db, file)
+        let found = syntax.into_iter().chain(semantic);
+        let mut codes: Vec<_> = found
+            .filter(|it| {
+                it.severity == Severity::Error || denies_lints && it.severity == Severity::Warning
+            })
+            .map(|it| it.code.as_str().to_owned())
+            .collect();
+        if denies_lints && uses_deprecated(db, file) {
+            codes.push("deprecated".into());
+        }
+        codes
     })
 }
 
@@ -1445,6 +1670,7 @@ fn add_crates(
         };
         let extra = ExtraCrateData {
             blaze_native_unit: library.extra_data(db).blaze_native_unit,
+            blaze_build_script_out_dir: library.extra_data(db).blaze_build_script_out_dir.clone(),
             version: None,
             display_name: Some(CrateDisplayName::from_canonical_name(&name)),
             potential_cfg_options: None,
@@ -1506,6 +1732,7 @@ fn compile(
         if let Some(unset) = built.unset {
             anyhow::bail!(unset);
         }
+        admit_example(db, asked, name)?;
         let example = crate::crates_named(db, name, &args)?;
         crate::link::Line::of(db, &example, building.sysroot, false)
     };
@@ -1520,6 +1747,29 @@ fn compile(
             Err(why)
         }
     }
+}
+
+fn admit_example(db: &RootDatabase, asked: &Asked, name: &str) -> anyhow::Result<()> {
+    let Some(project) = &asked.admission else { return Ok(()) };
+    let root = hir::Crate::all(db)
+        .into_iter()
+        .find(|krate| {
+            krate.display_name(db).is_some_and(|display| display.crate_name().as_str() == name)
+        })
+        .context("no generated doctest crate")?;
+    let root: ide_db::base_db::Crate = root.into();
+    let crates: Vec<_> = std::iter::once(root)
+        .chain(root.transitive_deps(db))
+        .map(hir::Crate::from)
+        .filter(|krate| !krate.origin(db).is_lang())
+        .collect();
+    let trace = crate::dep_info::ReplayTrace::from_crates(
+        db,
+        &crates,
+        name,
+        crate::dep_info::replay_key(project)?,
+    )?;
+    crate::cargo::spec::admit_trace(&trace, project)
 }
 
 /// What the examples are built with: the run of ra-jit that loaded the library, with nothing
@@ -1584,7 +1834,7 @@ fn run(
     let library: ide_db::base_db::Crate = krate.into();
     let cfg = library.cfg_options(db).clone();
     document(db, krate);
-    let (tests, left_out) = hir::attach_db(db, || tests(db, asked, krate));
+    let (tests, left_out) = hir::attach_db(db, || tests(db, asked, krate, target));
     library.set_cfg_options(db).to(cfg);
     let (plans, unit) = plan(db, building, asked, krate, &tests, target);
     let db: &RootDatabase = db;
@@ -1642,6 +1892,8 @@ fn run(
             match plan {
                 Plan::Rustc => _ = ready.send((at, None)),
                 Plan::Checked => _ = ready.send((at, Some(Ours::Checked))),
+                Plan::Rejected(codes) => _ = ready.send((at, Some(Ours::Rejected(codes.clone())))),
+                Plan::Failed(why) => _ = ready.send((at, Some(Ours::Failed(why.clone())))),
                 Plan::Ours(_) => {}
             }
         }
@@ -1663,7 +1915,14 @@ fn run(
                             if let Ok(Ours::Linked(_)) = &compiled {
                                 counted.remembered.fetch_add(1, Ordering::Relaxed);
                             }
-                            _ = ready.send((at, compiled.ok()));
+                            let compiled = match compiled {
+                                Ok(ours) => Some(ours),
+                                Err(why) if asked.admission.is_some() => {
+                                    Some(Ours::Failed(format!("{why:#}")))
+                                }
+                                Err(_) => None,
+                            };
+                            _ = ready.send((at, compiled));
                         }
                     })
                 })

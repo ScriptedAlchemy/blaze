@@ -259,6 +259,7 @@ mod tests {
             assert_eq!(matches!(chosen, Chosen::Given(_)), branch == "given");
             let cwd = std::env::current_dir().unwrap();
             let json = blaze_metadata::metadata(&blaze_metadata::Asked {
+                cargo_home: None,
                 cwd: &cwd,
                 env: std::env::vars().collect(),
                 manifest_path: None,

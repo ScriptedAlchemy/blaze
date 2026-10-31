@@ -165,8 +165,7 @@ fn a_tag_is_refused() {
 
 #[test]
 fn an_unknown_key_is_refused() {
-    // `{0: ".", 1: ".", 2: null, 3: null, 4: ["", "", <32 zeros>], 5: ".", 6: 0}`: key 6 is not
-    // `ExecPlatform`'s.
+    // `ExecPlatform`'s ten keys and then `10: 0`: key 10 is not `ExecPlatform`'s.
     let mut bytes = Vec::new();
     let v = blaze_wire::ExecPlatform {
         triple: ".".into(),
@@ -175,19 +174,23 @@ fn an_unknown_key_is_refused() {
         libc: None,
         linker: (String::new(), String::new(), [0u8; 32]),
         cpu: ".".into(),
+        cc: None,
+        cxx: None,
+        ar: None,
+        native_root: None,
     };
     bytes.extend_from_slice(&encode(&v));
-    // Replace the map's six keys with seven: a map of six is `a6`.
-    bytes[0] = 0xa7;
-    bytes.extend_from_slice(&[0x06, 0x00]);
+    // Replace the map's ten keys with eleven: a map of ten is `aa`.
+    bytes[0] = 0xab;
+    bytes.extend_from_slice(&[0x0a, 0x00]);
     let (named, kind) = refused_as::<blaze_wire::ExecPlatform>(&bytes);
     assert_eq!(named, "unknown key");
-    assert_eq!(kind, ErrorKind::UnknownKey(6));
+    assert_eq!(kind, ErrorKind::UnknownKey(10));
 }
 
 #[test]
 fn a_missing_key_is_refused() {
-    // `ExecPlatform` without key 5: the map has five keys.
+    // `ExecPlatform` without key 9: the map has nine keys.
     let v = blaze_wire::ExecPlatform {
         triple: ".".into(),
         os: ".".into(),
@@ -195,14 +198,18 @@ fn a_missing_key_is_refused() {
         libc: None,
         linker: (String::new(), String::new(), [0u8; 32]),
         cpu: ".".into(),
+        cc: None,
+        cxx: None,
+        ar: None,
+        native_root: None,
     };
     let mut bytes = encode(&v);
-    // The last field is key 5, one byte, and its value `"."`, two, so drop three and count five.
-    bytes.truncate(bytes.len() - 3);
-    bytes[0] = 0xa5;
+    // The last field is key 9, one byte, and its value `null`, one, so drop two and count nine.
+    bytes.truncate(bytes.len() - 2);
+    bytes[0] = 0xa9;
     let (named, kind) = refused_as::<blaze_wire::ExecPlatform>(&bytes);
     assert_eq!(named, "missing key");
-    assert_eq!(kind, ErrorKind::MissingKey(5));
+    assert_eq!(kind, ErrorKind::MissingKey(9));
 }
 
 #[test]

@@ -87,8 +87,12 @@ def main():
         invoked = work / "product-tool-invocations"
         for tool in ("cargo", "rustc", "rustdoc"):
             path = blockers / tool
-            path.write_text(f'#!/bin/sh\necho {tool} >> "{invoked}"\nexit 97\n')
+            path.write_text(f'#!{shutil.which("sh")}\necho {tool} >> "{invoked}"\nexit 97\n')
             path.chmod(0o755)
+        for tool in ("cargo", "rustc", "rustdoc"):
+            assert subprocess.run([str(blockers / tool)]).returncode == 97
+        assert invoked.read_text().splitlines() == ["cargo", "rustc", "rustdoc"]
+        invoked.unlink()
         base = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO_", "RUST"))}
         base["RUSTUP_TOOLCHAIN"] = "1.99.0"
 
@@ -123,6 +127,34 @@ def main():
             assert not invoked.exists(), invoked.read_text() if invoked.exists() else ""
             passed += 1
             print(f"PASS {roots[0].name} {' '.join(flags)} success={success}")
+
+        def run_graph_pair(roots):
+            nonlocal passed
+            rustc = shutil.which("rustc")
+            version = subprocess.check_output([rustc, "-vV"], env=base, text=True)
+            assert "release: 1.99.0\n" in version, version
+            host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
+            cfg = work / "host.cfg"
+            cfg.write_bytes(subprocess.check_output([rustc, "--print", "cfg"], env=base))
+            results = []
+            for product, root in zip((True, False), roots):
+                home = work / (root.name + "-home")
+                home.mkdir(exist_ok=True)
+                env = {**base, "CARGO_HOME": str(home)}
+                if product:
+                    env.update(PATH=str(blockers) + ":/usr/bin:/bin", RUSTC=str(blockers / "rustc"), RUSTDOC=str(blockers / "rustdoc"))
+                    command = [blaze, "--unit-graph", "--offline", "--filter-platform", host, "--cfg-file", str(cfg)]
+                else:
+                    env["RUSTC_BOOTSTRAP"] = "1"
+                    command = [cargo, "+1.99.0", "build", "--offline", "--unit-graph", "-Z", "unstable-options"]
+                result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
+                assert result.returncode == 0, (command, result.stderr)
+                results.append(normalize(json.loads(result.stdout), root, home))
+            assert results[0] == results[1], json.dumps(results, indent=2)
+            assert (roots[0] / "Cargo.lock").read_text() == (roots[1] / "Cargo.lock").read_text()
+            assert not invoked.exists(), invoked.read_text() if invoked.exists() else ""
+            passed += 1
+            print(f"PASS {roots[0].name} --unit-graph --offline")
 
         roots = pair("path")
         for root in roots:
@@ -187,6 +219,12 @@ def main():
             write(root, ".cargo/config.toml", f"[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='{registry}'\n")
         run_pair(roots, ("--offline",))
         run_pair(roots, ("--frozen",))
+
+        roots = pair("inactive-root-optional")
+        for root in roots:
+            app(root, "optional_leaf={version='1',optional=true}\n")
+            write(root, ".cargo/config.toml", f"[source.crates-io]\nreplace-with='local'\n[source.local]\nlocal-registry='{registry}'\n")
+        run_graph_pair(roots)
 
         publish(registry, "unified", "1.0.0")
         publish(registry, "unified", "1.1.0")

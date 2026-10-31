@@ -2,13 +2,34 @@ name: distributed protocol regressions
 
 on:
   pull_request:
-    branches: [dist/main]
+    branches: [dist/main, dist/c4-keys]
     paths:
       - crates/blaze-dist/**
       - crates/blaze-dist-local/**
       - crates/blaze-wire/**
+      - crates/blaze-spec/**
+      - crates/blaze-manifest/**
+      - crates/blaze-metadata/**
+      - crates/blaze-resolve/**
+      - crates/ra-jit/src/**
+      - crates/hir-ty-codegen/**
+      - vendor/rust-analyzer/crates/base-db/**
+      - vendor/rust-analyzer/crates/project-model/**
+      - vendor/rust-analyzer/crates/hir-expand/**
+      - vendor/rust-analyzer/crates/paths/**
+      - vendor/rust-analyzer/crates/vfs/**
+      - vendor/rust-analyzer/crates/vfs-notify/**
+      - vendor/rust-analyzer/crates/ide-db/**
+      - vendor/proc-macro-srv/**
+      - harness/dist/**
+      - harness/norustc.py
+      - harness/norustc_test.py
       - Cargo.toml
       - Cargo.lock
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - .github/actions/toolchain/**
       - .github/workflows/blaze-dist-review.yaml
   workflow_dispatch:
 
@@ -35,7 +56,133 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt
-      - name: Check protocol formatting
-        run: cargo fmt -p blaze-dist -p blaze-dist-local -- --check
-      - name: Test the actual protocol and wire crates
-        run: cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -- --test-threads=2
+          llvm: build
+      - name: Check protocol and build-spec formatting
+        run: cargo fmt -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --check
+      - name: Test protocol, wire, and immutable build specifications
+        run: nix develop .#bench --command cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --test-threads=2
+      - name: Check complete C2 fixture and group coverage
+        run: nix develop .#bench --command python3 -I -B harness/dist/buildspec.py --self-test
+
+  c2-runtime:
+    name: C2 runtime (${{ matrix.os }}, ${{ matrix.lane }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        lane: [basic, workspace, commands, profiles-native, nested, saved-cranelift, saved-llvm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Verify execution tracing and audit integrity
+        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
+      - name: Record exact source, host, and pinned compilers
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/c2-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            rustc -vV
+            cargo -V
+            nix develop .#bench --command llvm-config --version
+          } > "$RUNNER_TEMP/c2-evidence/identity.txt"
+      - name: Validate complete native platform and immutable input contracts
+        run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
+      - name: Build the actual CLI with both owned backends
+        id: replay_cli
+        run: nix develop .#bench --command cargo build --locked --release -p ra-jit --bins --features llvm
+      - name: Bootstrap a fresh complete owned macro runtime
+        id: owned_runtime
+        if: ${{ !cancelled() && steps.replay_cli.outcome == 'success' }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/owned_macro_server.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-owned-server" --memory-mib 8192 --timeout 1800 \
+            > "$RUNNER_TEMP/c2-evidence/bootstrap.log" 2>&1
+      - name: Original C2 generation and local command differential
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && !startsWith(matrix.lane, 'saved-') }}
+        shell: bash
+        env:
+          C2_GROUP: ${{ matrix.lane }}
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/buildspec.py \
+            --bin "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-local" --memory-mib 8192 --timeout 1200 --shared-store \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
+            --ci-group "$C2_GROUP" --json "$RUNNER_TEMP/c2-evidence/local.json" \
+            > "$RUNNER_TEMP/c2-evidence/local.log" 2>&1
+      - name: Verify target-salted Nix run-path controls
+        if: ${{ startsWith(matrix.lane, 'saved-') }}
+        run: python3 -I harness/dist/test_saved_spec_nix_rpath.py
+      - name: Saved execution with compiler subprocesses blocked (Cranelift)
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && matrix.lane == 'saved-cranelift' }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-cranelift" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
+            --backend cranelift > "$RUNNER_TEMP/c2-evidence/cranelift.log" 2>&1
+      - name: Saved execution with compiler subprocesses blocked (LLVM)
+        if: ${{ !cancelled() && steps.owned_runtime.outcome == 'success' && matrix.lane == 'saved-llvm' }}
+        shell: bash
+        run: |
+          nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+            --blaze "$GITHUB_WORKSPACE/target/release/ra-jit" \
+            --work "$RUNNER_TEMP/c2-llvm" --memory-mib 8192 --timeout 1200 \
+            --owned-server "$RUNNER_TEMP/c2-owned-server/blaze-proc-macro-srv" \
+            --backend llvm > "$RUNNER_TEMP/c2-evidence/llvm.log" 2>&1
+      - name: Keep C2 runtime and tool audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: c2-runtime-${{ matrix.os }}-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/c2-evidence
+            ${{ runner.temp }}/c2-owned-server/image-pins.json
+            ${{ runner.temp }}/c2-owned-server/tool-controls.json
+            ${{ runner.temp }}/c2-owned-server/*.watchdog.json
+            ${{ runner.temp }}/c2-owned-server/*audit.json
+            ${{ runner.temp }}/c2-owned-server/*external-execs.json
+            ${{ runner.temp }}/c2-owned-server/*.exec
+            ${{ runner.temp }}/c2-local/*.exec
+            ${{ runner.temp }}/c2-local/product-tools.log
+            ${{ runner.temp }}/c2-cranelift/results.json
+            ${{ runner.temp }}/c2-cranelift/*.exec
+            ${{ runner.temp }}/c2-cranelift/*.log
+            ${{ runner.temp }}/c2-llvm/results.json
+            ${{ runner.temp }}/c2-llvm/*.exec
+            ${{ runner.temp }}/c2-llvm/*.log
+            ${{ runner.temp }}/c2-cranelift/bundle/no-run.cbor.outputs
+            ${{ runner.temp }}/c2-llvm/bundle/no-run.cbor.outputs
+          if-no-files-found: warn
+
+  c2-runtime-result:
+    name: C2 runtime (${{ matrix.os }})
+    needs: c2-runtime
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      C2_RESULT: ${{ needs.c2-runtime.result }}
+    steps:
+      - name: Require every C2 lane on both platforms
+        run: test "$C2_RESULT" = success

@@ -79,8 +79,7 @@ const PRINTED_KEPT: usize = 4 << 20;
 /// terminal, which it does not see through the pipe.
 fn listing_failures(
     command: &mut Command,
-    held: Option<Held>,
-    state: &State,
+    start: impl FnOnce(&mut Command) -> std::io::Result<std::process::Child>,
 ) -> std::io::Result<(ExitStatus, Option<Vec<String>>)> {
     use std::io::{IsTerminal as _, Read as _, Write as _};
     let out = std::io::stdout();
@@ -92,10 +91,7 @@ fn listing_failures(
         command.arg("--color=always");
     }
     command.stdout(std::process::Stdio::piped());
-    let held = held.unwrap_or_else(|| state.hold());
-    let child = started(command);
-    drop(held);
-    let mut child = child?;
+    let mut child = start(command)?;
     let mut printed = Vec::new();
     if let Some(mut from) = child.stdout.take() {
         let mut chunk = [0; 8192];
@@ -173,145 +169,268 @@ pub(crate) fn tests(
 ) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
     let (mut left, mut always_run) = (0, 0);
-    let sandbox = sandboxed::wanted(affected::on());
-    let declared_env = affected::declared_env(state);
-    let attempts = affected::attempts(state);
-    if let Some(Err(why)) = &sandbox {
-        say::fallback(
-            &format!("tests run outside a sandbox: {why}"),
-            "those that reach files, the environment, processes or the network run every time",
-        );
-    }
+    let passed_env = std::env::var(sandboxed::PASS).unwrap_or_default();
+    let override_attempts = std::env::var(affected::ATTEMPTS).ok();
     for test in state.programs.iter().filter(|it| it.test) {
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
-        let mut running = format!("{unit}{} ({shown})", source.display());
-        let mut picked = Vec::new();
-        let mut command = test_command(state, test)?;
-        let sandbox_env =
-            matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command, &declared_env));
-        let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
-        let pick = affected::pick(asked, state, test, identity.as_deref(), &command);
-        if let Pick::Some { names: Some(names), total, .. } = &pick {
-            left += total - names.len();
-            if names.is_empty() {
-                let unchanged = format!("{}, unchanged since the last pass", counted(*total));
-                say::status(asked.flags.quiet, "Skipping", &format!("{running}: {unchanged}"));
-                continue;
-            }
-            running.push_str(&format!(": {} of {}", names.len(), counted(*total)));
-            picked.push("--exact".to_owned());
-            picked.extend(names.iter().cloned());
-        }
-        say::status(asked.flags.quiet, "Running", &running);
-        if let Pick::Some { always, apart, .. } = &pick {
-            always_run += always.len();
-            for test in always.iter().filter(|_| asked.flags.verbose) {
-                let by = test.path.as_ref().map(|it| format!(", by {it}")).unwrap_or_default();
-                say::status(
-                    asked.flags.quiet,
-                    "Always",
-                    &format!("{}: {}{by}", test.name, test.why),
-                );
-            }
-            for (name, why) in apart.iter().filter(|_| asked.flags.verbose) {
-                say::status(asked.flags.quiet, "Sandboxed", &format!("{name}: {why}"));
-            }
-            let names: Vec<String> = apart.iter().map(|(name, _)| name.clone()).collect();
-            if let (Some(env), Some(dir), false) =
-                (sandbox_env, state.plan_dir(test), names.is_empty())
-            {
-                sandboxed::prepare(state, test, dir, &mut command, env, &names)
-                    .context("writing what the sandbox of the tests is")?;
-            }
-        }
-        command.args(asked.program_args()).args(&picked);
-        // The tests a sandbox runs, which a run again of some of them is given too.
-        let sandbox_list = command
-            .get_envs()
-            .find(|(name, _)| *name == crate::test_harness::SANDBOXED)
-            .and_then(|(_, list)| list.map(|it| it.to_owned()));
-        let listing = matches!(pick, Pick::Some { .. }) || attempts.any();
-        let ran = match listing {
-            true => listing_failures(&mut command, held.take(), state),
-            false => ended(&mut command, held.take(), state).map(|it| (it, None)),
+        let label = format!("{unit}{} ({shown})", source.display());
+        let programs = if matches!(test.kind, Kind::Test | Kind::Bench) {
+            affected::programs_identity(state.programs.iter().filter_map(|program| {
+                (program.package == test.package && program.kind == Kind::Bin && !program.test)
+                    .then_some((program.name.as_str(), program.executable.as_path()))
+            }))
+        } else {
+            Ok(String::new())
         };
-        let (mut status, mut failures) =
-            ran.with_context(|| format!("could not execute {shown}"))?;
-        // A test that fails runs again while it has attempts left (Bazel's
-        // `flaky_test_attempts`), and only the tests that failed do.
-        let (mut attempt, mut retried) = (1, Vec::new());
-        let mut exhausted = Vec::new();
-        while !status.success() {
-            let Some(failed) = failures.take() else { break };
-            let (retry, done) = retryable(&attempts, &test.package, failed, attempt);
-            exhausted.extend(done);
-            if retry.is_empty() {
-                failures = Some(exhausted.clone());
-                break;
-            }
-            attempt += 1;
-            say::status(
-                asked.flags.quiet,
-                "Retrying",
-                &format!("{running}: {} (attempt {attempt})", counted(retry.len())),
-            );
-            retried.extend(retry.iter().cloned());
-            let mut again = test_command(state, test)?;
-            if let Some(list) = &sandbox_list {
-                again.env(crate::test_harness::SANDBOXED, list);
-            }
-            // Each attempt is built from what the command asked, never from the argv of the
-            // attempt before: libtest refuses an option it is given twice.
-            again.args(retry_args(&asked.program_args().cloned().collect::<Vec<_>>(), &retry));
-            (status, failures) = listing_failures(&mut again, None, state)
-                .with_context(|| format!("could not execute {shown}"))?;
-        }
-        if status.success() && !exhausted.is_empty() {
-            failures = Some(exhausted);
-        } else if let Some(failures) = failures.as_mut() {
-            failures.extend(exhausted);
-            failures.sort();
-            failures.dedup();
-        }
-        let success = status.success() && failures.as_ref().is_none_or(Vec::is_empty);
-        // Those that passed on a later attempt are flaky, but still passed: Bazel's auto
-        // caching reuses a successful result even when it took retries.
-        retried.sort();
-        retried.dedup();
-        if !status.success() && failures.is_none() {
-            // A crashed retry has no summary proving which of its tests passed.
-            retried.clear();
-        }
-        retried.retain(|it| !failures.as_ref().is_some_and(|failed| failed.contains(it)));
-        if !retried.is_empty() {
-            let names = retried.join(", ");
-            say::status(
-                asked.flags.quiet,
-                "Flaky",
-                &format!("{names}: passed on attempt {attempt}"),
-            );
-        }
-        match pick {
-            Pick::Some { passed, names, .. } if !success => {
-                passed.failed(names.as_deref(), failures.as_deref())
-            }
-            Pick::Some { passed, .. } => passed.passed(),
-            Pick::Asked if !success => {
-                if let Some(dir) = state.plan_dir(test) {
-                    affected::forget_passes_at(dir).context("forgetting prior test passes")?;
-                }
-            }
-            Pick::Asked => {}
-        }
-        if !success {
+        let context = TestRun {
+            cache: affected::TestContext {
+                root: &state.root,
+                directory: state.plan_dir(test),
+                package: &test.package,
+                programs,
+                enabled: affected::on(),
+                passed_env: &passed_env,
+                inherit_env: true,
+            },
+            package_dir: &test.package_dir,
+            executable: &test.executable,
+            label: &label,
+            sandbox: sandboxed::wanted(affected::on()),
+            sandbox_env: None,
+            attempts: affected::attempts_at(&state.root, override_attempts.as_deref()),
+        };
+        let result = test_with(
+            asked,
+            &context,
+            || test_command(state, test),
+            |command| {
+                let held = held.take().unwrap_or_else(|| state.hold());
+                let child = started(command);
+                drop(held);
+                child
+            },
+        )?;
+        left += result.left;
+        always_run += result.always_run;
+        if !result.success {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
             }
         }
     }
+    test_summary(asked, left, always_run);
+    match failed.as_slice() {
+        [] => Ok(0),
+        [one] => {
+            say::error(&format!("test failed, to rerun pass `{one}`"));
+            Ok(FAILED)
+        }
+        several => {
+            say::error(&format!("{} targets failed:", several.len()));
+            several.iter().for_each(|it| eprintln!("    `{it}`"));
+            Ok(FAILED)
+        }
+    }
+}
+
+/// Execution policy shared by daemon builds and source-only owned builds. The caller
+/// supplies the admitted executable, its effective environment and a process starter;
+/// no Cargo build state or compiler fallback is required.
+pub(crate) struct TestRun<'a> {
+    pub(crate) cache: affected::TestContext<'a>,
+    pub(crate) package_dir: &'a Path,
+    pub(crate) executable: &'a Path,
+    pub(crate) label: &'a str,
+    pub(crate) sandbox: Option<Result<(), String>>,
+    /// Owned commands distinguish inherited values from Cargo/configuration overlays.
+    pub(crate) sandbox_env: Option<Result<Vec<(String, String)>, String>>,
+    pub(crate) attempts: affected::Attempts,
+}
+
+pub(crate) struct TestResult {
+    pub(crate) success: bool,
+    pub(crate) left: usize,
+    pub(crate) always_run: usize,
+}
+
+pub(crate) fn test_with(
+    asked: &Invocation,
+    context: &TestRun<'_>,
+    mut make_command: impl FnMut() -> anyhow::Result<Command>,
+    mut start: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+) -> anyhow::Result<TestResult> {
+    let (mut left, mut always_run) = (0, 0);
+    let mut running = context.label.to_owned();
+    if let Some(Err(why)) = &context.sandbox {
+        say::fallback(
+            &format!("tests run outside a sandbox: {why}"),
+            "those that reach files, the environment, processes or the network run every time",
+        );
+    }
+    let mut picked = Vec::new();
+    let mut command = make_command()?;
+    let declared_env = affected::declared_env_at(context.cache.root);
+    let sandbox_env = if matches!(context.sandbox, Some(Ok(()))) {
+        let mut env = context.sandbox_env.clone().unwrap_or_else(|| {
+            if context.cache.inherit_env {
+                sandboxed::env_owned(
+                    &command,
+                    &declared_env,
+                    context.cache.passed_env,
+                    std::env::vars_os(),
+                )
+            } else {
+                sandboxed::env_owned(
+                    &command,
+                    &declared_env,
+                    context.cache.passed_env,
+                    std::iter::empty(),
+                )
+            }
+        });
+        if [context.cache.root, context.package_dir, context.executable]
+            .into_iter()
+            .chain(context.cache.directory)
+            .any(|path| path.to_str().is_none())
+        {
+            // The sandbox's JSON/launcher protocol is textual. Running the native
+            // command without a sandbox preserves its actual paths instead of lossy ones.
+            env = Err("the sandbox protocol cannot represent a native path".into());
+        }
+        match env {
+            Ok(env) => Some(env),
+            Err(why) => {
+                say::fallback(
+                    &format!("tests run outside a sandbox: {why}"),
+                    "their native environment is preserved and outside inputs remain uncached unless declared",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
+    let pick = affected::pick_for(asked, &context.cache, identity.as_deref(), &command);
+    if let Pick::Some { names: Some(names), total, .. } = &pick {
+        left = total - names.len();
+        if names.is_empty() {
+            let unchanged = format!("{}, unchanged since the last pass", counted(*total));
+            say::status(asked.flags.quiet, "Skipping", &format!("{running}: {unchanged}"));
+            return Ok(TestResult { success: true, left, always_run: 0 });
+        }
+        running.push_str(&format!(": {} of {}", names.len(), counted(*total)));
+        picked.push("--exact".to_owned());
+        picked.extend(names.iter().cloned());
+    }
+    say::status(asked.flags.quiet, "Running", &running);
+    if let Pick::Some { always, apart, .. } = &pick {
+        always_run += always.len();
+        for test in always.iter().filter(|_| asked.flags.verbose) {
+            let by = test.path.as_ref().map(|it| format!(", by {it}")).unwrap_or_default();
+            say::status(asked.flags.quiet, "Always", &format!("{}: {}{by}", test.name, test.why));
+        }
+        for (name, why) in apart.iter().filter(|_| asked.flags.verbose) {
+            say::status(asked.flags.quiet, "Sandboxed", &format!("{name}: {why}"));
+        }
+        let names: Vec<String> = apart.iter().map(|(name, _)| name.clone()).collect();
+        if let (Some(env), Some(dir), false) =
+            (sandbox_env, context.cache.directory, names.is_empty())
+        {
+            sandboxed::prepare_at(
+                context.cache.root,
+                context.package_dir,
+                context.executable,
+                dir,
+                &mut command,
+                env,
+                &names,
+            )
+            .context("writing what the sandbox of the tests is")?;
+        }
+    }
+    command.args(asked.program_args()).args(&picked);
+    // The tests a sandbox runs, which a run again of some of them is given too.
+    let sandbox_list = command
+        .get_envs()
+        .find(|(name, _)| *name == crate::test_harness::SANDBOXED)
+        .and_then(|(_, list)| list.map(|it| it.to_owned()));
+    let listing = matches!(pick, Pick::Some { .. }) || context.attempts.any();
+    let ran = match listing {
+        true => listing_failures(&mut command, &mut start),
+        false => start(&mut command)?.wait().map(|it| (it, None)),
+    };
+    let (mut status, mut failures) = ran.with_context(|| format!("could not execute {running}"))?;
+    // A test that fails runs again while it has attempts left (Bazel's
+    // `flaky_test_attempts`), and only the tests that failed do.
+    let (mut attempt, mut retried) = (1, Vec::new());
+    let mut exhausted = Vec::new();
+    while !status.success() {
+        let Some(failed) = failures.take() else { break };
+        let (retry, done) = retryable(&context.attempts, context.cache.package, failed, attempt);
+        exhausted.extend(done);
+        if retry.is_empty() {
+            failures = Some(exhausted.clone());
+            break;
+        }
+        attempt += 1;
+        say::status(
+            asked.flags.quiet,
+            "Retrying",
+            &format!("{running}: {} (attempt {attempt})", counted(retry.len())),
+        );
+        retried.extend(retry.iter().cloned());
+        let mut again = make_command()?;
+        if let Some(list) = &sandbox_list {
+            again.env(crate::test_harness::SANDBOXED, list);
+        }
+        // Each attempt is built from what the command asked, never from the argv of the
+        // attempt before: libtest refuses an option it is given twice.
+        again.args(retry_args(&asked.program_args().cloned().collect::<Vec<_>>(), &retry));
+        (status, failures) = listing_failures(&mut again, &mut start)
+            .with_context(|| format!("could not execute {running}"))?;
+    }
+    if status.success() && !exhausted.is_empty() {
+        failures = Some(exhausted);
+    } else if let Some(failures) = failures.as_mut() {
+        failures.extend(exhausted);
+        failures.sort();
+        failures.dedup();
+    }
+    let success = status.success() && failures.as_ref().is_none_or(Vec::is_empty);
+    // Those that passed on a later attempt are flaky, but still passed: Bazel's auto
+    // caching reuses a successful result even when it took retries.
+    retried.sort();
+    retried.dedup();
+    if !status.success() && failures.is_none() {
+        // A crashed retry has no summary proving which of its tests passed.
+        retried.clear();
+    }
+    retried.retain(|it| !failures.as_ref().is_some_and(|failed| failed.contains(it)));
+    if !retried.is_empty() {
+        let names = retried.join(", ");
+        say::status(asked.flags.quiet, "Flaky", &format!("{names}: passed on attempt {attempt}"));
+    }
+    match pick {
+        Pick::Some { passed, names, .. } if !success => {
+            passed.failed(names.as_deref(), failures.as_deref())
+        }
+        Pick::Some { passed, .. } => passed.passed(),
+        Pick::Asked if !success => {
+            if let Some(directory) = context.cache.directory {
+                affected::forget_passes_at(directory)
+                    .context("invalidating failed test results")?;
+            }
+        }
+        Pick::Asked => {}
+    }
+    Ok(TestResult { success, left, always_run })
+}
+
+pub(crate) fn test_summary(asked: &Invocation, left: usize, always_run: usize) {
     let why = if asked.flags.verbose { "said above" } else { "`-v` says why" };
     let always = format!("{} run every time ({why})", counted(always_run));
     if left > 0 {
@@ -324,18 +443,6 @@ pub(crate) fn tests(
         say::status(asked.flags.quiet, "Skipped", &unchanged);
     } else if always_run > 0 {
         say::status(asked.flags.quiet, "Skipped", &format!("no test; {always}"));
-    }
-    match failed.as_slice() {
-        [] => Ok(0),
-        [one] => {
-            say::error(&format!("test failed, to rerun pass `{one}`"));
-            Ok(FAILED)
-        }
-        several => {
-            say::error(&format!("{} targets failed:", several.len()));
-            several.iter().for_each(|it| eprintln!("    `{it}`"));
-            Ok(FAILED)
-        }
     }
 }
 
@@ -602,6 +709,71 @@ mod tests {
         let (retry, exhausted) = super::retryable(&attempts, "p", retry, 3);
         assert!(retry.is_empty());
         assert_eq!(exhausted, ["flaky"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_retries_exactly_and_does_not_cache_an_exhausted_peer() {
+        use super::{TestRun, affected, test_with};
+        use std::process::Command;
+
+        for exact in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            let script = work.path().join("libtest.sh");
+            std::fs::write(&script, r#"
+if [ -f attempted ]; then
+    [ "$#" = 2 ] && [ "$1" = --exact ] && [ "$2" = flaky ] || exit 96
+    printf '\ntest flaky ... ok\n\ntest result: ok. 1 passed; 0 failed\n'
+    exit 0
+fi
+printf attempted >attempted
+if [ "$#" = 0 ]; then
+    printf '\ntest ordinary ... FAILED\ntest flaky ... FAILED\n\nfailures:\n    ordinary\n    flaky\n\ntest result: FAILED. 0 passed; 2 failed\n'
+else
+    [ "$#" = 2 ] && [ "$1" = --exact ] && [ "$2" = flaky ] || exit 96
+    printf '\ntest flaky ... FAILED\n\nfailures:\n    flaky\n\ntest result: FAILED. 0 passed; 1 failed\n'
+fi
+exit 101
+"#).unwrap();
+            let saved = work.path().join("tests-passed");
+            std::fs::write(&saved, "old\tordinary\nold\tflaky\n").unwrap();
+            let words = if exact { vec!["test", "--", "--exact", "flaky"] } else { vec!["test"] };
+            let asked = crate::cargo::cli::of_cargo(
+                &words.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let context = TestRun {
+                cache: affected::TestContext {
+                    root: work.path(),
+                    directory: Some(work.path()),
+                    package: "p",
+                    programs: Ok(String::new()),
+                    enabled: false,
+                    passed_env: "",
+                    inherit_env: false,
+                },
+                package_dir: work.path(),
+                executable: &script,
+                label: "shared runner fixture",
+                sandbox: None,
+                sandbox_env: None,
+                attempts: affected::Attempts::with_flaky(&["flaky"]),
+            };
+            let result = test_with(
+                &asked,
+                &context,
+                || {
+                    let mut command = Command::new("/bin/sh");
+                    command.arg(&script).env_clear().current_dir(work.path());
+                    Ok(command)
+                },
+                Command::spawn,
+            )
+            .unwrap();
+            assert_eq!(result.success, exact);
+            assert_eq!(saved.exists(), exact, "a known failure must revoke earlier cached passes");
+            assert!(work.path().join("attempted").is_file());
+        }
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
         let cfg: Vec<cargo_platform::Cfg> = cfg.iter().filter_map(platform_cfg).collect();
         let triple = triple.context("no target triple")?;
         let asked = blaze_metadata::Asked {
+            cargo_home: None,
             cwd: &cwd,
             env: vars.into_iter().collect(),
             manifest_path: manifest,
@@ -146,6 +147,7 @@ fn sysroot_metadata(
     let cfg = cfg.iter().filter_map(platform_cfg).collect::<Vec<_>>();
     let target = config.targets.first().context("std has no target")?;
     let asked = blaze_metadata::Asked {
+        cargo_home: None,
         cwd,
         env: vars.into_iter().collect(),
         manifest_path: Some(manifest),
@@ -182,6 +184,7 @@ pub(crate) fn programs(
         let triple = selection.target.as_deref().unwrap_or(&host_triple);
         let cfg = if triple == host_triple { host_cfg.clone() } else { platform_cfgs(triple)? };
         let asked = blaze_metadata::Asked {
+            cargo_home: None,
             cwd,
             env: crate::process::vars().collect(),
             manifest_path: manifest,

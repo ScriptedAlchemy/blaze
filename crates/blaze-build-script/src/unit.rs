@@ -207,4 +207,8 @@ pub struct DylibSearch {
     /// What the scripts of the host-only dependencies (build dependencies, proc macros) of the
     /// unit added with `rustc-link-search`, in order, kinds included (`native=/x`).
     pub plugin_search: Vec<PathBuf>,
+    /// What a directory of `plugin_search` must be below to be searched, when it is not
+    /// `host_root`: cargo keeps a script's output below the host's artifacts, and blaze below a
+    /// directory of its own in the target directory.
+    pub plugin_root: Option<PathBuf>,
 }

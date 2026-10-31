@@ -45,7 +45,7 @@ RUN_ID_ENV = "RA_JIT_RUN_ID"
 
 # The stand-in for a tool: one line per run (the tool, its pid, its parent's command line, its
 # arguments, the run it belongs to), then the real tool, which keeps the pid.
-STAND_IN = """#!/bin/sh
+STAND_IN = """#!{shell}
 parent=$(ps -o args= -p $PPID 2>/dev/null | cut -c1-300 | tr '\\t\\n' '  ')
 printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {tool} $$ "$parent" "$(echo "$*" | cut -c1-1500 | tr '\\t\\n' '  ')" "${{{run_id_env}-}}" >> {log}
 exec {real} "$@"
@@ -91,8 +91,42 @@ def run(argv, **kwargs):
 
 def external_execs(text):
     """Every external compiler/Cargo exec attempt, including split trace records."""
-    return [path for path in re.findall(r'execve\("([^"\n]+)"', text)
-            if os.path.basename(path).removesuffix(".real") in (*COUNTED, "rust-analyzer-proc-macro-srv")]
+    started, paths = False, []
+    calls = re.finditer(r'^\s*(?:(?:\d+|\[pid\s+\d+\])\s+)?(execve|seccomp|prctl)\((.*)$',
+                        text, re.MULTILINE)
+    for call in calls:
+        name, args = call.groups()
+        if name == "execve":
+            started = True
+            path = re.match(r'"([^"\n]+)"', args)
+            if path and os.path.basename(path[1]).removesuffix(".real") in (
+                    *COUNTED, "rust-analyzer-proc-macro-srv"):
+                paths.append(path[1])
+        elif started:
+            option = args.partition(",")[0].strip()
+            try:
+                numeric = int(option, 0) & 0xffffffff
+            except ValueError:
+                numeric = None
+            if ((name == "prctl" and (numeric == 22 or option == "PR_SET_SECCOMP"))
+                    or (name == "seccomp" and (numeric in (0, 1)
+                                              or option.startswith("SECCOMP_SET_MODE_")))):
+                raise RuntimeError("exec audit cannot certify a seccomp filter change attempt")
+    if not started:
+        raise RuntimeError("exec audit contains no initial execve")
+    return paths
+
+
+def exec_trace(argv, trace, *, detached=False):
+    """Keep exec attempts visible without ptrace stops on unrelated filesystem reads.
+
+    Filter changes are traced too: a later filter can hide exec attempts from seccomp-bpf,
+    so external_execs rejects that evidence. The tracer's own setup precedes the first exec.
+    Raw arguments keep private thread names and filter data out of the trace.
+    """
+    return ["strace", "--seccomp-bpf", "-f", *(["-D"] if detached else []),
+            "-e", "trace=execve,seccomp,prctl", "-e", "raw=prctl,seccomp",
+            "-o", os.fspath(trace), *argv]
 
 
 def traced_run(argv, trace, *, cwd, env, timeout=7200):
@@ -107,7 +141,7 @@ def traced_run(argv, trace, *, cwd, env, timeout=7200):
                               text=True, errors="replace", stdin=subprocess.DEVNULL)
     stdout, stderr = str(trace) + ".stdout", str(trace) + ".stderr"
     with open(stdout, "w") as out, open(stderr, "w") as err:
-        ran = subprocess.run(["strace", "-f", "-D", "-e", "trace=execve", "-o", str(trace), *argv],
+        ran = subprocess.run(exec_trace(argv, trace, detached=True),
                              cwd=cwd, env=env, timeout=timeout, stdout=out, stderr=err,
                              stdin=subprocess.DEVNULL)
     with open(stdout, errors="replace") as out, open(stderr, errors="replace") as err:
@@ -150,7 +184,7 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
     sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
     marker = os.path.join(toolchain, ".stand-in-log")
-    marker_text = log + ("\nblocked" if block else "") + ("\nblocked-server" if block_macro_server else "")
+    marker_text = log + ("\nblocked-v2" if block else "") + ("\nblocked-server-v2" if block_macro_server else "")
     if os.path.exists(marker) and open(marker).read().strip() == marker_text:
         return toolchain  # made for this log already: every blaze run of the work directory shares it
     if os.path.exists(toolchain):
@@ -168,41 +202,51 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=
             shutil.copy2(source, copy)
     for entry in os.listdir(os.path.join(sysroot, "bin")):
         source, copy = os.path.join(sysroot, "bin", entry), os.path.join(toolchain, "bin", entry)
-        if entry not in COUNTED:
+        if entry not in COUNTED and not (block_macro_server and entry == "rust-analyzer-proc-macro-srv"):
             os.symlink(source, copy)
             continue
         if not block:
             shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
-            script = STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+            script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
                                     run_id_env=run_id_env)
-            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 97\n" if block or entry == "rust-analyzer-proc-macro-srv" else script)
         os.chmod(copy, 0o755)
     if block_macro_server:
         source = os.path.join(sysroot, "libexec")
         destination = os.path.join(toolchain, "libexec")
         os.makedirs(destination)
-        for name in os.listdir(source) if os.path.isdir(source) else []:
+        for name in sorted(set(os.listdir(source) if os.path.isdir(source) else []) | {"rust-analyzer-proc-macro-srv"}):
             path = os.path.join(destination, name)
             if name != "rust-analyzer-proc-macro-srv":
                 os.symlink(os.path.join(source, name), path)
             else:
-                script = STAND_IN.format(tool=name, log=shlex.quote(log), real="unused",
+                script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=name, log=shlex.quote(log), real="unused",
                                         run_id_env=run_id_env)
                 with open(path, "w") as output:
-                    output.write(script.rsplit("exec ", 1)[0] + "exit 86\n")
+                    output.write(script.rsplit("exec ", 1)[0] + "exit 97\n")
                 os.chmod(path, 0o755)
     # rustup is outside the toolchain's bin directory. Audit its query/discovery
     # processes too; no row is allowed to hide them by calling them noncompiling.
-    rustup = shutil.which("rustup")
-    if rustup and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
+    rustup = None if block else shutil.which("rustup")
+    if (block or rustup) and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
         copy = os.path.join(toolchain, "bin", "rustup")
         with open(copy, "w") as out:
-            script = STAND_IN.format(tool="rustup", log=shlex.quote(log),
-                                    real=shlex.quote(os.path.realpath(rustup)),
+            script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool="rustup", log=shlex.quote(log),
+                                    real=shlex.quote(os.path.realpath(rustup)) if rustup else "unused",
                                     run_id_env=run_id_env)
-            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 97\n" if block else script)
         os.chmod(copy, 0o755)
+    if block:
+        for name in COUNTED:
+            copy = os.path.join(toolchain, "bin", name)
+            if os.path.exists(copy):
+                continue
+            script = STAND_IN.format(shell=shutil.which("sh") or "/bin/sh", tool=name,
+                                    log=shlex.quote(log), real="unused", run_id_env=run_id_env)
+            with open(copy, "w") as out:
+                out.write(script.rsplit("exec ", 1)[0] + "exit 97\n")
+            os.chmod(copy, 0o755)
     with open(marker, "w") as f:
         f.write(marker_text + "\n")
     return toolchain

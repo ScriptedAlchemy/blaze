@@ -66,6 +66,7 @@ fn bar() -> Unit {
             host_deps: vec!["/p/foo/target/debug/deps".into()],
             sysroot_libdir: "/t/lib/rustlib/x86_64-unknown-linux-gnu/lib".into(),
             plugin_search: Vec::new(),
+            plugin_root: None,
         },
         ..Unit::default()
     }
@@ -262,6 +263,23 @@ fn dynamic_libraries_on_linux() {
              :/opt/lib:/p/foo/target/debug/build/dep-1/out"
         )
     );
+    // Blaze keeps a script's output below its own directory of the target directory, not below
+    // the host's artifacts: a dependency's library there is searched, the system's still not.
+    unit.dylib_search.plugin_search = vec![
+        "native=/p/foo/target/ra-jit/build-scripts/debug/build/dep-1/out".into(),
+        "/usr/lib".into(),
+    ];
+    unit.dylib_search.plugin_root = Some("/p/foo/target".into());
+    let env = super::env(&unit, &os(&[])).unwrap();
+    assert_eq!(
+        var(&env, "LD_LIBRARY_PATH"),
+        Some(
+            "/p/foo/target/debug:/p/foo/target/debug/deps:/t/lib/rustlib/x86_64-unknown-linux-gnu/lib\
+             :/p/foo/target/ra-jit/build-scripts/debug/build/dep-1/out"
+        )
+    );
+    unit.dylib_search.plugin_search = Vec::new();
+    unit.dylib_search.plugin_root = None;
     // A cargo run by a cargo has the outer one's directories in front already.
     let outer = "/p/foo/target/debug:/p/foo/target/debug/deps:/t/lib/rustlib/x86_64-unknown-linux-gnu/lib:/x";
     let env = super::env(&bar(), &os(&[("LD_LIBRARY_PATH", outer)])).unwrap();

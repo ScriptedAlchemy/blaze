@@ -1,0 +1,33 @@
+[package]
+name = "blaze-spec"
+description = "the BuildSpec of docs/distributed.md from cargo's resolution: a command's flags, configuration and environment resolved by blaze-manifest and blaze-metadata into units, a profile for each, an ExecPlatform and the keys, or a refusal that names what blaze cannot honour"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blake3 = "1"
+blaze-manifest.workspace = true
+blaze-metadata.workspace = true
+blaze-registry = { path = "../blaze-registry" }
+blaze-resolve = { path = "../blaze-resolve" }
+blaze-wire.workspace = true
+cargo-util-schemas = "=0.14.3"
+serde_json.workspace = true
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+semver.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "basic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+util = { path = "util" }
+
+[dev-dependencies]
+testutil = { path = "testutil" }
+
+[[bench]]
+name = "speed"
+harness = false

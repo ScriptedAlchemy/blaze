@@ -1,0 +1,15 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+on-target = []
+on-host = ["dep:leaf"]
+on-macro = []
+on-extra = []
+on-dev = []
+
+[dependencies]
+leaf = { path = "../leaf", optional = true }
