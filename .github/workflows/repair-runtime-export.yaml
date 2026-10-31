@@ -5,9 +5,12 @@ on:
     paths: [.github/workflows/repair-runtime-export.yaml]
 permissions:
   contents: read
+concurrency:
+  group: blaze-runtime-source-export
+  cancel-in-progress: true
 jobs:
   export:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
