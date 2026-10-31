@@ -130,6 +130,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
+      - name: Test compiler subprocess input and output
+        if: ${{ !cancelled() }}
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- child:: --test-threads=2
       - name: Test compiler export and import identities
         if: ${{ !cancelled() }}
         run: |
