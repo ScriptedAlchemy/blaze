@@ -182,7 +182,8 @@ jobs:
           cargo test --locked -p ra-jit --bin ra-jit -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
       - name: Test compiler subprocess input and output
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p ra-jit --bin ra-jit -- child:: --test-threads=2
+        run: |
+          cargo test --locked -p ra-jit --bin ra-jit -- child:: --test-threads=2
       - name: Test compiler export and import identities
         if: ${{ !cancelled() }}
         run: |
