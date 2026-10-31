@@ -73,6 +73,16 @@ impl Asked {
         self.seen.lock().is_ok_and(|seen| *seen == manifest)
     }
 
+    /// A failed demand fetch is coalesced for the current lookup, not forever.
+    /// Rebuild it on the keeper's next throttled look even when the manifest is unchanged.
+    fn failed_fetch(&self) -> bool {
+        self.lazy.read().is_ok_and(|lazy| {
+            lazy.as_ref().is_some_and(|lazy| {
+                lazy.packs.iter().any(|(_, _, arrived)| arrived.get() == Some(&false))
+            })
+        })
+    }
+
     /// Notes what the manifest is, and says whether that is not what it was.
     pub(super) fn see(&self, manifest: Option<Digest>) -> bool {
         let Ok(mut seen) = self.seen.lock() else { return false };
@@ -153,8 +163,8 @@ impl Shared {
         self.remote.traffic.try_again();
         let start = Instant::now();
         let now = self.manifest_now().await;
-        if now.is_some() && !self.asked.saw(now) {
-            eprintln!("remote: the manifest of `{}` has changed", self.project);
+        if now.is_some() && (!self.asked.saw(now) || self.asked.failed_fetch()) {
+            eprintln!("remote: refreshing the manifest of `{}`", self.project);
             let done = self.pull_and_remember(now).await;
             self.report(done, start);
         }
