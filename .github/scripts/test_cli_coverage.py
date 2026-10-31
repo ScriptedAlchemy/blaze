@@ -39,7 +39,8 @@ class CLICoverageTests(unittest.TestCase):
         names = ["scripts::tests::library_descriptor", "cargo::cache_service::tests::fresh_remote",
                  "child::tests::duplex", "future_module::new_regression"]
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # macOS exposes temporary directories through /var -> /private/var.
+            root = Path(directory).resolve()
             exe = root / "target/test-cli"
             exe.parent.mkdir()
             exe.write_text(f"#!{sys.executable}\nimport sys\nnames={names!r}\n"
