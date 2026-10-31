@@ -168,17 +168,24 @@ impl Loaded {
     /// The variables of the process the next load is for, over the worker's own, a `None`
     /// removing one the worker has. A proc macro reads its server's environment, as it reads
     /// rustc's, so a server started for an earlier request with other variables does not
-    /// expand what is loaded from now on: a new generation is started with these.
+    /// expand what is loaded from now on: a new generation is started with these. Whether
+    /// they are other than those told before, in any order: the expanders the database has
+    /// are then of servers with other variables, and are to be loaded again
+    /// ([`Self::add`] with no workspace) before they expand for this process.
     pub fn set_proc_macro_env(
         &mut self,
         env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
-    ) {
+    ) -> bool {
+        let env: Vec<_> =
+            env.into_iter().collect::<std::collections::BTreeMap<_, _>>().into_iter().collect();
         for server in [&self.proc_macro_server, &self.listed_server] {
             if let Some(Ok(server)) = server {
                 server.set_generation_env(env.iter().map(|(name, value)| (name, value)));
             }
         }
+        let changed = self.proc_macro_env.as_ref() != Some(&env);
         self.proc_macro_env = Some(env);
+        changed
     }
 
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
@@ -1020,6 +1027,10 @@ impl ProcMacroExpander for Expander {
     fn content_identity(&self) -> Option<[u8; 32]> {
         self.0.content_identity()
     }
+
+    fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.0.environment_identity()
+    }
 }
 
 fn resolve_sub_span(
@@ -1051,6 +1062,16 @@ mod tests {
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
+
+    #[test]
+    fn a_changed_proc_macro_environment_is_told_in_any_order() {
+        let var = |name: &str, value: Option<&str>| (name.into(), value.map(Into::into));
+        let mut loaded = Loaded::default();
+        assert!(loaded.set_proc_macro_env(vec![var("PR15_PRIVATE", Some("old")), var("A", None)]));
+        assert!(!loaded.set_proc_macro_env(vec![var("A", None), var("PR15_PRIVATE", Some("old"))]));
+        assert!(loaded.set_proc_macro_env(vec![var("A", None), var("PR15_PRIVATE", None)]));
+        assert!(!loaded.set_proc_macro_env(vec![var("PR15_PRIVATE", None), var("A", None)]));
+    }
 
     #[test]
     fn test_loading_rust_analyzer() {

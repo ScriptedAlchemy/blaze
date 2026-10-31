@@ -3129,11 +3129,32 @@ impl Checkouts {
 
     /// The variables the proc-macro servers of a load for the request this thread serves
     /// start with: its complete snapshot over the daemon's, not those of a process that asked
-    /// before, so one it has not is removed and a value that is not Unicode is its own.
+    /// before, so one it has not is removed and a value that is not Unicode is its own. Not the
+    /// cargo configuration's: those are for the commands cargo runs (and name this machine's
+    /// own server), which no server reads, and a kept expansion is keyed on these.
     fn macro_env(&self) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
-        let base = self.cargo_config.extra_env.iter();
-        let base = base.map(|(name, value)| (name.into(), value.as_ref().map(Into::into)));
-        base.chain(inputs::server_env(&process::native())).collect()
+        inputs::server_env(&process::native())
+    }
+
+    /// Has the expanders of the database expand with the variables of the request this
+    /// thread serves ([`Self::macro_env`]) when the servers have others: an edit of a macro's
+    /// caller alone makes nothing stale, and its new expansion must not read the variables of
+    /// the request before it. Every library is loaded again, into servers that have this
+    /// request's, and the database is given those expanders. `false` when they had them.
+    fn refresh_macro_env(
+        &mut self,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<bool> {
+        if !self.loaded.set_proc_macro_env(self.macro_env()) || self.loaded.workspaces().is_empty()
+        {
+            return Ok(false);
+        }
+        eprintln!("macros: the request's variables differ from the servers', loading them again");
+        self.refresh_macro_image_identities();
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.collect_macro_generations();
+        Ok(true)
     }
 
     fn collect_macro_generations(&self) {
@@ -9865,6 +9886,32 @@ fn run_holding(
                             }
                             listed.touch(&db, Some(&reading));
                             lock(&as_built).clear();
+                        }
+                        // A macro reads its server's variables as it reads rustc's: servers
+                        // started for another request are replaced, with what this one has,
+                        // though nothing of the checkout is stale.
+                        let read_from = SystemTime::now();
+                        let before = CratesAsLoaded::of(&db);
+                        match checkouts.refresh_macro_env(&mut db, tree.vfs()) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                                let new = before.changed(&db);
+                                hydrate_includes(&mut db, &mut tree, &mut files, |db| {
+                                    resolve_names(db, &new)
+                                });
+                                for program in &mut programs {
+                                    program.known.touch(&db, None);
+                                    program.unbuilt.stale = true;
+                                }
+                                listed.touch(&db, None);
+                                lock(&as_built).clear();
+                            }
+                            Err(error) => {
+                                let _ =
+                                    writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
+                                continue;
+                            }
                         }
                     }
                     // Read native inputs with the admitted request's environment too.

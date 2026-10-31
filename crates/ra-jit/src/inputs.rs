@@ -518,20 +518,24 @@ fn run_env<'a>(
 
 /// The variables a proc-macro server started for a request with the complete snapshot
 /// `asked` has over the daemon's: each the request has otherwise than the daemon, native, and
-/// each the daemon has and the request has not, removed. A macro reads its server's variables
-/// as it reads rustc's, which are the asking process's. The daemon's own (`RA_JIT_*`, [`OWN`])
-/// stay the daemon's.
+/// each the daemon has and the request has not, removed, so the server has the request's
+/// variables and no other. A macro reads its server's variables as it reads rustc's, which are
+/// the asking process's; a kept expansion is keyed on them, so two machines whose requests
+/// carry the same variables give the same key. The daemon's own (`RA_JIT_*`, [`OWN`]) are the
+/// request's too: no server reads them, and the daemon's are of its machine.
 pub(crate) fn server_env(
     asked: &crate::process::Native,
 ) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
-    let theirs = |name: &std::ffi::OsStr| {
-        let name = name.to_string_lossy();
-        !name.starts_with("RA_JIT_") && !OWN.contains(&&*name)
-    };
-    let asked: std::collections::BTreeMap<_, _> =
-        asked.vars().filter(|(name, _)| theirs(name)).collect();
-    let own: std::collections::BTreeMap<_, _> =
-        std::env::vars_os().filter(|(name, _)| theirs(name)).collect();
+    server_env_over(std::env::vars_os(), asked)
+}
+
+/// [`server_env`] over a daemon whose variables are `own`.
+fn server_env_over(
+    own: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    asked: &crate::process::Native,
+) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    let asked: std::collections::BTreeMap<_, _> = asked.vars().collect();
+    let own: std::collections::BTreeMap<_, _> = own.collect();
     let set = asked
         .iter()
         .filter(|&(name, value)| own.get(name) != Some(value))
@@ -1538,18 +1542,18 @@ mod tests {
     /// A process that asks for a build gives the scripts its variables: those the daemon does
     /// not have alike, those it has not that one before had, and the ones asked for.
     /// PR15_PRIVATE: a daemon started by a process that had it, then a request without it,
-    /// then one with a value that is not Unicode. The servers of each have what it has.
+    /// then one with a value that is not Unicode. The servers of each have what it has, and
+    /// nothing of the daemon's own: its `RA_JIT_*` and target directory are the request's.
     #[cfg(unix)]
     #[test]
     fn macro_servers_start_with_the_complete_snapshot_of_the_request() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
         let own: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let given = ["PR15_PRIVATE", "RA_JIT_NOT_THEIRS", "CARGO_TARGET_DIR"];
         let gone = own
             .iter()
             .map(|(name, _)| name.clone())
-            .find(|it| {
-                it.to_str().is_some_and(|it| !it.starts_with("RA_JIT_") && !OWN.contains(&it))
-            })
+            .find(|name| !given.iter().any(|it| name == *it))
             .expect("the test runs with a variable of its own");
         let raw = OsString::from_vec(b"raw-\xff-value".to_vec());
         let asked = crate::process::Native::of(
@@ -1565,11 +1569,50 @@ mod tests {
             env.contains(&("PR15_PRIVATE".into(), Some(raw))),
             "a value is the request's, native"
         );
+        let elsewhere = Some(OsString::from("/elsewhere"));
+        assert!(env.contains(&("RA_JIT_NOT_THEIRS".into(), Some("1".into()))), "{env:?}");
+        assert!(env.contains(&("CARGO_TARGET_DIR".into(), elsewhere)), "the request's: {env:?}");
         assert!(
-            env.iter().all(|(name, _)| *name == gone || name == "PR15_PRIVATE"),
-            "nothing else differs, and the daemon's own stay its own: {env:?}"
+            env.iter().all(|(name, _)| *name == gone || given.iter().any(|it| name == *it)),
+            "nothing else differs: {env:?}"
         );
         assert_eq!(server_env(&crate::process::Native::own()), Vec::new());
+    }
+
+    /// Sol's K1: two machines whose daemons have their own variables (each its own discovered
+    /// server, home and path) and whose requests are the same give their servers the same
+    /// environment, the request's, and nothing of either daemon's.
+    #[test]
+    fn two_daemons_give_the_same_request_the_same_server_environment() {
+        use std::{collections::BTreeMap, ffi::OsString};
+        let pairs = |it: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            it.iter().map(|(name, value)| ((*name).into(), (*value).into())).collect()
+        };
+        let request = pairs(&[("HOME", "/home/me"), ("PATH", "/usr/bin"), ("PR15_PRIVATE", "v")]);
+        let asked = crate::process::Native::of(request.clone());
+        let started = |own: Vec<(OsString, OsString)>| {
+            let mut vars: BTreeMap<_, _> = own.clone().into_iter().collect();
+            for (name, value) in server_env_over(own.into_iter(), &asked) {
+                match value {
+                    Some(value) => vars.insert(name, value),
+                    None => vars.remove(&name),
+                };
+            }
+            vars
+        };
+        let a = started(pairs(&[
+            ("RA_JIT_PROC_MACRO_SERVER", "/opt/a/bin/server"),
+            ("RA_JIT_OWN_TARGET", "1"),
+            ("HOME", "/home/a"),
+            ("PATH", "/opt/a/bin"),
+        ]));
+        let b = started(pairs(&[
+            ("RA_JIT_PROC_MACRO_SERVER", "/opt/b/bin/server"),
+            ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS", "false"),
+            ("USER", "b"),
+        ]));
+        assert_eq!(a, b);
+        assert_eq!(a, request.into_iter().collect::<BTreeMap<_, _>>());
     }
 
     #[test]

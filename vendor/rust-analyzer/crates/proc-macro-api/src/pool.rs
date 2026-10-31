@@ -13,6 +13,9 @@ pub(crate) struct ProcMacroServerPool {
     workers: Arc<[ProcMacroServerProcess]>,
     version: u32,
     loaded: Arc<Mutex<HashMap<paths::AbsPathBuf, PreparedLibrary>>>,
+    /// The digest of the variables its servers started with, every one of them, when the pool
+    /// started them itself ([`crate::server_environment`]); unknown for another transport.
+    environment: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +50,16 @@ impl PreparedLibrary {
 impl ProcMacroServerPool {
     pub(crate) fn new(workers: Vec<ProcMacroServerProcess>) -> Self {
         let version = workers[0].version();
-        Self { workers: workers.into(), version, loaded: Default::default() }
+        Self { workers: workers.into(), version, loaded: Default::default(), environment: None }
+    }
+
+    pub(crate) fn with_environment(mut self, environment: [u8; 32]) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
+    pub(crate) fn environment(&self) -> Option<[u8; 32]> {
+        self.environment
     }
 
     pub(crate) fn replaces(&self, path: &paths::AbsPathBuf, content: [u8; 32]) -> bool {
