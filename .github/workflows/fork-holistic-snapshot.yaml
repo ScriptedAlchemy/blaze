@@ -3,13 +3,16 @@ on:
   push:
     branches: [audit/fork-holistic-20261031]
     paths: [.github/workflows/fork-holistic-snapshot.yaml]
+concurrency:
+  group: fork-holistic-source-export
+  cancel-in-progress: true
 permissions:
   contents: read
   pull-requests: read
   actions: read
 jobs:
   snapshot:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
