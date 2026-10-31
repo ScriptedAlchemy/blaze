@@ -77,6 +77,31 @@ fn find() -> Option<PathBuf> {
 /// rustc compiled at `<library>` and prints where it is ([`libraries_of`]).
 pub(crate) const COMMAND: &str = "proc-macro-library";
 
+/// An independently invocable source-only producer build. The plan is a JSON rendering
+/// of `Vec<own_script::Planned>`, not a rust-project file or a wrapper record.
+pub(crate) const SOURCE_COMMAND: &str = "proc-macro-source";
+
+pub(crate) fn source_command(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    let sysroot = PathBuf::from(args.next().context("the source sysroot is named first")?);
+    let plan = PathBuf::from(args.next().context("then the owned host source plan")?);
+    let dir = std::path::absolute(args.next().context("then an exclusive build directory")?)?;
+    anyhow::ensure!(args.next().is_none(), "unexpected producer build argument");
+    let crates = serde_json::from_slice(&std::fs::read(plan)?)?;
+    let env = std::env::vars_os().collect::<Vec<_>>();
+    let library = own_script::link_macro_planned(
+        &sysroot,
+        crates,
+        &dir,
+        &env,
+        own_script::SourceMode::Legacy,
+    )
+    .map_err(anyhow::Error::msg)?;
+    println!("{}", library.display());
+    Ok(())
+}
+
 /// The directory, in the record of a proc macro rustc compiled, of ra-jit's library of it.
 const OWN: &str = "ra-jit";
 
@@ -226,6 +251,7 @@ pub(crate) fn restored(key: &[u8; 32], made: &Made<'_>) -> bool {
 pub(crate) fn keep<'a>(
     key: &[u8; 32],
     made: &Made<'_>,
+    project: &Path,
     inputs: impl Iterator<Item = (&'a Path, &'a Path)>,
 ) {
     let Some(store) = store() else { return };
@@ -233,21 +259,39 @@ pub(crate) fn keep<'a>(
     else {
         return;
     };
+    let Ok(project) = std::fs::read(project).and_then(|bytes| {
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+    }) else {
+        return;
+    };
     let mut files = BTreeMap::new();
-    let read = |files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, info: &[u8], from: &Path| {
+    let read = |files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+                info: &[u8],
+                from: &Path,
+                project: Option<&serde_json::Value>| {
         let info = crate::dep_info::DepInfo::parse(&String::from_utf8_lossy(info));
         for file in info.files {
             let path = from.join(&file);
+            let path = match project {
+                Some(project) => match crate::compiler_json::physical_path(project, &path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        files.insert(path, None);
+                        continue;
+                    }
+                },
+                None => path,
+            };
             let digest = std::fs::read(&path).ok().map(|it| Sha256::digest(it).to_vec());
             files.insert(path, digest);
         }
     };
     let parent = made.dep_info.parent().unwrap_or(Path::new(""));
-    read(&mut files, &dep_info, parent);
+    read(&mut files, &dep_info, parent, Some(&project));
     for (info, from) in inputs {
         let Ok(bytes) = std::fs::read(info) else { return };
         files.insert(info.to_owned(), Some(Sha256::digest(&bytes).to_vec()));
-        read(&mut files, &bytes, from);
+        read(&mut files, &bytes, from, None);
     }
     let Some(files) = files.into_iter().map(|(path, it)| Some((path, it?))).collect() else {
         return;
@@ -368,7 +412,8 @@ pub(crate) fn rustc_first(rustc: &OsStr, args: &[String], cwd: &Path) -> anyhow:
         std::fs::copy(&library, &kept)
             .with_context(|| format!("copying {} to {}", library.display(), kept.display()))?;
         let mut compile = super::wrapper::rustc_of(rustc);
-        for (name, _) in std::env::vars().filter(|(name, _)| own_script::read_by_crates(name)) {
+        for (name, _) in crate::process::vars().filter(|(name, _)| own_script::read_by_crates(name))
+        {
             compile.env_remove(name);
         }
         compile.args(&record.args).envs(&record.crate_env).current_dir(&record.cwd);

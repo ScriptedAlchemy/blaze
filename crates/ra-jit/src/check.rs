@@ -19,6 +19,180 @@ use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
 
+/// An included expression is allowed to be non-item source, but the expression
+/// parser's ERROR recovery root is not evidence of a valid expression. That
+/// parser can consume trailing items without reporting an error for them.
+pub(crate) fn expression_input(text: &str, edition: syntax::Edition) -> bool {
+    use syntax::ast::AstNode as _;
+    let parse = syntax::ast::Expr::parse(text, edition);
+    parse.errors().is_empty() && syntax::ast::Expr::cast(parse.syntax_node()).is_some()
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_item_recovery_does_not_hide_a_dependency_syntax_error() {
+        let text = r#"include!(concat!(env!("OUT_DIR"), "/shared.rs"));
+pub fn value() -> u8 { 1 }
+pub fn broken() -> u8 { 1 + }
+"#;
+        assert!(!syntax::SourceFile::parse(text, syntax::Edition::Edition2021).errors().is_empty());
+        assert!(!expression_input(text, syntax::Edition::Edition2021));
+        assert!(expression_input("1 + 2", syntax::Edition::Edition2021));
+        assert!(expression_input("include!(\"value.rs\")", syntax::Edition::Edition2021));
+        assert!(!expression_input("1 +", syntax::Edition::Edition2021));
+    }
+}
+
+/// Syntax failures in source-only builds must be reported before codegen/linking.
+/// Walk semantic modules rather than all loaded source-root files.
+pub(crate) fn syntax(
+    db: &RootDatabase,
+    args: &Args,
+    files: &[WatchedFile],
+) -> anyhow::Result<Option<crate::errors::Diagnostic>> {
+    let mut checked = Vec::new();
+    for name in args.crates() {
+        for krate in crate::crates_named(db, name, args)? {
+            for id in ide_db::base_db::Crate::from(krate).transitive_deps(db) {
+                if id.data(db).origin.is_lang() {
+                    continue;
+                }
+                let krate = hir::Crate::from(id);
+                checked.extend(krate.modules(db).into_iter().map(|module| {
+                    module.definition_source_file_id(db).original_file(db).file_id(db)
+                }));
+            }
+        }
+    }
+    checked.sort_unstable();
+    checked.dedup();
+    let paths = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, it.path.clone())),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    Ok(crate::unparsed(db, &checked, &Sources { paths }, &args.checkout))
+}
+
+/// A metadata-only compiler probe checks all source bodies, including unreachable
+/// ones. It loads an owned source description, not a Cargo workspace or rmeta.
+pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
+    crate::process_wide();
+    let config = crate::cargo_config(&args);
+    let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
+    let (mut db, vfs, _) =
+        crate::load(&[&args.project], &config, load, args.selection.clone(), None, None)?;
+    ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    let crates = crate::crates_named(&db, &args.krate, &args)?;
+    anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
+    let krate = crates[0];
+    let id = ide_db::base_db::Crate::from(krate);
+    if krate.feature_attributes_on_stable(&db) {
+        anyhow::ensure!(
+            !bootstrap,
+            "bootstrap feature probes require the owned release feature catalog"
+        );
+        eprintln!("error[E0554]: `#![feature]` may not be used on the stable release channel");
+        return Ok(false);
+    }
+    let files = WatchedFile::sources(&vfs, &db, SystemTime::now());
+    let paths: FxHashMap<_, _> = files
+        .iter()
+        .filter_map(|it| match it.file {
+            Watched::Source(id) => Some((id, it.path.clone())),
+            Watched::Included(_) => None,
+        })
+        .collect();
+    let mut checked: Vec<_> = krate
+        .modules(&db)
+        .into_iter()
+        .map(|module| module.definition_source_file_id(&db).original_file(&db).file_id(&db))
+        .collect();
+    checked.sort_unstable();
+    checked.dedup();
+    let sources = Sources { paths };
+    let diagnostics = ide_diagnostics::DiagnosticsConfig::test_sample();
+    let mut undecided = Vec::new();
+    for &file in &checked {
+        let (inferred, hard): (Vec<_>, Vec<_>) = hir::attach_db(&db, || {
+            ide_diagnostics::semantic_diagnostics_within(
+                &db,
+                &diagnostics,
+                &ide_db::assists::AssistResolveStrategy::None,
+                file,
+                Some(std::sync::Arc::new(FxHashSet::from_iter([id]))),
+            )
+            .into_iter()
+            .filter(|it| it.severity == ide_db::Severity::Error)
+            .filter(|it| {
+                // A syntax error found in lowering, as `..base` in a destructuring assignment
+                // or a free function without a body, is one rustc reports too.
+                matches!(
+                    it.code,
+                    ide_diagnostics::DiagnosticCode::RustcHardError(_)
+                        | ide_diagnostics::DiagnosticCode::SyntaxError
+                ) || matches!(it.code.as_str(), "macro-error" | "macro-def-error")
+            })
+            .partition(|it| {
+                let code = it.code.as_str();
+                INFERRED.contains(&code) || crate::BORROWCK.contains(&code)
+            })
+        });
+        undecided
+            .extend(inferred.into_iter().map(|it| format!("{}: {}", it.code.as_str(), it.message)));
+        let hard: Vec<_> = hard.into_iter().map(|it| it.message).collect();
+        if !hard.is_empty() {
+            for message in hard {
+                eprintln!("error: {message}");
+            }
+            return Ok(false);
+        }
+    }
+    let within = Some(std::sync::Arc::new(FxHashSet::from_iter([id])));
+    // What rests on inferred types or the owned borrow checker is undecided above.
+    let except: Vec<&str> = INFERRED.iter().chain(crate::BORROWCK).copied().collect();
+    let broken =
+        crate::broken_in_except(&db, &checked, &sources, &args.checkout, within, false, &except);
+    let refused = hir::attach_db(&db, || {
+        crate::refusal(&db, &checked, &sources, &args.checkout, broken, None)
+    });
+    if let Some(refused) = refused {
+        eprintln!("{refused}");
+        return Ok(false);
+    }
+    let acceptance = hir::attach_db(&db, || hir::compiler_acceptance::check(&db, id));
+    if !acceptance.errors.is_empty() {
+        for error in &acceptance.errors {
+            eprintln!("error: {error}");
+        }
+        return Ok(false);
+    }
+    // Mismatched types rustc certainly rejects are in `acceptance.errors`; the rest are
+    // undecided, a refusal and never a "no".
+    undecided.extend(acceptance.unsupported.iter().cloned());
+    anyhow::ensure!(
+        undecided.is_empty(),
+        "owned compiler probe acceptance is not proven: {}",
+        undecided.join("; ")
+    );
+    Ok(true)
+}
+
+/// rust-analyzer's errors that rest on the types it inferred: of expressions, of method and
+/// field lookups through them, of the traits it solved and the exhaustiveness of matches on
+/// them. A gap in its inference or coercions reports one where rustc reports none, so one
+/// is not proof that rustc rejects a probe; nor is an error of the owned borrow checker.
+const INFERRED: [&str; 25] = [
+    "E0004", "E0005", "E0033", "E0054", "E0057", "E0061", "E0133", "E0277", "E0282", "E0308",
+    "E0559", "E0599", "E0600", "E0604", "E0605", "E0606", "E0607", "E0608", "E0614", "E0616",
+    "E0618", "E0620", "E0624", "E0641", "E0804",
+];
+
 /// What a checker answers when the workspace changed in a way only loading it again takes
 /// in: a source file came or went, a manifest changed, or the source of a build script or a
 /// proc macro did, which run as they were built.

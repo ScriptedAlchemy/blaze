@@ -24,6 +24,7 @@ salsa.workspace = true
 thin-vec.workspace = true
 
 # local deps
+paths.workspace = true
 stdx.workspace = true
 intern.workspace = true
 base-db.workspace = true

@@ -1,17 +1,18 @@
 //! Defines messages for cross-process message passing based on `ndjson` wire protocol
 pub(crate) mod flat;
+mod wire_impl;
 pub use self::flat::*;
 
 use std::io::{self, BufRead, Write};
 
 use paths::Utf8PathBuf;
 use serde::de::DeserializeOwned;
-use serde_derive::{Deserialize, Serialize};
 
 use crate::{ProcMacroKind, transport::json};
 
+wire_enum! {
 /// Represents requests sent from the client to the proc-macro-srv.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum Request {
     // IMPORTANT: Keep his first, otherwise postcard will break as its not a self describing format
     // As such, this is the only request that needs to be supported across all protocol versions
@@ -32,9 +33,11 @@ pub enum Request {
     /// Since [`crate::version::RUST_ANALYZER_SPAN_SUPPORT`]
     SetConfig(ServerConfig),
 }
+}
 
+wire_enum! {
 /// Defines the mode used for handling span data.
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub enum SpanMode {
     /// Default mode, where spans are identified by an ID.
     #[default]
@@ -43,9 +46,11 @@ pub enum SpanMode {
     /// Rust Analyzer-specific span handling mode.
     RustAnalyzer,
 }
+}
 
+wire_enum! {
 /// Represents responses sent from the proc-macro-srv to the client.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum Response {
     // IMPORTANT: Keep his first, otherwise postcard will break as its not a self describing format
     // As such, this is the only request that needs to be supported across all protocol versions
@@ -70,30 +75,36 @@ pub enum Response {
     /// Since [`crate::version::RUST_ANALYZER_SPAN_SUPPORT`]
     ExpandMacroExtended(Result<ExpandMacroExtended, PanicMessage>),
 }
-
-/// Configuration settings for the proc-macro-srv.
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct ServerConfig {
-    /// Defines how span data should be handled.
-    pub span_mode: SpanMode,
 }
 
+wire_struct! {
+/// Configuration settings for the proc-macro-srv.
+#[derive(Debug, Default)]
+pub struct ServerConfig {
+    /// Defines how span data should be handled.
+    pub span_mode: SpanMode = Default::default(),
+}
+}
+
+wire_struct! {
 /// Represents an extended macro expansion response, including span data mappings.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct ExpandMacroExtended {
     /// The expanded syntax tree.
     pub tree: FlatTree,
     /// Additional span data mappings.
     pub span_data_table: Vec<u32>,
 }
+}
 
+wire_newtype! {
 /// Represents an error message when a macro expansion results in a panic.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct PanicMessage(pub String);
+}
 
 /// Represents a macro expansion request sent from the client.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct ExpandMacro {
     /// The path to the dynamic library containing the macro.
     pub lib: Utf8PathBuf,
@@ -102,12 +113,11 @@ pub struct ExpandMacro {
     /// The current working directory for the macro expansion.
     pub current_dir: Option<String>,
     /// Macro expansion data, including the macro body, name and attributes.
-    #[serde(flatten)]
     pub data: ExpandMacroData,
 }
 
 /// Represents the input data required for expanding a macro.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct ExpandMacroData {
     /// Argument of macro call.
     ///
@@ -124,21 +134,15 @@ pub struct ExpandMacroData {
     /// Possible attributes for the attribute-like macros.
     pub attributes: Option<FlatTree>,
     /// marker for serde skip stuff
-    #[serde(skip_serializing_if = "ExpnGlobals::skip_serializing_if")]
-    #[serde(default)]
     pub has_global_spans: ExpnGlobals,
     /// Table of additional span data.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
     pub span_data_table: Vec<u32>,
 }
 
 /// Represents global expansion settings, including span resolution.
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Debug)]
 pub struct ExpnGlobals {
     /// Determines whether to serialize the expansion settings.
-    #[serde(skip_serializing)]
-    #[serde(default)]
     pub serialize: bool,
     /// Defines the `def_site` span location.
     pub def_site: usize,

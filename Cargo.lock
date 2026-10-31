@@ -597,6 +597,7 @@ dependencies = [
  "indexmap",
  "intern",
  "la-arena",
+ "paths",
  "rustc-hash 2.1.2",
  "salsa",
  "semver",
@@ -707,10 +708,12 @@ dependencies = [
  "blaze-registry",
  "blaze-resolve",
  "cargo-util-schemas",
+ "flate2",
  "rustc-hash 2.1.2",
  "semver",
  "serde",
  "serde_json",
+ "tar",
  "toml",
  "url",
 ]
@@ -788,6 +791,7 @@ name = "blaze-wire"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
@@ -1949,6 +1953,7 @@ dependencies = [
  "itertools",
  "mbe",
  "parser",
+ "paths",
  "rustc-hash 2.1.2",
  "salsa",
  "smallvec",
@@ -2345,10 +2350,12 @@ dependencies = [
  "memchr",
  "nohash-hasher",
  "parser",
+ "paths",
  "profile",
  "rayon",
  "rustc-hash 2.1.2",
  "salsa",
+ "sha2 0.10.9",
  "smallvec",
  "span",
  "stdx",
@@ -3249,6 +3256,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "sha2 0.10.9",
  "span",
  "stdx",
  "tracing",

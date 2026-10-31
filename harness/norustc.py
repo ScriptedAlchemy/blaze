@@ -25,7 +25,7 @@ lowered them. Where a count differs from run to run (cargo's own cache of what r
 is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
 """
-import json, os, platform, shlex, shutil, subprocess, sys, tempfile, time
+import json, os, platform, re, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -36,7 +36,7 @@ BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
 PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
-COUNTED = ("rustc", "rustdoc", "cargo")
+COUNTED = ("rustc", "rustdoc", "cargo", "rustup")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
 # The variable a harness puts in the environment of every process of a run, so that a process
@@ -89,12 +89,54 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kwargs)
 
 
+def external_execs(text):
+    """Every external compiler/Cargo exec attempt, including split trace records."""
+    return [path for path in re.findall(r'execve\("([^"\n]+)"', text)
+            if os.path.basename(path).removesuffix(".real") in (*COUNTED, "rust-analyzer-proc-macro-srv")]
+
+
+def traced_run(argv, trace, *, cwd, env, timeout=7200):
+    """Trace product children without waiting for a long-lived daemon to exit.
+
+    Detached strace keeps inherited stdio open. Use files rather than pipes so
+    request completion, not daemon exit, determines when the client returns.
+    The caller stops its daemon before the final trace census and cleanup.
+    """
+    if sys.platform != "linux":
+        return subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, capture_output=True,
+                              text=True, errors="replace", stdin=subprocess.DEVNULL)
+    stdout, stderr = str(trace) + ".stdout", str(trace) + ".stderr"
+    with open(stdout, "w") as out, open(stderr, "w") as err:
+        ran = subprocess.run(["strace", "-f", "-D", "-e", "trace=execve", "-o", str(trace), *argv],
+                             cwd=cwd, env=env, timeout=timeout, stdout=out, stderr=err,
+                             stdin=subprocess.DEVNULL)
+    with open(stdout, errors="replace") as out, open(stderr, errors="replace") as err:
+        return subprocess.CompletedProcess(argv, ran.returncode, out.read(), err.read())
+
+
 def real_toolchain():
-    """The sysroot of the pinned toolchain, from the rustup proxy on PATH."""
-    return run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
+    """Reference-only sysroot query, with rustup or the flake's direct pinned rustc."""
+    selected = run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"])
+    if selected.returncode == 0:
+        return selected.stdout.strip()
+    # A Nix compiler is not a rustup proxy and does not understand +toolchain.
+    # Verify its release before using it for the independent oracle.
+    version = run(["rustc", "--version"], check=True).stdout
+    if not version.startswith(f"rustc {TOOLCHAIN} "):
+        raise RuntimeError(f"the reference compiler must be Rust {TOOLCHAIN}")
+    return run(["rustc", "--print", "sysroot"], check=True).stdout.strip()
 
 
-def stand_ins(work, log, run_id_env=RUN_ID_ENV):
+def reference_host(toolchain):
+    """The independent oracle's actual host, never a product compilation request."""
+    version = run([os.path.join(toolchain, "bin", "rustc"), "-vV"], check=True).stdout
+    facts = dict(line.split(": ", 1) for line in version.splitlines() if ": " in line)
+    if facts.get("release") != TOOLCHAIN or not facts.get("host"):
+        raise RuntimeError(f"reference host requires Rust {TOOLCHAIN}: {version}")
+    return facts["host"]
+
+
+def stand_ins(work, log, run_id_env=RUN_ID_ENV, block=False, block_macro_server=False):
     """A copy of the pinned toolchain at `work/toolchain` whose rustc, rustdoc and cargo are
     stand-ins that append a line to `log` for each run and then run the real tool, which keeps
     the pid. Every other program of the toolchain is linked, and its libraries are copied, so
@@ -108,18 +150,19 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
     sysroot = real_toolchain()
     toolchain = os.path.join(work, "toolchain")
     marker = os.path.join(toolchain, ".stand-in-log")
-    if os.path.exists(marker) and open(marker).read().strip() == log:
+    marker_text = log + ("\nblocked" if block else "") + ("\nblocked-server" if block_macro_server else "")
+    if os.path.exists(marker) and open(marker).read().strip() == marker_text:
         return toolchain  # made for this log already: every blaze run of the work directory shares it
     if os.path.exists(toolchain):
         shutil.rmtree(toolchain)
     os.makedirs(os.path.join(toolchain, "bin"))
     os.makedirs(os.path.join(toolchain, "lib"))
     for entry in os.listdir(sysroot):
-        if entry not in ("bin", "lib"):
+        if entry not in ("bin", "lib") and not (block_macro_server and entry == "libexec"):
             os.symlink(os.path.join(sysroot, entry), os.path.join(toolchain, entry))
     for entry in os.listdir(os.path.join(sysroot, "lib")):
         source, copy = os.path.join(sysroot, "lib", entry), os.path.join(toolchain, "lib", entry)
-        if os.path.isdir(source):
+        if os.path.isdir(source) or block:
             os.symlink(source, copy)
         else:
             shutil.copy2(source, copy)
@@ -128,13 +171,40 @@ def stand_ins(work, log, run_id_env=RUN_ID_ENV):
         if entry not in COUNTED:
             os.symlink(source, copy)
             continue
-        shutil.copy2(source, copy + ".real")
+        if not block:
+            shutil.copy2(source, copy + ".real")
         with open(copy, "w") as out:
-            out.write(STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
-                                      run_id_env=run_id_env))
+            script = STAND_IN.format(tool=entry, log=shlex.quote(log), real=shlex.quote(copy + ".real"),
+                                    run_id_env=run_id_env)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
+        os.chmod(copy, 0o755)
+    if block_macro_server:
+        source = os.path.join(sysroot, "libexec")
+        destination = os.path.join(toolchain, "libexec")
+        os.makedirs(destination)
+        for name in os.listdir(source) if os.path.isdir(source) else []:
+            path = os.path.join(destination, name)
+            if name != "rust-analyzer-proc-macro-srv":
+                os.symlink(os.path.join(source, name), path)
+            else:
+                script = STAND_IN.format(tool=name, log=shlex.quote(log), real="unused",
+                                        run_id_env=run_id_env)
+                with open(path, "w") as output:
+                    output.write(script.rsplit("exec ", 1)[0] + "exit 86\n")
+                os.chmod(path, 0o755)
+    # rustup is outside the toolchain's bin directory. Audit its query/discovery
+    # processes too; no row is allowed to hide them by calling them noncompiling.
+    rustup = shutil.which("rustup")
+    if rustup and not os.path.exists(os.path.join(toolchain, "bin", "rustup")):
+        copy = os.path.join(toolchain, "bin", "rustup")
+        with open(copy, "w") as out:
+            script = STAND_IN.format(tool="rustup", log=shlex.quote(log),
+                                    real=shlex.quote(os.path.realpath(rustup)),
+                                    run_id_env=run_id_env)
+            out.write(script.rsplit("exec ", 1)[0] + "exit 86\n" if block else script)
         os.chmod(copy, 0o755)
     with open(marker, "w") as f:
-        f.write(log + "\n")
+        f.write(marker_text + "\n")
     return toolchain
 
 

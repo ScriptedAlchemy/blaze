@@ -118,7 +118,11 @@ impl<'db> Ctx<'db> {
 }
 
 /// `built` after the passes.
-fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+fn run_passes<'db>(
+    db: &'db dyn HirDatabase,
+    built: &MirBody<'db>,
+    const_eval: bool,
+) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
     // rustc's `CleanupPostBorrowck` before these: a false edge, which only borrow checking
@@ -131,7 +135,7 @@ fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db
         }
     }
     // `Assert`s first: lowering says where each panicking statement unwinds by its position.
-    asserts::add_asserts(&ctx, &mut body);
+    asserts::add_asserts(&ctx, &mut body, const_eval);
     upvars::upvars_in_place(&mut body);
     body.promoted_constants = body
         .promoted_locals
@@ -152,7 +156,9 @@ pub fn runtime_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body(def)?)
+    let body = run_passes(db, db.mir_body(def)?, false);
+    db.depend_on_included_inputs(def.krate(db));
+    body
 }
 
 /// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
@@ -164,7 +170,7 @@ pub fn runtime_promoted_mir_body_query<'db>(
     expr: hir_def::hir::ExprId,
 ) -> Result<'db, MirBody<'db>> {
     let built = super::promoted_mir_body_query(db, def, expr).map_err(Clone::clone)?;
-    run_passes(db, built)
+    run_passes(db, built, false)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_closure_cycle_result)]
@@ -172,7 +178,7 @@ pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_closure(closure)?)
+    run_passes(db, db.mir_body_for_closure(closure)?, false)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result)]
@@ -180,7 +186,7 @@ pub fn runtime_mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_coroutine(coroutine)?)
+    run_passes(db, db.mir_body_for_coroutine(coroutine)?, false)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result)]
@@ -188,7 +194,7 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?)
+    run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?, false)
 }
 
 /// What the future of an instance of a coroutine keeps from one `poll` to the next: the locals
@@ -223,6 +229,33 @@ pub fn held_frame<'db>(
     let tys = held.locals.iter().map(|&local| body.locals[local].ty.clone());
     let types = monomorphized_tys(db, tys, subst, trait_env)?;
     Ok(HeldFrame { body, held, types })
+}
+
+/// A callee evaluated in a constant: retain arithmetic checks independently of its
+/// runtime profile, while still elaborating drops before interpretation.
+#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result)]
+pub(super) fn monomorphized_const_eval_mir_body<'db>(
+    db: &'db dyn HirDatabase,
+    def: InferBodyId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<'db, MirBody<'db>> {
+    let body = run_passes(db, db.mir_body(def)?, true)?;
+    monomorphized(db, &body, &subst, &trait_env)
+}
+
+#[salsa::tracked(
+    returns(as_ref),
+    cycle_result = monomorphized_runtime_mir_body_for_closure_cycle_result
+)]
+pub(super) fn monomorphized_const_eval_closure_body<'db>(
+    db: &'db dyn HirDatabase,
+    closure: InternedClosureId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<'db, MirBody<'db>> {
+    let body = run_passes(db, db.mir_body_for_closure(closure)?, true)?;
+    monomorphized(db, &body, &subst, &trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result)]

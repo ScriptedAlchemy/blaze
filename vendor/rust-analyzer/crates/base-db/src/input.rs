@@ -388,6 +388,7 @@ impl FromStr for ReleaseChannel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UniqueCrateData {
     root_file_id: FileId,
+    blaze_native_unit: Option<u32>,
     disambiguator: Option<Box<(BuiltCrateData, HashableCfgOptions)>>,
 }
 
@@ -420,6 +421,8 @@ pub type BuiltCrateData = CrateData<Crate>;
 /// Crate data unrelated to analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraCrateData {
+    /// Compiler-description unit identity for native settings, never an environment value.
+    pub blaze_native_unit: Option<u32>,
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
     /// its `[package].name` can be different for other project types or even
@@ -435,6 +438,7 @@ pub struct ExtraCrateData {
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct Env {
     entries: FxHashMap<String, String>,
+    non_unicode: FxHashSet<String>,
 }
 
 impl fmt::Debug for Env {
@@ -446,13 +450,18 @@ impl fmt::Debug for Env {
                 f.debug_map().entries(self.0.iter().copied()).finish()
             }
         }
-        f.debug_struct("Env")
-            .field("entries", &{
-                let mut entries: Vec<_> = self.entries.iter().collect();
-                entries.sort();
-                EnvDebug(entries)
-            })
-            .finish()
+        let mut debug = f.debug_struct("Env");
+        debug.field("entries", &{
+            let mut entries: Vec<_> = self.entries.iter().collect();
+            entries.sort();
+            EnvDebug(entries)
+        });
+        if !self.non_unicode.is_empty() {
+            let mut names: Vec<_> = self.non_unicode.iter().collect();
+            names.sort();
+            debug.field("non_unicode", &names);
+        }
+        debug.finish()
     }
 }
 
@@ -615,7 +624,12 @@ impl CrateGraphBuilder {
                 codegen_flags: Vec::new(),
                 proc_macro_cwd,
             },
-            extra: ExtraCrateData { version, display_name, potential_cfg_options },
+            extra: ExtraCrateData {
+                blaze_native_unit: None,
+                version,
+                display_name,
+                potential_cfg_options,
+            },
             cfg_options,
             env,
             ws_data,
@@ -646,6 +660,10 @@ impl CrateGraphBuilder {
 
     pub fn set_codegen_flags(&mut self, krate: CrateBuilderId, flags: Vec<String>) {
         self.arena[krate].basic.codegen_flags = flags;
+    }
+
+    pub fn set_native_unit(&mut self, krate: CrateBuilderId, unit: Option<u32>) {
+        self.arena[krate].extra.blaze_native_unit = unit;
     }
 
     pub fn set_in_db(self, db: &mut dyn SourceDatabase) -> CratesIdMap {
@@ -727,8 +745,11 @@ impl CrateGraphBuilder {
                 Some(Box::new((crate_data.clone(), krate.cfg_options.to_hashable())))
             };
 
-            let unique_crate_data =
-                UniqueCrateData { root_file_id: krate.basic.root_file_id, disambiguator };
+            let unique_crate_data = UniqueCrateData {
+                root_file_id: krate.basic.root_file_id,
+                blaze_native_unit: krate.extra.blaze_native_unit,
+                disambiguator,
+            };
             let crate_input = match crates_map.0.entry(unique_crate_data) {
                 Entry::Occupied(entry) => {
                     let old_crate = *entry.get();
@@ -955,19 +976,32 @@ impl Crate {
 
 impl Extend<(String, String)> for Env {
     fn extend<T: IntoIterator<Item = (String, String)>>(&mut self, iter: T) {
-        self.entries.extend(iter);
+        for (key, value) in iter {
+            self.set(&key, value);
+        }
     }
 }
 
 impl FromIterator<(String, String)> for Env {
     fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
-        Env { entries: FromIterator::from_iter(iter) }
+        Env { entries: FromIterator::from_iter(iter), non_unicode: FxHashSet::default() }
     }
 }
 
 impl Env {
     pub fn set(&mut self, env: &str, value: impl Into<String>) {
+        self.non_unicode.remove(env);
         self.entries.insert(env.to_owned(), value.into());
+    }
+
+    /// The operating system supplied bytes that cannot form a Rust string.
+    pub fn set_non_unicode(&mut self, name: &str) {
+        self.entries.remove(name);
+        self.non_unicode.insert(name.to_owned());
+    }
+
+    pub fn is_non_unicode(&self, name: &str) -> bool {
+        self.non_unicode.contains(name)
     }
 
     pub fn get(&self, env: &str) -> Option<String> {
@@ -979,19 +1013,24 @@ impl Env {
     }
 
     pub fn extend_from_other(&mut self, other: &Env) {
-        self.entries.extend(other.entries.iter().map(|(x, y)| (x.to_owned(), y.to_owned())));
+        self.extend(other.entries.iter().map(|(x, y)| (x.to_owned(), y.to_owned())));
+        for name in &other.non_unicode {
+            self.set_non_unicode(name);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.non_unicode.is_empty()
     }
 
     pub fn insert(&mut self, k: impl Into<String>, v: impl Into<String>) -> Option<String> {
-        self.entries.insert(k.into(), v.into())
+        let key = k.into();
+        self.non_unicode.remove(&key);
+        self.entries.insert(key, v.into())
     }
 
     pub fn contains_key(&self, arg: &str) -> bool {
-        self.entries.contains_key(arg)
+        self.entries.contains_key(arg) || self.non_unicode.contains(arg)
     }
 }
 

@@ -185,6 +185,7 @@ struct Allocated {
 
 pub struct Evaluator<'db> {
     db: &'db dyn HirDatabase,
+    const_context: bool,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
@@ -217,7 +218,8 @@ pub struct Evaluator<'db> {
     layout_cache: RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
     projected_ty_cache: RefCell<FxHashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
     not_special_fn_cache: RefCell<FxHashSet<FunctionId>>,
-    mir_or_dyn_index_cache: RefCell<FxHashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
+    mir_or_dyn_index_cache:
+        RefCell<FxHashMap<(FunctionId, GenericArgs<'db>, bool), MirOrDynIndex<'db>>>,
     /// Constantly dropping and creating `Locals` is very costly. We store
     /// old locals that we normally want to drop here, to reuse their allocations
     /// later.
@@ -582,6 +584,10 @@ impl<'db> Evaluator<'db> {
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         let lang_items = interner.lang_items();
         Ok(Evaluator {
+            const_context: !matches!(
+                owner,
+                InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(_))
+            ),
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
@@ -821,10 +827,11 @@ impl<'db> Evaluator<'db> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
-    /// Whether arithmetic of the body being evaluated panics when it overflows, which is
-    /// what the code compiled from the body does: a constant is what running it would give.
+    /// Const evaluation always checks overflow, including calls to functions
+    /// compiled with runtime overflow checks disabled.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
-        crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+        self.const_context
+            || crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {
@@ -2249,7 +2256,7 @@ impl<'db> Evaluator<'db> {
         subst: GenericArgs<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, Interval> {
-        let body = super::optimize::interpreted_body(
+        let body = super::transform::monomorphized_const_eval_mir_body(
             self.db,
             konst.into(),
             subst.store(),
@@ -2257,9 +2264,12 @@ impl<'db> Evaluator<'db> {
         )
         .map_err(|e| {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
-            MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
+            MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e.clone())))
         })?;
-        let result = self.interpret_mir(body, iter::empty())?;
+        let previous_context = std::mem::replace(&mut self.const_context, true);
+        let result = self.interpret_mir(body, iter::empty());
+        self.const_context = previous_context;
+        let result = result?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
         let addr = self.heap_allocate(result.size, align)?;
@@ -3200,12 +3210,22 @@ impl<'db> Evaluator<'db> {
         locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        let mir_body = super::optimize::interpreted_closure_body(
-            self.db,
-            closure,
-            generic_args.store(),
-            self.param_env.store(),
-        )
+        let mir_body = if self.const_context {
+            super::transform::monomorphized_const_eval_closure_body(
+                self.db,
+                closure,
+                generic_args.store(),
+                self.param_env.store(),
+            )
+            .map_err(Clone::clone)
+        } else {
+            super::optimize::interpreted_closure_body(
+                self.db,
+                closure,
+                generic_args.store(),
+                self.param_env.store(),
+            )
+        }
         .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
         let closure_data =
             if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
@@ -3295,11 +3315,11 @@ impl<'db> Evaluator<'db> {
         locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, MirOrDynIndex<'db>> {
-        let pair = (def, generic_args);
+        let pair = (def, generic_args, self.const_context);
         if let Some(r) = self.mir_or_dyn_index_cache.borrow().get(&pair) {
             return Ok(r.clone());
         }
-        let (def, generic_args) = pair;
+        let (def, generic_args, _) = pair;
         let r = if let Some(self_ty_idx) =
             is_dyn_method(self.interner(), self.param_env.param_env, def, generic_args)
         {
@@ -3314,12 +3334,22 @@ impl<'db> Evaluator<'db> {
                 not_supported!("evaluating builtin derive impls is not supported")
             };
 
-            let mir_body = super::optimize::interpreted_body(
-                self.db,
-                imp.into(),
-                generic_args.store(),
-                self.param_env.store(),
-            )
+            let mir_body = if self.const_context {
+                super::transform::monomorphized_const_eval_mir_body(
+                    self.db,
+                    imp.into(),
+                    generic_args.store(),
+                    self.param_env.store(),
+                )
+                .map_err(Clone::clone)
+            } else {
+                super::optimize::interpreted_body(
+                    self.db,
+                    imp.into(),
+                    generic_args.store(),
+                    self.param_env.store(),
+                )
+            }
             .map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(MirEvalError::MirLowerError(imp, e)),
@@ -3328,7 +3358,7 @@ impl<'db> Evaluator<'db> {
             })?;
             MirOrDynIndex::Mir(mir_body)
         };
-        self.mir_or_dyn_index_cache.borrow_mut().insert((def, generic_args), r.clone());
+        self.mir_or_dyn_index_cache.borrow_mut().insert(pair, r.clone());
         Ok(r)
     }
 

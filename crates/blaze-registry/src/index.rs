@@ -345,7 +345,7 @@ fn dependency(dep: RegistryDependency) -> anyhow::Result<IndexDependency> {
         default_features: dep.default_features,
         platform,
         kind,
-        registry: registry.filter(|it| !it.is_crates_io()),
+        registry,
         public: dep.public.unwrap_or(false),
         artifact,
     })
@@ -578,9 +578,18 @@ mod tests {
     }
 
     #[test]
-    fn crates_io_drops_its_own_registry() {
+    fn explicit_crates_io_is_distinct_from_a_dependency_in_the_same_registry() {
         let line = r#"{"name":"a","vers":"1.0.0","deps":[{"name":"b","req":"1","registry":"https://github.com/rust-lang/crates.io-index"}],"cksum":"00"}"#;
-        assert_eq!(parse_line(line.as_bytes()).unwrap().entry.deps[0].registry, None);
+        assert!(
+            parse_line(line.as_bytes()).unwrap().entry.deps[0]
+                .registry
+                .as_ref()
+                .unwrap()
+                .is_crates_io()
+        );
+        let implicit =
+            line.replace(",\"registry\":\"https://github.com/rust-lang/crates.io-index\"", "");
+        assert_eq!(parse_line(implicit.as_bytes()).unwrap().entry.deps[0].registry, None);
     }
 
     #[test]

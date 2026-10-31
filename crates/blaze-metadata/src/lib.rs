@@ -1,20 +1,18 @@
 //! `cargo metadata --format-version 1` with its `resolve`, made by blaze with no cargo: the
-//! workspace read by blaze-manifest, every package `Cargo.lock` locks fetched by
-//! blaze-registry where cargo would have it and read from its manifest, and the two resolves
-//! of cargo's `resolve_ws_with_opts` made by blaze-resolve, guided by the lock file. Either
-//! the whole workspace's graph, as `cargo metadata` prints it, or that of one build
-//! ([`Build`]), whose features are a build's and not unified over every member
-//! (docs/self-contained.md, "Resolution and fetching").
-//!
-//! What it does not do yet is an error the caller can take to cargo: a lock file that is
-//! missing or that the manifests no longer agree with (choosing versions needs the index,
-//! #321), `[replace]`, a registry with a git index, and a dependency of a registry package
-//! whose `.crate` cannot be fetched.
+//! workspace read by blaze-manifest, versions chosen by blaze-resolve from blaze-registry's
+//! sources, and selected packages fetched and read from their manifests. The previous
+//! `Cargo.lock`, when present, guides version choices; an ordinary resolve creates or
+//! updates it, while `Asked::locked` preserves Cargo's locked contract.
 
 mod graph;
+mod registry;
+mod required;
 mod summary;
+mod units;
 
-use std::collections::BTreeMap;
+pub use units::{ResolvedUnit, UnitDependency};
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -54,9 +52,19 @@ pub struct Asked<'a> {
     /// `--filter-platform`: the target's triple and its `cfg`.
     pub platform: Option<TargetPlatform<'a>>,
     pub offline: bool,
+    /// `--locked`; combine with `offline` for `--frozen`.
+    pub locked: bool,
     /// blaze's store, which keeps `.crate` files by their sha256.
     pub store: Option<Arc<dyn blaze_registry::Blobs>>,
+    /// The release of the rustc a program names, run in `cwd` with `env`, as its `rustc -vV`
+    /// says it (`1.99.0`), without running it. Cargo prefers dependencies that build with that
+    /// release when no member declares a `rust-version`; a resolve that needs it and has none
+    /// fails.
+    pub rust_release: Option<&'a RustRelease<'a>>,
 }
+
+/// What answers [`Asked::rust_release`]: the program, the directory and the variables.
+pub type RustRelease<'a> = dyn Fn(&Path, &Path, &[(String, String)]) -> Option<String> + 'a;
 
 /// The members a `cargo build` builds, as its flags select them.
 pub struct Build<'a> {
@@ -86,6 +94,32 @@ struct Package {
     manifest_path: PathBuf,
     manifest: Box<Manifest>,
     locked_source: Option<String>,
+}
+
+/// The release of the rustc cargo would ask its version of, as `load_global_rustc` finds
+/// it: `RUSTC`, else `build.rustc`, else `rustc` on `PATH`. Cargo resolves for that release
+/// when no member declares a `rust-version`, never for blaze's own.
+fn toolchain_release(asked: &Asked<'_>, config: &Config) -> Result<semver::Version> {
+    let program = match asked.env.iter().find(|(name, _)| name == "RUSTC") {
+        Some((_, rustc)) if rustc.contains('/') || cfg!(windows) && rustc.contains('\\') => {
+            asked.cwd.join(rustc)
+        }
+        Some((_, rustc)) => PathBuf::from(rustc),
+        None => match &config.build_config()?.rustc {
+            Some(rustc) => rustc.resolve_program(asked.cwd),
+            None => PathBuf::from("rustc"),
+        },
+    };
+    let release = asked.rust_release.and_then(|release| release(&program, asked.cwd, &asked.env));
+    let release = release.with_context(|| {
+        format!(
+            "no workspace member declares a `rust-version`, so the dependencies are those that \
+             build with the release of `{}`, which blaze does not know",
+            program.display()
+        )
+    })?;
+    semver::Version::parse(&release)
+        .with_context(|| format!("`{}` is of release `{release}`", program.display()))
 }
 
 /// The root manifest of the workspace the manifest at `manifest_path` is in, as
@@ -120,37 +154,63 @@ pub struct Targets<'a> {
 
 /// The JSON `cargo metadata --format-version 1` prints for `asked`.
 pub fn metadata(asked: &Asked<'_>) -> Result<String> {
-    Ok(made(asked)?.0)
+    Ok(made(asked, None, None)?.0)
 }
 
 /// Metadata with the structural source bytes that produced it. A daemon must not certify
 /// this graph with manifest bytes read after a build script has run.
 pub fn metadata_with_sources(asked: &Asked<'_>) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
-    let (json, _, sources) = made(asked)?;
+    let (json, _, sources) = made(asked, None, None)?;
     Ok((json, sources))
+}
+
+/// Build metadata with separate host facts, including host-only dependency features.
+pub fn metadata_with_sources_for_host(
+    asked: &Asked<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<(PathBuf, Vec<u8>)>)> {
+    let (json, _, sources) = made(asked, Some(host), None)?;
+    Ok((json, sources))
+}
+
+/// Resolve an application's build without folding host and target feature domains.
+/// Target facts are supplied by the owned planner, never queried from a toolchain.
+pub fn build_units(
+    asked: &Asked<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<ResolvedUnit>, Vec<(PathBuf, Vec<u8>)>)> {
+    anyhow::ensure!(asked.build.is_some(), "compile units require a build selection");
+    let mut units = Vec::new();
+    let (json, _, sources) = made(asked, Some(host), Some(&mut units))?;
+    Ok((json, units, sources))
 }
 
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
 /// graph has them: of each member the build selects, the binaries whose `required-features`
 /// it is built with, or the one target named.
 pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
+    selected_programs(asked, targets, None)
+}
+
+/// Select programs using separate host and target feature domains, as `build_units` does.
+pub fn programs_for_host(
+    asked: &Asked<'_>,
+    targets: Targets<'_>,
+    host: &TargetPlatform<'_>,
+) -> Result<(String, Vec<Program>)> {
+    selected_programs(asked, targets, Some(host))
+}
+
+fn selected_programs(
+    asked: &Asked<'_>,
+    targets: Targets<'_>,
+    host: Option<&TargetPlatform<'_>>,
+) -> Result<(String, Vec<Program>)> {
     anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
-    let (json, roots, _) = made(asked)?;
-    let metadata: serde_json::Value = serde_json::from_str(&json)?;
-    let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
-    let features: FxHashMap<&str, Vec<&str>> = nodes
-        .filter_map(|node| {
-            let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
-            Some((node["id"].as_str()?, on.collect()))
-        })
-        .collect();
-    let packages = metadata["packages"].as_array().into_iter().flatten();
+    let (json, selected, _) = made(asked, host, None)?;
     let mut programs = Vec::new();
-    for package in packages {
-        let Some(id) = package["id"].as_str().filter(|id| roots.iter().any(|it| it == id)) else {
-            continue;
-        };
-        let on = features.get(id).map(Vec::as_slice).unwrap_or_default();
+    for Selection { package, features } in selected {
+        let id = package["id"].as_str().context("a selected package's id")?;
         for target in package["targets"].as_array().into_iter().flatten() {
             let of = |key: &str, it: &str| {
                 target[key].as_array().is_some_and(|all| all.iter().any(|kind| kind == it))
@@ -167,10 +227,9 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
                 continue;
             }
             let required = target["required-features"].as_array().into_iter().flatten();
-            // A feature of a dependency (`dep/feature`) is taken to be on.
             let missing: Vec<&str> = required
                 .filter_map(|it| it.as_str())
-                .filter(|it| !it.contains('/') && !on.contains(it))
+                .filter(|it| !features.contains(*it))
                 .collect();
             let asked_for = targets.bin.is_some() || targets.example.is_some();
             if !missing.is_empty() && asked_for {
@@ -195,8 +254,18 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     Ok((json, programs))
 }
 
-/// The metadata of `asked`, and the ids of the members its build selects.
-fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>)>)> {
+struct Selection {
+    package: serde_json::Value,
+    features: BTreeSet<String>,
+}
+
+/// The metadata and selected members, including targets with unmet requirements
+/// so an explicit `--bin` can report them even when the build graph is empty.
+fn made(
+    asked: &Asked<'_>,
+    host: Option<&TargetPlatform<'_>>,
+    units: Option<&mut Vec<ResolvedUnit>>,
+) -> Result<(String, Vec<Selection>, Vec<(PathBuf, Vec<u8>)>)> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start("metadata", asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
@@ -207,8 +276,16 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
         bail!("`[replace]` is not read by blaze yet");
     }
     let lock_path = root.join("Cargo.lock");
-    let lock_text = String::from_utf8(ctx.read_source(&lock_path)?)
-        .with_context(|| format!("no lock file at {}", lock_path.display()))?;
+    let lock_text = match ctx.read_source(&lock_path) {
+        Ok(bytes) => Some(
+            String::from_utf8(bytes)
+                .with_context(|| format!("failed to read {}", lock_path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", lock_path.display()));
+        }
+    };
 
     let path_packages = path_packages(&ws, &root, &ctx)?;
     let mut path_deps = PathDeps::default();
@@ -218,27 +295,34 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
         let entry = path_deps.entry(m.package_id.name.clone()).or_default();
         entry.insert(m.package_id.version.clone(), SourceId::for_path(&dir)?);
     }
-    let lock = lockfile::into_resolve(lockfile::parse(&lock_text)?, &lock_text, &path_deps)?;
-    let fetched = fetch(&lock, &ctx, offline, asked.store.clone())?;
+    let lock = lock_text
+        .as_deref()
+        .map(|text| {
+            lockfile::parse(text)
+                .and_then(|parsed| lockfile::into_resolve(parsed, text, &path_deps))
+                .with_context(|| format!("failed to parse {}", lock_path.display()))
+        })
+        .transpose()?;
+    let mut context = blaze_registry::Context::new(
+        ctx.config.home().to_owned(),
+        blaze_registry::http::HyperHttp::shared()?,
+    );
+    context.net.offline = offline;
+    context.store = asked.store.clone();
+    let context = Arc::new(context);
+    let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, context.clone())?;
 
     let mut serialized: Vec<SerializedPackage<'_>> =
         ws.members().map(|(path, m)| export_package(path, m)).collect();
     let member_count = serialized.len();
-    for package in path_packages.iter().chain(&fetched) {
-        let mut it = export_package(&package.manifest_path, &package.manifest);
-        if let Some(source) = &package.locked_source {
-            it.set_source(source.clone());
-        }
-        serialized.push(it);
+    for package in &path_packages {
+        serialized.push(export_package(&package.manifest_path, &package.manifest));
     }
     let mut reads = FxHashMap::default();
     let mut ids = Vec::with_capacity(serialized.len());
     for package in &serialized {
-        let mut read = summary::read(&serde_json::to_value(package)?)?;
+        let read = summary::read(&serde_json::to_value(package)?)?;
         let id = read.summary.package_id();
-        if let Some(Some(checksum)) = lock.checksums().get(&id) {
-            read.summary.set_checksum(checksum.clone());
-        }
         ids.push(id);
         reads.insert(id, read);
     }
@@ -247,14 +331,17 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
     for read in reads.values() {
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
+    let registry = registry::SourcesRegistry::new(registry, &sources, &context, &ctx);
     let patch = summary::patch_tables(&root, &registry, &ctx)?;
     let by_path: FxHashMap<SourceId, Summary> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
         .collect();
-    let member_ids = &ids[..member_count];
-    let members: Vec<&Summary> = member_ids.iter().map(|id| &reads[id].summary).collect();
+    let member_ids = ids[..member_count].to_vec();
+    let member_summaries: Vec<Summary> =
+        member_ids.iter().map(|id| reads[id].summary.clone()).collect();
+    let members: Vec<&Summary> = member_summaries.iter().collect();
     let current =
         ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
     let behavior = match ws.resolve_behavior() {
@@ -271,12 +358,35 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
         replace: &[],
         require_optional_deps: true,
         version_ordering: VersionOrdering::MaximumVersionsFirst,
-        rust_versions: None,
-        resolve_version: ResolveVersion::default(),
+        rust_versions: {
+            let fallback = ctx.config.get_string("resolver.incompatible-rust-versions")?;
+            let fallback = fallback
+                .as_ref()
+                .map(|it| it.val.as_str())
+                .unwrap_or(if behavior == ResolveBehavior::V3 { "fallback" } else { "allow" });
+            match fallback {
+                "allow" => None,
+                "fallback" => {
+                    let mut versions = members
+                        .iter()
+                        .filter_map(|it| it.rust_version())
+                        .map(|it| it.to_partial())
+                        .collect::<Vec<_>>();
+                    if versions.is_empty() {
+                        versions.push(toolchain_release(asked, &ctx.config)?.into());
+                    }
+                    Some(versions)
+                }
+                value => bail!("invalid resolver.incompatible-rust-versions value `{value}`"),
+            }
+        },
+        resolve_version: ResolveVersion::with_rust_version(
+            members.iter().filter_map(|it| it.rust_version()).min(),
+        ),
     };
     let specs: Vec<PackageIdSpec> = match &asked.build {
         None => member_ids.iter().map(|id| id.to_spec()).collect(),
-        Some(build) => selected(&ws, member_ids, build)?,
+        Some(build) => selected(&ws, &member_ids, build)?,
     };
     let cli_features = CliFeatures::from_command_line(
         asked.features,
@@ -290,29 +400,80 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
     let (mut whole, targeted) = resolve_ws(
         &mut PackageRegistry::new(registry),
         &resolving,
-        Some(&lock),
+        lock.as_ref(),
         &cli_features,
         &specs,
         has_dev_units,
     )?;
-    if lockfile::lockfile_to_write(&mut whole, Some(&lock_text), None, None)?.is_some() {
-        bail!("{} would change: the manifests no longer agree with it", lock_path.display());
+    let locked = asked.locked.then_some(lockfile::Locked {
+        flag: "--locked",
+        path: &lock_path,
+        path_deps: &path_deps,
+    });
+    let lowest_rust_version = members.iter().filter_map(|it| it.rust_version()).min();
+    let new_lock =
+        lockfile::lockfile_to_write(&mut whole, lock_text.as_deref(), lowest_rust_version, locked)?;
+    if let Some(text) = &new_lock {
+        write_lockfile(&lock_path, text)?;
+    }
+    let fetched = fetch(&targeted, &ctx, &sources)?;
+    for package in &fetched {
+        let mut exported = export_package(&package.manifest_path, &package.manifest);
+        if let Some(source) = &package.locked_source {
+            exported.set_source(source.clone());
+        }
+        let mut read = summary::read(&serde_json::to_value(&exported)?)?;
+        let id = read.summary.package_id();
+        if let Some(Some(checksum)) = whole.checksums().get(&id) {
+            read.summary.set_checksum(checksum.clone());
+        }
+        ids.push(id);
+        reads.insert(id, read);
+        serialized.push(exported);
     }
 
     let kinds = match &asked.platform {
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
         None => vec![CompileKind::Host],
     };
-    let packages = Packages { reads: &reads, platform: asked.platform.as_ref() };
+    let packages = Packages { reads: &reads, platform: asked.platform.as_ref(), host };
     let mut roots = Vec::new();
+    let mut root_features = FxHashMap::default();
+    let mut resolved_units = Vec::new();
     let resolve = match &asked.build {
-        None => resolve_graph(&targeted, member_ids, current, &packages, &kinds)?,
+        None => resolve_graph(&targeted, &member_ids, current, &packages, &kinds)?,
         Some(build) => {
             let member_features = members_with_features(&members_of(), &specs, &cli_features)?;
             let opts = FeatureOpts::new(behavior, has_dev_units, ForceAllTargets::No);
             let features =
                 FeatureResolver::resolve(&packages, &targeted, &member_features, &kinds, opts)?;
             roots = member_features.iter().map(|(it, _)| it.package_id()).collect();
+            for &pkg in &roots {
+                root_features.insert(
+                    pkg,
+                    required::available(
+                        pkg,
+                        &targeted,
+                        &features,
+                        &reads,
+                        build.dev_units,
+                        &packages,
+                        kinds[0],
+                    ),
+                );
+            }
+            if units.is_some() {
+                resolved_units = units::of_build(
+                    &targeted,
+                    &features,
+                    &roots,
+                    build.dev_units,
+                    &reads,
+                    &packages,
+                    kinds[0],
+                    &root_features,
+                )?;
+            }
             let activated = |platform: &Platform| packages.activates(platform);
             graph::of_build(
                 &targeted,
@@ -322,6 +483,7 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
                 &reads,
                 &activated,
                 current,
+                &root_features,
             )?
         }
     };
@@ -329,29 +491,63 @@ fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>, Vec<(PathBuf, Vec<u8>
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
     let reached: FxHashMap<PackageId, usize> =
         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
+    let selected = roots
+        .iter()
+        .map(|id| {
+            Ok(Selection {
+                package: serde_json::to_value(&serialized[reached[id]])?,
+                features: root_features.remove(id).unwrap_or_default(),
+            })
+        })
+        .collect::<Result<_>>()?;
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
         let id = ids.iter().find(|id| id.to_spec() == node.id).copied();
         let id = id.with_context(|| format!("no package {} was read", node.id))?;
         listed.push((id, reached[&id]));
     }
+    // Target-folded metadata may omit a dependency selected only by a host predicate.
+    // Its manifest was already read by this resolution; retain its source package too.
+    for unit in &resolved_units {
+        let id = ids.iter().find(|id| id.to_spec().to_string() == unit.package).copied();
+        let id = id.with_context(|| format!("no unit package {} was read", unit.package))?;
+        if !listed.iter().any(|(listed, _)| *listed == id) {
+            listed.push((id, reached[&id]));
+        }
+    }
     listed.sort();
     let mut slots: Vec<Option<SerializedPackage<'_>>> = serialized.into_iter().map(Some).collect();
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
     let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
-    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect(), ctx.sources()))
+    if let Some(units) = units {
+        *units = resolved_units;
+    }
+    let mut inputs = ctx.sources();
+    if let Some(text) = new_lock {
+        inputs.retain(|(path, _)| path != &lock_path);
+        inputs.push((lock_path, text.into_bytes()));
+    }
+    Ok((json, selected, inputs))
 }
 
 /// What the resolve graph and the feature resolver read of the packages.
 struct Packages<'a> {
     reads: &'a FxHashMap<PackageId, Read>,
     platform: Option<&'a TargetPlatform<'a>>,
+    host: Option<&'a TargetPlatform<'a>>,
 }
 
 impl Packages<'_> {
     fn activates(&self, platform: &Platform) -> bool {
         self.platform.is_none_or(|it| it.activates(platform))
+    }
+
+    fn activates_for(&self, platform: &Platform, kind: CompileKind) -> bool {
+        match (kind, self.host) {
+            (CompileKind::Host, Some(host)) => host.activates(platform),
+            _ => self.activates(platform),
+        }
     }
 }
 
@@ -364,8 +560,8 @@ impl MetadataPackages for Packages<'_> {
         self.reads.get(&id).and_then(|it| it.lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 
@@ -378,8 +574,8 @@ impl PackageTargets for Packages<'_> {
         self.reads.get(&package_id).is_some_and(|it| it.proc_macro_lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 
@@ -447,20 +643,11 @@ fn path_dependencies(package: &serde_json::Value) -> Vec<PathBuf> {
 fn fetch(
     lock: &blaze_resolve::Resolve,
     ctx: &Context,
-    offline: bool,
-    store: Option<Arc<dyn blaze_registry::Blobs>>,
+    sources: &blaze_registry::Sources,
 ) -> Result<Vec<Package>> {
-    let mut context = blaze_registry::Context::new(
-        ctx.config.home().to_owned(),
-        blaze_registry::http::HyperHttp::shared()?,
-    );
-    context.net.offline = offline;
-    context.store = store;
-    let sources = blaze_registry::Sources::new(&source_config(&ctx.config)?, Arc::new(context))?;
     let mut locked = Vec::new();
     let mut ids = Vec::new();
-    // The `[[patch.unused]]` entries too, which the resolve has to see to keep them unused.
-    for id in lock.sort().into_iter().chain(lock.unused_patches().iter().copied()) {
+    for id in lock.sort() {
         if id.source_id().is_path() {
             continue;
         }
@@ -497,7 +684,10 @@ fn fetch(
 }
 
 /// The source of a package the lock file pins to `source`, as blaze-manifest names it.
-fn manifest_source(source: &str, config: &Config) -> Result<blaze_manifest::source::SourceId> {
+pub(crate) fn manifest_source(
+    source: &str,
+    config: &Config,
+) -> Result<blaze_manifest::source::SourceId> {
     use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};
     use cargo_util_schemas::core::GitReference;
     let (kind, rest) = source.split_once('+').context("a source with no kind")?;
@@ -571,4 +761,121 @@ fn source_config(config: &Config) -> Result<blaze_registry::SourceConfig> {
     out.crates_io_git =
         config.get_string("registries.crates-io.protocol")?.is_some_and(|it| it.val == "git");
     Ok(out)
+}
+
+fn write_lockfile(path: &Path, text: &str) -> Result<()> {
+    blaze_registry::write_whole(path, text.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod lock_publication_tests {
+    use super::write_lockfile;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "blaze-lock-publication-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_see_only_complete_lockfiles() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        let old = format!("version = 4\n# old {}\n", "x".repeat(64 * 1024));
+        let new = format!("version = 4\n# new {}\n", "y".repeat(64 * 1024));
+        write_lockfile(&path, &old).unwrap();
+        let done = AtomicBool::new(false);
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.wait();
+                for n in 0..128 {
+                    write_lockfile(&path, if n % 2 == 0 { &new } else { &old }).unwrap();
+                }
+                done.store(true, Ordering::Release);
+            });
+            started.wait();
+            let mut reads = 0;
+            while !done.load(Ordering::Acquire) || reads == 0 {
+                let read = std::fs::read_to_string(&path).unwrap();
+                assert!(read == old || read == new, "partial lockfile: {} bytes", read.len());
+                reads += 1;
+            }
+        });
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_preserves_private_permissions_and_symlink_identity() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let target = fixture.0.join("shared.lock");
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&target, "version = 4\n# old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink("shared.lock", &path).unwrap();
+        write_lockfile(&path, "version = 4\n# new\n").unwrap();
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "version = 4\n# new\n");
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_refuses_a_read_only_lockfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&path, "version = 4\n# authoritative\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            return;
+        }
+        assert!(write_lockfile(&path, "version = 4\n# replacement\n").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "version = 4\n# authoritative\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_publication_preserves_the_authoritative_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("Cargo.lock");
+        write_lockfile(&path, "version = 4\n# authoritative\n").unwrap();
+        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = fixture.0.join("permission-probe");
+        if std::fs::write(&probe, "").is_ok() {
+            std::fs::remove_file(probe).unwrap();
+            return;
+        }
+        assert!(write_lockfile(&path, "version = 4\n# replacement\n").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "version = 4\n# authoritative\n");
+    }
 }

@@ -116,6 +116,7 @@ mod imports;
 mod llvm;
 mod patch;
 mod places;
+mod relocate;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
@@ -216,6 +217,8 @@ pub const CARGO_HOME: &str = "/cargo";
 /// patch after for the same static and value: a running program keeps the copy the first gave
 /// it (`docs/live.md#types`).
 pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
+
+pub use relocate::{CHECKOUT, SHARED, names_checkout, read_as, stored_as};
 
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
@@ -372,6 +375,11 @@ pub trait SymbolResolver {
     /// Where the sources of the standard library are, when the toolchain tells where they
     /// were built.
     fn library_sources(&self) -> Option<LibrarySources> {
+        None
+    }
+    /// The checkout's directory, which [`CHECKOUT`] stands for in what is stored: a file below
+    /// it or beside it is written as that, and read as the directory it is here.
+    fn checkout(&self) -> Option<String> {
         None
     }
     /// Whether data has in it where the checkout is, which another checkout's is not.
@@ -2564,9 +2572,9 @@ fn closures_of(
         .collect()
 }
 
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(copy), revisions = usize::MAX)]
+// Retain ordinary revision validation: included inputs can change without any
+// of the instance's arguments changing.
+#[salsa::tracked(returns(copy))]
 fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
@@ -2750,7 +2758,9 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_root").entered();
-    tier::for_build(|| root_code(db, func, false)).map(Produced::code)
+    let code = tier::for_build(|| root_code(db, func, false)).map(Produced::code);
+    db.depend_on_included_inputs(func.krate(db));
+    code
 }
 
 /// The instance a non-generic function is compiled as under its own symbol.
@@ -2934,16 +2944,22 @@ fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Com
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(ref), revisions = usize::MAX)]
+#[salsa::tracked(returns(ref))]
 fn compiled_instance<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
-    tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
+    // The code can be instantiated in a caller crate, but its included literals
+    // belong to the definition's crate, not the monomorphization environment.
+    let krate = match instance.def {
+        InstanceDef::Fn(func) => func.krate(db),
+        _ => env.krate,
+    };
+    let code = tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code);
+    db.depend_on_included_inputs(krate);
+    code
 }
 
 /// Whether a compile leaves LLVM's part to later ([`Produced::Pending`]): not at all, for a
@@ -5143,13 +5159,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .filter(|_| base.is_none() && std::env::var_os("RA_JIT_CACHE_CHECK").is_none())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
-                    std::sync::Arc::new(cached::Entries::new(
-                        store,
-                        debugged,
-                        program.flatten(),
-                        home,
-                        library,
-                    ))
+                    std::sync::Arc::new(
+                        cached::Entries::new(store, debugged, program.flatten(), home, library)
+                            .in_checkout(symbols.checkout()),
+                    )
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
@@ -6088,6 +6101,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let symbols = self.symbols;
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
+                .in_checkout(symbols.checkout())
         })
     }
 
@@ -15725,9 +15739,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let done = body(self);
         self.inner_pad = enclosing;
         done?;
-        let Some(after) = self.builder.current_block() else {
-            unsupported!("guarded call without a block to return to");
-        };
+        // Finish the normal path before laying out the exceptional path. Its
+        // continuation must be a new block, not an unfinished block revisited
+        // after emitting the landing pad.
+        let after = self.builder.create_block();
+        self.builder.ins().jump(after, &[]);
         self.builder.switch_to_block(pad);
         let exception = self.builder.block_params(pad)[0];
         self.in_cleanup = true;
@@ -16247,9 +16263,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.inner_pad = enclosing;
         dropped?;
-        let Some(after) = self.builder.current_block() else {
-            unsupported!("drop without a block to return to");
-        };
+        let after = self.builder.create_block();
+        self.builder.ins().jump(after, &[]);
         self.in_cleanup = true;
         let mut cleaned = Ok(());
         for at in 1..count {
@@ -16756,6 +16771,58 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use test_fixture::WithFixture;
+
+    fn compile_cleanup_edges(ladder: bool) {
+        let (db, _) = ide_db::RootDatabase::with_single_file("pub fn fixture() {}\n");
+        hir::attach_db(&db, || {
+            let krate = base_db::all_crates(&db)[0];
+            let env = super::ParamEnvAndCrate {
+                param_env: hir_ty::next_solver::ParamEnv::empty(),
+                krate,
+            };
+            let isa = super::target().unwrap();
+            let mut cg =
+                super::Recorder::new(&db, &**isa, super::selected_target().unwrap(), false);
+            let mut ctx = super::build(&mut cg, env, None, false, |fx| {
+                let entry = fx.builder.create_block();
+                fx.builder.switch_to_block(entry);
+                let slot = fx.scratch();
+                let operation = |fx: &mut super::FunctionCx<'_, '_>| -> super::Result<()> {
+                    let sig = fx.cg.make_signature();
+                    let callee = fx.cg.import("cleanup_test_call", &sig)?;
+                    let callee = fx.cg.declare_func_in_func(callee, fx.builder.func);
+                    fx.invoke(callee, &[]);
+                    // A returning call can be followed by writes in the same
+                    // block. The cleanup emitter must terminate that block.
+                    let value = fx.builder.ins().iconst(types::I32, 7);
+                    fx.builder.ins().store(super::MEM, value, slot, 0);
+                    Ok(())
+                };
+                if ladder {
+                    fx.drop_ladder(3, |fx, _| operation(fx))?;
+                } else {
+                    fx.guarded(operation, operation)?;
+                }
+                fx.builder.ins().return_(&[]);
+                Ok(())
+            })
+            .unwrap();
+            cranelift_codegen::verify_function(&ctx.func, &**isa).unwrap();
+            let code = super::emit(&mut ctx).unwrap();
+            assert!(!code.bytes.is_empty());
+        });
+    }
+
+    #[test]
+    fn guarded_cleanup_fills_normal_block_before_landing_pad() {
+        compile_cleanup_edges(false);
+    }
+
+    #[test]
+    fn drop_ladder_fills_normal_block_before_landing_pads() {
+        compile_cleanup_edges(true);
+    }
 
     /// `emit` names the function itself by a placeholder id until it is stitched, and
     /// `FuncId::from_u32` asserts `u32::MAX` away where debug assertions are on, as in

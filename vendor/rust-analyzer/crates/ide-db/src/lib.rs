@@ -13,6 +13,7 @@ mod apply_change;
 
 pub mod active_parameter;
 pub mod assists;
+pub mod code_identity;
 pub mod defs;
 pub mod documentation;
 pub mod famous_defs;
@@ -233,12 +234,28 @@ impl SourceDatabase for RootDatabase {
         let root = self.source_root(root).source_root(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
-        let path = anchor.parent()?.absolutize(path.path);
+        let path = paths::native::absolutize(anchor.parent()?, path.path)?;
         Some(self.files.included_file(self, krate, &path, durability))
     }
 
     fn env_is_read(&self, krate: base_db::Crate, key: &str) {
         self.files.env_is_read(krate, key);
+    }
+
+    fn depend_on_included_inputs(&self, krate: base_db::Crate) {
+        // Optimized MIR and const evaluation may embed a dependency's literal
+        // without retaining a call edge to the definition that read it.
+        for dependency in krate.transitive_deps(self) {
+            _ = self.files.included_by(self, dependency);
+        }
+        _ = self.files.included_by(self, krate);
+    }
+
+    fn included_inputs(
+        &self,
+        krate: base_db::Crate,
+    ) -> Vec<(base_db::AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        self.files.included_by(self, krate)
     }
 
     fn env_is_unset(&self, krate: base_db::Crate, key: &str) {
@@ -250,8 +267,9 @@ impl SourceDatabase for RootDatabase {
         let root = self.source_root(root_id).source_root(self);
         if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
             && let Some(parent) = anchor.parent()
+            && let Some(path) = paths::native::absolutize(parent, path.path)
         {
-            self.files.include_source(&parent.absolutize(path.path), root_id);
+            self.files.include_source(&path, root_id);
         }
     }
 

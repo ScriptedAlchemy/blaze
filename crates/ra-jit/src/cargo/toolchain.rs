@@ -49,11 +49,26 @@ impl std::fmt::Display for Chosen {
 
 /// Has the cargo, rustc and daemon of this command be blaze's release. A rustc that is that
 /// release is used as it is; rustup's copy is named in `RUSTUP_TOOLCHAIN`, which rustup's
-/// proxies take over a toolchain file or an override, with its cargo in `CARGO`; blaze's own
+/// proxies take over a toolchain file or an override, with its cargo in `CARGO`; `RUSTC`
+/// names the selected compiler in every case. blaze's own
 /// is named in `CARGO`, `RUSTC` and `RUSTDOC` and is first on `PATH`, for the processes this one
 /// starts and not the user's shell. `Err` is why the command can't be built, said for the user
 /// to act on. Before any thread starts: it sets the environment.
 pub(crate) fn settle() -> Result<Chosen, String> {
+    let chosen = choose()?;
+    let (Chosen::Given(dir) | Chosen::Rustup(dir) | Chosen::Own(dir)) = &chosen;
+    // Resolution uses the compiler selected here, even when PATH names a packaged launcher.
+    // SAFETY: before any thread is started.
+    unsafe {
+        std::env::set_var(
+            "RUSTC",
+            dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        );
+    }
+    Ok(chosen)
+}
+
+fn choose() -> Result<Chosen, String> {
     let ours = OURS.trim();
     let other = super::state::other_toolchain_allowed();
     let rustc = super::state::rustc_path();
@@ -129,7 +144,6 @@ fn use_own(dir: &Path) {
     // SAFETY: before any thread is started.
     unsafe {
         std::env::set_var("CARGO", exe("cargo"));
-        std::env::set_var("RUSTC", exe("rustc"));
         std::env::set_var("RUSTDOC", exe("rustdoc"));
         std::env::set_var("RUSTUP_TOOLCHAIN", dir);
         if let Ok(path) = std::env::join_paths(path) {
@@ -231,4 +245,108 @@ fn with_library(sysroot: &Path, release: &str) -> Result<(), String> {
         "Rust {release} has no source of its standard library, which blaze compiles: \
          `rustup component add rust-src --toolchain {release}` adds it"
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settled_compiler_drives_resolution_behind_packaged_proxies() {
+        const CHILD: &str = "BLAZE_TEST_SETTLED_RESOLUTION";
+        if let Some(branch) = std::env::var_os(CHILD) {
+            let chosen = settle().unwrap();
+            assert_eq!(matches!(chosen, Chosen::Given(_)), branch == "given");
+            let cwd = std::env::current_dir().unwrap();
+            let json = blaze_metadata::metadata(&blaze_metadata::Asked {
+                cwd: &cwd,
+                env: std::env::vars().collect(),
+                manifest_path: None,
+                config: &[],
+                features: &[],
+                all_features: false,
+                no_default_features: false,
+                build: None,
+                platform: None,
+                offline: true,
+                locked: false,
+                store: None,
+                rust_release: Some(&crate::answers::rust_release),
+            })
+            .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(metadata["packages"][0]["name"], "settled-toolchain");
+            let manifest = paths::AbsPathBuf::assert_utf8(cwd.join("Cargo.toml"));
+            let workspace = project_model::CargoWorkspace::new(
+                serde_json::from_str(&json).unwrap(),
+                project_model::ManifestPath::try_from(manifest.clone()).unwrap(),
+                Default::default(),
+                false,
+            );
+            let plan = crate::plan::Plan::own(
+                &workspace,
+                manifest.as_ref(),
+                &crate::plan::Selection::default(),
+                &crate::plan::Asked {
+                    // The sysroot `settle` chose, which it also exported for the planner.
+                    sysroot: match &chosen {
+                        Chosen::Given(dir) | Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
+                    },
+                    triple: "aarch64-apple-darwin",
+                    cfg: &[],
+                    env: &Default::default(),
+                },
+            )
+            .unwrap();
+            assert!(
+                plan.package(&workspace[workspace.packages().next().unwrap()].id.repr).is_some()
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("rustup");
+        let installed = home.join("toolchains/1.99.0-aarch64-apple-darwin");
+        crate::answers::tests::synthetic_toolchain(&installed);
+        std::fs::create_dir_all(installed.join("lib/rustlib/src/rust/library")).unwrap();
+        let cargo = installed.join("bin/cargo");
+        std::fs::write(&cargo, "this cargo must not execute").unwrap();
+        let proxies = root.path().join("packaged/bin");
+        std::fs::create_dir_all(&proxies).unwrap();
+        std::fs::write(proxies.join("rustc"), "#!/bin/sh\nexit 97\n").unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='settled-toolchain'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/lib.rs"), "").unwrap();
+        for branch in ["rustup", "given"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cargo::toolchain::tests::settled_compiler_drives_resolution_behind_packaged_proxies",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, branch)
+                .env("HOME", root.path())
+                .env("USERPROFILE", root.path())
+                .env("RUSTUP_HOME", &home)
+                .env("PATH", &proxies)
+                .env("RUST_BACKTRACE", "0")
+                .current_dir(&project);
+            if branch == "given" {
+                command.env("CARGO", &cargo);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{branch}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }

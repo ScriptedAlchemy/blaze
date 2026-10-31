@@ -16,15 +16,22 @@
 extern crate rustc_driver as _;
 
 pub mod bidirectional_protocol;
+#[cfg(test)]
+mod generation_tests;
 pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
+pub mod producer_lifetime;
+pub mod snapshot_dir;
 pub mod transport;
 
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
 use span::{ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
-use std::{fmt, io, sync::Arc, time::SystemTime};
+use std::{
+    fmt, io,
+    sync::{Arc, Mutex, Weak},
+};
 
 use crate::{
     bidirectional_protocol::SubCallback, pool::ProcMacroServerPool, process::ProcMacroServerProcess,
@@ -80,26 +87,110 @@ pub enum ProcMacroKind {
 
 /// A handle to proc-macro server process pool which load dylibs with macros (.so or .dll)
 /// and runs actual macro expansion functions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcMacroClient {
     /// Currently, the proc macro process expands all procedural macros sequentially.
     ///
     /// That means that concurrent salsa requests may block each other when expanding proc macros,
     /// which is unfortunate, but simple and good enough for the time being.
-    pool: Arc<ProcMacroServerPool>,
+    epochs: Arc<Mutex<Epochs>>,
+    /// New library generations get a pool whose lifetime follows their handles, started with
+    /// the environment of the load ([`Epochs::env`]). This releases native server images
+    /// without changing either wire protocol.
+    spawn_generation: Option<Arc<SpawnGeneration>>,
+    snapshot_root: Option<std::path::PathBuf>,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
+}
+
+/// The variables a server starts with over this process's: a `None` removes one.
+type GenerationEnv = Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>;
+
+type SpawnGeneration = dyn Fn(&GenerationEnv) -> io::Result<ProcMacroServerPool> + Send + Sync;
+
+/// Only the unused first pool is held strongly. Serving pools belong to consumers.
+struct Epochs {
+    initial: Option<Arc<ProcMacroServerPool>>,
+    current: Weak<ProcMacroServerPool>,
+    live: Vec<Weak<ProcMacroServerPool>>,
+    /// What the next generation starts with: the environment of the latest load, whose
+    /// macros a server that a load before it started must not expand.
+    env: GenerationEnv,
+}
+
+impl Epochs {
+    fn new(pool: ProcMacroServerPool, env: GenerationEnv) -> Self {
+        let pool = Arc::new(pool);
+        Self {
+            current: Arc::downgrade(&pool),
+            live: vec![Arc::downgrade(&pool)],
+            initial: Some(pool),
+            env,
+        }
+    }
+}
+
+/// `env` in one order, the last of a name standing, without what changes nothing of what a
+/// server has from this process: two loads whose servers would have the same variables have
+/// equal environments.
+fn generation_env<'a>(
+    env: impl IntoIterator<
+        Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+    >,
+) -> GenerationEnv {
+    let vars: std::collections::BTreeMap<_, _> = env
+        .into_iter()
+        .map(|(key, value)| {
+            (key.as_ref().to_owned(), value.as_ref().map(|value| value.as_ref().to_owned()))
+        })
+        .collect();
+    vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
+}
+
+/// The digest of the environment a server started with `env` has: each variable of the map
+/// the request asked for ([`process::requested_environment`]), in the order of its name. A
+/// macro reads any of them as it reads rustc's, so an expansion kept under one is not
+/// another's, and a handle of a server with one is not a handle of a server with another.
+/// Where the server is on this machine is not in it: on Windows the server is started with
+/// its toolchain's `bin` ahead of `PATH`, and two machines whose requests agree name the same.
+fn server_environment(env: &GenerationEnv) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let vars = process::requested_environment(env.iter().map(|(name, value)| (name, value)));
+    let mut hash = Sha256::new();
+    hash.update(b"proc-macro server environment 2");
+    hash.update((vars.len() as u64).to_le_bytes());
+    for (name, value) in &vars {
+        for bytes in [name.as_encoded_bytes(), value.as_encoded_bytes()] {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    hash.finalize().into()
+}
+
+impl fmt::Debug for ProcMacroClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcMacroClient").field("path", &self.path).finish()
+    }
 }
 
 /// Represents a dynamically loaded library containing procedural macros.
 pub struct MacroDylib {
     path: AbsPathBuf,
+    expected_content: Option<[u8; 32]>,
 }
 
 impl MacroDylib {
     /// Creates a new MacroDylib instance with the given path.
     pub fn new(path: AbsPathBuf) -> MacroDylib {
-        MacroDylib { path }
+        MacroDylib { path, expected_content: None }
+    }
+
+    /// Bind a previously validated producer artifact to the immutable bytes
+    /// copied for loading, rather than checking its replaceable pathname again.
+    pub fn with_expected_content(mut self, content: [u8; 32]) -> Self {
+        self.expected_content = Some(content);
+        self
     }
 }
 
@@ -109,20 +200,101 @@ impl MacroDylib {
 /// we share a single expander process for all macros within a workspace.
 #[derive(Debug, Clone)]
 pub struct ProcMacro {
-    pool: ProcMacroServerPool,
+    pool: Arc<ProcMacroServerPool>,
     dylib_path: Arc<AbsPathBuf>,
     name: Box<str>,
     kind: ProcMacroKind,
-    dylib_last_modified: Option<SystemTime>,
+    dylib_content: Option<[u8; 32]>,
+    original_dylib_path: Arc<AbsPathBuf>,
+    _snapshot: Arc<LibrarySnapshot>,
+}
+
+enum LibrarySnapshot {
+    Temporary(stdx::tempfile::NamedTempDir),
+    WorkerOwned(std::path::PathBuf),
+}
+
+impl LibrarySnapshot {
+    fn copy(source: &AbsPath, root: Option<&std::path::Path>) -> io::Result<(Self, [u8; 32])> {
+        // Open first: a missing producer must not leave an empty generation.
+        let mut input = std::fs::File::open(source)?;
+        // The daemon knows this private worker home and removes it only after
+        // killing/waiting for that worker group. This covers stop without Drop.
+        if let Some(root) = root {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = snapshot_dir::prepare(root, std::process::id())?;
+            let (path, mut file) = loop {
+                let path = dir.join(format!(
+                    "generation-{}",
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::File::options().write(true).create_new(true).open(&path) {
+                    Ok(file) => break (path, file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            let snapshot = Self::WorkerOwned(path);
+            let digest = Self::copy_and_hash(&mut input, &mut file)?;
+            return Ok((snapshot, digest));
+        }
+        let dir = stdx::tempfile::NamedTempDir::new("proc-macro-content")?;
+        let mut file = std::fs::File::create(dir.path().join("library"))?;
+        let digest = Self::copy_and_hash(&mut input, &mut file)?;
+        Ok((Self::Temporary(dir), digest))
+    }
+
+    fn copy_and_hash(
+        input: &mut impl io::Read,
+        output: &mut impl io::Write,
+    ) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    fn snapshot_path(&self) -> std::path::PathBuf {
+        match self {
+            Self::Temporary(dir) => dir.path().join("library"),
+            Self::WorkerOwned(path) => path.clone(),
+        }
+    }
+}
+
+impl Drop for LibrarySnapshot {
+    fn drop(&mut self) {
+        if let Self::WorkerOwned(path) = self {
+            _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl fmt::Debug for LibrarySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot_path().fmt(f)
+    }
 }
 
 impl Eq for ProcMacro {}
+/// The same macro of the same library, expanded by a server with the same variables: a macro
+/// reads them as it reads rustc's, so a handle of a server with others is another expander,
+/// and what was expanded with the one is not the other's (the database compares these).
 impl PartialEq for ProcMacro {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.kind == other.kind
-            && self.dylib_path == other.dylib_path
-            && self.dylib_last_modified == other.dylib_last_modified
+            && self.original_dylib_path == other.original_dylib_path
+            && self.dylib_content == other.dylib_content
+            && self.environment_identity() == other.environment_identity()
     }
 }
 
@@ -154,20 +326,33 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker = ProcMacroServerProcess::spawn(process_path, env.clone(), version)?;
-            workers.push(worker);
-        }
-
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+        let path = process_path.to_owned();
+        let vars = generation_env(env);
+        let version = version.cloned();
+        let factory = move |vars: &GenerationEnv| {
+            let mut workers = Vec::with_capacity(num_process);
+            for _ in 0..num_process {
+                workers.push(ProcMacroServerProcess::spawn(
+                    &path,
+                    vars.iter().map(|(key, value)| (key, value)),
+                    version.as_ref(),
+                )?);
+            }
+            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(vars)))
+        };
+        let pool = factory(&vars)?;
+        Ok(ProcMacroClient {
+            epochs: Arc::new(Mutex::new(Epochs::new(pool, vars))),
+            path: process_path.to_owned(),
+            spawn_generation: Some(Arc::new(factory)),
+            snapshot_root: None,
+        })
     }
 
     /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
     ///
     /// The `process_path` is used for `Self::server_path`. This function is mainly used for testing.
+    /// This non-replayable transport cannot rotate a native pool; use `spawn` in production.
     pub fn with_io_channels(
         process_path: &AbsPath,
         spawn: impl Fn(
@@ -180,16 +365,99 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker =
-                ProcMacroServerProcess::run(spawn.clone(), version, || "<unknown>".to_owned())?;
-            workers.push(worker);
+        let mut workers = Vec::with_capacity(num_process);
+        for _ in 0..num_process {
+            workers.push(ProcMacroServerProcess::run(spawn.clone(), version, || {
+                "<unknown>".to_owned()
+            })?);
         }
+        Ok(ProcMacroClient {
+            epochs: Arc::new(Mutex::new(Epochs::new(
+                ProcMacroServerPool::new(workers),
+                Vec::new(),
+            ))),
+            path: process_path.to_owned(),
+            spawn_generation: None,
+            snapshot_root: None,
+        })
+    }
 
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+    /// Replayable test transport for exercising epoch lifetime without a native server.
+    #[cfg(test)]
+    pub fn with_generation_io_channels(
+        process_path: &AbsPath,
+        spawn: impl Fn(
+            Option<ProtocolFormat>,
+        ) -> io::Result<(
+            Box<dyn process::ProcessExit>,
+            Box<dyn io::Write + Send + Sync>,
+            Box<dyn io::BufRead + Send + Sync>,
+        )> + Clone
+        + Send
+        + Sync
+        + 'static,
+        version: Option<&Version>,
+        num_process: usize,
+    ) -> io::Result<ProcMacroClient> {
+        let version = version.cloned();
+        let factory = move |_: &GenerationEnv| {
+            let mut workers = Vec::with_capacity(num_process);
+            for _ in 0..num_process {
+                workers.push(ProcMacroServerProcess::run(spawn.clone(), version.as_ref(), || {
+                    "<unknown>".to_owned()
+                })?);
+            }
+            Ok(ProcMacroServerPool::new(workers))
+        };
+        Ok(ProcMacroClient {
+            epochs: Arc::new(Mutex::new(Epochs::new(factory(&Vec::new())?, Vec::new()))),
+            path: process_path.to_owned(),
+            spawn_generation: Some(Arc::new(factory)),
+            snapshot_root: None,
+        })
+    }
+
+    /// Use a private worker root whose owner performs post-wait cleanup after abrupt exit.
+    /// Other clients use self-cleaning temporary snapshots and never read daemon environment.
+    pub fn with_snapshot_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.snapshot_root = root;
+        self
+    }
+
+    /// A workspace reload can replace content-addressed producer *paths*, not
+    /// just bytes at an existing path. Retire its native epoch at the next load.
+    /// Existing consumers still own the previous epoch; an unused cold pool is reused.
+    pub fn begin_load_epoch(&self) {
+        if self.spawn_generation.is_some() {
+            let Ok(mut epochs) = self.epochs.lock() else { return };
+            if epochs.initial.is_none() {
+                epochs.current = Weak::new();
+            }
+        }
+    }
+
+    /// Has the generations started from now on start with `env` over this process's
+    /// variables, a `None` removing one, as the load they serve has them. A server reads the
+    /// variables it started with, and a macro reads them as rustc's process has them, so an
+    /// environment other than the one the serving epoch started with retires that epoch, and
+    /// the unused first pool with it: what is loaded next is loaded into servers of `env`.
+    /// Consumers of the old epoch keep it, as at any reload.
+    pub fn set_generation_env<'a>(
+        &self,
+        env: impl IntoIterator<
+            Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+        >,
+    ) {
+        if self.spawn_generation.is_none() {
+            return;
+        }
+        let env = generation_env(env);
+        let Ok(mut epochs) = self.epochs.lock() else { return };
+        if epochs.env != env {
+            epochs.env = env;
+            epochs.current = Weak::new();
+            epochs.initial = None;
+        }
     }
 
     /// Returns the absolute path to the proc-macro server.
@@ -199,16 +467,65 @@ impl ProcMacroClient {
 
     /// Loads a proc-macro dylib into the server process returning a list of `ProcMacro`s loaded.
     pub fn load_dylib(&self, dylib: MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
-        self.pool.load_dylib(&dylib)
+        let prepared = pool::PreparedLibrary::copy(&dylib, self.snapshot_root.as_deref())?;
+        // Serialize registration and rotation: concurrent loads must agree on an epoch.
+        let mut epochs = self.epochs.lock().map_err(|_| ServerError {
+            message: "proc-macro epoch state poisoned".into(),
+            io: None,
+        })?;
+        let mut pool = epochs.current.upgrade();
+        if let Some(factory) = &self.spawn_generation {
+            if pool.as_ref().is_none_or(|pool| pool.replaces(&dylib.path, prepared.content)) {
+                let next = Arc::new(factory(&epochs.env).map_err(|error| ServerError {
+                    message: "spawning proc-macro epoch".into(),
+                    io: Some(Arc::new(error)),
+                })?);
+                pool = Some(next);
+            }
+        }
+        let pool = pool.expect("non-replayable transport retains its initial pool");
+        let handles = pool.load_dylib(&dylib, prepared)?;
+        if self.spawn_generation.is_some() {
+            // Publish only a successfully loaded epoch. A rejected replacement
+            // must not displace the still-serving pool or break its reuse.
+            epochs.current = Arc::downgrade(&pool);
+            epochs.live.retain(|live| live.strong_count() != 0);
+            if !epochs.live.iter().any(|live| live.ptr_eq(&epochs.current)) {
+                let current = epochs.current.clone();
+                epochs.live.push(current);
+            }
+            epochs.initial = None;
+        }
+        Ok(handles)
     }
 
     /// Checks if the proc-macro server has exited.
-    pub fn exited(&self) -> Option<&ServerError> {
-        self.pool.exited()
+    pub fn exited(&self) -> Option<ServerError> {
+        let epochs = match self.epochs.try_lock() {
+            Ok(epochs) => epochs,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some(ServerError {
+                    message: "proc-macro epoch state poisoned".into(),
+                    io: None,
+                });
+            }
+        };
+        epochs.live.iter().filter_map(Weak::upgrade).find_map(|pool| pool.exited().cloned())
     }
 }
 
 impl ProcMacro {
+    pub fn content_identity(&self) -> Option<[u8; 32]> {
+        self.dylib_content
+    }
+
+    /// The digest of every variable the server that expands this macro started with, which a
+    /// macro can read; `None` when the server was not started by this client.
+    pub fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.pool.environment()
+    }
+
     /// Returns the name of the procedural macro.
     pub fn name(&self) -> &str {
         &self.name

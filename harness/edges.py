@@ -2,8 +2,9 @@
 """edges.py: a package whose build script runs after another package's (`links`) is run as often
 as cargo runs it, whatever the edge: normal, renamed, optional and on or off, for the platform or
 another, a dev-dependency (no edge) and a build-dependency (no edge, but cargo builds the script
-again, unless it is for another platform), and is built by whom each variant says (`EXPECTED`): a
-dropped edge or a spurious one sends a build to cargo, or keeps one from it, whatever it built.
+again, unless it is for another platform), and is built by whom each variant says (`EXPECTED`):
+blaze's own build, or, where cargo alone does more than for an edit, blaze's own build or a
+handoff to cargo that says why. A build cargo did without saying so is wrong in every variant.
 
 usage: edges.py [VARIANT...]    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
@@ -13,16 +14,18 @@ member `native` with `links = "probe"` whose script watches `data.txt` (and, in 
 prints it as its metadata). Two edits of
 `native/data.txt` and one of the parent's `src/main.rs` are built with `cargo ra-jit`, and after
 each the program and the number of runs of both scripts are those of cargo alone in `target-ref`.
+A run is counted wherever the build ran the script: in cargo's `target/debug/build`, or in
+blaze's own `target/ra-jit/build-scripts`, where the owned build runs it (`scriptrerun.runs`).
 
 Python 3, stdlib only.
 """
-import glob, os, shutil, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import cargo_ra_jit
 from cargo_ra_jit import Side, how_built, wait_warm
-from scriptrerun import build, differences, tails
+from scriptrerun import build, differences, not_built_as, runs, tails
 
 PARENT_BUILD = r"""use std::{env, fs, path::PathBuf};
 fn main() {
@@ -80,19 +83,16 @@ VARIANTS = {
     "normal-changing": ('[dependencies]\nnative = { path = "native" }\n', '[workspace]\n'),
 }
 
-# Who builds each edit (`data 2`, `data 3`, `main 8`): the daemon, or cargo, which a parent's
-# script that printed or wrote something else, or a build-dependency's that ran again, sends it to.
+# Who builds each edit (`data 2`, `data 3`, `main 8`): blaze ("daemon"), or, where a parent's
+# script that printed or wrote something else or a build-dependency's that ran again has cargo
+# alone do more than for an edit ("cargo"), blaze's own build or a handoff that says why
+# (`scriptrerun.not_built_as`). A build cargo did without saying so is wrong in every variant.
 EXPECTED = dict.fromkeys(VARIANTS, ("daemon",) * 3)
 EXPECTED.update({
     "build-dep": ("cargo", "cargo", "daemon"),
     "build-dep-counter": ("cargo",) * 3,
     "normal-changing": ("cargo", "cargo", "daemon"),
 })
-
-
-def count(target, package):
-    found = glob.glob(os.path.join(target, "debug", "build", f"{package}-*", "runs"))
-    return sum(int(open(p).read() or 0) for p in found)
 
 
 def variant(bin_dir, name):
@@ -127,10 +127,11 @@ def variant(bin_dir, name):
         ours = subprocess.run([os.path.join(ws, "target/debug/parent")], capture_output=True)
         theirs = subprocess.run([os.path.join(ws, "target-ref/debug/parent")], capture_output=True)
         problems = differences(ours, theirs, built)
-        # A handoff the variant does not make is a dropped or spurious edge, whatever it built.
-        if expected and how.split(":")[0] != expected:
-            problems.append(f"built by {how}, expected {expected}")
-        counts = tuple(count(os.path.join(ws, t), p) for p in ("parent", "native") for t in ("target", "target-ref"))
+        # A build cargo did without saying why is a dropped or spurious edge, whatever it built.
+        built_as = expected and not_built_as(how, expected)
+        if built_as:
+            problems.append(built_as)
+        counts = tuple(runs(os.path.join(ws, t), p) for p in ("parent", "native") for t in ("target", "target-ref"))
         if counts[0] != counts[1] or counts[2] != counts[3]:
             problems.append(f"runs parent {counts[0]}/{counts[1]}, native {counts[2]}/{counts[3]} (ours/cargo)")
         wrong.extend(f"{name}: {step}: {p}" for p in problems)

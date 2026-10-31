@@ -7,9 +7,11 @@
 //!
 //! To run a script as cargo does, the wrapper puts a few lines of shell where rustc linked
 //! it. Cargo runs those, and they run `ra-jit build-script`, which writes down the
-//! environment and the directory cargo ran it in and becomes the script.
+//! environment names and directory cargo ran it in and becomes the script. Values
+//! are held by the daemon only for its lifetime.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -30,12 +32,77 @@ const REAL: &str = "RA_JIT_BUILD_SCRIPT";
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "ra-jit-ran.json";
 
-/// How cargo ran a build script.
+/// How cargo ran a build script, as written beside its `OUT_DIR`: the names of its variables,
+/// never their values (docs/native-environment.md).
 #[derive(Serialize, Deserialize)]
+struct Recorded {
+    real: PathBuf,
+    cwd: PathBuf,
+    env_names: Vec<String>,
+}
+
+/// How cargo ran a build script, with the values of its variables: those of the run itself, or
+/// else [`Recorded`] with what the daemon holds of that run ([`environment`]). After the daemon
+/// that held them stops, the run cannot be read, and its script is cargo's to run.
 struct Ran {
     real: PathBuf,
     cwd: PathBuf,
     env: Vec<(String, String)>,
+}
+
+impl Ran {
+    /// The variables of `env` that are text, as cargo's runs of the script read them.
+    fn of(real: PathBuf, cwd: PathBuf, env: &crate::process::Native) -> Ran {
+        let env = env.vars().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        });
+        Ran { real, cwd, env: env.collect() }
+    }
+
+    /// The run written down in `run_dir`, with the variables the daemon holds of it.
+    fn read(run_dir: &Path) -> Result<Ran, String> {
+        let recorded = std::fs::read(run_dir.join(RAN)).map_err(|it| format!("{RAN}: {it}"))?;
+        let recorded: Recorded = serde_json::from_slice(&recorded).map_err(|it| it.to_string())?;
+        let env = environment(run_dir).ok_or("build-script environment is no longer in memory")?;
+        Ok(Ran::of(recorded.real, recorded.cwd, &env))
+    }
+
+    /// What of it is written down in `run_dir`: names only.
+    fn recorded(real: PathBuf, cwd: PathBuf, env: &crate::process::Native) -> Recorded {
+        let env_names = env.vars().map(|(name, _)| crate::env_identity::name(&name)).collect();
+        Recorded { real, cwd, env_names }
+    }
+}
+
+/// The run written down in `run_dir`, without the values of its variables.
+fn recorded(run_dir: &Path) -> Option<Recorded> {
+    serde_json::from_slice(&std::fs::read(run_dir.join(RAN)).ok()?).ok()
+}
+
+static ENVIRONMENTS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<PathBuf, crate::process::Native>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn remember(dir: PathBuf, env: crate::process::Native) {
+    crate::lock(&ENVIRONMENTS).insert(dir, env);
+}
+
+pub(crate) fn remembered(dir: &Path) -> Option<crate::process::Native> {
+    crate::lock(&ENVIRONMENTS).get(dir).cloned()
+}
+
+pub(crate) fn environment(dir: &Path) -> Option<crate::process::Native> {
+    remembered(dir).or_else(|| {
+        let reply = super::client::ask(
+            super::daemon::Request::ScriptEnvironment(dir.to_owned()),
+            super::client::Start::Never,
+        )
+        .ok()??;
+        match reply {
+            super::daemon::Reply::ScriptEnvironment(env) => env,
+            _ => None,
+        }
+    })
 }
 
 /// Has cargo run the script rustc linked at `linked` through `ra-jit build-script`.
@@ -103,30 +170,33 @@ pub(crate) fn run_as_cargo_does(
     real: PathBuf,
     args: impl Iterator<Item = OsString>,
 ) -> anyhow::Result<()> {
-    let env: Vec<(String, String)> = std::env::vars_os()
-        .filter(|(name, _)| name != REAL)
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .collect();
-    let out_dir =
-        env.iter().find(|(name, _)| name == "OUT_DIR").map(|(_, value)| PathBuf::from(value));
+    let env = crate::process::Native::of(
+        std::env::vars_os().filter(|(name, _)| name != REAL && name != continuation::KEY),
+    );
+    let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
     let args: Vec<OsString> = args.collect();
     let cwd = std::env::current_dir()?;
     if let Some(out_dir) = &out_dir {
-        let ran = Ran { real: real.clone(), cwd: cwd.clone(), env: env.clone() };
+        let ran = Ran::of(real.clone(), cwd.clone(), &env);
         if continuation::consume(&ran, out_dir)? {
             return Ok(());
         }
     }
     if let Some(run_dir) = out_dir.as_deref().and_then(Path::parent) {
-        let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
-        // Without it the script is not run again by the daemon, and cargo builds.
+        // This request is memory-only. A daemon restart loses replay eligibility;
+        // it never reconstructs a caller snapshot from disk or its own environment.
+        let _ = super::client::ask(
+            super::daemon::Request::RememberScript { dir: run_dir.to_owned(), env: env.clone() },
+            super::client::Start::Never,
+        );
+        let ran = Ran::recorded(real.clone(), cwd.clone(), &env);
         let _ = std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran)?);
     }
     // A run is not replayed from the store: what a script reads besides the files it names,
     // and what it does beside its `OUT_DIR` (a file elsewhere, an extended attribute), are
     // not in any key a run is kept under, so a run that is to happen happens.
     let mut script = Command::new(&real);
-    script.args(&args).env_remove(REAL);
+    script.args(&args).env_remove(REAL).env_remove(continuation::KEY);
     become_it(&mut script)
 }
 
@@ -172,21 +242,19 @@ pub(crate) fn in_out_dir(path: &Path) -> bool {
 /// The `links` of the package whose script wrote `out_dir`, as cargo set it to run it
 /// (`CARGO_MANIFEST_LINKS`), when it was written down and the package has one.
 pub(crate) fn links_of(out_dir: &Path) -> Option<String> {
-    let ran = std::fs::read(out_dir.parent()?.join(RAN)).ok()?;
-    let ran = serde_json::from_slice::<Ran>(&ran).ok()?;
+    let ran = Ran::read(out_dir.parent()?).ok()?;
     ran.env.into_iter().find(|it| it.0 == "CARGO_MANIFEST_LINKS").map(|it| it.1)
 }
 
 /// Whether a script can be run again as cargo ran it into `out_dir`.
 pub(crate) fn can_rerun(out_dir: &Path) -> bool {
-    out_dir.parent().is_some_and(|it| it.join(RAN).exists())
+    out_dir.parent().is_some_and(|it| it.join(RAN).exists() && environment(it).is_some())
 }
 
 /// The directory cargo ran the script that wrote `out_dir` in, which is its package's, when
 /// it was written down.
 pub(crate) fn ran_in(out_dir: &Path) -> Option<PathBuf> {
-    let ran = std::fs::read(out_dir.parent()?.join(RAN)).ok()?;
-    serde_json::from_slice::<Ran>(&ran).ok().map(|it| it.cwd)
+    recorded(out_dir.parent()?).map(|it| it.cwd)
 }
 
 /// Whether the script that wrote `out_dir` is as cargo would compile it now: no file rustc
@@ -195,8 +263,7 @@ pub(crate) fn ran_in(out_dir: &Path) -> Option<PathBuf> {
 /// cargo compiles it again when one changes.
 pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> bool {
     let Some(run_dir) = out_dir.parent() else { return false };
-    let Ok(ran) = std::fs::read(run_dir.join(RAN)) else { return false };
-    let Ok(ran) = serde_json::from_slice::<Ran>(&ran) else { return false };
+    let Some(ran) = recorded(run_dir) else { return false };
     let Some(linked) = ran.real.to_str().and_then(|it| it.strip_suffix(".real")) else {
         return false;
     };
@@ -208,12 +275,10 @@ pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> b
     let read = crate::dep_info::DepInfo::parse(&read);
     // Cargo sets its own from the manifest, which a change of has the checkout loaded again;
     // whoever runs cargo sets the others.
-    let set = |name: &str| ran.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
-    if read
-        .env
-        .iter()
-        .any(|(name, value)| !name.starts_with("CARGO_") || set(name) != value.as_deref())
-    {
+    let Some(env) = environment(run_dir) else { return false };
+    let env = env.unicode();
+    let set = |name: &str| env.get(name);
+    if read.env.iter().any(|(name, value)| !name.starts_with("CARGO_") || set(name) != *value) {
         return false;
     }
     !read.files.is_empty()
@@ -493,11 +558,8 @@ fn edges<'a>(
 /// cargo's record of that compile ([`records::compiled_with`]); every declared one when it
 /// cannot be read.
 fn built_with<'a>(out_dir: &Path, cargo: &Cargo<'a>) -> Vec<&'a Dependency> {
-    let compiled = out_dir
-        .parent()
-        .and_then(|it| std::fs::read(it.join(RAN)).ok())
-        .and_then(|it| serde_json::from_slice::<Ran>(&it).ok())
-        .and_then(|it| records::compiled_with(&it.real).ok());
+    let compiled =
+        out_dir.parent().and_then(recorded).and_then(|it| records::compiled_with(&it.real).ok());
     cargo
         .dependencies
         .iter()
@@ -564,9 +626,7 @@ fn judge_locked_inner(
         let unit = records::Unit::of(&dep.out_dir)?;
         let fingerprint = recorded_in(&dep.out_dir, completed)?;
         let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
-        let ran: Ran = std::fs::read(dep.out_dir.parent().ok_or("no run directory")?.join(RAN))
-            .map_err(|it| it.to_string())
-            .and_then(|it| serde_json::from_slice(&it).map_err(|it| it.to_string()))?;
+        let ran = Ran::read(dep.out_dir.parent().ok_or("no run directory")?)?;
         let said = said_to_cargo(&printed, &dep.out_dir, &dep.out_dir, &ran, &context)
             .map_err(|it| it.to_string())?;
         let prefix = format!("DEP_{}_", blaze_build_script::envify(&dep.links));
@@ -584,9 +644,7 @@ fn judge_locked_inner(
     // start replacing OUT_DIR between that read and the tree digest. Hold the lock before
     // reading the invocation too, which cargo can replace with another environment.
     let run_dir = out_dir.parent().ok_or("a build script without a directory")?;
-    let ran: Ran = std::fs::read(run_dir.join(RAN))
-        .map_err(|it| format!("{RAN}: {it}"))
-        .and_then(|it| serde_json::from_slice(&it).map_err(|it| it.to_string()))?;
+    let ran = Ran::read(run_dir)?;
     let var = |name: &str| ran.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
     // The directory as cargo names it, which its records have.
     let cargos = var("OUT_DIR")
@@ -881,6 +939,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn run_record_contains_names_only_and_restart_cannot_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::process::Native::of([("TOKEN".into(), "synthetic-secret".into())]);
+        let ran = Ran::recorded(dir.path().join("script"), dir.path().to_owned(), &env);
+        let bytes = serde_json::to_vec(&ran).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-secret"));
+        std::fs::write(dir.path().join(RAN), bytes).unwrap();
+        remember(dir.path().to_owned(), env.clone());
+        assert_eq!(remembered(dir.path()), Some(env));
+        assert!(can_rerun(&dir.path().join("out")));
+        crate::lock(&ENVIRONMENTS).remove(dir.path());
+        assert_eq!(remembered(dir.path()), None);
+    }
+
     /// A run directory as cargo and `ra-jit build-script` leave one, for a script that
     /// writes `wrote` and prints where.
     fn ran(name: &str, wrote: &str) -> PathBuf {
@@ -938,8 +1011,7 @@ mod tests {
             ("CARGO_PKG_DESCRIPTION".to_owned(), wrote.to_owned()),
             ("PATH".to_owned(), std::env::var("PATH").unwrap()),
         ];
-        let ran = Ran { real, cwd: run_dir.clone(), env };
-        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+        write_ran(&run_dir, &Ran { real, cwd: run_dir.clone(), env });
         std::fs::write(run_dir.join("watched"), "").unwrap();
         let printed = format!("cargo:in={}\ncargo:rerun-if-changed=watched\n", out_dir.display());
         recorded(&out_dir, printed.as_bytes());
@@ -1011,8 +1083,17 @@ mod tests {
     }
 
     fn ran_of(out_dir: &Path) -> Ran {
-        serde_json::from_slice(&std::fs::read(out_dir.parent().unwrap().join(RAN)).unwrap())
-            .unwrap()
+        Ran::read(out_dir.parent().unwrap()).unwrap()
+    }
+
+    /// Writes down `ran` in `run_dir` as `ra-jit build-script` does: its variables' names there,
+    /// and their values with the daemon.
+    fn write_ran(run_dir: &Path, ran: &Ran) {
+        let env = ran.env.iter().map(|(name, value)| (name.into(), value.into()));
+        let env = crate::process::Native::of(env);
+        let recorded = Ran::recorded(ran.real.clone(), ran.cwd.clone(), &env);
+        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&recorded).unwrap()).unwrap();
+        remember(run_dir.to_owned(), env);
     }
 
     #[test]
@@ -1428,22 +1509,38 @@ mod tests {
     /// cargo holds its lock on a build directory. A lock this process held would be held as
     /// well by a process another test starts meanwhile, until it runs what it was started for.
     fn held(lock: &Path) -> std::process::Child {
-        let holds = "open(my $f, '<', shift) or die; flock($f, LOCK_EX) or die; $| = 1; print qq(held\n); <STDIN>;";
-        let mut cargo = Command::new("perl")
-            .args(["-MFcntl=:flock", "-e", holds])
-            .arg(lock)
+        let mut cargo = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cargo::script::tests::cargo_directory_lock_holder", "--nocapture"])
+            .env("RA_JIT_TEST_CARGO_LOCK", lock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let mut output = std::io::BufReader::new(cargo.stdout.take().unwrap());
         let mut held = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(cargo.stdout.take().unwrap()),
-            &mut held,
-        )
-        .unwrap();
-        assert_eq!(held, "held\n");
+        loop {
+            held.clear();
+            assert!(
+                std::io::BufRead::read_line(&mut output, &mut held).unwrap() > 0,
+                "lock holder exited before acquiring its lock"
+            );
+            if held.ends_with("cargo directory lock held\n") {
+                break;
+            }
+        }
+        cargo.stdout = Some(output.into_inner());
         cargo
+    }
+
+    #[test]
+    fn cargo_directory_lock_holder() {
+        use std::io::Write as _;
+        let Some(path) = std::env::var_os("RA_JIT_TEST_CARGO_LOCK") else { return };
+        let lock = std::fs::File::open(path).unwrap();
+        lock.lock().unwrap();
+        println!("cargo directory lock held");
+        std::io::stdout().flush().unwrap();
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
     }
 
     #[test]
@@ -1596,8 +1693,7 @@ mod tests {
     /// Has the script of `out_dir` be one rustc compiled from `sources`, as `.d` says.
     fn compiled(out_dir: &Path, sources: &str) {
         let run_dir = out_dir.parent().unwrap();
-        let mut ran: Ran =
-            serde_json::from_slice(&std::fs::read(run_dir.join(RAN)).unwrap()).unwrap();
+        let mut ran = Ran::read(run_dir).unwrap();
         let linked = run_dir.join("build_script_build-0123");
         if ran.real != linked.with_extension("real") {
             std::fs::copy(&ran.real, linked.with_extension("real")).unwrap();
@@ -1606,7 +1702,7 @@ mod tests {
         // A copy on macOS keeps the time of the file it was copied from.
         let real = std::fs::File::options().write(true).open(&ran.real).unwrap();
         real.set_modified(SystemTime::now()).unwrap();
-        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+        write_ran(run_dir, &ran);
         std::fs::write(linked.with_extension("d"), format!("{}: {sources}\n", linked.display()))
             .unwrap();
     }
@@ -1640,10 +1736,9 @@ mod tests {
         compiled(&out_dir, "build.rs\n\n# env-dep:SOME_VARIABLE=1");
         assert!(!compiled_from_what_is_there(&out_dir, workspace));
         // One of cargo's own is as cargo set it to run the script, or not.
-        let at = workspace.join(RAN);
-        let mut ran: Ran = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+        let mut ran = Ran::read(workspace).unwrap();
         ran.env.push(("CARGO_PKG_VERSION".to_owned(), "1.0.0".to_owned()));
-        std::fs::write(&at, serde_json::to_vec(&ran).unwrap()).unwrap();
+        write_ran(workspace, &ran);
         compiled(&out_dir, "build.rs\n\n# env-dep:CARGO_PKG_VERSION=1.0.0");
         assert!(compiled_from_what_is_there(&out_dir, workspace));
         compiled(&out_dir, "build.rs\n\n# env-dep:CARGO_PKG_VERSION=2.0.0");
@@ -2004,10 +2099,9 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
     /// Has the script of `out_dir` run with `name` set to `value`, as cargo's run had.
     fn with_variable(out_dir: &Path, name: &str, value: &Path) {
         let run_dir = out_dir.parent().unwrap();
-        let mut ran: Ran =
-            serde_json::from_slice(&std::fs::read(run_dir.join(RAN)).unwrap()).unwrap();
+        let mut ran = Ran::read(run_dir).unwrap();
         ran.env.push((name.to_owned(), value.to_str().unwrap().to_owned()));
-        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+        write_ran(run_dir, &ran);
     }
 
     #[test]
@@ -2112,8 +2206,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         );
         let mut ran = ran_of(&out_dir);
         ran.real = ran.real.with_extension("inner");
-        std::fs::write(out_dir.parent().unwrap().join(RAN), serde_json::to_vec(&ran).unwrap())
-            .unwrap();
+        write_ran(out_dir.parent().unwrap(), &ran);
         let before = records::Unit::of(&out_dir).unwrap().recorded().unwrap();
         changed(&out_dir);
         let mut completed = Vec::new();
@@ -2131,6 +2224,124 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
         assert!(!path.exists(), "a subsequent build cannot consume this run");
     }
 
+    /// Cargo 1.99 writes the value of each variable a script says it reads
+    /// (`rerun-if-env-changed`, `LocalFingerprint::from_env`) into its fingerprint of the run,
+    /// and of no other variable: a run made for it has the same fingerprint, which goes where
+    /// cargo writes it. The private file cargo's leg is given has no value.
+    #[test]
+    fn a_completed_run_carries_no_value_of_a_variable_to_cargos_leg() {
+        let lines = format!(
+            "{COUNTS}echo cargo::rerun-if-env-changed=PR15_DECLARED\nprintf %s \"$PR15_READ\" > /dev/null\n"
+        );
+        let out_dir = ran_script("carried-values", &lines, "");
+        let mut ran = ran_of(&out_dir);
+        ran.env.push(("PR15_READ".to_owned(), "pr15-planted-read".to_owned()));
+        write_ran(out_dir.parent().unwrap(), &ran);
+        let planted = |name: &str| match name {
+            "PR15_DECLARED" => Some("pr15-planted-declared".to_owned()),
+            "PR15_READ" => Some("pr15-planted-read".to_owned()),
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &planted, ..CARGO };
+        changed(&out_dir);
+        let mut completed = Vec::new();
+        judge_for(&out_dir, &cargo, &mut completed).unwrap();
+        assert_eq!(completed.len(), 1);
+        let json = serde_json::to_string(completed[0].fingerprint()).unwrap();
+        let declared =
+            r#"{"RerunIfEnvChanged":{"var":"PR15_DECLARED","val":"pr15-planted-declared"}}"#;
+        assert!(json.contains(declared), "cargo's format, with the declared value: {json}");
+        assert!(!json.contains("pr15-planted-read"), "and no other: {json}");
+        let continuation =
+            Continuation::for_command(&mut Command::new("sh"), &completed).unwrap().unwrap();
+        let path = continuation.path();
+        let carried =
+            String::from_utf8_lossy(&std::fs::read(path.join("runs")).unwrap()).into_owned();
+        assert!(!carried.contains("pr15-planted"), "a value in the private file: {carried}");
+        assert!(continuation::consume_in(&ran, &out_dir, &path).unwrap(), "still the run");
+        drop(continuation);
+        completed[0].record().unwrap();
+        let written = std::fs::read_to_string(hash_of(&out_dir).with_extension("json")).unwrap();
+        assert_eq!(written, json, "written as cargo writes it");
+        std::fs::remove_dir_all(out_dir.ancestors().nth(4).unwrap()).unwrap();
+    }
+
+    /// The run of `golden`'s script that cargo 1.99.0 recorded (`records/run-build-script-
+    /// build-script-build.json`: two `rerun-if-changed`, `U8R_GOLDEN=on` and `U8R_UNSET` unset),
+    /// made again by the daemon in cargo's `OUT_DIR` after a file it watches was written: the
+    /// same inputs, so the fingerprint it records is cargo's file byte for byte, and its hash,
+    /// with the declared value and nothing else, as cargo writes it after its own run.
+    #[test]
+    fn a_run_the_daemon_makes_is_recorded_byte_for_byte_as_cargo_records_it() {
+        let json = include_str!("records/run-build-script-build-script-build.json");
+        let hash = include_str!("records/run-build-script-build-script-build");
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-script-golden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("target/debug");
+        let run_dir = dest.join("build/golden-5c9bbc4b342d463e");
+        let out_dir = run_dir.join("out");
+        let package = root.join("golden");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(package.join("data")).unwrap();
+        for lock in [".cargo-build-lock", ".cargo-lock"] {
+            std::fs::write(dest.join(lock), "").unwrap();
+        }
+        std::fs::write(package.join("build.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(package.join("data/in.txt"), "in\n").unwrap();
+        let said = "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=data/./in.txt\n\
+                    cargo:rerun-if-env-changed=U8R_GOLDEN\ncargo:rerun-if-env-changed=U8R_UNSET\n";
+        let real = run_dir.join("script");
+        let lines = format!(
+            "#!/bin/sh\necho run >> \"$OUT_DIR/../runs\"\nprintf '{}'\n",
+            said.replace('\n', "\\n")
+        );
+        let written = Command::new("sh")
+            .args(["-c", "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\""])
+            .arg(&real)
+            .arg(&lines)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
+        let env = vec![
+            ("OUT_DIR".to_owned(), text(&out_dir)),
+            ("CARGO_MANIFEST_DIR".to_owned(), text(&package)),
+            ("U8R_GOLDEN".to_owned(), "on".to_owned()),
+            ("PATH".to_owned(), std::env::var("PATH").unwrap()),
+        ];
+        let ran = Ran { real: real.clone(), cwd: package.clone(), env };
+        write_ran(&run_dir, &ran);
+        std::fs::write(run_dir.join("output"), said).unwrap();
+        std::fs::write(run_dir.join("root-output"), out_dir.as_os_str().as_encoded_bytes())
+            .unwrap();
+        let fingerprints = dest.join(".fingerprint/golden-5c9bbc4b342d463e");
+        std::fs::create_dir_all(&fingerprints).unwrap();
+        let recorded = fingerprints.join("run-build-script-build-script-build");
+        std::fs::write(&recorded, hash).unwrap();
+        std::fs::write(recorded.with_extension("json"), json).unwrap();
+        // Run an hour ago, compiled before it, and a file it watches written since.
+        let ago = |seconds| SystemTime::now() - Duration::from_secs(seconds);
+        set_written(&real, ago(7200));
+        set_written(&run_dir.join("output"), ago(3600));
+        set_written(&package.join("build.rs"), ago(5400));
+        set_written(&package.join("data/in.txt"), ago(1800));
+        let values = |name: &str| match name {
+            "U8R_GOLDEN" => Some("on".to_owned()),
+            "U8R_UNSET" => None,
+            _ => cargo_env(name),
+        };
+        let cargo = Cargo { env: &values, ..CARGO };
+        let mut completed = Vec::new();
+        judge_for(&out_dir, &cargo, &mut completed).unwrap();
+        assert_eq!(std::fs::read_to_string(run_dir.join("runs")).unwrap(), "run\n");
+        assert_eq!(completed.len(), 1, "the daemon made the run");
+        completed[0].record().unwrap();
+        assert_eq!(std::fs::read_to_string(recorded.with_extension("json")).unwrap(), json);
+        assert_eq!(std::fs::read_to_string(&recorded).unwrap(), hash);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn a_completed_run_is_consumed_only_for_unchanged_inputs() {
         for change in [
@@ -2144,6 +2355,8 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             "output",
             "dropped",
             "quiet",
+            "real",
+            "cwd",
         ] {
             let lines = format!(
                 "{COUNTS}echo cargo::rerun-if-changed=inputs\necho cargo::rerun-if-changed=missing\necho cargo::rerun-if-env-changed=PR5_CONTINUE\n"
@@ -2155,7 +2368,7 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
             if matches!(change, "dropped" | "quiet") {
                 ran.real = ran.real.with_extension("inner");
                 std::fs::write(&ran.real, COUNTS).unwrap();
-                std::fs::write(ran.cwd.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+                write_ran(&ran.cwd, &ran);
                 if change == "quiet" {
                     recorded(&out_dir, b"cargo::metadata=in=before\n");
                     let edit = ran.cwd.join("package-edit");
@@ -2197,6 +2410,14 @@ echo \"cargo:rustc-env=INPUT=$(cat input.txt)\"
                     std::fs::write(&edit, "after").unwrap();
                     set_written(&edit, SystemTime::now() + Duration::from_secs(2));
                 }
+                // Cargo's leg runs another script in the directory, or runs it elsewhere: the
+                // same file by another name, and the same inputs, are not the same run.
+                "real" => {
+                    let other = ran.real.with_extension("other");
+                    std::fs::hard_link(&ran.real, &other).unwrap();
+                    ran.real = other;
+                }
+                "cwd" => ran.cwd = ran.cwd.join("inputs"),
                 _ => unreachable!(),
             }
             assert!(!continuation::consume_in(&ran, &out_dir, &path).unwrap(), "{change}: changed");
@@ -2371,7 +2592,7 @@ printf 'pub const RUNS: u32 = 1;\n' > "$OUT_DIR/generated.rs"
                 *value = package.to_str().unwrap().to_owned();
             }
         }
-        std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran).unwrap()).unwrap();
+        write_ran(run_dir, &ran);
         let unit = records::Unit::of(&out_dir).unwrap();
         let began = unit.begin().unwrap();
         let initial = Command::new(&ran.real)

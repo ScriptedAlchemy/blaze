@@ -247,13 +247,8 @@ impl ProjectWorkspace {
         };
 
         // Resolve the Cargo.toml to the workspace root as we base the `target` dir off of it.
-        let own_root = config.own_metadata.as_ref().map(|own| (own.root)(cargo_toml));
-        let own_root = own_root.and_then(|it| {
-            it.inspect_err(|e| {
-                eprintln!("blaze could not find the workspace itself, so cargo does: {e:#}")
-            })
-            .ok()
-        });
+        let own_root =
+            config.own_metadata.as_ref().map(|own| (own.root)(cargo_toml)).transpose()?;
         let mut cmd = sysroot.tool(Tool::Cargo, workspace_dir, extra_env);
         cmd.args(["locate-project", "--workspace", "--manifest-path", cargo_toml.as_str()]);
         let cargo_toml = &match own_root {
@@ -298,18 +293,16 @@ impl ProjectWorkspace {
             .ok()
             .flatten();
 
-        // blaze's own `cargo metadata` needs the target's `cfg` first; cargo's is asked only
-        // when blaze's says no.
-        let mut own = config.own_metadata.as_ref().map(|own| {
-            let target = targets.first().map(Deref::deref);
-            let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
-            let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)
-                .inspect_err(|e| {
-                    eprintln!("blaze could not resolve the workspace itself, so cargo does: {e:#}")
-                })
-                .ok();
-            (cfg, metadata)
-        });
+        // blaze's own metadata needs the target's `cfg` first.
+        let mut own = match &config.own_metadata {
+            Some(own) => {
+                let target = targets.first().map(Deref::deref);
+                let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
+                let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)?;
+                Some((cfg, Some(metadata)))
+            }
+            None => None,
+        };
         let (own_metadata, sources) = match own.as_mut().and_then(|it| it.1.take()) {
             Some((metadata, sources)) => (Some(metadata), sources),
             None => (None, Vec::new()),
@@ -1190,37 +1183,54 @@ fn project_json_to_crate_graph(
                     cfg,
                     target,
                     codegen_flags,
+                    blaze_native_unit,
                     env,
+                    invalid_env,
                     crate_attrs,
                     proc_macro_dylib_path,
                     is_proc_macro,
                     repository,
                     is_workspace_member,
                     proc_macro_cwd,
+                    build,
                     ..
                 },
                 file_id,
             )| {
                 let mut env = env.clone().into_iter().collect::<Env>();
-                // Override existing env vars with those from `extra_env`
-                env.extend(
-                    extra_env
-                        .iter()
-                        .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
-                );
+                if project.compiler_mode {
+                    for name in invalid_env {
+                        env.set_non_unicode(name);
+                    }
+                }
+                if !project.compiler_mode {
+                    // Editor configuration can override the crate's environment.
+                    // A compiler description has already bound its source env;
+                    // service/config variables must not become env! inputs.
+                    env.extend(
+                        extra_env
+                            .iter()
+                            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))),
+                    );
+                }
 
-                let target_cfgs = match target.as_deref() {
-                    Some(target) => cfg_cache.entry(target).or_insert_with(|| {
-                        rustc_cfg::get(
-                            QueryConfig::Rustc(sysroot, project.project_root().as_ref()),
-                            Some(target),
-                            extra_env,
-                        )
-                    }),
-                    None => &rustc_cfg,
-                };
-
-                let cfg_options = {
+                let cfg_options = if project.compiler_mode {
+                    // The compiler description already resolved target, profile,
+                    // test and user cfgs for this unit. Adding analyzer defaults
+                    // here can activate mutually exclusive source branches (for
+                    // example both panic="abort" and panic="unwind").
+                    cfg.iter().cloned().collect()
+                } else {
+                    let target_cfgs = match target.as_deref() {
+                        Some(target) => cfg_cache.entry(target).or_insert_with(|| {
+                            rustc_cfg::get(
+                                QueryConfig::Rustc(sysroot, project.project_root().as_ref()),
+                                Some(target),
+                                extra_env,
+                            )
+                        }),
+                        None => &rustc_cfg,
+                    };
                     let mut cfg_options: CfgOptions =
                         target_cfgs.iter().chain(cfg.iter()).cloned().collect();
 
@@ -1265,7 +1275,12 @@ fn project_json_to_crate_graph(
                         CrateOrigin::Local { repo: None, name: None }
                     },
                     crate_attrs.clone(),
-                    TargetKind::Lib { is_proc_macro: *is_proc_macro },
+                    match build.as_ref().map(|build| build.target_kind) {
+                        Some(TargetKind::Lib { .. }) | None => {
+                            TargetKind::Lib { is_proc_macro: *is_proc_macro }
+                        }
+                        Some(kind) => kind,
+                    },
                     match proc_macro_cwd {
                         Some(path) => Arc::new(path.clone()),
                         None => project_root.clone(),
@@ -1273,6 +1288,7 @@ fn project_json_to_crate_graph(
                     crate_ws_data.clone(),
                 );
                 crate_graph.set_codegen_flags(crate_graph_crate_id, codegen_flags.clone());
+                crate_graph.set_native_unit(crate_graph_crate_id, *blaze_native_unit);
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),
@@ -1766,6 +1782,10 @@ fn add_target_crate_root(
     cargo_path: &Utf8Path,
 ) -> CrateBuilderId {
     let edition = pkg.edition;
+    let mut cfg_options = cfg_options;
+    if matches!(kind, TargetKind::Lib { is_proc_macro: true }) {
+        cfg_options.insert_atom(sym::proc_macro);
+    }
     let potential_cfg_options = if pkg.features.is_empty() {
         None
     } else {

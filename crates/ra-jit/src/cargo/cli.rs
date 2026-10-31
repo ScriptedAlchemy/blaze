@@ -185,6 +185,8 @@ pub(crate) struct Flags {
     pub(crate) excludes: Vec<String>,
     pub(crate) features: Vec<String>,
     pub(crate) all_features: bool,
+    pub(crate) locked: bool,
+    pub(crate) offline: bool,
     pub(crate) no_default_features: bool,
     pub(crate) profile: Option<String>,
     pub(crate) config: Vec<String>,
@@ -367,6 +369,8 @@ impl Invocation {
             features: self.flags.features.clone(),
             no_default_features: self.flags.no_default_features,
             all_features: self.flags.all_features,
+            locked: self.flags.locked,
+            offline: self.flags.offline,
             packages: self.flags.packages.clone(),
             workspace: self.flags.workspace,
             excludes: self.flags.excludes.clone(),
@@ -400,6 +404,12 @@ impl Flags {
                 self.features.extend(features.filter(|it| !it.is_empty()).map(str::to_owned));
             }
             "--all-features" => self.all_features = true,
+            "--locked" => self.locked = true,
+            "--offline" => self.offline = true,
+            "--frozen" => {
+                self.locked = true;
+                self.offline = true;
+            }
             "--no-default-features" => self.no_default_features = true,
             "-r" | "--release" => self.profile = Some("release".to_owned()),
             "--profile" => self.profile = owned(),
@@ -457,16 +467,38 @@ pub(crate) fn worker_env() -> BTreeMap<String, String> {
     env
 }
 
+pub(crate) fn producer_env_in(env: &[(String, String)]) -> BTreeMap<String, String> {
+    env.iter().filter(|(name, _)| named(name, WORKER_ENV)).cloned().collect()
+}
+
+fn named(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|it| if it.ends_with('_') { name.starts_with(it) } else { name == *it })
+}
+
 fn env_named(names: &[&str]) -> BTreeMap<String, String> {
-    let named = |name: &str| {
-        names.iter().any(|it| if it.ends_with('_') { name.starts_with(it) } else { name == *it })
-    };
-    std::env::vars().filter(|(name, _)| named(name)).collect()
+    crate::process::vars().filter(|(name, _)| named(name, names)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_identity_reads_the_supplied_environment_without_memory_policy() {
+        let env = [
+            ("RUSTFLAGS".into(), "--cfg caller".into()),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL".into(), "1".into()),
+            ("RA_JIT_MEMORY_MAX".into(), "16G".into()),
+            ("CARGO_PKG_NAME".into(), "wrapper-only".into()),
+        ];
+        assert_eq!(
+            producer_env_in(&env),
+            BTreeMap::from([
+                ("RUSTFLAGS".into(), "--cfg caller".into()),
+                ("CARGO_PROFILE_DEV_OPT_LEVEL".into(), "1".into()),
+            ])
+        );
+    }
 
     fn build(subcommand: &str, args: &str) -> Invocation {
         let words = std::iter::once(subcommand).chain(args.split_whitespace());
@@ -508,6 +540,19 @@ mod tests {
         let asked = build("build", "--features");
         assert_eq!(asked.build_args, ["--features"]);
         assert!(asked.flags.features.is_empty());
+    }
+
+    #[test]
+    fn lockfile_policy_survives_worker_selection_and_flag_round_trip() {
+        for (flag, locked, offline) in
+            [("--locked", true, false), ("--offline", false, true), ("--frozen", true, true)]
+        {
+            let invocation = build("build", flag);
+            let selection = invocation.selection();
+            assert_eq!((selection.locked, selection.offline), (locked, offline));
+            let rebuilt = build("build", &selection.flags().join(" "));
+            assert_eq!((rebuilt.flags.locked, rebuilt.flags.offline), (locked, offline));
+        }
     }
 
     #[test]

@@ -173,34 +173,21 @@ impl Sysroot {
         }
     }
 
-    pub fn tool_path(&self, tool: Tool, current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
-        match self.root() {
-            Some(root) => {
-                let mut cmd = toolchain::command(
-                    Tool::Rustup.path(),
-                    current_dir,
-                    &envs
-                        .into_iter()
-                        .map(|(k, v)| (k.clone(), Some(v.clone())))
-                        .collect::<FxHashMap<_, _>>(),
-                );
-                if !envs.contains_key("RUSTUP_TOOLCHAIN")
-                    && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
-                {
-                    cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(root));
-                }
-
-                cmd.arg("which");
-                cmd.arg(tool.name());
-                (|| {
-                    Some(Utf8PathBuf::from(
-                        String::from_utf8(cmd.output().ok()?.stdout).ok()?.trim_end(),
-                    ))
-                })()
-                .unwrap_or_else(|| Utf8PathBuf::from(tool.name()))
-            }
-            _ => tool.path(),
+    pub fn tool_path(&self, tool: Tool, _current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
+        // An explicit tool wins. Otherwise the discovered source toolchain already
+        // names its bin directory; asking rustup to rediscover it starts an avoidable
+        // process and may select a different toolchain.
+        let name = tool.name().to_ascii_uppercase();
+        if let Some(path) = envs.get(&name) {
+            return Utf8PathBuf::from(path);
         }
+        if let Some(root) = self.root() {
+            return root
+                .join("bin")
+                .join(format!("{}{}", tool.name(), env::consts::EXE_SUFFIX))
+                .into();
+        }
+        tool.path()
     }
 
     pub fn discover_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {

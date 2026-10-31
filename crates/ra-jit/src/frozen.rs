@@ -136,7 +136,7 @@ fn key_of(
     vars.sort_unstable();
     field(vars.join("\n").as_bytes());
     if let Some(out) = &out {
-        for (path, hash) in crate::content::written_to(db, krate, out) {
+        for (path, hash) in crate::content::written_to(db, krate, out)? {
             field(path.as_bytes());
             field(&hash);
         }

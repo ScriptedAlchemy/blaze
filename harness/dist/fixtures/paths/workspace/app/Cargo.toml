@@ -1,0 +1,9 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inner = { path = "../inner" }
+shared = { path = "../../shared" }
+fastrand = "=2.4.1"

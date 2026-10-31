@@ -662,6 +662,7 @@ fn validate_receipt(
             .arrived(
                 context.symbols.cargo_home().as_deref(),
                 context.symbols.library_sources().as_ref(),
+                context.symbols.checkout().as_deref(),
             )
             .ok_or("entry paths cannot be bound here")?;
     }

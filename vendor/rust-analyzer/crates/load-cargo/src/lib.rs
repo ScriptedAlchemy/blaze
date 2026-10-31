@@ -51,6 +51,10 @@ pub struct LoadCargoConfig {
     pub proc_macro_processes: usize,
 }
 
+pub use proc_macro_api::producer_lifetime as proc_macro_producer_lifetime;
+/// Worker snapshot allocation and post-wait cleanup use the same API-owned layout.
+pub use proc_macro_api::snapshot_dir as proc_macro_snapshot_dir;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcMacroServerChoice {
     Sysroot,
@@ -144,9 +148,46 @@ pub struct Loaded {
     /// The server of the libraries that list their macros ([`serve_listed_with`]), started
     /// when the first of them is loaded.
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    snapshot_root: Option<std::path::PathBuf>,
+    expected_macro_images: FxHashMap<AbsPathBuf, [u8; 32]>,
+    /// The variables the proc-macro servers start with over the worker's, as the latest
+    /// request has them ([`Self::set_proc_macro_env`]); the load's own when none was told.
+    proc_macro_env: Option<Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>>,
 }
 
 impl Loaded {
+    pub fn set_proc_macro_image_identities(&mut self, images: FxHashMap<AbsPathBuf, [u8; 32]>) {
+        self.expected_macro_images = images;
+    }
+
+    /// Explicit worker ownership for snapshots, set before starting either server.
+    pub fn set_proc_macro_snapshot_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.snapshot_root = root;
+    }
+
+    /// The variables of the process the next load is for, over the worker's own, a `None`
+    /// removing one the worker has. A proc macro reads its server's environment, as it reads
+    /// rustc's, so a server started for an earlier request with other variables does not
+    /// expand what is loaded from now on: a new generation is started with these. Whether
+    /// they are other than those told before, in any order: the expanders the database has
+    /// are then of servers with other variables, and are to be loaded again
+    /// ([`Self::add`] with no workspace) before they expand for this process.
+    pub fn set_proc_macro_env(
+        &mut self,
+        env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    ) -> bool {
+        let env: Vec<_> =
+            env.into_iter().collect::<std::collections::BTreeMap<_, _>>().into_iter().collect();
+        for server in [&self.proc_macro_server, &self.listed_server] {
+            if let Some(Ok(server)) = server {
+                server.set_generation_env(env.iter().map(|(name, value)| (name, value)));
+            }
+        }
+        let changed = self.proc_macro_env.as_ref() != Some(&env);
+        self.proc_macro_env = Some(env);
+        changed
+    }
+
     pub fn workspaces(&self) -> &[ProjectWorkspace] {
         &self.workspaces
     }
@@ -158,6 +199,11 @@ impl Loaded {
 
     /// Puts `workspace` where the one at `index` is. It is loaded by the next [`Self::add`].
     pub fn replace(&mut self, index: usize, workspace: ProjectWorkspace) {
+        for server in [&self.proc_macro_server, &self.listed_server] {
+            if let Some(Ok(server)) = server {
+                server.begin_load_epoch();
+            }
+        }
         self.workspaces[index] = workspace;
     }
 
@@ -236,17 +282,29 @@ impl Loaded {
             Ok((_, path)) => !listed.contains(path),
             Err(_) => false,
         });
+        let server_env = self.proc_macro_env.clone().unwrap_or_else(|| {
+            let env = extra_env.iter();
+            env.map(|(name, value)| (name.into(), value.as_ref().map(Into::into))).collect()
+        });
         if self.proc_macro_server.is_none() && unlisted {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
+            self.proc_macro_server =
+                spawn_proc_macro_server(ws, &server_env, load_config).map(|server| {
+                    server.map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                });
         }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {
+            let env = server_env.iter().map(|(name, value)| (name, value));
             let spawned =
-                ProcMacroClient::spawn(server, extra_env, None, load_config.proc_macro_processes);
-            self.listed_server = Some(spawned.map_err(|e| {
-                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
-            }));
+                ProcMacroClient::spawn(server, env, None, load_config.proc_macro_processes);
+            self.listed_server = Some(
+                spawned
+                    .map(|server| server.with_snapshot_root(self.snapshot_root.clone()))
+                    .map_err(|e| {
+                        ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
+                    }),
+            );
         }
         let proc_macros = {
             fn running(
@@ -273,7 +331,12 @@ impl Loaded {
                                 false => &proc_macro_server,
                             };
                             server.as_ref().map_err(Clone::clone).and_then(|proc_macro_server| {
-                                load_proc_macro(proc_macro_server, &path, &[])
+                                load_proc_macro_with_content(
+                                    proc_macro_server,
+                                    &path,
+                                    &[],
+                                    self.expected_macro_images.get(&path).copied(),
+                                )
                             })
                         }),
                     )
@@ -398,13 +461,13 @@ fn join_root(
 
 fn spawn_proc_macro_server(
     ws: &ProjectWorkspace,
-    extra_env: &FxHashMap<String, Option<String>>,
+    env: &[(std::ffi::OsString, Option<std::ffi::OsString>)],
     load_config: &LoadCargoConfig,
 ) -> Option<Result<ProcMacroClient, ProcMacroLoadingError>> {
     let spawn = |path: &AbsPath| {
         ProcMacroClient::spawn(
             path,
-            extra_env,
+            env.iter().map(|(name, value)| (name, value)),
             ws.toolchain.as_ref(),
             load_config.proc_macro_processes,
         )
@@ -713,8 +776,20 @@ pub fn load_proc_macro(
     path: &AbsPath,
     ignored_macros: &[Box<str>],
 ) -> ProcMacroLoadResult {
+    load_proc_macro_with_content(server, path, ignored_macros, None)
+}
+
+fn load_proc_macro_with_content(
+    server: &ProcMacroClient,
+    path: &AbsPath,
+    ignored_macros: &[Box<str>],
+    expected: Option<[u8; 32]>,
+) -> ProcMacroLoadResult {
     let res: Result<Vec<_>, _> = (|| {
-        let dylib = MacroDylib::new(path.to_path_buf());
+        let dylib = match expected {
+            Some(content) => MacroDylib::new(path.to_path_buf()).with_expected_content(content),
+            None => MacroDylib::new(path.to_path_buf()),
+        };
         let vec = server.load_dylib(dylib).map_err(|e| {
             ProcMacroLoadingError::ProcMacroSrvError(format!("{e}").into_boxed_str())
         })?;
@@ -948,6 +1023,14 @@ impl ProcMacroExpander for Expander {
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         (other as &dyn Any).downcast_ref::<Self>() == Some(self)
     }
+
+    fn content_identity(&self) -> Option<[u8; 32]> {
+        self.0.content_identity()
+    }
+
+    fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.0.environment_identity()
+    }
 }
 
 fn resolve_sub_span(
@@ -979,6 +1062,16 @@ mod tests {
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
+
+    #[test]
+    fn a_changed_proc_macro_environment_is_told_in_any_order() {
+        let var = |name: &str, value: Option<&str>| (name.into(), value.map(Into::into));
+        let mut loaded = Loaded::default();
+        assert!(loaded.set_proc_macro_env(vec![var("PR15_PRIVATE", Some("old")), var("A", None)]));
+        assert!(!loaded.set_proc_macro_env(vec![var("A", None), var("PR15_PRIVATE", Some("old"))]));
+        assert!(loaded.set_proc_macro_env(vec![var("A", None), var("PR15_PRIVATE", None)]));
+        assert!(!loaded.set_proc_macro_env(vec![var("PR15_PRIVATE", None), var("A", None)]));
+    }
 
     #[test]
     fn test_loading_rust_analyzer() {

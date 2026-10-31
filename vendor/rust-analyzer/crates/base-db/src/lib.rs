@@ -163,6 +163,13 @@ impl Files {
 
     /// Where the file known as `path` is read from.
     pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
+        let resolved = match paths::native::resolve(path) {
+            Ok(path) => path,
+            // This non-fallible watcher API must never read a physical shadow of
+            // a malformed logical name. NUL is invalid on every host filesystem.
+            Err(_) => return std::path::PathBuf::from("\0invalid-native-source-path"),
+        };
+        let path = resolved.as_ref();
         let views = self.views.read().unwrap_or_else(|it| it.into_inner());
         let over = views
             .iter()
@@ -368,6 +375,11 @@ pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
 }
 
+/// Whether the process supplied a value that cannot form a Rust string.
+pub fn process_env_is_non_unicode(db: &dyn salsa::Database, key: &str) -> bool {
+    ProcessEnv::try_get(db).is_some_and(|env| env.vars(db).is_non_unicode(key))
+}
+
 /// Has builds from here on be for a process with the variables `vars`.
 pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
     use salsa::Setter as _;
@@ -393,6 +405,16 @@ pub struct FileText {
 pub struct IncludedFile {
     #[returns(ref)]
     pub bytes: Option<std::sync::Arc<[u8]>>,
+}
+
+/// An include performed by the current tracked query execution. Unlike the
+/// historical watcher map, salsa accumulators retract observations when the
+/// query stops reading a file, and replay them on memo hits.
+#[salsa::accumulator]
+#[derive(Clone, Debug)]
+pub struct CurrentIncludedInput {
+    pub krate: Crate,
+    pub path: AbsPathBuf,
 }
 
 #[salsa::input(debug)]
@@ -457,6 +479,18 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// as `krate` reads it.
     fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
         None
+    }
+
+    /// Record dependencies on the externally included inputs discovered for this crate.
+    /// Consumers retaining code across revisions call this after lowering, when the
+    /// complete read set is known. The bytes remain tracked salsa inputs.
+    fn depend_on_included_inputs(&self, _krate: Crate) {}
+
+    /// Tracked bytes of observed external inputs. Historical observations remain
+    /// available for conservative code identities; current required inputs are
+    /// separately accumulated by semantic owner discovery.
+    fn included_inputs(&self, _krate: Crate) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        Vec::new()
     }
 
     /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing

@@ -23,13 +23,16 @@
 extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 mod attrs;
+mod channel_features;
 mod from_id;
 mod has_source;
 mod semantics;
 mod source_analyzer;
 
+pub mod compiler_acceptance;
 pub mod db;
 pub mod diagnostics;
+pub mod input_owners;
 pub mod symbols;
 pub mod term_search;
 
@@ -195,7 +198,7 @@ pub use {
         mod_path::{ModPath, PathKind, tool_path},
         name::{self, Name},
         prettify_macro_expansion,
-        proc_macro::{ProcMacros, ProcMacrosBuilder},
+        proc_macro::{CrateProcMacros, ProcMacros, ProcMacrosBuilder},
         tt,
     },
     // FIXME: Properly encapsulate mir

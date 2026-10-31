@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """coldbuild.py: `cargo blaze build` and `run` from nothing are blaze's own whole build, with
-no `cargo build` (docs/no-rustc.md, step K, #91), under `RA_JIT_WHOLE_BUILD=1`.
+no `cargo build` (docs/no-rustc.md, step K, #91), through the default owned route.
 
     python3 coldbuild.py                 # the fixtures
     python3 coldbuild.py bench [names]   # bench.py's projects: ripgrep fd hyperfine by default
@@ -131,7 +131,6 @@ def write(root, files):
 
 def env_for(root, remote=None):
     env = base_env(os.path.join(root, "home"))
-    env["RA_JIT_WHOLE_BUILD"] = "1"
     if remote:
         env["RA_JIT_STD_FROM"] = remote
     return env
@@ -147,7 +146,6 @@ def blaze(ws, env, *args):
 def cargo(ws, env, target, *args):
     """cargo's own build of the same source, into a target directory of its own."""
     env = dict(env, CARGO_TARGET_DIR=target)
-    env.pop("RA_JIT_WHOLE_BUILD", None)
     start = time.monotonic()
     ran = subprocess.run(["cargo", *args], cwd=ws, env=env, capture_output=True, text=True, timeout=TIMEOUT)
     return ran, time.monotonic() - start

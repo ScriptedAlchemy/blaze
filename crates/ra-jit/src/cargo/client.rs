@@ -36,7 +36,21 @@ pub(crate) enum Start {
 
 /// Sends `request` to the daemon. `None` when there is none and none was to be started;
 /// `Reply::Restart` when the one there is is of another version and none was to be started.
-pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
+pub(crate) fn ask(mut request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
+    match &mut request {
+        Request::Sync(checkout) | Request::Warm(checkout) | Request::Build(checkout) => {
+            if checkout.native_env.is_none() {
+                checkout.native_env = Some(
+                    crate::process::native()
+                        .over(checkout.env.iter().map(|(k, v)| (k.into(), v.into()))),
+                );
+            }
+        }
+        Request::Ahead(ahead) | Request::Check(ahead) => {
+            ahead.native_env = Some(crate::process::native());
+        }
+        _ => {}
+    }
     let home = home()?;
     let socket = socket_in(&home);
     // A daemon of another version exits for a client that starts its own, and for one that

@@ -14,17 +14,27 @@ use cargo_metadata::Metadata;
 /// its message, status 101.
 pub(crate) fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let config = Config::from_process().and_then(|mut process| {
-        process.start("metadata", config)?;
-        Ok(process)
-    });
-    match config.and_then(|config| read(config, manifest_path)) {
+    match no_deps_in(&cwd, manifest_path, config, crate::process::vars().collect()) {
         Ok(metadata) => metadata,
         Err(err) => {
             refused(&err, &cwd);
             std::process::exit(101)
         }
     }
+}
+
+/// Read from the invoking Cargo's directory, not the directory it runs rustc in.
+/// A caller that only collects provenance must not end a compile on a reader error.
+pub(super) fn no_deps_in(
+    cwd: &Path,
+    manifest_path: Option<&Path>,
+    config: &[String],
+    env: Vec<(String, String)>,
+) -> anyhow::Result<Metadata> {
+    let mut process = Config::load(cwd, env, &[])?;
+    process.start("metadata", config)?;
+    let manifest = manifest_path.map(|path| cwd.join(path));
+    read(process, manifest.as_deref())
 }
 
 fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata> {
@@ -43,10 +53,11 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
         return None;
     }
     let selection = selection.clone();
+    let offline = selection.offline;
     let root = |manifest: &project_model::ManifestPath| {
         let manifest: &Path = manifest.as_ref();
         let cwd = manifest.parent().unwrap_or(Path::new("/"));
-        let root = blaze_metadata::workspace_root(cwd, std::env::vars().collect(), manifest)?;
+        let root = blaze_metadata::workspace_root(cwd, crate::process::vars().collect(), manifest)?;
         let root = paths::AbsPathBuf::assert_utf8(root);
         Ok(project_model::ManifestPath::try_from(root).expect("a manifest is a file"))
     };
@@ -64,7 +75,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             }
             None => (loaded.parent().unwrap_or(Path::new("/")).to_owned(), Some(loaded)),
         };
-        let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
         for (key, value) in env {
             match value {
                 Some(value) => vars.insert(key.clone(), value.clone()),
@@ -88,10 +99,14 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
                 dev_units: selection.dev_deps,
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
-            offline: false,
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
+            rust_release: Some(&crate::answers::rust_release),
         };
-        let (json, sources) = blaze_metadata::metadata_with_sources(&asked)?;
+        let (host_triple, host_cfg) = host_platform()?;
+        let host = blaze_metadata::TargetPlatform { triple: &host_triple, cfg: &host_cfg };
+        let (json, sources) = blaze_metadata::metadata_with_sources_for_host(&asked, &host)?;
         let metadata =
             serde_json::from_str(&json).context("blaze's own metadata is not cargo's form")?;
         Ok((metadata, sources))
@@ -99,7 +114,9 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),
         metadata: std::sync::Arc::new(metadata),
-        sysroot: std::sync::Arc::new(sysroot_metadata),
+        sysroot: std::sync::Arc::new(move |manifest, config, cfg| {
+            sysroot_metadata(manifest, config, cfg, offline)
+        }),
     })
 }
 
@@ -109,10 +126,11 @@ fn sysroot_metadata(
     manifest: &project_model::ManifestPath,
     config: &project_model::CargoMetadataConfig,
     cfg: &[cfg::CfgAtom],
+    offline: bool,
 ) -> anyhow::Result<Metadata> {
     let manifest: &Path = manifest.as_ref();
     let cwd = manifest.parent().context("std manifest has no directory")?;
-    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut vars: std::collections::BTreeMap<String, String> = crate::process::vars().collect();
     for (name, value) in &config.extra_env {
         match value {
             Some(value) => vars.insert(name.clone(), value.clone()),
@@ -137,8 +155,10 @@ fn sysroot_metadata(
         no_default_features: no_default,
         build: None,
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
-        offline: false,
+        offline,
+        locked: true,
         store: None,
+        rust_release: Some(&crate::answers::rust_release),
     };
     let json = blaze_metadata::metadata(&asked)?;
     serde_json::from_str(&json).context("blaze's std metadata is not cargo's form")
@@ -158,28 +178,12 @@ pub(crate) fn programs(
         return None;
     }
     let planned = || {
-        let rustc = super::state::rustc_path();
-        let asked = |args: &[&str]| {
-            let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
-            said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
-        };
-        let triple = match &selection.target {
-            Some(triple) => triple.clone(),
-            None => {
-                let told = asked(&["-vV"])?;
-                let host = told.lines().find_map(|it| it.strip_prefix("host: "));
-                host.context("rustc names no host")?.to_owned()
-            }
-        };
-        let printed = asked(&["--print", "cfg", "--target", &triple])?;
-        let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
-            use std::str::FromStr;
-            cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
-        });
-        let cfg = cfg.collect::<anyhow::Result<Vec<_>>>()?;
+        let (host_triple, host_cfg) = host_platform()?;
+        let triple = selection.target.as_deref().unwrap_or(&host_triple);
+        let cfg = if triple == host_triple { host_cfg.clone() } else { platform_cfgs(triple)? };
         let asked = blaze_metadata::Asked {
             cwd,
-            env: std::env::vars().collect(),
+            env: crate::process::vars().collect(),
             manifest_path: manifest,
             config: &selection.config,
             features: &selection.features,
@@ -191,13 +195,41 @@ pub(crate) fn programs(
                 excludes: &selection.excludes,
                 dev_units: selection.dev_deps,
             }),
-            platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
-            offline: false,
+            platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
+            offline: selection.offline,
+            locked: selection.locked,
             store: None,
+            rust_release: Some(&crate::answers::rust_release),
         };
-        Ok(blaze_metadata::programs(&asked, targets)?.1)
+        let host = blaze_metadata::TargetPlatform { triple: &host_triple, cfg: &host_cfg };
+        Ok(blaze_metadata::programs_for_host(&asked, targets, &host)?.1)
     };
     Some(planned())
+}
+
+fn compiler_answer(args: &[&str]) -> anyhow::Result<String> {
+    let rustc = super::state::rustc_path();
+    // `rustc_says` uses the owned answers; it never runs a compiler.
+    super::state::rustc_says(&rustc, args)
+        .filter(|it| !it.is_empty())
+        .with_context(|| format!("blaze has no compiler answer for {}", args.join(" ")))
+}
+
+fn platform_cfgs(triple: &str) -> anyhow::Result<Vec<cargo_platform::Cfg>> {
+    let printed = compiler_answer(&["--print", "cfg", "--target", triple])?;
+    printed
+        .lines()
+        .filter(|it| !it.is_empty())
+        .map(|it| it.parse().with_context(|| format!("the cfg {it}")))
+        .collect()
+}
+
+fn host_platform() -> anyhow::Result<(String, Vec<cargo_platform::Cfg>)> {
+    let told = compiler_answer(&["-vV"])?;
+    let host = told.lines().find_map(|it| it.strip_prefix("host: "));
+    let host = host.context("blaze has no compiler host")?.to_owned();
+    let cfg = platform_cfgs(&host)?;
+    Ok((host, cfg))
 }
 
 /// A `cfg` as rust-analyzer has it, as cargo's platforms read it.
@@ -243,6 +275,30 @@ mod tests {
                 std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn provenance_reader_uses_cargo_cwd_and_returns_errors() {
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-provenance-cwd-{}", std::process::id()));
+        let workspace = root.join("macros");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='producer'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "").unwrap();
+        let env = vec![("CARGO_HOME".into(), root.join("home").display().to_string())];
+        let read = super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env.clone());
+        assert_eq!(read.unwrap().packages[0].name.as_str(), "producer");
+        assert!(
+            super::no_deps_in(&workspace, Some(Path::new("macros/Cargo.toml")), &[], env.clone())
+                .is_err()
+        );
+        std::fs::write(workspace.join("Cargo.toml"), "invalid = [").unwrap();
+        assert!(super::no_deps_in(&root, Some(Path::new("macros/Cargo.toml")), &[], env).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Each workspace of blaze-manifest's fixtures that cargo reads is, as `cargo_metadata`
