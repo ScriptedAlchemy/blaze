@@ -405,7 +405,8 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     if let Some(host_root) = &search.host_root {
         let mut search_path =
             cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-        search_path.extend(below(&search.plugin_search, host_root));
+        let plugin_root = search.plugin_root.as_deref().unwrap_or(host_root);
+        search_path.extend(below(&search.plugin_search, plugin_root));
         cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
     }
     // The jobserver's `Client::configure`.

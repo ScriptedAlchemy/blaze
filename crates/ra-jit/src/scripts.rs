@@ -833,8 +833,38 @@ impl<'a> Runner<'a> {
                 deps.push((format!("run of {}", dep_data.name), ran.fingerprint, ran.made));
             }
         }
-        let unit = self.unit(package, for_host, &lib, exe, dependencies)?;
+        let plugin_search = self.plugin_search(package)?;
+        let unit = self.unit(package, for_host, &lib, exe, dependencies, plugin_search)?;
         self.judge(package, unit, compiled, &deps)
+    }
+
+    /// What the scripts of the packages the script of `package` is compiled with (its build
+    /// dependencies and theirs, as the host has them) added with `rustc-link-search`, in the
+    /// order cargo runs them: where the script's run finds a shared library one of them built
+    /// (`add_plugin_deps`).
+    fn plugin_search(&mut self, package: Package) -> Result<Vec<PathBuf>, String> {
+        let cargo = self.cargo;
+        let mut queue: Vec<Package> = cargo[package]
+            .dependencies
+            .iter()
+            .filter(|it| it.kind == DepKind::Build)
+            .map(|it| it.pkg)
+            .collect();
+        queue.reverse();
+        let mut seen = FxHashSet::default();
+        let mut paths = Vec::new();
+        while let Some(dep) = queue.pop() {
+            if !seen.insert(dep) {
+                continue;
+            }
+            if self.runs(dep) {
+                let ran = self.script(dep, true)?;
+                paths.extend(ran.output.library_paths.iter().map(|it| it.path().to_owned()));
+            }
+            let normal = cargo[dep].dependencies.iter().filter(|it| it.kind == DepKind::Normal);
+            queue.extend(normal.map(|it| it.pkg).rev());
+        }
+        Ok(paths)
     }
 
     /// Where a build's judgment of the script of `package` starts: what the build judged already,
@@ -848,7 +878,7 @@ impl<'a> Runner<'a> {
         for_host: bool,
         lib: &Profile,
     ) -> Result<Option<Arc<Done>>, String> {
-        let probe = self.unit(package, for_host, lib, PathBuf::new(), Vec::new())?;
+        let probe = self.unit(package, for_host, lib, PathBuf::new(), Vec::new(), Vec::new())?;
         let run_dir = blaze_build_script::run::run_dir(&probe).to_owned();
         let build = self.asked.build;
         match self.leases.decision(build, &run_dir) {
@@ -1118,6 +1148,7 @@ impl<'a> Runner<'a> {
         lib: &Profile,
         script: PathBuf,
         dependencies: Vec<unit::Dependency>,
+        plugin_search: Vec<PathBuf>,
     ) -> Result<Unit, String> {
         let data = &self.cargo[package];
         let debuginfo = self.debuginfo(package, for_host, lib);
@@ -1222,7 +1253,9 @@ impl<'a> Runner<'a> {
                 host_root: Some(target_dir.join(&dir_name)),
                 host_deps: vec![target_dir.join(&dir_name).join("deps")],
                 sysroot_libdir: self.sysroot.join("lib/rustlib").join(self.asked.host).join("lib"),
-                plugin_search: Vec::new(),
+                plugin_search,
+                // Blaze's scripts write below its own directory of the target directory.
+                plugin_root: Some(target_dir.to_owned()),
             },
             jobserver: None,
         })
