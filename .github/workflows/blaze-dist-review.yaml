@@ -204,4 +204,6 @@ jobs:
             ${{ runner.temp }}/c2-llvm/results.json
             ${{ runner.temp }}/c2-llvm/*.exec
             ${{ runner.temp }}/c2-llvm/*.log
+            ${{ runner.temp }}/c2-cranelift/bundle/no-run.cbor.outputs
+            ${{ runner.temp }}/c2-llvm/bundle/no-run.cbor.outputs
           if-no-files-found: warn

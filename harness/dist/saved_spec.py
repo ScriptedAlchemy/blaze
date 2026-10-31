@@ -30,6 +30,11 @@ import tracedecay
 from owned_macro_server import runtime_record
 
 
+# The groups of cases `--only` selects among. The whole run is the gate; a group alone is for
+# working on one case without the hour the others take.
+GROUPS = ("core", "raw", "owned", "producer-profile", "native-dependency", "dynamic", "workspace", "tail")
+
+
 def write(root, name, contents):
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -438,7 +443,7 @@ def owned_shared_cache(runner, blaze, work, env):
     assert before == after, "read-only compiler changed the remote"
 
 
-def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile):
+def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile, only=frozenset(GROUPS)):
     def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True):
         expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *command, "--locked", "--offline"], reference_env, project, guarded=False)
         saved = bundle / (name + ".cbor")
@@ -449,124 +454,130 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
             assert actual == expected, (name, actual, expected)
         return saved, expected, actual
 
-    raw_compiler_case(runner, blaze, real, work, env, oracle_env)
-    owned_test_policy(runner, blaze, work, env)
-    owned_shared_cache(runner, blaze, work, env)
+    if "raw" in only:
+        raw_compiler_case(runner, blaze, real, work, env, oracle_env)
+    if "owned" in only:
+        owned_test_policy(runner, blaze, work, env)
+        owned_shared_cache(runner, blaze, work, env)
     profile = ["--config", "profile.dev.debug=0"]
-    project = work / "producer-profile"
-    producer_fixture(project)
-    _, expected, _ = roundtrip("producer-profile", project, ["run", *profile])
-    assert expected == "42|owned-build\n", expected
-
-    project = work / "native-dependency"
-    native_fixture(project)
     compiler = shutil.which("cc", path=oracle_env["PATH"])
     assert compiler, "native C oracle compiler is unavailable"
-    wrapper = write(work, "native-tools/bound-cc", "#!" + (shutil.which("sh") or "/bin/sh") + "\nexec " + shlex.quote(compiler) + ' "$@"\n')
-    wrapper.chmod(0o755)
-    native_env, native_oracle = dict(env, CC=str(wrapper)), dict(oracle_env, CC=str(wrapper))
-    saved, expected, _ = roundtrip("native-dependency", project, ["run", *profile], native_env, native_oracle)
-    assert expected == "42\n", expected
-    results = list(Path(str(saved) + ".outputs").glob("replay-*/result.json"))
-    with wrapper.open("a") as output:
-        output.write("# compiler bytes changed; version and behavior are unchanged\n")
-    runner.run("native-compiler-bytes-changed", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile,
-               expected=None, contains="platform")
-    assert list(Path(str(saved) + ".outputs").glob("replay-*/result.json")) == results
+    if "producer-profile" in only:
+      project = work / "producer-profile"
+      producer_fixture(project)
+      _, expected, _ = roundtrip("producer-profile", project, ["run", *profile])
+      assert expected == "42|owned-build\n", expected
 
-    project = work / "dynamic-producers"
-    dynamic_producer_fixture(project)
-    dynamic_env = without_nix_rpath(dict(env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-product-target")))
-    dynamic_oracle = without_nix_rpath(dict(oracle_env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-oracle-target")))
-    command = ["run", "-p", "saved-dynamic-app", *profile]
-    expected, _ = runner.run("dynamic-reference", [real / "bin/cargo", *command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
-    assert expected == "42|42|42|true\n", expected
-    extension = ".so" if sys.platform.startswith("linux") else ".dylib"
-    reference_target = Path(dynamic_oracle["CARGO_TARGET_DIR"])
-    controls = [reference_target / "debug/saved-dynamic-app", *reference_target.rglob("libsaved_dynamic" + extension), *reference_target.rglob("libsaved_dynamic_macro*" + extension), *reference_target.rglob("build-script-build")]
-    no_rpath_control(runner, "dynamic-reference", controls, dynamic_oracle, project)
-    def direct(name, direct_command):
-        wrapped = [sys.executable, __file__, "--cache-phase", str(blaze), str(work / (name + "-stop.log")),
-                   str(blaze), "cargo", *direct_command, "--locked", "--offline"]
-        return runner.run(name, wrapped, dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
-    actual, _ = direct("dynamic-direct", command)
-    assert actual == expected, (actual, expected)
-    test_command = ["test", "-p", "saved-dynamic-app", "--test", "runtime", *profile]
-    test_reference, _ = runner.run("dynamic-test-reference", [real / "bin/cargo", *test_command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
-    test_direct, _ = direct("dynamic-test-direct", test_command)
-    from buildspec import parse_run
-    assert parse_run(test_direct) == parse_run(test_reference), (test_direct, test_reference)
-    test_spec = bundle / "dynamic-producer-tests.cbor"
-    runner.run("dynamic-test-save", [blaze, "cargo", "spec", "--out", test_spec, *test_command], dynamic_env, project)
-    saved = bundle / "dynamic-producers.cbor"
-    runner.run("dynamic-save", [blaze, "cargo", "spec", "--out", saved, *command], dynamic_env, project)
-    shutil.rmtree(project)
-    actual, _ = runner.run("dynamic-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile)
-    assert actual == expected, (actual, expected)
-    test_replay, _ = runner.run("dynamic-test-replay", [blaze, "cargo", "spec", "--run", test_spec], hostile_env, hostile)
-    assert parse_run(test_replay) == parse_run(test_reference), (test_replay, test_reference)
-    outputs = Path(str(saved) + ".outputs")
-    controls = [*outputs.rglob("libsaved_dynamic" + extension), *outputs.rglob("libsaved_dynamic_macro" + extension), *outputs.rglob("build-script-build")]
-    for receipt in outputs.glob("replay-*/result.json"):
-        controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
-    no_rpath_control(runner, "dynamic-product", controls, env, hostile)
-    test_outputs = Path(str(test_spec) + ".outputs")
-    controls = [*test_outputs.rglob("libsaved_dynamic" + extension), *test_outputs.rglob("libsaved_dynamic_macro" + extension), *test_outputs.rglob("build-script-build")]
-    for receipt in test_outputs.glob("replay-*/result.json"):
-        controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
-    no_rpath_control(runner, "dynamic-test-product", controls, env, hostile)
+    if "native-dependency" in only:
+      project = work / "native-dependency"
+      native_fixture(project)
+      wrapper = write(work, "native-tools/bound-cc", "#!" + (shutil.which("sh") or "/bin/sh") + "\nexec " + shlex.quote(compiler) + ' "$@"\n')
+      wrapper.chmod(0o755)
+      native_env, native_oracle = dict(env, CC=str(wrapper)), dict(oracle_env, CC=str(wrapper))
+      saved, expected, _ = roundtrip("native-dependency", project, ["run", *profile], native_env, native_oracle)
+      assert expected == "42\n", expected
+      results = list(Path(str(saved) + ".outputs").glob("replay-*/result.json"))
+      with wrapper.open("a") as output:
+          output.write("# compiler bytes changed; version and behavior are unchanged\n")
+      runner.run("native-compiler-bytes-changed", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile,
+                 expected=None, contains="platform")
+      assert list(Path(str(saved) + ".outputs").glob("replay-*/result.json")) == results
 
-    project = work / "workspace-libraries"
-    workspace_libraries(project)
-    _, _, actual = roundtrip("workspace-libraries", project, ["build", "--workspace", *profile], check_stdout=False)
-    artifacts = json.loads(actual)["artifacts"]
-    assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
+    if "dynamic" in only:
+      project = work / "dynamic-producers"
+      dynamic_producer_fixture(project)
+      dynamic_env = without_nix_rpath(dict(env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-product-target")))
+      dynamic_oracle = without_nix_rpath(dict(oracle_env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-oracle-target")))
+      command = ["run", "-p", "saved-dynamic-app", *profile]
+      expected, _ = runner.run("dynamic-reference", [real / "bin/cargo", *command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
+      assert expected == "42|42|42|true\n", expected
+      extension = ".so" if sys.platform.startswith("linux") else ".dylib"
+      reference_target = Path(dynamic_oracle["CARGO_TARGET_DIR"])
+      controls = [reference_target / "debug/saved-dynamic-app", *reference_target.rglob("libsaved_dynamic" + extension), *reference_target.rglob("libsaved_dynamic_macro*" + extension), *reference_target.rglob("build-script-build")]
+      no_rpath_control(runner, "dynamic-reference", controls, dynamic_oracle, project)
+      def direct(name, direct_command):
+          wrapped = [sys.executable, __file__, "--cache-phase", str(blaze), str(work / (name + "-stop.log")),
+                     str(blaze), "cargo", *direct_command, "--locked", "--offline"]
+          return runner.run(name, wrapped, dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+      actual, _ = direct("dynamic-direct", command)
+      assert actual == expected, (actual, expected)
+      test_command = ["test", "-p", "saved-dynamic-app", "--test", "runtime", *profile]
+      test_reference, _ = runner.run("dynamic-test-reference", [real / "bin/cargo", *test_command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
+      test_direct, _ = direct("dynamic-test-direct", test_command)
+      from buildspec import parse_run
+      assert parse_run(test_direct) == parse_run(test_reference), (test_direct, test_reference)
+      test_spec = bundle / "dynamic-producer-tests.cbor"
+      runner.run("dynamic-test-save", [blaze, "cargo", "spec", "--out", test_spec, *test_command], dynamic_env, project)
+      saved = bundle / "dynamic-producers.cbor"
+      runner.run("dynamic-save", [blaze, "cargo", "spec", "--out", saved, *command], dynamic_env, project)
+      shutil.rmtree(project)
+      actual, _ = runner.run("dynamic-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile)
+      assert actual == expected, (actual, expected)
+      test_replay, _ = runner.run("dynamic-test-replay", [blaze, "cargo", "spec", "--run", test_spec], hostile_env, hostile)
+      assert parse_run(test_replay) == parse_run(test_reference), (test_replay, test_reference)
+      outputs = Path(str(saved) + ".outputs")
+      controls = [*outputs.rglob("libsaved_dynamic" + extension), *outputs.rglob("libsaved_dynamic_macro" + extension), *outputs.rglob("build-script-build")]
+      for receipt in outputs.glob("replay-*/result.json"):
+          controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
+      no_rpath_control(runner, "dynamic-product", controls, env, hostile)
+      test_outputs = Path(str(test_spec) + ".outputs")
+      controls = [*test_outputs.rglob("libsaved_dynamic" + extension), *test_outputs.rglob("libsaved_dynamic_macro" + extension), *test_outputs.rglob("build-script-build")]
+      for receipt in test_outputs.glob("replay-*/result.json"):
+          controls.extend(item["executable"] for item in json.loads(receipt.read_text())["artifacts"] if item.get("executable"))
+      no_rpath_control(runner, "dynamic-test-product", controls, env, hostile)
 
-    def native_consumer(name, selected, source):
-        caller = write(work, name + ".c", source)
-        binary = work / name
-        support = list(dict.fromkeys(item["runtime"] for item in selected if item.get("runtime")))
-        plans = [native_link_arguments(item) for item in selected]
-        before = [word for leading, _ in plans for word in leading]
-        after = [word for _, trailing in plans for word in trailing]
-        runner.run(name + "-link", [compiler, *before, caller, *[item["artifact"] for item in selected], *support, *after, "-o", binary], env, hostile)
-        runner.run(name + "-run", [binary], env, hostile)
+    if "workspace" in only:
+      project = work / "workspace-libraries"
+      workspace_libraries(project)
+      _, _, actual = roundtrip("workspace-libraries", project, ["build", "--workspace", *profile], check_stdout=False)
+      artifacts = json.loads(actual)["artifacts"]
+      assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
 
-    native_consumer("workspace-native", artifacts,
-                    "extern unsigned saved_a(unsigned), saved_b(unsigned);\n"
-                    "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
-                    "return saved_a(input) + saved_b(input) == 42 ? 0 : 1; }\n")
+      def native_consumer(name, selected, source):
+          caller = write(work, name + ".c", source)
+          binary = work / name
+          support = list(dict.fromkeys(item["runtime"] for item in selected if item.get("runtime")))
+          plans = [native_link_arguments(item) for item in selected]
+          before = [word for leading, _ in plans for word in leading]
+          after = [word for _, trailing in plans for word in trailing]
+          runner.run(name + "-link", [compiler, *before, caller, *[item["artifact"] for item in selected], *support, *after, "-o", binary], env, hostile)
+          runner.run(name + "-run", [binary], env, hostile)
 
-    project = work / "workspace-allocator"
-    workspace_libraries(project, custom_allocator=True)
-    _, _, actual = roundtrip("workspace-allocator", project, ["build", "--workspace", *profile], check_stdout=False)
-    artifacts = json.loads(actual)["artifacts"]
-    assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
-    custom = [item for item in artifacts if item["crate"] == "saved_doc_b"]
-    assert len(custom) == 1, artifacts
-    native_consumer("custom-allocator-native", custom,
-                    "#include <stddef.h>\nextern unsigned saved_b(unsigned);\n"
-                    "extern size_t saved_alloc_count(void);\n"
-                    "int main(int argc, char **argv) { size_t before = saved_alloc_count(); "
-                    "if (saved_b((unsigned)(argc + 40)) != 42) return 1; "
-                    "return saved_alloc_count() > before ? 0 : 2; }\n")
-    source = ("#include <stddef.h>\nextern unsigned saved_a(unsigned), saved_b(unsigned);\n"
-              "extern size_t saved_alloc_count(void);\n"
-              "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
-              "size_t before = saved_alloc_count(); unsigned a = saved_a(input); "
-              "if (saved_alloc_count() <= before) return 1; before = saved_alloc_count(); "
-              "unsigned b = saved_b(input); if (saved_alloc_count() <= before) return 2; "
-              "return a + b == 42 ? 0 : 3; }\n")
-    for name, selected in [("default-first", sorted(artifacts, key=lambda item: item["crate"])),
-                           ("custom-first", sorted(artifacts, key=lambda item: item["crate"], reverse=True))]:
-        native_consumer("mixed-allocator-" + name, selected, source)
+      native_consumer("workspace-native", artifacts,
+                      "extern unsigned saved_a(unsigned), saved_b(unsigned);\n"
+                      "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
+                      "return saved_a(input) + saved_b(input) == 42 ? 0 : 1; }\n")
 
-    project = work / "workspace-doctests"
-    workspace_libraries(project)
-    _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
-    from buildspec import parse_run
-    assert parse_run(actual) == parse_run(expected), (actual, expected)
-    assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
+      project = work / "workspace-allocator"
+      workspace_libraries(project, custom_allocator=True)
+      _, _, actual = roundtrip("workspace-allocator", project, ["build", "--workspace", *profile], check_stdout=False)
+      artifacts = json.loads(actual)["artifacts"]
+      assert len(artifacts) == 2 and all(item["kind"] == "object" for item in artifacts), artifacts
+      custom = [item for item in artifacts if item["crate"] == "saved_doc_b"]
+      assert len(custom) == 1, artifacts
+      native_consumer("custom-allocator-native", custom,
+                      "#include <stddef.h>\nextern unsigned saved_b(unsigned);\n"
+                      "extern size_t saved_alloc_count(void);\n"
+                      "int main(int argc, char **argv) { size_t before = saved_alloc_count(); "
+                      "if (saved_b((unsigned)(argc + 40)) != 42) return 1; "
+                      "return saved_alloc_count() > before ? 0 : 2; }\n")
+      source = ("#include <stddef.h>\nextern unsigned saved_a(unsigned), saved_b(unsigned);\n"
+                "extern size_t saved_alloc_count(void);\n"
+                "int main(int argc, char **argv) { unsigned input = (unsigned)(argc - 1); "
+                "size_t before = saved_alloc_count(); unsigned a = saved_a(input); "
+                "if (saved_alloc_count() <= before) return 1; before = saved_alloc_count(); "
+                "unsigned b = saved_b(input); if (saved_alloc_count() <= before) return 2; "
+                "return a + b == 42 ? 0 : 3; }\n")
+      for name, selected in [("default-first", sorted(artifacts, key=lambda item: item["crate"])),
+                             ("custom-first", sorted(artifacts, key=lambda item: item["crate"], reverse=True))]:
+          native_consumer("mixed-allocator-" + name, selected, source)
+
+      project = work / "workspace-doctests"
+      workspace_libraries(project)
+      _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
+      from buildspec import parse_run
+      assert parse_run(actual) == parse_run(expected), (actual, expected)
+      assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
 
 
 def standalone(work, name, files):
@@ -688,7 +699,11 @@ def main():
     parser.add_argument("--owned-server", type=Path, required=True,
                         help="fresh compiler-owned server; supplied only to execution, never to capture")
     parser.add_argument("--linker-library-path", help="explicit captured loader path for an externally packaged native linker")
+    parser.add_argument("--only", help="comma-separated case groups to run, the rest skipped: " + ", ".join(GROUPS)
+                        + " (default: all; the gate is the whole run)")
     args = parser.parse_args()
+    only = set(args.only.split(",")) if args.only else set(GROUPS)
+    assert only <= set(GROUPS), sorted(only - set(GROUPS))
     assert 0 < args.memory_mib <= tracedecay.WATCHDOG_MB
     assert args.timeout > 0
     blaze, work = args.blaze.resolve(), args.work.resolve()
@@ -740,7 +755,19 @@ def main():
     oracle_env.update(RUSTUP_HOME=str(real.parent.parent), RUSTUP_TOOLCHAIN=str(real),
                       PATH=str(real / "bin") + os.pathsep + native_path,
                       CARGO_TARGET_DIR=str(work / "oracle-target"), RUST_BACKTRACE="0")
+    hostile = work / "unrelated"
+    write(hostile, ".cargo/config.toml", '[build]\nrustflags=["--cfg", "hostile"]\n')
+    hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
+                       CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value",
+                       RA_JIT_PROC_MACRO_SERVER=str(owned_server),
+                       RA_JIT_CACHE=str(work / "worker-cache"),
+                       RA_JIT_REMOTE=str(work / "worker-remote"),
+                       RA_JIT_PROJECT="must-not-inherit", RA_JIT_REMOTE_UNSIGNED="1")
+    # Worker-side configuration above where each replay materializes its copy: the bundle
+    # directory and, farther up, the work directory.
+    write(bundle, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
     try:
+      if "core" in only:
         expected, _ = runner.run("reference", [real / "bin/cargo", "run", "--locked", "--offline",
             *selected, "--", "argument"], oracle_env, original, guarded=False)
         assert expected == "captured|config-value|argument\n", expected
@@ -772,20 +799,10 @@ def main():
             shutil.move(bundle, moved)
         bundle.mkdir()
         spec = moved / "saved.cbor"
-        hostile = work / "unrelated"
-        write(hostile, ".cargo/config.toml", '[build]\nrustflags=["--cfg", "hostile"]\n')
-        # Worker-side configuration above where each replay materializes its copy: the
-        # bundle directory (the moved one for this replay, the fresh one for the later
-        # cases) and, farther up, the work directory.
+        # The moved bundle is above this replay's copy too.
         write(bundle, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
         write(moved, ".cargo/config.toml", '[build]\ntarget="hostile-worker-target"\n')
         ancestor = write(work, ".cargo/config.toml", '[env]\nANCESTOR_ONLY="leaked"\n[build]\nrustflags=["--cfg", "ancestor_hostile"]\n')
-        hostile_env = dict(env, RUSTFLAGS="-Copt-level=invalid", RA_JIT_BACKEND="invalid",
-                           CARGO_PROFILE_DEV_OPT_LEVEL="invalid", SAVED_SPEC_LABEL="ambient-value",
-                           RA_JIT_PROC_MACRO_SERVER=str(owned_server),
-                           RA_JIT_CACHE=str(work / "worker-cache"),
-                           RA_JIT_REMOTE=str(work / "worker-remote"),
-                           RA_JIT_PROJECT="must-not-inherit", RA_JIT_REMOTE_UNSIGNED="1")
         actual, _ = runner.run("replay-after-removal", [blaze, "cargo", "spec", "--run", spec],
                                hostile_env, hostile)
         assert actual == expected, (actual, expected)
@@ -931,8 +948,9 @@ def main():
                        hostile_env, hostile, expected=None, contains="not a valid Unicode string")
             assert not list(Path(str(invalid) + ".outputs").glob("replay-*/result.json"))
 
-        required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile)
+      required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile, only)
 
+      if "tail" in only:
         for name in ("check-invalid", "external-include"):
             project = work / name
             shutil.copytree(template, project)
