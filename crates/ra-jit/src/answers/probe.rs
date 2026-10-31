@@ -389,9 +389,16 @@ mod tests {
             std::fs::write(&source, format!(
                 "#![no_std]\n#[cfg(panic = \"{rejected}\")] compile_error!(\"wrong panic\");\n#[cfg(rust_analyzer)] compile_error!(\"editor cfg\");\n#[cfg(not(requested))] compile_error!(\"missing cfg\");\n"
             )).unwrap();
-            let (db, _, _) =
-                crate::load(&[&project], &config, load, parsed.selection.clone(), None, None)
-                    .unwrap();
+            let (db, _, _) = crate::load(
+                &[&project],
+                &config,
+                load,
+                parsed.selection.clone(),
+                None,
+                None,
+                parsed.project_origin,
+            )
+            .unwrap();
             let roots = crate::crates_named(&db, "probe", &parsed).unwrap();
             assert_eq!(roots.len(), 1);
             assert!(matches!(
