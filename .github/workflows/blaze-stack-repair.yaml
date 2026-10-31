@@ -1,0 +1,33 @@
+name: Blaze stack repair workspace
+
+on:
+  push:
+    branches: [repair/blaze-stack-20261030]
+    paths: [.github/workflows/blaze-stack-repair.yaml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export the exact repository objects for local conflict resolution
+        run: |
+          git bundle create "$RUNNER_TEMP/blaze-repair.bundle" --all
+          git bundle verify "$RUNNER_TEMP/blaze-repair.bundle"
+          git show-ref > "$RUNNER_TEMP/blaze-repair-refs.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-repair-workspace
+          path: |
+            ${{ runner.temp }}/blaze-repair.bundle
+            ${{ runner.temp }}/blaze-repair-refs.txt
+          retention-days: 1
+          if-no-files-found: error
