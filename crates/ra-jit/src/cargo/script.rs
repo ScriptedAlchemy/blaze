@@ -230,6 +230,39 @@ pub(crate) fn printed(out_dir: &Path) -> Option<PathBuf> {
     Some(if second.exists() { second } else { run_dir.join("output") })
 }
 
+/// The directories what a script printed (`printed`) has the linker search, in order, as
+/// cargo passes them to rustc: `rustc-link-search=[KIND=]PATH` and the `-L` of
+/// `rustc-flags`, the kind taken off.
+pub(crate) fn link_search_dirs(printed: &str) -> Vec<PathBuf> {
+    let dir = |spec: &str| {
+        let path = match spec.split_once('=') {
+            Some(("native" | "crate" | "dependency" | "framework" | "all", path)) => path,
+            _ => spec,
+        };
+        PathBuf::from(path)
+    };
+    let mut dirs = Vec::new();
+    for line in printed.lines() {
+        let Some(line) = line.strip_prefix("cargo:") else { continue };
+        let line = line.strip_prefix(':').unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "rustc-link-search" => dirs.push(dir(value)),
+            "rustc-flags" => {
+                let mut flags = value.split_whitespace();
+                while let Some(flag) = flags.next() {
+                    if let Some(rest) = flag.strip_prefix("-L") {
+                        let rest = if rest.is_empty() { flags.next().unwrap_or("") } else { rest };
+                        dirs.push(dir(rest));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    dirs
+}
+
 /// The directory the build script of `krate`'s package wrote to: what the crate graph
 /// recorded for the crate, or else its `OUT_DIR`. A script's own `cargo:rustc-env=OUT_DIR=...`
 /// shadows the variable the crate's code sees, as it does under cargo, and never where the
@@ -952,6 +985,23 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+
+    /// The link search directories a script printed, as cargo passes them: by either prefix,
+    /// with or without a kind, and the `-L` of `rustc-flags` joined or apart.
+    #[test]
+    fn link_search_dirs_are_read_from_what_a_script_printed() {
+        let printed = "cargo:rustc-link-search=native=/t/build/native-1/out\n\
+                       cargo::rustc-link-search=/t/build/other/out\n\
+                       cargo:rustc-flags=-L /t/flagged -lfoo -L/t/joined\n\
+                       cargo:rustc-link-lib=dylib=saved_dynamic\n\
+                       cargo:rustc-env=OUT_DIR=/native-script-marker\n";
+        let dirs: Vec<_> =
+            link_search_dirs(printed).iter().map(|it| it.display().to_string()).collect();
+        assert_eq!(
+            dirs,
+            ["/t/build/native-1/out", "/t/build/other/out", "/t/flagged", "/t/joined"]
+        );
+    }
 
     #[test]
     fn run_record_contains_names_only_and_restart_cannot_replay() {

@@ -59,6 +59,22 @@ impl Explicit {
     }
 }
 
+/// The variable programs on this machine find dynamic libraries by: `LD_LIBRARY_PATH` on
+/// Linux, `DYLD_FALLBACK_LIBRARY_PATH` on macOS, `PATH` on Windows.
+pub fn host_dylib_var() -> &'static str {
+    if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else if cfg!(target_os = "aix") {
+        "LIBPATH"
+    } else if cfg!(target_os = "haiku") {
+        "LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
 /// What the machine that runs the script is, as far as its environment goes: cargo decides
 /// these by what it was built for, which is the host.
 struct HostOs {
