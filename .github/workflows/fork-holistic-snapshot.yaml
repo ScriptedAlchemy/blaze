@@ -1,0 +1,48 @@
+name: Fork history and stack snapshot
+on:
+  push:
+    branches: [audit/fork-holistic-20261031]
+    paths: [.github/workflows/fork-holistic-snapshot.yaml]
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Retain every branch and PR head plus the parent repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/fork-holistic"
+          mkdir -p "$out"
+          gh api "repos/$GITHUB_REPOSITORY" > "$out/repository.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100" | jq -s 'add' > "$out/pulls.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" | jq -s 'add' > "$out/branches.json"
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' '+refs/pull/*/head:refs/remotes/pulls/*'
+          parent=$(jq -r '.parent.full_name' "$out/repository.json")
+          git remote add parent "https://github.com/$parent.git"
+          git fetch parent '+refs/heads/*:refs/remotes/parent/*'
+          git for-each-ref --format='%(refname) %(objectname)' > "$out/refs.txt"
+          git bundle create "$out/source.bundle" --all
+          git bundle verify "$out/source.bundle"
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > "$out/snapshot-at.txt"
+          python3 - "$out/pulls.json" <<'PY'
+          import json,sys
+          for p in json.load(open(sys.argv[1])):
+              print(p['number'],p['state'],'merged' if p['merged_at'] else '',p['base']['ref'],p['head']['ref'],p['head']['sha'],p['title'])
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fork-holistic-source
+          path: ${{ runner.temp }}/fork-holistic
+          retention-days: 7
+          if-no-files-found: error
