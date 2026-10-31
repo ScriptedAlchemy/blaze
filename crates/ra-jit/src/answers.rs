@@ -183,8 +183,14 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
 pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> {
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-    let rustc = toolchain_rustc(command.get_program(), command.get_current_dir(), &var);
-    if let Some(error) = rustc.as_ref().and_then(|it| own::deployment_error(it, &args, &var)) {
+    let rustc =
+        toolchain_rustc(command.get_program(), command.get_current_dir(), &var).map_err(|gap| {
+            io::Error::other(format!(
+                "owned compiler query has no toolchain: {gap}; \
+                 rustc was not executed; Cargo was not executed"
+            ))
+        })?;
+    if let Some(error) = own::deployment_error(&rustc, &args, &var) {
         #[cfg(unix)]
         let status = {
             use std::os::unix::process::ExitStatusExt as _;
@@ -200,13 +206,11 @@ pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> 
         let defaults = |name: &str| {
             if name == "MACOSX_DEPLOYMENT_TARGET" { None } else { var(name) }
         };
-        let stdout = rustc
-            .as_ref()
-            .and_then(|it| own::answer(it, &args, stdin, &defaults))
+        let stdout = own::answer(&rustc, &args, stdin, &defaults)
             .ok_or_else(|| io::Error::other("unmodelled print after deployment target error"))?;
         return Ok(Output { status, stdout, stderr: error.into_bytes() });
     }
-    let stdout = rustc.as_ref().and_then(|rustc| own::answer(rustc, &args, stdin, &var));
+    let stdout = own::answer(&rustc, &args, stdin, &var);
     match stdout {
         Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
         None => Err(io::Error::other(format!(
@@ -271,26 +275,26 @@ fn cargo_question_in(
         };
         Output { status, stdout, stderr }
     };
+    // RUSTC as a producer names it (blaze's probe launcher among them), or the rustc of the
+    // installation this cargo is of. Either is resolved from records, and a program blaze does
+    // not model is a named gap.
     let compiler = || match compiler {
-        Some(compiler) => {
-            let found = toolchain_rustc(compiler, command.get_current_dir(), &var);
-            found.filter(|rustc| own::host_tuple(rustc).is_some()).or_else(|| {
-                // Producers name an owned probe launcher in RUSTC. Its installed source
-                // toolchain remains explicit, and contains the facts rather than the launcher.
-                let selected = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
-                selected.is_absolute().then(|| {
-                    selected.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
-                })
-            })
-        }
+        Some(compiler) => toolchain_rustc(compiler, command.get_current_dir(), &var),
         None => toolchain_rustc(command.get_program(), command.get_current_dir(), &var)
             .map(|path| path.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX))),
     };
     if args == ["--version"] || args == ["-V"] {
-        let version = compiler().and_then(|rustc| own::cargo_version(&rustc));
-        return Some(version.map(|stdout| output(stdout, Vec::new(), 0)).ok_or_else(|| {
-            io::Error::other("owned Cargo version facts unavailable; Cargo was not executed")
-        }));
+        let unavailable = |gap: String| {
+            io::Error::other(format!(
+                "owned Cargo version facts unavailable{gap}; Cargo was not executed"
+            ))
+        };
+        return Some(match compiler() {
+            Ok(rustc) => own::cargo_version(&rustc)
+                .map(|stdout| output(stdout, Vec::new(), 0))
+                .ok_or_else(|| unavailable(String::new())),
+            Err(gap) => Err(unavailable(format!(": {gap}"))),
+        });
     }
     let env: std::collections::BTreeMap<String, String> =
         crate::process::unicode(native.iter().map(|(key, value)| (key.clone(), value.clone())))
@@ -318,10 +322,14 @@ fn cargo_question_in(
                 .map(|stdout| output(stdout, Vec::new(), 0)),
         );
     }
-    let Some(rustc) = compiler() else {
-        return Some(Err(io::Error::other(format!(
-            "owned Cargo query has no toolchain model: {args:?}; Cargo was not executed"
-        ))));
+    let rustc = match compiler() {
+        Ok(rustc) => rustc,
+        Err(gap) => {
+            return Some(Err(io::Error::other(format!(
+                "owned Cargo query has no toolchain model: {args:?}: {gap}; \
+                 Cargo was not executed"
+            ))));
+        }
     };
     if args.first().is_some_and(|it| it == "rustc")
         && args.iter().any(|it| it == "--print" || it.starts_with("--print="))
@@ -422,7 +430,7 @@ fn cargo_metadata(
     args: &[String],
     cwd: &Path,
     env: std::collections::BTreeMap<String, String>,
-    compiler: &dyn Fn() -> Option<PathBuf>,
+    compiler: &dyn Fn() -> Result<PathBuf, String>,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> io::Result<Vec<u8>> {
     let query = || -> anyhow::Result<Vec<u8>> {
@@ -490,8 +498,8 @@ fn cargo_metadata(
             let cfg = platform
                 .as_deref()
                 .map(|target| -> anyhow::Result<Vec<cargo_platform::Cfg>> {
-                    let rustc = compiler().ok_or_else(|| {
-                        anyhow::anyhow!("owned Cargo metadata target facts unavailable")
+                    let rustc = compiler().map_err(|gap| {
+                        anyhow::anyhow!("owned Cargo metadata target facts unavailable: {gap}")
                     })?;
                     let sysroot = rustc.parent().and_then(Path::parent).ok_or_else(|| {
                         anyhow::anyhow!("owned Cargo metadata sysroot unavailable")
@@ -573,58 +581,193 @@ fn var_of(command: &Command, name: &str) -> Option<OsString> {
     }
 }
 
-/// The rustc of the toolchain that `program`, as this process would run it, is.
 /// The release of the rustc `program` names, run in `cwd` with the variables `env`, as cargo's
 /// `rustc -vV` would find it, from the toolchain's records; nothing is run.
 pub(crate) fn rust_release(program: &Path, cwd: &Path, env: &[(String, String)]) -> Option<String> {
     let var = |name: &str| {
         env.iter().find(|(key, _)| key == name).map(|(_, value)| OsString::from(value))
     };
-    own::release(&toolchain_rustc(program.as_os_str(), Some(cwd), &var)?)
+    own::release(&toolchain_rustc(program.as_os_str(), Some(cwd), &var).ok()?)
 }
 
+/// The rustc of the toolchain that `program`, as this process would run it, is.
 pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
-    toolchain_rustc(program, None, &|name| std::env::var_os(name))
+    toolchain_rustc(program, None, &|name| std::env::var_os(name)).ok()
 }
 
-/// Resolve rustup's installed selection from its records, without executing a proxy.
-/// Direct CLI invocations do not inherit rustup's RUSTUP_HOME or expanded toolchain name.
+/// The rustc of the toolchain `program` reaches, from the records on disk; nothing is run.
+/// It is a compiler, which is itself; a rustup proxy (a link to rustup, or a copy of it where
+/// links are not made); or a launcher of a packaged rustup that execs such a proxy. Both of
+/// the latter reach rustup's selection. Anything else is a wrapper whose program is not
+/// known without running it, and so a named gap: never a guess at the compiler it reaches.
 fn toolchain_rustc(
     program: &OsStr,
     cwd: Option<&Path>,
     var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<PathBuf> {
-    let cwd = cwd.map(Path::to_owned).or_else(|| std::env::current_dir().ok())?;
-    let found = if Path::new(program).components().count() > 1 {
-        cwd.join(program)
-    } else {
-        let paths = var("PATH")?;
+) -> Result<PathBuf, String> {
+    let cwd = cwd
+        .map(Path::to_owned)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or("the current directory is not known")?;
+    let on_path = Path::new(program).components().count() == 1;
+    let found = if on_path {
+        let paths = var("PATH").ok_or("PATH is not set")?;
         let name = Path::new(program).with_extension(std::env::consts::EXE_EXTENSION);
-        std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(&name))
+            .find(|it| it.is_file())
+            .ok_or_else(|| format!("{} is not on PATH", Path::new(&name).display()))?
+    } else {
+        cwd.join(program)
     };
-    let real = std::fs::canonicalize(&found).ok()?;
-    let rustup = found.with_file_name("rustup");
-    // rustup links its proxies where the filesystem links them, and copies them where it
-    // cannot, as a runner's image does: the copy is rustup's too, and the `rustup` it was
-    // copied from is beside it.
-    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
-        || same_file::is_same_file(&real, &rustup).unwrap_or(false)
-        || is_copy_of(&real, &rustup);
-    if proxy {
-        return rustup_selected(&cwd, var);
+    let real =
+        std::fs::canonicalize(&found).map_err(|error| format!("{}: {error}", found.display()))?;
+    let selected = |fallback: Option<PathBuf>| {
+        rustup_selected(&cwd, var, fallback).ok_or_else(|| {
+            format!("rustup's records select no installed toolchain for {}", found.display())
+        })
+    };
+    if is_rustup_proxy(&found, &real) {
+        return selected(None);
     }
     if own::is_compiler(&real) {
-        return Some(real);
+        return Ok(real);
     }
-    // A packaged rustup puts launchers on PATH instead: Homebrew's (rustup 1.29, the
-    // macOS runner image's) are scripts that name its settings and exec the proxy it keeps
-    // in libexec. A launcher is neither rustup nor a compiler, and rustup's records name the
-    // toolchain it reaches; with no such records it is all there is to name.
-    rustup_selected(&cwd, var).or(Some(real))
+    if let Some(fallback) = packaged_launcher(&real) {
+        return selected(Some(fallback));
+    }
+    if is_producer_launcher(&real) {
+        // A producer's RUSTC: the compiler it reaches is blaze, and the facts are those of the
+        // source toolchain the producer names explicitly beside it.
+        let selected = var("RUSTUP_TOOLCHAIN").map(PathBuf::from).filter(|it| it.is_absolute());
+        let rustc = selected
+            .map(|it| it.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX)));
+        return rustc.and_then(|it| std::fs::canonicalize(it).ok()).ok_or_else(|| {
+            format!(
+                "blaze's probe launcher {} names no installed source toolchain by an absolute \
+                 RUSTUP_TOOLCHAIN",
+                found.display()
+            )
+        });
+    }
+    let name = Path::new(program).file_name().unwrap_or(program).to_string_lossy();
+    Err(match on_path {
+        true => format!("{name} on PATH is a wrapper blaze does not model: {}", found.display()),
+        false => format!("{} is a wrapper blaze does not model", found.display()),
+    })
 }
 
-/// The rustc of rustup's selection for `cwd`, from its records.
-fn rustup_selected(cwd: &Path, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// Whether `found`, which is `real`, is rustup's proxy. rustup links its proxies where the
+/// filesystem links them, and copies them where it cannot, as a runner's image does: the copy
+/// is rustup's too, and the `rustup` it was copied from is beside it.
+fn is_rustup_proxy(found: &Path, real: &Path) -> bool {
+    let rustup = found.with_file_name(format!("rustup{}", std::env::consts::EXE_SUFFIX));
+    real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"))
+        || same_file::is_same_file(real, &rustup).unwrap_or(false)
+        || is_copy_of(real, &rustup)
+}
+
+/// Whether `launcher` is the probe launcher [`producer_launcher`] writes for this executable:
+/// that script, byte for byte, exec'ing this very executable's `producer-rustc`.
+fn is_producer_launcher(launcher: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        const MOST: u64 = 64 * 1024;
+        let Ok(exe) = std::env::current_exe() else { return false };
+        if !std::fs::metadata(launcher).is_ok_and(|it| it.len() <= MOST) {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(launcher) else { return false };
+        let Some(quoted) = bytes
+            .strip_prefix(b"#!/bin/sh\nexec '")
+            .and_then(|it| it.strip_suffix(b"' producer-rustc \"$@\"\n"))
+        else {
+            return false;
+        };
+        let (mut target, mut at) = (Vec::new(), 0);
+        // The path is single-quoted, an apostrophe in it written '\''.
+        while at < quoted.len() {
+            if quoted[at..].starts_with(b"'\\''") {
+                target.push(b'\'');
+                at += 4;
+            } else if quoted[at] == b'\'' {
+                return false;
+            } else {
+                target.push(quoted[at]);
+                at += 1;
+            }
+        }
+        let target = Path::new(OsStr::from_bytes(&target));
+        same_file::is_same_file(target, &exe).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = launcher;
+        false
+    }
+}
+
+/// The fallback settings a packaged rustup's launcher names, when `launcher` is one.
+/// Homebrew's rustup (1.29, the macOS runner image's) puts on PATH a script for each proxy:
+///
+/// ```text
+/// #!/bin/bash
+/// RUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS="<prefix>/etc/rustup/settings.toml" exec "<keg>/libexec/bin/rustc"  "$@"
+/// ```
+///
+/// It is this shape only, read and never run: the settings and the proxy are named by plain
+/// double-quoted words, and the proxy is the one of the same name in the libexec of a rustup
+/// keg (`Cellar/rustup/<version>`), which is rustup's own proxy there.
+fn packaged_launcher(launcher: &Path) -> Option<PathBuf> {
+    const MOST: u64 = 4096;
+    if std::fs::metadata(launcher).ok()?.len() > MOST {
+        return None;
+    }
+    let text = std::fs::read_to_string(launcher).ok()?;
+    let mut lines = text.lines().filter(|it| !it.trim().is_empty());
+    if !matches!(lines.next()?.trim_end(), "#!/bin/bash" | "#!/bin/sh") {
+        return None;
+    }
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    // A double-quoted word with nothing the shell would expand or unescape in it.
+    let quoted = |rest: &str| -> Option<(String, String)> {
+        let rest = rest.strip_prefix('"')?;
+        let (word, rest) = rest.split_once('"')?;
+        (!word.contains(['$', '`', '\\'])).then(|| (word.to_owned(), rest.to_owned()))
+    };
+    let rest = line.trim().strip_prefix("RUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS=")?;
+    let (settings, rest) = quoted(rest)?;
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start().strip_prefix("exec")?;
+    let (proxy, rest) = quoted(rest.strip_prefix(char::is_whitespace)?.trim_start())?;
+    if rest.trim() != "\"$@\"" {
+        return None;
+    }
+    let (settings, proxy) = (PathBuf::from(settings), PathBuf::from(proxy));
+    let bin = proxy.parent()?;
+    let keg = bin.parent().filter(|it| it.ends_with("libexec")).and_then(Path::parent)?;
+    let is_keg = keg.parent().is_some_and(|it| it.ends_with("Cellar/rustup"));
+    let named_alike = proxy.file_name() == launcher.file_name();
+    let real = std::fs::canonicalize(&proxy).ok()?;
+    (settings.is_absolute()
+        && proxy.is_absolute()
+        && bin.ends_with("libexec/bin")
+        && is_keg
+        && named_alike
+        && is_rustup_proxy(&proxy, &real))
+    .then_some(settings)
+}
+
+/// The rustc of rustup's selection for `cwd`, from its records. `fallback` is the settings a
+/// launcher has rustup fall back to, over the variable and rustup's own place for them.
+fn rustup_selected(
+    cwd: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(selected) = var("RUSTUP_TOOLCHAIN")
         && Path::new(&selected).is_absolute()
     {
@@ -639,7 +782,13 @@ fn rustup_selected(cwd: &Path, var: &dyn Fn(&str) -> Option<OsString>) -> Option
         var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(|home| PathBuf::from(home).join(".rustup"))
     })?;
-    let toolchain = installed_selection(&home, cwd, var("RUSTUP_TOOLCHAIN"))?;
+    let fallback = fallback.or_else(|| {
+        cfg!(unix).then(|| {
+            var("RUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS")
+                .map_or_else(|| PathBuf::from("/etc/rustup/settings.toml"), PathBuf::from)
+        })
+    });
+    let toolchain = installed_selection(&home, cwd, var("RUSTUP_TOOLCHAIN"), fallback.as_deref())?;
     let toolchain = toolchain.to_str()?;
     let dir = if Path::new(&toolchain).is_absolute() {
         PathBuf::from(toolchain)
@@ -692,16 +841,26 @@ fn is_copy_of(program: &Path, rustup: &Path) -> bool {
             .is_some_and(|it| std::fs::read(rustup).is_ok_and(|was| it == was))
 }
 
-fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option<OsString> {
+/// The toolchain rustup selects for `cwd`: the variable's, a directory override's, a
+/// toolchain file's, or the default, which is the fallback settings' when the user's name none.
+fn installed_selection(
+    home: &Path,
+    cwd: &Path,
+    env: Option<OsString>,
+    fallback: Option<&Path>,
+) -> Option<OsString> {
     if let Some(selected) = env.filter(|it| !it.is_empty()) {
         return Some(selected);
     }
-    let settings: toml::Value =
-        toml::from_str(&std::fs::read_to_string(home.join("settings.toml")).ok()?).ok()?;
+    let read = |path: &Path| -> Option<toml::Value> {
+        toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let settings = read(&home.join("settings.toml"));
     let cwd = std::fs::canonicalize(cwd).ok()?;
     for dir in cwd.ancestors() {
         if let Some(selected) = settings
-            .get("overrides")
+            .as_ref()
+            .and_then(|it| it.get("overrides"))
             .and_then(|it| it.get(dir.to_str()?))
             .and_then(|it| it.as_str())
         {
@@ -717,7 +876,10 @@ fn installed_selection(home: &Path, cwd: &Path, env: Option<OsString>) -> Option
             }
         }
     }
-    settings.get("default_toolchain")?.as_str().map(OsString::from)
+    let default = |settings: Option<toml::Value>| {
+        settings?.get("default_toolchain")?.as_str().map(OsString::from)
+    };
+    default(settings).or_else(|| default(read(fallback?)))
 }
 
 #[cfg(test)]
@@ -744,15 +906,18 @@ pub(crate) mod tests {
             _ => None,
         };
         let expected = std::fs::canonicalize(compiler).unwrap();
-        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars), Some(expected.clone()));
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars), Ok(expected.clone()));
         let selected = |name: &str| {
             if name == "RUSTUP_TOOLCHAIN" { Some("1.99.0".into()) } else { vars(name) }
         };
-        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &selected), Some(expected));
+        assert_eq!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &selected), Ok(expected));
         std::fs::write(cwd.join("rust-toolchain.toml"), "[toolchain]\nchannel='missing'\n")
             .unwrap();
-        assert!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars).is_none());
-        assert_eq!(installed_selection(&home, &cwd, Some("1.99.0".into())), Some("1.99.0".into()));
+        assert!(toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &vars).is_err());
+        assert_eq!(
+            installed_selection(&home, &cwd, Some("1.99.0".into()), None),
+            Some("1.99.0".into())
+        );
         let override_dir = installed.to_string_lossy();
         std::fs::write(
             home.join("settings.toml"),
@@ -763,7 +928,10 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(installed_selection(&home, &cwd, None), Some(installed.as_os_str().to_owned()));
+        assert_eq!(
+            installed_selection(&home, &cwd, None, None),
+            Some(installed.as_os_str().to_owned())
+        );
     }
 
     /// A runner's fresh rustup install: its own home, the default toolchain by its full name,
@@ -859,17 +1027,79 @@ pub(crate) mod tests {
             assert_eq!(own::host_tuple(&rustc).as_deref(), Some("aarch64-apple-darwin"));
         }
 
+        // The settings the launcher names are rustup's fallback, read when the user's name no
+        // default toolchain.
+        std::fs::write(rustup_home.join("settings.toml"), "version = \"12\"\n").unwrap();
+        let fallback = root.path().join("etc/rustup/settings.toml");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, "default_toolchain = \"1.99.0-aarch64-apple-darwin\"\n").unwrap();
+        let launcher = |extra: &str| {
+            format!(
+                "#!/bin/bash\nRUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS=\"{}\" exec \"{}\"  \"$@\"\n{extra}",
+                fallback.display(),
+                keg.join("libexec/bin/rustc").display(),
+            )
+        };
+        std::fs::write(bin.join("rustc"), launcher("")).unwrap();
+        assert_eq!(resolve(None), Ok(expected.clone()));
+
         // A compiler on PATH outside rustup is itself, whatever rustup has selected.
         let other = synthetic_toolchain(&root.path().join("other"));
         let var = |name: &str| match name {
             "PATH" => Some(other.parent().unwrap().as_os_str().to_owned()),
             "HOME" => Some(home.clone().into_os_string()),
+            "RUSTUP_TOOLCHAIN" => Some(installed.clone().into_os_string()),
             _ => None,
         };
         assert_eq!(
             toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &var),
-            Some(std::fs::canonicalize(&other).unwrap())
+            Ok(std::fs::canonicalize(&other).unwrap())
         );
+
+        // Anything else on PATH named rustc is a wrapper whose compiler is known only by
+        // running it: a gap by name, never rustup's selection, and never run.
+        let refused = |script: String| {
+            let tool = root.path().join("tool bin");
+            std::fs::create_dir_all(&tool).unwrap();
+            let wrapper = tool.join("rustc");
+            std::fs::write(&wrapper, script).unwrap();
+            let var = |name: &str| match name {
+                "PATH" => Some(tool.clone().into_os_string()),
+                "HOME" => Some(home.clone().into_os_string()),
+                "RUSTUP_TOOLCHAIN" => Some(installed.clone().into_os_string()),
+                _ => None,
+            };
+            let gap = toolchain_rustc(OsStr::new("rustc"), Some(&cwd), &var).unwrap_err();
+            let named =
+                format!("rustc on PATH is a wrapper blaze does not model: {}", wrapper.display());
+            assert_eq!(gap, named);
+            let env = [("PATH", &tool), ("HOME", &home), ("RUSTUP_TOOLCHAIN", &installed)]
+                .map(|(name, value)| (name.to_owned(), value.display().to_string()));
+            assert_eq!(rust_release(Path::new("rustc"), &cwd, &env), None);
+            // Asked, never run: `answer` resolves the program and runs nothing.
+            let name = OsStr::new("rustc");
+            let mut command = Command::new(name);
+            command
+                .current_dir(&cwd)
+                .env("PATH", &tool)
+                .env("HOME", &home)
+                .env("RUSTUP_TOOLCHAIN", &installed)
+                .arg("-vV");
+            let error = answer(&mut command, &[]).unwrap_err().to_string();
+            assert!(error.contains(&named) && error.contains("rustc was not executed"), "{error}");
+        };
+        let a = synthetic_toolchain(&root.path().join("opt/toolchain A"));
+        refused(format!("#!/bin/sh\nexec '{}' \"$@\"\n", a.display()));
+        // Homebrew's shape, but what it execs is a compiler, not the keg's proxy.
+        refused(format!(
+            "#!/bin/bash\nRUSTUP_OVERRIDE_UNIX_FALLBACK_SETTINGS=\"{}\" exec \"{}\" \"$@\"\n",
+            fallback.display(),
+            a.display()
+        ));
+        // Homebrew's shape with more the shell would run.
+        refused(launcher("echo more\n"));
+        refused(launcher("").replace(" exec ", " exec env "));
+        refused(launcher("").replace(&fallback.display().to_string(), "$HOME/settings.toml"));
     }
 
     pub(crate) fn synthetic_toolchain(dir: &Path) -> PathBuf {
@@ -1310,8 +1540,21 @@ pub(crate) mod tests {
         // remain in the explicitly selected installation, not beside CARGO.
         command.env("RUSTUP_TOOLCHAIN", &toolchain);
         let launcher = dir.path().join("owned-probe-launcher");
-        std::fs::write(&launcher, "must not execute").unwrap();
+        producer_launcher(&launcher).unwrap();
         assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
+        // Anything else named as RUSTC is a wrapper blaze does not model, whatever the
+        // toolchain beside it says: refused by name, and never run.
+        let script = std::fs::read(&launcher).unwrap();
+        for imitation in [
+            b"must not execute".to_vec(),
+            [&script[..], b"echo more\n"].concat(),
+            String::from_utf8(script.clone()).unwrap().replace("producer-rustc", "other").into(),
+        ] {
+            std::fs::write(&launcher, imitation).unwrap();
+            let error = cargo_query(&mut command, launcher.as_os_str()).unwrap_err().to_string();
+            let named = format!("{} is a wrapper blaze does not model", launcher.display());
+            assert!(error.contains(&named) && error.contains("Cargo was not executed"), "{error}");
+        }
     }
 
     #[test]
@@ -1320,10 +1563,12 @@ pub(crate) mod tests {
         let rustc = dir.path().join("missing-rustc");
         let mut version = Command::new(std::env::current_exe().unwrap());
         version.arg("--version").env_remove("RUSTUP_TOOLCHAIN");
-        let error = cargo_query(&mut version, rustc.as_os_str()).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "owned Cargo version facts unavailable; Cargo was not executed"
+        let error = cargo_query(&mut version, rustc.as_os_str()).unwrap_err().to_string();
+        assert!(
+            error.starts_with("owned Cargo version facts unavailable: ")
+                && error.contains(&*rustc.to_string_lossy())
+                && error.ends_with("; Cargo was not executed"),
+            "{error}"
         );
         let compiler = synthetic_toolchain(&dir.path().join("toolchain"));
         let mut unknown = Command::new(std::env::current_exe().unwrap());

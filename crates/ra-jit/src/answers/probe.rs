@@ -205,27 +205,7 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
         std::fs::write(&path, text)?;
         path
     };
-    let plan = crate::cargo::own_script::planned_description(
-        sysroot,
-        vec![crate::cargo::own_script::Planned {
-            out_dir: None,
-            workspace_member: false,
-            proc_macro: None,
-            name: probe.name.clone(),
-            root: source,
-            edition: probe.edition.to_string(),
-            cfg: probe.cfg,
-            codegen_flags: probe.flags,
-            // Caller variables are already in the checker process. Crate overrides
-            // would persist credentials in a temporary source description.
-            env: BTreeMap::new(),
-            deps: vec![],
-        }],
-    );
-    let mut plan: serde_json::Value = serde_json::from_str(&plan)?;
-    if let Some(target) = &probe.target {
-        plan["crates"][0]["target"] = serde_json::json!(target);
-    }
+    let plan = description(sysroot, &probe, source)?;
     let project = dir.path().join("rust-project.json");
     std::fs::write(&project, serde_json::to_vec(&plan)?)?;
     let mut argv = vec![
@@ -243,6 +223,41 @@ pub(super) fn check(sysroot: &Path, args: &[OsString]) -> Result<bool> {
         .ok()
         .is_some_and(|it| it == "1" || it.split(',').any(|name| name == probe.name));
     crate::check::source(parsed, bootstrap)
+}
+
+fn description(
+    sysroot: &Path,
+    probe: &Probe,
+    source: std::path::PathBuf,
+) -> Result<serde_json::Value> {
+    let plan = crate::cargo::own_script::planned_description(
+        sysroot,
+        vec![crate::cargo::own_script::Planned {
+            out_dir: None,
+            workspace_member: false,
+            proc_macro: None,
+            name: probe.name.clone(),
+            root: source,
+            edition: probe.edition.to_string(),
+            cfg: probe.cfg.clone(),
+            codegen_flags: probe.flags.clone(),
+            env: BTreeMap::new(),
+            deps: vec![],
+        }],
+    );
+    let mut plan: serde_json::Value = serde_json::from_str(&plan)?;
+    plan["compiler_mode"] = serde_json::json!(true);
+    let root = &mut plan["crates"][0];
+    root["is_workspace_member"] = serde_json::json!(false);
+    root["build"] = serde_json::json!({
+        "label": root["display_name"],
+        "build_file": root["root_module"],
+        "target_kind": "lib",
+    });
+    if let Some(target) = &probe.target {
+        root["target"] = serde_json::json!(target);
+    }
+    Ok(plan)
 }
 
 fn emit_empty_ir(
@@ -320,6 +335,74 @@ mod tests {
             let root = path.join("lib/rustlib/src/rust/library").join(name).join("src");
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join("lib.rs"), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn metadata_descriptor_loads_authoritative_cfgs_as_a_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = dir.path().join("toolchain");
+        source_toolchain(&sysroot);
+        let source = dir.path().join("probe.rs");
+        let project = dir.path().join("rust-project.json");
+        let mut probe = parse(
+            &[
+                "--crate-name=probe",
+                "--crate-type=lib",
+                "--edition=2021",
+                "--target=x86_64-unknown-linux-gnu",
+                "--emit=metadata",
+                "-Cpanic=abort",
+                "probe.rs",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        for (panic, rejected) in [("abort", "unwind"), ("unwind", "abort")] {
+            probe.cfg = vec![format!("panic=\"{panic}\""), "requested".into()];
+            probe.flags = vec![format!("-Cpanic={panic}")];
+            let plan = description(&sysroot, &probe, source.clone()).unwrap();
+            let root = &plan["crates"][0];
+            assert_eq!(root["build"]["target_kind"], "lib");
+            assert_eq!(root["env"], serde_json::json!({}));
+            assert_eq!(root["edition"], "2021");
+            assert_eq!(root["target"], "x86_64-unknown-linux-gnu");
+            assert_eq!(root["codegen_flags"], serde_json::json!([format!("-Cpanic={panic}")]));
+            std::fs::write(&project, serde_json::to_vec(&plan).unwrap()).unwrap();
+            let args = || {
+                crate::Args::parse(
+                    vec![
+                        project.display().to_string(),
+                        "--crate".into(),
+                        "probe".into(),
+                        "--out".into(),
+                        dir.path().join("unused.o").display().to_string(),
+                    ]
+                    .into_iter(),
+                )
+                .unwrap()
+            };
+            let parsed = args();
+            let config = crate::cargo_config(&parsed);
+            let load =
+                crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
+            std::fs::write(&source, format!(
+                "#![no_std]\n#[cfg(panic = \"{rejected}\")] compile_error!(\"wrong panic\");\n#[cfg(rust_analyzer)] compile_error!(\"editor cfg\");\n#[cfg(not(requested))] compile_error!(\"missing cfg\");\n"
+            )).unwrap();
+            let (db, _, _) =
+                crate::load(&[&project], &config, load, parsed.selection.clone(), None, None)
+                    .unwrap();
+            let roots = crate::crates_named(&db, "probe", &parsed).unwrap();
+            assert_eq!(roots.len(), 1);
+            assert!(matches!(
+                roots[0].target_kind(&db),
+                crate::TargetKind::Lib { is_proc_macro: false }
+            ));
+            assert!(crate::check::source(args(), false).unwrap(), "{panic}");
+            assert_eq!(plan["compiler_mode"], true);
+            assert_eq!(root["is_workspace_member"], false);
+            std::fs::write(&source, "#![no_std]\ncompile_error!(\"real error\");\n").unwrap();
+            assert!(!crate::check::source(args(), false).unwrap(), "real diagnostics must fail");
         }
     }
 

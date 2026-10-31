@@ -1782,6 +1782,10 @@ fn add_target_crate_root(
     cargo_path: &Utf8Path,
 ) -> CrateBuilderId {
     let edition = pkg.edition;
+    let mut cfg_options = cfg_options;
+    if matches!(kind, TargetKind::Lib { is_proc_macro: true }) {
+        cfg_options.insert_atom(sym::proc_macro);
+    }
     let potential_cfg_options = if pkg.features.is_empty() {
         None
     } else {

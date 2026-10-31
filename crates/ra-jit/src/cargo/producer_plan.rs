@@ -203,6 +203,7 @@ impl Producers {
             explicit_target: selection.target.is_some(),
             packages: Some(&packages),
             host_cargo: None,
+            shared: None,
         };
         let mut raw: BTreeMap<_, _> = self.compile_env.vars().collect();
         raw.extend(env.iter().map(|(name, value)| (name.into(), value.into())));

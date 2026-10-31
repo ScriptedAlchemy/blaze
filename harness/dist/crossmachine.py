@@ -95,7 +95,8 @@ FIXTURES = {
                            about="negative invalidation: B changes only an included binary payload"),
     "macros": dict(source="dir", workspace="macros", package="app", run=[],
                    env={"RA_JIT_PROC_MACRO_CACHE_SKIP": "Embedded"},
-                   about="a proc-macro crate: two pure macros and a derive that reads a file while it expands"),
+                   about="a proc-macro crate: two pure macros, a derive that reads a file while it expands "
+                         "and one that reads a variable of its compiler's environment"),
     "ripgrep": dict(source="pinned", workspace=".", package="ripgrep", run=None,
                     about="13 crates, two build scripts, registry dependencies"),
     # Acceptance names it; it is 165,752 functions and the project whose memory G0 failed, so it is
@@ -545,9 +546,14 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
+def macro_mutation_step(step):
+    return (step in ("same-size-restored-mtime", "dependency-restored-mtime")
+            or step.startswith(("reload-", "private-")))
+
+
 def valid_macro_mutation(step, same_size, same_mtime, before, after,
                          old_dylibs, dylibs, old_reloads, reloads):
-    mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
+    mutation = macro_mutation_step(step)
     if mutation:
         return (same_size and same_mtime and before != after and old_dylibs != dylibs
                 and reloads > old_reloads)
@@ -607,6 +613,14 @@ def token_scan(roots, token):
                     errors.append(path)
     return dict(scanned=len(seen), hits=hits, errors=errors, roots=roots)
 
+def macro_private_environment(env, step):
+    """Change the witness's request environment, including repeated removals."""
+    env.pop("PR15_PRIVATE", None)
+    private = {} if step == "private-removed" else {"PR15_PRIVATE": "raw-\udcff-value"}
+    env.update(private)
+    return private
+
+
 def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server):
     from cargo_ra_jit import Side, program_output, wait_warm
     import norustc
@@ -623,6 +637,11 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
     env["RA_JIT_PROC_MACRO_SERVER"] = os.path.abspath(owned_server)
     token = "c4-witness-" + secrets.token_hex(24)
     env["C4_PLANTED_TOKEN"] = token
+    # The daemon starts with a variable the derive `Private` reads. The private- steps remove
+    # it from the client, then give it a value that is not Unicode, each with the macro edited:
+    # a warm server must expand with what the client has now, as rustc's process would.
+    private = {"PR15_PRIVATE": "old-private-value"}
+    env.update(private)
     audit_log = os.path.join(work, "product-tools.log")
     audit_bin = norustc.stand_ins(os.path.join(work, "product-audit"), audit_log, block=True, block_macro_server=True)
     env["PATH"] = os.path.join(audit_bin, "bin") + os.pathsep + env["PATH"]
@@ -641,6 +660,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
     previous_reload_count = 0
     steps = ["initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"]
     steps.extend(f"reload-{index:02}" for index in range(reloads))
+    steps.extend(["private-removed", "private-raw"])
     try:
         for step in steps:
             audit_before = len(norustc.runs(audit_log))
@@ -663,12 +683,20 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
                 with open(source, "w") as output:
                     output.write(text)
                 os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif step.startswith("private-"):
+                private = macro_private_environment(env, step)
+                text = re.sub(r"described (?:ONE|TWO|\d{3}|P\d\d)",
+                              "described P0" + str(steps.index(step) % 10), text)
+                with open(source, "w") as output:
+                    output.write(text)
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
             _, built = side.cargo("build", "-p", "app")
             _, ready = wait_warm(side, ws)
             status = side.cargo("status")[1].stdout
             actual = program_output(side.cargo("run", "-p", "app")[1])
             shutil.rmtree(os.path.join(ws, "target-ref"), ignore_errors=True)
-            expected = reference(machine, bin_dir, ws, FIXTURES["macros"], env["RA_JIT_CACHE"], env["RA_JIT_HOME"])
+            expected = reference(machine, bin_dir, ws, FIXTURES["macros"], env["RA_JIT_CACHE"], env["RA_JIT_HOME"],
+                                 extra=private)
             pids = re.findall(r"(?:daemon:|worker:) pid (\d+)", status)
             builds = sum(int(n) for n in re.findall(r"(\d+) builds by the daemon", status))
             generation = valid_worker_generation(status, ready, pids, previous_pids, builds, previous_builds)
@@ -680,7 +708,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
             new_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
             same_size = os.stat(edited_source).st_size == before.st_size
             same_mtime = os.stat(edited_source).st_mtime_ns == before.st_mtime_ns
-            mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
+            mutation = macro_mutation_step(step)
             worker = workers_log(side)
             reload_count = len(re.findall(r"(?m)^reload:", worker))
             reload_valid = (reload_count > previous_reload_count if mutation
@@ -961,10 +989,10 @@ def build_and_run(machine, bin_dir, ws, spec, label, store, ra_home, keys_log, e
     return run
 
 
-def reference(machine, bin_dir, ws, spec, store, ra_home):
-    """What plain cargo's program prints on this machine."""
+def reference(machine, bin_dir, ws, spec, store, ra_home, extra=None):
+    """What plain cargo's program prints on this machine, with the variables `extra` too."""
     from cargo_ra_jit import Side, program_output
-    env = machine.env(bin_dir, store, ra_home)
+    env = machine.env(bin_dir, store, ra_home, extra)
     # Plain cargo: nothing of ra-jit's, but the directory `Side` keeps its tally in.
     for k in [k for k in env if k.startswith("RA_JIT_") and k != "RA_JIT_HOME"]:
         env.pop(k)
@@ -1386,6 +1414,13 @@ def self_test():
     check("PM changed size fails the same-size control", not valid_macro_mutation("same-size-restored-mtime", False, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1))
     check("PM stale image fails", not valid_macro_mutation("dependency-restored-mtime", True, True, "a", "b", {"a": "image"}, {"a": "image"}, 0, 1))
     check("PM missing reload fails", not valid_macro_mutation("reload-00", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
+    private_env = {"PR15_PRIVATE": "old", "KEEP": "kept"}
+    check("PM private removal clears the request", macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
+    check("PM raw value after removal is preserved", macro_private_environment(private_env, "private-raw") == {"PR15_PRIVATE": "raw-\udcff-value"} and private_env == {"KEEP": "kept", "PR15_PRIVATE": "raw-\udcff-value"})
+    check("PM repeated removal is safe", macro_private_environment(private_env, "private-removed") == {} and macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
+    check("PM private source edits share the reload policy", all(macro_mutation_step(step) for step in ("private-removed", "private-raw")) and not macro_mutation_step("unchanged-content"))
+    check("PM private source edits pass with a new image and reload", all(valid_macro_mutation(step, True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1) for step in ("private-removed", "private-raw")))
+    check("PM environment step must edit and reload", not valid_macro_mutation("private-removed", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
     check("PM unchanged control cannot hide a reload", not valid_macro_mutation("unchanged-content", True, True, "a", "a", {"a": "image"}, {"a": "image"}, 1, 2))
     check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))
     check("cargo build count fails", not valid_worker_generation(ready_status.replace("0 by cargo", "1 by cargo"), ["ready"], ["1", "2"], ["1", "2"], 3, 2))

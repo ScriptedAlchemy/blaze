@@ -44,16 +44,26 @@ fn identity(key: &[u8; 32], value: Option<&str>) -> Option<String> {
     crate::env_identity::Identity::from_key(*key).value(value)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+/// A run this build made in cargo's `OUT_DIR`, which is cargo's once the build checked it.
 pub(crate) struct Completed {
+    carried: Carried,
+    /// Cargo's fingerprint of the run, in cargo's format: it has the value of each variable
+    /// the script said it reads (`rerun-if-env-changed`), as cargo writes it, so it goes only
+    /// where cargo writes it, never into the private file of [`Carried`].
+    fingerprint: super::super::records::Fingerprint,
+    began: std::time::SystemTime,
+}
+
+/// What cargo's leg is given of a completed run, in the private file: what [`consume_in`]
+/// compares and prints again, and no value of a variable.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Carried {
     out_dir: PathBuf,
     real: PathBuf,
     cwd: PathBuf,
     run: Run,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    fingerprint: super::super::records::Fingerprint,
-    began: std::time::SystemTime,
     inputs: Inputs,
 }
 
@@ -145,11 +155,11 @@ impl Inputs {
 
 impl Completed {
     pub(super) fn out_dir(&self) -> &std::path::Path {
-        &self.out_dir
+        &self.carried.out_dir
     }
 
     pub(super) fn run(&self) -> &Run {
-        &self.run
+        &self.carried.run
     }
 
     pub(super) fn fingerprint(&self) -> &super::super::records::Fingerprint {
@@ -160,11 +170,11 @@ impl Completed {
     /// next build finds it and does not run the script again. Not when the directory has
     /// another run by then.
     pub(crate) fn record(&self) -> Result<(), String> {
-        let unit = super::super::records::Unit::of(&self.out_dir)?;
+        let unit = super::super::records::Unit::of(self.out_dir())?;
         let _held = unit.hold()?;
         let printed = std::fs::read(unit.output()).map_err(|it| it.to_string())?;
-        if Run::left(&printed, &self.out_dir)? != self.run {
-            return Err(format!("{}: another run of the script", self.out_dir.display()));
+        if Run::left(&printed, self.out_dir())? != *self.run() {
+            return Err(format!("{}: another run of the script", self.out_dir().display()));
         }
         unit.record(&self.fingerprint)
     }
@@ -178,17 +188,16 @@ impl Completed {
         began: std::time::SystemTime,
         inputs: Inputs,
     ) -> Self {
-        Self {
+        let carried = Carried {
             out_dir: out_dir.to_owned(),
             real: ran.real.clone(),
             cwd: ran.cwd.clone(),
             run,
             stdout: output.stdout,
             stderr: output.stderr,
-            fingerprint,
-            began,
             inputs,
-        }
+        };
+        Self { carried, fingerprint, began }
     }
 }
 
@@ -204,12 +213,13 @@ impl Continuation {
                 continue;
             }
             let unit =
-                super::super::records::Unit::of(&done.out_dir).map_err(anyhow::Error::msg)?;
+                super::super::records::Unit::of(done.out_dir()).map_err(anyhow::Error::msg)?;
             let _held = unit.hold().map_err(anyhow::Error::msg)?;
-            let run = Run::left(&std::fs::read(unit.output())?, &done.out_dir)
+            let run = Run::left(&std::fs::read(unit.output())?, done.out_dir())
                 .map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(run == done.run, "the consumed script's output changed");
-            unit.ran(done.began, &done.stdout, &done.stderr).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(run == *done.run(), "the consumed script's output changed");
+            let carried = &done.carried;
+            unit.ran(done.began, &carried.stdout, &carried.stderr).map_err(anyhow::Error::msg)?;
             unit.record(&done.fingerprint).map_err(anyhow::Error::msg)?;
         }
         Ok(())
@@ -247,7 +257,8 @@ impl Continuation {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&held.0, std::fs::Permissions::from_mode(0o700))?;
         }
-        std::fs::write(held.0.join("runs"), serde_json::to_vec(completed)?)?;
+        let carried: Vec<&Carried> = completed.iter().map(|it| &it.carried).collect();
+        std::fs::write(held.0.join("runs"), serde_json::to_vec(&carried)?)?;
         command.env(VARIABLE, &held.0).env(KEY, hex(&OWN_KEY));
         Ok(Some(held))
     }
@@ -269,7 +280,7 @@ pub(super) fn consume_in(
     out_dir: &std::path::Path,
     dir: &std::path::Path,
 ) -> anyhow::Result<bool> {
-    let completed: Vec<Completed> = serde_json::from_slice(&std::fs::read(dir.join("runs"))?)?;
+    let completed: Vec<Carried> = serde_json::from_slice(&std::fs::read(dir.join("runs"))?)?;
     let Some((index, done)) = completed.iter().enumerate().find(|(_, it)| it.out_dir == out_dir)
     else {
         return Ok(false);

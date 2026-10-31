@@ -264,16 +264,19 @@ fn build(
     let private: Value = serde_json::from_str(described).map_err(|it| it.to_string())?;
     let private = crate::compiler_json::write(&project, &private).map_err(|it| it.to_string())?;
     let executable = std::env::current_exe().map_err(|it| it.to_string())?;
-    let mut ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
+    let ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
+    let said = run_build(ra_jit, &private, dir)?;
+    complete(&said)?;
+    Ok(said)
+}
+
+/// Runs the build `ra_jit`, sending it the private project `private`: what it said, or why
+/// it did not build, in its own words when it stopped before reading the project.
+fn run_build(mut ra_jit: Command, private: &[u8], dir: &Path) -> Result<String, String> {
     ra_jit.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = ra_jit.spawn().map_err(|it| format!("ra-jit did not run: {it}"))?;
-    let sent = child.stdin.take().ok_or("project pipe")?.write_all(&private);
-    if let Err(error) = sent {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("sending owned project: {error}"));
-    }
-    let built = child.wait_with_output().map_err(|it| format!("waiting for ra-jit: {it}"))?;
+    let child = ra_jit.spawn().map_err(|it| format!("ra-jit did not run: {it}"))?;
+    let built = crate::child::feed(child, private)
+        .map_err(|it| format!("sending ra-jit the owned project: {it}"))?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
@@ -283,7 +286,6 @@ fn build(
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
         return Err(format!("ra-jit did not build it ({}): {last}", built.status));
     }
-    complete(&said)?;
     Ok(said)
 }
 
@@ -320,11 +322,29 @@ fn build_command(
     if made.proc_macro {
         ra_jit.args(["--crate", "proc_macro", "--shared"]);
     }
+    // Replay has already selected the backend and compiler policy from the
+    // saved request. The executor's ambient settings must not replace them.
+    let replay = asked.is_some_and(|(env, _)| {
+        env.iter().any(|(name, value)| name == "RA_JIT_SPEC_REPLAY" && value == "1")
+    });
+    let setting = |name: &str| {
+        if replay {
+            asked.and_then(|(env, _)| {
+                env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+            })
+        } else {
+            std::env::var_os(name)
+        }
+    };
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
     let not_the_builds = |text: &str| {
         let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO"
+        cargos
+            || text.starts_with("RUSTC_")
+            || text.starts_with("RA_JIT_")
+            || text.starts_with("BLAZE_")
+            || text == "CARGO"
     };
     if let Some((env, inputs)) = asked {
         ra_jit.env_clear();
@@ -341,13 +361,28 @@ fn build_command(
         }
     }
     for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE", "RA_JIT_RUN_ID"] {
-        if let Some(value) = std::env::var_os(kept).filter(|_| asked.is_some()) {
+        if let Some(value) = setting(kept).filter(|_| asked.is_some()) {
             ra_jit.env(kept, value);
         }
     }
     for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
-        if let Some(value) = std::env::var_os(kept) {
+        if let Some(value) = setting(kept) {
             ra_jit.env(kept, value);
+        }
+    }
+    if replay {
+        for kept in [
+            "RA_JIT_SPEC_REPLAY",
+            "RA_JIT_OPT",
+            "RA_JIT_EMIT",
+            "RA_JIT_MIR_OPT",
+            "RA_JIT_WORKER_MEMORY",
+            "RA_JIT_MEMORY_RESERVE",
+            "RA_JIT_PRESSURE_GRACE_SECS",
+        ] {
+            if let Some(value) = setting(kept) {
+                ra_jit.env(kept, value);
+            }
         }
     }
     if let Some(store) = store {
@@ -1080,6 +1115,68 @@ mod tests {
     }
 
     #[test]
+    fn saved_producer_command_keeps_the_captured_compiler_policy() {
+        let dir = Path::new("/producer");
+        let made = Made {
+            name: "derive",
+            proc_macro: true,
+            exe: dir.join("libderive.dylib"),
+            dep_info: dir.join("derive.d"),
+        };
+        // Both backends must be read from this snapshot, not from the process
+        // running this test. No global environment mutation is needed.
+        for backend in ["cranelift", "llvm"] {
+            let policy = [
+                ("RA_JIT_SPEC_REPLAY", "1"),
+                ("RA_JIT_BACKEND", backend),
+                ("RA_JIT_OPT", "2"),
+                ("RA_JIT_EMIT", "fast"),
+                ("RA_JIT_MIR_OPT", "0"),
+                ("RA_JIT_STD_FROM", "off"),
+                ("RA_JIT_PROC_MACRO_SERVER", "0"),
+                ("RA_JIT_MEMORY_MAX", "8192M"),
+                ("RA_JIT_OWN_BASE_MEMORY", "6144M"),
+                ("RA_JIT_WORKER_MEMORY", "4096M"),
+                ("RA_JIT_MEMORY_RESERVE", "256M"),
+                ("RA_JIT_PRESSURE_GRACE_SECS", "30"),
+                ("RA_JIT_SPARE", "0"),
+                ("RA_JIT_RUN_ID", "saved-producer"),
+            ];
+            let mut env: Vec<(OsString, OsString)> =
+                policy.iter().map(|(name, value)| ((*name).into(), (*value).into())).collect();
+            // BLAZE aliases are command controls, not a second source of replay
+            // policy. They must not shadow the selected RA_JIT values at startup.
+            env.push(("BLAZE_BACKEND".into(), "invalid".into()));
+            env.push(("BLAZE_OPT".into(), "invalid".into()));
+            env.push(("PATH".into(), "/tools".into()));
+            let command = build_command(
+                Path::new("/blaze/ra-jit"),
+                &dir.join("rust-project.json"),
+                dir,
+                &made,
+                None,
+                true,
+                Some((&env, &dir.join("producer.inputs"))),
+            );
+            let actual = command.get_envs().collect::<BTreeMap<_, _>>();
+            for (name, value) in policy {
+                assert_eq!(
+                    actual.get(OsStr::new(name)).copied().flatten(),
+                    Some(OsStr::new(value)),
+                    "{name} for {backend}"
+                );
+            }
+            for name in ["RA_JIT_HOME", "BLAZE_BACKEND", "BLAZE_OPT"] {
+                assert!(actual.get(OsStr::new(name)).copied().flatten().is_none(), "{name}");
+            }
+            assert_eq!(
+                actual.get(OsStr::new("PATH")).copied().flatten(),
+                Some(OsStr::new("/tools"))
+            );
+        }
+    }
+
+    #[test]
     fn a_variable_read_as_rustc_would_read_it() {
         let info = crate::dep_info::DepInfo {
             files: Vec::new(),
@@ -1103,5 +1200,41 @@ mod tests {
         assert!(Asked { args: &optimized, cwd }.cfg().is_empty());
         let told = args(&["-C", "opt-level=3", "-Cdebug-assertions=on"]);
         assert_eq!(Asked { args: &told, cwd }.cfg(), ["debug_assertions"]);
+    }
+
+    /// A producer build that ends before it reads its project is reported with what it
+    /// said, even under `SIGPIPE`'s default action (`end_with_reader`), instead of ending
+    /// the process with the signal. The test binary is that process, run apart with the
+    /// variable.
+    #[test]
+    #[cfg(unix)]
+    fn a_build_that_stops_reading_is_reported_not_a_signal() {
+        const PARENT: &str = "BLAZE_TEST_BUILD_STOPS_READING";
+        if std::env::var_os(PARENT).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cargo::own_script::tests::a_build_that_stops_reading_is_reported_not_a_signal",
+                    "--nocapture",
+                ])
+                .env(PARENT, "1")
+                .env("RUST_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(said.contains("1 passed; 0 failed"), "{said}");
+            return;
+        }
+        crate::end_with_reader();
+        let dir = std::env::temp_dir().join(format!("blaze-stops-reading-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut stops = Command::new("sh");
+        stops.args(["-c", "echo 'error: no proc_macro crate for saved_producer_mac' >&2; exit 1"]);
+        // More than a pipe holds, so the write cannot finish before the child is gone.
+        let failed = run_build(stops, &vec![b' '; 8 << 20], &dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failed.starts_with("ra-jit did not build it (exit status: 1)"), "{failed}");
+        assert!(failed.contains("error: no proc_macro crate for saved_producer_mac"), "{failed}");
     }
 }

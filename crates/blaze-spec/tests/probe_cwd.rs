@@ -70,8 +70,12 @@ fn system_child_probes_receive_exactly_the_request_environment() {
         env.insert("BLAZE_PROBE_REQUEST_VALUE".to_owned(), value.into());
         let machine =
             Machine { cwd: &root, triple: &host.triple, cpu: &host.cpu, env: &env, linker: None };
+        let facts = blaze_spec::platform::facts(&machine, &System).unwrap();
+        assert_eq!(facts.cc.unwrap().1, format!("{value}:unset"));
+        // A bound platform is read in what a replay has: a variable no spec carries never
+        // reaches its probes.
         let platform = exec_platform(&machine, &System).unwrap();
-        assert_eq!(platform.cc.unwrap().1, format!("{value}:unset"));
+        assert_eq!(platform.cc.unwrap().1, ":unset");
         // Unlike a shell, env adds no variables of its own: this exercises the
         // byte-output path used for SDK lookup as well as text version probes.
         let bytes = System.run_path_in(&root, &env, &env_tool, &[]).unwrap();
