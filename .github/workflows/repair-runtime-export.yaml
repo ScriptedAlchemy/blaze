@@ -2,7 +2,7 @@ name: Blaze runtime repair sources
 on:
   push:
     branches: [repair/blaze-runtime-20261031]
-    paths: [.github/workflows/repair-runtime-export.yaml, '.github/repair/runtime-cleanup.patch']
+    paths: [.github/workflows/repair-runtime-export.yaml, '.github/repair/native-link.patch']
 permissions:
   contents: write
 concurrency:
@@ -16,45 +16,56 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Apply and validate the reviewed repair without moving PR branches
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+          llvm: none
+      - name: Prepare native library context repair on the published runtime fixes
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'Blaze CI repair'
           git config user.email 'noreply@openai.com'
-          c2_base=88b220e61614e483dfa0c6fcc992a502c2e72c02
-          ci_base=75a7e503b756e3fbfa6f06561de22a51533bd679
+          c2_base=377b13be812124a5d5f390855032a9c1388f2e49
+          ci_base=1347e74fba9dfc536c0fa36762e25e26b46151b2
           test "$(git rev-parse origin/dist/c2-buildspec)" = "$c2_base"
           test "$(git rev-parse origin/ci-redesign)" = "$ci_base"
-          patch="$GITHUB_WORKSPACE/.github/repair/runtime-cleanup.patch"
-          c2="$RUNNER_TEMP/runtime-repair-c2"
-          ci="$RUNNER_TEMP/runtime-repair-ci"
+          python3 - <<'PY'
+          import os, pathlib, re
+          source = pathlib.Path('.github/repair/native-link.patch').read_text()
+          source = source.replace('\n diff --git ', '\ndiff --git ')
+          source = re.sub(r'^index [^\n]*\n', '', source, flags=re.MULTILINE)
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'native-link.patch').write_text(source)
+          PY
+          c2="$RUNNER_TEMP/native-repair-c2"
+          ci="$RUNNER_TEMP/native-repair-ci"
           git worktree add --detach "$c2" "$c2_base"
-          git -C "$c2" apply --index "$patch"
+          git -C "$c2" apply --index "$RUNNER_TEMP/native-link.patch"
           git -C "$c2" diff --cached --check
-          test "$(git -C "$c2" write-tree)" = 687fc0ec1930c7494befbebfc744b1956f539d73
-          (cd "$c2"; python3 -I harness/dist/test_buildspec_cleanup.py) 2>&1 | tee "$RUNNER_TEMP/runtime-repair-c2-tests.log"
-          git -C "$c2" commit -m 'harness: release saved replay scratch after each C2 comparison' -m 'Saved replay writes large per-unit archives beside its CBOR, outside the local target cleaned by the harness. Release only newly created replay directories after stopping the product and inspecting its artifacts, including partial failures. Keep immutable inputs, pre-existing outputs, --keep, and result receipts beside the JSON evidence. Nine lifecycle regressions run in the existing self-test gate. No acceptance checks or resource limits are relaxed.'
+          test "$(git -C "$c2" write-tree)" = c68f82950f082206754134cb1b95db1f1044712a
+          files=(crates/ra-jit/src/cargo/own_script.rs crates/ra-jit/src/cargo/producer_plan.rs crates/ra-jit/src/scripts.rs crates/ra-jit/src/scripts/tests.rs)
+          (cd "$c2"; rustfmt --config skip_children=true "${files[@]}"; rustfmt --check --config skip_children=true "${files[@]}"; python3 -I harness/dist/test_buildspec_cleanup.py) 2>&1 | tee "$RUNNER_TEMP/native-repair-checks.log"
+          git -C "$c2" add -- "${files[@]}"
+          git -C "$c2" diff --cached --check
+          git -C "$c2" diff --cached > "$RUNNER_TEMP/native-repair-final.patch"
+          git -C "$c2" commit -m 'producers: retain judged native library flags in compiler contexts' -m 'The saved dynamic fixture reached its link but lost -L and -l: a native-unit context is authoritative, and ordinary producer descriptions omitted their build-script directives. Apply the judged library output before freezing that context, through the existing Cargo link-rule model, in both script and proc-macro producer planners. Keep OUT_DIR overrides distinct from the actual output tree; do not reread mutable script output as a fallback. Add a descriptor-to-private-context regression for paths with spaces, native library modifiers, target-specific argument filtering, and the build-script root boundary. Formatted with Rust 1.99.0; the new Rust regression is left to the PR compiler/test gate.'
           c2_sha=$(git -C "$c2" rev-parse HEAD)
           git worktree add --detach "$ci" "$ci_base"
           git -C "$ci" merge --no-commit --no-ff "$c2_sha"
           git -C "$ci" diff --cached --check
-          test "$(git -C "$ci" write-tree)" = 361e6e70b6874ecaae1769c8cff194e3c0c58801
-          (cd "$ci"; python3 -I harness/dist/test_buildspec_cleanup.py; python3 -I harness/dist/test_check_nix_workflow.py; python3 -I .github/scripts/test_bench_pair.py; python3 -I .github/scripts/test_bench_verdict.py) 2>&1 | tee "$RUNNER_TEMP/runtime-repair-ci-tests.log"
-          git -C "$ci" commit -m 'Merge C2 runtime repairs into shared-build CI' -m 'Carry the Nix run-path control correction, native build-script output-directory identity, and C2 replay scratch cleanup into ci-redesign. Preserve every CI-specific file and the shared build/bundle consumers. This keeps the original product-fix history instead of drifting copies. The documentation merges without conflicts.'
+          git -C "$ci" diff --quiet "$ci_base" -- .github harness/dist/check_nix_workflow.py harness/dist/test_check_nix_workflow.py
+          (cd "$ci"; python3 -I harness/dist/test_buildspec_cleanup.py; python3 -I harness/dist/test_check_nix_workflow.py; python3 -I .github/scripts/test_bench_pair.py; python3 -I .github/scripts/test_bench_verdict.py) 2>&1 | tee "$RUNNER_TEMP/native-repair-ci-checks.log"
+          git -C "$ci" commit -m 'Merge producer native library context repair into shared-build CI'
           ci_sha=$(git -C "$ci" rev-parse HEAD)
-          git push origin "$c2_sha:refs/heads/repair/c2-runtime-tested-20261031" "$ci_sha:refs/heads/repair/ci-runtime-tested-20261031"
-          printf '{"c2":"%s","ci":"%s","c2_base":"%s","ci_base":"%s","c2_tree":"%s","ci_tree":"%s"}\n' "$c2_sha" "$ci_sha" "$c2_base" "$ci_base" "$(git -C "$c2" rev-parse HEAD^{tree})" "$(git -C "$ci" rev-parse HEAD^{tree})" | tee "$RUNNER_TEMP/runtime-repair-receipt.json"
-          git update-ref refs/heads/runtime-repair-c2 "$c2_sha"
-          git update-ref refs/heads/runtime-repair-ci "$ci_sha"
-          git bundle create "$RUNNER_TEMP/runtime-repair.bundle" refs/heads/runtime-repair-c2 refs/heads/runtime-repair-ci
+          git push origin "$c2_sha:refs/heads/repair/c2-native-formatted-20261031" "$ci_sha:refs/heads/repair/ci-native-formatted-20261031"
+          printf '{"c2":"%s","ci":"%s","c2_base":"%s","ci_base":"%s","c2_tree":"%s","ci_tree":"%s"}\n' "$c2_sha" "$ci_sha" "$c2_base" "$ci_base" "$(git -C "$c2" rev-parse HEAD^{tree})" "$(git -C "$ci" rev-parse HEAD^{tree})" | tee "$RUNNER_TEMP/native-repair-receipt.json"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: blaze-runtime-repair
+          name: blaze-native-link-repair
           path: |
-            ${{ runner.temp }}/runtime-repair-receipt.json
-            ${{ runner.temp }}/runtime-repair-*-tests.log
-            ${{ runner.temp }}/runtime-repair.bundle
+            ${{ runner.temp }}/native-repair-receipt.json
+            ${{ runner.temp }}/native-repair-final.patch
+            ${{ runner.temp }}/native-repair*checks.log
           retention-days: 1
           if-no-files-found: warn
