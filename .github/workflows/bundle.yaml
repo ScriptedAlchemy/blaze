@@ -81,6 +81,8 @@ jobs:
       - name: Test and build sets
         env:
           RUSTC_WRAPPER: ${{ steps.toolchain.outputs.rustc-wrapper }}
+          # Nested Cargo workspaces must also put their artifacts under the bundle's target root.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py build \
             --platform "${{ inputs.platform }}" --base-sha "${{ inputs.base-sha }}" \
