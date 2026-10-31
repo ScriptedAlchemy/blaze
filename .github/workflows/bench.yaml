@@ -34,9 +34,16 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      # Both builds place every function and loop head on the same alignment. The benchmark
+      # links hir-ty-codegen, so a change there moves the addresses of the store's code the
+      # benchmarks measure without touching it, and on x86 a hot loop that lands differently
+      # runs tens of percent slower: `store/has_miss` was +47% on four runs of a change that
+      # left ra-jit-store alone, and flat in a paired run on another machine. With the
+      # alignment pinned, a difference is the code's.
+      - run: echo 'RUSTFLAGS=-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5' >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bench
+          key: bench-aligned
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base
