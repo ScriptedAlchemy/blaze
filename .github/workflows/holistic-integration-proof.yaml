@@ -1,0 +1,85 @@
+name: Holistic integration preparation
+on:
+  push:
+    branches: [audit/fork-holistic-20261031]
+    paths: [.github/workflows/holistic-integration-proof.yaml]
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconstruct only the reviewed integration changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/integration-proof"
+          cp .github/holistic-integration.patch "$RUNNER_TEMP/integration-proof/changes.patch"
+          cp .github/holistic-architecture.md "$RUNNER_TEMP/integration-proof/architecture.md"
+          git checkout --detach 972fbe245765fe54032cc153757485d960c935a4
+          git checkout b13ad6a7f178b4e4918d744fb058fb03bfd9a02c -- crates/blaze-spec/src/native_tree.rs crates/ra-jit/src/doctest.rs crates/ra-jit/src/native_inputs/replay/tests.rs
+          git checkout dbe4869048fdf4844c7a4d39b5f01c77f028b904 -- harness/unittests.py harness/uigate.py harness/dist/tests.py harness/test_gate_verdicts.py .github/workflows/history-gates-proof.yaml vendor/rust-analyzer/crates/proc-macro-api/src/generation_tests.rs vendor/rust-analyzer/crates/proc-macro-api/src/lib.rs vendor/rust-analyzer/crates/proc-macro-api/src/process.rs
+          git apply "$RUNNER_TEMP/integration-proof/changes.patch"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          note=(Path(os.environ['RUNNER_TEMP'])/'integration-proof/architecture.md').read_text()
+          path=Path('docs/distributed-review-20261030.md')
+          original=path.read_text()
+          title,old=original.split('\n',1)
+          path.write_text(title+'\n\n'+note+'\n\n## Original 2026-10-30 review\n'+old)
+          PY
+      - name: Verify regressions and all existing Python CI contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/integration-proof"
+          for script in .github/scripts/test_*.py; do
+            python3 -I "$script" > "$out/$(basename "$script").log" 2>&1 || { cat "$out/$(basename "$script").log"; exit 1; }
+          done
+          python3 -I harness/test_gate_verdicts.py -v > "$out/gate-verdicts.log" 2>&1
+          python3 -I harness/dist/tests.py --self-test > "$out/distributed-verdicts.log" 2>&1
+          python3 -I harness/dist/test_saved_spec_nix_rpath.py > "$out/nix-rpath.log" 2>&1
+          git diff --check
+      - name: Retain exact blobs for authorized workflow publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          paths=subprocess.check_output(['git','diff','--name-only','HEAD'],text=True).splitlines()
+          paths+=subprocess.check_output(['git','ls-files','--others','--exclude-standard'],text=True).splitlines()
+          entries=[]
+          for path in sorted(set(paths)):
+              data=Path(path).read_text()
+              response=subprocess.check_output(['gh','api','--method','POST',f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs",'--input','-'],input=json.dumps({'content':data,'encoding':'utf-8'}),text=True)
+              sha=json.loads(response)['sha']
+              expected=subprocess.check_output(['git','hash-object',path],text=True).strip()
+              assert sha==expected,(path,sha,expected)
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          out=Path(os.environ['RUNNER_TEMP'])/'integration-proof'
+          (out/'blobs.json').write_text(json.dumps(entries,indent=2)+'\n')
+          subprocess.run(['git','add','--all'],check=True)
+          (out/'tree.txt').write_text(subprocess.check_output(['git','write-tree'],text=True))
+          (out/'verified.patch').write_bytes(subprocess.check_output(['git','diff','--cached','HEAD']))
+          print(json.dumps(entries,indent=2))
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: holistic-integration-proof
+          path: |
+            ${{ runner.temp }}/integration-proof/*.log
+            ${{ runner.temp }}/integration-proof/*.json
+            ${{ runner.temp }}/integration-proof/*.txt
+            ${{ runner.temp }}/integration-proof/verified.patch
+          retention-days: 7
+          if-no-files-found: error
