@@ -10,11 +10,11 @@ import subprocess
 import sys
 
 ROOT = Path.cwd()
-C2 = "4b9546e8dfde4601ab99efc47b58da62b981a7c6"
+C2 = "1f32f6b32a0bfe2be194043a8d1f2d11cd2b9233"
 C4 = "0b833a84da5b9b4c9916ffbf4474e2405f52ae65"
 CI = "6ae5e5cb512bb34afaf5a443e264d332bc1dee6b"
-MERGE_TREE = "23aee0a033b3f0b23f2874625768a19bc8a3acc4"
-FIX_TREE = "7d3eb42024cfbf064f120369958705b68c1773b6"
+MERGE_TREE = "3bd1d42a0fe5d489a3d5f935c1a34026573b5f6d"
+FIX_TREE = "8ae17ce8abf0b3efb6653363aa4f7bab5ed62df2"
 PATCH = ROOT / ".github/repair/producer-policy.patch"
 TEMP = Path(os.environ["RUNNER_TEMP"])
 
@@ -64,8 +64,15 @@ answers.write_text(text)
 run("git", "add", "crates/ra-jit/src/answers.rs", cwd=c2)
 run("git", "diff", "--cached", "--check", cwd=c2)
 require(git("write-tree", cwd=c2) == MERGE_TREE, "C4 merge differs from the locally reviewed tree")
-run("git", "commit", "-m", "Merge current C4 producer fixes into saved BuildSpec execution", "-m", "Keep the owned Cargo metadata front door while adapting compiler resolution to the strict Result-returning toolchain API. Preserve the C4 producer cfg, snapshot and fingerprint fixes.", cwd=c2)
-run("git", "apply", "--index", str(PATCH), cwd=c2)
+run("git", "commit", "-m", "Merge current C4 producer fixes into saved BuildSpec execution", "-m", "Keep the owned Cargo metadata front door while adapting compiler resolution to the strict Result-returning toolchain API. Preserve the C4 producer cfg, snapshot and fingerprint fixes, plus the concurrent child::feed diagnostics correction.", cwd=c2)
+# The concurrent C2 commit already improves child-pipe diagnostics. Apply only
+# the independent compiler-policy and regression hunks, preserving that work.
+patch = PATCH.read_text()
+require(patch.count("diff --git ") == 1, "unexpected patch files")
+policy = patch[:patch.index("@@")] + patch[patch.index("@@ -320,"):]
+policy_patch = TEMP / "producer-policy-only.patch"
+policy_patch.write_text(policy)
+run("git", "apply", "--index", str(policy_patch), cwd=c2)
 require(git("write-tree", cwd=c2) == FIX_TREE, "producer repair differs from the locally reviewed tree")
 # Format only the new implementation; other merge content must remain unchanged.
 run("rustfmt", "+1.99.0", "--edition", "2024", "crates/ra-jit/src/cargo/own_script.rs", cwd=c2)
@@ -75,7 +82,7 @@ run("git", "diff", "--cached", "--check", cwd=c2)
 run("cargo", "+1.99.0", "fmt", "-p", "ra-jit", "--", "--check", cwd=c2)
 run(sys.executable, "-I", "-B", "harness/dist/test_saved_spec.py", cwd=c2)
 run(sys.executable, "-I", "-B", "harness/norustc_test.py", cwd=c2)
-run("git", "commit", "-m", "Honor saved compiler policy when launching owned producers", "-m", "Use the explicit replay environment for backend, lowering and memory policy instead of restoring ambient RA_JIT settings. Remove BLAZE aliases before child startup, retain replay admission, and preserve producer diagnostics after an early stdin rejection. Cover both backend selections and conflicting alias controls.", cwd=c2)
+run("git", "commit", "-m", "Honor saved compiler policy when launching owned producers", "-m", "Use the explicit replay environment for backend, lowering and memory policy instead of restoring ambient RA_JIT settings. Remove BLAZE aliases before child startup and retain replay admission. Cover both backend selections and conflicting alias controls; preserve the concurrent child::feed implementation.", cwd=c2)
 c2_sha = git("rev-parse", "HEAD", cwd=c2)
 run("git", "worktree", "add", "--detach", str(ci), CI)
 run("git", "merge", "--no-ff", "-m", "Merge repaired BuildSpec execution and current C4 into CI redesign", c2_sha, cwd=ci)
