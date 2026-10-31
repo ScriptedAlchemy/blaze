@@ -102,6 +102,19 @@ def allowed_bundle_key(key):
     return key.startswith("workspace/target/") or key.startswith("temp/owned-runtime/")
 
 
+def artifact_path(key, base):
+    """Only target artifacts may be restored; internal symlinks cannot reach source files."""
+    if not allowed_bundle_key(key):
+        die(f"refusing non-build artifact {key!r}")
+    path = from_key(key, base)
+    name, _, _ = key.partition("/")
+    directory = "target" if name == "workspace" else "owned-runtime"
+    allowed_root = os.path.join(os.path.realpath(base[name]), directory)
+    if os.path.commonpath([allowed_root, os.path.realpath(path)]) != allowed_root:
+        die(f"refusing non-build destination {key!r}")
+    return path
+
+
 def verified_executable(path, key, manifest):
     """Every consumer, including `path`, validates a binary before using it."""
     want = manifest["files"].get(key)
@@ -239,9 +252,7 @@ def pack(args):
     keys = sorted(set(keys))
     files = {}
     for key in keys:
-        if not allowed_bundle_key(key):
-            die(f"refusing non-build artifact {key!r}")
-        path = from_key(key, base)
+        path = artifact_path(key, base)
         if not os.path.isfile(path):
             die(f"{key} was not built")
         files[key] = {"sha256": sha256_file(path), "size": os.path.getsize(path),
@@ -305,15 +316,14 @@ def unpack(args):
     seen = set()
     zstd = subprocess.Popen(["zstd", "-d", "-c", "-q", str(src / "bundle.tar.zst")],
                             stdout=subprocess.PIPE)
+    completed = False
     try:
         with tarfile.open(fileobj=zstd.stdout, mode="r|") as tar:
             for member in tar:
-                if not allowed_bundle_key(member.name):
-                    die(f"refusing non-build artifact {member.name!r}")
                 want = files.get(member.name)
                 if want is None or not member.isfile() or member.name in seen:
                     die(f"unlisted or repeated member {member.name!r}")
-                path = from_key(member.name, base)
+                path = artifact_path(member.name, base)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 # Do not truncate a previously present hardlink or follow a final
                 # symlink. A corrupt/truncated tar leaves the old file untouched.
@@ -338,20 +348,22 @@ def unpack(args):
                     if want["executable"]:
                         os.chmod(temp_path, 0o755)
                     # Recheck in case a concurrent process changed a parent link.
-                    from_key(member.name, base)
+                    artifact_path(member.name, base)
                     os.replace(temp_path, path)
                     temp_path = None
                 finally:
                     if temp_path and os.path.exists(temp_path):
                         os.unlink(temp_path)
                 seen.add(member.name)
+        completed = True
     finally:
-        # A failed member verification must not leak the decompressor or its pipe.
+        # On success let zstd exit normally; terminate it only on a rejected
+        # member, when a full pipe could otherwise block the child forever.
         zstd.stdout.close()
-        if zstd.poll() is None:
+        if not completed and zstd.poll() is None:
             zstd.terminate()
-        zstd.wait()
-    if zstd.wait() != 0:
+        status = zstd.wait()
+    if status != 0:
         die("zstd failed")
     missing = sorted(set(files) - seen)
     if missing:

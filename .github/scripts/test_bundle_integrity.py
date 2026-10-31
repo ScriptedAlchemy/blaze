@@ -75,6 +75,15 @@ class BundleIntegrityTests(unittest.TestCase):
             bundle.from_key("workspace/target/escape/file", self.base)
         self.assertFalse((outside / "file").exists())
 
+    def test_symlink_inside_workspace_cannot_overwrite_checkout_sources(self):
+        source = self.workspace / "src"
+        source.mkdir()
+        (source / "lib.rs").write_text("source")
+        (self.workspace / "target/src-link").symlink_to(source, target_is_directory=True)
+        with self.assertRaises(SystemExit):
+            bundle.artifact_path("workspace/target/src-link/lib.rs", self.base)
+        self.assertEqual((source / "lib.rs").read_text(), "source")
+
     def test_corrupt_archive_never_truncates_preexisting_hardlink(self):
         linked = self.root / "hardlinked"
         os.link(self.binary, linked)
