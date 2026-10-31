@@ -33,26 +33,69 @@ jobs:
           payload=zlib.decompress(base64.b64decode(Path('.github/holistic-repairs.b64').read_text()[:6042]+tail,validate=True))
           assert hashlib.sha256(payload).hexdigest()=='0de5ade555a182b6177bf98d7a317aaa1d973b13f289ad6068de58acf091a91d'
           out=Path(os.environ['RUNNER_TEMP'])/'holistic-proof'
-          for name,data in json.loads(payload).items(): (out/Path(name).name).write_text(data)
-          (out/'lazy.patch').write_bytes(Path('.github/holistic-lazy.patch').read_bytes())
+          for name,data in json.loads(payload).items():
+              if name=='publication.patch':
+                  assert data.count('assert_ne!(observed, published);')==1
+                  data=data.replace('assert_ne!(observed, published);','assert!(observed != published);')
+              (out/Path(name).name).write_text(data)
+          lazy=Path('.github/holistic-lazy.patch').read_text()
+          lazy=lazy.replace('assert_eq!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()), observed);','assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);')
+          (out/'lazy.patch').write_text(lazy)
+          (out/'identity-followup.patch').write_bytes(Path('.github/holistic-identity-followup.patch').read_bytes())
           PY
           git checkout --detach "$BASE"
-          out="$RUNNER_TEMP/holistic-proof"
-          cp "$out/source_identity_test.py" harness/source_identity_test.py
-          git apply "$out/identity.patch"
-          git apply "$out/publication.patch"
-          git apply "$out/lazy.patch"
+          git config user.name 'Blaze repair'
+          git config user.email 'noreply@openai.com'
+          cp "$RUNNER_TEMP/holistic-proof/source_identity_test.py" harness/source_identity_test.py
+          git apply "$RUNNER_TEMP/holistic-proof/identity.patch"
       - uses: ./.github/actions/toolchain
-        with: {components: rustfmt, llvm: build}
-      - name: Validate compiler source identity and prepare exact before/after runner
+        with: {components: rustfmt, llvm: none}
+      - name: Verify complete identity regression suite before publishing it
         shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/holistic-proof"
-          rustfmt --edition 2024 crates/ra-jit/build.rs crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git apply --include=harness/source_identity_test.py "$out/identity-followup.patch"
+          rustc --edition=2024 crates/ra-jit/build.rs -o "$out/identity-before-followup"
+          set +e
+          BLAZE_BUILD_SCRIPT="$out/identity-before-followup" python3 -I harness/source_identity_test.py -v > "$out/identity-before-followup.log" 2>&1
+          status=$?
+          set -e
+          test "$status" = 1
+          grep -q 'test_git_metadata_file_is_not_compiler_source.*FAIL' "$out/identity-before-followup.log"
+          grep -q 'test_unrelated_non_unicode_environment_is_not_decoded.*ERROR' "$out/identity-before-followup.log"
+          git apply --include=crates/ra-jit/build.rs "$out/identity-followup.patch"
+          rustfmt --edition 2024 crates/ra-jit/build.rs
           rustc --edition=2024 crates/ra-jit/build.rs -o "$out/identity-after"
           BLAZE_BUILD_SCRIPT="$out/identity-after" python3 -I harness/source_identity_test.py -v 2>&1 | tee "$out/identity-after.log"
+          git diff --check
+          git add crates/ra-jit/build.rs harness/source_identity_test.py
+          git commit -m 'Reject incomplete compiler source identities without losing native path fidelity'
+          git branch review/holistic-source-identity
+          git push origin HEAD:refs/heads/review/holistic-source-identity
+          git log -1 --format='%H %s' > "$out/identity-commit.txt"
+          git bundle create "$out/identity.bundle" review/holistic-source-identity "^$BASE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: holistic-source-identity-proof
+          path: |
+            ${{ runner.temp }}/holistic-proof/identity*.log
+            ${{ runner.temp }}/holistic-proof/identity.bundle
+            ${{ runner.temp }}/holistic-proof/identity-commit.txt
+          retention-days: 7
+          if-no-files-found: error
+      - uses: ./.github/actions/toolchain
+        with: {llvm: build}
+      - name: Prepare runtime regressions without requiring Debug for digest values
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          git apply "$out/publication.patch"
+          git apply "$out/lazy.patch"
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
           cp crates/ra-jit/src/remote/keeper.rs "$out/keeper-after.rs"
+          cp crates/ra-jit/src/remote/keeper/recovery_tests.rs "$out/recovery-after.rs"
           git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
       - name: Reproduce publication and lazy-recovery failures on the original keeper
         shell: bash
@@ -67,7 +110,7 @@ jobs:
           grep -q 'a write is not an installed lookup' "$out/recovery-before.log"
           grep -q 'unchanged manifest must not freeze a failed pack fetch' "$out/recovery-before.log"
           grep -q 'a failed index retry must leave recovery possible' "$out/recovery-before.log"
-      - name: Validate repaired runtime without weakening failure coalescing
+      - name: Validate repaired runtime
         shell: bash
         run: |
           set -euo pipefail
@@ -78,24 +121,22 @@ jobs:
           cargo fmt --all -- --check
           git diff --check
           git diff > "$out/verified.patch"
-      - name: Publish only the lazy-recovery change on the verified source stack
+      - name: Publish two focused runtime commits on the verified identity stack
         shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/holistic-proof"
-          git fetch origin refs/heads/review/holistic-source-identity
-          parent=$(git rev-parse FETCH_HEAD)
-          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs crates/ra-jit/src/remote/keeper/recovery_tests/lazy_download_tests.rs crates/ra-jit/build.rs harness/source_identity_test.py
-          git diff --cached --exit-code "$parent" -- crates/ra-jit/build.rs harness/source_identity_test.py
-          git reset --soft "$parent"
-          python3 - <<'PY'
-          import subprocess
-          expected={'crates/ra-jit/src/remote/keeper.rs','crates/ra-jit/src/remote/keeper/recovery_tests.rs','crates/ra-jit/src/remote/keeper/recovery_tests/lazy_download_tests.rs'}
-          actual=set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines())
-          assert actual==expected,(actual,expected)
-          PY
-          git config user.name 'Blaze repair'
-          git config user.email 'noreply@openai.com'
+          git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
+          git show "$BASE:crates/ra-jit/src/remote/keeper/recovery_tests.rs" > crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git apply "$out/publication.patch"
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git commit -m 'Do not acknowledge remote cache reads when publishing local work'
+          git branch review/holistic-remote-publication
+          git push origin HEAD:refs/heads/review/holistic-remote-publication
+          cp "$out/keeper-after.rs" crates/ra-jit/src/remote/keeper.rs
+          cp "$out/recovery-after.rs" crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs crates/ra-jit/src/remote/keeper/recovery_tests/lazy_download_tests.rs
           git commit -m 'Retry failed lazy pack fetches through the throttled keeper'
           git branch review/holistic-lazy-recovery
           git push origin HEAD:refs/heads/review/holistic-lazy-recovery
