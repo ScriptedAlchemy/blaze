@@ -101,23 +101,26 @@ jobs:
           mkdir -p "$tango"
           cp "$RUNNER_TEMP/bench-base" "$RUNNER_TEMP/bench-base-copy"
           started=$SECONDS
+          aa_status=0
           "$RUNNER_TEMP/bench-base" --color never compare "$RUNNER_TEMP/bench-base-copy" \
             -t "$TIME" --noise-threshold "$NOISE" -o -v \
-            --dump "$tango/aa" | tee "$tango/aa.txt" || true
+            --dump "$tango/aa" | tee "$tango/aa.txt" || aa_status=$?
           aa_seconds=$((SECONDS - started))
           attempts=()
+          exit_codes=()
           for attempt in 1 2; do
             status=0
             "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" \
               -t "$TIME" --noise-threshold "$NOISE" -o -v \
               --dump "$tango/compare-$attempt" | tee "$tango/compare-$attempt.txt" || status=$?
             attempts+=("$tango/compare-$attempt.txt")
+            exit_codes+=(--exit-code "$status")
             [ "$status" != 0 ] || break
             [ "$attempt" = 2 ] || echo "A slowdown over ${NOISE}%: measuring again"
           done
           status=0
           python3 -I .github/scripts/bench_verdict.py --aa "$tango/aa.txt" --aa-seconds "$aa_seconds" \
-            --cpu-file "$tango/cpu.txt" "${attempts[@]}" | tee "$tango/verdict.txt" || status=$?
+            --cpu-file "$tango/cpu.txt" --aa-exit-code "$aa_status" "${exit_codes[@]}" "${attempts[@]}" | tee "$tango/verdict.txt" || status=$?
           {
             echo '### tango: change against base'; echo '```'; cat "$tango/verdict.txt"; echo '```'
             echo '```'; cat "$tango/aa.txt" "${attempts[@]}"; echo '```'
@@ -126,7 +129,7 @@ jobs:
           case "$(head -1 "$tango/verdict.txt")" in
             *environmental) echo "::warning::the runner shows over ${NOISE}% between two copies of the same binary: the comparison with the base is not counted" ;;
             *regression) echo "::error::the same benchmark is over ${NOISE}% slower than on the base in both comparisons" ;;
-            *error) echo "::error::tango measured nothing in its last comparison" ;;
+            *error) echo "::error::tango comparison failed or produced incomplete measurements" ;;
           esac
           exit "$status"
       # On main, and on a pull request whose base has no benchmarks.

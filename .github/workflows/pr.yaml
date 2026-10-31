@@ -66,6 +66,13 @@ jobs:
         env:
           TIER: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/dist/main' || github.ref == 'refs/heads/dist/c4-keys'))) && 'full' || inputs.tier || 'fast' }}
         run: echo "tier=$TIER" | tee -a "$GITHUB_OUTPUT"
+      - name: Check CI helper contracts before compiling
+        run: |
+          python3 -I .github/scripts/test_changes.py
+          python3 -I .github/scripts/test_bundle_integrity.py
+          python3 -I .github/scripts/test_bundle_transport.py
+          python3 -I .github/scripts/test_bench_pair.py
+          python3 -I .github/scripts/test_bench_verdict.py
       - id: areas
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,10 +86,10 @@ jobs:
           if [ "$TIER" != full ]; then
             case "$EVENT" in
               pull_request|push)
-                files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --jq 'if (.files | length) >= 300 then "" else .files[].filename end') || files=;;
+                files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD") || files=;;
             esac
           fi
-          echo "$files" | python3 -I .github/scripts/changes.py | tee -a "$GITHUB_OUTPUT"
+          echo "$files" | python3 -I .github/scripts/changes.py --compare-json | tee -a "$GITHUB_OUTPUT"
 
   build-linux:
     name: build linux-x64

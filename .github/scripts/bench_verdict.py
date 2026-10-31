@@ -36,6 +36,10 @@ def means(text):
     for line in text.splitlines():
         block = BLOCK.match(line)
         if block:
+            # Duplicate results or a header without its mean indicate incomplete
+            # evidence; never let a later block overwrite a previous measurement.
+            if name is not None or block.group(1) in found:
+                return {}
             name = block.group(1)
             continue
         mean = MEAN.match(line)
@@ -43,7 +47,7 @@ def means(text):
             base, candidate, _, pct, star = mean.groups()
             found[name] = (base, candidate, float(pct), star == "*")
             name = None
-    return found
+    return found if name is None else {}
 
 
 def slow(text):
@@ -76,10 +80,13 @@ def cpu_line(text):
     return cpu + ("; " + ", ".join(digests) if digests else "")
 
 
-def judge(aa, attempts, cpu="", aa_seconds=None):
+def judge(aa, attempts, cpu="", aa_seconds=None, exit_codes=None, aa_exit_code=None):
     """The verdict word, the report and the exit status for the texts of one job."""
+    control = means(aa)
+    measured = [means(text) for text in attempts]
+    expected = set(control) or next((set(rows) for rows in measured if rows), set())
     aa_slow = slow(aa)
-    parsed = [bool(means(text)) for text in attempts]
+    parsed = [bool(rows) and set(rows) == expected for rows in measured]
     slows = [slow(text) for text in attempts]
     lines = []
     if cpu:
@@ -92,8 +99,14 @@ def judge(aa, attempts, cpu="", aa_seconds=None):
     for number, (ok, slowed) in enumerate(zip(parsed, slows), 1):
         lines.append(f"comparison {number}: " + (f"over the threshold: {show(slowed)}" if ok else "measured nothing"))
 
-    if not parsed[-1]:
+    process_failed = exit_codes is not None and (
+        len(exit_codes) != len(attempts) or not exit_codes
+        or exit_codes[-1] not in (0, 1) or (exit_codes[-1] == 1 and not slows[-1]))
+    if process_failed:
+        lines.append(f"comparison process exit statuses: {exit_codes}")
+    if process_failed or not parsed or not parsed[-1]:
         verdict, status = "error", 1
+        lines.append("last comparison has missing, duplicate, or incomplete measurements")
     else:
         # A comparison that measured nothing says nothing about which benchmark was slow.
         repeated = set(slows[-1])
@@ -107,7 +120,7 @@ def judge(aa, attempts, cpu="", aa_seconds=None):
             verdict, status = "pass", 0
         if len(attempts) > 1 and repeated:
             lines.append("over the threshold in both comparisons: " + ", ".join(sorted(repeated)))
-    if aa_slow and verdict != "error":
+    if aa_slow and aa_exit_code in (None, 0, 1) and verdict != "error":
         note = f", where it would have been {verdict}" if verdict in ("regression", "noise") else ""
         verdict, status = "environmental", 0
         lines.append(
@@ -123,13 +136,16 @@ def main(argv=None):
     parser.add_argument("--aa", required=True, help="tango's output of bench-base against its copy")
     parser.add_argument("--aa-seconds", type=int, help="how long the A/A control took")
     parser.add_argument("--cpu-file", help="the job's cpu.txt")
+    parser.add_argument("--exit-code", type=int, action="append", help="one exit status per comparison")
+    parser.add_argument("--aa-exit-code", type=int, help="the A/A process exit status")
     parser.add_argument("attempts", nargs="+", help="tango's output of each comparison, in order")
     args = parser.parse_args(argv)
     cpu = ""
     if args.cpu_file and Path(args.cpu_file).is_file():
         cpu = cpu_line(Path(args.cpu_file).read_text())
     _, report, status = judge(
-        Path(args.aa).read_text(), [Path(it).read_text() for it in args.attempts], cpu, args.aa_seconds
+        Path(args.aa).read_text(), [Path(it).read_text() for it in args.attempts], cpu, args.aa_seconds,
+        args.exit_code, args.aa_exit_code
     )
     print(report)
     return status
