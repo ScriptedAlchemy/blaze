@@ -546,10 +546,14 @@ def recognized_fallback(text):
     return bool(re.search(r"building with cargo|this build is cargo's|this is `cargo|"
                           r"nothing has changed since cargo built|^\s*Compiling ", text, re.M))
 
+def macro_mutation_step(step):
+    return (step in ("same-size-restored-mtime", "dependency-restored-mtime")
+            or step.startswith(("reload-", "private-")))
+
+
 def valid_macro_mutation(step, same_size, same_mtime, before, after,
                          old_dylibs, dylibs, old_reloads, reloads):
-    mutation = (step in ("same-size-restored-mtime", "dependency-restored-mtime")
-                or step.startswith(("reload-", "private-")))
+    mutation = macro_mutation_step(step)
     if mutation:
         return (same_size and same_mtime and before != after and old_dylibs != dylibs
                 and reloads > old_reloads)
@@ -608,6 +612,14 @@ def token_scan(roots, token):
                 except OSError:
                     errors.append(path)
     return dict(scanned=len(seen), hits=hits, errors=errors, roots=roots)
+
+def macro_private_environment(env, step):
+    """Change the witness's request environment, including repeated removals."""
+    env.pop("PR15_PRIVATE", None)
+    private = {} if step == "private-removed" else {"PR15_PRIVATE": "raw-\udcff-value"}
+    env.update(private)
+    return private
+
 
 def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server):
     from cargo_ra_jit import Side, program_output, wait_warm
@@ -672,9 +684,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
                     output.write(text)
                 os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
             elif step.startswith("private-"):
-                env.pop("PR15_PRIVATE")
-                private = {} if step == "private-removed" else {"PR15_PRIVATE": "raw-\udcff-value"}
-                env.update(private)
+                private = macro_private_environment(env, step)
                 text = re.sub(r"described (?:ONE|TWO|\d{3}|P\d\d)",
                               "described P0" + str(steps.index(step) % 10), text)
                 with open(source, "w") as output:
@@ -698,7 +708,7 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
             new_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
             same_size = os.stat(edited_source).st_size == before.st_size
             same_mtime = os.stat(edited_source).st_mtime_ns == before.st_mtime_ns
-            mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")
+            mutation = macro_mutation_step(step)
             worker = workers_log(side)
             reload_count = len(re.findall(r"(?m)^reload:", worker))
             reload_valid = (reload_count > previous_reload_count if mutation
@@ -1404,6 +1414,12 @@ def self_test():
     check("PM changed size fails the same-size control", not valid_macro_mutation("same-size-restored-mtime", False, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1))
     check("PM stale image fails", not valid_macro_mutation("dependency-restored-mtime", True, True, "a", "b", {"a": "image"}, {"a": "image"}, 0, 1))
     check("PM missing reload fails", not valid_macro_mutation("reload-00", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
+    private_env = {"PR15_PRIVATE": "old", "KEEP": "kept"}
+    check("PM private removal clears the request", macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
+    check("PM raw value after removal is preserved", macro_private_environment(private_env, "private-raw") == {"PR15_PRIVATE": "raw-\udcff-value"} and private_env == {"KEEP": "kept", "PR15_PRIVATE": "raw-\udcff-value"})
+    check("PM repeated removal is safe", macro_private_environment(private_env, "private-removed") == {} and macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
+    check("PM private source edits share the reload policy", all(macro_mutation_step(step) for step in ("private-removed", "private-raw")) and not macro_mutation_step("unchanged-content"))
+    check("PM private source edits pass with a new image and reload", all(valid_macro_mutation(step, True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1) for step in ("private-removed", "private-raw")))
     check("PM environment step must edit and reload", not valid_macro_mutation("private-removed", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
     check("PM unchanged control cannot hide a reload", not valid_macro_mutation("unchanged-content", True, True, "a", "a", {"a": "image"}, {"a": "image"}, 1, 2))
     check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))
