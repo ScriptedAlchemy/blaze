@@ -1605,12 +1605,23 @@ impl<'a> Runner<'a> {
         );
         set("CARGO_PKG_README", data.readme.as_ref().map(ToString::to_string).unwrap_or_default());
         set("CARGO_CRATE_NAME", name.to_owned());
+        // What the script asked the linker for goes on the line of its library, as cargo has
+        // it on rustc's (`-L` and `-l`), which the link of a program of the crate reads back
+        // from the unit's flags; a script's link arguments are for its own package's programs,
+        // which a described library is not.
+        let mut link_flags = Vec::new();
         if let Some(ran) = ran {
             set("OUT_DIR", ran.out_dir.display().to_string());
             for (key, value) in &ran.output.env {
                 set(key, value.clone());
             }
             cfg.extend(ran.output.cfgs.iter().cloned());
+            for path in &ran.output.library_paths {
+                link_flags.extend(["-L".to_owned(), path.path().display().to_string()]);
+            }
+            for library in &ran.output.library_links {
+                link_flags.extend(["-l".to_owned(), library.clone()]);
+            }
         }
         Ok(crate::cargo::own_script::Planned {
             out_dir: ran.map(|ran| ran.out_dir.clone()),
@@ -1621,6 +1632,7 @@ impl<'a> Runner<'a> {
             cfg,
             codegen_flags: std::iter::once(format!("-Copt-level={}", profile.opt_level))
                 .chain(self.host_flags.iter().cloned())
+                .chain(link_flags)
                 .collect(),
             env,
             deps: Vec::new(),

@@ -971,7 +971,15 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
         (package, true),
         Ok(Arc::new(Done {
             out_dir: base.join("out"),
-            output: blaze_build_script::Output::default(),
+            // A script that links a library it built and renames its crate's `OUT_DIR`.
+            output: blaze_build_script::Output {
+                library_paths: vec![blaze_build_script::output::LibraryPath::External(
+                    base.join("out"),
+                )],
+                library_links: vec!["dylib=saved_dynamic".to_owned()],
+                env: vec![("OUT_DIR".to_owned(), "/native-script-marker".to_owned())],
+                ..Default::default()
+            },
             fingerprint: 0,
             generation: 0,
             ran: false,
@@ -982,11 +990,24 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
     let mut leaves = Vec::new();
     let index = runner.add_source_leaf(package, &mut leaves).unwrap();
     assert!(leaves[index].cfg.iter().any(|cfg| cfg == "proc_macro"));
+    // The library's line carries what its script asked the linker for, as cargo has rustc's;
+    // where the script wrote is described apart from the variable it renamed.
+    let flags = &leaves[index].codegen_flags;
+    let out = base.join("out").display().to_string();
+    assert!(
+        flags.windows(2).any(|it| it == ["-L", out.as_str()])
+            && flags.windows(2).any(|it| it == ["-l", "dylib=saved_dynamic"]),
+        "{flags:?}"
+    );
+    assert_eq!(leaves[index].env["OUT_DIR"], "/native-script-marker");
+    assert_eq!(leaves[index].out_dir.as_deref(), Some(base.join("out").as_path()));
     let described = crate::cargo::own_script::planned_description(&pkg.sysroot, leaves);
     let described: serde_json::Value = serde_json::from_str(&described).unwrap();
     assert!(
         described["crates"][index]["cfg"].as_array().unwrap().iter().any(|cfg| cfg == "proc_macro")
     );
+    assert_eq!(described["crates"][index]["blaze_build_script_out_dir"], serde_json::json!(out));
+    assert_eq!(described["crates"][index]["env"]["OUT_DIR"], "/native-script-marker");
     let mut crates = Vec::new();
     runner.add_source(package, &mut crates, &mut FxHashMap::default()).unwrap();
     let root = crates.iter().find(|krate| krate.name == "macros").unwrap();
