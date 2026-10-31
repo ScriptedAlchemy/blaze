@@ -1,0 +1,28 @@
+name: Blaze deep repair snapshot
+on:
+  push:
+    branches: [repair/blaze-runtime-20261031]
+    paths: [.github/workflows/blaze-deep-review.yaml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export exact PR histories
+        run: |
+          set -euo pipefail
+          git update-ref refs/heads/snapshot-ci 89d814aa7e7102f8285697091a89de0b5d053f7c
+          git update-ref refs/heads/snapshot-c2 937c36922a87ae1360ea10ca1e54b7f7aee92a1f
+          git bundle create "$RUNNER_TEMP/blaze-deep-review.bundle" refs/heads/snapshot-ci refs/heads/snapshot-c2
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-deep-review
+          path: ${{ runner.temp }}/blaze-deep-review.bundle
+          retention-days: 1
+          if-no-files-found: error
