@@ -118,7 +118,9 @@ def artifact_path(key, base):
 def verified_executable(path, key, manifest):
     """Every consumer, including `path`, validates a binary before using it."""
     want = manifest["files"].get(key)
-    if not want or not os.path.isfile(path) or sha256_file(path) != want["sha256"]:
+    if (not want or not want.get("executable") or not os.path.isfile(path)
+            or not os.access(path, os.X_OK) or os.path.getsize(path) != want["size"]
+            or sha256_file(path) != want["sha256"]):
         die(f"{path} changed since it was unpacked")
     return path
 
@@ -135,7 +137,9 @@ def record(argv):
     base = json.loads(Path(os.environ["BUNDLE_RECORD_BASE"]).read_text())
     env = {k: v for k, v in os.environ.items()
            if base.get(k) != v and not k.startswith("BUNDLE_RECORD")}
-    row = {"exe": os.path.realpath(argv[0]), "args": argv[1:], "cwd": os.getcwd(), "env": env}
+    removed = sorted(k for k in base if k not in os.environ and not k.startswith("BUNDLE_RECORD"))
+    row = {"exe": os.path.realpath(argv[0]), "args": argv[1:], "cwd": os.getcwd(),
+           "env": env, "env_remove": removed}
     with open(os.environ["BUNDLE_RECORD"], "a") as f:
         f.write(json.dumps(row) + "\n")
 
@@ -280,11 +284,25 @@ def pack(args):
     (outdir / "bundle.json").write_text(text)
     zstd = subprocess.Popen(["zstd", "-T0", "-3", "-q", "-o", str(outdir / "bundle.tar.zst")],
                             stdin=subprocess.PIPE)
-    with tarfile.open(fileobj=zstd.stdin, mode="w|") as tar:
-        for key in keys:
-            tar.add(from_key(key, base), arcname=key, recursive=False)
-    zstd.stdin.close()
-    if zstd.wait() != 0:
+    completed = False
+    try:
+        # Cargo may hardlink two artifact names. The wire contract admits regular
+        # members only, so pack their bytes, not tar's implicit hardlink entries.
+        with tarfile.open(fileobj=zstd.stdin, mode="w|", dereference=True) as tar:
+            for key in keys:
+                tar.add(artifact_path(key, base), arcname=key, recursive=False)
+        zstd.stdin.close()
+        completed = True
+    finally:
+        if not completed and zstd.poll() is None:
+            zstd.terminate()
+        try:
+            zstd.stdin.close()
+        except BrokenPipeError:
+            pass
+        finally:
+            status = zstd.wait()
+    if status != 0:
         die("zstd failed")
     digest = hashlib.sha256(text.encode()).hexdigest()
     total = sum(f["size"] for f in files.values())
@@ -355,6 +373,11 @@ def unpack(args):
                     if temp_path and os.path.exists(temp_path):
                         os.unlink(temp_path)
                 seen.add(member.name)
+        # tar stops at its end marker, before zstd necessarily finishes writing
+        # valid padding or validating its frame checksum. Drain to EOF before
+        # closing the pipe, rather than turning a valid archive into SIGPIPE.
+        while zstd.stdout.read(1 << 20):
+            pass
         completed = True
     finally:
         # On success let zstd exit normally; terminate it only on a rejected
@@ -396,7 +419,11 @@ def test(args):
         verified_executable(run["exe"], key, manifest)
         command = [run["exe"], *run["args"], *extra]
         print(f"     Running {os.path.relpath(run['exe'], manifest['roots']['workspace'])}", flush=True)
-        code = subprocess.run(command, cwd=run["cwd"], env={**os.environ, **run["env"]}).returncode
+        env = dict(os.environ)
+        for name in run.get("env_remove", []):
+            env.pop(name, None)
+        env.update(run["env"])
+        code = subprocess.run(command, cwd=run["cwd"], env=env).returncode
         if code != 0:
             print(f"error: test failed, to rerun pass the same arguments to bundle.py test {args.set}")
             sys.exit(code)

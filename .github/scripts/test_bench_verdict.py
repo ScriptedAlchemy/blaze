@@ -77,6 +77,46 @@ class VerdictTest(unittest.TestCase):
     def test_a_single_slow_comparison_is_not_confirmed_clean(self):
         self.assertEqual(self.judge(run(), run(["store/has_miss"]))[:2], ("regression", 1))
 
+    def test_partial_final_report_cannot_pass(self):
+        partial = run().split("store/has_miss")[0]
+        self.assertEqual(self.judge(run(), partial)[:2], ("error", 1))
+        self.assertEqual(self.judge(run(), run(["store/has_miss"]), partial)[:2], ("error", 1))
+
+    def test_duplicate_and_truncated_blocks_are_not_measurements(self):
+        self.assertEqual(self.judge(run(), run() + run())[:2], ("error", 1))
+        truncated = run().split("store/has_miss")[0] + "store/has_miss (n: 300, outliers: 2)\n"
+        self.assertEqual(self.judge(run(), truncated)[:2], ("error", 1))
+
+    def test_incomplete_slow_control_cannot_excuse_regression(self):
+        partial = run(["store/get_hit"]).split("store/has_miss")[0]
+        self.assertEqual(self.judge(partial, run(["store/has_miss"]), run(["store/has_miss"]))[:2],
+                         ("error", 1))
+
+    def test_complete_retry_can_replace_failed_partial_attempt(self):
+        partial = run().split("store/has_miss")[0]
+        self.assertEqual(self.judge(run(), partial, run())[:2], ("pass", 0))
+
+    def test_completed_text_does_not_hide_a_failed_process(self):
+        for code in (1, 2, 137, -11):
+            with self.subTest(code=code):
+                verdict, _, status = bench_verdict.judge(run(), [run()], exit_codes=[code])
+                self.assertEqual((verdict, status), ("error", 1))
+
+    def test_failed_control_cannot_excuse_a_repeated_regression(self):
+        verdict, _, status = bench_verdict.judge(run(["store/has_miss"]),
+            [run(["store/has_miss"]), run(["store/has_miss"])],
+            exit_codes=[1, 1], aa_exit_code=137)
+        self.assertEqual((verdict, status), ("regression", 1))
+
+    def test_valid_process_exit_codes_preserve_existing_policy(self):
+        verdict, _, status = bench_verdict.judge(run(), [run(measured=False), run()],
+                                                exit_codes=[2, 0], aa_exit_code=0)
+        self.assertEqual((verdict, status), ("pass", 0))
+        verdict, _, status = bench_verdict.judge(run(["store/has_miss"]),
+            [run(["store/has_miss"]), run(["store/has_miss"])],
+            exit_codes=[1, 1], aa_exit_code=1)
+        self.assertEqual((verdict, status), ("environmental", 0))
+
     def test_cpu_and_digests(self):
         cpu = (
             "Model name:                              AMD EPYC 7763 64-Core Processor\n"

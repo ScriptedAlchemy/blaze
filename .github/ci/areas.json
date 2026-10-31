@@ -1,5 +1,5 @@
 {
-  "_doc": "Which checks a change runs (pr.yaml, job changes): an area runs when a changed file matches one of its `paths` and none of its `ignore` (fnmatch, where * crosses /). Changes to the CI itself, and the full tier, run every area. `macos` marks an area with macOS checks in the fast tier; the full tier builds macOS anyway (the dist area's macOS C2 groups are the full tier's alone). The area that owns a check owns its entry. Contract: docs/reports/CI-fork.md.",
+  "_doc": "Which checks a change runs (pr.yaml, job changes): an area runs when a changed file matches one of its `paths` and none of its `ignore` (fnmatch, where * crosses /). Changes to the CI itself, and the full tier, run every area. `macos` marks an area with macOS checks in the fast tier; the full tier builds macOS anyway (the dist area's macOS C2 groups are the full tier's alone). The area that owns a check owns its entry. Contract: docs/reports/CI-fork.md. Runtime consumers include all compiler crates and vendored dependencies, excluding benchmark, fuzz, and browser-only tooling.",
   "ci": {
     "paths": [
       ".github/workflows/pr.yaml",
@@ -9,28 +9,15 @@
       ".github/actions/toolchain/*",
       ".github/scripts/bundle.py",
       ".github/scripts/changes.py",
-      ".github/ci/*"
+      ".github/ci/*",
+      ".github/scripts/test_changes.py",
+      ".github/scripts/test_bundle*.py"
     ]
   },
   "dist": {
     "paths": [
-      "crates/blaze-dist/**",
-      "crates/blaze-dist-local/**",
-      "crates/blaze-wire/**",
-      "crates/blaze-spec/**",
-      "crates/blaze-manifest/**",
-      "crates/blaze-metadata/**",
-      "crates/blaze-resolve/**",
-      "crates/ra-jit/src/**",
-      "crates/hir-ty-codegen/**",
-      "vendor/rust-analyzer/crates/base-db/**",
-      "vendor/rust-analyzer/crates/project-model/**",
-      "vendor/rust-analyzer/crates/hir-expand/**",
-      "vendor/rust-analyzer/crates/paths/**",
-      "vendor/rust-analyzer/crates/vfs/**",
-      "vendor/rust-analyzer/crates/vfs-notify/**",
-      "vendor/rust-analyzer/crates/ide-db/**",
-      "vendor/proc-macro-srv/**",
+      "crates/**",
+      "vendor/**",
       "harness/dist/**",
       "harness/norustc.py",
       "harness/norustc_test.py",
@@ -41,41 +28,26 @@
       "nix/**",
       ".github/actions/toolchain/**",
       ".github/workflows/blaze-dist-review.yaml"
+    ],
+    "ignore": [
+      "crates/ra-jit-bench/**",
+      "crates/ra-jit-fuzz/**",
+      "crates/ra-jit-wasm/**"
     ]
   },
   "serve": {
     "paths": [
-      "crates/blaze-serve/**",
-      "crates/blaze-wire/**",
-      "crates/blaze-metadata/**",
-      "crates/blaze-manifest/**",
-      "crates/blaze-resolve/**",
-      "crates/hir-ty-codegen/**",
-      "crates/ra-jit-store/**",
-      "crates/ra-jit/**",
-      "crates/blaze-spec/**",
-      "vendor/rust-analyzer/crates/project-model/**",
-      "vendor/proc-macro-srv/**",
-      "vendor/rust-analyzer/crates/base-db/**",
-      "vendor/rust-analyzer/crates/hir-expand/**",
-      "vendor/rust-analyzer/crates/project-model/**",
-      "vendor/rust-analyzer/crates/syntax/**",
-      "vendor/rust-analyzer/crates/cfg/**",
-      "vendor/rust-analyzer/crates/hir/**",
-      "vendor/rust-analyzer/crates/hir-def/**",
-      "vendor/rust-analyzer/crates/hir-ty/**",
-      "vendor/rust-analyzer/crates/hir-ty-borrowck/**",
-      "vendor/rust-analyzer/crates/paths/**",
-      "vendor/rust-analyzer/crates/vfs/**",
-      "vendor/rust-analyzer/crates/vfs-notify/**",
-      "vendor/rust-analyzer/crates/ide-db/**",
-      "vendor/rust-analyzer/crates/ide-diagnostics/**",
-      "vendor/rust-analyzer/crates/load-cargo/**",
-      "vendor/rust-analyzer/crates/proc-macro-api/**",
+      "crates/**",
+      "vendor/**",
       "harness/**",
       "Cargo.toml",
       "Cargo.lock",
       ".github/workflows/blaze-serve-review.yaml"
+    ],
+    "ignore": [
+      "crates/ra-jit-bench/**",
+      "crates/ra-jit-fuzz/**",
+      "crates/ra-jit-wasm/**"
     ]
   },
   "bench": {
