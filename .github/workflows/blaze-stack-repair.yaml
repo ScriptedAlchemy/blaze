@@ -36,15 +36,29 @@ jobs:
           fi
           rustup toolchain install 1.99.0 --profile minimal -c rustfmt
           rustup default 1.99.0
-      - name: Resolve the reviewed stack and stage the producer fix
+      - name: Resolve the reviewed stack and test the producer fix
         id: prepare
-        run: python3 -I .github/repair/prepare.py
+        run: python3 -I .github/repair/finish.py
+      - name: Retain failed preparation state without credentials
+        if: failure()
+        run: |
+          for work in "$RUNNER_TEMP"/blaze-repair-c4 "$RUNNER_TEMP"/blaze-repair-c2 "$RUNNER_TEMP"/blaze-repair-ci; do
+            if [ -d "$work" ]; then
+              git -C "$work" status --short
+              git -C "$work" diff --cc > "$RUNNER_TEMP/$(basename "$work")-conflict.diff"
+              git -C "$work" diff --cached > "$RUNNER_TEMP/$(basename "$work")-staged.diff"
+            fi
+          done
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: blaze-repair-receipt
-          path: ${{ runner.temp }}/blaze-repair-receipt.json
+          path: |
+            ${{ runner.temp }}/blaze-repair-receipt.json
+            ${{ runner.temp }}/blaze-repair-*-conflict.diff
+            ${{ runner.temp }}/blaze-repair-*-staged.diff
           retention-days: 3
-          if-no-files-found: error
+          if-no-files-found: warn
 
   validate:
     needs: prepare
