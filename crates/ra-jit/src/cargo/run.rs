@@ -100,7 +100,13 @@ fn listing_failures(
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(error) => {
+                    // A partial transcript cannot certify the tests that did not report.
+                    // Closing the reader alone could leave a child blocked on its stdout.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
             };
             // A reader that went away does not stop the tests, as it would not under cargo.
             let mut out = out.lock();
@@ -112,21 +118,42 @@ fn listing_failures(
         }
     }
     let status = child.wait()?;
-    Ok((status, failures(&String::from_utf8_lossy(&printed))))
+    // A signal, launcher error or successful process is not a libtest failure, even if
+    // a nested process printed something that looks like a failure summary. Only the
+    // normal libtest failure exit can authorize selective retries and partial passes.
+    let failed = (status.code() == Some(FAILED))
+        .then(|| failures(&String::from_utf8_lossy(&printed)))
+        .flatten();
+    Ok((status, failed))
 }
 
 /// The tests libtest's summary lists as failed in what a program of tests printed: the names
 /// under the last `failures:` before `test result: FAILED`.
 fn failures(printed: &str) -> Option<Vec<String>> {
     let plain = without_colors(printed);
-    let end = plain.rfind("\ntest result: FAILED")?;
+    let end = plain.rfind("\ntest result: FAILED.")?;
+    let summary = plain[end + 1..].trim_end();
+    if summary.contains('\n') {
+        return None;
+    }
+    let count = summary
+        .strip_prefix("test result: FAILED. ")?
+        .split(';')
+        .nth(1)?
+        .trim()
+        .strip_suffix(" failed")?
+        .parse::<usize>()
+        .ok()?;
     let start = plain[..end].rfind("\nfailures:\n")? + "\nfailures:\n".len();
-    let names: Vec<String> = plain[start..end]
+    let names = plain[start..end]
         .lines()
-        .filter_map(|it| it.strip_prefix("    "))
-        .map(str::to_owned)
-        .collect();
-    (!names.is_empty()).then_some(names)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.strip_prefix("    ").filter(|name| !name.is_empty()).map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    // A capped transcript can lose the beginning of a long failure list; neither that
+    // nor a repeated name proves which of the other tests passed.
+    let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+    (count > 0 && names.len() == count && unique.len() == count).then_some(names)
 }
 
 /// `text` without the escapes that color a terminal's text.
@@ -257,6 +284,22 @@ pub(crate) struct TestResult {
 }
 
 pub(crate) fn test_with(
+    asked: &Invocation,
+    context: &TestRun<'_>,
+    make_command: impl FnMut() -> anyhow::Result<Command>,
+    start: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+) -> anyhow::Result<TestResult> {
+    let result = test_with_inner(asked, context, make_command, start);
+    if result.is_err() {
+        if let Some(directory) = context.cache.directory {
+            affected::forget_passes_at(directory)
+                .context("invalidating incomplete test results")?;
+        }
+    }
+    result
+}
+
+fn test_with_inner(
     asked: &Invocation,
     context: &TestRun<'_>,
     mut make_command: impl FnMut() -> anyhow::Result<Command>,
@@ -793,3 +836,11 @@ exit 101
         assert_eq!(failures("\nrunning 2 tests\ntest a ... ok\n"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "run/output_tests.rs"]
+mod output_tests;
+
+#[cfg(all(test, unix))]
+#[path = "run/policy_tests.rs"]
+mod policy_tests;
