@@ -2881,7 +2881,8 @@ impl Checkouts {
             self.debug[at] = debug;
             self.unloaded.remove(&at);
         }
-        self.loaded.set_proc_macro_env(self.macro_env());
+        // The workspaces being added have their scripts' directories too.
+        self.loaded.set_proc_macro_env(self.macro_env_over(&workspaces));
         self.refresh_macro_image_identities();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         for (root, workspace, config, build, own) in watched {
@@ -3134,11 +3135,23 @@ impl Checkouts {
     /// cargo configuration's: those are for the commands cargo runs (and name this machine's
     /// own server), which no server reads, and a kept expansion is keyed on these.
     fn macro_env(&self) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+        self.macro_env_over(&[])
+    }
+
+    /// [`Self::macro_env`] for the loaded workspaces and `adding`, which are about to be.
+    fn macro_env_over(
+        &self,
+        adding: &[ProjectWorkspace],
+    ) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
         let mut env = inputs::server_env(&process::native());
-        let search = self.plugin_search();
+        let search = self.plugin_search(adding);
         if search.is_empty() {
             return env;
         }
+        eprintln!(
+            "macros: the servers search {} directories the build scripts named",
+            search.len()
+        );
         // Cargo has rustc find a shared library a build script built through the dynamic
         // library path of its run (`add_plugin_deps`); a proc macro that links one is loaded
         // by a server, whose path it is here. The request's directories stay first.
@@ -3164,9 +3177,9 @@ impl Checkouts {
     /// macros link: what the workspaces' build scripts had the linker search, below the target
     /// directory, as cargo's `add_plugin_deps` has it (a directory outside is likely the
     /// system's, whose libraries would then be found in place of its own).
-    fn plugin_search(&self) -> Vec<PathBuf> {
+    fn plugin_search(&self, adding: &[ProjectWorkspace]) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        for workspace in self.loaded.workspaces() {
+        for workspace in self.loaded.workspaces().iter().chain(adding) {
             let ProjectWorkspaceKind::Cargo { cargo, build_scripts, .. } = &workspace.kind else {
                 continue;
             };
