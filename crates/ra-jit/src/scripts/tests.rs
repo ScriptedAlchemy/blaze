@@ -191,6 +191,7 @@ fn a_build_dependencys_script_uses_the_host_even_when_the_package_is_also_for_th
         explicit_target: true,
         packages: Some(&packages),
         host_cargo: None,
+        shared: None,
     };
     // The installed toolchain's identity selects checked-in cfg answers. No executable is
     // present in this fixture, so obtaining host cfgs cannot rely on a compiler process.
@@ -417,6 +418,7 @@ impl Fixture {
             explicit_target: false,
             packages: Some(&packages),
             host_cargo: None,
+            shared: None,
         };
         let mut runner =
             Runner::new(leases, &self.cargo, &asked, self.sysroot.clone(), &self.cfg).unwrap();
@@ -1035,6 +1037,7 @@ fn a_script_runs_again_after_the_script_of_a_library_it_is_compiled_with_ran_aga
         explicit_target: false,
         packages: None,
         host_cargo: None,
+        shared: None,
     };
     let mut runner =
         Runner::new(&leases, &pkg.cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
@@ -1118,10 +1121,14 @@ fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
         explicit_target: false,
         packages,
         host_cargo: None,
+        shared: None,
     };
     assert!(!for_the_host_alone(&asked(Some(&for_target)), &id));
     assert!(for_the_host_alone(&asked(Some(&for_host)), &id));
-    assert!(for_the_host_alone(&asked(None), &id), "every package is the host's when none is said");
+    assert!(
+        !for_the_host_alone(&asked(None), &id),
+        "every package is the target's when none is said"
+    );
     assert!(
         !for_the_host_alone(&asked(Some(&for_host)), "another"),
         "nor one the build does not have"
@@ -1141,5 +1148,67 @@ fn the_host_pass_runs_the_scripts_of_the_packages_built_for_the_host_alone() {
     assert!(ran.0.is_empty(), "no host output of a package built for the target alone");
     assert!(ran.2.is_empty(), "and no run judged");
     assert!(pkg.runs().is_empty());
+    // Nor of a build that says no packages, whose target pass runs the script for the target.
+    let ran = run_producers(
+        &pkg.cargo,
+        &asked(None),
+        pkg.sysroot.clone(),
+        Vec::new(),
+        vec!["unix".to_owned()],
+        &BTreeMap::new(),
+        &|id| for_the_host_alone(&asked(None), id),
+    )
+    .unwrap();
+    assert!(ran.0.is_empty() && ran.2.is_empty(), "a build that says none runs none for the host");
+    assert!(pkg.runs().is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A package the build has for the target and, with the same features, for the host (a
+/// dependency and a build-dependency at once, in a build for the host): cargo has one unit of
+/// its script's run for both (`traverse_and_share` settles the host's deferred debuginfo to the
+/// target's, and the two units are one), so the script runs once. Before, the host's run was
+/// keyed by its whole library profile, deferred debuginfo and all, and ran again in a directory
+/// of its own. One the host has with other features is the host's alone: its debuginfo is
+/// none, as cargo weakens it, in a directory of its own.
+#[cfg(unix)]
+#[test]
+fn a_package_built_for_the_host_and_the_target_alike_has_one_run() {
+    let base = dir("shared-run");
+    let pkg = Fixture::at(&base);
+    let leases = Leases::default();
+    let id = pkg.cargo[pkg.package].id.repr.clone();
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let packages = FxHashMap::from_iter([(id.clone(), true)]);
+    let alike = FxHashSet::from_iter([id.clone()]);
+    let unlike = FxHashSet::default();
+    let asked = |shared| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: Some(&packages),
+        host_cargo: None,
+        shared,
+    };
+    let run = |asked: &Asked<'_>, for_host: bool| {
+        let runner =
+            Runner::new(&leases, &pkg.cargo, asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let lib = runner.profile(pkg.package, unit_for, &runner.kind(for_host));
+        let unit = runner.unit(pkg.package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        (unit.out_dir, unit.profile.debuginfo)
+    };
+    let shared = asked(Some(&alike));
+    let (host, target) = (run(&shared, true), run(&shared, false));
+    assert_eq!(host, target, "one run, with the target's debuginfo");
+    assert!(target.1, "a dev build's");
+    let apart = asked(Some(&unlike));
+    let (host, target) = (run(&apart, true), run(&apart, false));
+    assert_ne!(host.0, target.0, "a run for each");
+    assert!(!host.1 && target.1, "the host's alone has none");
     let _ = std::fs::remove_dir_all(&base);
 }
