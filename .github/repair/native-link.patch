@@ -1,0 +1,194 @@
+diff --git a/crates/ra-jit/src/cargo/own_script.rs b/crates/ra-jit/src/cargo/own_script.rs
+index 8d4b597ba..29fbf49cd 100644
+--- a/crates/ra-jit/src/cargo/own_script.rs
++++ b/crates/ra-jit/src/cargo/own_script.rs
+@@ -457,6 +457,28 @@ pub(crate) struct Planned {
+     pub(crate) proc_macro: Option<PathBuf>,
+ }
+ 
++impl Planned {
++    /// Attach a host library's judged script output before its native compiler context is
++    /// frozen. A build-script executable gets no output of its own; these crates are the
++    /// libraries it links, or a proc macro and its libraries, not binary/cdylib targets.
++    pub(crate) fn apply_library_script(&mut self, out_dir: &Path, output: &blaze_build_script::Output) {
++        use blaze_build_script::{apply::{Compile, Linked}, unit::{Package, Target}};
++
++        self.out_dir = Some(out_dir.to_owned());
++        self.env.insert("OUT_DIR".into(), out_dir.display().to_string());
++        self.env.extend(output.env.iter().cloned());
++        self.cfg.extend(output.cfgs.iter().cloned());
++        // The link trusts native-unit flags and must not reread mutable script output.
++        // Use the same Cargo rule and ordering as the ordinary compile path, preserving
++        // library modifiers and excluding arguments meant only for binaries or cdylibs.
++        let target = Target { kind: vec!["lib".into()], ..Target::default() };
++        self.codegen_flags.extend(
++            Compile::of(&Package::default(), &target, false, &[Linked { own: true, output }], &[])
++                .args(),
++        );
++    }
++}
++
+ /// The `rust-project.json` of the script that is the first of `crates`, over the standard
+ /// library of `sysroot`.
+ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> String {
+ diff --git a/crates/ra-jit/src/cargo/producer_plan.rs b/crates/ra-jit/src/cargo/producer_plan.rs
+index d310a2982..c4d901926 100644
+--- a/crates/ra-jit/src/cargo/producer_plan.rs
++++ b/crates/ra-jit/src/cargo/producer_plan.rs
+@@ -229,10 +229,7 @@ impl Producers {
+             if unit.host
+                 && let Some((out_dir, output)) = outputs.get(&unit.package)
+             {
+-                krate.cfg.extend(output.cfgs.clone());
+-                krate.out_dir = Some(out_dir.clone());
+-                krate.env.insert("OUT_DIR".into(), out_dir.display().to_string());
+-                krate.env.extend(output.env.clone());
++                krate.apply_library_script(out_dir, output);
+                 self.scripts.insert(unit.package.clone());
+             }
+         }
+diff --git a/crates/ra-jit/src/scripts.rs b/crates/ra-jit/src/scripts.rs
+index 3d773c9ba..ab9745c8f 100644
+--- a/crates/ra-jit/src/scripts.rs
++++ b/crates/ra-jit/src/scripts.rs
+@@ -1573,7 +1573,7 @@ impl<'a> Runner<'a> {
+             format!("blaze has no built-in cfg answer for build-script host `{}`", self.asked.host)
+         })?;
+         let features = features.iter().map(|it| format!("feature={it:?}")).collect::<Vec<_>>();
+-        let mut cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
++        let cfg = source_cfgs(host_cfgs, &features, &effective, &applied.cfgs);
+         let package_dir: &Path = data.manifest.parent().as_ref();
+         let manifest: &Path = data.manifest.as_ref();
+         let version = &data.version;
+@@ -1605,15 +1605,8 @@ impl<'a> Runner<'a> {
+         );
+         set("CARGO_PKG_README", data.readme.as_ref().map(ToString::to_string).unwrap_or_default());
+         set("CARGO_CRATE_NAME", name.to_owned());
+-        if let Some(ran) = ran {
+-            set("OUT_DIR", ran.out_dir.display().to_string());
+-            for (key, value) in &ran.output.env {
+-                set(key, value.clone());
+-            }
+-            cfg.extend(ran.output.cfgs.iter().cloned());
+-        }
+-        Ok(crate::cargo::own_script::Planned {
+-            out_dir: ran.map(|ran| ran.out_dir.clone()),
++        let mut described = crate::cargo::own_script::Planned {
++            out_dir: None,
+             workspace_member: data.is_member,
+             name: name.to_owned(),
+             root: root.to_owned(),
+@@ -1625,7 +1618,11 @@ impl<'a> Runner<'a> {
+             env,
+             deps: Vec::new(),
+             proc_macro: None,
+-        })
++        };
++        if let Some(ran) = ran {
++            described.apply_library_script(&ran.out_dir, &ran.output);
++        }
++        Ok(described)
+     }
+ }
+ 
+diff --git a/crates/ra-jit/src/scripts/tests.rs b/crates/ra-jit/src/scripts/tests.rs
+index 10e661060..fbeddb74e 100644
+--- a/crates/ra-jit/src/scripts/tests.rs
++++ b/crates/ra-jit/src/scripts/tests.rs
+@@ -1006,6 +1006,96 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
+     let _ = std::fs::remove_dir_all(&base);
+ }
+ 
++/// The descriptor and its private native unit must agree about the native libraries a
++/// build dependency's script named, even when it shadows OUT_DIR. The linker intentionally
++/// does not consult the live output file once the native context has been captured.
++#[cfg(unix)]
++#[test]
++fn ordinary_producer_native_context_keeps_judged_library_flags() {
++    use crate::cargo::own_script::{SourceMode, planned_description, with_mode};
++    use blaze_build_script::output::{LibraryPath, LinkArgTarget};
++    use std::ffi::{OsStr, OsString};
++
++    let base = tempfile::tempdir().unwrap();
++    let pkg = Fixture::at(base.path());
++    let env = BTreeMap::from([
++        ("CARGO_HOME".to_owned(), base.path().join("home").display().to_string()),
++        ("RUSTFLAGS".to_owned(), "--cfg host_user".to_owned()),
++    ]);
++    let asked = Asked {
++        env: &env,
++        build: 0,
++        profile: "dev",
++        config: &[],
++        host: HOST,
++        target: HOST,
++        explicit_target: false,
++        packages: None,
++        host_cargo: None,
++        shared: None,
++    };
++    let leases = Leases::default();
++    let runner = Runner::new(&leases, &pkg.cargo, &asked, pkg.sysroot.clone(), &pkg.cfg).unwrap();
++    let profile = runner.profile(pkg.package, UnitFor::new_host(true), &CompileKind::Host);
++    let out_dir = base.path().join("native output");
++    let native_search = format!("native={}", out_dir.display());
++    let output = blaze_build_script::Output {
++        library_paths: vec![
++            LibraryPath::External("native=/external".into()),
++            LibraryPath::CargoArtifact(native_search.clone().into()),
++        ],
++        library_links: vec!["dylib=saved_dynamic".into(), "static:+whole-archive=helper".into()],
++        linker_args: vec![
++            (LinkArgTarget::All, "-Wl,--as-needed".into()),
++            (LinkArgTarget::Bin, "must-not-reach-producer".into()),
++            (LinkArgTarget::Cdylib, "must-not-reach-proc-macro".into()),
++        ],
++        env: vec![("OUT_DIR".into(), "/native-script-marker".into())],
++        cfgs: vec!["native_ready".into()],
++        ..Default::default()
++    };
++    let done = Done {
++        out_dir: out_dir.clone(),
++        output,
++        fingerprint: 0,
++        generation: 0,
++        ran: false,
++        made: None,
++        links: None,
++    };
++    let script = runner.described(
++        pkg.package, "build_script_build", &pkg.root.join("build.rs"), &profile, &[], None,
++    ).unwrap();
++    let library = runner.described(
++        pkg.package, "gen", &pkg.root.join("lib.rs"), &profile, &[], Some(&done),
++    ).unwrap();
++    let mut expected = script.codegen_flags.clone();
++    expected.extend([
++        "-L".into(), native_search,
++        "-L".into(), "native=/external".into(),
++        "-l".into(), "dylib=saved_dynamic".into(),
++        "-l".into(), "static:+whole-archive=helper".into(),
++        "-C".into(), "link-arg=-Wl,--as-needed".into(),
++    ]);
++    assert_eq!(library.codegen_flags, expected);
++    assert!(library.cfg.iter().any(|cfg| cfg == "native_ready"));
++    assert!(!script.cfg.iter().any(|cfg| cfg == "native_ready"));
++    assert_eq!(library.out_dir.as_ref(), Some(&out_dir));
++    assert_eq!(library.env["OUT_DIR"], "/native-script-marker");
++    let script_flags = script.codegen_flags.clone();
++    let description = planned_description(&pkg.sysroot, vec![script, library]);
++    let project: serde_json::Value = serde_json::from_str(&with_mode(
++        description,
++        SourceMode::Cargo { root: &pkg.root, members: &[true, true], env: &[] },
++    ).unwrap()).unwrap();
++    let encoded: Vec<u8> = serde_json::from_value(project[blaze_wire::native::UNIT_FIELD].clone()).unwrap();
++    let units = blaze_wire::native::decode_units(&encoded).unwrap();
++    assert_eq!(units[&0].flags, script_flags.into_iter().map(OsString::from).collect::<Vec<_>>());
++    assert_eq!(units[&1].flags, expected.into_iter().map(OsString::from).collect::<Vec<_>>());
++    assert_eq!(units[&1].env[OsStr::new("OUT_DIR")], "/native-script-marker");
++    assert_eq!(project["crates"][1]["blaze_build_script_out_dir"], serde_json::json!(out_dir));
++}
++
+ /// A crate of a script's compile, as `Runner::compile` describes it, compiled with what the
+ /// script whose output is in `out_dir` said, or with the producer image `proc_macro`.
+ #[cfg(unix)]
