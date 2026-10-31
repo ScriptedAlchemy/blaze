@@ -7,8 +7,8 @@
 #   `cargo test` would start recorded, and the executables of build and bench sets
 #   bundle.json: the source identity, toolchain, and the sha256 of every file
 #
-# This job alone writes the Rust and Nix caches (the fork's policy): sccache and the dev shell's
-# own paths, on pushes to dist/* and on a pull request's own ref, one entry per ref.
+# This job alone writes the Actions cache (the fork's policy): sccache, on pushes to dist/main
+# and dist/c4-keys and on a pull request's own ref, one entry per ref.
 name: bundle
 
 on:
@@ -63,8 +63,10 @@ jobs:
         with:
           llvm: build
           shell: bench
-          cache: nix sccache
-          cache-save: ${{ inputs.cache-write }}
+          # sccache alone. The Nix entry (the bench shell's own paths, 1.18 GB) saved a consumer
+          # 10 s of 106 on PR #32: restoring it took 29 s and importing it 44 s, about what
+          # building the toolchains takes. It is not worth a ninth of the fork's 10 GB.
+          cache: sccache
           cache-scope: bundle
           sccache-size: 3G
       - name: Release ra-jit with both owned backends
