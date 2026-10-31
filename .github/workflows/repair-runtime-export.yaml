@@ -1,0 +1,30 @@
+name: Blaze runtime repair sources
+on:
+  push:
+    branches: [repair/blaze-runtime-20261031]
+    paths: [.github/workflows/repair-runtime-export.yaml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export only the pinned source histories
+        shell: bash
+        run: |
+          git cat-file -e 88b220e61614e483dfa0c6fcc992a502c2e72c02^{commit}
+          git cat-file -e 75a7e503b756e3fbfa6f06561de22a51533bd679^{commit}
+          git update-ref refs/heads/repair-source-c2 88b220e61614e483dfa0c6fcc992a502c2e72c02
+          git update-ref refs/heads/repair-source-ci 75a7e503b756e3fbfa6f06561de22a51533bd679
+          git bundle create "$RUNNER_TEMP/blaze-runtime-sources.bundle" refs/heads/repair-source-c2 refs/heads/repair-source-ci
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-runtime-sources
+          path: ${{ runner.temp }}/blaze-runtime-sources.bundle
+          retention-days: 1
+          if-no-files-found: error
