@@ -51,6 +51,9 @@ struct Described {
     compiled_macro: bool,
     /// The dep-info of the library rustc compiled of it, and the directory its paths are from.
     inputs: Option<(PathBuf, PathBuf)>,
+    /// The directory the build script of its package wrote to, which its `OUT_DIR` need not
+    /// name: a script renames the variable with `cargo:rustc-env=OUT_DIR=...`.
+    out_dir: Option<PathBuf>,
 }
 
 /// What a build makes of the first crate of its description.
@@ -203,6 +206,7 @@ fn compile_in(
         proc_macro: None,
         compiled_macro: made.proc_macro,
         inputs: None,
+        out_dir: None,
     };
     crates.push(first);
     let mut linked = BTreeMap::new();
@@ -421,6 +425,7 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
         proc_macro: None,
         compiled_macro: false,
         inputs: None,
+        out_dir: None,
     };
     let exe = dir.join("build-script-build");
     let made = Made { name: SCRIPT, proc_macro: false, dep_info: exe.with_extension("d"), exe };
@@ -668,6 +673,7 @@ fn planned_source_description(sysroot: &Path, crates: Vec<Planned>, macro_root: 
             proc_macro: it.proc_macro,
             compiled_macro: macro_root && at == 0,
             inputs: None,
+            out_dir: it.out_dir,
         })
         .collect();
     source_description(sysroot, &crates, true)
@@ -749,6 +755,7 @@ fn add(
         proc_macro: library.is_none().then(|| path.to_owned()),
         compiled_macro: false,
         inputs: Some((info, record.cwd.clone())),
+        out_dir: None,
     });
     // A proc macro's libraries are described too, though the library of it is what
     // expands: what the store keeps of the script is keyed by them.
@@ -775,6 +782,7 @@ fn described(krate: &Described, member: bool, native: bool) -> Value {
         "is_workspace_member": member,
         "is_proc_macro": krate.proc_macro.is_some() || krate.compiled_macro,
         "proc_macro_dylib_path": krate.proc_macro.as_deref().map(path),
+        "blaze_build_script_out_dir": krate.out_dir.as_deref().map(path),
     })
 }
 
@@ -896,6 +904,31 @@ mod tests {
                 .collect::<String>();
             assert_eq!(complete(&said).is_ok(), counts.iter().all(|n| *n == 0));
         }
+    }
+
+    /// The description names where a script wrote apart from its crate's `OUT_DIR`, which
+    /// the script renames with `cargo:rustc-env`; the link finds what it printed by the former.
+    #[test]
+    fn a_planned_crate_describes_its_script_out_dir_apart_from_the_variable() {
+        let source = |name: &str, out_dir: Option<PathBuf>| Planned {
+            out_dir,
+            workspace_member: false,
+            name: name.into(),
+            root: std::env::temp_dir().join(format!("{name}.rs")),
+            edition: "2021".into(),
+            cfg: Vec::new(),
+            codegen_flags: Vec::new(),
+            env: [("OUT_DIR".to_owned(), "/native-script-marker".to_owned())].into(),
+            deps: Vec::new(),
+            proc_macro: None,
+        };
+        let out = std::env::temp_dir().join("build/native-0123/out");
+        let crates = vec![source("build_script_build", None), source("native", Some(out.clone()))];
+        let plain: Value =
+            serde_json::from_str(&planned_description(Path::new("/sysroot"), crates)).unwrap();
+        assert_eq!(plain["crates"][0]["blaze_build_script_out_dir"], Value::Null);
+        assert_eq!(plain["crates"][1]["blaze_build_script_out_dir"], json!(out));
+        assert_eq!(plain["crates"][1]["env"]["OUT_DIR"], "/native-script-marker");
     }
 
     #[test]
