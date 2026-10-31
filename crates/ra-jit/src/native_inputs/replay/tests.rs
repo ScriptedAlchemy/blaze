@@ -417,6 +417,39 @@ fn admitted_library_order_matches_an_actual_native_link() {
 }
 
 #[test]
+#[cfg(unix)]
+fn recorded_parent_spelled_search_directories_bind_resolved_libraries() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(root.path()).unwrap();
+    let prefix = base.join("a");
+    fs::create_dir(&prefix).unwrap();
+    write(&base, "lib/libchoice.a.1", b"!<arch>\nchoice");
+    let alias = base.join("alias");
+    symlink(".", &alias).unwrap();
+    let aliased_library = alias.join("lib");
+    // Like Debian's libm.so -> /lib/<triple>/libm.so.6 with /lib -> usr/lib:
+    // resolving the file revisits an alias that is also another capture's ancestor.
+    symlink(aliased_library.join("libchoice.a.1"), base.join("lib/libchoice.a")).unwrap();
+    let search = prefix.join("../lib");
+    let captured = bindings(&[
+        ("linker/libraries/0", &prefix),
+        ("linker/libraries/1", &search),
+        ("native-alias", &aliased_library),
+    ]);
+    let closure = Closure::from_bindings(&captured.encode_bindings()).unwrap();
+    for args in [words(&["-lchoice"]), words(&["-La/../lib", "-lchoice"])] {
+        let mut collector = Collector::new(&closure, base.clone(), false);
+        collector.arguments(args).unwrap();
+        assert_eq!(collector.seen, BTreeSet::from([search.join("libchoice.a")]));
+    }
+    let mut collector = Collector::new(&closure, base, false);
+    collector.arguments(words(&["alias/lib/libchoice.a"])).unwrap();
+    assert_eq!(collector.seen, BTreeSet::from([aliased_library.join("libchoice.a")]));
+}
+
+#[test]
 fn library_search_and_explicit_files_preserve_parent_component_semantics() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("a")).unwrap();
