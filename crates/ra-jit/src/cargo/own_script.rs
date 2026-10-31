@@ -322,11 +322,29 @@ fn build_command(
     if made.proc_macro {
         ra_jit.args(["--crate", "proc_macro", "--shared"]);
     }
+    // Replay has already selected the backend and compiler policy from the
+    // saved request. The executor's ambient settings must not replace them.
+    let replay = asked.is_some_and(|(env, _)| {
+        env.iter().any(|(name, value)| name == "RA_JIT_SPEC_REPLAY" && value == "1")
+    });
+    let setting = |name: &str| {
+        if replay {
+            asked.and_then(|(env, _)| {
+                env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+            })
+        } else {
+            std::env::var_os(name)
+        }
+    };
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
     let not_the_builds = |text: &str| {
         let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO"
+        cargos
+            || text.starts_with("RUSTC_")
+            || text.starts_with("RA_JIT_")
+            || text.starts_with("BLAZE_")
+            || text == "CARGO"
     };
     if let Some((env, inputs)) = asked {
         ra_jit.env_clear();
@@ -343,13 +361,28 @@ fn build_command(
         }
     }
     for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE", "RA_JIT_RUN_ID"] {
-        if let Some(value) = std::env::var_os(kept).filter(|_| asked.is_some()) {
+        if let Some(value) = setting(kept).filter(|_| asked.is_some()) {
             ra_jit.env(kept, value);
         }
     }
     for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
-        if let Some(value) = std::env::var_os(kept) {
+        if let Some(value) = setting(kept) {
             ra_jit.env(kept, value);
+        }
+    }
+    if replay {
+        for kept in [
+            "RA_JIT_SPEC_REPLAY",
+            "RA_JIT_OPT",
+            "RA_JIT_EMIT",
+            "RA_JIT_MIR_OPT",
+            "RA_JIT_WORKER_MEMORY",
+            "RA_JIT_MEMORY_RESERVE",
+            "RA_JIT_PRESSURE_GRACE_SECS",
+        ] {
+            if let Some(value) = setting(kept) {
+                ra_jit.env(kept, value);
+            }
         }
     }
     if let Some(store) = store {
@@ -1079,6 +1112,68 @@ mod tests {
         assert_eq!(env.get(OsStr::new("BLAZE_ANSWERS")), Some(&Some(OsStr::new("own"))));
         assert_eq!(env.get(OsStr::new("RA_JIT_OWN_RESOLVE")), Some(&Some(OsStr::new("1"))));
         assert_eq!(env.get(OsStr::new("BLAZE_OWN_RESOLVE")), Some(&Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn saved_producer_command_keeps_the_captured_compiler_policy() {
+        let dir = Path::new("/producer");
+        let made = Made {
+            name: "derive",
+            proc_macro: true,
+            exe: dir.join("libderive.dylib"),
+            dep_info: dir.join("derive.d"),
+        };
+        // Both backends must be read from this snapshot, not from the process
+        // running this test. No global environment mutation is needed.
+        for backend in ["cranelift", "llvm"] {
+            let policy = [
+                ("RA_JIT_SPEC_REPLAY", "1"),
+                ("RA_JIT_BACKEND", backend),
+                ("RA_JIT_OPT", "2"),
+                ("RA_JIT_EMIT", "fast"),
+                ("RA_JIT_MIR_OPT", "0"),
+                ("RA_JIT_STD_FROM", "off"),
+                ("RA_JIT_PROC_MACRO_SERVER", "0"),
+                ("RA_JIT_MEMORY_MAX", "8192M"),
+                ("RA_JIT_OWN_BASE_MEMORY", "6144M"),
+                ("RA_JIT_WORKER_MEMORY", "4096M"),
+                ("RA_JIT_MEMORY_RESERVE", "256M"),
+                ("RA_JIT_PRESSURE_GRACE_SECS", "30"),
+                ("RA_JIT_SPARE", "0"),
+                ("RA_JIT_RUN_ID", "saved-producer"),
+            ];
+            let mut env: Vec<(OsString, OsString)> =
+                policy.iter().map(|(name, value)| ((*name).into(), (*value).into())).collect();
+            // BLAZE aliases are command controls, not a second source of replay
+            // policy. They must not shadow the selected RA_JIT values at startup.
+            env.push(("BLAZE_BACKEND".into(), "invalid".into()));
+            env.push(("BLAZE_OPT".into(), "invalid".into()));
+            env.push(("PATH".into(), "/tools".into()));
+            let command = build_command(
+                Path::new("/blaze/ra-jit"),
+                &dir.join("rust-project.json"),
+                dir,
+                &made,
+                None,
+                true,
+                Some((&env, &dir.join("producer.inputs"))),
+            );
+            let actual = command.get_envs().collect::<BTreeMap<_, _>>();
+            for (name, value) in policy {
+                assert_eq!(
+                    actual.get(OsStr::new(name)).copied().flatten(),
+                    Some(OsStr::new(value)),
+                    "{name} for {backend}"
+                );
+            }
+            for name in ["RA_JIT_HOME", "BLAZE_BACKEND", "BLAZE_OPT"] {
+                assert!(actual.get(OsStr::new(name)).copied().flatten().is_none(), "{name}");
+            }
+            assert_eq!(
+                actual.get(OsStr::new("PATH")).copied().flatten(),
+                Some(OsStr::new("/tools"))
+            );
+        }
     }
 
     #[test]
