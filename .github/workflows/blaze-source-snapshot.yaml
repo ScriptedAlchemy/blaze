@@ -1,0 +1,35 @@
+name: Blaze source snapshot for runtime/CI repairs
+on:
+  push:
+    branches: [repair/blaze-runtime-20261031]
+    paths: [.github/workflows/blaze-source-snapshot.yaml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bundle current PR branches for offline review
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin refs/heads/dist/c2-buildspec refs/heads/ci-redesign refs/heads/dist/c4-keys
+          git update-ref refs/heads/snapshot-c2 "$(git rev-parse FETCH_HEAD)" || true
+          git update-ref refs/heads/snapshot-c2 "$(git rev-parse origin/dist/c2-buildspec)"
+          git update-ref refs/heads/snapshot-ci "$(git rev-parse origin/ci-redesign)"
+          git update-ref refs/heads/snapshot-c4 "$(git rev-parse origin/dist/c4-keys)"
+          git bundle create "$RUNNER_TEMP/blaze-source-snapshot.bundle" refs/heads/snapshot-c2 refs/heads/snapshot-ci refs/heads/snapshot-c4
+          git show-ref | grep refs/heads/snapshot- > "$RUNNER_TEMP/blaze-source-snapshot-refs.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-source-snapshot
+          path: |
+            ${{ runner.temp }}/blaze-source-snapshot.bundle
+            ${{ runner.temp }}/blaze-source-snapshot-refs.txt
+          retention-days: 1
+          if-no-files-found: error
