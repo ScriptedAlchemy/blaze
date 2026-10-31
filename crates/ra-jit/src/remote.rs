@@ -1243,13 +1243,20 @@ impl Shared {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
-        let done = self.runtime.block_on(async {
-            self.asked.see(self.manifest_now().await);
-            self.pull_as_set().await
-        });
+        let done = self
+            .runtime
+            .block_on(async { self.pull_and_remember(self.manifest_now().await).await });
         let asked = self.asked.clone();
         ra_jit_store::fetch_missing_with(Box::new(move |key| asked.fetch(key)));
         self.report(done, start);
+    }
+
+    /// Remember only a completed pull. A failed transfer must remain retryable even
+    /// when the remote's manifest has not changed since it was first observed.
+    async fn pull_and_remember(&self, observed: Option<Digest>) -> anyhow::Result<String> {
+        let done = self.pull_as_set().await;
+        self.asked.see(if done.is_ok() { observed } else { None });
+        done
     }
 
     /// A pull the way the daemon is set to pull: of every pack, or of what says where the
@@ -1333,12 +1340,20 @@ impl Lazy {
             packs: Vec::new(),
             holder: FxHashMap::default(),
         };
+        let mut failed = 0;
         for fetched in fetched {
             match fetched {
                 Ok((pack, listed, keys)) => lazy.add(pack, listed, &keys),
-                Err(e) => eprintln!("remote: {e:#}"),
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("remote: {e:#}");
+                }
             }
         }
+        // Do not replace a working lookup table with a partial one or certify the
+        // manifest as fetched when an index was unavailable. The next look can retry
+        // the same manifest; normal compilation remains the fallback meanwhile.
+        anyhow::ensure!(failed == 0, "{failed} remote pack key lists could not be loaded");
         Ok(lazy)
     }
 
