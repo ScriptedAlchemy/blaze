@@ -1305,8 +1305,7 @@ impl<'a> Runner<'a> {
         }
         self.making_images.push(package);
         let result = (|| {
-            let mut crates = Vec::new();
-            self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+            let crates = self.producer_sources(package)?;
             let newest_run = self.newest_run(&crates);
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
@@ -1321,6 +1320,7 @@ impl<'a> Runner<'a> {
                     members: &members,
                     env: &env,
                 },
+                self.cargo.target_directory().as_ref(),
             )
             .map(|image| (image, newest_run))
             .map_err(|it| format!("{it:#}"))
@@ -1338,6 +1338,18 @@ impl<'a> Runner<'a> {
         self.image_leases.extend(self.leases.image_leases(self.asked.build, leases));
         self.images.insert(package, image.library.clone());
         Ok(image.library)
+    }
+
+    fn producer_sources(
+        &mut self,
+        package: Package,
+    ) -> Result<Vec<crate::cargo::own_script::Planned>, String> {
+        let mut crates = Vec::new();
+        let root = self.add_source(package, &mut crates, &mut FxHashMap::default())?;
+        if !crates[root].cfg.iter().any(|cfg| cfg == "proc_macro") {
+            crates[root].cfg.push("proc_macro".to_owned());
+        }
+        Ok(crates)
     }
 
     fn add(

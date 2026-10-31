@@ -208,6 +208,15 @@ fn digest(path: &Path) -> Result<[u8; 32]> {
 }
 
 fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> Result<()> {
+    walk_inner(path, inputs, active, None)
+}
+
+fn walk_inner(
+    path: &Path,
+    inputs: &mut Snapshot,
+    active: &mut BTreeSet<PathBuf>,
+    output: Option<&Path>,
+) -> Result<()> {
     let link = std::fs::symlink_metadata(path)?;
     let (metadata, link) = if link.file_type().is_symlink() {
         (std::fs::metadata(path)?, Some(Revision::of(&link)))
@@ -215,6 +224,9 @@ fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> R
         (link, None)
     };
     let canonical = std::fs::canonicalize(path)?;
+    if output.is_some_and(|root| canonical.starts_with(root)) {
+        return Ok(());
+    }
     inputs.bindings.insert(path.to_owned(), canonical.clone());
     inputs.revisions.insert(path.to_owned(), (Revision::of(&metadata), link));
     if metadata.is_file() {
@@ -232,7 +244,7 @@ fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> R
             {
                 continue;
             }
-            walk(&entry, inputs, active)?;
+            walk_inner(&entry, inputs, active, output)?;
         }
         active.remove(&canonical);
     } else {
@@ -241,9 +253,13 @@ fn walk(path: &Path, inputs: &mut Snapshot, active: &mut BTreeSet<PathBuf>) -> R
     Ok(())
 }
 
-pub(crate) fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
+pub(crate) fn snapshot(sysroot: &Path, crates: &[Planned], output_root: &Path) -> Result<Snapshot> {
     let mut inputs = Snapshot::default();
     let mut roots = BTreeSet::new();
+    let mut outputs = BTreeSet::new();
+    // Prepare output ancestors before recording their source-directory revisions.
+    std::fs::create_dir_all(output_root)?;
+    let output = std::fs::canonicalize(output_root)?;
     for krate in crates {
         if let Some(image) = &krate.proc_macro {
             walk(image, &mut inputs, &mut BTreeSet::new())?;
@@ -257,12 +273,15 @@ pub(crate) fn snapshot(sysroot: &Path, crates: &[Planned]) -> Result<Snapshot> {
             .context("producer source without a parent")?;
         roots.insert(package.to_owned());
         if let Some(out) = &krate.out_dir {
-            roots.insert(out.clone());
+            outputs.insert(out.clone());
         }
     }
-    // Source std is part of an owned image, including local toolchain source edits.
-    roots.insert(sysroot.join("lib/rustlib/src/rust/library"));
     for root in roots {
+        walk_inner(&root, &mut inputs, &mut BTreeSet::new(), Some(&output))?;
+    }
+    // Explicit generated inputs and the toolchain are independent of package walks.
+    outputs.insert(sysroot.join("lib/rustlib/src/rust/library"));
+    for root in outputs {
         walk(&root, &mut inputs, &mut BTreeSet::new())?;
     }
     // A changed compiler cannot reuse an earlier producer even under the same version.
@@ -341,17 +360,18 @@ pub(crate) fn link(
     dir: &Path,
     env: &[(OsString, OsString)],
     mode: own_script::SourceMode<'_>,
+    output_root: &Path,
 ) -> Result<Image> {
     let description = own_script::planned_macro_description(sysroot, crates.clone())
         .map_err(anyhow::Error::msg)?;
     let description = own_script::with_mode(description, mode).map_err(anyhow::Error::msg)?;
-    let before = snapshot(sysroot, &crates)?;
+    let before = snapshot(sysroot, &crates, output_root)?;
     let key = recipe(sysroot, &description, env, &before)?;
     stored(&dir.join("images"), &key, &before, |attempt| {
         let library = own_script::link_macro_planned(sysroot, crates.clone(), attempt, env, mode)
             .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
-            snapshot(sysroot, &crates)? == before,
+            snapshot(sysroot, &crates, output_root)? == before,
             "producer source changed during owned compilation; image not admitted"
         );
         let bytes = std::fs::read(attempt.join("producer.inputs"))?;
@@ -367,7 +387,7 @@ pub(crate) fn link(
     })
     .and_then(|(image, reused)| {
         anyhow::ensure!(
-            !reused || snapshot(sysroot, &crates)? == before,
+            !reused || snapshot(sysroot, &crates, output_root)? == before,
             "producer source changed while reusing its image"
         );
         Ok(image)
@@ -542,12 +562,85 @@ mod tests {
             deps: Vec::new(),
             proc_macro: None,
         };
-        snapshot(&sysroot, &[source.clone()]).unwrap();
+        snapshot(&sysroot, &[source.clone()], &dir.path().join("build")).unwrap();
         source.out_dir = Some(out.clone());
         std::fs::write(out.join("generated.rs"), "one").unwrap();
-        let before = snapshot(&sysroot, &[source.clone()]).unwrap();
+        let before = snapshot(&sysroot, &[source.clone()], &dir.path().join("build")).unwrap();
         std::fs::write(out.join("generated.rs"), "two").unwrap();
-        assert_ne!(before, snapshot(&sysroot, &[source]).unwrap());
+        assert_ne!(before, snapshot(&sysroot, &[source], &dir.path().join("build")).unwrap());
+    }
+
+    #[test]
+    fn snapshots_exclude_new_nested_output_but_keep_source_and_declared_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("package");
+        let sysroot = dir.path().join("sysroot");
+        let output = package.join("generated/nested/build-area");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir_all(sysroot.join("lib/rustlib/src/rust/library")).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(package.join("lib.rs"), "one").unwrap();
+        let mut source = Planned {
+            out_dir: None,
+            workspace_member: false,
+            name: "fixture".into(),
+            root: package.join("lib.rs"),
+            edition: "2021".into(),
+            cfg: Vec::new(),
+            codegen_flags: Vec::new(),
+            env: Default::default(),
+            deps: Vec::new(),
+            proc_macro: None,
+        };
+        let capture = |source: &Planned| snapshot(&sysroot, &[source.clone()], &output).unwrap();
+        let before = capture(&source);
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("image"), "generated").unwrap();
+        assert_eq!(before, capture(&source), "creating output must not change source");
+        std::fs::write(package.join("generated/nested/sibling.rs"), "source").unwrap();
+        assert_ne!(before, capture(&source), "source beside output must remain visible");
+        std::fs::remove_file(package.join("generated/nested/sibling.rs")).unwrap();
+        assert_ne!(before, capture(&source), "directory revisions retain transient source edits");
+        std::fs::write(package.join("lib.rs"), "two").unwrap();
+        assert_ne!(before, capture(&source), "source changes must reject publication");
+        let generated = output.join("declared-out");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(generated.join("input.rs"), "one").unwrap();
+        source.out_dir = Some(generated.clone());
+        let with_out = capture(&source);
+        std::fs::write(generated.join("input.rs"), "two").unwrap();
+        assert_ne!(with_out, capture(&source), "declared OUT_DIR remains an input");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_exclude_output_through_directory_aliases() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("package");
+        let sysroot = dir.path().join("sysroot");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir_all(sysroot.join("lib/rustlib/src/rust/library")).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(package.join("lib.rs"), "one").unwrap();
+        symlink(&package, dir.path().join("alias")).unwrap();
+        let output = dir.path().join("alias/custom/build");
+        let source = Planned {
+            out_dir: None,
+            workspace_member: false,
+            name: "fixture".into(),
+            root: package.join("lib.rs"),
+            edition: "2021".into(),
+            cfg: Vec::new(),
+            codegen_flags: Vec::new(),
+            env: Default::default(),
+            deps: Vec::new(),
+            proc_macro: None,
+        };
+        let before = snapshot(&sysroot, &[source.clone()], &output).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("image"), "generated").unwrap();
+        assert_eq!(before, snapshot(&sysroot, &[source], &output).unwrap());
     }
 
     #[cfg(unix)]
