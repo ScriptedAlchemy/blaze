@@ -1,0 +1,69 @@
+name: Stage reviewed cache repair candidates
+on:
+  push:
+    branches: [verify/holistic-cache-20261031]
+    paths: [.github/workflows/holistic-source-stage.yaml]
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      BASE: b13ad6a7f178b4e4918d744fb058fb03bfd9a02c
+      IDENTITY: 21430ebd9f572f8bb44ced250caa8a7c1a9b15e2
+    steps:
+      - uses: actions/checkout@v7
+        with: {fetch-depth: 0}
+      - name: Reconstruct the same candidate as the pinned runtime proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re,subprocess,textwrap
+          workflow=subprocess.check_output(['git','show','38281e06e2ef93aed1aefe76679f60de4e011299:.github/workflows/holistic-cache-proof.yaml'],text=True)
+          pattern=r'      - name: Prepare reviewed source and peer-availability regression\n        shell: bash\n        run: \|\n(.*?)\n      - uses: \.\/\.github\/actions\/toolchain'
+          found=re.findall(pattern,workflow,re.S)
+          assert len(found)==1
+          subprocess.run(['bash','-euo','pipefail','-c',textwrap.dedent(found[0])],check=True)
+          PY
+      - uses: ./.github/actions/toolchain
+        with: {components: rustfmt, llvm: none}
+      - name: Format, inspect and publish source-only draft candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          cp crates/ra-jit/src/remote/keeper.rs "$out/keeper-after.rs"
+          cp crates/ra-jit/src/remote/keeper/recovery_tests.rs "$out/recovery-after.rs"
+          python3 harness/rustcsites.py > "$out/compiler-sites.log"
+          cargo fmt --all -- --check
+          git diff --check
+          git diff > "$out/candidate.patch"
+          git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
+          git show "$BASE:crates/ra-jit/src/remote/keeper/recovery_tests.rs" > crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git apply "$out/publication.patch"
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git commit -m 'Keep cache publication separate from installed remote read state'
+          git branch review/holistic-publication-fix
+          git push origin HEAD:refs/heads/review/holistic-publication-fix
+          cp "$out/keeper-after.rs" crates/ra-jit/src/remote/keeper.rs
+          cp "$out/recovery-after.rs" crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git commit -m 'Recover failed lazy pack requests through existing keeper polling'
+          git branch review/holistic-lazy-fix
+          git push origin HEAD:refs/heads/review/holistic-lazy-fix
+          git log -3 --format='%H %T %s' > "$out/candidate-commits.txt"
+          git bundle create "$out/candidate.bundle" review/holistic-lazy-fix "^$BASE"
+          git status --porcelain > "$out/candidate-status.txt"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: holistic-runtime-candidates
+          path: |
+            ${{ runner.temp }}/holistic-proof/candidate*
+            ${{ runner.temp }}/holistic-proof/compiler-sites.log
+          retention-days: 7
+          if-no-files-found: error
