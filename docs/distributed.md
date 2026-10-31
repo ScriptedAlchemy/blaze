@@ -3048,7 +3048,10 @@ The CLI now saves the actual source inputs, including dirty and untracked files,
 path/registry/Git dependency trees, configuration reads and relative symlink targets. A canonical
 locked-source index belongs to that snapshot: changing which captured package directory a locked
 source names changes the source identity. The original invocation is a separate CBOR replay recipe,
-so equivalent command spellings retain the same `BuildSpec` and `JobContent`. The selected manifest,
+so equivalent command spellings retain the same `BuildSpec` and `JobContent`. Its record is a blob
+of the store like the sources, named by the BLAKE3 of its canonical CBOR, and the saved file names
+it by that digest beside the spec: replay authenticates the record's bytes before reading any field
+of it, so one edited in place, or another put where it was, is refused by name. The selected manifest,
 config-file operands, native values and source-relative working directory survive relocation.
 Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
 complete spec, and verifies the execution platform before creating compiler descriptions.
@@ -3062,12 +3065,15 @@ The configuration files resolution read are part of the replay record (version 2
 order, and every reading of the configuration during replay, the executor's included, is made from
 exactly those through `Config::from_image`, with no discovery: a Cargo home that was an ancestor's
 `.cargo` to the requester keeps its place, though the snapshot mounts it, and no file above the
-directory a worker materializes the snapshot in is read. Path dependencies outside the workspace still keep their relative topology below the common
+directory a worker materializes the snapshot in is read. The search for the workspace root and for
+the current manifest stop at that directory too, so a `Cargo.toml` above it, broken or claiming the
+snapshot with a `[workspace]`, changes nothing. Path dependencies outside the workspace still keep their relative topology below the common
 source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
 Linux unit tests; the layout independence of path dependencies is not normalized.)
 
-`ra-jit cargo spec --out FILE build|run|test ...` writes canonical BuildSpec CBOR to `FILE`
-and the immutable blobs plus replay recipe to `FILE.inputs/`. Copy both to replay elsewhere with
+`ra-jit cargo spec --out FILE build|run|test ...` writes to `FILE`, in canonical CBOR, the
+BuildSpec and the digest of its replay record, and the immutable blobs, the record among them, to
+`FILE.inputs/`. Copy both to replay elsewhere with
 `ra-jit cargo spec --run FILE`. Successful artifacts and a `result.json` are retained under
 `FILE.outputs/`. The original checkout is not needed. Each compiler description carries authoritative
 cfgs, environment, dependency renames, target kinds and profiles; the loader cannot add analyzer cfgs
