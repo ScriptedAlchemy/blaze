@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   proof:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: '0'
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: {fetch-depth: 0}
-      - name: Prepare exact reviewed source and real store-key regression fixtures
+      - name: Prepare reviewed source and peer-availability regression
         shell: bash
         run: |
           set -euo pipefail
@@ -36,7 +36,11 @@ jobs:
           out=Path(os.environ['RUNNER_TEMP'])/'holistic-proof'
           publication=json.loads(payload)['publication.patch']
           assert publication.count('assert_ne!(observed, published);')==1
-          (out/'publication.patch').write_text(publication.replace('assert_ne!(observed, published);','assert!(observed != published);'))
+          publication=publication.replace('assert_ne!(observed, published);','assert!(observed != published);')
+          old='assert_eq!(lookup.as_ref().unwrap().packs.len(), 2);'
+          assert publication.count(old)==1
+          publication=publication.replace(old,'assert!(lookup.as_ref().unwrap().packs.iter().any(|(digest, _, _)| *digest == peer_digest));')
+          (out/'publication.patch').write_text(publication)
           lazy=Path('.github/holistic-lazy.patch').read_text()
           lazy=lazy.replace('assert_eq!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()), observed);','assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);')
           (out/'lazy.patch').write_text(lazy)
@@ -62,7 +66,7 @@ jobs:
           PY
       - uses: ./.github/actions/toolchain
         with: {components: rustfmt, llvm: build}
-      - name: Reproduce all three failures against the original keeper
+      - name: Validate the actual repaired runtime and all remote tests
         shell: bash
         run: |
           set -euo pipefail
@@ -70,26 +74,26 @@ jobs:
           rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
           cp crates/ra-jit/src/remote/keeper.rs "$out/keeper-after.rs"
           cp crates/ra-jit/src/remote/keeper/recovery_tests.rs "$out/recovery-after.rs"
-          git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
-          set +e
-          nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote::keeper::recovery_tests:: -- --test-threads=2 --nocapture > "$out/recovery-before.log" 2>&1
-          status=$?
-          set -e
-          test "$status" = 101
-          grep -q 'a write is not an installed lookup' "$out/recovery-before.log"
-          grep -q 'unchanged manifest must not freeze a failed pack fetch' "$out/recovery-before.log"
-          grep -q 'a failed index retry must leave recovery possible' "$out/recovery-before.log"
-      - name: Validate the repaired runtime and all remote tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/holistic-proof"
-          cp "$out/keeper-after.rs" crates/ra-jit/src/remote/keeper.rs
           nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote:: -- --test-threads=2 2>&1 | tee "$out/remote-after.log"
           python3 harness/rustcsites.py | tee "$out/compiler-sites.log"
           cargo fmt --all -- --check
           git diff --check
           git diff > "$out/verified.patch"
+      - name: Reconfirm all three original failures with the corrected fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
+          set +e
+          nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote::keeper::recovery_tests:: -- --test-threads=2 --nocapture > "$out/recovery-before.log" 2>&1
+          status=$?
+          set -e
+          cp "$out/keeper-after.rs" crates/ra-jit/src/remote/keeper.rs
+          test "$status" = 101
+          grep -q 'a write is not an installed lookup' "$out/recovery-before.log"
+          grep -q 'unchanged manifest must not freeze a failed pack fetch' "$out/recovery-before.log"
+          grep -q 'a failed index retry must leave recovery possible' "$out/recovery-before.log"
       - name: Publish two focused source-only runtime commits
         shell: bash
         run: |
