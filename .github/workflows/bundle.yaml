@@ -56,6 +56,10 @@ jobs:
       sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+      - name: Verify cache retention and complete CLI dispatch before setup
+        run: |
+          python3 -I .github/scripts/test_cache_prune.py
+          python3 -I .github/scripts/test_cli_coverage.py
       - if: inputs.base-sha != ''
         run: git fetch --no-tags --depth=1 origin "${{ inputs.base-sha }}"
       - id: toolchain

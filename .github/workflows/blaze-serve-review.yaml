@@ -63,15 +63,16 @@ jobs:
       - name: Test the actual server, HTTP routes, and publication races
         if: ${{ !cancelled() }}
         run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-server -- --test-threads=2
-      - name: Test remote clients and fetch recovery
+      # Run the entire prebuilt CLI suite once. Filter unions silently omitted
+      # scripts::tests and cargo::cache_service::tests (including new regressions).
+      - name: Test every owned CLI unit test
         if: ${{ !cancelled() }}
         run: |
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- remote:: --test-threads=2
+          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- --test-threads=2
       - name: Test compiler project and replay profile integration
         if: ${{ !cancelled() }}
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-project -- --test-threads=2
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::spec:: --test-threads=2
           python3 -I harness/tracedecay_test.py
       - name: Test owned dependency resolution and Cargo lock parity
         if: ${{ !cancelled() }}
@@ -85,7 +86,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-syntax -- empty_crate:: --test-threads=2
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- answers:: --test-threads=2
       # Against the bundle's debug ra-jit (set serve-debug-cli), as before: the dev profile keeps
       # debug_assertions and overflow checks, which the release CLI drops.
       - name: Verify real probe artifacts with rustc and LLVM
@@ -101,9 +101,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-proc-macro -- generation_tests producer_lifetime --test-threads=2
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- env_identity cargo::producer_image content::tests unreadable_trees --test-threads=2
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cfg -- check_cfg --test-threads=2
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- compiler_json:: dep_info:: native_inputs::units::tests cargo::own_script::tests scripts::captured::tests process::tests --test-threads=2
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-paths -- native:: --test-threads=2
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-project -- compiler_project --test-threads=2
           nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-hir-def -- non_unicode_process_environment unicode_crate_environment --test-threads=2
@@ -112,11 +110,6 @@ jobs:
       - name: Test bootstrap protocol wire compatibility
         if: ${{ !cancelled() }}
         run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-bootstrap -- --test-threads=2
-      - name: Test build-script reruns and Cargo fingerprints
-        if: ${{ !cancelled() }}
-        run: |
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::script:: --test-threads=2
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::records:: --test-threads=2
       - name: Save owned probe evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
@@ -126,14 +119,6 @@ jobs:
             target/empty-probe-review/results.json
             target/empty-probe-review/*/*.log
           if-no-files-found: ignore
-      - name: Test affected selection, retries, and native input identities
-        if: ${{ !cancelled() }}
-        run: |
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- cargo::affected:: cargo::sandboxed:: cargo::run:: native_inputs:: --test-threads=2
-      - name: Test compiler subprocess input and output
-        if: ${{ !cancelled() }}
-        run: |
-          nix develop .#bench --command python3 -I .github/scripts/bundle.py test serve-cli -- child:: --test-threads=2
       - name: Test compiler export and import identities
         if: ${{ !cancelled() }}
         run: |

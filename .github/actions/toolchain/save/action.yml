@@ -52,9 +52,4 @@ runs:
         KEY: ${{ inputs.key }}
         SCOPE: ${{ inputs.scope }}
         REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
-      run: |
-        gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100&ref=$REF&key=$SCOPE" \
-          --jq ".actions_caches[] | select(.key != \"$KEY\") | .id" |
-          while read -r id; do
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "deleted superseded cache $id" || echo "could not delete cache $id"
-          done
+      run: python3 "$GITHUB_ACTION_PATH/prune.py"
