@@ -359,7 +359,8 @@ fn an_unchanged_library_loaded_for_another_environment_is_served_with_it() {
     client.set_generation_env([("PR15_PRIVATE", &None::<String>)]);
     let after = client.load_dylib(MacroDylib::new(library.clone())).unwrap();
     assert!(!Arc::ptr_eq(&after[0].pool, &before[0].pool), "a new server serves the new load");
-    assert_eq!(after[0], before[0], "the same macro, so only its server differs");
+    assert_ne!(after[0], before[0], "the same macro of a server with other variables is another");
+    assert_ne!(after[0].environment_identity(), before[0].environment_identity());
     assert_eq!(last(), "absent");
     drop((before, after));
 }
@@ -369,13 +370,31 @@ fn an_unchanged_library_loaded_for_another_environment_is_served_with_it() {
 #[test]
 fn a_server_environment_is_named_by_every_variable_it_has() {
     let os = |it: &str| std::ffi::OsString::from(it);
+    let server = paths::AbsPathBuf::assert_utf8(std::env::temp_dir().join("server"));
+    let named = |env: &crate::GenerationEnv| crate::server_environment(&server, env);
     let set = |value: &str| vec![(os("PR15_PRIVATE"), Some(os(value))), (os("PR15_OTHER"), None)];
-    let first = crate::server_environment(&set("old-private-value"));
+    let first = named(&set("old-private-value"));
     let reordered = set("old-private-value").into_iter().rev().collect();
-    assert_eq!(crate::server_environment(&reordered), first);
-    assert_ne!(crate::server_environment(&set("new-private-value")), first);
-    assert_ne!(crate::server_environment(&vec![(os("PR15_PRIVATE"), None)]), first);
-    assert_eq!(crate::server_environment(&set("old-private-value")), first);
+    assert_eq!(named(&reordered), first);
+    assert_ne!(named(&set("new-private-value")), first);
+    assert_ne!(named(&vec![(os("PR15_PRIVATE"), None)]), first);
+    assert_eq!(named(&set("old-private-value")), first);
+    // What the launcher sets for itself is what the server has, whatever the overlay says:
+    // two requests that differ only there start servers alike.
+    let internal = |value: Option<&str>| {
+        let mut env = set("old-private-value");
+        env.push((os("RUST_ANALYZER_INTERNALS_DO_NOT_USE"), value.map(os)));
+        named(&env)
+    };
+    assert_eq!(internal(Some("a")), internal(Some("b")));
+    assert_eq!(internal(None), internal(Some("a")));
+    let child = crate::process::child_environment(
+        &server,
+        set("old-private-value").iter().map(|(k, v)| (k, v)),
+    );
+    assert_eq!(child.get(&os("RUST_ANALYZER_INTERNALS_DO_NOT_USE")), Some(&os("this is unstable")));
+    assert_eq!(child.get(&os("PR15_PRIVATE")), Some(&os("old-private-value")));
+    assert!(!child.contains_key(&os("PR15_OTHER")));
 }
 
 #[test]

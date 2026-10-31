@@ -526,8 +526,16 @@ fn run_env<'a>(
 pub(crate) fn server_env(
     asked: &crate::process::Native,
 ) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    server_env_over(std::env::vars_os(), asked)
+}
+
+/// [`server_env`] over a daemon whose variables are `own`.
+fn server_env_over(
+    own: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    asked: &crate::process::Native,
+) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
     let asked: std::collections::BTreeMap<_, _> = asked.vars().collect();
-    let own: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    let own: std::collections::BTreeMap<_, _> = own.collect();
     let set = asked
         .iter()
         .filter(|&(name, value)| own.get(name) != Some(value))
@@ -1569,6 +1577,42 @@ mod tests {
             "nothing else differs: {env:?}"
         );
         assert_eq!(server_env(&crate::process::Native::own()), Vec::new());
+    }
+
+    /// Sol's K1: two machines whose daemons have their own variables (each its own discovered
+    /// server, home and path) and whose requests are the same give their servers the same
+    /// environment, the request's, and nothing of either daemon's.
+    #[test]
+    fn two_daemons_give_the_same_request_the_same_server_environment() {
+        use std::{collections::BTreeMap, ffi::OsString};
+        let pairs = |it: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            it.iter().map(|(name, value)| ((*name).into(), (*value).into())).collect()
+        };
+        let request = pairs(&[("HOME", "/home/me"), ("PATH", "/usr/bin"), ("PR15_PRIVATE", "v")]);
+        let asked = crate::process::Native::of(request.clone());
+        let started = |own: Vec<(OsString, OsString)>| {
+            let mut vars: BTreeMap<_, _> = own.clone().into_iter().collect();
+            for (name, value) in server_env_over(own.into_iter(), &asked) {
+                match value {
+                    Some(value) => vars.insert(name, value),
+                    None => vars.remove(&name),
+                };
+            }
+            vars
+        };
+        let a = started(pairs(&[
+            ("RA_JIT_PROC_MACRO_SERVER", "/opt/a/bin/server"),
+            ("RA_JIT_OWN_TARGET", "1"),
+            ("HOME", "/home/a"),
+            ("PATH", "/opt/a/bin"),
+        ]));
+        let b = started(pairs(&[
+            ("RA_JIT_PROC_MACRO_SERVER", "/opt/b/bin/server"),
+            ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS", "false"),
+            ("USER", "b"),
+        ]));
+        assert_eq!(a, b);
+        assert_eq!(a, request.into_iter().collect::<BTreeMap<_, _>>());
     }
 
     #[test]

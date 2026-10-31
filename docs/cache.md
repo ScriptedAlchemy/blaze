@@ -84,8 +84,12 @@ The server's variables are in the key because a macro reads any of them by itsel
 (`std::env::var`), as it reads rustc's, without asking: with only a variable changed and the
 input the same byte for byte, rustc expands again, and an expansion read back from before
 would be a wrong build. The server is started with the request's variables and no other
-([native-environment.md](native-environment.md)), so the key is of what the request carried,
-not of the daemon's machine; two machines whose requests carry the same variables share a key.
+([native-environment.md](native-environment.md)) but the one the launcher sets for itself
+(`RUST_ANALYZER_INTERNALS_DO_NOT_USE`), and the digest is of that same map, so the key is of
+what the request carried, not of the daemon's machine (not its discovered server, home or
+path); two machines whose requests carry the same variables share a key. A macro of a server
+with other variables is another expander to the database too, so an expansion it remembers is
+not reused for a call whose input did not change.
 That is the trade-off: requests that differ in any variable, `HOME`, `PATH` or `USER` among
 them, share no expansion, and a missed hit is a slower build where a stale one would be a
 wrong one. The keys log (`RA_JIT_KEYS_LOG`) names this part of a call's key `senv=`, and

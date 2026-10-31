@@ -79,7 +79,12 @@ nothing of the checkout is stale, as when only a caller of a macro was edited (`
 macro witness's `private-removed` and `private-raw` rows hold this against
 Cargo: a daemon started with `PR15_PRIVATE` set, a request without it and then
 one with a value that is not Unicode, each with the macro edited; its
-`consumer-removed` row removes the variable again and edits only the caller.
+`consumer-removed` row removes the variable again and edits only the caller, and
+its `body-set` row gives it again and edits only a function body after the
+derived item, the derive's input unchanged: a macro of servers with other
+variables is not equal to the one before, so the database expands it again.
+The servers are not given the cargo configuration's variables (the target
+directory flag, the discovered server), which are for the commands cargo runs.
 A kept expansion (`ra-jit-expand`) is keyed on the digest of every variable of
 the server that expanded it, so the same input under another environment is
 expanded again rather than read back; a third build with the first

@@ -147,20 +147,15 @@ fn generation_env<'a>(
     vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
 }
 
-/// The digest of the environment a server started with `env` over this process's has: each
-/// variable, in the order of its name, the overlay's set and its removals applied. A macro reads
-/// any of them as it reads rustc's, so an expansion kept under one is not another's.
-fn server_environment(env: &GenerationEnv) -> [u8; 32] {
+/// The digest of the environment a server at `path` started with `env` has: each variable of
+/// the very map it is started with ([`process::child_environment`]), in the order of its
+/// name. A macro reads any of them as it reads rustc's, so an expansion kept under one is not
+/// another's, and a handle of a server with one is not a handle of a server with another.
+fn server_environment(path: &AbsPath, env: &GenerationEnv) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut vars: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
-    for (name, value) in env {
-        match value {
-            Some(value) => vars.insert(name.clone(), value.clone()),
-            None => vars.remove(name),
-        };
-    }
+    let vars = process::child_environment(path, env.iter().map(|(name, value)| (name, value)));
     let mut hash = Sha256::new();
-    hash.update(b"proc-macro server environment 1");
+    hash.update(b"proc-macro server environment 2");
     hash.update((vars.len() as u64).to_le_bytes());
     for (name, value) in &vars {
         for bytes in [name.as_encoded_bytes(), value.as_encoded_bytes()] {
@@ -288,12 +283,16 @@ impl fmt::Debug for LibrarySnapshot {
 }
 
 impl Eq for ProcMacro {}
+/// The same macro of the same library, expanded by a server with the same variables: a macro
+/// reads them as it reads rustc's, so a handle of a server with others is another expander,
+/// and what was expanded with the one is not the other's (the database compares these).
 impl PartialEq for ProcMacro {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.kind == other.kind
             && self.original_dylib_path == other.original_dylib_path
             && self.dylib_content == other.dylib_content
+            && self.environment_identity() == other.environment_identity()
     }
 }
 
@@ -337,7 +336,7 @@ impl ProcMacroClient {
                     version.as_ref(),
                 )?);
             }
-            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(vars)))
+            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(&path, vars)))
         };
         let pool = factory(&vars)?;
         Ok(ProcMacroClient {

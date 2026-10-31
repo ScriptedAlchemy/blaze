@@ -2934,11 +2934,11 @@ impl Checkouts {
 
     /// The variables the proc-macro servers of a load for the request this thread serves
     /// start with: its complete snapshot over the daemon's, not those of a process that asked
-    /// before, so one it has not is removed and a value that is not Unicode is its own.
+    /// before, so one it has not is removed and a value that is not Unicode is its own. Not the
+    /// cargo configuration's: those are for the commands cargo runs (and name this machine's
+    /// own server), which no server reads, and a kept expansion is keyed on these.
     fn macro_env(&self) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
-        let base = self.cargo_config.extra_env.iter();
-        let base = base.map(|(name, value)| (name.into(), value.as_ref().map(Into::into)));
-        base.chain(inputs::server_env(&process::native())).collect()
+        inputs::server_env(&process::native())
     }
 
     /// Has the expanders of the database expand with the variables of the request this
