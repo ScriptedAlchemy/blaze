@@ -495,8 +495,8 @@ fn asked_by_script(
         return native_flags(&unit.flags, target);
     }
     let mut asked = Native::default();
-    let Some(out_dir) = krate.env(db).get("OUT_DIR") else { return Ok(asked) };
-    let printed = crate::cargo::script::printed(Path::new(&out_dir));
+    let Some(out_dir) = crate::cargo::script::out_dir_of(db, krate) else { return Ok(asked) };
+    let printed = crate::cargo::script::printed(&out_dir);
     let Some(Ok(printed)) = printed.map(std::fs::read_to_string) else { return Ok(asked) };
     for line in printed.lines() {
         let Some(line) = line.strip_prefix("cargo:") else { continue };
@@ -829,6 +829,50 @@ mod tests {
         assert!(
             command_of(&line, &[], Path::new("program"), CommandPurpose::NativeInputs).is_err()
         );
+    }
+
+    /// A script's `cargo:rustc-env=OUT_DIR=...` renames the variable its crate's code sees, as
+    /// it does under cargo; what the script printed for the link is still found beside the
+    /// directory the script wrote to, which the crate graph records.
+    #[test]
+    fn a_script_that_renamed_out_dir_still_gives_the_link_its_libraries() {
+        let run = tempfile::tempdir().unwrap();
+        let out = run.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(
+            run.path().join("output"),
+            "cargo:rustc-link-search=native=/producer/lib\ncargo:rustc-link-lib=dylib=saved_dynamic\n\
+             cargo:rustc-env=OUT_DIR=/native-script-marker\n",
+        )
+        .unwrap();
+        let mut db = RootDatabase::default();
+        let mut graph = base_db::CrateGraphBuilder::default();
+        let mut env = base_db::Env::default();
+        env.set("OUT_DIR", "/native-script-marker");
+        let krate = graph.add_crate_root(
+            vfs::FileId::from_raw(7),
+            syntax::Edition::Edition2021,
+            Some(base_db::CrateDisplayName::from_canonical_name("native")),
+            None,
+            Default::default(),
+            None,
+            env,
+            CrateOrigin::Local { repo: None, name: None },
+            Vec::new(),
+            base_db::TargetKind::Lib { is_proc_macro: false },
+            triomphe::Arc::new(paths::AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+            triomphe::Arc::new(base_db::CrateWorkspaceData {
+                target: Err("fixture".into()),
+                toolchain: None,
+            }),
+        );
+        graph.set_build_script_out_dir(krate, Some(paths::AbsPathBuf::assert_utf8(out)));
+        let krate = graph.set_in_db(&mut db)[&krate];
+        let target = Target { apple: false, arch: "x86_64".into(), shared: false };
+        let asked = asked_by_script(&db, krate, &target).unwrap();
+        assert_eq!(asked.search, vec![OsString::from("-L/producer/lib")]);
+        let libs: Vec<_> = asked.libs.iter().map(|it| target.lib(it)).collect();
+        assert_eq!(libs, vec![vec!["-lsaved_dynamic".to_owned()]]);
     }
 
     #[test]

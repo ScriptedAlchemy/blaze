@@ -147,6 +147,25 @@ fn generation_env<'a>(
     vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
 }
 
+/// The digest of the environment a server at `path` started with `env` has: each variable of
+/// the very map it is started with ([`process::child_environment`]), in the order of its
+/// name. A macro reads any of them as it reads rustc's, so an expansion kept under one is not
+/// another's, and a handle of a server with one is not a handle of a server with another.
+fn server_environment(path: &AbsPath, env: &GenerationEnv) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let vars = process::child_environment(path, env.iter().map(|(name, value)| (name, value)));
+    let mut hash = Sha256::new();
+    hash.update(b"proc-macro server environment 2");
+    hash.update((vars.len() as u64).to_le_bytes());
+    for (name, value) in &vars {
+        for bytes in [name.as_encoded_bytes(), value.as_encoded_bytes()] {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    hash.finalize().into()
+}
+
 impl fmt::Debug for ProcMacroClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcMacroClient").field("path", &self.path).finish()
@@ -264,12 +283,16 @@ impl fmt::Debug for LibrarySnapshot {
 }
 
 impl Eq for ProcMacro {}
+/// The same macro of the same library, expanded by a server with the same variables: a macro
+/// reads them as it reads rustc's, so a handle of a server with others is another expander,
+/// and what was expanded with the one is not the other's (the database compares these).
 impl PartialEq for ProcMacro {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.kind == other.kind
             && self.original_dylib_path == other.original_dylib_path
             && self.dylib_content == other.dylib_content
+            && self.environment_identity() == other.environment_identity()
     }
 }
 
@@ -313,7 +336,7 @@ impl ProcMacroClient {
                     version.as_ref(),
                 )?);
             }
-            Ok(ProcMacroServerPool::new(workers))
+            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(&path, vars)))
         };
         let pool = factory(&vars)?;
         Ok(ProcMacroClient {
@@ -493,6 +516,12 @@ impl ProcMacroClient {
 impl ProcMacro {
     pub fn content_identity(&self) -> Option<[u8; 32]> {
         self.dylib_content
+    }
+
+    /// The digest of every variable the server that expands this macro started with, which a
+    /// macro can read; `None` when the server was not started by this client.
+    pub fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.pool.environment()
     }
 
     /// Returns the name of the procedural macro.

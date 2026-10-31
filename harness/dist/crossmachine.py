@@ -162,8 +162,9 @@ def read_macro_log(text):
     for line in text.splitlines():
         parts = line.split("\t")
         if parts[0] == "macro" and len(parts) >= 9:
-            parts_of = dict(p.split("=", 1) for p in parts[4:8] if "=" in p)
-            calls.append(dict(kind=parts[1], name=parts[2], key=parts[3], outcome=parts[8], **parts_of))
+            # The parts are named (`senv=` is the server's environment); the outcome is last.
+            parts_of = dict(p.split("=", 1) for p in parts[4:-1] if "=" in p)
+            calls.append(dict(kind=parts[1], name=parts[2], key=parts[3], outcome=parts[-1], **parts_of))
         elif parts[0] == "macro-env" and len(parts) >= 3:
             envs[parts[1]] = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
     return calls, envs
@@ -183,7 +184,7 @@ def compare_macros(fixture, a_log, b_log):
         if a is None:
             cause, kind = "no call of that macro with that input on A", "expansion"
         else:
-            differing = [k for k in ("dylib", "env", "cwd") if a.get(k) != c.get(k)]
+            differing = [k for k in ("dylib", "env", "cwd", "senv") if a.get(k) != c.get(k)]
             if not differing:
                 cause, kind = f"the key is A's, A did not keep it: {a['outcome']}", "expansion"
             else:
@@ -194,6 +195,8 @@ def compare_macros(fixture, a_log, b_log):
                     bits.append("environment " + ", ".join(f"{n} (value hash {ours.get(n)!r} on A, {theirs.get(n)!r} on B)" for n in names[:4]))
                 if "cwd" in differing:
                     bits.append("current directory")
+                if "senv" in differing:
+                    bits.append("the macro server's environment (any variable a macro could read)")
                 if "dylib" in differing:
                     bits.append("macro library bytes")
                 cause = "key differs by " + "; ".join(bits)
@@ -616,7 +619,8 @@ def token_scan(roots, token):
 def macro_private_environment(env, step):
     """Change the witness's request environment, including repeated removals."""
     env.pop("PR15_PRIVATE", None)
-    private = {} if step == "private-removed" else {"PR15_PRIVATE": "raw-\udcff-value"}
+    private = {"private-removed": {}, "consumer-removed": {},
+               "body-set": {"PR15_PRIVATE": "old-private-value"}}.get(step, {"PR15_PRIVATE": "raw-\udcff-value"})
     env.update(private)
     return private
 
@@ -660,11 +664,18 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
     previous_reload_count = 0
     steps = ["initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"]
     steps.extend(f"reload-{index:02}" for index in range(reloads))
-    steps.extend(["private-removed", "private-raw"])
+    # consumer-removed is Sol's: the variable removed and only a caller of the macro edited,
+    # which makes nothing of the checkout stale; its new expansion must still not see it.
+    # body-set is Sol's next: the variable given again and only a function body after the
+    # derived item edited, the derive's input unchanged: its expansion must still be expanded
+    # again for the new variables, not reused from the database as an equal expander's.
+    steps.extend(["private-removed", "private-raw", "consumer-removed", "body-set"])
+    consumer = os.path.join(ws, "app/src/main.rs")
     try:
         for step in steps:
             audit_before = len(norustc.runs(audit_log))
-            edited_source = producer if step == "dependency-restored-mtime" else source
+            edited_source = {"dependency-restored-mtime": producer, "consumer-removed": consumer,
+                             "body-set": consumer}.get(step, source)
             before = os.stat(edited_source)
             old_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
             if step == "same-size-restored-mtime":
@@ -690,6 +701,16 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
                 with open(source, "w") as output:
                     output.write(text)
                 os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif step == "consumer-removed":
+                private = macro_private_environment(env, step)
+                caller = open(consumer).read().replace("Widget", "Gizmos")
+                with open(consumer, "w") as output:
+                    output.write(caller)
+            elif step == "body-set":
+                private = macro_private_environment(env, step)
+                caller = open(consumer).read().replace('"manifest length {}"', '"manifest LENGTH {}"')
+                with open(consumer, "w") as output:
+                    output.write(caller)
             _, built = side.cargo("build", "-p", "app")
             _, ready = wait_warm(side, ws)
             status = side.cargo("status")[1].stdout
@@ -1201,8 +1222,8 @@ def build_scripts(machine, bin_dir, ws, package, store, ra_home):
 
 def expansion_cause(said, spec):
     skipped = spec.get("env", {}).get("RA_JIT_PROC_MACRO_CACHE_SKIP")
-    why = ("the key holds the macro library's bytes, the crate's environment (CARGO_MANIFEST_DIR, OUT_DIR) and the "
-           "current directory (ra-jit-expand)")
+    why = ("the key holds the macro library's bytes, the crate's environment (CARGO_MANIFEST_DIR, OUT_DIR), the "
+           "current directory and the digest of the macro server's whole environment (ra-jit-expand)")
     if skipped:
         why += f"; {skipped} is named in RA_JIT_PROC_MACRO_CACHE_SKIP and is expanded every time by design"
     m = re.search(r"^proc macros: .*$", said, re.M)
@@ -1420,6 +1441,14 @@ def self_test():
     check("PM repeated removal is safe", macro_private_environment(private_env, "private-removed") == {} and macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
     check("PM private source edits share the reload policy", all(macro_mutation_step(step) for step in ("private-removed", "private-raw")) and not macro_mutation_step("unchanged-content"))
     check("PM private source edits pass with a new image and reload", all(valid_macro_mutation(step, True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1) for step in ("private-removed", "private-raw")))
+    check("PM consumer-only removal clears the request and is no macro edit",
+          macro_private_environment(private_env, "consumer-removed") == {} and "PR15_PRIVATE" not in private_env
+          and not macro_mutation_step("consumer-removed")
+          and valid_macro_mutation("consumer-removed", True, False, "a", "b", {"a": "image"}, {"a": "image"}, 1, 1)
+          and not valid_macro_mutation("consumer-removed", True, False, "a", "b", {"a": "image"}, {"a": "image"}, 1, 2))
+    check("PM body-only step gives the variable again and is no macro edit",
+          macro_private_environment(private_env, "body-set") == {"PR15_PRIVATE": "old-private-value"}
+          and private_env["PR15_PRIVATE"] == "old-private-value" and not macro_mutation_step("body-set"))
     check("PM environment step must edit and reload", not valid_macro_mutation("private-removed", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
     check("PM unchanged control cannot hide a reload", not valid_macro_mutation("unchanged-content", True, True, "a", "a", {"a": "image"}, {"a": "image"}, 1, 2))
     check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))
@@ -1461,6 +1490,11 @@ def self_test():
     d = compare_macros("t", a_log, read_macro_log(b_text))
     check("a variable that still holds a path is named", d and "CARGO_MANIFEST_DIR" in d[0].why and d[0].kind == "expansion")
     check("a macro line is not a function entry", read_keys_log(macro_log) == {})
+    with_server = macro_log.replace("\tcwd=c1\t", "\tcwd=c1\tsenv=s1\t")
+    check("a macro line with the server's environment keeps its outcome",
+          read_macro_log(with_server)[0][0]["outcome"] == "expanded" and read_macro_log(with_server)[0][0]["senv"] == "s1")
+    d = compare_macros("t", read_macro_log(with_server), read_macro_log(with_server.replace("senv=s1", "senv=s2")))
+    check("a call that differs by its server's environment says so", d and "server's environment" in d[0].why)
     pending = Difference("t", "script-run", "k", "why")
     check("a script-run difference is pending, an expansion is not", pending.pending and not Difference("t", "expansion", "k", "w").pending)
     print("self-test:", "ok" if ok else "FAILED")

@@ -59,6 +59,13 @@ pub struct Program {
 /// variables of the process that ran it: where to find programs, who runs it, where it may
 /// write, and how it is to speak. Nothing else of the worker's environment reaches it, and
 /// nothing of the requester's that was not in the spec.
+///
+/// `HOME` and `TMPDIR` are the worker's own, not the job-private home the compiler and the
+/// producers get, on purpose: Cargo starts a `cargo run` program or a test with its own
+/// process's `HOME` and `TMPDIR` (it sets neither), and a program that keeps state under its
+/// home has to behave as it does under Cargo. The job-private home is a build-input rule (no
+/// `~/.cargo` of the worker may reach a compilation); a program's run is not a build input. A
+/// test that reads `$HOME` is as hermetic here as under Cargo, and no more.
 const WORKER_BASE: &[&str] =
     &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "TERM", "LANG"];
 

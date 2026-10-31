@@ -66,13 +66,29 @@ A proc macro reads its server's environment, as it reads rustc's, which under
 Cargo is the asking process's. Each load a request makes has the proc-macro
 servers of its next generation start with that request's complete snapshot over
 the daemon's environment: a variable the request has otherwise is its native
-value, and one the daemon has that the request lacks is removed. The daemon's
-own (`RA_JIT_*`, `CARGO_TARGET_DIR` and the wrappers) stay the daemon's. A load
+value, and one the daemon has that the request lacks is removed, the daemon's
+own (`RA_JIT_*`, `CARGO_TARGET_DIR` and the wrappers) too: a server has the
+request's variables and no other, which no server reads otherwise. A load
 whose variables differ from those the serving generation started with retires
 that generation, so a server started for an earlier request never expands for a
-later one (`proc-macro-api`'s
+later one. A request whose variables differ from those of the live servers has
+every macro library loaded again into servers that have its own, even when
+nothing of the checkout is stale, as when only a caller of a macro was edited (`proc-macro-api`'s
 `a_generation_starts_with_the_environment_of_its_load`, `inputs.rs`'s
 `macro_servers_start_with_the_complete_snapshot_of_the_request`). The strict
 macro witness's `private-removed` and `private-raw` rows hold this against
 Cargo: a daemon started with `PR15_PRIVATE` set, a request without it and then
-one with a value that is not Unicode, each with the macro edited.
+one with a value that is not Unicode, each with the macro edited; its
+`consumer-removed` row removes the variable again and edits only the caller, and
+its `body-set` row gives it again and edits only a function body after the
+derived item, the derive's input unchanged: a macro of servers with other
+variables is not equal to the one before, so the database expands it again.
+The servers are not given the cargo configuration's variables (the target
+directory flag, the discovered server), which are for the commands cargo runs.
+A kept expansion (`ra-jit-expand`) is keyed on the digest of every variable of
+the server that expanded it, so the same input under another environment is
+expanded again rather than read back; a third build with the first
+environment may read back the first expansion. An expander that cannot name
+its server's environment is never kept. Two machines whose requests carry the
+same variables give a call the same key; requests that differ in any variable
+do not share it ([cache.md](cache.md#proc-macro-expansions)).

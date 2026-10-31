@@ -8,7 +8,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -163,6 +162,54 @@ impl Prepared {
 /// The version of the replay record's encoding.
 const RECORD_VERSION: u32 = 4;
 
+/// The version of [`Saved`]'s encoding.
+const SAVED_VERSION: u32 = 1;
+
+/// What `cargo spec --out FILE` writes to `FILE`: the BuildSpec, and the replay record that
+/// reproduces it, named by the BLAKE3 of the record's canonical CBOR. Everything replay reads
+/// from `FILE.inputs/` is then reached from `FILE` by content, as the sources are from the spec's
+/// root: a record edited in place, or another one put where it was, is refused, not trusted
+/// because a field inside it names the spec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved {
+    /// The spec, the job's identity.
+    pub build: BuildSpec,
+    /// The digest of the replay record's bytes. It is not part of the spec's identity: the same
+    /// spec saved from two invocations has two records.
+    pub record: Digest,
+}
+
+impl Saved {
+    /// What a capture saves, for a spec [`capture`] made.
+    pub fn of(made: &Spec) -> anyhow::Result<Self> {
+        let record = made.record.context("this spec was not captured with replay inputs")?;
+        Ok(Self { build: made.build.clone(), record })
+    }
+}
+
+impl Wire for Saved {
+    fn encode(&self, e: &mut blaze_wire::Encoder) {
+        e.array(3);
+        SAVED_VERSION.encode(e);
+        self.build.encode(e);
+        self.record.encode(e);
+    }
+
+    fn decode(r: &mut blaze_wire::Reader<'_>) -> Result<Self, blaze_wire::Error> {
+        r.array_start(3)?;
+        let at = r.position();
+        if u32::decode(r)? != SAVED_VERSION {
+            return Err(blaze_wire::Error {
+                kind: blaze_wire::ErrorKind::UnexpectedType { expected: "saved spec version 1" },
+                at,
+            });
+        }
+        let saved = Self { build: BuildSpec::decode(r)?, record: <Digest as Wire>::decode(r)? };
+        r.array_end()?;
+        Ok(saved)
+    }
+}
+
 /// The configuration files resolution read, placed in the snapshot. Replay reads these and no
 /// others, in this order: discovery from the worker's tree could fold a file in at another
 /// precedence (a Cargo home that lay above the workspace was an ancestor's `.cargo`, and is a
@@ -298,10 +345,17 @@ fn native(ctx: &Context<'_>) -> BTreeMap<String, OsString> {
     })
 }
 
-fn record_path(spec: &BuildSpec, store: &Path) -> PathBuf {
-    let digest: String =
-        blaze_wire::digest_of(spec).iter().map(|byte| format!("{byte:02x}")).collect();
-    store.join(format!("replay-{digest}.cbor"))
+/// The replay record `digest` names in `store`. Its bytes are authenticated before any field of
+/// it is read.
+fn read_record(digest: &Digest, store: &Path) -> anyhow::Result<Record> {
+    let name = crate::snapshot::name(digest);
+    let bytes = std::fs::read(store.join(&name))
+        .with_context(|| format!("the saved replay record {name} is missing"))?;
+    ensure!(
+        crate::snapshot::hash(&bytes) == *digest,
+        "the saved replay record {name} does not match its digest: it was changed after the save"
+    );
+    Ok(blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?)
 }
 
 fn config_files(
@@ -535,10 +589,7 @@ pub fn capture(
     )
     .context("captured inputs cannot reproduce the request offline")?;
     drop(baseline);
-    let mut writing = tempfile::NamedTempFile::new_in(store)?;
-    writing.write_all(&blaze_wire::encode(&record))?;
-    writing.as_file().sync_all()?;
-    writing.persist(record_path(&made.build, store)).map_err(|error| error.error)?;
+    made.record = Some(crate::snapshot::put(store, &blaze_wire::encode(&record))?);
     Ok(made)
 }
 
@@ -550,7 +601,7 @@ pub fn capture(
     reason = "the authenticated identity and executor context are explicit"
 )]
 pub fn prepare(
-    given: &BuildSpec,
+    saved: &Saved,
     store: &Path,
     destination: &Path,
     host: &Host,
@@ -559,11 +610,9 @@ pub fn prepare(
     rust_release: Option<&blaze_metadata::RustRelease<'_>>,
     executor: &BTreeMap<String, OsString>,
 ) -> anyhow::Result<Prepared> {
-    let bytes = std::fs::read(record_path(given, store))
-        .context("the saved replay recipe is missing or does not match this BuildSpec")?;
-    let record: Record = blaze_wire::decode(&bytes, &blaze_wire::Limits::DOCUMENTED)?;
+    let record = read_record(&saved.record, store)?;
     prepare_record(
-        given,
+        &saved.build,
         store,
         destination,
         host,

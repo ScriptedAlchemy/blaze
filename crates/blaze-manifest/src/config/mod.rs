@@ -482,6 +482,13 @@ impl Config {
         &self.home
     }
 
+    /// The directory every ancestor walk stops at, when this configuration reads a replayed
+    /// snapshot ([`Config::with_discovery_root`]): configuration discovery, the workspace root's
+    /// search and the search for the current manifest read nothing above it.
+    pub fn discovery_root(&self) -> Option<&Path> {
+        self.discovery_root.as_deref()
+    }
+
     pub fn env(&self, key: &str) -> Option<&str> {
         self.env.get(key).map(String::as_str)
     }

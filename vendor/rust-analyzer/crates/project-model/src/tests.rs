@@ -292,6 +292,29 @@ fn compiler_unit_identity_preserves_distinct_instances_of_the_same_source() {
     assert_eq!(files.len(), 1);
 }
 
+/// A build script's `cargo:rustc-env=OUT_DIR=...` renames the variable its crate sees; the
+/// description names the directory the script wrote to apart from it, and the graph keeps it.
+#[test]
+fn compiler_project_keeps_the_script_out_dir_apart_from_the_variable() {
+    let mut json = compiler_project();
+    json["crates"][0]["env"]["OUT_DIR"] = "/native-script-marker".into();
+    json["crates"][0]["blaze_build_script_out_dir"] = "/target/build/native-0123/out".into();
+    let workspace = rust_project_workspace(serde_json::from_value(json).unwrap());
+    let (graph, _) = to_crate_graph(workspace, &mut Default::default());
+    let dirs: Vec<_> = graph
+        .iter()
+        .filter_map(|id| graph[id].extra.blaze_build_script_out_dir.as_ref())
+        .map(|it| it.as_str().to_owned())
+        .collect();
+    assert_eq!(dirs, ["/target/build/native-0123/out"]);
+    let renamed = graph
+        .iter()
+        .find(|&id| graph[id].extra.blaze_build_script_out_dir.is_some())
+        .map(|id| graph[id].env.get("OUT_DIR"))
+        .unwrap();
+    assert_eq!(renamed.as_deref(), Some("/native-script-marker"));
+}
+
 #[test]
 fn compiler_project_preserves_exact_cfg_env_and_target_kinds() {
     let mut json = compiler_project();

@@ -996,8 +996,9 @@ fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
     let helper = crates.iter().find(|krate| krate.name == "helper").unwrap();
     assert!(!helper.cfg.iter().any(|cfg| cfg == "proc_macro"));
     let profile = runner.profile(package, UnitFor::new_host(true), &CompileKind::Host);
+    let features = runner.cargo[package].active_features.clone();
     let script = runner
-        .described(package, "build_script_build", &base.join("build.rs"), &profile, None)
+        .described(package, "build_script_build", &base.join("build.rs"), &profile, &features, None)
         .unwrap();
     assert!(!script.cfg.iter().any(|cfg| cfg == "proc_macro"));
     let _ = std::fs::remove_dir_all(&base);
@@ -1220,5 +1221,134 @@ fn a_package_built_for_the_host_and_the_target_alike_has_one_run() {
     let (host, target) = (run(&apart, true), run(&apart, false));
     assert_ne!(host.0, target.0, "a run for each");
     assert!(!host.1 && target.1, "the host's alone has none");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The review's workspace (resolver 2, `debug = 0`): `app` depends on `parent` and on `native`
+/// with its `target-extra` feature, and its script is compiled with `parent`; `parent` depends
+/// on `native`, which has `links` and prints its features as metadata. `parent` has the same
+/// features for the host and the target, but the `native` it is given metadata by does not, so
+/// cargo has two units of `parent`'s run (`traverse_and_share`'s `dep_hash`): the target's
+/// `DEP_NATIVE_MODE` is "target" and the host's "host". Before, the key named `parent`'s own
+/// features, profile and flags alone, and with no debuginfo either way the two were one run, the
+/// host's, whose metadata the target's consumer was given. With `native` alike for both, the
+/// two are one run, as cargo has it. And `native`'s script, which reads its feature, is compiled
+/// once for each set of features, where blaze compiled the host's alone and ran it for both.
+#[cfg(unix)]
+#[test]
+fn runs_given_metadata_by_different_runs_of_a_links_dependency_are_two() {
+    let base = dir("links-identity");
+    let toolchain = Fixture::at(&base);
+    let root = base.join("ws");
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"parent\", \"native\"]\n\
+         [profile.dev]\ndebug = 0\n",
+    );
+    let package = |name: &str, rest: &str| {
+        write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 build = \"build.rs\"\n{rest}"
+            ),
+        );
+        write(&format!("{name}/build.rs"), "fn main() {}\n");
+        write(&format!("{name}/src/lib.rs"), "");
+    };
+    package(
+        "app",
+        "[dependencies]\nparent = { path = \"../parent\" }\n\
+         native = { path = \"../native\", features = [\"target-extra\"] }\n\
+         [build-dependencies]\nparent = { path = \"../parent\" }\n",
+    );
+    package("parent", "[dependencies]\nnative = { path = \"../native\" }\n");
+    package("native", "links = \"native\"\n[features]\ntarget-extra = []\n");
+    let env = BTreeMap::from([("CARGO_HOME".to_owned(), base.join("home").display().to_string())]);
+    let config = Config::load(&root, env.clone(), &[]).unwrap();
+    let cx = blaze_manifest::Context::new(config);
+    let manifest = root.join("Cargo.toml");
+    let ws = blaze_manifest::Workspace::new(&manifest, &cx).unwrap();
+    let metadata = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let id = |name: &str| {
+        let packages = metadata["packages"].as_array().unwrap();
+        packages.iter().find(|it| it["name"] == name).unwrap()["id"].as_str().unwrap().to_owned()
+    };
+    let (app, parent, native) = (id("app"), id("parent"), id("native"));
+    let normal = json!([{ "kind": null, "target": null }]);
+    let both = json!([{ "kind": null, "target": null }, { "kind": "build", "target": null }]);
+    // As the build of each has it: `native` the target's with its feature, or the host's without.
+    let workspace = |native_features: &[&str]| {
+        let mut metadata = metadata.clone();
+        metadata["resolve"] = json!({ "root": null, "nodes": [
+            { "id": app, "dependencies": [parent, native], "features": [], "deps": [
+                { "name": "parent", "pkg": parent, "dep_kinds": both },
+                { "name": "native", "pkg": native, "dep_kinds": normal },
+            ] },
+            { "id": parent, "dependencies": [native], "features": [], "deps": [
+                { "name": "native", "pkg": native, "dep_kinds": normal },
+            ] },
+            { "id": native, "dependencies": [], "features": native_features, "deps": [] },
+        ] });
+        let manifest =
+            project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(manifest.clone()))
+                .unwrap();
+        let metadata = serde_json::from_value(metadata).unwrap();
+        CargoWorkspace::new(metadata, manifest, ide_db::base_db::Env::default(), false)
+    };
+    let target_ws = workspace(&["target-extra"]);
+    let host_ws = workspace(&[]);
+    let packages = FxHashMap::from_iter([app, parent.clone(), native.clone()].map(|it| (it, true)));
+    let leases = Leases::default();
+    let asked = |shared| Asked {
+        env: &env,
+        build: 0,
+        profile: "dev",
+        config: &[],
+        host: HOST,
+        target: HOST,
+        explicit_target: false,
+        packages: Some(&packages),
+        host_cargo: None,
+        shared,
+    };
+    // `parent`'s run for the host, in the build of the host's workspace, and for the target.
+    let run = |cargo: &CargoWorkspace, asked: &Asked<'_>, for_host: bool| {
+        let runner =
+            Runner::new(&leases, cargo, asked, toolchain.sysroot.clone(), &toolchain.cfg).unwrap();
+        let package = cargo.packages().find(|&it| cargo[it].id.repr == parent).unwrap();
+        let unit_for = if for_host { UnitFor::new_host(false) } else { UnitFor::new_normal() };
+        let lib = runner.profile(package, unit_for, &runner.kind(for_host));
+        let unit = runner.unit(package, for_host, &lib, PathBuf::new(), Vec::new()).unwrap();
+        (unit.out_dir, unit.profile.debuginfo)
+    };
+    // `shared_with_the_host` has `parent` and not `native`, whose features differ.
+    let alone = FxHashSet::from_iter([parent.clone()]);
+    let apart = asked(Some(&alone));
+    let (host, target) = (run(&host_ws, &apart, true), run(&target_ws, &apart, false));
+    assert_eq!((host.1, target.1), (false, false), "no debuginfo either way, at debug = 0");
+    assert_ne!(host.0, target.0, "a run for each, as `native`'s differ");
+    // With `native` alike for both, both share, and `parent` has one run.
+    let alike = FxHashSet::from_iter([parent.clone(), native.clone()]);
+    let shared = asked(Some(&alike));
+    let (host, target) = (run(&target_ws, &shared, true), run(&target_ws, &shared, false));
+    assert_eq!(host, target, "one run when the runs of `native` are one");
+    // `native`'s script is compiled for the host either way, but with the features of the run
+    // it is for, which `cfg!(feature = "target-extra")` reads: two executables, as cargo has.
+    let runner =
+        Runner::new(&leases, &host_ws, &apart, toolchain.sysroot.clone(), &toolchain.cfg).unwrap();
+    let package = host_ws.packages().find(|&it| host_ws[it].id.repr == native).unwrap();
+    let profile = runner.profile(package, UnitFor::new_host(false), &CompileKind::Host);
+    let dir = |features: &[&str]| {
+        let features: Vec<String> = features.iter().map(|it| (*it).to_owned()).collect();
+        runner.compile_dir(package, &features, &profile)
+    };
+    assert_ne!(dir(&[]), dir(&["target-extra"]), "a compile for each set of features");
+    assert_eq!(dir(&["target-extra"]), dir(&["target-extra"]));
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -5,7 +5,9 @@
 //! database while it runs. Its key is the content of the macro's dylib, the macro's name and
 //! kind, the input (and the attribute's input) with each span replaced by its place in a
 //! table of the distinct spans of the call (`def_site`, `call_site`, `mixed_site`, then the
-//! input's), that table's spans, the environment and the current directory it is given. A
+//! input's), that table's spans, the environment and the current directory it is given, and
+//! every variable of the server that expands it (by digest), which a macro reads without
+//! asking as it reads rustc's: an expander that cannot name them is not kept. A
 //! span is in the key as its byte range, which is from the item it is anchored to, and which
 //! of the call's anchors and syntax contexts it has, numbered as they first appear: the
 //! next call with the same key has other anchors and contexts, as another database or
@@ -54,7 +56,7 @@ use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
 /// What the key of an expansion starts with: another number when the key or the value is
 /// made otherwise.
-const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 4";
+const DOMAIN: &[u8] = b"ra-jit proc-macro expansion 5";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -193,6 +195,8 @@ struct Parts {
     input: String,
     env: String,
     cwd: String,
+    /// The server's environment.
+    server_env: String,
 }
 
 /// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
@@ -286,6 +290,10 @@ impl Kept {
             field(value.as_bytes());
         }
         field(current_dir.as_bytes());
+        // The variables of the server, all of them: a macro reads one by itself, and one
+        // changed under the same input is another expansion, as rustc's process would make it.
+        let server_env = self.inner.environment_identity()?;
+        field(&server_env);
         let key = hasher.finalize().into();
         let env: Vec<(&str, std::borrow::Cow<'_, str>)> = env
             .into_iter()
@@ -296,6 +304,7 @@ impl Kept {
             input: short(&input.concat()),
             env: short(env_text(&env).as_bytes()),
             cwd: short(current_dir.as_bytes()),
+            server_env: short(&server_env),
         });
         if parts.is_some() {
             log_env(&env);
@@ -361,6 +370,76 @@ fn env_text(env: &[(&str, std::borrow::Cow<'_, str>)]) -> String {
 }
 
 #[cfg(test)]
+mod environment_key_tests {
+    use super::*;
+
+    /// A macro that reads a variable of its process: the expander says which process.
+    #[derive(Debug)]
+    struct ReadsItsProcess(Mutex<Option<[u8; 32]>>);
+
+    impl ProcMacroExpander for ReadsItsProcess {
+        fn expand(
+            &self,
+            _: &dyn SourceDatabase,
+            subtree: &tt::TopSubtree,
+            _: Option<&tt::TopSubtree>,
+            _: &Env,
+            _: Span,
+            _: Span,
+            _: Span,
+            _: String,
+        ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+            Ok(subtree.clone())
+        }
+
+        fn eq_dyn(&self, _: &dyn ProcMacroExpander) -> bool {
+            false
+        }
+
+        fn environment_identity(&self) -> Option<[u8; 32]> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// The same input with PR15_PRIVATE's value changed between builds is another key, so the
+    /// second build expands afresh; a third with the first value has the first build's key.
+    #[test]
+    fn an_expansion_is_kept_under_the_environment_of_its_server() {
+        let inner = Arc::new(ReadsItsProcess(Mutex::new(None)));
+        let loaded: [u8; KEY] = Sha256::digest(b"the macro library").into();
+        let kept = Kept {
+            inner: inner.clone(),
+            dylib: Dylib::at(&AbsPathBuf::assert_utf8(std::env::temp_dir()), Some(loaded)),
+            name: "Private".into(),
+            kind: ProcMacroKind::CustomDerive,
+            skipped: false,
+        };
+        let span = Span {
+            range: TextRange::empty(0.into()),
+            anchor: SpanAnchor {
+                file_id: span::EditionedFileId::new(
+                    span::FileId::from_raw(0),
+                    span::Edition::Edition2024,
+                ),
+                ast_id: span::ROOT_ERASED_FILE_AST_ID,
+            },
+            ctx: SyntaxContext::root(span::Edition::Edition2024),
+        };
+        let input = tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
+        let env = Env::default();
+        let key = |server: Option<&[u8]>| {
+            *inner.0.lock().unwrap() = server.map(|it| Sha256::digest(it).into());
+            kept.call(&input, None, &env, span, span, span, "/work").map(|call| call.key)
+        };
+        let first = key(Some(b"PR15_PRIVATE=old-private-value")).unwrap();
+        let second = key(Some(b"PR15_PRIVATE absent")).unwrap();
+        assert_ne!(first, second, "the second build's expansion is not the first's");
+        assert_eq!(key(Some(b"PR15_PRIVATE=old-private-value")), Some(first));
+        assert_eq!(key(None), None, "an expander that cannot name its process is not kept");
+    }
+}
+
+#[cfg(test)]
 mod diagnostic_tests {
     use super::env_text;
 
@@ -398,13 +477,14 @@ impl Call {
         let Some(parts) = &self.parts else { return };
         let disk: String = store.disk_key(&self.key).iter().map(|it| format!("{it:02x}")).collect();
         write_log(&format!(
-            "macro\t{}\t{}\t{disk}\tdylib={}\tinput={}\tenv={}\tcwd={}\t{outcome}\n",
+            "macro\t{}\t{}\t{disk}\tdylib={}\tinput={}\tenv={}\tcwd={}\tsenv={}\t{outcome}\n",
             kind_name(kept.kind),
             kept.name,
             parts.dylib,
             parts.input,
             parts.env,
             parts.cwd,
+            parts.server_env,
         ));
     }
 }
@@ -531,6 +611,10 @@ impl ProcMacroExpander for Kept {
 
     fn content_identity(&self) -> Option<[u8; 32]> {
         self.inner.content_identity().or_else(|| self.dylib.hash().copied())
+    }
+
+    fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.inner.environment_identity()
     }
 }
 
