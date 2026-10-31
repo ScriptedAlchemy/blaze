@@ -1377,7 +1377,8 @@ impl<'a> Runner<'a> {
         }
         self.making_images.push(package);
         let result = (|| {
-            let crates = self.producer_sources(package)?;
+            let mut crates = Vec::new();
+            self.add_source(package, &mut crates, &mut FxHashMap::default())?;
             let newest_run = self.newest_run(&crates);
             let dir = self.base.join("producers").join(format!("{package:?}"));
             let env = self.child_env().into_iter().collect::<Vec<_>>();
@@ -1410,18 +1411,6 @@ impl<'a> Runner<'a> {
         self.image_leases.extend(self.leases.image_leases(self.asked.build, leases));
         self.images.insert(package, image.library.clone());
         Ok(image.library)
-    }
-
-    fn producer_sources(
-        &mut self,
-        package: Package,
-    ) -> Result<Vec<crate::cargo::own_script::Planned>, String> {
-        let mut crates = Vec::new();
-        let root = self.add_source(package, &mut crates, &mut FxHashMap::default())?;
-        if !crates[root].cfg.iter().any(|cfg| cfg == "proc_macro") {
-            crates[root].cfg.push("proc_macro".to_owned());
-        }
-        Ok(crates)
     }
 
     fn add(
@@ -1467,7 +1456,12 @@ impl<'a> Runner<'a> {
             true => Some(self.script(package, true)?),
             false => None,
         };
-        let described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        let mut described = self.described(package, &name, &root, &host, ran.as_deref())?;
+        if matches!(lib.kind, TargetKind::Lib { is_proc_macro: true })
+            && !described.cfg.iter().any(|cfg| cfg == "proc_macro")
+        {
+            described.cfg.push("proc_macro".to_owned());
+        }
         let index = crates.len();
         crates.push(described);
         Ok(index)

@@ -906,7 +906,7 @@ fn producer_compiler_cfg_preserves_host_facts_and_effective_profile() {
 
 #[cfg(unix)]
 #[test]
-fn ordinary_macro_producer_plans_crate_kind_only_for_its_root() {
+fn ordinary_macro_descriptors_mark_roots_and_fresh_dependency_leaves() {
     let base = dir("macro-root-cfg");
     let root = base.join("pkg");
     std::fs::create_dir_all(root.join("helper")).unwrap();
@@ -978,7 +978,16 @@ fn ordinary_macro_producer_plans_crate_kind_only_for_its_root() {
             links: None,
         })),
     );
-    let crates = runner.producer_sources(package).unwrap();
+    let mut leaves = Vec::new();
+    let index = runner.add_source_leaf(package, &mut leaves).unwrap();
+    assert!(leaves[index].cfg.iter().any(|cfg| cfg == "proc_macro"));
+    let described = crate::cargo::own_script::planned_description(&pkg.sysroot, leaves);
+    let described: serde_json::Value = serde_json::from_str(&described).unwrap();
+    assert!(
+        described["crates"][index]["cfg"].as_array().unwrap().iter().any(|cfg| cfg == "proc_macro")
+    );
+    let mut crates = Vec::new();
+    runner.add_source(package, &mut crates, &mut FxHashMap::default()).unwrap();
     let root = crates.iter().find(|krate| krate.name == "macros").unwrap();
     for fact in ["proc_macro", "unix", "custom_host", "panic=\"abort\"", "feature=\"selected\""] {
         assert!(root.cfg.iter().any(|cfg| cfg == fact), "missing {fact}: {:?}", root.cfg);
