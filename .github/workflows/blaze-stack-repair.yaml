@@ -1,4 +1,4 @@
-name: Blaze stack repair workspace
+name: Blaze stack repair
 
 on:
   push:
@@ -10,24 +10,60 @@ permissions:
   contents: read
 
 jobs:
-  workspace:
-    runs-on: macos-15
-    timeout-minutes: 10
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      c2_sha: ${{ steps.prepare.outputs.c2_sha }}
+      ci_sha: ${{ steps.prepare.outputs.ci_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          persist-credentials: false
-      - name: Export the exact repository objects for local conflict resolution
-        run: |
-          git bundle create "$RUNNER_TEMP/blaze-repair.bundle" --all
-          git bundle verify "$RUNNER_TEMP/blaze-repair.bundle"
-          git show-ref > "$RUNNER_TEMP/blaze-repair-refs.txt"
+      - name: Install the pinned formatter
+        run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt
+      - name: Resolve the reviewed stack and stage the producer fix
+        id: prepare
+        run: python3 -I .github/repair/prepare.py
       - uses: actions/upload-artifact@v7
         with:
-          name: blaze-repair-workspace
-          path: |
-            ${{ runner.temp }}/blaze-repair.bundle
-            ${{ runner.temp }}/blaze-repair-refs.txt
-          retention-days: 1
+          name: blaze-repair-receipt
+          path: ${{ runner.temp }}/blaze-repair-receipt.json
+          retention-days: 3
           if-no-files-found: error
+
+  validate:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.c2_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+          llvm: build
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: blaze-stack-repair
+      - name: Run the full CLI regression suite on the repaired source
+        run: |
+          set -o pipefail
+          nix develop .#bench --command cargo test --locked -p ra-jit --bin ra-jit --features llvm -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/blaze-repair-tests.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: blaze-repair-tests
+          path: ${{ runner.temp }}/blaze-repair-tests.log
+          retention-days: 3
+          if-no-files-found: warn
