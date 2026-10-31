@@ -229,7 +229,9 @@ class Harness:
             return "EXPECTED EXECUTED TEST WAS IGNORED"
         if failed is not None and run.failed != failed:
             return f"WRONG TERMINAL FAILURES: {sorted(run.failed)}"
-        if (run.code == 0) != passes or bool(run.failed) == passes:
+        # Cargo reports an ordinary failed test as 101. A signal or infrastructure
+        # exit after a FAILED line is not the expected negative test result.
+        if run.code != (0 if passes else 101) or bool(run.failed) == passes:
             return f"ENDED {run.code} WITH {', '.join(sorted(run.failed)) or 'no test'} FAILED"
         if unsaid := [it for it in says if not re.search(it, run.out, re.M)]:
             return f"DID NOT SAY {' NOR '.join(unsaid)}"
