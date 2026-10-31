@@ -176,6 +176,35 @@ version="0.1.0"
     write(root, "app/tests/runtime.rs", '#[test] fn binary_environment() { assert_eq!(env!("CARGO_BIN_EXE_saved-dynamic-app"), "source-value"); let runtime=std::env::var_os("CARGO_BIN_EXE_saved-dynamic-app").unwrap(); assert!(std::path::Path::new(&runtime).is_file()); assert_ne!(runtime, std::ffi::OsString::from("source-value")); }\n')
 
 
+def without_nix_rpath(env):
+    """The environment with Nix's run-path flags removed from every `NIX_LDFLAGS*` value.
+
+    A `nix develop` shell's cc setup hook appends `-rpath $out/lib` to `NIX_LDFLAGS` as the
+    shell starts, so `NIX_DONT_SET_RPATH` set afterwards stops the wrapper adding paths for
+    `-L` directories but not that one, and every link in the shell carries a RUNPATH into a
+    directory that never exists. The no-rpath control reads the reference's binaries too, so
+    both legs link without it.
+    """
+    out = dict(env)
+    for name, value in env.items():
+        if not name.startswith("NIX_LDFLAGS"):
+            continue
+        words = value.split()
+        kept = []
+        skip = False
+        for word in words:
+            if skip:
+                skip = False
+            elif word in ("-rpath", "--rpath"):
+                skip = True
+            elif word.startswith(("-rpath=", "--rpath=", "-Wl,-rpath,", "-Wl,-rpath=")):
+                pass
+            else:
+                kept.append(word)
+        out[name] = " ".join(kept)
+    return out
+
+
 def no_rpath_control(runner, name, files, env, cwd):
     files = sorted(set(map(Path, files)))
     assert files, "native loader control has no linked artifacts"
@@ -442,8 +471,8 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
 
     project = work / "dynamic-producers"
     dynamic_producer_fixture(project)
-    dynamic_env = dict(env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-product-target"))
-    dynamic_oracle = dict(oracle_env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-oracle-target"))
+    dynamic_env = without_nix_rpath(dict(env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-product-target")))
+    dynamic_oracle = without_nix_rpath(dict(oracle_env, NIX_DONT_SET_RPATH="1", CARGO_TARGET_DIR=str(work / "dynamic-oracle-target")))
     command = ["run", "-p", "saved-dynamic-app", *profile]
     expected, _ = runner.run("dynamic-reference", [real / "bin/cargo", *command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
     assert expected == "42|42|42|true\n", expected
