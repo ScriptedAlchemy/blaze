@@ -102,6 +102,15 @@ class UnitVerdictTests(unittest.TestCase):
                 "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
         self.assertFalse(errors(text))
 
+    def test_multiple_doctests_in_one_file_and_rustdoc_groups_are_distinct(self):
+        text = (cargo_build() + suite() + "   Doc-tests other\n"
+                "test src/lib.rs - first (line 1) ... ok\n"
+                "test src/lib.rs - second (line 5) ... ok\n"
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                "test src/lib.rs - third (line 9) ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+        self.assertFalse(errors(text))
+
     def test_cli_rejects_a_compile_failure_after_all_known_failures(self):
         # Test the script's exit status, not just the parser in isolation.
         text = cargo_build()
@@ -123,8 +132,11 @@ class UnitVerdictTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
-            (root / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.0.0"\nedition="2021"\n')
-            (root / "src/lib.rs").write_text('#[test] fn known() { assert!(false); }\n')
+            (root / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.0.0"\nedition="2024"\n')
+            (root / "src/lib.rs").write_text(
+                '//! ```\n//! assert_eq!(2 + 2, 4);\n//! ```\n'
+                '//! ```no_run\n//! assert_eq!(3 + 3, 6);\n//! ```\n'
+                '#[test] fn known() { assert!(false); }\n')
             run = subprocess.run(["cargo", "test", "--offline", "--no-fail-fast", "--message-format=json"],
                                  cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, timeout=90,

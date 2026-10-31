@@ -38,7 +38,7 @@ OPEN = {
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 RUNNING = re.compile(r"^\s+Running .*[/\\]deps[/\\](\w+?)-[0-9a-f]{16}")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
-RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
+RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:\s|$)")
 
 
 SUMMARY = re.compile(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;")
@@ -52,6 +52,7 @@ class Transcript:
         self.errors = []
         self.suite = None
         self.suites = 0
+        self.doctest = None
 
     def end_suite(self):
         if self.suite is not None:
@@ -81,9 +82,14 @@ class Transcript:
                     return
         if m := RUNNING.match(line) or DOCTESTS.match(line):
             self.end_suite()
+            self.doctest = m.group(1) if DOCTESTS.match(line) else None
             self.suite = {"name": m.group(1), "outcomes": {}}
             self.suites += 1
         elif m := RESULT.match(line):
+            # Rustdoc can run multiple libtest groups under one Doc-tests banner
+            # (for example merged 2024 doctests and separately compiled examples).
+            if self.suite is None and self.doctest is not None:
+                self.suite = {"name": self.doctest, "outcomes": {}}
             if self.suite is None:
                 self.errors.append("test result outside a running test target")
                 return
@@ -95,6 +101,8 @@ class Transcript:
             if m.group(2) == "FAILED":
                 self.failed.add(name)
         elif m := SUMMARY.match(line):
+            if self.suite is None and self.doctest is not None:
+                self.suite = {"name": self.doctest, "outcomes": {}}
             if self.suite is None:
                 self.errors.append("libtest summary without a running target")
                 return
