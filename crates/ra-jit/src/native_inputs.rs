@@ -131,9 +131,9 @@ fn collect_known(db: &RootDatabase, args: &Args, binary: &Path) -> anyhow::Resul
         let root: ide_db::base_db::Crate = root.into();
         for krate in std::iter::once(root).chain(root.transitive_deps(db)) {
             if !krate.data(db).origin.is_lang()
-                && let Some(out) = krate.env(db).get("OUT_DIR")
+                && let Some(out) = crate::cargo::script::out_dir_of(db, krate)
             {
-                out_dirs.insert(PathBuf::from(out));
+                out_dirs.insert(out);
             }
         }
     }

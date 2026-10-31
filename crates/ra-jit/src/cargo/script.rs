@@ -230,6 +230,20 @@ pub(crate) fn printed(out_dir: &Path) -> Option<PathBuf> {
     Some(if second.exists() { second } else { run_dir.join("output") })
 }
 
+/// The directory the build script of `krate`'s package wrote to: what the crate graph
+/// recorded for the crate, or else its `OUT_DIR`. A script's own `cargo:rustc-env=OUT_DIR=...`
+/// shadows the variable the crate's code sees, as it does under cargo, and never where the
+/// script's files and what it printed are.
+pub(crate) fn out_dir_of(
+    db: &crate::RootDatabase,
+    krate: ide_db::base_db::Crate,
+) -> Option<PathBuf> {
+    if let Some(out) = &krate.extra_data(db).blaze_build_script_out_dir {
+        return Some(PathBuf::from(out.as_str()));
+    }
+    krate.env(db).get("OUT_DIR").map(PathBuf::from)
+}
+
 /// Whether `path` can be in a script's `OUT_DIR`: below `build/<unit>/out` in cargo's first
 /// layout or `build/<package>/<hash>/out` in its second, where the objects of a library are
 /// too.

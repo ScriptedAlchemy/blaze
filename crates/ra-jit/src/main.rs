@@ -6250,8 +6250,8 @@ impl Executable {
 fn built_in(db: &RootDatabase, base: &Path) -> Vec<PathBuf> {
     let crates = ide_db::base_db::all_crates(db);
     let scripts = crates.iter().filter_map(|krate| {
-        let out = krate.env(db).get("OUT_DIR")?;
-        let below = Path::new(&out).strip_prefix(base).ok()?.components().next()?;
+        let out = cargo::script::out_dir_of(db, *krate)?;
+        let below = out.strip_prefix(base).ok()?.components().next()?;
         Some(base.join(below))
     });
     // Cargo tags the directories it builds in.

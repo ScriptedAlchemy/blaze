@@ -376,7 +376,12 @@ def owned_test_policy(runner, blaze, work, env):
 
 
 def cache_phase(blaze, stop_log, command):
-    """Run the application and stop its private daemon before the trace can finish."""
+    """Run `blaze cargo ...` and stop the daemon it started before the trace can finish.
+
+    A direct `blaze cargo run` or `test` leaves its daemon running for the next command, and
+    the exec tracer follows every process the row started, so the row would end only when
+    the daemon did. The daemon is stopped from the same environment the command had.
+    """
     status = 1
     try:
         status = subprocess.run(command).returncode
@@ -480,11 +485,15 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     reference_target = Path(dynamic_oracle["CARGO_TARGET_DIR"])
     controls = [reference_target / "debug/saved-dynamic-app", *reference_target.rglob("libsaved_dynamic" + extension), *reference_target.rglob("libsaved_dynamic_macro*" + extension), *reference_target.rglob("build-script-build")]
     no_rpath_control(runner, "dynamic-reference", controls, dynamic_oracle, project)
-    actual, _ = runner.run("dynamic-direct", [blaze, "cargo", *command, "--locked", "--offline"], dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+    def direct(name, direct_command):
+        wrapped = [sys.executable, __file__, "--cache-phase", str(blaze), str(work / (name + "-stop.log")),
+                   str(blaze), "cargo", *direct_command, "--locked", "--offline"]
+        return runner.run(name, wrapped, dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+    actual, _ = direct("dynamic-direct", command)
     assert actual == expected, (actual, expected)
     test_command = ["test", "-p", "saved-dynamic-app", "--test", "runtime", *profile]
     test_reference, _ = runner.run("dynamic-test-reference", [real / "bin/cargo", *test_command, "--locked", "--offline"], dynamic_oracle, project, guarded=False)
-    test_direct, _ = runner.run("dynamic-test-direct", [blaze, "cargo", *test_command, "--locked", "--offline"], dict(dynamic_env, RA_JIT_PROC_MACRO_SERVER=str(args.owned_server)), project)
+    test_direct, _ = direct("dynamic-test-direct", test_command)
     from buildspec import parse_run
     assert parse_run(test_direct) == parse_run(test_reference), (test_direct, test_reference)
     test_spec = bundle / "dynamic-producer-tests.cbor"
@@ -648,6 +657,14 @@ class Runner:
         shown = shlex.join(list(map(str, command))).encode("utf-8", "backslashreplace").decode("utf-8")
         write(self.work, name + ".log", "$ " + shown
               + "\n" + out + err)
+        # A build the daemon's worker refused names the worker's log, which lives in the
+        # runtime directory and is not among the evidence a run uploads: keep a copy beside
+        # the row's log while the file is there.
+        for said in re.findall(r"what blaze said is in (\S+)\)", out + err):
+            try:
+                shutil.copyfile(Path(cwd, said), self.work / (name + ".worker.log"))
+            except OSError as error:
+                print(f"{name}: cannot keep the worker log {said}: {error}", file=sys.stderr)
         write(self.work, "results.json", json.dumps({"rows": self.rows}, indent=2) + "\n")
         print(f"{name}: exit={child.returncode}, seconds={row['seconds']}", flush=True)
         assert not timed_out and "watchdog" not in row, row
