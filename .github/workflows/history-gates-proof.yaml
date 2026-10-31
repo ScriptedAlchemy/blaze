@@ -1,0 +1,42 @@
+name: Verify historical gate repairs
+on:
+  push:
+    branches: [repair/history-gates-20261031]
+    paths: [.github/workflows/history-gates-proof.yaml]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: none
+      - name: Apply bounded distributed-verdict repair
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('harness/dist/tests.py')
+          text = path.read_text()
+          old = '        if (run.code == 0) != passes or bool(run.failed) == passes:\n'
+          new = ('        # Cargo reports an ordinary failed test as 101. A signal or infrastructure\n'
+                 '        # exit after a FAILED line is not the expected negative test result.\n'
+                 '        if run.code != (0 if passes else 101) or bool(run.failed) == passes:\n')
+          assert text.count(old) == 1, 'source drift'
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Exercise every verdict and real Cargo output
+        run: |
+          cargo --version
+          python3 -I harness/test_gate_verdicts.py -v
+          python3 -I harness/dist/tests.py --self-test
+          git diff --check
+      - name: Publish the verified source-only change to this repair branch
+        run: |
+          git config user.name 'Blaze repair'
+          git config user.email 'noreply@openai.com'
+          git add harness/dist/tests.py
+          git commit -m 'Require normal test failure status instead of accepting process signals'
+          git push origin HEAD:refs/heads/repair/history-gates-20261031
