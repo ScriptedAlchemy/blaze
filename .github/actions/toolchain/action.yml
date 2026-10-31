@@ -104,8 +104,10 @@ runs:
       run: |
         # The cache holds only the paths no substituter has, not their closures. Realise the
         # references from the configured substituters and these unsigned paths from our cache.
-        xargs nix-store --realise --option extra-substituters "file://$HOME/.cache/toolchain-nix" \
-          --option require-sigs false < ~/.cache/toolchain-nix/paths
+        # Trust this cache's unsigned outputs explicitly: the daemon still checks signatures
+        # with a client-side require-sigs=false. This also restores existing reduced entries.
+        xargs nix-store --realise --option extra-substituters "file://$HOME/.cache/toolchain-nix?trusted=true" \
+          < ~/.cache/toolchain-nix/paths
         rm -rf ~/.cache/toolchain-nix
     - name: LLVM 20 (Nix)
       if: runner.os != 'Windows' && inputs.llvm != 'none'
