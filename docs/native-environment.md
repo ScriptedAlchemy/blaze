@@ -70,9 +70,12 @@ value, and one the daemon has that the request lacks is removed. The daemon's
 own (`RA_JIT_*`, `CARGO_TARGET_DIR` and the wrappers) stay the daemon's. A load
 whose variables differ from those the serving generation started with retires
 that generation, so a server started for an earlier request never expands for a
-later one (`proc-macro-api`'s
+later one. A request whose variables differ from those of the live servers has
+every macro library loaded again into servers that have its own, even when
+nothing of the checkout is stale, as when only a caller of a macro was edited (`proc-macro-api`'s
 `a_generation_starts_with_the_environment_of_its_load`, `inputs.rs`'s
 `macro_servers_start_with_the_complete_snapshot_of_the_request`). The strict
 macro witness's `private-removed` and `private-raw` rows hold this against
 Cargo: a daemon started with `PR15_PRIVATE` set, a request without it and then
-one with a value that is not Unicode, each with the macro edited.
+one with a value that is not Unicode, each with the macro edited; its
+`consumer-removed` row removes the variable again and edits only the caller.

@@ -616,7 +616,8 @@ def token_scan(roots, token):
 def macro_private_environment(env, step):
     """Change the witness's request environment, including repeated removals."""
     env.pop("PR15_PRIVATE", None)
-    private = {} if step == "private-removed" else {"PR15_PRIVATE": "raw-\udcff-value"}
+    removed = step in ("private-removed", "consumer-removed")
+    private = {} if removed else {"PR15_PRIVATE": "raw-\udcff-value"}
     env.update(private)
     return private
 
@@ -660,11 +661,15 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
     previous_reload_count = 0
     steps = ["initial", "same-size-restored-mtime", "dependency-restored-mtime", "unchanged-content"]
     steps.extend(f"reload-{index:02}" for index in range(reloads))
-    steps.extend(["private-removed", "private-raw"])
+    # consumer-removed is Sol's: the variable removed and only a caller of the macro edited,
+    # which makes nothing of the checkout stale; its new expansion must still not see it.
+    steps.extend(["private-removed", "private-raw", "consumer-removed"])
+    consumer = os.path.join(ws, "app/src/main.rs")
     try:
         for step in steps:
             audit_before = len(norustc.runs(audit_log))
-            edited_source = producer if step == "dependency-restored-mtime" else source
+            edited_source = {"dependency-restored-mtime": producer,
+                             "consumer-removed": consumer}.get(step, source)
             before = os.stat(edited_source)
             old_digest = hashlib.sha256(open(edited_source, "rb").read()).hexdigest()
             if step == "same-size-restored-mtime":
@@ -690,6 +695,11 @@ def macro_content_report(work, bin_dir, machines, sources, reloads, owned_server
                 with open(source, "w") as output:
                     output.write(text)
                 os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif step == "consumer-removed":
+                private = macro_private_environment(env, step)
+                caller = open(consumer).read().replace("Widget", "Gizmos")
+                with open(consumer, "w") as output:
+                    output.write(caller)
             _, built = side.cargo("build", "-p", "app")
             _, ready = wait_warm(side, ws)
             status = side.cargo("status")[1].stdout
@@ -1420,6 +1430,11 @@ def self_test():
     check("PM repeated removal is safe", macro_private_environment(private_env, "private-removed") == {} and macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
     check("PM private source edits share the reload policy", all(macro_mutation_step(step) for step in ("private-removed", "private-raw")) and not macro_mutation_step("unchanged-content"))
     check("PM private source edits pass with a new image and reload", all(valid_macro_mutation(step, True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1) for step in ("private-removed", "private-raw")))
+    check("PM consumer-only removal clears the request and is no macro edit",
+          macro_private_environment(private_env, "consumer-removed") == {} and "PR15_PRIVATE" not in private_env
+          and not macro_mutation_step("consumer-removed")
+          and valid_macro_mutation("consumer-removed", True, False, "a", "b", {"a": "image"}, {"a": "image"}, 1, 1)
+          and not valid_macro_mutation("consumer-removed", True, False, "a", "b", {"a": "image"}, {"a": "image"}, 1, 2))
     check("PM environment step must edit and reload", not valid_macro_mutation("private-removed", True, True, "a", "b", {"a": "image"}, {"b": "image"}, 1, 1))
     check("PM unchanged control cannot hide a reload", not valid_macro_mutation("unchanged-content", True, True, "a", "a", {"a": "image"}, {"a": "image"}, 1, 2))
     check("nonready workers fail", not valid_worker_generation(ready_status, ["loading"], ["1", "2"], ["1", "2"], 3, 2))

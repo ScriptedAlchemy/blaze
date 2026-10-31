@@ -2941,6 +2941,27 @@ impl Checkouts {
         base.chain(inputs::server_env(&process::native())).collect()
     }
 
+    /// Has the expanders of the database expand with the variables of the request this
+    /// thread serves ([`Self::macro_env`]) when the servers have others: an edit of a macro's
+    /// caller alone makes nothing stale, and its new expansion must not read the variables of
+    /// the request before it. Every library is loaded again, into servers that have this
+    /// request's, and the database is given those expanders. `false` when they had them.
+    fn refresh_macro_env(
+        &mut self,
+        db: &mut RootDatabase,
+        vfs: &mut vfs::Vfs,
+    ) -> anyhow::Result<bool> {
+        if !self.loaded.set_proc_macro_env(self.macro_env()) || self.loaded.workspaces().is_empty()
+        {
+            return Ok(false);
+        }
+        eprintln!("macros: the request's variables differ from the servers', loading them again");
+        self.refresh_macro_image_identities();
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        self.collect_macro_generations();
+        Ok(true)
+    }
+
     fn collect_macro_generations(&self) {
         for generation in self.macro_generations.values() {
             match generation.collect() {
@@ -9550,6 +9571,32 @@ fn run_holding(
                             }
                             listed.touch(&db, Some(&reading));
                             lock(&as_built).clear();
+                        }
+                        // A macro reads its server's variables as it reads rustc's: servers
+                        // started for another request are replaced, with what this one has,
+                        // though nothing of the checkout is stale.
+                        let read_from = SystemTime::now();
+                        let before = CratesAsLoaded::of(&db);
+                        match checkouts.refresh_macro_env(&mut db, tree.vfs()) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                                let new = before.changed(&db);
+                                hydrate_includes(&mut db, &mut tree, &mut files, |db| {
+                                    resolve_names(db, &new)
+                                });
+                                for program in &mut programs {
+                                    program.known.touch(&db, None);
+                                    program.unbuilt.stale = true;
+                                }
+                                listed.touch(&db, None);
+                                lock(&as_built).clear();
+                            }
+                            Err(error) => {
+                                let _ =
+                                    writeln!(&stream, "{}", failed_reply(&format!("{error:#}")));
+                                continue;
+                            }
                         }
                     }
                     // Read native inputs with the admitted request's environment too.

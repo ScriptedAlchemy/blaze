@@ -327,6 +327,43 @@ fn a_generation_starts_with_the_environment_of_its_load() {
     drop((first, second, third));
 }
 
+/// Sol's consumer-only case at the client: PR15_PRIVATE set, a load; then removed and only a
+/// caller of the macro edited, so no library changes. The daemon loads the same library again
+/// for the new environment, and what that load returns is served by a server without it.
+#[test]
+fn an_unchanged_library_loaded_for_another_environment_is_served_with_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = stdx::tempfile::NamedTempDir::new("generation-consumer-env-test").unwrap();
+    let script = dir.path().join("server");
+    let seen = dir.path().join("seen");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"${{PR15_PRIVATE-absent}}\" >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*ApiVersionCheck*) echo '{{\"ApiVersionCheck\":0}}';;\n*ListMacros*) echo '{{\"ListMacros\":{{\"Ok\":[[\"Private\",\"CustomDerive\"]]}}}}';;\nesac\ndone\n",
+        seen.display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = paths::AbsPathBuf::assert_utf8(script);
+    let library = paths::AbsPathBuf::assert_utf8(dir.path().join("library"));
+    std::fs::write(&library, b"the macro, never edited").unwrap();
+    let given = [("PR15_PRIVATE", Some("old-private-value".to_owned()))];
+    let client = loop {
+        match ProcMacroClient::spawn(&server, given.iter().map(|(k, v)| (k, v)), None, 1) {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            spawned => break spawned.unwrap(),
+        }
+    };
+    let last = || std::fs::read_to_string(&seen).unwrap().lines().last().unwrap().to_owned();
+    let before = client.load_dylib(MacroDylib::new(library.clone())).unwrap();
+    assert_eq!(last(), "old-private-value");
+    client.set_generation_env([("PR15_PRIVATE", &None::<String>)]);
+    let after = client.load_dylib(MacroDylib::new(library.clone())).unwrap();
+    assert!(!Arc::ptr_eq(&after[0].pool, &before[0].pool), "a new server serves the new load");
+    assert_eq!(after[0], before[0], "the same macro, so only its server differs");
+    assert_eq!(last(), "absent");
+    drop((before, after));
+}
+
 #[test]
 fn distinct_paths_share_epoch_reload_retains_consumers_and_reports_crash() {
     use std::os::unix::fs::PermissionsExt;
