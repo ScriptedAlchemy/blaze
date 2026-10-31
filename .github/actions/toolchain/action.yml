@@ -102,7 +102,10 @@ runs:
     - if: steps.nix-restore.outputs.cache-hit == 'true'
       shell: bash
       run: |
-        xargs nix copy --no-check-sigs --from "file://$HOME/.cache/toolchain-nix" < ~/.cache/toolchain-nix/paths
+        # The cache holds only the paths no substituter has, not their closures. Realise the
+        # references from the configured substituters and these unsigned paths from our cache.
+        xargs nix-store --realise --option extra-substituters "file://$HOME/.cache/toolchain-nix" \
+          --option require-sigs false < ~/.cache/toolchain-nix/paths
         rm -rf ~/.cache/toolchain-nix
     - name: LLVM 20 (Nix)
       if: runner.os != 'Windows' && inputs.llvm != 'none'
@@ -112,6 +115,8 @@ runs:
         echo "$(nix build --no-link --print-out-paths .#llvm)/bin" >> "$GITHUB_PATH"
     # The shell's paths that no configured substituter has, which is what the step above built.
     - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+      id: nix-export
+      continue-on-error: true
       shell: bash
       run: |
         export SUBSTITUTERS=$(nix config show substituters)
@@ -122,16 +127,32 @@ runs:
           done
           echo "$1"' sh > "$RUNNER_TEMP/toolchain-nix-paths"
         echo "$(wc -l < "$RUNNER_TEMP/toolchain-nix-paths") paths to cache"
+        if [ ! -s "$RUNNER_TEMP/toolchain-nix-paths" ]; then exit 0; fi
+        # The shell profile keeps its runtime closure alive; downloaded compiler archives and
+        # other build-only inputs can go before we stage another copy of the toolchains.
+        nix store gc
+        df -h "$HOME" "$GITHUB_WORKSPACE"
+        # Budget for both the staged NARs and the Actions archive, plus 1 GiB for the runner.
+        size=$(xargs du -sk < "$RUNNER_TEMP/toolchain-nix-paths" | awk '{n += $1} END {print n+0}')
+        free=$(df -Pk "$HOME" | awk 'END {print $4}')
+        if [ "$free" -lt "$((2 * size + 1048576))" ]; then
+          echo "::warning::Skipping Nix cache export: ${size} KiB of paths, ${free} KiB free"
+          exit 0
+        fi
         mkdir -p ~/.cache/toolchain-nix
-        xargs nix copy --to "file://$HOME/.cache/toolchain-nix?compression=none" < "$RUNNER_TEMP/toolchain-nix-paths"
+        # Without --no-recursive, nix copy adds the substitutable references back (LLVM, GCC,
+        # etc.): PR32 staged 5 GiB uncompressed and filled the disk making the Actions archive.
+        xargs nix copy --no-recursive --to "file://$HOME/.cache/toolchain-nix?compression=zstd" < "$RUNNER_TEMP/toolchain-nix-paths"
         mv "$RUNNER_TEMP/toolchain-nix-paths" ~/.cache/toolchain-nix/paths
         du -sh ~/.cache/toolchain-nix
-    - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+    - if: steps.nix-export.outputs.ready == 'true'
+      continue-on-error: true
       uses: actions/cache/save@v6
       with:
         path: ~/.cache/toolchain-nix
         key: ${{ steps.nix-key.outputs.key }}
-    - if: steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
+    - if: always() && steps.nix-key.outputs.key && steps.nix-restore.outputs.cache-hit != 'true' && inputs.cache-save == 'true'
       shell: bash
       run: rm -rf ~/.cache/toolchain-nix
 

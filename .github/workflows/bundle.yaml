@@ -120,9 +120,17 @@ jobs:
       # Even when the run is cancelled (a newer push to the pull request): what sccache holds
       # by then is as valid as a whole build's, and without it every run after a cancelled one
       # starts cold. On PR #32 a push cancelled the build after 29 minutes and nothing was kept.
+      - name: Free build products before archiving sccache
+        if: ${{ always() && inputs.cache-write }}
+        run: |
+          du -sh target vendor/proc-macro-srv/target "$RUNNER_TEMP/owned-runtime" "$RUNNER_TEMP/bundle-out" ~/.cache/toolchain-sccache || true
+          # Consumers use the uploaded bundle; the bootstrap evidence has been uploaded too.
+          rm -rf target vendor/proc-macro-srv/target "$RUNNER_TEMP/owned-runtime" "$RUNNER_TEMP/bundle-out"
+          df -h "$GITHUB_WORKSPACE"
       - if: ${{ always() && inputs.cache-write }}
         uses: ./.github/actions/toolchain/save
         with:
+          rustc-wrapper: ${{ steps.toolchain.outputs.rustc-wrapper }}
           key: ${{ steps.toolchain.outputs.sccache-key }}
           scope: ${{ steps.toolchain.outputs.sccache-scope }}
           hit: ${{ steps.toolchain.outputs.sccache-hit }}

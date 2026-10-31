@@ -5,6 +5,9 @@
 name: toolchain-save
 description: save sccache's directory and drop this ref's older entries
 inputs:
+  rustc-wrapper:
+    description: the toolchain action's rustc-wrapper output (empty if setup did not complete)
+    default: ""
   key:
     description: the toolchain action's sccache-key output
     required: true
@@ -21,17 +24,28 @@ runs:
   using: composite
   steps:
     - if: always() && inputs.hit != 'true'
+      id: prepare
       shell: bash
+      env:
+        WRAPPER: ${{ inputs.rustc-wrapper }}
+        KEY: ${{ inputs.key }}
+        SCOPE: ${{ inputs.scope }}
       run: |
-        "$SCCACHE_PATH" --show-stats
-        "$SCCACHE_PATH" --stop-server > /dev/null || true
-        du -sh ~/.cache/toolchain-sccache || true
-    - if: always() && inputs.hit != 'true'
+        if [ -z "$KEY" ] || [ -z "$SCOPE" ] || [ ! -x "$WRAPPER" ] || [ ! -d ~/.cache/toolchain-sccache ]; then
+          echo "No sccache directory ready to save (toolchain setup may have been skipped)"
+          exit 0
+        fi
+        "$WRAPPER" --show-stats || true
+        "$WRAPPER" --stop-server > /dev/null || true
+        du -sh ~/.cache/toolchain-sccache
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+    - if: always() && steps.prepare.outputs.ready == 'true'
+      id: save
       uses: actions/cache/save@v6
       with:
         path: ~/.cache/toolchain-sccache
         key: ${{ inputs.key }}
-    - if: always() && inputs.hit != 'true'
+    - if: always() && steps.prepare.outputs.ready == 'true' && steps.save.outcome == 'success'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
