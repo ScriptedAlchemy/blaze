@@ -62,8 +62,6 @@ print("Captured branch leases: " + json.dumps(expected), flush=True)
 run("git", "config", "user.name", "Zack Jackson")
 run("git", "config", "user.email", "25274700+ScriptedAlchemy@users.noreply.github.com")
 
-# The newly added private-removed row removes the key; the following private-raw
-# row used to remove it again without a default and fail before running a build.
 c4 = worktree("blaze-repair-c4", expected["dist/c4-keys"])
 fixture = c4 / "harness/dist/crossmachine.py"
 source = fixture.read_text()
@@ -101,12 +99,36 @@ require(source.count(old) == 1 and "def macro_private_environment(" not in sourc
 source = source.replace(old, "                private = macro_private_environment(env, step)")
 require(source.count("def macro_content_report(") == 1, "macro witness entry changed")
 source = source.replace("def macro_content_report(", helper + "def macro_content_report(")
+# The runtime row and its content check previously disagreed: private-* edits
+# had to reload under one predicate but had to keep the reload count under the other.
+old_local = '            mutation = step in ("same-size-restored-mtime", "dependency-restored-mtime") or step.startswith("reload-")'
+require(source.count(old_local) == 1, "runtime mutation predicate changed; inspect it")
+for step in ("private-removed", "private-raw"):
+    scope = {"step": step}
+    exec(old_local.strip(), scope)
+    require(scope["mutation"] is False, "original reload contradiction did not reproduce")
+print("Reproduced: private source edits were incorrectly required not to reload", flush=True)
+source = source.replace(old_local, "            mutation = macro_mutation_step(step)")
+old_check = '''    mutation = (step in ("same-size-restored-mtime", "dependency-restored-mtime")
+                or step.startswith(("reload-", "private-")))'''
+require(source.count(old_check) == 1, "content mutation predicate changed; inspect it")
+source = source.replace(old_check, "    mutation = macro_mutation_step(step)")
+predicate = '''def macro_mutation_step(step):
+    return (step in ("same-size-restored-mtime", "dependency-restored-mtime")
+            or step.startswith(("reload-", "private-")))
+
+
+'''
+require(source.count("def valid_macro_mutation(") == 1, "macro content validation changed")
+source = source.replace("def valid_macro_mutation(", predicate + "def valid_macro_mutation(")
 marker = '    check("PM environment step must edit and reload",'
 require(source.count(marker) == 1, "macro witness self-test changed")
 tests = r'''    private_env = {"PR15_PRIVATE": "old", "KEEP": "kept"}
     check("PM private removal clears the request", macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
     check("PM raw value after removal is preserved", macro_private_environment(private_env, "private-raw") == {"PR15_PRIVATE": "raw-\udcff-value"} and private_env == {"KEEP": "kept", "PR15_PRIVATE": "raw-\udcff-value"})
     check("PM repeated removal is safe", macro_private_environment(private_env, "private-removed") == {} and macro_private_environment(private_env, "private-removed") == {} and private_env == {"KEEP": "kept"})
+    check("PM private source edits share the reload policy", all(macro_mutation_step(step) for step in ("private-removed", "private-raw")) and not macro_mutation_step("unchanged-content"))
+    check("PM private source edits pass with a new image and reload", all(valid_macro_mutation(step, True, True, "a", "b", {"a": "image"}, {"b": "image"}, 0, 1) for step in ("private-removed", "private-raw")))
 '''
 source = source.replace(marker, tests + marker)
 ast.parse(source)
@@ -114,11 +136,9 @@ fixture.write_text(source)
 run(sys.executable, "-I", "-B", "harness/dist/crossmachine.py", "--self-test", cwd=c4)
 run("git", "add", "harness/dist/crossmachine.py", cwd=c4)
 run("git", "diff", "--cached", "--check", cwd=c4)
-run("git", "commit", "-m", "Fix consecutive private environment transitions in the macro witness", "-m", "The private-removed row leaves PR15_PRIVATE absent. The following private-raw row must not pop the missing key without a default. Exercise removal, raw-byte restoration and repeated removal through the same helper the runtime witness uses.", cwd=c4)
+run("git", "commit", "-m", "Fix private macro environment transitions and contradictory reload checks", "-m", "Keep repeated removals safe and use one mutation predicate for both runtime reload admission and content validation. The private-* rows must reload after their source edits, not simultaneously retain and advance the reload count. Regressions cover removals, raw-byte restoration, real reloads and unchanged controls.", cwd=c4)
 c4_sha = git("rev-parse", "HEAD", cwd=c4)
 
-# Current C2 already contains the concurrent strict toolchain resolution and
-# child::feed changes. Never replace those with the older conflict resolution.
 c2 = worktree("blaze-repair-c2", expected["dist/c2-buildspec"])
 run("git", "merge", "--no-ff", "-m", "Merge current C4 producer fixes into saved BuildSpec execution", c4_sha, cwd=c2)
 implementation = c2 / "crates/ra-jit/src/cargo/own_script.rs"
@@ -128,7 +148,6 @@ require(digest(policy_function(before)) == OLD_POLICY,
 require("crate::child::feed(child, private)" in before, "concurrent producer diagnostics missing")
 patch = (ROOT / ".github/repair/producer-policy.patch").read_text()
 require(patch.count("diff --git ") == 1, "unexpected patch files")
-# Drop the obsolete diagnostic hunks; child::feed already implements that fix.
 policy = patch[:patch.index("@@")] + patch[patch.index("@@ -320,"):]
 policy_patch = TEMP / "producer-policy-only.patch"
 policy_patch.write_text(policy)
@@ -137,8 +156,8 @@ after = implementation.read_text()
 require(digest(policy_function(after)) == FIXED_POLICY, "producer policy differs from the reviewed function")
 require("crate::child::feed(child, private)" in after, "producer diagnostics were overwritten")
 
-# Execute the exact production command builder and its new test independently
-# of the large compiler dependency graph. The full crate is tested separately.
+# Test the actual production command builder without the large compiler dependency
+# graph first. The following validation job compiles and tests the whole CLI.
 test_start = after.index("    #[test]\n    fn saved_producer_command_keeps_the_captured_compiler_policy()")
 test_end = after.index("    #[test]\n    fn a_variable_read_as_rustc_would_read_it()", test_start)
 regression = after[test_start:test_end]
@@ -168,7 +187,7 @@ run("git", "diff", "--cached", "--check", cwd=c2)
 run("cargo", "+1.99.0", "fmt", "-p", "ra-jit", "--", "--check", cwd=c2)
 run(sys.executable, "-I", "-B", "harness/dist/test_saved_spec.py", cwd=c2)
 run(sys.executable, "-I", "-B", "harness/norustc_test.py", cwd=c2)
-run("git", "commit", "-m", "Honor saved compiler policy when launching owned producers", "-m", "Use the explicit replay environment for backend, lowering and memory policy instead of restoring ambient RA_JIT settings. Remove BLAZE aliases before child startup and retain replay admission. The extracted production command-builder regression fails before and passes after for both backends. Preserve concurrent child::feed and strict toolchain-resolution fixes.", cwd=c2)
+run("git", "commit", "-m", "Honor saved compiler policy when launching owned producers", "-m", "Use the explicit replay environment for backend, lowering and memory policy instead of restoring ambient RA_JIT settings. Remove BLAZE aliases before child startup and retain replay admission. The extracted production Rust command-builder regression fails before and passes after for both backends. Preserve concurrent child::feed and strict toolchain-resolution fixes.", cwd=c2)
 c2_sha = git("rev-parse", "HEAD", cwd=c2)
 ci = worktree("blaze-repair-ci", expected["ci-redesign"])
 run("git", "merge", "--no-ff", "-m", "Merge repaired BuildSpec execution and current C4 into CI redesign", c2_sha, cwd=ci)
@@ -179,7 +198,7 @@ run_id = os.environ["GITHUB_RUN_ID"]
 heads = {"c4": (c4, c4_sha), "c2": (c2, c2_sha), "ci": (ci, ci_sha)}
 staged = {name: {"sha": sha, "tree": git("rev-parse", "HEAD^{tree}", cwd=path), "staging_ref": f"repair/staged-{name}-{run_id}"} for name, (path, sha) in heads.items()}
 run("git", "push", "--atomic", "origin", *[f"{data['sha']}:refs/heads/{data['staging_ref']}" for data in staged.values()])
-receipt = {"expected": expected, **staged, "checks": ["all integration merges clean", "reviewed producer function SHA256 before and after", "original macro transition failure reproduced", "macro witness self-tests including repeated transitions", "extracted production Rust command-builder test fails before and passes after", "rustfmt and cargo fmt", "saved-spec Python tests", "execution-audit Python tests", "CI compiler source equality"], "rust_full_suite": "separate validation job; not yet claimed passing", "pr_refs_updated": False}
+receipt = {"expected": expected, **staged, "checks": ["all integration merges clean", "reviewed producer function SHA256 before and after", "both original macro witness bugs reproduced", "macro witness self-tests with five regressions", "extracted production Rust command-builder test fails before and passes after", "rustfmt and cargo fmt", "saved-spec Python tests", "execution-audit Python tests", "CI compiler source equality"], "rust_full_suite": "separate validation job; not yet claimed passing", "pr_refs_updated": False}
 (TEMP / "blaze-repair-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
 print(json.dumps(receipt, indent=2), flush=True)
 with open(os.environ["GITHUB_OUTPUT"], "a") as output:
