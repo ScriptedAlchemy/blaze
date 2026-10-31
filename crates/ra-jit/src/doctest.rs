@@ -154,6 +154,18 @@ fn documented_root(project: &serde_json::Value) -> anyhow::Result<&serde_json::V
 
 /// Run examples from a validated compiler description. This path never invokes
 /// Cargo, rustc or rustdoc, including on invalid examples or compilation failures.
+/// The directory a saved run's doctests are named from, as cargo names them: cargo runs
+/// rustdoc in the workspace root and gives it the file's path from there (`a/src/lib.rs - item
+/// (line 1)` for a member `a`), and the examples themselves run in the package's directory
+/// (`--test-run-directory`). The description names the workspace root as the source naming
+/// root; one without it names from the package's directory, `run_in`.
+fn named_from(project: &serde_json::Value, run_in: &Path) -> anyhow::Result<PathBuf> {
+    Ok(match crate::compiler_json::source_root(project)? {
+        Some(root) => root.into(),
+        None => run_in.to_owned(),
+    })
+}
+
 pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
     let json = crate::compiler_json::read(project)?;
     let bytes: Vec<u8> = serde_json::from_value(json["blaze_spec_doctest"].clone())?;
@@ -163,6 +175,7 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
     let source = PathBuf::from(root["root_module"].as_str().context("no documented source")?);
     let manifest = Path::new(root["build"]["build_file"].as_str().context("no doctest manifest")?);
     let run_in = manifest.parent().context("no doctest package")?.to_owned();
+    let cwd = named_from(&json, &run_in)?;
     let env = match crate::cargo::spec::runtime_environment(&json)? {
         Some(env) => env,
         None => {
@@ -186,7 +199,7 @@ pub(crate) fn saved(project: &Path, crate_name: &str) -> anyhow::Result<i32> {
         crate_name: crate_name.to_owned(),
         source,
         edition: root["edition"].as_str().context("no doctest edition")?.to_owned(),
-        cwd: run_in.clone(),
+        cwd,
         run_in,
         env: env.into_iter().collect(),
         rustc_args: Vec::new(),
@@ -719,6 +732,34 @@ mod recording_tests {
         },
         process::Native,
     };
+
+    /// `workspace-doctests` in saved_spec.py: a member's doctest is `a/src/lib.rs - saved_a
+    /// (line 1)` under cargo, named from the workspace root rustdoc runs in, not the package.
+    #[test]
+    fn saved_doctests_are_named_from_the_workspace_root() {
+        let mut project = serde_json::json!({"compiler_mode":true,
+            "blaze_compiler_source_root":{"version":1,"path":"/workspace","unit":0},
+            "crates":[{"display_name":"saved_a","blaze_native_unit":0,"is_workspace_member":true}]});
+        let run_in = Path::new("/workspace/a");
+        let asked = Asked {
+            admission: None,
+            crate_name: "saved_a".into(),
+            source: "/workspace/a/src/lib.rs".into(),
+            edition: "2021".into(),
+            cwd: named_from(&project, run_in).unwrap(),
+            run_in: run_in.to_owned(),
+            env: Vec::new(),
+            rustc_args: Vec::new(),
+            target: None,
+            features: Vec::new(),
+            build: None,
+            wanted: Wanted::default(),
+            dir: "/scratch".into(),
+        };
+        assert_eq!(asked.shown(Path::new("/workspace/a/src/lib.rs")), "a/src/lib.rs");
+        project.as_object_mut().unwrap().remove("blaze_compiler_source_root");
+        assert_eq!(named_from(&project, run_in).unwrap(), run_in);
+    }
 
     #[test]
     fn documented_root_uses_explicit_unit_not_first_workspace_member() {
