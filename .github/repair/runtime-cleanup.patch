@@ -1,0 +1,243 @@
+diff --git a/harness/dist/buildspec.py b/harness/dist/buildspec.py
+index 5a8174fe..d75f48e6 100755
+--- a/harness/dist/buildspec.py
++++ b/harness/dist/buildspec.py
+@@ -1496,7 +1496,9 @@ def scan_programs(target):
+ def saved_programs(results):
+     found = collections.Counter()
+     for result in results:
+-        for artifact in json.load(open(result))["artifacts"]:
++        with open(result) as source:
++            artifacts = json.load(source)["artifacts"]
++        for artifact in artifacts:
+             if not artifact.get("executable"):
+                 continue
+             if not os.path.isfile(artifact["executable"]):
+@@ -1835,19 +1837,39 @@ class Ctx:
+         offset = self.audit_offset()
+         saved = len(args) == 4 and args[:3] == ["cargo", "spec", "--run"]
+         outputs = args[3] + ".outputs" if saved else None
+-        before = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) if outputs else set()
++        def replays():
++            return {path for path in glob.glob(os.path.join(glob.escape(outputs), "replay-*"))
++                    if os.path.isdir(path) and not os.path.islink(path)} if outputs else set()
++        before = replays()
+         run = self.blaze.run(args, copy_root, env, merge=True)
+         if self.audit and not run.watchdog:
+             norustc.settle(self.audit[0], limit=60)
+         self.blaze.stop(home, copy_root, env)
+         dispatched = count_dispatched(self.audit, offset)
+-        summary = summarize(run.out, target, run.code)
+-        if outputs:
+-            results = set(glob.glob(os.path.join(outputs, "replay-*", "result.json"))) - before
+-            if run.code == 0 and not results:
+-                raise HarnessError("saved replay succeeded without a completed result")
+-            summary["programs"] = saved_programs(sorted(results))
+-        return summary, run, dispatched
++        try:
++            summary = summarize(run.out, target, run.code)
++            if outputs:
++                results = [os.path.join(path, "result.json") for path in replays() - before
++                           if os.path.isfile(os.path.join(path, "result.json"))]
++                if run.code == 0 and not results:
++                    raise HarnessError("saved replay succeeded without a completed result")
++                summary["programs"] = saved_programs(sorted(results))
++            return summary, run, dispatched
++        finally:
++            # Saved replay ignores CARGO_TARGET_DIR: its (large) artifacts live beside the
++            # CBOR, not under `local`. Once inspected and stopped, release only this run's
++            # directories, including incomplete failures. Keep the saved inputs for the
++            # later foreign-checkout replay, and small result manifests with the evidence.
++            if outputs and not self.args.keep:
++                for path in sorted(replays() - before):
++                    result = os.path.join(path, "result.json")
++                    if os.path.isfile(result):
++                        report_dir = os.path.dirname(os.path.abspath(self.args.json)) if self.args.json else self.work
++                        evidence = os.path.join(report_dir, "replay-results")
++                        os.makedirs(evidence, exist_ok=True)
++                        name = os.path.basename(args[3]) + "-" + os.path.basename(path) + ".json"
++                        shutil.copyfile(result, os.path.join(evidence, name))
++                    shutil.rmtree(path)
+ 
+     def run_local(self, case):
+         res = self.results[case.full]
+@@ -3316,6 +3338,10 @@ def environment(**kw):
+ 
+ def self_test(args):
+     t = SelfTest()
++    cleanup = subprocess.run([sys.executable, "-I", os.path.join(HERE, "test_buildspec_cleanup.py")],
++                             capture_output=True, text=True)
++    t.check(cleanup.returncode == 0, "saved replay scratch is released only after inspection",
++            cleanup.stdout + cleanup.stderr)
+     self_test_spec_reading(t)
+     self_test_units(t)
+     self_test_parsing(t)
+diff --git a/harness/dist/test_buildspec_cleanup.py b/harness/dist/test_buildspec_cleanup.py
+new file mode 100644
+index 00000000..efd8d746
+--- /dev/null
++++ b/harness/dist/test_buildspec_cleanup.py
+@@ -0,0 +1,163 @@
++"""Lifecycle regressions for C2's per-run replay scratch directories."""
++import json
++from pathlib import Path
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from buildspec import Ctx, HarnessError, Run
++
++
++class ReplayCleanupTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.spec = self.root / "fixture[1].cbor"
++        self.spec.write_bytes(b"saved spec")
++        self.inputs = Path(str(self.spec) + ".inputs")
++        self.inputs.mkdir()
++        (self.inputs / "source.rs").write_text("fn main() {}\n")
++        self.outputs = Path(str(self.spec) + ".outputs")
++        self.outputs.mkdir()
++        self.old = self.outputs / "replay-existing"
++        self.old.mkdir()
++        (self.old / "do-not-remove").write_text("existing output")
++        self.created = []
++        self.stops = []
++        self.ctx = Ctx.__new__(Ctx)
++        self.ctx.work = str(self.root)
++        self.ctx.args = SimpleNamespace(keep=False, json=None)
++        self.ctx.cargo_home = str(self.root / "cargo-home")
++        self.ctx.audit = None
++        self.ctx.owned_server = None
++        self.ctx.blaze = SimpleNamespace(
++            new_home=lambda: str(self.root / "home"),
++            env=lambda base, **kwargs: base,
++            run=self.run_product,
++            stop=self.stop_product,
++        )
++        self.status = 0
++        self.publish = True
++        self.missing_program = False
++
++    def run_product(self, args, cwd, env, merge):
++        # An incomplete replay still leaves scratch output when a command fails.
++        directory = self.outputs / f"replay-new-{len(self.created)}"
++        directory.mkdir()
++        self.created.append(directory)
++        artifact = directory / "program"
++        if not self.missing_program:
++            artifact.write_bytes(b"compiled program")
++        (directory / "compiled.std.a").write_bytes(b"compiled standard library")
++        if self.publish:
++            (directory / "result.json").write_text(json.dumps({"artifacts": [{
++                "executable": str(artifact), "test": False,
++                "target_kind": 1, "target": "fixture",
++            }]}))
++        return Run(args, self.status, "@@result\n", "", 0.01)
++
++    def stop_product(self, home, cwd, env):
++        # Inspection/cleanup must not race a live producer.
++        self.assertTrue(self.created[-1].is_dir())
++        self.stops.append(home)
++        return Run([], 0, "", "", 0.0)
++
++    def receipt(self):
++        root = Path(self.ctx.args.json).resolve().parent if self.ctx.args.json else self.root
++        return root / "replay-results" / (self.spec.name + "-" + self.created[-1].name + ".json")
++
++    def execute(self):
++        return self.ctx.local_run(None, ["cargo", "spec", "--run", str(self.spec)],
++                                  (str(self.root), str(self.root / "local")), {}, "test", None)
++
++    def assert_preserved(self):
++        self.assertEqual(self.spec.read_bytes(), b"saved spec")
++        self.assertEqual((self.inputs / "source.rs").read_text(), "fn main() {}\n")
++        self.assertEqual((self.old / "do-not-remove").read_text(), "existing output")
++
++    def test_releases_each_replay_after_inspection_not_at_suite_exit(self):
++        for _ in range(3):
++            summary, run, _ = self.execute()
++            self.assertEqual(summary["programs"], ["bin:fixture"])
++            self.assertEqual(run.code, 0)
++            self.assertFalse(self.created[-1].exists())
++            receipt = self.receipt()
++            self.assertEqual(json.loads(receipt.read_text())["artifacts"][0]["target"], "fixture")
++        self.assertEqual(len(self.stops), 3)
++        self.assert_preserved()
++
++    def test_json_report_keeps_receipts_with_uploaded_evidence(self):
++        self.ctx.args.json = str(self.root / "evidence" / "local.json")
++        self.execute()
++        self.assertTrue(self.receipt().is_file())
++        self.assertFalse(self.created[-1].exists())
++        self.assert_preserved()
++
++    def test_keep_retains_the_complete_replay(self):
++        self.ctx.args.keep = True
++        self.execute()
++        self.assertTrue((self.created[-1] / "compiled.std.a").is_file())
++        self.assertTrue((self.created[-1] / "result.json").is_file())
++        self.assert_preserved()
++
++    def test_expected_nonzero_test_result_still_releases_its_artifacts(self):
++        self.status = 101
++        summary, run, _ = self.execute()
++        self.assertEqual(summary["exit"], 101)
++        self.assertEqual(run.code, 101)
++        self.assertFalse(self.created[-1].exists())
++        self.assertTrue(self.receipt().is_file())
++        self.assert_preserved()
++
++    def test_partial_failed_replay_is_released_without_a_result_manifest(self):
++        self.status, self.publish = 1, False
++        summary, run, _ = self.execute()
++        self.assertEqual(run.code, 1)
++        self.assertEqual(summary["programs"], [])
++        self.assertFalse(self.created[-1].exists())
++        self.assert_preserved()
++
++    def test_new_symlink_is_not_followed_or_removed(self):
++        target = self.root / "outside"
++        target.mkdir()
++        (target / "do-not-remove").write_text("not replay scratch")
++        original = self.ctx.blaze.run
++        def run(*args, **kwargs):
++            result = original(*args, **kwargs)
++            (self.outputs / "replay-link").symlink_to(target, target_is_directory=True)
++            return result
++        self.ctx.blaze.run = run
++        self.execute()
++        self.assertTrue((self.outputs / "replay-link").is_symlink())
++        self.assertEqual((target / "do-not-remove").read_text(), "not replay scratch")
++        self.assertFalse(self.created[-1].exists())
++        self.assert_preserved()
++
++    def test_keep_retains_partial_failure_too(self):
++        self.ctx.args.keep = True
++        self.status, self.publish = 1, False
++        self.execute()
++        self.assertTrue((self.created[-1] / "compiled.std.a").is_file())
++        self.assert_preserved()
++
++    def test_missing_result_still_fails_before_cleanup(self):
++        self.publish = False
++        with self.assertRaisesRegex(HarnessError, "without a completed result"):
++            self.execute()
++        self.assertFalse(self.created[-1].exists())
++        self.assert_preserved()
++
++    def test_missing_executable_still_fails_before_cleanup(self):
++        self.missing_program = True
++        with self.assertRaisesRegex(HarnessError, "missing executable"):
++            self.execute()
++        self.assertFalse(self.created[-1].exists())
++        self.assertTrue(self.receipt().is_file())
++        self.assert_preserved()
++
++
++if __name__ == "__main__":
++    unittest.main()
