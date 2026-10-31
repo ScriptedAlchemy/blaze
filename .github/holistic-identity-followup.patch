@@ -1,0 +1,66 @@
+diff --git a/crates/ra-jit/build.rs b/crates/ra-jit/build.rs
+--- a/crates/ra-jit/build.rs
++++ b/crates/ra-jit/build.rs
+@@ -67,8 +67,12 @@
+         field(name.as_bytes());
+         field(&bytes);
+     }
+-    let mut features: Vec<String> =
+-        std::env::vars().map(|it| it.0).filter(|it| it.starts_with("CARGO_FEATURE_")).collect();
++    // An unrelated native environment value need not be Unicode. Feature names
++    // are Cargo's ASCII names; inspecting them must not decode every value.
++    let mut features: Vec<String> = std::env::vars_os()
++        .filter_map(|(name, _)| name.into_string().ok())
++        .filter(|name| name.starts_with("CARGO_FEATURE_"))
++        .collect();
+     features.sort();
+     field(features.join(" ").as_bytes());
+     field(std::env::var("TARGET").unwrap_or_default().as_bytes());
+@@ -92,10 +96,15 @@
+     for entry in std::fs::read_dir(dir)? {
+         let entry = entry?;
+         let name = entry.file_name();
++        // A worktree/submodule uses a .git file rather than a directory. Neither
++        // spelling is source or should key an otherwise identical compiler.
++        if name == ".git" {
++            continue;
++        }
+         let path = entry.path();
+         let kind = std::fs::metadata(&path)?;
+         if kind.is_dir() {
+-            if name != "target" && name != "node_modules" && name != ".git" {
++            if name != "target" && name != "node_modules" {
+                 listed(&path, files, ancestors)?;
+             }
+         } else if kind.is_file() {
+diff --git a/harness/source_identity_test.py b/harness/source_identity_test.py
+--- a/harness/source_identity_test.py
++++ b/harness/source_identity_test.py
+@@ -59,6 +59,27 @@
+         self.assertNotEqual(before, self.identity(CARGO_FEATURE_LLVM="1"))
+         self.assertNotEqual(before, self.identity(TARGET="another-target"))
+         self.assertNotEqual(before, self.identity(CARGO_CFG_DEBUG_ASSERTIONS=""))
++
++    @unittest.skipUnless(os.name == "posix", "Unix native environment fixture")
++    def test_unrelated_non_unicode_environment_is_not_decoded(self):
++        before = self.identity()
++        self.assertEqual(before, self.identity(UNRELATED_NATIVE_VALUE=os.fsdecode(b"\xff")))
++
++    def test_git_metadata_file_is_not_compiler_source(self):
++        before = self.identity()
++        (self.root / "vendor/example/.git").write_text("gitdir: /machine/one\n")
++        self.assertEqual(before, self.identity())
++        (self.root / "vendor/example/.git").write_text("gitdir: /machine/two\n")
++        self.assertEqual(before, self.identity())
++
++    @unittest.skipUnless(os.name == "posix", "Unix source alias fixture")
++    def test_file_symlink_referent_contents_are_hashed(self):
++        external = self.root.parent / "external.rs"
++        external.write_text("1")
++        (self.root / "vendor/alias.rs").symlink_to(external)
++        before = self.identity()
++        external.write_text("2")
++        self.assertNotEqual(before, self.identity())
+ 
+     def test_generated_output_directories_do_not_invalidate_identity(self):
+         before = self.identity()
