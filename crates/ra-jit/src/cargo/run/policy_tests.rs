@@ -34,7 +34,10 @@ fn crashes_never_become_flaky_successes_or_partial_cached_passes() {
         let work = tempfile::tempdir().unwrap();
         let root = work.path();
         let script = root.join("test.sh");
-        std::fs::write(&script, format!(r#"
+        std::fs::write(
+            &script,
+            format!(
+                r#"
 if [ -f attempted ]; then
     printf '\ntest flaky ... ok\n\ntest result: ok. 1 passed; 0 failed\n'
     exit 0
@@ -42,16 +45,25 @@ fi
 printf yes >attempted
 printf '\nfailures:\n    flaky\n\ntest result: FAILED. 1 passed; 1 failed\n'
 {ending}
-"#)).unwrap();
+"#
+            ),
+        )
+        .unwrap();
         std::fs::write(root.join("tests-reach"), "new\tflaky\nnew\tother\n").unwrap();
         std::fs::write(root.join("tests-passed"), "old\tflaky\nold\tother\n").unwrap();
         let asked = crate::cargo::cli::of_cargo(&["test".into()]).unwrap();
         let context = context(root, &script);
         let mut starts = 0;
-        let result = test_with(&asked, &context, || command(root, &script), |cmd| {
-            starts += 1;
-            cmd.spawn()
-        }).unwrap();
+        let result = test_with(
+            &asked,
+            &context,
+            || command(root, &script),
+            |cmd| {
+                starts += 1;
+                cmd.spawn()
+            },
+        )
+        .unwrap();
         assert!(!result.success, "a crashed process passed after retry: {ending}");
         assert_eq!(starts, 1, "a crash is not an assertion failure to retry");
         assert!(std::fs::read_to_string(root.join("tests-passed")).unwrap_or_default().is_empty());
@@ -67,7 +79,8 @@ fn command_construction_error_revokes_earlier_passes() {
     std::fs::write(&saved, "old\tfirst\n").unwrap();
     let asked = crate::cargo::cli::of_cargo(&["test".into()]).unwrap();
     let context = context(root, &script);
-    let result = test_with(&asked, &context, || anyhow::bail!("fixture command error"), Command::spawn);
+    let result =
+        test_with(&asked, &context, || anyhow::bail!("fixture command error"), Command::spawn);
     assert!(result.is_err());
     assert!(!saved.exists(), "a failed invocation retained an older success");
 }
@@ -84,13 +97,18 @@ fn failed_retry_spawn_revokes_earlier_passes() {
     let asked = crate::cargo::cli::of_cargo(&["test".into()]).unwrap();
     let context = context(root, &script);
     let mut starts = 0;
-    let result = test_with(&asked, &context, || command(root, &script), |cmd| {
-        starts += 1;
-        if starts == 2 {
-            return Err(std::io::Error::other("fixture retry spawn failure"));
-        }
-        cmd.spawn()
-    });
+    let result = test_with(
+        &asked,
+        &context,
+        || command(root, &script),
+        |cmd| {
+            starts += 1;
+            if starts == 2 {
+                return Err(std::io::Error::other("fixture retry spawn failure"));
+            }
+            cmd.spawn()
+        },
+    );
     assert!(result.is_err());
     assert_eq!(starts, 2);
     assert!(!saved.exists(), "an interrupted retry retained earlier successes");

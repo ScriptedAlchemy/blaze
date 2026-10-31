@@ -153,9 +153,9 @@ impl Shared {
         self.remote.traffic.try_again();
         let start = Instant::now();
         let now = self.manifest_now().await;
-        if now.is_some() && self.asked.see(now) {
+        if now.is_some() && !self.asked.saw(now) {
             eprintln!("remote: the manifest of `{}` has changed", self.project);
-            let done = self.pull_as_set().await;
+            let done = self.pull_and_remember(now).await;
             self.report(done, start);
         }
     }
@@ -261,3 +261,7 @@ fn end_by(signal: i32) -> ! {
 fn end_by(status: i32) -> ! {
     std::process::exit(status)
 }
+
+#[cfg(test)]
+#[path = "keeper/recovery_tests.rs"]
+mod recovery_tests;

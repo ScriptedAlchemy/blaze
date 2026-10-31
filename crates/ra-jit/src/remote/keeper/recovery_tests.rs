@@ -1,6 +1,8 @@
 //! Directory-remote failures must not become permanent negative cache entries.
 use super::*;
-use crate::remote::{Listed, Manifest, Remote, STORE_FORMAT, keys_object, pack_file, pack_object, tests};
+use crate::remote::{
+    Listed, Manifest, Remote, STORE_FORMAT, keys_object, pack_file, pack_object, tests,
+};
 use std::path::PathBuf;
 
 struct Fixture {
@@ -26,10 +28,19 @@ impl Fixture {
         let digest = Digest::of(&pack);
         let keys = Digest::of(&[]);
         let listed = Listed { size: pack.len() as u64, keys, format: STORE_FORMAT, packed: None };
-        tests::put(&remote_dir, &Manifest::at("recovery"), Manifest([(digest, listed)].into()).lines().as_bytes());
+        tests::put(
+            &remote_dir,
+            &Manifest::at("recovery"),
+            Manifest([(digest, listed)].into()).lines().as_bytes(),
+        );
         let shared = Shared {
-            store, remote: Arc::new(remote), project: "recovery".into(), runtime,
-            lazy, push_every: None, asked: Arc::default(),
+            store,
+            remote: Arc::new(remote),
+            project: "recovery".into(),
+            runtime,
+            lazy,
+            push_every: None,
+            asked: Arc::default(),
         };
         Self { _work: work, remote_dir, shared, pack, digest, keys }
     }
