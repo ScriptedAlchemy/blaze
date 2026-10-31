@@ -1,0 +1,116 @@
+name: Holistic cache invariants proof
+on:
+  push:
+    branches: [verify/holistic-cache-20261031]
+    paths: [.github/workflows/holistic-cache-proof.yaml]
+permissions:
+  contents: write
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      BASE: b13ad6a7f178b4e4918d744fb058fb03bfd9a02c
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Decode the exact reviewed candidate and leave the proof branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/holistic-proof"
+          python3 - <<'PY'
+          import base64,hashlib,json,os,zlib
+          from pathlib import Path
+          tail = 'TSFvScgq9O+3CtkcbQLqs/KJfstAjmMgt4YsTiCA+1haNv96wXiimKRo11KixaVdDciPidKgCuA/99Df7tMoDAtBg0W83dt2xaZxyq3+Hk1z3VsaUGGQfadeiKrRNNv0UI9+exjrLv3//6MxxxT1+wfTi1AjjNUXeJnd/AXBvKj9SRx6p8L0UoEuVtGlSdyg02x4scOk/ywyse+ATe3yJiAsjyBI6+jlBePuquXDnqFheN7hHqm1Y73sbDci0aUOyz6vtfTwq+kgUQ13S+37gItM78H2j7+kJs7u9VxZDVk2bym6FORN9sQs7UVMs9hNW3dZtEeP1J5C2Vp9cJ1MXTabysiWOvtvWvG8Uqhf1vxo7WCgdZVXkpL46kf6NtTH3XwJRy+sKlqW8LNgp1FAblmFu1TnF5UymELtS2qKC46rkuKpn3Vannz1ZFbhXkaO4aZK5roQHwJgtXm6WZ+WbSqKCNpEijq74CqXfd9IcHgWoZK/W0h+7ov9cqjHeqUY66FyydTApn4ocoVNcD5uawqwg1tNM2YZ1YSN6ticlfK4xJEs1LxNIyoStAD5WGsVFNzthDRRLj7YUv6Ya7+QpX3oH4DwpCAetaOYTIVjL9NZxcGDShBG665esDt+lOPI/leuQGL1MpQqLUKiMq83bpxLQ/4V5vPL6ZThsITsWEupxo6Vu54+3riSoOJd0obwRXqlf0yQHGFN8A1aX4f0DC1a98Iawqga9+y6vF7vJ5Tj6aoEvdhanCdv6dsPuFyRwo6at1k7awWEOoDcK6ZxjMQrLv5uO1bPUn3xaq76fdfz++qq4EYiVP0wQDuio5S0Xme3nLArPME7C2NWKDTZU91fK/Z9Ax3SdkWRgn/hVs4FJ42nyoZ91mMuWXZ3IPNRbjX4aq/fRnUqlqtdSQvTtDbmsNNvQry2FdNoieDgZ/rb/91+qhdNh/j0a+WRXP/qQqij2aaOUYCeWdDWcKOPtT8bGlk9tpwY/7sToO/Slz1DdzHEebiOPQ9y0dZ7xteDAdR92Sq/CVcDo/OV3KVCyOb/z2swfzf9tABvjVQwR1xJpbsP7S5zjcvvt/Xa78Vw=='
+          encoded = Path('.github/holistic-repairs.b64').read_text()[:6042] + tail
+          payload = zlib.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(payload).hexdigest() == '0de5ade555a182b6177bf98d7a317aaa1d973b13f289ad6068de58acf091a91d'
+          out = Path(os.environ['RUNNER_TEMP'])/'holistic-proof'
+          for name,text in json.loads(payload).items():
+              path=out/Path(name).name
+              path.write_text(text)
+          PY
+          git checkout --detach "$BASE"
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rustfmt
+          llvm: build
+      - name: Reproduce and repair the actual compiler fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          cp "$out/source_identity_test.py" harness/source_identity_test.py
+          rustc --edition=2024 crates/ra-jit/build.rs -o "$out/identity-before"
+          set +e
+          BLAZE_BUILD_SCRIPT="$out/identity-before" python3 -I harness/source_identity_test.py -v > "$out/identity-before.log" 2>&1
+          status=$?
+          set -e
+          test "$status" = 1
+          grep -q 'FAIL: test_directory_symlink_referents_are_hashed' "$out/identity-before.log"
+          grep -q 'FAIL: test_unreadable_source_is_not_ignored' "$out/identity-before.log"
+          grep -q 'FAIL: test_backslash_filename_is_not_a_directory_separator' "$out/identity-before.log"
+          git apply "$out/identity.patch"
+          rustfmt --edition 2024 crates/ra-jit/build.rs
+          rustc --edition=2024 crates/ra-jit/build.rs -o "$out/identity-after"
+          BLAZE_BUILD_SCRIPT="$out/identity-after" python3 -I harness/source_identity_test.py -v 2>&1 | tee "$out/identity-after.log"
+      - name: Reproduce the publication race against the original keeper
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          git apply "$out/publication.patch"
+          git show "$BASE:crates/ra-jit/src/remote/keeper.rs" > crates/ra-jit/src/remote/keeper.rs
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          set +e
+          nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote::keeper::recovery_tests::publishing_cannot_acknowledge_a_peers_unpulled_pack -- --exact --nocapture > "$out/publication-before.log" 2>&1
+          status=$?
+          set -e
+          test "$status" = 101
+          grep -q 'a write is not an installed lookup' "$out/publication-before.log"
+      - name: Validate the repaired runtime and complete remote regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          git apply --include=crates/ra-jit/src/remote/keeper.rs "$out/publication.patch"
+          rustfmt --edition 2024 crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          nix develop --command cargo test --locked --release -p ra-jit --bin ra-jit remote:: -- --test-threads=2 2>&1 | tee "$out/remote-after.log"
+          python3 harness/rustcsites.py | tee "$out/compiler-sites.log"
+          cargo fmt --all -- --check
+          git diff --check
+          git diff > "$out/verified.patch"
+      - name: Publish two source-only commits as a review stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/holistic-proof"
+          git config user.name 'Blaze repair'
+          git config user.email 'noreply@openai.com'
+          git add crates/ra-jit/src/remote/keeper.rs crates/ra-jit/src/remote/keeper/recovery_tests.rs
+          git commit -m 'Do not acknowledge remote cache reads when publishing local work'
+          git branch review/holistic-remote-publication
+          git push origin HEAD:refs/heads/review/holistic-remote-publication
+          git add crates/ra-jit/build.rs harness/source_identity_test.py
+          git commit -m 'Reject incomplete compiler source identities and hash directory aliases'
+          git branch review/holistic-source-identity
+          git push origin HEAD:refs/heads/review/holistic-source-identity
+          git log -2 --format='%H %s' > "$out/commits.txt"
+          git bundle create "$out/validated.bundle" review/holistic-remote-publication review/holistic-source-identity "^$BASE"
+          git status --porcelain > "$out/status.txt"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: holistic-cache-proof
+          path: |
+            ${{ runner.temp }}/holistic-proof/*.log
+            ${{ runner.temp }}/holistic-proof/*.patch
+            ${{ runner.temp }}/holistic-proof/*.txt
+            ${{ runner.temp }}/holistic-proof/*.bundle
+          retention-days: 7
+          if-no-files-found: error
