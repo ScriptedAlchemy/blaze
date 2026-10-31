@@ -121,9 +121,12 @@ ref holds one entry per platform and kind, not one per push.
   commit. sccache keys each compile by the compiler's hash, its arguments, its input files and
   the environment variables dep-info lists; crates that link (bins, proc macros) are never
   cached, so `ra-jit`'s own crate always compiles.
-- **Nix**: only the paths of the bench shell that no substituter has, keyed
-  `nix-shell-v1-<OS>-<arch>-bench-<hash of flake.nix, flake.lock, nix/>`, exact match only.
-  Consumers restore it read-only (`cache: nix`, `cache-save: false`).
+- **No Nix cache.** The bundle job wrote one at first: the bench shell's paths that no
+  substituter has, 1.18 GB, keyed by the flake. In a consumer it saved 10 s of about 106: the
+  restore took 29 s and `nix copy` 44 s, then `nix develop` 14 s, against about 106 s to build
+  the toolchains (bench job of run 41135905519). Not worth a ninth of the budget, so the job
+  stopped writing it. A consumer's `cache: nix` with `cache-save: false` now misses at the cost
+  of one lookup.
 - A hit only makes the build faster. What is checked is fixed by `source.tree` in `bundle.json`,
   which every consumer verifies against its checkout.
 
@@ -334,4 +337,47 @@ After: pending completed runs of `pr.yaml` on this branch. Negative control: pen
 
 ## Measured after
 
-(filled in from the runs on ScriptedAlchemy/blaze#32)
+From the runs of pull request #32: 41131203167 (cold, cancelled by a push after 29 min),
+41135905519 (a pull request run, warm sccache from the run before), 41146774784 (the full
+tier, which reads no pull request's cache). Wall-clock end to end was the queue's: one run's
+`changes` waited 70 minutes for a runner, and a push to the branch cancels the run before it.
+Below are job and step times.
+
+**Builds of ra-jit per push.** Before, PR18 built the release CLI in each of 14 C2 lane jobs and in
+the server job (15 builds), and bootstrapped the macro runtime 15 times. Bench built its own pair.
+Now ra-jit is built once per platform and the runtime is bootstrapped once.
+
+**The producer, `build (linux-x64)`:**
+
+| step | cold (41146774784) | warm (41135905519) |
+|---|---|---|
+| toolchain (rustup, Nix, the bench shell) | 142 s | 110 s |
+| release ra-jit, cranelift and llvm | 529 s (712 s with no cache at all) | 221 s |
+| owned macro runtime bootstrap | 289 s | 380 s |
+| test and build sets (dist, c2-contracts, 15 server sets, bench pair) | 657 s | 323 s |
+| pack, digest, upload | 12 s | 17 s |
+| sccache save and prune | none (no write on that event) | 18 s |
+| **job** | **27 min** | **18 min** |
+
+Before, the C2 lanes alone spent 20 to 30 minutes each on this setup: on Linux, seven times per
+push. The release build that took 628 to 888 s at `CARGO_BUILD_JOBS=2` in a lane takes 221 to
+529 s here, on all four cores and with sccache.
+
+**A consumer's setup** is the toolchain step (about 104 s, all of it the Nix shell) plus
+`.github/actions/bundle` (download, verify and unpack: 33 s). It was 20 to 30 minutes in a
+C2 lane, about 20 in the server job, and 4.5 minutes in bench.
+
+**bench**: the `tango` job is 2 min 47 s (comparison 19 s), against 5 min 30 s on PR18 (run
+41098738519), with the base and head built by the producer in one job with the same shell and
+arguments, and compared on one runner as before.
+
+**Cache**: 8.1 GB in 20 entries after these runs. #32's ref holds one sccache entry
+(1.56 GB): `toolchain/save` deleted the ones it superseded.
+
+Not measured yet: the C2 lanes, `bundle (<platform>)` and the server consumers on a run that
+finishes (41146774784 had them queued). The same goes for fable's negative control on
+`dist/ci-control-fable` (run 41114303311 was cancelled before it ran). The bundle's own
+rejections are proven by the server consumer's negative control in every run (a changed byte in
+a recorded test executable is refused), `test_bench_pair.py`, and locally: a wrong digest, a
+different tree and a tampered tar member each fail `unpack`, and a failing test makes
+`bundle.py test` exit 101.

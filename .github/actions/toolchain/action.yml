@@ -10,7 +10,8 @@
 # otherwise fetch or compute from the same inputs, under a key of those inputs, and a job that
 # misses does the work itself. Nothing is cached that the job's checks read as their subject.
 #   nix      the paths of the dev shell (`shell`) that no substituter of the Nix config has: the
-#            Rust toolchains rust-overlay assembles on the runner. Keyed by OS, architecture,
+#            Rust toolchains rust-overlay assembles on the runner. Measured on PR #32 it saves
+#            10 s of 106 (docs/reports/CI-fork.md), and the bundle job no longer writes it. Keyed by OS, architecture,
 #            shell and the hash of flake.nix, flake.lock and nix/; an exact key alone is
 #            restored. The paths a job builds itself are the same paths, by Nix's own naming.
 #   sccache  rustc's outputs for the steps that set `RUSTC_WRAPPER` to the `rustc-wrapper`
