@@ -162,8 +162,9 @@ def read_macro_log(text):
     for line in text.splitlines():
         parts = line.split("\t")
         if parts[0] == "macro" and len(parts) >= 9:
-            parts_of = dict(p.split("=", 1) for p in parts[4:8] if "=" in p)
-            calls.append(dict(kind=parts[1], name=parts[2], key=parts[3], outcome=parts[8], **parts_of))
+            # The parts are named (`senv=` is the server's environment); the outcome is last.
+            parts_of = dict(p.split("=", 1) for p in parts[4:-1] if "=" in p)
+            calls.append(dict(kind=parts[1], name=parts[2], key=parts[3], outcome=parts[-1], **parts_of))
         elif parts[0] == "macro-env" and len(parts) >= 3:
             envs[parts[1]] = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
     return calls, envs
@@ -183,7 +184,7 @@ def compare_macros(fixture, a_log, b_log):
         if a is None:
             cause, kind = "no call of that macro with that input on A", "expansion"
         else:
-            differing = [k for k in ("dylib", "env", "cwd") if a.get(k) != c.get(k)]
+            differing = [k for k in ("dylib", "env", "cwd", "senv") if a.get(k) != c.get(k)]
             if not differing:
                 cause, kind = f"the key is A's, A did not keep it: {a['outcome']}", "expansion"
             else:
@@ -194,6 +195,8 @@ def compare_macros(fixture, a_log, b_log):
                     bits.append("environment " + ", ".join(f"{n} (value hash {ours.get(n)!r} on A, {theirs.get(n)!r} on B)" for n in names[:4]))
                 if "cwd" in differing:
                     bits.append("current directory")
+                if "senv" in differing:
+                    bits.append("the macro server's environment (any variable a macro could read)")
                 if "dylib" in differing:
                     bits.append("macro library bytes")
                 cause = "key differs by " + "; ".join(bits)
@@ -1211,8 +1214,8 @@ def build_scripts(machine, bin_dir, ws, package, store, ra_home):
 
 def expansion_cause(said, spec):
     skipped = spec.get("env", {}).get("RA_JIT_PROC_MACRO_CACHE_SKIP")
-    why = ("the key holds the macro library's bytes, the crate's environment (CARGO_MANIFEST_DIR, OUT_DIR) and the "
-           "current directory (ra-jit-expand)")
+    why = ("the key holds the macro library's bytes, the crate's environment (CARGO_MANIFEST_DIR, OUT_DIR), the "
+           "current directory and the digest of the macro server's whole environment (ra-jit-expand)")
     if skipped:
         why += f"; {skipped} is named in RA_JIT_PROC_MACRO_CACHE_SKIP and is expanded every time by design"
     m = re.search(r"^proc macros: .*$", said, re.M)
@@ -1476,6 +1479,11 @@ def self_test():
     d = compare_macros("t", a_log, read_macro_log(b_text))
     check("a variable that still holds a path is named", d and "CARGO_MANIFEST_DIR" in d[0].why and d[0].kind == "expansion")
     check("a macro line is not a function entry", read_keys_log(macro_log) == {})
+    with_server = macro_log.replace("\tcwd=c1\t", "\tcwd=c1\tsenv=s1\t")
+    check("a macro line with the server's environment keeps its outcome",
+          read_macro_log(with_server)[0][0]["outcome"] == "expanded" and read_macro_log(with_server)[0][0]["senv"] == "s1")
+    d = compare_macros("t", read_macro_log(with_server), read_macro_log(with_server.replace("senv=s1", "senv=s2")))
+    check("a call that differs by its server's environment says so", d and "server's environment" in d[0].why)
     pending = Difference("t", "script-run", "k", "why")
     check("a script-run difference is pending, an expansion is not", pending.pending and not Difference("t", "expansion", "k", "w").pending)
     print("self-test:", "ok" if ok else "FAILED")

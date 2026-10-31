@@ -147,6 +147,30 @@ fn generation_env<'a>(
     vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
 }
 
+/// The digest of the environment a server started with `env` over this process's has: each
+/// variable, in the order of its name, the overlay's set and its removals applied. A macro reads
+/// any of them as it reads rustc's, so an expansion kept under one is not another's.
+fn server_environment(env: &GenerationEnv) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut vars: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    for (name, value) in env {
+        match value {
+            Some(value) => vars.insert(name.clone(), value.clone()),
+            None => vars.remove(name),
+        };
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"proc-macro server environment 1");
+    hash.update((vars.len() as u64).to_le_bytes());
+    for (name, value) in &vars {
+        for bytes in [name.as_encoded_bytes(), value.as_encoded_bytes()] {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    hash.finalize().into()
+}
+
 impl fmt::Debug for ProcMacroClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcMacroClient").field("path", &self.path).finish()
@@ -313,7 +337,7 @@ impl ProcMacroClient {
                     version.as_ref(),
                 )?);
             }
-            Ok(ProcMacroServerPool::new(workers))
+            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(vars)))
         };
         let pool = factory(&vars)?;
         Ok(ProcMacroClient {
@@ -493,6 +517,12 @@ impl ProcMacroClient {
 impl ProcMacro {
     pub fn content_identity(&self) -> Option<[u8; 32]> {
         self.dylib_content
+    }
+
+    /// The digest of every variable the server that expands this macro started with, which a
+    /// macro can read; `None` when the server was not started by this client.
+    pub fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.pool.environment()
     }
 
     /// Returns the name of the procedural macro.

@@ -364,6 +364,20 @@ fn an_unchanged_library_loaded_for_another_environment_is_served_with_it() {
     drop((before, after));
 }
 
+/// The expansion cache keys on what a server's environment is in whole: an overlay in another
+/// order is the same, a value changed or removed is another, and back again is the first.
+#[test]
+fn a_server_environment_is_named_by_every_variable_it_has() {
+    let os = |it: &str| std::ffi::OsString::from(it);
+    let set = |value: &str| vec![(os("PR15_PRIVATE"), Some(os(value))), (os("PR15_OTHER"), None)];
+    let first = crate::server_environment(&set("old-private-value"));
+    let reordered = set("old-private-value").into_iter().rev().collect();
+    assert_eq!(crate::server_environment(&reordered), first);
+    assert_ne!(crate::server_environment(&set("new-private-value")), first);
+    assert_ne!(crate::server_environment(&vec![(os("PR15_PRIVATE"), None)]), first);
+    assert_eq!(crate::server_environment(&set("old-private-value")), first);
+}
+
 #[test]
 fn distinct_paths_share_epoch_reload_retains_consumers_and_reports_crash() {
     use std::os::unix::fs::PermissionsExt;

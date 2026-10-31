@@ -1027,6 +1027,10 @@ impl ProcMacroExpander for Expander {
     fn content_identity(&self) -> Option<[u8; 32]> {
         self.0.content_identity()
     }
+
+    fn environment_identity(&self) -> Option<[u8; 32]> {
+        self.0.environment_identity()
+    }
 }
 
 fn resolve_sub_span(
