@@ -2,32 +2,59 @@ name: Blaze runtime repair sources
 on:
   push:
     branches: [repair/blaze-runtime-20261031]
-    paths: [.github/workflows/repair-runtime-export.yaml]
+    paths: [.github/workflows/repair-runtime-export.yaml, '.github/repair/runtime-cleanup.patch']
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: blaze-runtime-source-export
   cancel-in-progress: true
 jobs:
-  export:
+  prepare:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          persist-credentials: false
-      - name: Export only the pinned source histories
+      - name: Apply and validate the reviewed repair without moving PR branches
         shell: bash
         run: |
-          git cat-file -e 88b220e61614e483dfa0c6fcc992a502c2e72c02^{commit}
-          git cat-file -e 75a7e503b756e3fbfa6f06561de22a51533bd679^{commit}
-          git update-ref refs/heads/repair-source-c2 88b220e61614e483dfa0c6fcc992a502c2e72c02
-          git update-ref refs/heads/repair-source-ci 75a7e503b756e3fbfa6f06561de22a51533bd679
-          git bundle create "$RUNNER_TEMP/blaze-runtime-sources.bundle" refs/heads/repair-source-c2 refs/heads/repair-source-ci
+          set -euo pipefail
+          git config user.name 'Blaze CI repair'
+          git config user.email 'noreply@openai.com'
+          c2_base=88b220e61614e483dfa0c6fcc992a502c2e72c02
+          ci_base=75a7e503b756e3fbfa6f06561de22a51533bd679
+          test "$(git rev-parse origin/dist/c2-buildspec)" = "$c2_base"
+          test "$(git rev-parse origin/ci-redesign)" = "$ci_base"
+          patch="$GITHUB_WORKSPACE/.github/repair/runtime-cleanup.patch"
+          c2="$RUNNER_TEMP/runtime-repair-c2"
+          ci="$RUNNER_TEMP/runtime-repair-ci"
+          git worktree add --detach "$c2" "$c2_base"
+          git -C "$c2" apply --index "$patch"
+          git -C "$c2" diff --cached --check
+          test "$(git -C "$c2" write-tree)" = 687fc0ec1930c7494befbebfc744b1956f539d73
+          (cd "$c2"; python3 -I harness/dist/test_buildspec_cleanup.py) 2>&1 | tee "$RUNNER_TEMP/runtime-repair-c2-tests.log"
+          git -C "$c2" commit -m 'harness: release saved replay scratch after each C2 comparison' -m 'Saved replay writes large per-unit archives beside its CBOR, outside the local target cleaned by the harness. Release only newly created replay directories after stopping the product and inspecting its artifacts, including partial failures. Keep immutable inputs, pre-existing outputs, --keep, and result receipts beside the JSON evidence. Nine lifecycle regressions run in the existing self-test gate. No acceptance checks or resource limits are relaxed.'
+          c2_sha=$(git -C "$c2" rev-parse HEAD)
+          git worktree add --detach "$ci" "$ci_base"
+          git -C "$ci" merge --no-commit --no-ff "$c2_sha"
+          git -C "$ci" diff --cached --check
+          test "$(git -C "$ci" write-tree)" = 361e6e70b6874ecaae1769c8cff194e3c0c58801
+          (cd "$ci"; python3 -I harness/dist/test_buildspec_cleanup.py; python3 -I harness/dist/test_check_nix_workflow.py; python3 -I .github/scripts/test_bench_pair.py; python3 -I .github/scripts/test_bench_verdict.py) 2>&1 | tee "$RUNNER_TEMP/runtime-repair-ci-tests.log"
+          git -C "$ci" commit -m 'Merge C2 runtime repairs into shared-build CI' -m 'Carry the Nix run-path control correction, native build-script output-directory identity, and C2 replay scratch cleanup into ci-redesign. Preserve every CI-specific file and the shared build/bundle consumers. This keeps the original product-fix history instead of drifting copies. The documentation merges without conflicts.'
+          ci_sha=$(git -C "$ci" rev-parse HEAD)
+          git push origin "$c2_sha:refs/heads/repair/c2-runtime-tested-20261031" "$ci_sha:refs/heads/repair/ci-runtime-tested-20261031"
+          printf '{"c2":"%s","ci":"%s","c2_base":"%s","ci_base":"%s","c2_tree":"%s","ci_tree":"%s"}\n' "$c2_sha" "$ci_sha" "$c2_base" "$ci_base" "$(git -C "$c2" rev-parse HEAD^{tree})" "$(git -C "$ci" rev-parse HEAD^{tree})" | tee "$RUNNER_TEMP/runtime-repair-receipt.json"
+          git update-ref refs/heads/runtime-repair-c2 "$c2_sha"
+          git update-ref refs/heads/runtime-repair-ci "$ci_sha"
+          git bundle create "$RUNNER_TEMP/runtime-repair.bundle" refs/heads/runtime-repair-c2 refs/heads/runtime-repair-ci
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          name: blaze-runtime-sources
-          path: ${{ runner.temp }}/blaze-runtime-sources.bundle
+          name: blaze-runtime-repair
+          path: |
+            ${{ runner.temp }}/runtime-repair-receipt.json
+            ${{ runner.temp }}/runtime-repair-*-tests.log
+            ${{ runner.temp }}/runtime-repair.bundle
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: warn
