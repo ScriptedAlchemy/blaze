@@ -1,9 +1,14 @@
 //! A signal cannot wait behind an earlier remote operation before its grace period begins.
 use super::*;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 
 const CHILD: &str = "BLAZE_REMOTE_SHUTDOWN_CHILD";
+#[cfg(unix)]
+const REQUESTED_EXIT: i32 = libc::SIGTERM;
+#[cfg(windows)]
+const REQUESTED_EXIT: i32 = CONTROL_C_EXIT;
 
 #[test]
 fn shutdown_child() {
@@ -15,14 +20,14 @@ fn shutdown_child() {
             "blocked" => {
                 // A previously queued push owns the keeper. No receiver can reach End.
                 steps.send(Step::Push).unwrap();
-                request_end(steps, libc::SIGTERM, Duration::from_millis(25)).await;
+                request_end(steps, REQUESTED_EXIT, Duration::from_millis(25)).await;
                 // Keep the receiver alive, without manufacturing successful publication.
                 let _held = coming;
                 std::future::pending::<()>().await;
             }
             "closed" => {
                 drop(coming);
-                request_end(steps, libc::SIGTERM, LAST_PUSH).await;
+                request_end(steps, REQUESTED_EXIT, LAST_PUSH).await;
                 std::future::pending::<()>().await;
             }
             "graceful" => {
@@ -32,7 +37,7 @@ fn shutdown_child() {
                     };
                     end_by(signal);
                 });
-                request_end(steps, libc::SIGTERM, LAST_PUSH).await;
+                request_end(steps, REQUESTED_EXIT, LAST_PUSH).await;
                 std::future::pending::<()>().await;
             }
             _ => panic!("unknown shutdown fixture"),
@@ -52,7 +57,10 @@ fn exits_by_requested_signal(mode: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert_eq!(status.signal(), Some(libc::SIGTERM), "unexpected child result: {status}");
+            #[cfg(unix)]
+            assert_eq!(status.signal(), Some(REQUESTED_EXIT), "unexpected child result: {status}");
+            #[cfg(windows)]
+            assert_eq!(status.code(), Some(REQUESTED_EXIT), "unexpected child result: {status}");
             return;
         }
         if Instant::now() >= deadline {
