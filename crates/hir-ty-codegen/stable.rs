@@ -37,6 +37,25 @@ const CHECKED: &str = " checked";
 /// Before what stands for a crate from outside the checkout that rustc has no id for.
 const OF_LIBRARY: char = '^';
 
+/// After a crate's id, before what a debugger is told of its code (0 nothing, 1 lines, 2
+/// variables), where that is not what it is told of the build's own code.
+const DEBUG: &str = ".d";
+
+/// What a debugger is told of the code `name` names, when the crate it is written in is told
+/// otherwise than the build's own code ([`DEBUG`]); `None` when it is told what that is. The
+/// kinds of instance whose code is written in a crate spell that crate first.
+pub(super) fn told_in(name: &str) -> Option<super::Told> {
+    let kinds = ["fn ", "closure ", "coroutine by move ", "coroutine ", "vtable shim "];
+    let rest = kinds.iter().find_map(|kind| name.strip_prefix(kind))?;
+    let (_, told) = rest[..rest.find(':')?].rsplit_once(DEBUG)?;
+    match told {
+        "0" => Some(super::Told::Nothing),
+        "1" => Some(super::Told::Lines),
+        "2" => Some(super::Told::Variables),
+        _ => None,
+    }
+}
+
 /// Before the hash that stands for a type written longer than [`SPELLED`]: a closure that
 /// wraps closures has a type that holds each of theirs, and written out in full its name
 /// doubles with each level.
@@ -498,6 +517,15 @@ impl<'a, 'db> StableNames<'a, 'db> {
                     None => return self.miss("no crate id"),
                 },
             }
+        }
+        // The code of a crate a debugger is told of otherwise than of the build's own is not
+        // the code of the crate built as the build is: the store keeps an entry under what is
+        // told of the build's own (`later::Keeper`), and what is told of this crate is in the
+        // names of its code. A build that tells of every crate alike names them as it did.
+        let told = super::told_of(self.symbols, Some(krate));
+        if told != super::told_of(self.symbols, None) {
+            out.pop();
+            write!(out, "{DEBUG}{}:", told as u8).ok()?;
         }
         Some(())
     }

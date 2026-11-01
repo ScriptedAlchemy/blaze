@@ -123,7 +123,10 @@ pub(crate) fn project_profile(project: &Path) -> anyhow::Result<Option<crate::pl
         .flags
         .iter()
         .any(|word| word.starts_with("--cap-lints=") || word.starts_with("--force-warn="));
-    Ok(Some(Whole { debug: Described { level, kept, frame_pointers }, lto: false, lints_capped }))
+    let strip =
+        crate::link::Strip::of_spec(profile.strip).context("unknown owned replay strip profile")?;
+    let debug = Described { level, kept, frame_pointers };
+    Ok(Some(Whole { debug, lto: false, lints_capped, strip }))
 }
 
 pub(super) fn command(words: &[String]) -> anyhow::Result<i32> {
@@ -1524,11 +1527,17 @@ mod tests {
         assert!(whole.debug.frame_pointers);
         assert!(whole.lints_capped);
         assert!(!whole.lto);
-        let mut stripped = profile();
-        stripped.strip = 1;
-        let whole = project_profile(&project(dir.path(), &stripped, &[])).unwrap().unwrap();
-        assert_eq!(whole.debug.level, crate::plan::Level::Nothing);
-        assert_eq!(whole.debug.kept, crate::plan::Kept::Linked);
+        assert_eq!(whole.strip, crate::link::Strip::None);
+        for (level, strip) in [(1, crate::link::Strip::Debuginfo), (2, crate::link::Strip::Symbols)]
+        {
+            let mut stripped = profile();
+            stripped.strip = level;
+            let whole = project_profile(&project(dir.path(), &stripped, &[])).unwrap().unwrap();
+            assert_eq!(whole.debug.level, crate::plan::Level::Nothing);
+            assert_eq!(whole.debug.kept, crate::plan::Kept::Linked);
+            // The link takes out what rustc's would: the root's setting reaches it.
+            assert_eq!(whole.strip, strip);
+        }
     }
 
     #[test]

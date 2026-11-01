@@ -52,6 +52,12 @@ pub(crate) fn package_variable(name: &str) -> bool {
 }
 
 impl Context {
+    /// The toolchain the program was built against: `sysroot_lib` is its
+    /// `lib/rustlib/<triple>/lib`.
+    pub(crate) fn sysroot(&self) -> Option<&Path> {
+        self.sysroot_lib.ancestors().nth(4)
+    }
+
     fn encode(&self) -> String {
         let units = BTreeMap::from([(
             0,
