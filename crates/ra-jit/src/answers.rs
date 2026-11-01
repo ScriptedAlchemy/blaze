@@ -1143,10 +1143,12 @@ pub(crate) mod tests {
         let gap = own::gap(&rustc).unwrap();
         assert!(gap.contains("manifest-rustc-<host>") && gap.contains("rust-lld"), "{gap}");
         assert!(gap.contains("\"src\""), "{gap}");
-        // The query's refusal carries it.
-        let mut command = Command::new(&rustc);
-        command.arg("--version");
-        let error = answer(&mut command, &[]).unwrap_err().to_string();
+        // The query's refusal carries it. `answer` reads the command and starts nothing: the
+        // synthetic compiler is a text file.
+        let compiler = rustc.clone();
+        let mut query = Command::new(compiler);
+        query.arg("--version");
+        let error = answer(&mut query, &[]).unwrap_err().to_string();
         assert!(
             error.contains("has no model") && error.contains("manifest-rustc-<host>"),
             "{error}"
