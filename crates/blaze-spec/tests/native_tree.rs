@@ -211,7 +211,7 @@ mod unix {
     }
 
     #[test]
-    fn unreadable_files_and_directories_are_errors_not_missing_entries() {
+    fn unreadable_files_are_errors_not_missing_entries() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("denied");
         fs::write(&file, b"must be read").unwrap();
@@ -222,15 +222,44 @@ mod unix {
         if !privileged {
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         }
+    }
+
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn unreadable_directories_are_observations_not_missing_entries() {
+        let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("directory");
         fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("member"), b"member of an unreadable directory").unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
         let privileged = fs::read_dir(&directory).is_ok();
-        let result = Tree::capture(root.path());
+        let first = Tree::capture(root.path());
+        let second = Tree::capture(root.path());
+        let denied_root = Tree::capture(&directory);
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        if !privileged {
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        if privileged {
+            eprintln!(
+                "skipping: this process may read a 0o000 directory (running as root?), so a \
+                 denied listing cannot be observed"
+            );
+            return;
         }
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.entry(Path::new("directory")).unwrap().kind, Kind::Unreadable);
+        assert!(
+            first.entry(Path::new("directory/member")).is_none(),
+            "an unreadable directory's members are unknown, not bound"
+        );
+        let denied_root = denied_root.unwrap();
+        assert_eq!(denied_root.entry(Path::new("")).unwrap().kind, Kind::Unreadable);
+        assert_ne!(
+            denied_root.entry(Path::new("")).unwrap().kind,
+            Kind::Missing,
+            "an unreadable root is not a missing root"
+        );
+        assert_eq!(first.digest(), second.digest(), "the observation is stable");
+        assert_eq!(first.entries, second.entries);
     }
 
     #[test]

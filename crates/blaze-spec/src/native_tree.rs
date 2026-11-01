@@ -29,6 +29,12 @@ pub enum Kind {
     },
     /// A symlink expansion or directory edge returns to an active ancestor.
     Cycle,
+    /// A directory that exists but whose members the capturing user may not list.
+    ///
+    /// Its name, its type and every symlink reaching it are bound like any other node. Its
+    /// members are unknown: nothing below it is a missing candidate and nothing below it is
+    /// admitted. Only a denied listing is recorded here; every other read error propagates.
+    Unreadable,
 }
 
 /// One logical pathname, including the identity of every symlink traversed there.
@@ -59,8 +65,10 @@ pub struct Tree {
 impl Tree {
     /// Read the complete closure rooted at `root`, following symlinks and hashing files.
     ///
-    /// Files and directory membership are checked again after they are read. Permission,
-    /// I/O and unsupported-node errors propagate; only `NotFound` becomes a missing node.
+    /// Files and directory membership are checked again after they are read. A directory
+    /// whose listing is denied becomes an [`Kind::Unreadable`] observation, because it is part
+    /// of the observed platform even though its members cannot be. Other permission, I/O and
+    /// unsupported-node errors propagate; only `NotFound` becomes a missing node.
     pub fn capture(root: &Path) -> io::Result<Self> {
         let root =
             if root.is_absolute() { root.to_owned() } else { std::env::current_dir()?.join(root) };
@@ -271,6 +279,9 @@ impl Tree {
     /// root in the identity. The same SDK moved to another directory therefore hashes alike.
     pub fn digest(&self) -> Digest {
         let mut hash = Sha256::new();
+        // An unreadable observation is a new, disjoint kind tag: every tree capturable before
+        // this kind existed hashes exactly as it did, so the version and saved identities
+        // stay valid.
         frame(&mut hash, b"blaze.native-tree.v1");
         hash.update((self.entries.len() as u64).to_le_bytes());
         for (path, entry) in &self.entries {
@@ -283,6 +294,7 @@ impl Tree {
                 Kind::Missing => frame(&mut hash, b"missing"),
                 Kind::Directory => frame(&mut hash, b"directory"),
                 Kind::Cycle => frame(&mut hash, b"cycle"),
+                Kind::Unreadable => frame(&mut hash, b"unreadable"),
                 Kind::File { digest, len, executable } => {
                     frame(&mut hash, b"file");
                     hash.update(len.to_le_bytes());
@@ -320,7 +332,7 @@ impl Tree {
         let mut content = component(b"content");
         let mut mode = component(b"mode");
         let mut links = component(b"links");
-        let mut counts = [0_u64; 5];
+        let mut counts = [0_u64; 6];
         for (path, entry) in &self.entries {
             let path = path.as_os_str().as_encoded_bytes();
             frame(&mut membership, path);
@@ -346,10 +358,14 @@ impl Tree {
                     counts[3] += 1;
                     b"cycle".as_slice()
                 }
+                Kind::Unreadable => {
+                    counts[4] += 1;
+                    b"unreadable".as_slice()
+                }
             };
             frame(&mut membership, kind);
             if !entry.links.is_empty() {
-                counts[4] += entry.links.len() as u64;
+                counts[5] += entry.links.len() as u64;
                 frame(&mut links, path);
                 links.update((entry.links.len() as u64).to_le_bytes());
                 for target in &entry.links {
@@ -445,20 +461,41 @@ impl Tree {
                     return Ok(());
                 }
                 let before = Stamp::of(&metadata)?;
-                let children = names(&path)?;
-                self.entries.insert(
-                    logical.to_owned(),
-                    Entry { links: links.clone(), kind: Kind::Directory },
-                );
-                for name in &children {
-                    let requested = path.join(name);
-                    self.walk(&requested, &logical.join(name), resolve(&requested)?, active)?;
+                let children = match names(&path) {
+                    Ok(children) => Some(children),
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+                    Err(error) => return Err(error),
+                };
+                match children {
+                    Some(children) => {
+                        self.entries.insert(
+                            logical.to_owned(),
+                            Entry { links: links.clone(), kind: Kind::Directory },
+                        );
+                        for name in &children {
+                            let requested = path.join(name);
+                            self.walk(
+                                &requested,
+                                &logical.join(name),
+                                resolve(&requested)?,
+                                active,
+                            )?;
+                        }
+                        if names(&path)? != children || Stamp::of(&fs::metadata(&path)?)? != before
+                        {
+                            return Err(changed(&path));
+                        }
+                        active.remove(&path);
+                        Kind::Directory
+                    }
+                    // The directory is part of the platform: bind that it exists, is a
+                    // directory and could not be listed, never an empty directory. No walk
+                    // below it can claim its members are missing.
+                    None => {
+                        active.remove(&path);
+                        Kind::Unreadable
+                    }
                 }
-                if names(&path)? != children || Stamp::of(&fs::metadata(&path)?)? != before {
-                    return Err(changed(&path));
-                }
-                active.remove(&path);
-                Kind::Directory
             }
         };
         let after = resolve(requested)?;
@@ -482,7 +519,7 @@ impl Tree {
 
 pub(crate) struct Summary {
     pub(crate) digest: Digest,
-    pub(crate) counts: [u64; 5],
+    pub(crate) counts: [u64; 6],
     pub(crate) membership: Digest,
     pub(crate) content: Digest,
     pub(crate) mode: Digest,
@@ -502,6 +539,7 @@ fn same_kind(actual: &ResolvedKind, expected: &Kind) -> bool {
         (ResolvedKind::Missing, Kind::Missing)
             | (ResolvedKind::Cycle, Kind::Cycle)
             | (ResolvedKind::Directory(_), Kind::Directory)
+            | (ResolvedKind::Directory(_), Kind::Unreadable)
             | (ResolvedKind::File(_), Kind::File { .. })
     )
 }

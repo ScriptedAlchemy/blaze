@@ -32,7 +32,7 @@ from owned_macro_server import runtime_record
 
 # The groups of cases `--only` selects among. The whole run is the gate; a group alone is for
 # working on one case without the hour the others take.
-GROUPS = ("core", "raw", "owned", "producer-profile", "native-dependency", "dynamic", "workspace", "tail")
+GROUPS = ("core", "raw", "owned", "producer-profile", "native-dependency", "dynamic", "workspace", "doctests", "tail")
 
 
 def write(root, name, contents):
@@ -581,9 +581,25 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
                              ("custom-first", sorted(artifacts, key=lambda item: item["crate"], reverse=True))]:
           native_consumer("mixed-allocator-" + name, selected, source)
 
+    if "doctests" in only:
       project = work / "workspace-doctests"
       workspace_libraries(project)
-      _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
+      # The worker's cache as the cases before left it: the replay's compilers must not read
+      # or write it, whether or not it is there.
+      def cache_listing():
+          cache = work / "worker-cache"
+          return sorted((str(p.relative_to(cache)), p.stat().st_size, p.stat().st_mtime_ns) for p in cache.rglob("*") if p.is_file()) if cache.exists() else None
+      cache_before = cache_listing()
+      saved, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
+      # Both doctest compilers must consume the one raw unit built by this replay,
+      # even though the worker environment supplies an outside compiler cache.
+      replay_log = (work / "workspace-doctests-replay.log").read_text()
+      assert replay_log.count("standard library: from this replay,") == 2, replay_log
+      jobs = list(Path(str(saved) + ".outputs").glob("replay-*"))
+      assert len(jobs) == 1, jobs
+      units = list((jobs[0] / "std-units").iterdir())
+      assert len(units) == 1, units
+      assert cache_listing() == cache_before, "saved replay used the worker's cache"
       from buildspec import parse_run
       assert parse_run(actual) == parse_run(expected), (actual, expected)
       assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
@@ -972,7 +988,11 @@ def main():
             saved = bundle / (name + ".cbor")
             runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved,
                        "check" if name == "check-invalid" else "build", *selected], env, project)
-            reason = {"check-invalid": "mismatched types", "external-include": "outside the immutable source snapshot"}[name]
+            # The type error by rustc's code: blaze writes E0308's message as rust-analyzer has
+            # it ("expected u32, found bool"), not rustc's headline "mismatched types". The
+            # include outside the snapshot is refused as the replay says it: a compiler read
+            # outside the authenticated source and producer inputs.
+            reason = {"check-invalid": "error[E0308]", "external-include": "outside authenticated source and producer inputs"}[name]
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name

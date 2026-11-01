@@ -1,15 +1,41 @@
-# Microbenchmarks of the store's hot paths (crates/ra-jit-bench), run by tango in pairs: on a
-# pull request the base's binary and the change's, both from the bundle, interleaved on one
-# runner so that the runner's own drift cancels out. A change fails the run only when the same
-# benchmark is slower than on the base beyond doubt (tango's z-score) and by more than NOISE
-# percent in two comparisons in a row; a benchmark that is slow in one comparison and another in
-# the next is noise. Before the comparison the runner is asked whether it can tell two copies of
-# the same binary apart (bench-base against a copy of itself, the A/A control): if a benchmark is
-# over NOISE percent there, the verdict is "environmental" and the comparison with the base is
-# reported and not counted. PR18's tango failed on a pair that was bit-identical in seven runs
-# (docs/reports/CI-fork.md). The runner's CPU and both binaries' sha256 are recorded beside every
-# verdict. The verdict is .github/scripts/bench_verdict.py's. On main the benchmarks run alone,
-# for the times.
+# Microbenchmarks of ra-jit's hot paths, run by tango in pairs: on a pull request each benchmark
+# binary of the change against the same binary of its base, both from the bundle, interleaved on
+# one runner so that the runner's own drift cancels out. Each binary is a benchmark package of its
+# own that links only what it measures: `store` (crates/ra-jit-bench-store) the store and tango and
+# nothing else, `codegen` (crates/ra-jit-bench-codegen) the compiler. The producer builds each
+# side as a set of .github/ci/test-sets.json (`bench-<name>-head`, `bench-<name>-base`), one cargo
+# command each; .github/scripts/bench_pair.py checks their provenance and pairs them.
+#
+# Both sides are built with every function and loop head on the same alignment (the sets'
+# `rustflags`): a binary that is relinked has its code at other addresses, and on x86 a hot loop
+# that lands differently runs tens of percent slower (`store/has_miss` was +47% on four runs of a
+# change that left ra-jit-store alone, when the store's benchmark still linked hir-ty-codegen, and
+# flat in a paired run on another machine). With the alignment pinned, a difference in the code's
+# placement is not one in its speed. And both are built with their checkout and target directory
+# remapped (`remap-paths`), so that the base, built in a worktree of its own, comes out as the
+# same bytes as the head where the source is the same.
+#
+# A binary whose bytes are the base's is not run, and passes ("unchanged by this change: not
+# judged"): the change left everything it links alone. It cannot be measured instead, because
+# what no flag pins (the layout of data, heap and pages) still moves a relinked binary, and the
+# A/A control below does not see it: on PR #18 the same two binaries of the store's benchmark
+# (identical sha256) measured `store/get_hit` +21.9% and then +11.2%, the control flat, on an
+# Intel Xeon 6975P-C runner (run 41276848562), and passed on an AMD EPYC 7763 one (run
+# 41266194244), with ra-jit-store untouched by the branch.
+#
+# A binary that differs fails the run only when the same benchmark is slower than on the base
+# beyond doubt (tango's z-score) and by more than NOISE percent in two comparisons in a row; a
+# benchmark that is slow in one comparison and another in the next is noise. Before the
+# comparison the runner is asked whether it can tell two copies of the same binary apart (the
+# base against a copy of itself, the A/A control): if a benchmark is over NOISE percent there, the
+# verdict is "environmental" and the comparison with the base is reported and not counted. PR18's
+# tango failed on a pair that was bit-identical in seven runs (docs/reports/CI-fork.md). The
+# runner's CPU and each binary's sha256 are recorded beside every verdict. The verdicts are
+# .github/scripts/bench_verdict.py's; each binary's tables, tango dumps and verdict are kept under
+# tango/<name>/ in the artifact.
+#
+# On main, and for a binary its base does not have (a base from before the split has
+# crates/ra-jit-bench, and neither package), the benchmarks run alone, for the times.
 name: bench
 on:
   workflow_call:
@@ -52,98 +78,126 @@ jobs:
         with:
           platform: linux-x64
           sha256: ${{ inputs.bundle-linux-x64-sha256 }}
-      # Both binaries were built by the producer with the same compiler, flags
-      # and benchmark profile. They are paired on this one runner, as before.
+      # Every binary was built by the producer with the same compiler, flags and benchmark
+      # profile as its pair. Each pair is compared on this one runner, as before.
       - name: Check benchmark provenance rejection
         run: |
           python3 -B .github/scripts/test_bench_pair.py -v
           python3 -B .github/scripts/test_bench_verdict.py -v
       - name: Verify benchmark pair provenance
+        id: pairs
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 -I .github/scripts/bench_pair.py
-      # The runner's CPU, with the pair's digests, on pass and on fail: on #18 the pair was
+      # The runner's CPU, with every binary's digest, on pass and on fail: on #18 the pair was
       # bit-identical across seven runs and the one failure ran on another CPU family (EPYC 7763,
       # Zen 3) than the six passes (EPYC 9V74, 9V45, Xeon 6975P), so the CPU is the variable to
       # record beside every verdict (docs/reports/CI-fork.md).
-      - name: Record the runner's CPU and the benchmark pair
+      - name: Record the runner's CPU and the benchmark pairs
         if: always()
         run: |
           mkdir -p "$RUNNER_TEMP/tango"
           {
             lscpu | grep -E 'Model name|^CPU\(s\)'
             grep -m1 '^flags' /proc/cpuinfo || true
-            sha256sum "$RUNNER_TEMP"/bench-* 2>/dev/null || echo "no benchmark pair prepared"
+            find "$RUNNER_TEMP/bench" -maxdepth 1 -type f \( -name '*-head' -o -name '*-base' \) 2>/dev/null \
+              | sort | xargs -r sha256sum | grep . || echo "no benchmark pair prepared"
           } > "$RUNNER_TEMP/tango/cpu.txt"
-          cat "$RUNNER_TEMP/tango/cpu.txt" | tee -a "$RUNNER_TEMP/bench.txt"
-          { echo '### tango: runner CPU and benchmark pair'; echo '```'; grep -v '^flags' "$RUNNER_TEMP/tango/cpu.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/tango/cpu.txt"
+          { echo '### tango: runner CPU and benchmark pairs'; echo '```'; grep -v '^flags' "$RUNNER_TEMP/tango/cpu.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Record benchmark context
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          mkdir -p "$RUNNER_TEMP/tango"
           {
             git rev-parse HEAD "$BASE_SHA"
             nix develop .#bench --command rustc -vV
             nix develop .#bench --command cargo --version
             uname -a
             lscpu
-            sha256sum "$RUNNER_TEMP"/bench-*
+            cat "$RUNNER_TEMP/bench/pairs.txt"
+            (cd "$RUNNER_TEMP/bench" && sha256sum -- *-head *-base 2>/dev/null) || true
           } > "$RUNNER_TEMP/tango/context.txt"
-      # The A/A control, then at most two comparisons; tango's exit status is not the verdict,
-      # bench_verdict.py's reading of its output is (same benchmark in both comparisons).
+      # Per pair: one whose bytes are the base's is passed unrun; one that differs gets the A/A
+      # control, then at most two comparisons. Tango's exit status is not the verdict,
+      # bench_verdict.py's reading of its output is (the same benchmark in both comparisons).
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
-          [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
-          tango="$RUNNER_TEMP/tango"
-          mkdir -p "$tango"
-          cp "$RUNNER_TEMP/bench-base" "$RUNNER_TEMP/bench-base-copy"
-          started=$SECONDS
-          aa_status=0
-          "$RUNNER_TEMP/bench-base" --color never compare "$RUNNER_TEMP/bench-base-copy" \
-            -t "$TIME" --noise-threshold "$NOISE" -o -v \
-            --dump "$tango/aa" | tee "$tango/aa.txt" || aa_status=$?
-          aa_seconds=$((SECONDS - started))
-          attempts=()
-          exit_codes=()
-          for attempt in 1 2; do
-            status=0
-            "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" \
+          bin=$RUNNER_TEMP/bench
+          # Bench $1, whose two binaries differ: its tables, dumps and verdict go in tango/$1.
+          judge() {
+            local bench=$1 out=$RUNNER_TEMP/tango/$1 base=$bin/$1-base head=$bin/$1-head
+            local attempts=() exit_codes=() attempt run_status aa_status=0 status=0 started
+            mkdir -p "$out"
+            cp "$base" "$RUNNER_TEMP/aa-$bench"
+            started=$SECONDS
+            "$base" --color never compare "$RUNNER_TEMP/aa-$bench" \
               -t "$TIME" --noise-threshold "$NOISE" -o -v \
-              --dump "$tango/compare-$attempt" | tee "$tango/compare-$attempt.txt" || status=$?
-            attempts+=("$tango/compare-$attempt.txt")
-            exit_codes+=(--exit-code "$status")
-            [ "$status" != 0 ] || break
-            [ "$attempt" = 2 ] || echo "A slowdown over ${NOISE}%: measuring again"
-          done
+              --dump "$out/aa" | tee "$out/aa.txt" || aa_status=$?
+            local aa_seconds=$((SECONDS - started))
+            for attempt in 1 2; do
+              run_status=0
+              "$head" --color never compare "$base" \
+                -t "$TIME" --noise-threshold "$NOISE" -o -v \
+                --dump "$out/compare-$attempt" | tee "$out/compare-$attempt.txt" || run_status=$?
+              attempts+=("$out/compare-$attempt.txt")
+              exit_codes+=(--exit-code "$run_status")
+              [ "$run_status" != 0 ] || break
+              [ "$attempt" = 2 ] || echo "$bench: a slowdown over ${NOISE}%: measuring again"
+            done
+            python3 -I .github/scripts/bench_verdict.py --bench "$bench" --aa "$out/aa.txt" \
+              --aa-seconds "$aa_seconds" --cpu-file "$RUNNER_TEMP/tango/cpu.txt" \
+              --aa-exit-code "$aa_status" "${exit_codes[@]}" "${attempts[@]}" | tee "$out/verdict.txt" || status=$?
+            {
+              echo "### tango: $bench, change against base"; echo '```'; cat "$out/verdict.txt"; echo '```'
+              echo '```'; cat "$out/aa.txt" "${attempts[@]}"; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cat "$out/verdict.txt" "$out/aa.txt" "${attempts[@]}" > "$out/bench.txt"
+            case "$(head -1 "$out/verdict.txt")" in
+              *environmental) echo "::warning::$bench: the runner shows over ${NOISE}% between two copies of the same binary: the comparison with the base is not counted" ;;
+              *regression) echo "::error::$bench: the same benchmark is over ${NOISE}% slower than on the base in both comparisons" ;;
+              *error) echo "::error::$bench: tango comparison failed or produced incomplete measurements" ;;
+            esac
+            return "$status"
+          }
           status=0
-          python3 -I .github/scripts/bench_verdict.py --aa "$tango/aa.txt" --aa-seconds "$aa_seconds" \
-            --cpu-file "$tango/cpu.txt" --aa-exit-code "$aa_status" "${exit_codes[@]}" "${attempts[@]}" | tee "$tango/verdict.txt" || status=$?
-          {
-            echo '### tango: change against base'; echo '```'; cat "$tango/verdict.txt"; echo '```'
-            echo '```'; cat "$tango/aa.txt" "${attempts[@]}"; echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          { cat "$tango/verdict.txt" "$tango/aa.txt" "${attempts[@]}"; } >> "$RUNNER_TEMP/bench.txt"
-          case "$(head -1 "$tango/verdict.txt")" in
-            *environmental) echo "::warning::the runner shows over ${NOISE}% between two copies of the same binary: the comparison with the base is not counted" ;;
-            *regression) echo "::error::the same benchmark is over ${NOISE}% slower than on the base in both comparisons" ;;
-            *error) echo "::error::tango comparison failed or produced incomplete measurements" ;;
-          esac
+          mapfile -t pairs < "$bin/pairs.txt"
+          for pair in "${pairs[@]}"; do
+            bench=${pair% *}
+            case "${pair#* }" in
+              identical)
+                mkdir -p "$RUNNER_TEMP/tango/$bench"
+                python3 -I .github/scripts/bench_verdict.py --bench "$bench" --unchanged "$RUNNER_TEMP/tango/pairs.json" \
+                  --cpu-file "$RUNNER_TEMP/tango/cpu.txt" | tee "$RUNNER_TEMP/tango/$bench/verdict.txt" || status=1
+                {
+                  echo "### tango: $bench"; echo "unchanged by this change: not judged (its bytes are the base's)"
+                  echo '```'; cat "$RUNNER_TEMP/tango/$bench/verdict.txt"; echo '```'
+                } >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              differs) judge "$bench" || status=1 ;;
+              head-only) echo "$bench: the base has no such benchmark, nothing to compare (its times are below)" ;;
+              *) echo "::error::$bench: bench_pair.py gave the pair no state this job knows: $pair"; status=1 ;;
+            esac
+          done
           exit "$status"
-      # On main, and on a pull request whose base has no benchmarks.
+      # On main, and for a benchmark whose base does not have it; also when a comparison failed.
       - name: Times
+        if: ${{ !cancelled() && steps.pairs.outcome == 'success' }}
         run: |
-          [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
-          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee -a "$RUNNER_TEMP/bench.txt"
-          { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          mapfile -t pairs < "$RUNNER_TEMP/bench/pairs.txt"
+          for pair in "${pairs[@]}"; do
+            bench=${pair% *}
+            [ "${pair#* }" = head-only ] || continue
+            mkdir -p "$RUNNER_TEMP/tango/$bench"
+            "$RUNNER_TEMP/bench/$bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/tango/$bench/times.txt"
+            { echo "### tango: $bench"; echo '```'; cat "$RUNNER_TEMP/tango/$bench/times.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Keep paired benchmark evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: tango-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/tango
-            ${{ runner.temp }}/bench.txt
+          path: ${{ runner.temp }}/tango
           retention-days: 7

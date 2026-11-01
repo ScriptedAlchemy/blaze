@@ -1,18 +1,14 @@
-//! The store's hot paths: the key a function is kept under, a record of a pack, the check of a
-//! sealed pack when it is first read, and a read of the store that finds a value or does not.
+//! The store's hot paths: a key under the identity of a build, a record of a pack, the check of
+//! a sealed pack when it is first read, and a read of the store that finds a value or does not.
+//! The key of a function's entry is the code generator's, measured in `ra-jit-bench-codegen`.
 //!
 //! Every benchmark does the same work on every run, so that tango can pair the binary of a
 //! change with the binary of its base.
 
 use std::hint::black_box;
 
-use hir_ty_codegen::bench::entry_key;
 use ra_jit_store::bench::{Salted, SealedStore, check_pack, encode_record, key_of};
 use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
-
-/// A name as long as a mangled generic function's.
-const NAME: &str = "_ZN4core4iter6traits8iterator8Iterator4fold17h0123456789abcdefE\
-                    <alloc::vec::into_iter::IntoIter<u32>, usize, closure>";
 
 /// What the store holds when the benchmarks read it: a thousand functions of 512 bytes.
 const COUNT: usize = 1000;
@@ -20,10 +16,6 @@ const LEN: usize = 512;
 
 fn benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("key/entry", |b| {
-            let program = key_of(7);
-            b.iter(move || entry_key(black_box(NAME), false, &program))
-        }),
         benchmark_fn("key/salted", |b| {
             let salted = Salted::new(b"a build", "a toolchain");
             let key = key_of(1);
