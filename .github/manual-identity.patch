@@ -1,0 +1,118 @@
+diff --git a/crates/ra-jit/build.rs b/crates/ra-jit/build.rs
+index ccf3821e9..faf7715a7 100644
+--- a/crates/ra-jit/build.rs
++++ b/crates/ra-jit/build.rs
+@@ -1,10 +1,10 @@
+ //! `RA_JIT_SOURCES`: what this build of ra-jit is built from, for the store to key what it
+ //! keeps by (`ra_jit_store::built_from`). A hash of every file of the workspace's crates, the
+ //! vendored ones included, of the manifest and lock file that pick the crates of crates.io, of
+-//! the files outside them a crate compiles in, of the features, the target and whether debug
+-//! assertions are on, which some of codegen checks under. The compiler that builds ra-jit is
+-//! not: what ra-jit compiles does not depend on it, and the toolchain it compiles against is
+-//! in the store's key apart. Two such builds of the same sources compile the same code into
++//! the files outside them a crate compiles in, of the features, target, effective cfg values
++//! and compiler flags (including debug assertions), which some of codegen checks under.
++//! The compiler that builds ra-jit is not: what ra-jit compiles does not depend on it, and
++//! the toolchain it compiles against is in the store's key apart. Two such builds of the same sources compile the same code into
+ //! the store, wherever they are built. Outside the workspace, as a published crate builds, it
+ //! is not set, and the store keys by the bytes of the executable.
+ //!
+@@ -49,7 +49,7 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
+         hash.update(&(bytes.len() as u64).to_le_bytes());
+         hash.update(bytes);
+     };
+-    field(b"blaze-source-identity-v2");
++    field(b"blaze-source-identity-v3");
+     for path in &files {
+         let bytes = std::fs::read(path)?;
+         let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
+@@ -75,8 +75,29 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
+         .collect();
+     features.sort();
+     field(features.join(" ").as_bytes());
+-    field(std::env::var("TARGET").unwrap_or_default().as_bytes());
+-    field(&[u8::from(std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some())]);
++    field(std::env::var("TARGET").map_err(std::io::Error::other)?.as_bytes());
++    // Cargo supplies the package's effective cfg and encoded flags to this
++    // script. Equal sources with a different custom cfg, target feature, panic
++    // strategy, or other codegen setting are not the same compiler. Do not
++    // inspect arbitrary environment values (which may be private or native).
++    let mut configuration = std::collections::BTreeMap::new();
++    for (name, value) in std::env::vars_os() {
++        let Ok(name) = name.into_string() else { continue };
++        if name.starts_with("CARGO_CFG_") || name == "CARGO_ENCODED_RUSTFLAGS" {
++            let value = value
++                .into_string()
++                .map_err(|_| std::io::Error::other("non-Unicode compiler configuration"))?;
++            configuration.insert(name, value);
++        }
++    }
++    field(b"compiler-configuration");
++    field(&(configuration.len() as u64).to_le_bytes());
++    for (name, value) in configuration {
++        field(name.as_bytes());
++        // Keep encoded argument boundaries and presence versus absence. Trying
++        // to normalize flags can collapse distinct cfg/codegen settings.
++        field(value.as_bytes());
++    }
+     Ok(hash.finish().iter().map(|byte| format!("{byte:02x}")).collect())
+ }
+ 
+diff --git a/harness/source_identity_test.py b/harness/source_identity_test.py
+index 7b150c5a9..2b40ed821 100644
+--- a/harness/source_identity_test.py
++++ b/harness/source_identity_test.py
+@@ -32,7 +32,8 @@ class SourceIdentityTests(unittest.TestCase):
+ 
+     def identity(self, root=None, **extra):
+         env = {k: v for k, v in os.environ.items()
+-               if not k.startswith("CARGO_FEATURE_") and k != "CARGO_CFG_DEBUG_ASSERTIONS"}
++               if not k.startswith(("CARGO_FEATURE_", "CARGO_CFG_"))
++               and k != "CARGO_ENCODED_RUSTFLAGS"}
+         env.update(CARGO_WORKSPACE_DIR=str(root or self.root), TARGET="test-target")
+         env.update(extra)
+         result = subprocess.run([SCRIPT], env=env, capture_output=True, text=True,
+@@ -160,6 +161,43 @@ class SourceIdentityTests(unittest.TestCase):
+         self.addCleanup(path.chmod, 0o700)
+         self.assertIsNone(self.identity())
+ 
++    def test_effective_custom_cfg_changes_compiler_identity(self):
++        original = self.identity(CARGO_CFG_COMPILER_MODE="first")
++        self.assertIsNotNone(original)
++        self.assertNotEqual(original, self.identity(CARGO_CFG_COMPILER_MODE="second"))
++        self.assertNotEqual(self.identity(), self.identity(CARGO_CFG_UNCHECKED_COMPILER=""))
++
++    def test_target_features_and_panic_strategy_change_identity(self):
++        self.assertNotEqual(self.identity(CARGO_CFG_TARGET_FEATURE="sse2"),
++                            self.identity(CARGO_CFG_TARGET_FEATURE="avx2,sse2"))
++        self.assertNotEqual(self.identity(CARGO_CFG_PANIC="abort"),
++                            self.identity(CARGO_CFG_PANIC="unwind"))
++
++    def test_effective_encoded_flags_and_argument_boundaries_are_preserved(self):
++        self.assertNotEqual(self.identity(), self.identity(CARGO_ENCODED_RUSTFLAGS=""))
++        self.assertNotEqual(self.identity(CARGO_ENCODED_RUSTFLAGS="--cfg\x1fmode_a"),
++                            self.identity(CARGO_ENCODED_RUSTFLAGS="--cfg\x1fmode_b"))
++        self.assertNotEqual(self.identity(CARGO_ENCODED_RUSTFLAGS="-C\x1fopt-level=2"),
++                            self.identity(CARGO_ENCODED_RUSTFLAGS="-C opt-level=2"))
++
++    def test_configuration_order_does_not_split_identity(self):
++        first = {"CARGO_CFG_A": "one", "CARGO_CFG_B": "two", "CARGO_ENCODED_RUSTFLAGS": "-C\x1fopt-level=2"}
++        self.assertEqual(self.identity(**first), self.identity(**dict(reversed(list(first.items())))))
++
++    @unittest.skipUnless(os.name == "posix", "Unix native configuration fixture")
++    def test_non_unicode_relevant_configuration_uses_binary_identity(self):
++        invalid = os.fsdecode(b"\xff")
++        self.assertIsNone(self.identity(CARGO_CFG_PRIVATE_MODE=invalid))
++        self.assertIsNone(self.identity(CARGO_ENCODED_RUSTFLAGS=invalid))
++        self.assertIsNone(self.identity(TARGET=invalid))
++
++    def test_ineffective_plain_flags_do_not_override_cargo_encoded_flags(self):
++        # Cargo removes RUSTFLAGS before executing a build script. A synthetic
++        # caller setting it must not override the recorded effective flags.
++        before = self.identity(CARGO_ENCODED_RUSTFLAGS="--cfg\x1fmode_a")
++        self.assertEqual(before, self.identity(CARGO_ENCODED_RUSTFLAGS="--cfg\x1fmode_a",
++                                               RUSTFLAGS="--cfg unrelated"))
++
+     def test_missing_required_source_fact_uses_binary_identity(self):
+         (self.root / "harness/toolchain").unlink()
+         self.assertIsNone(self.identity())
