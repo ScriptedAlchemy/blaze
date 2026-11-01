@@ -222,6 +222,89 @@ fn parent_components_require_observed_directories_and_keep_missing_prefixes_miss
 }
 
 #[cfg(unix)]
+#[test]
+#[allow(clippy::print_stderr)]
+fn an_unreadable_directory_is_an_observation_and_refuses_reads_below_it() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let work = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(work.path()).unwrap();
+    let root = base.join("root");
+    let private = base.join("external/private");
+    fs::create_dir_all(root.join("include")).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::write(root.join("include/header.h"), b"header").unwrap();
+    fs::write(private.join("secret.h"), b"secret").unwrap();
+    // The denied directory is reached through a directory symlink, as Debian's
+    // /usr/lib/ssl/private is reached from the captured /usr/lib.
+    symlink("../external/private", root.join("keys")).unwrap();
+
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+    let privileged = fs::read_dir(&private).is_ok();
+    let first = Tree::capture(&root);
+    let second = Tree::capture(&root);
+    let single = Tree::capture(&root.join("keys"));
+    let batch = Tree::capture_many(&[root.clone(), root.join("keys")]);
+    let closure = first.as_ref().ok().map(|tree| Closure {
+        roots: vec![Root { name: "linker/libraries/0".to_owned(), tree: tree.clone() }],
+    });
+    let encoded = closure.as_ref().map(Closure::encode_bindings);
+    let decoded = encoded.as_ref().and_then(|bytes| Closure::from_bindings(bytes).ok());
+    let validated = closure.as_ref().map(Closure::validate);
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    if privileged {
+        eprintln!(
+            "skipping: this process may read a 0o000 directory (running as root?), so a denied \
+             listing cannot be observed"
+        );
+        return;
+    }
+
+    let tree = first.unwrap();
+    let again = second.unwrap();
+    assert_eq!(tree.entry(Path::new("keys")).unwrap().kind, Kind::Unreadable);
+    assert_eq!(
+        tree.entry(Path::new("keys")).unwrap().links,
+        vec![std::path::PathBuf::from("../external/private")]
+    );
+    assert!(
+        tree.entry(Path::new("keys/secret.h")).is_none(),
+        "nothing below an unreadable directory is bound"
+    );
+    assert_eq!(tree.digest(), again.digest(), "the observation is stable");
+    assert_eq!(tree.entries, again.entries);
+
+    let single = single.unwrap();
+    let batch = batch.unwrap();
+    assert_eq!(batch[0].digest(), tree.digest());
+    assert_eq!(batch[1].digest(), single.digest(), "a re-rooted alias agrees");
+
+    let closure = closure.unwrap();
+    assert_eq!(decoded.unwrap().digest(), closure.digest(), "the bound identity survives CBOR");
+    validated.unwrap().unwrap();
+
+    // Everything outside the denial is admitted; a toolchain that never reads below it works.
+    let header = root.join("include/header.h");
+    let observed = closure.entry(&header).unwrap();
+    closure.admit(&header, &observed).unwrap();
+    assert_eq!(closure.entry(&root.join("keys")).unwrap().kind, Kind::Unreadable);
+
+    // A read below it is an unbound input, refused by name.
+    let secret = Entry {
+        links: Vec::new(),
+        kind: Kind::File { digest: [0; 32], len: 6, executable: false },
+    };
+    let refused = closure.admit(&root.join("keys/secret.h"), &secret).unwrap_err();
+    assert!(refused.to_string().contains("unbound native input"), "{refused}");
+    assert!(refused.to_string().contains("keys/secret.h"), "{refused}");
+
+    // The denial is part of the identity: once the members can be read, the binding is stale.
+    assert_ne!(Tree::capture(&root).unwrap().digest(), closure.roots[0].tree.digest());
+    assert!(Closure::from_bindings(&encoded.unwrap()).is_err());
+    assert!(closure.validate().is_err());
+}
+
+#[cfg(unix)]
 fn ancestor_path(aliased: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::symlink;
     let work = tempfile::tempdir().unwrap();

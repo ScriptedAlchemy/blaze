@@ -219,10 +219,20 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
         super::admit_inputs(program)?;
     }
     let mut published_support = false;
+    let mut debug_objects = Vec::new();
     let result = (|| -> anyhow::Result<i32> {
         for (program, (destination, kept)) in programs.iter_mut().zip(places) {
             if program.output == Output::Doctest {
                 continue;
+            }
+            if program.output == Output::Executable && reads_objects(&prepared, program.unit) {
+                let directory = program.executable.parent().context("artifact has no parent")?;
+                debug_objects.extend(
+                    ["compiled.o", "compiled.std.o"]
+                        .map(|name| directory.join(name))
+                        .into_iter()
+                        .filter(|it| it.is_file()),
+                );
             }
             let unit = native[program.unit as usize];
             std::fs::create_dir_all(
@@ -263,7 +273,7 @@ fn build(asked: &Invocation, format: super::super::messages::Format) -> anyhow::
             tests.as_ref(),
         )
     })();
-    let mut retained = BTreeSet::new();
+    let mut retained: BTreeSet<_> = debug_objects.into_iter().collect();
     if published_support {
         retained.extend(producers.prepared.outputs.values().map(|(out, _)| out.clone()));
         if producers.cargo.starts_with(work.path()) {
@@ -479,6 +489,19 @@ fn bind_binaries(
     Ok(())
 }
 
+/// Whether a debugger reads the code of the program the root `unit` links from the objects it
+/// was linked from, which the program names: on Apple's platforms, whose linker copies none of
+/// it into the program, and with `split-debuginfo = "unpacked"`. Cargo leaves rustc's objects
+/// for it then, and these stay where the link named them.
+fn reads_objects(prepared: &Prepared, unit: u32) -> bool {
+    let build = &prepared.resolved.spec.build;
+    let profile = &build.units[unit as usize].profile;
+    let described = build.units.iter().any(|unit| !unit.host && unit.profile.debug > 0);
+    described
+        && profile.strip == 0
+        && (prepared.host.triple.contains("-apple-") || profile.split_debuginfo == 2)
+}
+
 fn publish(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let directory = destination.parent().context("artifact has no parent")?;
     std::fs::create_dir_all(directory)?;
@@ -597,6 +620,26 @@ mod tests {
         assert!(!job.join("compiler-home").exists());
         assert!(cargo.is_file());
         assert_eq!(std::fs::read(support.join("runtime-data")).unwrap(), b"current producer data");
+    }
+
+    /// The objects a program's debug map names stay where its link found them, as cargo
+    /// leaves rustc's: everything else of the job goes.
+    #[test]
+    fn the_objects_a_debugger_reads_stay_where_the_program_names_them() {
+        let work = tempfile::tempdir().unwrap();
+        let job = work.path().join("job");
+        let unit = job.join("artifacts/unit-0");
+        std::fs::create_dir_all(&unit).unwrap();
+        for name in ["compiled.o", "compiled.std.o", "inputs.cbor", "rust-project.json"] {
+            std::fs::write(unit.join(name), name).unwrap();
+        }
+        std::fs::write(unit.join("program"), b"executable").unwrap();
+        publish(&unit.join("program"), &work.path().join("target/debug/program")).unwrap();
+        let kept = BTreeSet::from([unit.join("compiled.o"), unit.join("compiled.std.o")]);
+        prune_support(&job, &kept).unwrap();
+        assert_eq!(std::fs::read(unit.join("compiled.o")).unwrap(), b"compiled.o");
+        assert_eq!(std::fs::read(unit.join("compiled.std.o")).unwrap(), b"compiled.std.o");
+        assert!(!unit.join("inputs.cbor").exists() && !unit.join("rust-project.json").exists());
     }
 
     #[test]

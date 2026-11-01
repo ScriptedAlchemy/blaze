@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """The verdicts of `bench_verdict.py`, on tango's output as run 41131270465 of PR18 printed it."""
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("bench_verdict", Path(__file__).with_name("bench_verdict.py"))
@@ -66,7 +70,7 @@ class VerdictTest(unittest.TestCase):
     def test_a_control_that_measured_nothing_does_not_excuse_a_regression(self):
         verdict, status, report = self.judge(run(measured=False), run(["store/has_miss"]), run(["store/has_miss"]))
         self.assertEqual((verdict, status), ("regression", 1))
-        self.assertIn("A/A control (bench-base against a copy of itself, 21 s): measured nothing", report)
+        self.assertIn("A/A control (the base against a copy of itself, 21 s): measured nothing", report)
 
     def test_measuring_nothing_in_the_last_comparison_fails(self):
         self.assertEqual(self.judge(run(), run(["store/has_miss"]), run(measured=False))[:2], ("error", 1))
@@ -121,12 +125,65 @@ class VerdictTest(unittest.TestCase):
         cpu = (
             "Model name:                              AMD EPYC 7763 64-Core Processor\n"
             "CPU(s):                                  4\n"
-            "flags : fpu\n" + "a" * 64 + "  /tmp/bench-base\n" + "b" * 64 + "  /tmp/bench-head\n"
+            "flags : fpu\n" + "a" * 64 + "  /tmp/bench/store-base\n" + "b" * 64 + "  /tmp/bench/store-head\n"
+            + "c" * 64 + "  /tmp/bench/codegen-head\n"
         )
         self.assertEqual(
-            bench_verdict.cpu_line(cpu),
-            "AMD EPYC 7763 64-Core Processor (4 CPUs); bench-base " + "a" * 12 + ", bench-head " + "b" * 12,
+            bench_verdict.cpu_line(cpu, "store"),
+            "AMD EPYC 7763 64-Core Processor (4 CPUs); store-base " + "a" * 12 + ", store-head " + "b" * 12,
         )
+        self.assertTrue(bench_verdict.cpu_line(cpu).endswith(", codegen-head " + "c" * 12))
+
+
+class UnchangedTest(unittest.TestCase):
+    """A pair whose two binaries are one is passed without tango; nothing else is."""
+
+    def main(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = bench_verdict.main(list(argv))
+        return status, out.getvalue()
+
+    def pairs(self, *rows):
+        temp = tempfile.TemporaryDirectory(prefix="bench-verdict-test-")
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "pairs.json"
+        path.write_text(json.dumps(list(rows)))
+        return str(path)
+
+    def test_identical_pair_is_not_judged(self):
+        pairs = self.pairs({"bench": "store", "state": "identical", "head": "d" * 64, "base": "d" * 64},
+                           {"bench": "codegen", "state": "differs", "head": "e" * 64, "base": "f" * 64})
+        status, report = self.main("--bench", "store", "--unchanged", pairs)
+        self.assertEqual(status, 0)
+        self.assertEqual(report.splitlines()[0], "tango verdict: unchanged")
+        self.assertIn("store: unchanged by this change: not judged (its bytes are the base's)", report)
+
+    def test_differing_pair_cannot_be_passed_unrun(self):
+        for row in ({"bench": "store", "state": "differs", "head": "e" * 64, "base": "f" * 64},
+                    {"bench": "store", "state": "identical", "head": "e" * 64, "base": "f" * 64},
+                    {"bench": "store", "state": "head-only", "head": "e" * 64, "base": None},
+                    {"bench": "codegen", "state": "identical", "head": "d" * 64, "base": "d" * 64}):
+            with self.subTest(row=row):
+                status, report = self.main("--bench", "store", "--unchanged", self.pairs(row))
+                self.assertEqual((status, report.splitlines()[0]), (1, "tango verdict: error"))
+
+    def test_differing_pair_is_judged_from_tango(self):
+        temp = tempfile.TemporaryDirectory(prefix="bench-verdict-test-")
+        self.addCleanup(temp.cleanup)
+        aa, first, second = (Path(temp.name) / name for name in ("aa.txt", "compare-1.txt", "compare-2.txt"))
+        aa.write_text(run())
+        first.write_text(run(["store/get_hit"]))
+        second.write_text(run(["store/get_hit"]))
+        status, report = self.main("--bench", "store", "--aa", str(aa), "--exit-code", "1", "--exit-code", "1",
+                                   str(first), str(second))
+        self.assertEqual((status, report.splitlines()[0]), (1, "tango verdict: regression"))
+
+    def test_the_two_modes_do_not_mix(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.main("--bench", "store", "--unchanged", self.pairs(), "--aa", "aa.txt", "compare-1.txt")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.main("--bench", "store")
 
 
 if __name__ == "__main__":

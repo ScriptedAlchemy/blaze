@@ -181,23 +181,51 @@ def produced(messages):
     return files, executables
 
 
-# Keep the C2 comparison's code-layout policy in the build job, not in a
-# consumer that is forbidden to recompile. Both sides inherit the same flags.
-BENCH_ALIGNMENT_FLAGS = ["-C", "llvm-args=-align-all-functions=6",
-                         "-C", "llvm-args=-align-all-nofallthru-blocks=5"]
+def workspace_targets(cwd):
+    """Every (package, kind, target) of the cargo workspace checked out at `cwd`."""
+    out = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=cwd,
+                         check=True, capture_output=True, text=True).stdout
+    return {(package["name"], kind, target["name"])
+            for package in json.loads(out)["packages"]
+            for target in package["targets"] for kind in target["kind"]}
 
 
-def benchmark_environment(parent):
-    env = dict(parent)
-    if "CARGO_ENCODED_RUSTFLAGS" in env:
-        encoded = env["CARGO_ENCODED_RUSTFLAGS"]
-        inherited = encoded.split("\x1f") if encoded else []
-    else:
-        inherited = env.get("RUSTFLAGS", "").split()
-    flags = inherited + BENCH_ALIGNMENT_FLAGS
-    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
-    env.pop("RUSTFLAGS", None)
-    return env, flags
+def missing(requires, source, cwd):
+    """Why the checkout at `cwd` lacks what a set `requires`, or None when it has it.
+
+    `requires` is {"package": <name>} with at most one of `bench`, `bin`, `example`, `test`
+    naming a target of that kind. It is read from `cargo metadata`, not from a directory, so a
+    base whose package of that name exists elsewhere, or has no such target, is told apart.
+    """
+    kinds = [k for k in requires if k != "package"]
+    if set(requires) - {"package", "bench", "bin", "example", "test"} or len(kinds) > 1 \
+            or "package" not in requires:
+        die(f"requires {requires!r} is not {{package, and at most one target kind}}")
+    have = workspace_targets(cwd)
+    package = requires["package"]
+    if kinds:
+        kind, target = kinds[0], requires[kinds[0]]
+        if (package, kind, target) not in have:
+            return f"the {source} has no package {package} with {kind} target {target}"
+    elif not any(name == package for name, _, _ in have):
+        return f"the {source} has no package {package}"
+    return None
+
+
+def rustflags(spec, cwd, target_dir):
+    """The flags of a set: its own, then, with `remap-paths`, its checkout and target directory
+    remapped to /source and /target. The base is built in a worktree and a target directory of
+    its own, and a path in the binary (a build script's OUT_DIR in a panic's location, as
+    cranelift-codegen's generated code has) would make the same source two different binaries.
+    The target directory comes last: it may be inside the checkout, and rustc applies the last
+    prefix that matches."""
+    flags = list(spec.get("rustflags", []))
+    if spec.get("remap-paths"):
+        for path, to in ((cwd, "/source"), (target_dir, "/target")):
+            # As cargo is given it and as it resolves, should a link lie between.
+            for prefix in dict.fromkeys([os.path.abspath(path), os.path.realpath(path)]):
+                flags.append(f"--remap-path-prefix={prefix}={to}")
+    return flags
 
 
 def build(args):
@@ -214,6 +242,9 @@ def build(args):
         kind = next(k for k in ("test", "build", "bench") if k in spec)
         cwd = base["workspace"]
         entry = {"kind": kind, "args": spec[kind], "source": spec.get("source", "head")}
+        for field in ("rustflags", "remap-paths", "requires"):
+            if field in spec:
+                entry[field] = spec[field]
         if entry["source"] == "base":
             if not args.base_sha:
                 entry.update(absent=True, reason="no base commit (not a pull request)")
@@ -223,14 +254,24 @@ def build(args):
             if not Path(cwd).exists():
                 git("worktree", "add", "--detach", cwd, args.base_sha)
             entry["identity"] = source_identity(cwd)
-        if spec.get("requires") and not (Path(cwd) / spec["requires"]).exists():
-            entry.update(absent=True, reason=f"{spec['requires']} does not exist in {entry['source']}")
-            out[name] = entry
-            continue
+        if spec.get("requires"):
+            reason = missing(spec["requires"], entry["source"], cwd)
+            if reason:
+                entry.update(absent=True, reason=reason)
+                out[name] = entry
+                continue
         env = dict(os.environ)
         if entry["source"] == "base":
             # A target directory of its own beside the head's, built by the same shell and flags.
             env["CARGO_TARGET_DIR"] = str(Path(base["workspace"]) / "target" / "bundle-base")
+        if "rustflags" in spec or spec.get("remap-paths"):
+            # The set's flags are the whole of rustc's: one set by the job as well would be
+            # replaced without a word, so it is refused instead.
+            for var in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+                if os.environ.get(var):
+                    die(f"set {name} has its own rustflags, and the job sets {var}")
+            target_dir = Path(cwd) / (env.get("CARGO_TARGET_DIR") or "target")
+            env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags(spec, cwd, target_dir))
         if kind == "test":
             recordfile = temp / f"{name}.jsonl"
             recordfile.write_text("")
@@ -241,7 +282,6 @@ def build(args):
             (temp / f"{name}.env.json").write_text(json.dumps(env))
             command = ["cargo", "test", "--locked", "--message-format=json-render-diagnostics", *spec[kind]]
         elif kind == "bench":
-            env, entry["rustflags"] = benchmark_environment(env)
             command = ["cargo", "bench", "--locked", "--no-run", "--message-format=json-render-diagnostics", *spec[kind]]
         else:
             command = ["cargo", "build", "--locked", "--message-format=json-render-diagnostics", *spec[kind]]

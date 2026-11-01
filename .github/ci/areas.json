@@ -30,7 +30,8 @@
       ".github/workflows/blaze-dist-review.yaml"
     ],
     "ignore": [
-      "crates/ra-jit-bench/**",
+      "crates/ra-jit-bench-store/**",
+      "crates/ra-jit-bench-codegen/**",
       "crates/ra-jit-fuzz/**",
       "crates/ra-jit-wasm/**"
     ]
@@ -45,7 +46,8 @@
       ".github/workflows/blaze-serve-review.yaml"
     ],
     "ignore": [
-      "crates/ra-jit-bench/**",
+      "crates/ra-jit-bench-store/**",
+      "crates/ra-jit-bench-codegen/**",
       "crates/ra-jit-fuzz/**",
       "crates/ra-jit-wasm/**"
     ]
