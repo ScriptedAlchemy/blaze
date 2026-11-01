@@ -427,40 +427,14 @@ impl Tree {
             ResolvedKind::Missing => Kind::Missing,
             ResolvedKind::Cycle => Kind::Cycle,
             ResolvedKind::File(metadata) => {
-                let before = Stamp::of(&metadata)?;
-                let mut file = fs::File::open(&path)?;
-                if Stamp::of(&file.metadata()?)? != before {
-                    return Err(changed(&path));
-                }
-                let mut hash = Sha256::new();
-                let mut len = 0;
-                let mut buffer = [0; 64 * 1024];
-                loop {
-                    let count = file.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    len += count as u64;
-                    hash.update(&buffer[..count]);
-                }
-                if Stamp::of(&file.metadata()?)? != before
-                    || Stamp::of(&fs::metadata(&path)?)? != before
-                    || len != metadata.len()
-                {
-                    return Err(changed(&path));
-                }
-                Kind::File {
-                    digest: hash.finalize().into(),
-                    len,
-                    executable: executable(&metadata),
-                }
+                let (digest, len) = read_file(&path, &metadata, &mut || {})?;
+                Kind::File { digest, len, executable: executable(&metadata) }
             }
-            ResolvedKind::Directory(metadata) => {
+            ResolvedKind::Directory(_) => {
                 if !active.insert(path.clone()) {
                     self.entries.insert(logical.to_owned(), Entry { links, kind: Kind::Cycle });
                     return Ok(());
                 }
-                let before = Stamp::of(&metadata)?;
                 let children = match names(&path) {
                     Ok(children) => Some(children),
                     Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
@@ -481,8 +455,11 @@ impl Tree {
                                 active,
                             )?;
                         }
-                        if names(&path)? != children || Stamp::of(&fs::metadata(&path)?)? != before
-                        {
+                        // Membership is what a directory binds: an entry added, removed or
+                        // renamed while its children were read. Its stamp alone is not
+                        // (a child relinked in place, as Nix's store optimiser does, changes
+                        // the directory's ctime); each child's bytes were checked as read.
+                        if names(&path)? != children {
                             return Err(changed(&path));
                         }
                         active.remove(&path);
@@ -583,10 +560,19 @@ fn resolve(path: &Path) -> io::Result<Resolved> {
     let mut ancestors = BTreeMap::new();
     let (resolved, kind) =
         resolve_path(path, &mut BTreeSet::new(), &mut links, &mut ancestors, None)?;
-    if let ResolvedKind::File(metadata) | ResolvedKind::Directory(metadata) = &kind
-        && Stamp::of(metadata)? != Stamp::of(&fs::metadata(path)?)?
-    {
-        return Err(changed(path));
+    // What the path reaches must still be of the kind found: a file's bytes and a
+    // directory's members are checked as they are read, so a stamp alone is not compared
+    // (a file relinked in place by Nix's store optimiser keeps its bytes and changes its
+    // inode and ctime).
+    if let ResolvedKind::File(_) | ResolvedKind::Directory(_) = &kind {
+        let now = fs::metadata(path)?;
+        let same = match &kind {
+            ResolvedKind::File(_) => now.is_file(),
+            _ => now.is_dir(),
+        };
+        if !same {
+            return Err(changed(path));
+        }
     }
     Ok(Resolved { path: resolved, links, ancestors, kind })
 }
@@ -642,7 +628,9 @@ fn resolve_path(
                         return Ok((current, ResolvedKind::Cycle));
                     }
                     let target = fs::read_link(&current)?;
-                    if Stamp::of(&fs::symlink_metadata(&current)?)? != Stamp::of(&found)? {
+                    // The link's target is what it binds; its stamp is not (relinking it in
+                    // place leaves the same target).
+                    if fs::read_link(&current)? != target {
                         return Err(changed(&current));
                     }
                     // Prefix expansions precede the captured root. The final root's
@@ -730,6 +718,50 @@ fn executable(metadata: &Metadata) -> bool {
     }
 }
 
+/// The digest and length of the file at `path`, read whole. A file whose stamp moves while it
+/// is read is read again, and is the input it was when its bytes are the same both times: Nix's
+/// store optimiser relinks a file in place, which changes its inode and ctime and not a byte,
+/// and a build elsewhere may touch it. Bytes that differ between two reads are a changed input.
+/// `between` runs after the first read, for a test to move the file.
+fn read_file(
+    path: &Path,
+    metadata: &Metadata,
+    between: &mut dyn FnMut(),
+) -> io::Result<(Digest, u64)> {
+    let mut before = Stamp::of(metadata)?;
+    let mut first: Option<(Digest, u64)> = None;
+    for _ in 0..3 {
+        let mut file = fs::File::open(path)?;
+        let opened = Stamp::of(&file.metadata()?)?;
+        let mut hash = Sha256::new();
+        let mut len = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            len += count as u64;
+            hash.update(&buffer[..count]);
+        }
+        between();
+        let read: (Digest, u64) = (hash.finalize().into(), len);
+        match first {
+            Some(it) if it != read => return Err(changed(path)),
+            _ => {}
+        }
+        let after = Stamp::of(&file.metadata()?)?;
+        let now = fs::metadata(path)?;
+        if opened == before && after == before && Stamp::of(&now)? == before {
+            return Ok(read);
+        }
+        // Moved while read: the next read has to find the same bytes.
+        first = Some(read);
+        before = Stamp::of(&now)?;
+    }
+    Err(changed(path))
+}
+
 fn changed(path: &Path) -> io::Error {
     io::Error::other(format!("native input changed while reading {}", path.display()))
 }
@@ -796,5 +828,69 @@ mod digest_compatibility_tests {
                 0x44, 0xbe, 0x8c, 0x35,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    fn written(dir: &Path, bytes: &[u8]) -> (PathBuf, Metadata) {
+        let path = dir.join("input");
+        fs::write(&path, bytes).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        (path, metadata)
+    }
+
+    #[test]
+    fn a_file_moved_while_read_is_the_input_when_its_bytes_are_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, metadata) = written(dir.path(), b"the same bytes");
+        let mut moved = 0;
+        let later = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let (digest, len) = read_file(&path, &metadata, &mut || {
+            // Relinked in place, as Nix's store optimiser does: a new stamp, the same bytes.
+            if moved == 0 {
+                let again = dir.path().join("again");
+                fs::copy(&path, &again).unwrap();
+                fs::rename(&again, &path).unwrap();
+                fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+            }
+            moved += 1;
+        })
+        .unwrap();
+        assert_eq!(moved, 2, "read again after the move, then at rest");
+        assert_eq!(len, 14);
+        let expected: Digest = Sha256::digest(b"the same bytes").into();
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn a_file_whose_bytes_change_while_read_is_a_changed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, metadata) = written(dir.path(), b"first bytes");
+        let mut moved = 0;
+        let error = read_file(&path, &metadata, &mut || {
+            if moved == 0 {
+                fs::write(&path, b"other bytes").unwrap();
+            }
+            moved += 1;
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed while reading"), "{error}");
+    }
+
+    #[test]
+    fn a_file_that_never_rests_is_a_changed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, metadata) = written(dir.path(), b"restless");
+        let mut tick = 0_u64;
+        let error = read_file(&path, &metadata, &mut || {
+            tick += 1;
+            let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(tick);
+            fs::File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed while reading"), "{error}");
     }
 }
