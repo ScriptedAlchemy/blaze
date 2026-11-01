@@ -293,16 +293,9 @@ impl Profile {
                 anyhow::bail!("`debug = {level}`: ra-jit does not know the level")
             }
         };
-        // Stripping the symbols is the linker's to do; of what ra-jit writes, what a debugger
-        // reads is all either setting takes out.
-        let stripped = match &self.strip {
-            Strip::Resolved(Stripped::Named(what)) => match what.as_str() {
-                "none" => false,
-                "debuginfo" | "symbols" => true,
-                _ => anyhow::bail!("`strip = \"{what}\"`: ra-jit does not know the setting"),
-            },
-            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
-        };
+        // The link takes out what a debugger reads, whichever is stripped (`link::Strip`): ra-jit
+        // does not write it.
+        let stripped = self.strip()? != crate::link::Strip::None;
         if stripped || level == Level::Nothing {
             return Ok(Described::NOTHING);
         }
@@ -315,6 +308,16 @@ impl Profile {
             }
         };
         Ok(Described { level, kept, frame_pointers: false })
+    }
+
+    /// What the link of a program of this profile takes out of it. One cargo deferred is its
+    /// own choice for a build without debug info, which has nothing the setting would take out.
+    pub(crate) fn strip(&self) -> anyhow::Result<crate::link::Strip> {
+        match &self.strip {
+            Strip::Resolved(Stripped::Named(what)) => crate::link::Strip::named(what)
+                .with_context(|| format!("`strip = \"{what}\"`: ra-jit does not know the setting")),
+            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => Ok(crate::link::Strip::None),
+        }
     }
 
     /// Whether rustc compiles the whole program again when it links it.
@@ -434,6 +437,8 @@ pub(crate) struct Whole {
     /// Whether `--cap-lints` or `--force-warn` is among the flags, so that a lint the source
     /// denies may not fail rustc's build.
     pub(crate) lints_capped: bool,
+    /// What the link of the program takes out of it: the setting of the crate that is linked.
+    pub(crate) strip: crate::link::Strip,
 }
 
 impl Plan {
@@ -640,7 +645,13 @@ impl Plan {
     /// What the plan says of the programs cargo was asked to build.
     pub(crate) fn whole(&self) -> anyhow::Result<Whole> {
         let debug = Described { frame_pointers: self.frame_pointers, ..self.described()? };
-        Ok(Whole { debug, lto: self.lto, lints_capped: self.lints_capped })
+        // The programs are those of the packages cargo was asked to build, which a profile has
+        // alike unless a package's own section says otherwise: then the most any of them strips.
+        let mut strip = crate::link::Strip::None;
+        for built in self.packages.values().filter(|it| it.primary && it.for_target) {
+            strip = strip.max(built.profile.strip()?);
+        }
+        Ok(Whole { debug, lto: self.lto, lints_capped: self.lints_capped, strip })
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
@@ -822,6 +833,44 @@ impl UnitGraph {
 #[cfg(test)]
 mod tests {
     use super::{Flags, UnitGraph};
+
+    /// `strip` is the linked program's: the profile's, or the `-C strip` of the flags over it,
+    /// and what a debugger reads is then not written at all.
+    #[test]
+    fn strip_is_the_profiles_or_the_flags() {
+        let graph = |strip: serde_json::Value| -> UnitGraph {
+            let profile = serde_json::json!({
+                "opt_level": "0", "lto": "false", "debug_assertions": true,
+                "overflow_checks": true, "panic": "unwind", "debuginfo": 2,
+                "split_debuginfo": null, "strip": strip
+            });
+            serde_json::from_value(serde_json::json!({
+                "roots": [0],
+                "units": [{"pkg_id":"path+file:///w/app#app@0.1.0",
+                    "target":{"kind":["bin"],"crate_types":["bin"]},
+                    "profile":profile, "features":[], "dependencies":[]}]
+            }))
+            .unwrap()
+        };
+        let whole = |strip, flags: &str| {
+            graph(strip).plan(&Flags::parse(flags.split_whitespace()), false).unwrap().whole()
+        };
+        use crate::link::Strip;
+        let none = whole(serde_json::json!({"resolved": "None"}), "").unwrap();
+        assert_eq!(none.strip, Strip::None);
+        assert_eq!(none.debug.level, super::Level::Full);
+        let symbols = whole(serde_json::json!({"resolved": {"Named": "symbols"}}), "").unwrap();
+        assert_eq!(symbols.strip, Strip::Symbols);
+        assert_eq!(symbols.debug.level, super::Level::Nothing);
+        let debuginfo = whole(serde_json::json!({"resolved": {"Named": "debuginfo"}}), "").unwrap();
+        assert_eq!(debuginfo.strip, Strip::Debuginfo);
+        // A strip cargo deferred strips nothing a build with debug info has.
+        let deferred = whole(serde_json::json!({"deferred": {"Named": "debuginfo"}}), "").unwrap();
+        assert_eq!(deferred.strip, Strip::None);
+        let flagged = whole(serde_json::json!({"resolved": "None"}), "-C strip=symbols").unwrap();
+        assert_eq!(flagged.strip, Strip::Symbols);
+        assert!(whole(serde_json::json!({"resolved": {"Named": "all"}}), "").is_err());
+    }
 
     #[test]
     fn explicit_target_flags_are_not_given_to_host_only_proc_macro_units() {

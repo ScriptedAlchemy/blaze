@@ -270,7 +270,7 @@ pub fn programs(
 pub fn preflight(prepared: &Prepared, allow_producers: bool) -> anyhow::Result<()> {
     let build = &prepared.resolved.spec.build;
     let native = canonical_units(build, &prepared.resolved.graph)?;
-    for (at, unit) in native.iter().enumerate() {
+    for unit in &native {
         let label = format!("{}:{}", unit.package.name, unit.target.name);
         if !allow_producers {
             match unit.target.kind {
@@ -301,10 +301,6 @@ pub fn preflight(prepared: &Prepared, allow_producers: bool) -> anyhow::Result<(
         ensure!(
             unit.dependencies.iter().all(|dep| !dep.noprelude && !dep.public && !dep.nounused),
             "owned BuildSpec replay cannot represent special extern options of {label}"
-        );
-        ensure!(
-            build.units[at].profile.strip != 2,
-            "owned BuildSpec replay does not yet strip native symbols for {label}"
         );
     }
     for root in roots(build, &native) {
