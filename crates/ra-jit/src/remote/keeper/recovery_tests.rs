@@ -116,3 +116,84 @@ fn a_failed_lazy_refresh_preserves_the_previous_lookup() {
     fixture.look();
     assert!(fixture.shared.asked.saw(observed));
 }
+
+/// Freeze the manifest publication under the directory remote's actual CAS lock.
+/// A peer publishes after the keeper starts uploading, before its CAS can commit.
+/// No sleeps choose the ordering: the uploaded keys object is the barrier.
+#[test]
+fn publishing_cannot_acknowledge_a_peers_unpulled_pack() {
+    use ra_jit_store::Store;
+    use std::fs::File;
+
+    for lazy in [false, true] {
+        let fixture = Fixture::new(lazy);
+        let manifest = fixture.remote_dir.join(Manifest::at("recovery"));
+        std::fs::write(&manifest, b"").unwrap();
+        fixture.look();
+        let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+        assert!(fixture.shared.asked.saw(observed));
+
+        ra_jit_store::compiles_against("keeper-publication-regression");
+        let local = Store::owned(&fixture.shared.store).unwrap();
+        local.insert(&[41; 32], b"this worker's compiled entry");
+        let own_packs = local.seal_checked().unwrap();
+        assert_eq!(own_packs.len(), 1);
+        let own_bytes = local.pack(&own_packs[0]).unwrap();
+        let own_keys = ra_jit_store::pack_keys(&own_packs[0], &own_bytes).unwrap().concat();
+        let uploaded_keys = fixture.remote_dir.join(keys_object(&Digest::of(&own_keys)));
+        assert!(!uploaded_keys.exists());
+
+        let peer_store = Store::owned(&fixture._work.path().join("peer")).unwrap();
+        peer_store.insert(&[42; 32], b"a different worker's compiled entry");
+        let peer_packs = peer_store.seal_checked().unwrap();
+        let peer_pack = peer_store.pack(&peer_packs[0]).unwrap();
+        let peer_digest = Digest::of(&peer_pack);
+        let peer_keys = ra_jit_store::pack_keys(&peer_packs[0], &peer_pack).unwrap().concat();
+        let peer_keys_digest = Digest::of(&peer_keys);
+        tests::put(&fixture.remote_dir, &pack_object(&peer_digest), &peer_pack);
+        tests::put(&fixture.remote_dir, &keys_object(&peer_keys_digest), &peer_keys);
+        let lock = File::create(manifest.with_extension("lock")).unwrap();
+        lock.lock().unwrap();
+        fixture.shared.runtime.block_on(async {
+            let peer = async {
+                let uploaded = tokio::time::timeout(Duration::from_secs(10), async {
+                    while !uploaded_keys.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                if uploaded.is_ok() {
+                    let listed = Listed {
+                        size: peer_pack.len() as u64,
+                        keys: peer_keys_digest,
+                        format: STORE_FORMAT,
+                        packed: None,
+                    };
+                    std::fs::write(&manifest, Manifest([(peer_digest, listed)].into()).lines())
+                        .unwrap();
+                }
+                // Always release the lock before asserting, including on a timeout.
+                lock.unlock().unwrap();
+                uploaded.expect("the publisher never uploaded its keys");
+            };
+            futures_util::future::join(fixture.shared.send(), peer).await;
+        });
+        let published = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+        assert!(observed != published);
+        assert!(fixture.shared.asked.saw(observed), "a write is not an installed lookup");
+        assert!(!fixture.shared.asked.saw(published));
+        fixture.look();
+        assert!(fixture.shared.asked.saw(published));
+        if lazy {
+            let lookup = fixture.shared.asked.lazy.read().unwrap();
+            assert!(
+                lookup.as_ref().unwrap().packs.iter().any(|(digest, _, _)| *digest == peer_digest)
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(fixture.shared.store.join(pack_file(&peer_digest))).unwrap(),
+                peer_pack,
+            );
+        }
+    }
+}

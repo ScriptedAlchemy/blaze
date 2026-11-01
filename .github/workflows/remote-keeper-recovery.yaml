@@ -1,0 +1,42 @@
+# The normal PR ra-jit workflow runs formatting only. Exercise the actual
+# remote keeper recovery path before treating publication fixes as validated.
+name: Remote keeper recovery regressions
+on:
+  pull_request:
+    paths:
+      - crates/ra-jit/src/remote/keeper.rs
+      - crates/ra-jit/src/remote/keeper/recovery_tests.rs
+      - .github/workflows/remote-keeper-recovery.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: remote-keeper-recovery-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  recovery:
+    name: recovery (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '0'
+    steps:
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: remote-keeper-recovery
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test failed pulls, lazy index recovery and concurrent publication
+        shell: bash
+        run: cargo test --locked -p ra-jit --bin ra-jit remote::keeper::recovery_tests -- --nocapture

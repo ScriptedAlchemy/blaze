@@ -170,15 +170,13 @@ impl Shared {
         if tokio::task::spawn_blocking(ra_jit_store::seal_open).await.is_err() {
             eprintln!("remote: sealing the open pack panicked");
         }
-        let ours = self.asked.saw(self.manifest_now().await);
         let done = push(&self.store, &self.remote, &self.project).await;
         let sent = done.as_ref().is_ok_and(|said| !said.starts_with("0 packs"));
         if sent {
-            // Its own lines are no reason to pull; those another machine added before
-            // them still are.
-            if ours {
-                self.asked.see(self.manifest_now().await);
-            }
+            // Publication is not a pull. Another worker can extend the manifest
+            // while this push is uploading or retrying its compare-and-swap. Only
+            // pull_and_remember may acknowledge that the resulting lookup is here.
+            // The next look reuses local packs and fetches any concurrent additions.
             self.report(done, start);
         } else if let Err(e) = done {
             eprintln!("remote: {e:#}");
