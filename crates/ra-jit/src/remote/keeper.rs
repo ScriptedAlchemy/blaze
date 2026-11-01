@@ -281,6 +281,6 @@ fn end_by(status: i32) -> ! {
 #[path = "keeper/recovery_tests.rs"]
 mod recovery_tests;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "keeper/shutdown_tests.rs"]
 mod shutdown_tests;
