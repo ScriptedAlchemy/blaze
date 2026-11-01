@@ -163,6 +163,49 @@ enum DebugLevel {
     Named(String),
 }
 
+impl DebugLevel {
+    fn level(&self) -> anyhow::Result<Level> {
+        Ok(match self {
+            DebugLevel::Number(0) => Level::Nothing,
+            DebugLevel::Number(1) => Level::Lines,
+            DebugLevel::Number(2) => Level::Full,
+            DebugLevel::Named(name) => match name.as_str() {
+                "none" => Level::Nothing,
+                "line-directives-only" | "line-tables-only" | "limited" => Level::Lines,
+                "full" => Level::Full,
+                _ => anyhow::bail!("`debug = \"{name}\"`: ra-jit does not know the level"),
+            },
+            DebugLevel::Number(level) => {
+                anyhow::bail!("`debug = {level}`: ra-jit does not know the level")
+            }
+        })
+    }
+}
+
+/// What a crate built with `flags` has a debugger told of its code, where they say: the last
+/// `-C debuginfo` (or `-g`) among them, as rustc reads its command line.
+pub(crate) fn debuginfo_of(flags: &[String]) -> Option<Level> {
+    Flags::parse(flags.iter().map(String::as_str)).debuginfo?.level().ok()
+}
+
+/// Gives each package built for the target with debug info other than the program's (what the
+/// packages cargo was asked to build have) its own `-C debuginfo`, as cargo gives each unit's
+/// rustc its profile's: `[profile.dev.package.x] debug = 0` is that crate's alone. A package
+/// built as the program is has no flag of its own, and its crate's identity is what it was.
+fn own_debuginfo(packages: &mut FxHashMap<String, Built>) -> anyhow::Result<()> {
+    let mut program = Level::Nothing;
+    for built in packages.values().filter(|it| it.primary && it.for_target) {
+        program = program.max(built.profile.debug_level()?);
+    }
+    for built in packages.values_mut().filter(|it| it.for_target) {
+        let level = built.profile.debug_level()?;
+        if level != program {
+            built.codegen_flags.push(format!("-Cdebuginfo={}", level.number()));
+        }
+    }
+    Ok(())
+}
+
 /// A `strip` setting. One cargo deferred is its own choice for a build without debug info,
 /// which has nothing the setting would take out.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -210,6 +253,26 @@ pub(crate) enum Level {
     Lines,
     /// The variables and their types as well.
     Full,
+}
+
+impl Level {
+    /// The level as `-C debuginfo` spells it.
+    fn number(self) -> u8 {
+        match self {
+            Level::Nothing => 0,
+            Level::Lines => 1,
+            Level::Full => 2,
+        }
+    }
+
+    /// What the code generator is told of a crate's code at this level.
+    pub(crate) fn told(self) -> hir_ty_codegen::Told {
+        match self {
+            Level::Nothing => hir_ty_codegen::Told::Nothing,
+            Level::Lines => hir_ty_codegen::Told::Lines,
+            Level::Full => hir_ty_codegen::Told::Variables,
+        }
+    }
 }
 
 /// Where what a debugger reads of the code is kept (`split-debuginfo`). The lines are with
@@ -276,33 +339,19 @@ impl Profile {
         }
     }
 
+    /// What a debugger is told of the code of a crate built with this profile, whatever the
+    /// link of a program then strips.
+    pub(crate) fn debug_level(&self) -> anyhow::Result<Level> {
+        self.debuginfo.level()
+    }
+
     /// What the profile has a debugger told. Where the profile asks for it to be kept apart
     /// from the program, which ra-jit does not do, that is the reason not to build.
     pub(crate) fn described(&self) -> anyhow::Result<Described> {
-        let level = match &self.debuginfo {
-            DebugLevel::Number(0) => Level::Nothing,
-            DebugLevel::Number(1) => Level::Lines,
-            DebugLevel::Number(2) => Level::Full,
-            DebugLevel::Named(name) => match name.as_str() {
-                "none" => Level::Nothing,
-                "line-directives-only" | "line-tables-only" | "limited" => Level::Lines,
-                "full" => Level::Full,
-                _ => anyhow::bail!("`debug = \"{name}\"`: ra-jit does not know the level"),
-            },
-            DebugLevel::Number(level) => {
-                anyhow::bail!("`debug = {level}`: ra-jit does not know the level")
-            }
-        };
-        // Stripping the symbols is the linker's to do; of what ra-jit writes, what a debugger
-        // reads is all either setting takes out.
-        let stripped = match &self.strip {
-            Strip::Resolved(Stripped::Named(what)) => match what.as_str() {
-                "none" => false,
-                "debuginfo" | "symbols" => true,
-                _ => anyhow::bail!("`strip = \"{what}\"`: ra-jit does not know the setting"),
-            },
-            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
-        };
+        let level = self.debug_level()?;
+        // The link takes out what a debugger reads, whichever is stripped (`link::Strip`): ra-jit
+        // does not write it.
+        let stripped = self.strip()? != crate::link::Strip::None;
         if stripped || level == Level::Nothing {
             return Ok(Described::NOTHING);
         }
@@ -315,6 +364,16 @@ impl Profile {
             }
         };
         Ok(Described { level, kept, frame_pointers: false })
+    }
+
+    /// What the link of a program of this profile takes out of it. One cargo deferred is its
+    /// own choice for a build without debug info, which has nothing the setting would take out.
+    pub(crate) fn strip(&self) -> anyhow::Result<crate::link::Strip> {
+        match &self.strip {
+            Strip::Resolved(Stripped::Named(what)) => crate::link::Strip::named(what)
+                .with_context(|| format!("`strip = \"{what}\"`: ra-jit does not know the setting")),
+            Strip::Resolved(Stripped::None) | Strip::Deferred(_) => Ok(crate::link::Strip::None),
+        }
     }
 
     /// Whether rustc compiles the whole program again when it links it.
@@ -434,6 +493,8 @@ pub(crate) struct Whole {
     /// Whether `--cap-lints` or `--force-warn` is among the flags, so that a lint the source
     /// denies may not fail rustc's build.
     pub(crate) lints_capped: bool,
+    /// What the link of the program takes out of it: the setting of the crate that is linked.
+    pub(crate) strip: crate::link::Strip,
 }
 
 impl Plan {
@@ -598,6 +659,7 @@ impl Plan {
         if lto {
             eprintln!("{LTO_ACCEPTED}");
         }
+        own_debuginfo(&mut packages)?;
         let host_metadata = resolved.script_metadata(cargo.target_directory().as_ref())?;
         let host_manifest = project_model::ManifestPath::try_from(paths::AbsPathBuf::assert_utf8(
             host_metadata.workspace_root.join("Cargo.toml").into_std_path_buf(),
@@ -640,7 +702,13 @@ impl Plan {
     /// What the plan says of the programs cargo was asked to build.
     pub(crate) fn whole(&self) -> anyhow::Result<Whole> {
         let debug = Described { frame_pointers: self.frame_pointers, ..self.described()? };
-        Ok(Whole { debug, lto: self.lto, lints_capped: self.lints_capped })
+        // The programs are those of the packages cargo was asked to build, which a profile has
+        // alike unless a package's own section says otherwise: then the most any of them strips.
+        let mut strip = crate::link::Strip::None;
+        for built in self.packages.values().filter(|it| it.primary && it.for_target) {
+            strip = strip.max(built.profile.strip()?);
+        }
+        Ok(Whole { debug, lto: self.lto, lints_capped: self.lints_capped, strip })
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
@@ -781,7 +849,7 @@ impl UnitGraph {
         }
         let roots: FxHashSet<&str> =
             self.roots.iter().filter_map(|&it| Some(self.units.get(it)?.pkg_id.as_str())).collect();
-        let packages = best
+        let mut packages: FxHashMap<String, Built> = best
             .into_iter()
             .map(|(id, (index, unit))| {
                 let features = unit.features.iter().cloned().collect();
@@ -808,6 +876,7 @@ impl UnitGraph {
                 )
             })
             .collect();
+        own_debuginfo(&mut packages)?;
         Ok(Plan {
             packages,
             host_cargo: None,
@@ -822,6 +891,88 @@ impl UnitGraph {
 #[cfg(test)]
 mod tests {
     use super::{Flags, UnitGraph};
+
+    /// `[profile.dev.package.dep] debug = 0` is that package's alone: it is given its own
+    /// `-C debuginfo`, which the compiler reads per crate, and the program's packages, built as
+    /// the program is, are given none, so that their identity is what it was.
+    #[test]
+    fn a_package_built_with_other_debug_info_has_its_own_flag() {
+        let profile = |debuginfo: u8| {
+            serde_json::json!({
+                "opt_level": "0", "lto": "false", "debug_assertions": true,
+                "overflow_checks": true, "panic": "unwind", "debuginfo": debuginfo,
+                "split_debuginfo": null, "strip": {"resolved": "None"}
+            })
+        };
+        let graph: UnitGraph = serde_json::from_value(serde_json::json!({
+            "roots": [0],
+            "units": [
+                {"pkg_id":"path+file:///w/app#app@0.1.0",
+                 "target":{"kind":["bin"],"crate_types":["bin"]},
+                 "profile":profile(2), "features":[], "dependencies":[{"index":1},{"index":2}]},
+                {"pkg_id":"path+file:///w/quiet#quiet@0.1.0",
+                 "target":{"kind":["lib"],"crate_types":["lib"]},
+                 "profile":profile(0), "features":[], "dependencies":[]},
+                {"pkg_id":"path+file:///w/alike#alike@0.1.0",
+                 "target":{"kind":["lib"],"crate_types":["lib"]},
+                 "profile":profile(2), "features":[], "dependencies":[]}
+            ]
+        }))
+        .unwrap();
+        let plan = graph.plan(&Flags::default(), false).unwrap();
+        let flags = |id: &str| plan.package(id).unwrap().codegen_flags.clone();
+        assert_eq!(flags("path+file:///w/quiet#quiet@0.1.0"), ["-Copt-level=0", "-Cdebuginfo=0"]);
+        assert_eq!(flags("path+file:///w/alike#alike@0.1.0"), ["-Copt-level=0"]);
+        assert_eq!(flags("path+file:///w/app#app@0.1.0"), ["-Copt-level=0"]);
+        assert_eq!(plan.whole().unwrap().debug.level, super::Level::Full);
+        // What the compiler reads of a crate's flags: the last word of them, as rustc does.
+        let level = |flags: &[&str]| {
+            super::debuginfo_of(&flags.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(level(&["-Copt-level=0"]), None);
+        assert_eq!(level(&["-Cdebuginfo=0"]), Some(super::Level::Nothing));
+        assert_eq!(level(&["-g", "-C", "debuginfo=1"]), Some(super::Level::Lines));
+        assert_eq!(level(&["-Cdebuginfo=line-tables-only", "-g"]), Some(super::Level::Full));
+        assert_eq!(level(&["-Cdebuginfo=limited"]), Some(super::Level::Lines));
+    }
+
+    /// `strip` is the linked program's: the profile's, or the `-C strip` of the flags over it,
+    /// and what a debugger reads is then not written at all.
+    #[test]
+    fn strip_is_the_profiles_or_the_flags() {
+        let graph = |strip: serde_json::Value| -> UnitGraph {
+            let profile = serde_json::json!({
+                "opt_level": "0", "lto": "false", "debug_assertions": true,
+                "overflow_checks": true, "panic": "unwind", "debuginfo": 2,
+                "split_debuginfo": null, "strip": strip
+            });
+            serde_json::from_value(serde_json::json!({
+                "roots": [0],
+                "units": [{"pkg_id":"path+file:///w/app#app@0.1.0",
+                    "target":{"kind":["bin"],"crate_types":["bin"]},
+                    "profile":profile, "features":[], "dependencies":[]}]
+            }))
+            .unwrap()
+        };
+        let whole = |strip, flags: &str| {
+            graph(strip).plan(&Flags::parse(flags.split_whitespace()), false).unwrap().whole()
+        };
+        use crate::link::Strip;
+        let none = whole(serde_json::json!({"resolved": "None"}), "").unwrap();
+        assert_eq!(none.strip, Strip::None);
+        assert_eq!(none.debug.level, super::Level::Full);
+        let symbols = whole(serde_json::json!({"resolved": {"Named": "symbols"}}), "").unwrap();
+        assert_eq!(symbols.strip, Strip::Symbols);
+        assert_eq!(symbols.debug.level, super::Level::Nothing);
+        let debuginfo = whole(serde_json::json!({"resolved": {"Named": "debuginfo"}}), "").unwrap();
+        assert_eq!(debuginfo.strip, Strip::Debuginfo);
+        // A strip cargo deferred strips nothing a build with debug info has.
+        let deferred = whole(serde_json::json!({"deferred": {"Named": "debuginfo"}}), "").unwrap();
+        assert_eq!(deferred.strip, Strip::None);
+        let flagged = whole(serde_json::json!({"resolved": "None"}), "-C strip=symbols").unwrap();
+        assert_eq!(flagged.strip, Strip::Symbols);
+        assert!(whole(serde_json::json!({"resolved": {"Named": "all"}}), "").is_err());
+    }
 
     #[test]
     fn explicit_target_flags_are_not_given_to_host_only_proc_macro_units() {

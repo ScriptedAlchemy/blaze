@@ -154,10 +154,192 @@ mod environment_tests {
     }
 }
 
+/// What the link of a program takes out of what it writes, as `-C strip` (and a profile's
+/// `strip`) says: the setting of the crate that is linked, which rustc reads only there. Each
+/// takes out what the one before it does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Strip {
+    #[default]
+    None,
+    /// What a debugger reads of the code.
+    Debuginfo,
+    /// The symbol table too.
+    Symbols,
+}
+
+impl Strip {
+    /// The setting by its name, as `-C strip=` and a profile spell it.
+    pub(crate) fn named(name: &str) -> Option<Strip> {
+        match name {
+            "none" => Some(Strip::None),
+            "debuginfo" => Some(Strip::Debuginfo),
+            "symbols" => Some(Strip::Symbols),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Strip::None => "none",
+            Strip::Debuginfo => "debuginfo",
+            Strip::Symbols => "symbols",
+        }
+    }
+
+    /// The setting as a BuildSpec's `ProfileSpec.strip` has it: 0, 1 or 2.
+    pub(crate) fn of_spec(strip: u8) -> Option<Strip> {
+        [Strip::None, Strip::Debuginfo, Strip::Symbols].get(usize::from(strip)).copied()
+    }
+
+    /// What rustc tells a GNU-flavoured linker (`GccLinker::debuginfo`). Apple's linker is
+    /// told nothing: what it wrote is stripped once it is linked ([`Strip::objcopy`]).
+    fn linker_args(self, apple: bool) -> &'static [&'static str] {
+        match (self, apple) {
+            (Strip::None, _) | (_, true) => &[],
+            (Strip::Debuginfo, false) => &["-Wl,--strip-debug"],
+            (Strip::Symbols, false) => &["-Wl,--strip-all"],
+        }
+    }
+
+    /// What `rust-objcopy` is told to take out of a program that is linked already, as rustc
+    /// 1.99 has it for what Apple's linker wrote (`link_natively`). A shared library keeps its
+    /// global symbols: `--discard-all` is the most it can lose and still be loaded
+    /// (rust-lang/rust#93988).
+    fn objcopy(self, shared: bool) -> Option<&'static str> {
+        match (self, shared) {
+            (Strip::None, _) => None,
+            (Strip::Debuginfo, _) => Some("--strip-debug"),
+            (Strip::Symbols, true) => Some("--discard-all"),
+            (Strip::Symbols, false) => Some("--strip-all"),
+        }
+    }
+}
+
+/// The toolchain's `rust-objcopy`, which rustc strips with: in the `bin` of the host's
+/// `lib/rustlib/<host>`, which rustc puts ahead of `PATH`. `None` leaves it to `PATH`.
+pub(crate) fn objcopy_of(sysroot: Option<&Path>) -> Option<PathBuf> {
+    let tool = format!("rust-objcopy{}", std::env::consts::EXE_SUFFIX);
+    std::fs::read_dir(sysroot?.join("lib/rustlib"))
+        .ok()?
+        .filter_map(|it| Some(it.ok()?.path().join("bin").join(&tool)))
+        .find(|it| it.is_file())
+}
+
+/// The variable the host's loader finds libraries by when a program's own paths do not have
+/// them.
+const HOST_LOADER: &str = if cfg!(windows) {
+    "PATH"
+} else if cfg!(target_vendor = "apple") {
+    "DYLD_FALLBACK_LIBRARY_PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
+/// Runs `rust-objcopy` with `option` on `input`, writing `output` when that is given and else
+/// `input` in place, as rustc's `strip_with_external_utility` does: a tool that cannot be
+/// started is an error, and one that fails is warned of, and the program stays as linked.
+fn run_objcopy(
+    tool: Option<&Path>,
+    env: Option<&Environment>,
+    option: &str,
+    input: &Path,
+    output: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(tool.unwrap_or(Path::new("rust-objcopy")));
+    if let Some(env) = env {
+        env.apply(&mut command);
+    }
+    // The toolchain's tool loads the toolchain's LLVM from the sysroot's `lib`, which its own
+    // run path does not name: rustup gives rustc, and so the tool rustc starts, that directory
+    // in the loader's path, and here it is given to the tool itself.
+    if let Some(lib) = tool.and_then(|it| it.ancestors().nth(4)) {
+        let current = match env {
+            Some(env) => env.0.get(OsStr::new(HOST_LOADER)).cloned(),
+            None => std::env::var_os(HOST_LOADER),
+        };
+        let paths = std::iter::once(lib.to_owned())
+            .chain(current.iter().flat_map(std::env::split_paths).collect::<Vec<_>>());
+        command.env(HOST_LOADER, std::env::join_paths(paths)?);
+    }
+    command.arg(option).arg(input).args(output);
+    let shown = diagnostic_command(&command);
+    let ran = command.output().with_context(|| format!("running {shown}"))?;
+    if !ran.status.success() {
+        let mut said = ran.stderr;
+        said.extend_from_slice(&ran.stdout);
+        eprintln!(
+            "warning: stripping debug info with `rust-objcopy` failed: {}\n  |\n  = note: {}",
+            ran.status,
+            String::from_utf8_lossy(&said).trim_end()
+        );
+    }
+    Ok(())
+}
+
+/// Where the daemon notes how cargo's copy of the program it links at `binary` is stripped. The
+/// daemon's own executable keeps its symbols, which the edits it splices into it are found by,
+/// and the client strips the copy it puts where cargo has the program ([`place_stripped`]).
+pub(crate) fn strip_note(binary: &Path) -> PathBuf {
+    let mut note = binary.as_os_str().to_owned();
+    note.push(".strip");
+    PathBuf::from(note)
+}
+
+/// Notes `strip` for cargo's copy of the program at `binary` ([`strip_note`]), or that nothing
+/// is stripped of it.
+pub(crate) fn note_strip(binary: &Path, strip: Strip) -> anyhow::Result<()> {
+    let note = strip_note(binary);
+    match strip {
+        Strip::None => match std::fs::remove_file(&note) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", note.display()))
+            }
+            _ => Ok(()),
+        },
+        strip => std::fs::write(&note, strip.name())
+            .with_context(|| format!("writing {}", note.display())),
+    }
+}
+
+/// How the daemon noted that cargo's copy of `binary` is stripped ([`note_strip`]).
+pub(crate) fn noted_strip(binary: &Path) -> anyhow::Result<Strip> {
+    let note = strip_note(binary);
+    match std::fs::read_to_string(&note) {
+        Ok(name) => Strip::named(name.trim())
+            .with_context(|| format!("{} names no `strip` setting", note.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Strip::None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", note.display())),
+    }
+}
+
+/// Writes at `to` the executable `from` as the link of cargo's program leaves it with `strip`,
+/// with the toolchain of `sysroot`: a copy, as `from` is the daemon's own, written whole under
+/// another name and renamed onto `to`. Whatever was at `to` stays as it is for whoever runs it.
+pub(crate) fn place_stripped(
+    from: &Path,
+    to: &Path,
+    strip: Strip,
+    sysroot: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(option) = strip.objcopy(false) else { bail!("nothing to strip of {}", to.display()) };
+    let mut new = to.as_os_str().to_owned();
+    new.push(format!(".{}.new", std::process::id()));
+    let new = PathBuf::from(new);
+    _ = std::fs::remove_file(&new);
+    run_objcopy(objcopy_of(sysroot).as_deref(), None, option, from, Some(&new))?;
+    // A tool that failed leaves the program as it was linked, as rustc's does.
+    if !new.is_file() {
+        std::fs::copy(from, &new).with_context(|| format!("copying {}", from.display()))?;
+    }
+    let mode = from.metadata().with_context(|| format!("reading {}", from.display()))?;
+    std::fs::set_permissions(&new, mode.permissions())?;
+    std::fs::rename(&new, to).with_context(|| format!("installing {}", to.display()))
+}
+
 /// Links `objects` into the executable `exe`, with the native libraries of the crates `program`
 /// links. A shared library instead when `exports` names what it exports: the rest of it is
 /// its own, and the link leaves out what that does not reach, as rustc's of a `cdylib` does.
-/// How long `cc` took.
+/// What `strip` says is taken out of it as rustc's link takes it out. How long `cc` took.
 pub(crate) fn executable(
     db: &RootDatabase,
     program: &[Crate],
@@ -165,8 +347,10 @@ pub(crate) fn executable(
     sysroot: Option<&Path>,
     exe: &Path,
     exports: Option<&[String]>,
+    strip: Strip,
 ) -> anyhow::Result<Duration> {
     let mut line = Line::of(db, program, sysroot, exports.is_some())?;
+    line.strip = strip;
     let Some(exports) = exports else { return line.link(objects, exe) };
     let mut listed = exe.as_os_str().to_owned();
     listed.push(".exports");
@@ -309,8 +493,14 @@ pub(crate) struct Line {
     before: Vec<OsString>,
     after: Vec<OsString>,
     apple: bool,
+    /// A shared library is linked, not an executable.
+    shared: bool,
     env: Environment,
     generated: Vec<PathBuf>,
+    /// What the link takes out of what it writes.
+    strip: Strip,
+    /// The toolchain's `rust-objcopy`, which strips what Apple's linker wrote.
+    objcopy: Option<PathBuf>,
 }
 
 impl Line {
@@ -342,11 +532,14 @@ impl Line {
             before,
             after,
             apple: target.apple,
+            shared,
             env: match crate::native_inputs::native_unit_for_crate(db, first.into())? {
                 Some(unit) => Environment(unit.env.clone()),
                 None => Environment::of(db),
             },
             generated: Vec::new(),
+            strip: Strip::None,
+            objcopy: objcopy_of(sysroot),
         })
     }
 
@@ -361,7 +554,7 @@ impl Line {
                 cmd.arg(object);
             }
         }
-        cmd.args(&self.after).arg("-o").arg(exe);
+        cmd.args(&self.after).args(self.strip.linker_args(self.apple)).arg("-o").arg(exe);
         Ok(cmd)
     }
 
@@ -388,10 +581,17 @@ impl Line {
                 String::from_utf8_lossy(&ran.stderr)
             );
         }
+        let took = start.elapsed();
         if let Some(admission) = admission {
             admission.finish()?;
         }
-        Ok(start.elapsed())
+        // Apple's linker strips nothing: rustc strips what it wrote, in place.
+        if self.apple
+            && let Some(option) = self.strip.objcopy(self.shared)
+        {
+            run_objcopy(self.objcopy.as_deref(), Some(&self.env), option, exe, None)?;
+        }
+        Ok(took)
     }
 }
 
@@ -804,8 +1004,11 @@ mod tests {
             before: Vec::new(),
             after,
             apple: false,
+            shared: false,
             env: Environment([("OUT_DIR".into(), raw.clone())].into()),
             generated: Vec::new(),
+            strip: Strip::None,
+            objcopy: None,
         };
         let command = line.invocation(&[], Path::new("program")).unwrap();
         let args: Vec<_> = command.get_args().map(OsStr::as_bytes).collect();
@@ -873,6 +1076,102 @@ mod tests {
         assert_eq!(asked.search, vec![OsString::from("-L/producer/lib")]);
         let libs: Vec<_> = asked.libs.iter().map(|it| target.lib(it)).collect();
         assert_eq!(libs, vec![vec!["-lsaved_dynamic".to_owned()]]);
+    }
+
+    /// What rustc 1.99 does for each `-C strip`: a GNU-flavoured linker is told
+    /// (`GccLinker::debuginfo`), and what Apple's linker wrote is stripped by `rust-objcopy`
+    /// once it is linked, a shared library no further than `--discard-all` (`link_natively`).
+    #[test]
+    fn a_link_strips_what_rustcs_does() {
+        assert_eq!(Strip::named("none"), Some(Strip::None));
+        assert_eq!(Strip::named("debuginfo"), Some(Strip::Debuginfo));
+        assert_eq!(Strip::named("symbols"), Some(Strip::Symbols));
+        assert_eq!(Strip::named("all"), None);
+        for strip in [Strip::None, Strip::Debuginfo, Strip::Symbols] {
+            assert_eq!(Strip::named(strip.name()), Some(strip));
+        }
+        assert_eq!(Strip::of_spec(0), Some(Strip::None));
+        assert_eq!(Strip::of_spec(1), Some(Strip::Debuginfo));
+        assert_eq!(Strip::of_spec(2), Some(Strip::Symbols));
+        assert_eq!(Strip::of_spec(3), None);
+        assert!(Strip::None < Strip::Debuginfo && Strip::Debuginfo < Strip::Symbols);
+
+        assert!(Strip::None.linker_args(false).is_empty());
+        assert_eq!(Strip::Debuginfo.linker_args(false), ["-Wl,--strip-debug"]);
+        assert_eq!(Strip::Symbols.linker_args(false), ["-Wl,--strip-all"]);
+        for strip in [Strip::None, Strip::Debuginfo, Strip::Symbols] {
+            assert!(strip.linker_args(true).is_empty(), "{strip:?}");
+        }
+
+        assert_eq!(Strip::None.objcopy(false), None);
+        assert_eq!(Strip::None.objcopy(true), None);
+        assert_eq!(Strip::Debuginfo.objcopy(false), Some("--strip-debug"));
+        assert_eq!(Strip::Debuginfo.objcopy(true), Some("--strip-debug"));
+        assert_eq!(Strip::Symbols.objcopy(false), Some("--strip-all"));
+        assert_eq!(Strip::Symbols.objcopy(true), Some("--discard-all"));
+    }
+
+    #[test]
+    fn an_elf_line_tells_the_linker_what_to_strip() {
+        let line = |strip, apple| Line {
+            before: Vec::new(),
+            after: vec!["-nodefaultlibs".into()],
+            apple,
+            shared: false,
+            env: Environment(BTreeMap::new()),
+            generated: Vec::new(),
+            strip,
+            objcopy: None,
+        };
+        let args = |line: Line| -> Vec<String> {
+            let command = line.invocation(&[], Path::new("program")).unwrap();
+            command.get_args().map(|it| it.to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(args(line(Strip::None, false)), ["-nodefaultlibs", "-o", "program"]);
+        assert_eq!(
+            args(line(Strip::Symbols, false)),
+            ["-nodefaultlibs", "-Wl,--strip-all", "-o", "program"]
+        );
+        assert_eq!(
+            args(line(Strip::Debuginfo, false)),
+            ["-nodefaultlibs", "-Wl,--strip-debug", "-o", "program"]
+        );
+        // Apple's linker is told nothing; `rust-objcopy` strips what it wrote.
+        assert_eq!(args(line(Strip::Symbols, true)), ["-nodefaultlibs", "-o", "program"]);
+    }
+
+    #[test]
+    fn the_daemon_notes_how_cargos_copy_is_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("program");
+        assert_eq!(noted_strip(&binary).unwrap(), Strip::None);
+        note_strip(&binary, Strip::Symbols).unwrap();
+        assert_eq!(strip_note(&binary), dir.path().join("program.strip"));
+        assert_eq!(noted_strip(&binary).unwrap(), Strip::Symbols);
+        note_strip(&binary, Strip::Debuginfo).unwrap();
+        assert_eq!(noted_strip(&binary).unwrap(), Strip::Debuginfo);
+        // A profile that strips nothing leaves no note of an older one behind.
+        note_strip(&binary, Strip::None).unwrap();
+        assert!(!strip_note(&binary).exists());
+        assert_eq!(noted_strip(&binary).unwrap(), Strip::None);
+        note_strip(&binary, Strip::None).unwrap();
+        std::fs::write(strip_note(&binary), "everything").unwrap();
+        assert!(noted_strip(&binary).is_err());
+    }
+
+    #[test]
+    fn the_toolchains_objcopy_is_the_hosts() {
+        let sysroot = tempfile::tempdir().unwrap();
+        assert_eq!(objcopy_of(Some(sysroot.path())), None);
+        assert_eq!(objcopy_of(None), None);
+        let target = sysroot.path().join("lib/rustlib/wasm32-unknown-unknown/lib");
+        std::fs::create_dir_all(target).unwrap();
+        let bin = sysroot.path().join("lib/rustlib/aarch64-apple-darwin/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert_eq!(objcopy_of(Some(sysroot.path())), None);
+        let tool = bin.join(format!("rust-objcopy{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&tool, "").unwrap();
+        assert_eq!(objcopy_of(Some(sysroot.path())), Some(tool));
     }
 
     #[test]

@@ -78,11 +78,13 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.dirname(HERE)
@@ -846,6 +848,25 @@ def profiles_cases():
              edits=profile_edit("[profile.dev]\ndebug-assertions = false\n"), touches=["profile"]),
         Case("strip", "build", "[profile.dev] strip = \"debuginfo\"", expect="changed",
              edits=profile_edit('[profile.dev]\nstrip = "debuginfo"\n'), touches=["profile"]),
+        # What the program keeps of itself as cargo's link leaves it: its symbol table and what a
+        # debugger reads, with the profile as it is, and neither with `strip = "symbols"`, the
+        # program still running as it did. The proc macro and the build script are stripped too
+        # (a library to `--discard-all`), and still load and run.
+        Case("run", "run", "the program run as it is", expect="accepted", local=True,
+             lexpect=[("program", "bin", "top"), ("line", r"^@@bin top answer=3$"), ("exit", 0),
+                      ("symbols", "top"), ("described", "top", "dep_a")]),
+        Case("strip-symbols", "run", "[profile.dev] strip = \"symbols\"", expect="accepted",
+             edits=profile_edit('[profile.dev]\nstrip = "symbols"\n'), local=True,
+             lexpect=[("program", "bin", "top"), ("line", r"^@@bin top answer=3$"), ("exit", 0),
+                      ("stripped", "top")],
+             check=only_field("strip", 2, lambda u: True, "every unit's profile")),
+        # `debug = 0` for one package is that crate's alone: rustc compiles each crate with its own
+        # `-C debuginfo`, so dep_a's code is described to no debugger and dep_b's still is.
+        Case("pkg-debug0", "run", "[profile.dev.package.dep_a] debug = 0", expect="accepted",
+             edits=profile_edit("[profile.dev.package.dep_a]\ndebug = 0\n"), local=True,
+             lexpect=[("program", "bin", "top"), ("line", r"^@@bin top answer=3$"), ("exit", 0),
+                      ("symbols", "top"), ("described", "top", "dep_b"), ("not-described", "top", "dep_a")],
+             check=only_field("debug", 0, lambda u: u.package == "dep_a", "the override")),
         # cargo reads CARGO_PROFILE_<NAME>_<KEY> as the same setting.
         Case("env-opt1", "build", "CARGO_PROFILE_DEV_OPT_LEVEL=1 is [profile.dev] opt-level = 1", expect="changed",
              env={"CARGO_PROFILE_DEV_OPT_LEVEL": "1"}, touches=["profile"]),
@@ -987,6 +1008,19 @@ def native_skip(ctx):
     return None
 
 
+def check_deployment_platform(results, case):
+    base, current = results[f"{case.fixture.name}/base"], results[case.full]
+    if not base.made or not current.made:
+        return ["the deployment target comparison needs both platforms"]
+    sdk = field(base.platform, 2, "sdk")
+    if not isinstance(sdk, list) or len(sdk) != 3:
+        return ["the base platform has no macOS SDK deployment target"]
+    same = sdk[2] == case.env["MACOSX_DEPLOYMENT_TARGET"]
+    if (base.digests["platform"] == current.digests["platform"]) != same:
+        return [f"the explicit deployment target must {'preserve' if same else 'change'} the platform"]
+    return []
+
+
 def native_cases():
     cases = [Case("base", "build", "CC, CXX and AR not set: `cc`, `c++` and `ar`", expect="base", local=True,
                   lexpect=[("program", "bin", "cdep"), ("exit", 0)])]
@@ -1008,10 +1042,11 @@ def native_cases():
                  also=[("platform-same", one), ("job-differs", one)]),
         ]
     # The deployment target is in ExecPlatform.sdk on macOS. Whether it changes a function's code is
-    # what C2 records; the platform digest has to tell two targets apart.
+    # what C2 records; the platform digest has to tell two targets apart. Explicitly setting
+    # the host's default (11.0 on arm64) preserves the platform and still records script_env.
     cases += [
         Case("deploy-11", "build", "MACOSX_DEPLOYMENT_TARGET=11.0", env={"MACOSX_DEPLOYMENT_TARGET": "11.0"},
-             expect="changed", touches=["platform"],
+             expect="changed", touches=["script_env"], check=check_deployment_platform,
              skip=lambda ctx: None if sys.platform == "darwin" else "MACOSX_DEPLOYMENT_TARGET is macOS's (the platform has no deployment target on Linux)"),
         Case("deploy-14", "build", "MACOSX_DEPLOYMENT_TARGET=14.0", env={"MACOSX_DEPLOYMENT_TARGET": "14.0"},
              expect="changed", vs="deploy-11", touches=["platform"],
@@ -1515,10 +1550,177 @@ def summarize(output, target, code):
     return got
 
 
+# --- What a linked program keeps: its symbol table and what a debugger reads ---------------------
+#
+# Read from the files themselves (Mach-O 64 and ELF 64, little-endian), with nothing but the standard
+# library, so that a case can hold both runs to what cargo's link leaves: `strip = "symbols"` takes
+# out the symbol table, and a crate built with `debug = 0` is described to no debugger. An ELF
+# program stripped so has no `.symtab`; a Mach-O one keeps only the external symbols the loader
+# binds (`rust-objcopy --strip-all`), so what is counted there is the symbols of its own. On macOS
+# what a debugger reads is in the objects the program names (its N_OSO stabs, `split-debuginfo =
+# "unpacked"`); elsewhere in the program's own `.debug_*` sections.
+
+
+def _cstr(data, at):
+    end = data.find(b"\0", at)
+    return data[at:end if end >= 0 else len(data)]
+
+
+def macho_facts(data):
+    """(local symbols defined, stab entries, object paths of N_OSO stabs, bytes of __DWARF sections)."""
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    at, symtab, dwarf = 32, None, []
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, at)
+        if cmd == 0x2:  # LC_SYMTAB
+            symtab = struct.unpack_from("<IIII", data, at + 8)
+        elif cmd == 0x19:  # LC_SEGMENT_64
+            nsects = struct.unpack_from("<I", data, at + 64)[0]
+            for n in range(nsects):
+                sect = at + 72 + 80 * n
+                segname = data[sect + 16:sect + 32].rstrip(b"\0")
+                length, offset = struct.unpack_from("<Q", data, sect + 40)[0], struct.unpack_from("<I", data, sect + 48)[0]
+                if segname == b"__DWARF" and offset:
+                    dwarf.append(data[offset:offset + length])
+        at += size
+    defined, stabs, objects = 0, 0, []
+    if symtab:
+        symoff, nsyms, stroff, _ = symtab
+        for n in range(nsyms):
+            strx, kind = struct.unpack_from("<IB", data, symoff + 16 * n)
+            name = _cstr(data, stroff + strx)
+            if kind & 0xE0:
+                stabs += 1
+                if kind == 0x66:  # N_OSO
+                    objects.append(name.decode("utf-8", "surrogateescape"))
+            elif kind & 0x0E and not kind & 0x01:  # defined, not N_EXT
+                defined += 1
+    return defined, stabs, objects, b"".join(dwarf)
+
+
+def elf_facts(data):
+    """(defined symbols of .symtab, bytes of the .debug_* sections)."""
+    shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + shentsize * n) for n in range(shnum)]
+    names = sections[shstrndx][4] if shnum else 0
+    defined, debug = 0, []
+    for name, kind, flags, _, offset, size, link, _, _, entsize in sections:
+        named = _cstr(data, names + name)
+        if kind == 2 and entsize:  # SHT_SYMTAB
+            for n in range(1, size // entsize):
+                info, _, shndx = struct.unpack_from("<BBH", data, offset + entsize * n + 4)
+                if shndx != 0 and (info & 0xF) not in (3, 4):  # not STT_SECTION, STT_FILE
+                    defined += 1
+        elif named.startswith((b".debug_", b".zdebug_")):
+            body = data[offset:offset + size]
+            if flags & 0x800 and struct.unpack_from("<I", body, 0)[0] == 1:  # SHF_COMPRESSED, zlib
+                body = zlib.decompress(body[24:])
+            debug.append(body)
+    return defined, b"".join(debug)
+
+
+def ar_member(path, member):
+    """The bytes of `member` of the archive at `path` (BSD or GNU short names), or None."""
+    with open(path, "rb") as source:
+        data = source.read()
+    if not data.startswith(b"!<arch>\n"):
+        return None
+    at = 8
+    while at + 60 <= len(data):
+        name, size = data[at:at + 16].rstrip(b" "), int(data[at + 48:at + 58].strip() or 0)
+        body = at + 60
+        if name.startswith(b"#1/"):  # BSD: the name follows the header
+            length = int(name[3:])
+            name, start = data[body:body + length].rstrip(b"\0"), body + length
+        else:
+            name, start = name.rstrip(b"/"), body
+        if name.decode("utf-8", "surrogateescape") == member:
+            return data[start:body + size]
+        at = body + size + (size & 1)
+    return None
+
+
+def binary_facts(path, needles=()):
+    """What the program at `path` keeps: {"symbols": how many symbols of its own it defines (all of
+    an ELF `.symtab`, a Mach-O program's local ones), "debug": whether a debugger is told anything of
+    it, "described": which of `needles` (crate names) what a debugger reads names}."""
+    with open(path, "rb") as source:
+        data = source.read()
+    if data[:4] == b"\xcf\xfa\xed\xfe":
+        defined, stabs, objects, dwarf = macho_facts(data)
+        parts = [dwarf]
+        for obj in objects:
+            archive, _, member = obj[:-1].partition("(") if obj.endswith(")") else (obj, "", "")
+            if not os.path.isfile(archive):
+                continue
+            if member:
+                body = ar_member(archive, member)
+            else:
+                with open(archive, "rb") as source:
+                    body = source.read()
+            if body and body[:4] == b"\xcf\xfa\xed\xfe":
+                parts.append(macho_facts(body)[3])
+        debug = b"".join(parts)
+        told = bool(stabs or dwarf)
+    elif data[:6] == b"\x7fELF\x02\x01":
+        defined, debug = elf_facts(data)
+        told = bool(debug)
+    else:
+        raise HarnessError(f"{path} is neither a 64-bit Mach-O nor a 64-bit ELF file")
+    return {"symbols": defined, "debug": told,
+            "described": sorted(n for n in needles if n.encode() in debug)}
+
+
+BINARY_EXPECTATIONS = ("stripped", "symbols", "described", "not-described")
+
+
+def program_files(target):
+    """The programs at the top of each profile directory under CARGO_TARGET_DIR, by name."""
+    found = {}
+    if not os.path.isdir(target):
+        return found
+    for profile in sorted(os.listdir(target)):
+        base = os.path.join(target, profile)
+        if profile.startswith(".") or not os.path.isdir(base):
+            continue
+        if profile not in ("debug", "release") and not os.path.isdir(os.path.join(base, "deps")):
+            continue
+        for name in sorted(os.listdir(base)):
+            path = os.path.join(base, name)
+            if (name.startswith(".") or name.endswith(EXE_SKIP) or "." in name or not os.path.isfile(path)
+                    or not os.access(path, os.X_OK)):
+                continue
+            found[name] = path
+    return found
+
+
+def saved_program_files(results):
+    """The binaries (not tests, not examples) a saved replay's results name, by target."""
+    found = {}
+    for result in results:
+        with open(result) as source:
+            for artifact in json.load(source)["artifacts"]:
+                if artifact.get("executable") and not artifact["test"] and artifact["target_kind"] == 1:
+                    found[artifact["target"]] = artifact["executable"]
+    return found
+
+
+def binaries_summary(files, expect):
+    """binary_facts of each program a case's binary expectations name."""
+    wanted = [e for e in expect if e[0] in BINARY_EXPECTATIONS]
+    needles = sorted({e[2] for e in wanted if e[0] in ("described", "not-described")})
+    return {name: binary_facts(files[name], needles) if name in files else None
+            for name in sorted({e[1] for e in wanted})}
+
+
 def check_lexpect(summary, expect):
     """What the command's own run has to show: ("test", name, outcome), ("no-test", name) (not
     run, or ignored), ("program", kind, name), ("no-program", kind, name), ("line", regex) of a
-    program's `@@` lines, ("exit", n) and ("exit-nonzero",)."""
+    program's `@@` lines, ("exit", n) and ("exit-nonzero",). Of the binary `name` itself, which the
+    spec run is held to as well: ("stripped", name) (no symbol it defines, nothing a debugger
+    reads), ("symbols", name) (a symbol table), ("described", name, crate) and ("not-described",
+    name, crate) (whether what a debugger reads of it names the crate)."""
     problems = []
     named = lambda t, n: t[1] == n or t[1].endswith("::" + n)
     for item in expect:
@@ -1545,6 +1747,19 @@ def check_lexpect(summary, expect):
         elif kind == "exit-nonzero":
             if summary["exit"] == 0:
                 problems.append("exit 0, wanted a failure")
+        elif kind in BINARY_EXPECTATIONS:
+            facts = summary.get("binaries", {}).get(item[1])
+            if facts is None:
+                problems.append(f"no binary {item[1]} to read")
+            elif kind == "stripped" and (facts["symbols"] or facts["debug"]):
+                problems.append(f"{item[1]} keeps {facts['symbols']} symbols"
+                                f"{' and what a debugger reads' if facts['debug'] else ''}, wanted them stripped")
+            elif kind == "symbols" and not facts["symbols"]:
+                problems.append(f"{item[1]} has no symbols, wanted its symbol table")
+            elif kind == "described" and item[2] not in facts["described"]:
+                problems.append(f"a debugger is told nothing of {item[2]} in {item[1]}, wanted its debug info")
+            elif kind == "not-described" and item[2] in facts["described"]:
+                problems.append(f"a debugger is told of {item[2]} in {item[1]}, wanted none of it")
         else:
             raise HarnessError(f"an expectation of kind {kind!r}")
     return problems
@@ -1848,12 +2063,17 @@ class Ctx:
         dispatched = count_dispatched(self.audit, offset)
         try:
             summary = summarize(run.out, target, run.code)
+            files = program_files(target)
             if outputs:
                 results = [os.path.join(path, "result.json") for path in replays() - before
                            if os.path.isfile(os.path.join(path, "result.json"))]
                 if run.code == 0 and not results:
                     raise HarnessError("saved replay succeeded without a completed result")
                 summary["programs"] = saved_programs(sorted(results))
+                files = saved_program_files(sorted(results))
+            # Read before the replay's directories are released: its objects hold what a
+            # debugger reads on macOS.
+            summary["binaries"] = binaries_summary(files, case.lexpect if case else ())
             return summary, run, dispatched
         finally:
             # Saved replay ignores CARGO_TARGET_DIR: its (large) artifacts live beside the
@@ -1927,6 +2147,9 @@ class Ctx:
         for part, a, b in compare_summaries(sa, sb):
             out["diffs"].append(f"{part}: command {clip(a, 200)} / spec run {clip(b, 200)}")
         out["diffs"] += check_lexpect(sa, case.lexpect)
+        # What the link leaves of the binary is the spec run's to match too: cargo's, not the command's.
+        binary = [e for e in case.lexpect if e[0] in BINARY_EXPECTATIONS]
+        out["diffs"] += ["spec run: " + problem for problem in check_lexpect(sb, binary)]
         if out["diffs"]:
             out["status"] = "MISMATCH"
             out["tail"] = {"command": clip(ra.out[-600:], 600), "spec_run": clip(rb.out[-600:], 600)}
@@ -2275,7 +2498,7 @@ def main(argv=None):
 # test double.
 
 FAKE_RA_JIT = r'''#!@PYTHON@
-import hashlib, json, os, platform, re, shutil, subprocess, sys
+import hashlib, json, os, platform, re, shutil, struct, subprocess, sys
 
 BUG = os.environ.get("FAKE_BUG", "")
 
@@ -2761,6 +2984,34 @@ def hash16(text):
     return sha(text)[:16]
 
 
+def fake_elf(path, symbols, described):
+    """A 64-bit ELF file with a `.symtab` when `symbols`, and a `.debug_info` naming the crates
+    `described`: what the harness reads of a program, as cargo's link would leave it."""
+    names = b"\0.shstrtab\0.symtab\0.strtab\0.debug_info\0"
+    strtab = b"\0main\0"
+    symtab = bytes(24) + struct.pack("<IBBHQQ", 1, 0x12, 0, 1, 0, 0)
+    debug = b"\0".join(name.encode() for name in described)
+    body, sections = bytearray(), [(0, 0, 0, 0, 0, 0)]
+
+    def add(name, kind, data, link=0, entsize=0):
+        sections.append((name, kind, 64 + len(body), len(data), link, entsize))
+        body.extend(data)
+    add(1, 3, names)
+    if symbols:
+        add(19, 3, strtab)
+        add(11, 2, symtab, link=2, entsize=24)
+    if described:
+        add(27, 1, debug)
+    shoff = 64 + len(body)
+    header = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9), 2, 0x3E, 1, 0, 0, shoff,
+                         0, 64, 0, 0, 64, len(sections), 1)
+    with open(path, "wb") as f:
+        f.write(header + bytes(body))
+        for name, kind, offset, size, link, entsize in sections:
+            f.write(struct.pack("<IIQQQQIIQQ", name, kind, 0, 0, offset, size, link, 0, 1, entsize))
+    os.chmod(path, 0o755)
+
+
 def simulate(res, words, env):
     """What cargo prints for the command and the programs it leaves, written to $CARGO_TARGET_DIR."""
     o, units, root = res["opts"], res["units"], res["root"]
@@ -2784,8 +3035,16 @@ def simulate(res, words, env):
             os.makedirs(directory, exist_ok=True)
             stub(os.path.join(directory, "build-script-build"))
         elif u["kind"] == 1 and not u["test"]:
-            stub(os.path.join(deps, u["name"] + "-" + h))
-            stub(os.path.join(target, prof, u["name"]))
+            # What the link leaves: the program's own `strip`, and each target crate described as
+            # its own `debug` says.
+            replay = env.get("FAKE_REPLAY") == "1"
+            strip = 0 if replay and BUG == "replay-unstripped" else u["profile"]["6"]
+            levels = {x["pkg"]: x["profile"]["2"] for x in units.values() if not x["host"]}
+            if replay and BUG == "debug-whole-program":
+                levels = {name: u["profile"]["2"] for name in levels}
+            described = sorted(name for name, level in levels.items() if level) if strip == 0 else []
+            for path in (os.path.join(deps, u["name"] + "-" + h), os.path.join(target, prof, u["name"])):
+                fake_elf(path, strip < 2, described)
         elif u["test"] and u["kind"] in (0, 1, 2) or (u["kind"] == 2 and not u["test"]):
             stub(os.path.join(deps, u["name"].replace("-", "_") + "-" + h))
             exes[key] = h
@@ -2799,7 +3058,11 @@ def simulate(res, words, env):
     if cmd == "run":
         name = [u for u in units.values() if u["kind"] == 1][0]["name"]
         out.append("     Running `target/debug/%s`" % name)
-        out.append("@@bin %s add=3 args=%s" % (name, json.dumps(o["positional"] + ta)))
+        main = os.path.join(root, "src", "main.rs")
+        if os.path.exists(main) and "answer={}" in open(main).read():
+            out.append("@@bin %s answer=3" % name)  # profiles: dep_b::b() + dep_a::a()
+        else:
+            out.append("@@bin %s add=3 args=%s" % (name, json.dumps(o["positional"] + ta)))
         return "\n".join(out) + "\n", 0
     if cmd != "test":
         return "\n".join(out) + "\n", 0
@@ -2931,7 +3194,7 @@ def main():
             if canon(res["spec"][str(i)]) != canon(saved["spec"][str(i)]):
                 sys.stderr.write("blaze: the tree does not match the spec: %s\n" % name)
                 return 2
-        text, code = simulate(res, words, env)
+        text, code = simulate(res, words, dict(env, FAKE_REPLAY="1"))
         directory = rest[2] + ".outputs/replay-" + str(os.getpid())
         os.makedirs(directory)
         target = env["CARGO_TARGET_DIR"]
@@ -3210,6 +3473,17 @@ def self_test_spec_reading(t):
     t.check(unwrap({"BuildSpec": {"0": 1}}) == {"0": 1}, "blaze-wire's `{\"BuildSpec\": ...}` wrapper is taken off")
     t.check(lock_text([("b", []), ("a", ["b"])]).startswith("# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"a\""),
             "a Cargo.lock is written in name order")
+    case = argparse.Namespace(fixture=argparse.Namespace(name="native"), full="native/deploy-11",
+                              env={"MACOSX_DEPLOYMENT_TARGET": "11.0"})
+    for default, digest in [("11.0", "base"), ("10.12", "different")]:
+        base = argparse.Namespace(made=True, platform={"2": ["macosx", "26.0", default]},
+                                  digests={"platform": "base"})
+        current = argparse.Namespace(made=True, digests={"platform": digest})
+        results = {"native/base": base, case.full: current}
+        t.check(not check_deployment_platform(results, case),
+                f"explicit 11.0 {'preserves' if default == '11.0' else 'changes'} the default {default} platform")
+        current.digests["platform"] = "different" if digest == "base" else "base"
+        t.check(bool(check_deployment_platform(results, case)), "an incorrect deployment platform relation fails")
 
 
 def run_fixture_checks(t):
@@ -3307,7 +3581,10 @@ def self_test_oracle(t, tmp):
             cenv.update({k: (v or "").replace("@TOOLS@", os.path.join(tmp, "tools")) for k, v in case.env.items() if v is not None})
             ran = subprocess.run([cargo_oracle(), *case.words], cwd=os.path.join(copy, case.cwd), env=cenv, text=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
-            got = check_lexpect(summarize(ran.stdout, target, ran.returncode), case.lexpect)
+            summary = summarize(ran.stdout, target, ran.returncode)
+            # What cargo's link leaves of the program is what both blaze runs are held to.
+            summary["binaries"] = binaries_summary(program_files(target), case.lexpect)
+            got = check_lexpect(summary, case.lexpect)
             t.check(not got, f"cargo {' '.join(case.words)} on {case.full} shows what the case expects", "; ".join(got) + " | " + clip(ran.stdout[-300:]))
 
 
@@ -3429,6 +3706,8 @@ def self_test(args):
                 ("replay-git-root", ["nested/base"], True, "spec run"),
                 ("run-in-checkout", ["envcfg"], True, "foreign checkout changed"),
                 ("spec-run-drops-no-run", ["basic/no-run"], True, "spec run"),
+                ("replay-unstripped", ["profiles/strip-symbols"], True, "wanted them stripped"),
+                ("debug-whole-program", ["profiles/pkg-debug0"], True, "wanted none of it"),
                 ("unit-features", ["basic/base"], False, "features")]
         for bug, only, local, wanted in bugs:
             if bug == "unit-features" and not cargo:
