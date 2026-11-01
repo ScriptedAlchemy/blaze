@@ -73,14 +73,10 @@ impl Asked {
         self.seen.lock().is_ok_and(|seen| *seen == manifest)
     }
 
-    /// A failed demand fetch is coalesced for the current lookup, not forever.
-    /// Rebuild it on the keeper's next throttled look even when the manifest is unchanged.
+    /// Failed downloads and evicted packs are coalesced for one lookup, not forever.
+    /// Rebuild at the existing throttled boundary, including packs initially here.
     fn failed_fetch(&self) -> bool {
-        self.lazy.read().is_ok_and(|lazy| {
-            lazy.as_ref().is_some_and(|lazy| {
-                lazy.packs.iter().any(|(_, _, arrived)| arrived.get() == Some(&false))
-            })
-        })
+        self.lazy.read().is_ok_and(|lazy| lazy.as_ref().is_some_and(|lazy| lazy.needs_refresh()))
     }
 
     /// Notes what the manifest is, and says whether that is not what it was.
