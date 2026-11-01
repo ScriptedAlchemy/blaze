@@ -1264,8 +1264,16 @@ pub(super) fn rustc_named() -> Option<OsString> {
 
 /// What `rustc` prints when given `args` (`--version`, `--print=sysroot`), when it starts.
 pub(super) fn rustc_says(rustc: &OsStr, args: &[&str]) -> Option<String> {
-    let output = crate::answers::answer(Command::new(rustc).args(args), &[]).ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    rustc_says_or_why(rustc, args).ok()
+}
+
+/// [`rustc_says`], or why blaze cannot say it: the toolchain `rustc` reaches is not known from
+/// the records on disk, or the answer is not modelled. The reason is for the user, who is
+/// otherwise told only that the release is unknown.
+pub(super) fn rustc_says_or_why(rustc: &OsStr, args: &[&str]) -> Result<String, String> {
+    let output =
+        crate::answers::answer(Command::new(rustc).args(args), &[]).map_err(|it| it.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 pub(super) fn metadata(asked: &Invocation) -> Metadata {

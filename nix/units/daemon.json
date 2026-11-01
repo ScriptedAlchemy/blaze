@@ -1,7 +1,7 @@
 {
  "dir": ".",
  "inputs": {
-  "Cargo.lock": "35c2ed16c9426050dc734dbf041d7e840061a8761a48fc3b9bd910ee650394f2",
+  "Cargo.lock": "c7434152243d436f30491759bf53e00874616b20a07c85660d7ed6d54ac201c7",
   "Cargo.toml": "d01d0e3aa1aa049db80f3e5a60cee5cbb73976be91d4c854520602023d581644"
  },
  "packages": {
@@ -5275,19 +5275,36 @@
    },
    "version": "0.166.0"
   },
-  "ra-jit-bench@0.1.0": {
+  "ra-jit-bench-codegen@0.1.0": {
    "authors": "blaze contributors",
-   "description": "Microbenchmarks of ra-jit's hot paths, run by tango in pairs: a change against its base",
+   "description": "Microbenchmarks of ra-jit's code generator, run by tango in pairs: a change against its base",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-bench",
+   "name": "ra-jit-bench-codegen",
    "readme": "",
    "repository": "",
    "rust_version": "1.99",
    "source": {
-    "dir": "crates/ra-jit-bench",
+    "dir": "crates/ra-jit-bench-codegen",
+    "kind": "path"
+   },
+   "version": "0.1.0"
+  },
+  "ra-jit-bench-store@0.1.0": {
+   "authors": "blaze contributors",
+   "description": "Microbenchmarks of ra-jit's store, run by tango in pairs: a change against its base",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "ra-jit-bench-store",
+   "readme": "",
+   "repository": "",
+   "rust_version": "1.99",
+   "source": {
+    "dir": "crates/ra-jit-bench-store",
     "kind": "path"
    },
    "version": "0.1.0"

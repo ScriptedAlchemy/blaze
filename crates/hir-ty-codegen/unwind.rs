@@ -23,6 +23,7 @@ use cranelift_object::{
     },
 };
 
+mod compact;
 mod gcc_except_table;
 pub(super) mod seh;
 
@@ -50,6 +51,9 @@ fn address_for_data(data: DataId) -> Address {
 #[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct FunctionUnwind {
     frame: Frame,
+    /// LLVM's compact frame encoding, before the linker assigns personality indices.
+    /// Other producers use the FDE rather than asking the linker to infer a frame.
+    compact_encoding: Option<u32>,
     /// The function's `.gcc_except_table` entry. A function without one has no call that
     /// lands anywhere, and no personality to ask.
     landing_pads: Option<Vec<u8>>,
@@ -126,7 +130,11 @@ impl FunctionUnwind {
             Some(UnwindInfo::SystemV(info)) => info,
             Some(UnwindInfo::WindowsX64(info)) => {
                 let (frame, landing_pads) = seh::function(code, &info)?;
-                return Ok(Some(FunctionUnwind { frame: Frame::Windows(frame), landing_pads }));
+                return Ok(Some(FunctionUnwind {
+                    frame: Frame::Windows(frame),
+                    compact_encoding: None,
+                    landing_pads,
+                }));
             }
             _ => return Ok(None),
         };
@@ -171,14 +179,22 @@ impl FunctionUnwind {
         debug_assert!(writer.relocs.is_empty());
         Ok(Some(FunctionUnwind {
             frame: Frame::Cranelift(info),
+            compact_encoding: None,
             landing_pads: Some(writer.writer.into_vec()),
         }))
     }
 
     /// The unwind information of code that came with its own.
-    #[cfg(feature = "llvm")]
+    #[cfg(any(feature = "llvm", test))]
     pub(super) fn from_rows(rows: FrameRows, landing_pads: Option<Vec<u8>>) -> Self {
-        FunctionUnwind { frame: Frame::Rows(rows), landing_pads }
+        FunctionUnwind { frame: Frame::Rows(rows), compact_encoding: None, landing_pads }
+    }
+
+    /// Keeps the producer's compact encoding alongside the DWARF frame rules.
+    #[cfg(any(feature = "llvm", test))]
+    pub(super) fn with_compact_encoding(mut self, encoding: u32) -> Self {
+        self.compact_encoding = Some(encoding);
+        self
     }
 
     /// The unwind information of code of Windows that came with its own: how long the code
@@ -186,7 +202,7 @@ impl FunctionUnwind {
     #[cfg(feature = "llvm")]
     pub(super) fn from_unwind_info(len: u32, info: Vec<u8>, pads: seh::Pads) -> Self {
         let frame = Frame::Windows(seh::Frame { len, info });
-        FunctionUnwind { frame, landing_pads: pads.finish() }
+        FunctionUnwind { frame, compact_encoding: None, landing_pads: pads.finish() }
     }
 
     /// The function's `.eh_frame` entry, which a frame of Windows has none of.
@@ -236,6 +252,7 @@ pub(super) struct UnwindContext {
     /// The pointer to the personality the frames name, where they reach it through one.
     personality_ref: Option<DataId>,
     seh: seh::Tables,
+    compact: compact::Table,
 }
 
 /// The entries functions share: one that names the personality, for functions with landing
@@ -250,13 +267,26 @@ impl UnwindContext {
     pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
         let seh = seh::Tables::default();
+        let mut compact = compact::Table::default();
         let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
         // Nothing unwinds on wasm: a panic aborts there.
         if super::Target::current().is_wasm() {
-            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
+            return Ok(UnwindContext {
+                frame_table,
+                cies: None,
+                personality_ref: None,
+                seh,
+                compact,
+            });
         }
         let Some(mut cie) = module.isa().create_systemv_cie().filter(|_| dwarf) else {
-            return Ok(UnwindContext { frame_table, cies: None, personality_ref: None, seh });
+            return Ok(UnwindContext {
+                frame_table,
+                cies: None,
+                personality_ref: None,
+                seh,
+                compact,
+            });
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
@@ -268,6 +298,7 @@ impl UnwindContext {
         // linker of Mach-O makes that pointer, when asked for the one among its own.
         if macho {
             let personality = personality(module)?;
+            compact.personality = Some(personality);
             cie.personality = Some((
                 gimli::DwEhPe(
                     gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0,
@@ -280,6 +311,7 @@ impl UnwindContext {
                 personality_ref: None,
                 frame_table,
                 seh,
+                compact,
             });
         }
         // It must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
@@ -302,6 +334,7 @@ impl UnwindContext {
             personality_ref: Some(personality_ref),
             frame_table,
             seh,
+            compact,
         })
     }
 
@@ -341,22 +374,24 @@ impl UnwindContext {
         }
         let Some(cies) = self.cies else { return Ok(()) };
         let Some(mut fde) = unwind.fde(address_for_func(func)) else { return Ok(()) };
-        let Some(landing_pads) = &unwind.landing_pads else {
-            self.frame_table.add_fde(cies.plain, fde);
-            return Ok(());
+        let lsda = if let Some(landing_pads) = &unwind.landing_pads {
+            let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
+            let mut data = DataDescription::new();
+            data.define(landing_pads.clone().into_boxed_slice());
+            // Mach-O has room for 255 sections and every custom one counts, so there the
+            // tables lie with the constants, where the unwinder finds them as well.
+            if module.isa().triple().binary_format != target_lexicon::BinaryFormat::Macho {
+                data.set_custom_section(".gcc_except_table");
+            }
+            module.define_data(lsda, &data).map_err(|e| e.to_string())?;
+            fde.lsda = Some(address_for_data(lsda));
+            Some(lsda)
+        } else {
+            None
         };
-        let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
-        let mut data = DataDescription::new();
-        data.define(landing_pads.clone().into_boxed_slice());
-        // Mach-O has room for 255 sections and every custom one counts, so there the tables
-        // lie with the constants, where the unwinder finds them as well.
-        if module.isa().triple().binary_format != target_lexicon::BinaryFormat::Macho {
-            data.set_custom_section(".gcc_except_table");
-        }
-        module.define_data(lsda, &data).map_err(|e| e.to_string())?;
-        fde.lsda = Some(address_for_data(lsda));
-
-        self.frame_table.add_fde(cies.with_landing_pads, fde);
+        self.compact.add_function(func, unwind.compact_encoding, lsda);
+        let cie = if lsda.is_some() { cies.with_landing_pads } else { cies.plain };
+        self.frame_table.add_fde(cie, fde);
         Ok(())
     }
 
@@ -367,6 +402,7 @@ impl UnwindContext {
         if eh_frame.0.writer.slice().is_empty() {
             return Ok(());
         }
+        self.compact.emit(product, eh_frame.0.writer.slice())?;
         let section = product.object.section_id(StandardSection::EhFrame);
         product.object.section_mut(section).set_data(eh_frame.0.writer.into_vec(), 8);
         for reloc in &eh_frame.0.relocs {
@@ -384,7 +420,12 @@ impl UnwindContext {
             };
             let flags = match reloc.indirect && macho {
                 true => RelocationFlags::MachO {
-                    r_type: macho::ARM64_RELOC_POINTER_TO_GOT,
+                    r_type: match product.object.architecture() {
+                        cranelift_object::object::Architecture::Aarch64 => {
+                            macho::ARM64_RELOC_POINTER_TO_GOT
+                        }
+                        _ => macho::X86_64_RELOC_GOT,
+                    },
                     r_pcrel: true,
                     r_length: 2,
                 },

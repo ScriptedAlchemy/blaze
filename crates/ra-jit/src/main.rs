@@ -5099,12 +5099,23 @@ fn std_unit(
     let key: [u8; 32] = hasher.finalize().into();
     let object = args.out.with_extension("std.o");
     let archive = args.out.with_extension("std.a");
-    let store = ra_jit_store::Store::global();
+    let replay = cargo::spec::std_unit_cache(&args.project, &key)?;
+    let store = replay.is_none().then(ra_jit_store::Store::global).flatten();
     let stored = || -> anyhow::Result<Option<PathBuf>> {
-        let Some(bytes) = store.and_then(|it| it.get(&key)) else { return Ok(None) };
+        let bytes = if let Some(path) = &replay {
+            match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("reading replay standard library"),
+            }
+        } else {
+            store.and_then(|it| it.get(&key))
+        };
+        let Some(bytes) = bytes else { return Ok(None) };
         let path = if link::split::is_archive(&bytes) { &archive } else { &object };
         std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-        eprintln!("standard library: from the store, {} crates", members.len());
+        let from = if replay.is_some() { "this replay" } else { "the store" };
+        eprintln!("standard library: from {from}, {} crates", members.len());
         Ok(Some(path.clone()))
     };
     if let Some(path) = stored()? {
@@ -5164,6 +5175,12 @@ fn std_unit(
         store.settled();
         store.insert(&key, &bytes);
         store.flush();
+    }
+    if let Some(path) = replay {
+        // Publish only the complete raw unit, before any program's allocator support is
+        // added. Compilers in a replay run sequentially, and admission still traces every
+        // program and generated example even when their library unit was built earlier.
+        replace(&path, &bytes)?;
     }
     Ok(Some(path))
 }

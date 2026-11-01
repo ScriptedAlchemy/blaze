@@ -1,0 +1,43 @@
+name: Harness verdict regressions
+on:
+  pull_request:
+    paths:
+      - harness/unittests.py
+      - harness/uigate.py
+      - harness/ui-known.txt
+      - harness/dist/tests.py
+      - harness/test_gate_verdicts.py
+      - .github/workflows/history-gates-proof.yaml
+      - .github/actions/toolchain/**
+  push:
+    branches: [main, dist/main, dist/c4-keys]
+    paths:
+      - harness/unittests.py
+      - harness/uigate.py
+      - harness/ui-known.txt
+      - harness/dist/tests.py
+      - harness/test_gate_verdicts.py
+      - .github/workflows/history-gates-proof.yaml
+      - .github/actions/toolchain/**
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: harness-verdicts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  verdicts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: none
+      - name: Exercise verdicts, including actual Cargo output
+        run: |
+          cargo --version
+          python3 -I harness/test_gate_verdicts.py -v
+          python3 -I harness/dist/tests.py --self-test
