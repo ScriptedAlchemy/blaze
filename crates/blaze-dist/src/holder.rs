@@ -290,8 +290,18 @@ impl Holder {
     fn tick(&mut self, now: Millis, out: &mut Vec<Effect>) {
         if now >= self.next_beat {
             self.next_beat = now + self.config.heartbeat_ms;
-            let id = self.take_id();
-            self.beat = Some(id);
+            // A slow or lost heartbeat response must not become obsolete merely
+            // because another heartbeat interval passed. Retry the same local
+            // request id until its reply arrives: a late CANCEL must still fence
+            // this holder and release its retained compiler findings.
+            let id = match self.beat {
+                Some(id) => id,
+                None => {
+                    let id = self.take_id();
+                    self.beat = Some(id);
+                    id
+                }
+            };
             let call = Call::Events(WorkersEventsRequest {
                 execution: self.execution,
                 attempt: self.attempt,
