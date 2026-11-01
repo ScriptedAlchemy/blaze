@@ -270,7 +270,7 @@ pub fn programs(
 pub fn preflight(prepared: &Prepared, allow_producers: bool) -> anyhow::Result<()> {
     let build = &prepared.resolved.spec.build;
     let native = canonical_units(build, &prepared.resolved.graph)?;
-    for (at, unit) in native.iter().enumerate() {
+    for unit in &native {
         let label = format!("{}:{}", unit.package.name, unit.target.name);
         if !allow_producers {
             match unit.target.kind {
@@ -302,26 +302,10 @@ pub fn preflight(prepared: &Prepared, allow_producers: bool) -> anyhow::Result<(
             unit.dependencies.iter().all(|dep| !dep.noprelude && !dep.public && !dep.nounused),
             "owned BuildSpec replay cannot represent special extern options of {label}"
         );
-        ensure!(
-            build.units[at].profile.strip != 2,
-            "owned BuildSpec replay does not yet strip native symbols for {label}"
-        );
     }
-    for root in roots(build, &native) {
-        let root_profile = &build.units[root as usize].profile;
-        for at in reachable(build, &native, root) {
-            let unit = native[at as usize];
-            let profile = &build.units[at as usize].profile;
-            ensure!(
-                unit.target.kind == TargetKind::ProcMacro
-                    || (profile.debug, profile.strip, profile.split_debuginfo)
-                        == (root_profile.debug, root_profile.strip, root_profile.split_debuginfo),
-                "owned BuildSpec replay cannot mix per-unit debug/strip/split settings in {}:{}",
-                unit.package.name,
-                unit.target.name
-            );
-        }
-    }
+    // Each unit's debug level is its own (`-Cdebuginfo` among its codegen flags, which the
+    // compiler reads per crate), and `strip` and `split-debuginfo` are the linked root's, as
+    // rustc reads them only where it links: units of one program may differ in all three.
     Ok(())
 }
 

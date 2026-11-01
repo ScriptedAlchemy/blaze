@@ -43,8 +43,17 @@ class ChangeSelectionTests(unittest.TestCase):
             self.assertEqual(hit['code'], 'false')
 
     def test_bench_only_does_not_run_the_compiler_runtime_matrix(self):
-        hit = self.select(['crates/ra-jit-bench/benches/store.rs'])
-        self.assertEqual((hit['bench'], hit['dist'], hit['serve']), ('true', 'false', 'false'))
+        for path in ('crates/ra-jit-bench-store/benches/store.rs',
+                     'crates/ra-jit-bench-codegen/benches/codegen.rs'):
+            with self.subTest(path=path):
+                hit = self.select([path])
+                self.assertEqual((hit['bench'], hit['dist'], hit['serve']), ('true', 'false', 'false'))
+
+    def test_the_benchmarked_crates_still_run_the_runtime_matrix(self):
+        for path in ('crates/ra-jit-store/src/bench.rs', 'crates/hir-ty-codegen/mod.rs'):
+            with self.subTest(path=path):
+                hit = self.select([path])
+                self.assertEqual((hit['bench'], hit['dist'], hit['serve']), ('true', 'true', 'true'))
 
     def test_invalid_json_runs_every_area_instead_of_skipping(self):
         result = subprocess.run([sys.executable, '-I', str(SCRIPT), '--compare-json'],
