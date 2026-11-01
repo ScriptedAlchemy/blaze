@@ -428,17 +428,25 @@ out right, it fails the run until it is taken off the list:
 
 The other workflows: `bench-readme.yaml` measures real projects on each platform's dedicated
 benchmark machine and commits the tables and the README's numbers to main. It runs a platform only once the
-repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). On the fork, `pr.yaml` calls `bench.yaml` as a bundle consumer for the store's
-microbenchmarks. The producer compiles the base and head benchmark executables with the
-same pinned shell and `cargo bench` arguments; the consumer checks their provenance and
-compares them on one runner with the existing three-second samples, 10% noise threshold,
-and second comparison on a slowdown. The job fails only when the same benchmark is over the
-threshold in both comparisons; before them, `bench-base` is compared with a copy of itself, and
-a benchmark over the threshold there makes the verdict "environmental" (reported, not counted).
-The runner's CPU and both binaries' sha256 are in the summary and the artifact of every run
-(`.github/scripts/bench_verdict.py`, [reports/CI-fork.md](reports/CI-fork.md)). A missing base executable fails unless the producer
-explicitly records that the base has no benchmark package. The consumer compiles neither
-side. `blaze-serve-review.yaml` is also called by `pr.yaml`: it verifies the bundle and
+repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). On the fork, `pr.yaml` calls `bench.yaml` as a bundle consumer for the
+tango microbenchmarks of the store and the code generator. Each benchmark binary is a package that
+links only what it measures (`ra-jit-bench-store`, the store and tango alone; `ra-jit-bench-codegen`,
+the compiler), and the producer builds each, for the head and for the base, as a set of its own,
+with the same pinned shell, `cargo bench` arguments and function and loop alignment, and with
+its checkout and target directory remapped so that the same source is the same bytes in either
+checkout. A binary a change leaves byte-identical to its base's is not run and passes
+("unchanged by this change: not judged"): the A/A control below does not see what moves a
+relinked binary (on #18 the same two store binaries were +22% then +11% on `store/get_hit` on one
+CPU and passed on another). One that differs is compared on one runner with the
+three-second samples, 10% noise threshold and second comparison on a slowdown, and fails only
+when the same benchmark is over the threshold in both; before them, its base is compared with a
+copy of itself, and a benchmark over the threshold there makes the verdict "environmental"
+(reported, not counted). The runner's CPU and every binary's sha256 are in the summary and the
+artifact of every run (`.github/scripts/bench_pair.py` and `bench_verdict.py`,
+[reports/CI-fork.md](reports/CI-fork.md)). A missing base executable fails unless the producer
+explicitly records that the base has no such benchmark package (a base from before the split
+has `crates/ra-jit-bench`, and neither); that binary, like every one on main, is run alone for its
+times. The consumer compiles neither side. `blaze-serve-review.yaml` is also called by `pr.yaml`: it verifies the bundle and
 replays the test processes of `.github/ci/test-sets.json` with the original test filters,
 then runs saved-source replay and the probe/oracle harnesses against the shared release CLI.
 Its `server` aggregate requires both server tests and saved-source replay to pass. The
