@@ -149,7 +149,7 @@ fn whole(
     if runtime.len() != programs.len() || runtime.iter().any(Option::is_none) {
         return Err("the whole-build reply has no matching runtime contexts".into());
     }
-    for (program, plan) in programs.iter().zip(&checkout.programs) {
+    for ((program, plan), context) in programs.iter().zip(&checkout.programs).zip(&runtime) {
         let _unwritten = crate::splice::unwritten(&plan.binary);
         let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
         if !stand_ins.is_empty() {
@@ -172,8 +172,17 @@ fn whole(
             std::fs::create_dir_all(parent)
                 .map_err(|it| format!("creating {}: {it}", parent.display()))?;
         }
-        place(&plan.binary, &program.executable)
-            .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+        // The daemon's executable keeps its symbols for the edits spliced into it: what the
+        // profile strips is taken out of cargo's copy, as rustc's link takes it out.
+        let strip = crate::link::noted_strip(&plan.binary).map_err(|it| format!("{it:#}"))?;
+        if strip == crate::link::Strip::None {
+            place(&plan.binary, &program.executable)
+                .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+        } else {
+            let sysroot = context.as_ref().and_then(|it| it.sysroot());
+            crate::link::place_stripped(&plan.binary, &program.executable, strip, sysroot)
+                .map_err(|it| format!("{it:#}"))?;
+        }
     }
     runtime
         .into_iter()

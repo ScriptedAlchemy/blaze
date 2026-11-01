@@ -160,8 +160,11 @@ impl<'a, 'db> ExportContext<'a, 'db> {
         if policy.variables && !policy.debug {
             return Err("variable debug requires debug information".into());
         }
+        // The entries are kept under what is told of the code no crate's own setting covers
+        // (`later::Keeper`), which the policy names: it is all the resolver tells of any.
         if policy.debug != symbols.debug_directory().is_some()
             || policy.variables != (policy.debug && symbols.describes_variables())
+            || symbols.tells() != cached::Told::of(policy.debug, policy.variables)
         {
             return Err("debug policy and local compiler resolver disagree".into());
         }
@@ -289,8 +292,7 @@ impl<'a, 'db> ExportContext<'a, 'db> {
             root_names: &self.roots,
             own_crates: &self.owned,
             told,
-            debug: self.policy.debug,
-            variables: self.policy.variables,
+            debug: cached::Told::of(self.policy.debug, self.policy.variables),
             program: self.policy.program.map(Some),
             own: true,
             markable: true,
@@ -531,7 +533,7 @@ pub fn compile_batch(
         }
         let key = cached::Entry::key(
             &work.name,
-            cached::Told::of(described, context.policy.variables),
+            cached::Told::of(context.policy.debug, context.policy.variables),
             context.policy.program.as_ref(),
         )
         .ok_or("entry key settings are unavailable")?;
@@ -614,7 +616,11 @@ fn validate_receipt(
             return Err("receipt entry digest mismatch".into());
         }
         let mut entry = cached::Entry::decode(&bytes).ok_or("invalid entry references")?;
-        if entry.debug.is_some() != context.policy.debug {
+        // An entry is described as the crate its code is written in is built, which its name
+        // says where that is not as the build's own code is.
+        let told = stable::told_in(&exported.work.name)
+            .unwrap_or(cached::Told::of(context.policy.debug, context.policy.variables));
+        if entry.debug.is_some() != (told != cached::Told::Nothing) {
             return Err("entry debug setting differs from the context".into());
         }
         if stable::StableNames::of_checkout(&exported.work.name) && entry.tracked.is_none() {
