@@ -31,7 +31,8 @@ class SourceIdentityTests(unittest.TestCase):
 
     def identity(self, root=None, **extra):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("CARGO_FEATURE_") and k != "CARGO_CFG_DEBUG_ASSERTIONS"}
+               if not k.startswith(("CARGO_FEATURE_", "CARGO_CFG_"))
+               and k not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
         env.update(CARGO_WORKSPACE_DIR=str(root or self.root), TARGET="test-target")
         env.update(extra)
         result = subprocess.run([SCRIPT], env=env, capture_output=True, text=True,
@@ -59,6 +60,56 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertNotEqual(before, self.identity(CARGO_FEATURE_LLVM="1"))
         self.assertNotEqual(before, self.identity(TARGET="another-target"))
         self.assertNotEqual(before, self.identity(CARGO_CFG_DEBUG_ASSERTIONS=""))
+
+    def test_target_features_select_distinct_compiler_identities(self):
+        first = self.identity(CARGO_CFG_TARGET_FEATURE="sse,sse2")
+        second = self.identity(CARGO_CFG_TARGET_FEATURE="sse,sse2,avx2")
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
+    def test_custom_cfg_values_select_distinct_compiler_identities(self):
+        first = self.identity(CARGO_CFG_BLAZE_BUILD_MODE="owned")
+        second = self.identity(CARGO_CFG_BLAZE_BUILD_MODE="mixed")
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
+    def test_custom_cfg_presence_is_not_an_unconfigured_compiler(self):
+        self.assertNotEqual(self.identity(), self.identity(CARGO_CFG_BLAZE_SPECIAL=""))
+
+    def test_encoded_cfg_argument_boundaries_are_not_collapsed(self):
+        # Cargo's comma-joined cfg value cannot distinguish one value containing
+        # a comma from two separate cfg values. Keep the original flag boundaries.
+        first = self.identity(CARGO_CFG_BLAZE_MODE="a,b",
+                              CARGO_ENCODED_RUSTFLAGS='--cfg\x1fblaze_mode="a,b"')
+        second = self.identity(CARGO_CFG_BLAZE_MODE="a,b",
+                               CARGO_ENCODED_RUSTFLAGS='--cfg\x1fblaze_mode="a"\x1f--cfg\x1fblaze_mode="b"')
+        self.assertNotEqual(first, second)
+
+    def test_plain_rustflags_are_kept_when_encoded_flags_are_absent(self):
+        self.assertNotEqual(self.identity(), self.identity(RUSTFLAGS="--cfg=blaze_special"))
+
+    def test_encoded_flags_override_plain_flags_including_an_empty_value(self):
+        first = self.identity(CARGO_ENCODED_RUSTFLAGS="", RUSTFLAGS="--cfg=ignored_a")
+        second = self.identity(CARGO_ENCODED_RUSTFLAGS="", RUSTFLAGS="--cfg=ignored_b")
+        self.assertEqual(first, second)
+
+    @unittest.skipUnless(os.name == "posix", "Unix native Rust flags fixture")
+    def test_non_unicode_effective_rustflags_use_binary_identity(self):
+        self.assertIsNone(self.identity(CARGO_ENCODED_RUSTFLAGS=os.fsdecode(b"\xff")))
+
+    def test_cfg_insertion_order_does_not_change_identity(self):
+        first = self.identity(CARGO_CFG_ALPHA="1", CARGO_CFG_BETA="2")
+        second = self.identity(CARGO_CFG_BETA="2", CARGO_CFG_ALPHA="1")
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+
+    @unittest.skipUnless(os.name == "posix", "Unix native cfg value fixture")
+    def test_non_unicode_cfg_values_use_binary_identity(self):
+        self.assertIsNone(self.identity(CARGO_CFG_BLAZE_SPECIAL=os.fsdecode(b"\xff")))
+
+    @unittest.skipUnless(os.name == "posix", "Unix native cfg name fixture")
+    def test_non_unicode_cfg_names_use_binary_identity(self):
+        self.assertIsNone(self.identity(**{os.fsdecode(b"CARGO_CFG_\xff"): "1"}))
 
     @unittest.skipUnless(os.name == "posix", "Unix native environment fixture")
     def test_unrelated_non_unicode_environment_is_not_decoded(self):

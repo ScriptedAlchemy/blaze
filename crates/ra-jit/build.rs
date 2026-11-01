@@ -1,8 +1,8 @@
 //! `RA_JIT_SOURCES`: what this build of ra-jit is built from, for the store to key what it
 //! keeps by (`ra_jit_store::built_from`). A hash of every file of the workspace's crates, the
 //! vendored ones included, of the manifest and lock file that pick the crates of crates.io, of
-//! the files outside them a crate compiles in, of the features, the target and whether debug
-//! assertions are on, which some of codegen checks under. The compiler that builds ra-jit is
+//! the files outside them a crate compiles in, of the features, target, effective cfgs and
+//! compiler flags (including argument boundaries). The compiler that builds ra-jit is
 //! not: what ra-jit compiles does not depend on it, and the toolchain it compiles against is
 //! in the store's key apart. Two such builds of the same sources compile the same code into
 //! the store, wherever they are built. Outside the workspace, as a published crate builds, it
@@ -49,7 +49,7 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
         hash.update(&(bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     };
-    field(b"blaze-source-identity-v2");
+    field(b"blaze-source-identity-v3");
     for path in &files {
         let bytes = std::fs::read(path)?;
         let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
@@ -75,8 +75,42 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
         .collect();
     features.sort();
     field(features.join(" ").as_bytes());
+    // Cargo exposes the effective conditional-compilation inputs here, including
+    // target features, panic strategy and user --cfg values. Source bytes and
+    // Cargo feature names alone do not identify the compiler built from them.
+    let mut cfgs = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        if !name.to_string_lossy().starts_with("CARGO_CFG_") {
+            continue;
+        }
+        let name = name
+            .into_string()
+            .map_err(|_| std::io::Error::other("non-Unicode compiler cfg name"))?;
+        let value = value
+            .into_string()
+            .map_err(|_| std::io::Error::other("non-Unicode compiler cfg value"))?;
+        cfgs.push((name, value));
+    }
+    cfgs.sort();
+    field(b"effective compiler cfg");
+    for (name, value) in cfgs {
+        println!("cargo:rerun-if-env-changed={name}");
+        field(name.as_bytes());
+        field(value.as_bytes());
+    }
+    // Cargo's comma-joined CARGO_CFG values lose boundaries when a literal cfg
+    // value itself contains a comma. Keep the effective flags as well. An empty
+    // encoded value still overrides plain RUSTFLAGS, just as Cargo specifies.
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    let flags = std::env::var_os("CARGO_ENCODED_RUSTFLAGS")
+        .or_else(|| std::env::var_os("RUSTFLAGS"))
+        .unwrap_or_default()
+        .into_string()
+        .map_err(|_| std::io::Error::other("non-Unicode effective compiler flags"))?;
+    field(b"effective compiler flags");
+    field(flags.as_bytes());
     field(std::env::var("TARGET").unwrap_or_default().as_bytes());
-    field(&[u8::from(std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some())]);
     Ok(hash.finish().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
