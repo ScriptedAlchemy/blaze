@@ -30,7 +30,7 @@ class SourceIdentityTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(contents)
 
-    def identity(self, root=None, **extra):
+    def script_output(self, root=None, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CARGO_FEATURE_", "CARGO_CFG_"))
                and k not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
@@ -38,7 +38,11 @@ class SourceIdentityTests(unittest.TestCase):
         env.update(extra)
         result = subprocess.run([SCRIPT], env=env, capture_output=True, text=True,
                                 errors="replace", timeout=10, check=True)
-        identities = [line.split("=", 2)[2] for line in result.stdout.splitlines()
+        return result.stdout
+
+    def identity(self, root=None, **extra):
+        output = self.script_output(root, **extra)
+        identities = [line.split("=", 2)[2] for line in output.splitlines()
                       if line.startswith("cargo:rustc-env=RA_JIT_SOURCES=")]
         self.assertLessEqual(len(identities), 1)
         if identities:
@@ -132,6 +136,15 @@ class SourceIdentityTests(unittest.TestCase):
         before = self.identity()
         external.write_text("2")
         self.assertNotEqual(before, self.identity())
+
+    @unittest.skipUnless(os.name == "posix", "Unix source alias fixture")
+    def test_external_file_symlink_referent_is_watched(self):
+        external = self.root.parent / "external.rs"
+        external.write_text("original")
+        (self.root / "vendor/alias.rs").symlink_to(external)
+        output = self.script_output()
+        self.assertIn(f"cargo:rerun-if-changed={external.resolve()}", output)
+        self.assertIsNotNone(self.identity())
 
     def test_generated_output_directories_do_not_invalidate_identity(self):
         before = self.identity()
