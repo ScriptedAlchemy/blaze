@@ -51,6 +51,11 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
     };
     field(b"blaze-source-identity-v2");
     for path in &files {
+        // A source symlink's external referent can change without touching the link.
+        // Watch the physical file as well as its logical source-tree spelling.
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            println!("cargo:rerun-if-changed={}", std::fs::canonicalize(path)?.display());
+        }
         let bytes = std::fs::read(path)?;
         let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
         // Normalize separators, not characters in names: on Unix a backslash is
