@@ -3093,9 +3093,12 @@ outputs. `ExecPlatform.native_root` identifies that captured closure. Linking mu
 actual reads against the bindings, including symlink referents and recorded absences; an
 unbound input fails admission. This is an implemented boundary whose full platform coverage
 still needs the runtime gates below, not evidence that every native toolchain is supported.
-Preflight still reports unsupported output types and special extern options, symbol stripping,
-and incompatible per-unit debug/strip/split settings before compilation. Those are remaining
-execution limits, not completed Rust compatibility.
+A profile's `strip` is the linked root's, and replay strips as rustc 1.99 does, with the link the
+ordinary build shares (`link.rs`): an ELF link is told `--strip-debug` or `--strip-all`, and what
+Apple's linker wrote is stripped afterwards by the toolchain's `rust-objcopy` (`--strip-debug`,
+`--strip-all`, a shared library `--discard-all`). Preflight still reports unsupported output types
+and special extern options, and incompatible per-unit debug/split settings before compilation.
+Those are remaining execution limits, not completed Rust compatibility.
 
 The private version-2 deterministic CBOR trace carries input paths and keyed identities of
 observed environment values, distinguishing absence, empty text and native non-Unicode values.
