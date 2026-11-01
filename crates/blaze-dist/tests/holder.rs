@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use blaze_dist::Ranges;
-use blaze_dist::holder::{Compiled, Effect, Event, Holder, HolderConfig, Reply};
+use blaze_dist::holder::{Call, Compiled, Effect, Event, Holder, HolderConfig, Reply, StopWhy};
 use blaze_wire::{
     Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
     RootSet, Set, WorkJoinAnswer, WorkLeaseAnswer, WorkName, WorkResultAnswer, WorkersEventsAnswer,
@@ -174,4 +174,94 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
     holder.step(5, Event::Compiled(batch), &mut effects);
     assert_eq!(released(&effects), BTreeSet::from([FOUND]));
     assert!(effects.iter().all(|effect| matches!(effect, Effect::Release(_))));
+}
+
+/// A delayed heartbeat reply must not be invalidated by the next interval. A
+/// coordinator's CANCEL is authoritative even if its response took longer than
+/// the configured heartbeat period.
+#[test]
+fn late_cancellation_of_a_retried_heartbeat_stops_the_holder() {
+    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let mut holder = Holder::new(
+        "helper", ExecutionId(1), Attempt(1), roots,
+        Set::new(Vec::new()), BTreeSet::new(),
+        HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
+    );
+    let mut effects = Vec::new();
+    holder.start(0, &mut effects);
+    let first = sent(&effects);
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Events(_), .. })));
+    effects.clear();
+
+    holder.step(5, Event::Tick, &mut effects);
+    assert_eq!(sent(&effects), first, "an unanswered heartbeat keeps its request id");
+    effects.clear();
+    holder.step(
+        6,
+        Event::Reply { id: first, reply: Reply::Events(Ok(WorkersEventsAnswer::CANCEL)) },
+        &mut effects,
+    );
+    assert!(holder.is_stopped(), "a late cancellation must not be forgotten");
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::Stop(StopWhy::Cancelled))));
+}
+
+#[test]
+fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id() {
+    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let mut holder = Holder::new(
+        "helper", ExecutionId(1), Attempt(1), roots,
+        Set::new(Vec::new()), BTreeSet::new(),
+        HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
+    );
+    let mut effects = Vec::new();
+    holder.start(0, &mut effects);
+    let first = sent(&effects);
+    effects.clear();
+    holder.step(
+        1,
+        Event::Reply { id: first, reply: Reply::Events(Ok(WorkersEventsAnswer::CONTINUE)) },
+        &mut effects,
+    );
+    assert!(!holder.is_stopped());
+    holder.step(5, Event::Tick, &mut effects);
+    let next = sent(&effects);
+    assert_ne!(next, first);
+    effects.clear();
+
+    // A delayed duplicate of the first acknowledged heartbeat is not a new
+    // cancellation, but the outstanding heartbeat's cancellation is binding.
+    holder.step(
+        6,
+        Event::Reply { id: first, reply: Reply::Events(Ok(WorkersEventsAnswer::CANCEL)) },
+        &mut effects,
+    );
+    assert!(!holder.is_stopped());
+    holder.step(
+        7,
+        Event::Reply { id: next, reply: Reply::Events(Ok(WorkersEventsAnswer::CANCEL)) },
+        &mut effects,
+    );
+    assert!(holder.is_stopped());
+}
+
+#[test]
+fn heartbeat_resend_does_not_grow_independent_pending_heartbeats() {
+    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let mut holder = Holder::new(
+        "helper", ExecutionId(1), Attempt(1), roots,
+        Set::new(Vec::new()), BTreeSet::new(),
+        HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
+    );
+    let mut effects = Vec::new();
+    holder.start(0, &mut effects);
+    let first = sent(&effects);
+    for at in [5, 10, 15, 20, 25, 30] {
+        effects.clear();
+        holder.step(at, Event::Tick, &mut effects);
+        let beats: Vec<_> = effects.iter().filter_map(|effect| match effect {
+            Effect::Send { id, call: Call::Events(_) } => Some(*id),
+            _ => None,
+        }).collect();
+        assert_eq!(beats, vec![first]);
+    }
 }
