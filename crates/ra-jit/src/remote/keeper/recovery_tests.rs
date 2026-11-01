@@ -1,4 +1,94 @@
 //! Directory-remote failures must not become permanent negative cache entries.
+mod lazy_download_tests {
+    use super::*;
+
+    /// Install a real one-entry index while leaving its pack temporarily unavailable.
+    fn lazy_pack_fixture() -> (Fixture, [u8; 32], Vec<u8>, Digest) {
+        let fixture = Fixture::new(true);
+        ra_jit_store::compiles_against("keeper-lazy-recovery-regression");
+        let source = ra_jit_store::Store::owned(&fixture._work.path().join("producer")).unwrap();
+        let key = [71; 32];
+        source.insert(&key, b"a remotely compiled function");
+        let key = source.disk_key(&key);
+        let packs = source.seal_checked().unwrap();
+        assert_eq!(packs.len(), 1);
+        let pack = source.pack(&packs[0]).unwrap();
+        let keys = ra_jit_store::pack_keys(&packs[0], &pack).unwrap().concat();
+        let digest = Digest::of(&pack);
+        let keys_digest = Digest::of(&keys);
+        tests::put(&fixture.remote_dir, &keys_object(&keys_digest), &keys);
+        let listed = Listed {
+            size: pack.len() as u64,
+            keys: keys_digest,
+            format: STORE_FORMAT,
+            packed: None,
+        };
+        tests::put(
+            &fixture.remote_dir,
+            &Manifest::at("recovery"),
+            Manifest([(digest, listed)].into()).lines().as_bytes(),
+        );
+        fixture.look();
+        (fixture, key, pack, digest)
+    }
+
+    #[test]
+    fn failed_lazy_pack_fetch_recovers_without_manifest_republication() {
+        let (fixture, key, pack, digest) = lazy_pack_fixture();
+        let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+        assert!(fixture.shared.asked.saw(observed));
+        assert!(!fixture.shared.asked.fetch(&key));
+        let attempts = fixture.shared.remote.traffic.operations.load(Ordering::Relaxed);
+        for _ in 0..20 {
+            assert!(!fixture.shared.asked.fetch(&key));
+        }
+        assert_eq!(fixture.shared.remote.traffic.operations.load(Ordering::Relaxed), attempts);
+        tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
+        // The keeper, rather than every compiler lookup, opens the next retry window.
+        fixture.look();
+        assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);
+        assert!(
+            fixture.shared.asked.fetch(&key),
+            "unchanged manifest must not freeze a failed pack fetch"
+        );
+        assert_eq!(std::fs::read(fixture.shared.store.join(pack_file(&digest))).unwrap(), pack);
+    }
+
+    #[test]
+    fn an_unrequested_lazy_pack_does_not_force_a_new_index() {
+        let (fixture, _, _, _) = lazy_pack_fixture();
+        let before = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+        let operations = fixture.shared.remote.traffic.operations.load(Ordering::Relaxed);
+        fixture.look();
+        let after = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            fixture.shared.remote.traffic.operations.load(Ordering::Relaxed),
+            operations + 1
+        );
+    }
+
+    #[test]
+    fn a_failed_lazy_retry_keeps_its_lookup_and_can_retry_again() {
+        let (fixture, key, pack, digest) = lazy_pack_fixture();
+        assert!(!fixture.shared.asked.fetch(&key));
+        let before = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+        let (_, listed, _) = &before.packs[0];
+        let path = fixture.remote_dir.join(keys_object(&listed.keys));
+        let keys = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        fixture.look();
+        let after = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&before, &after));
+        tests::put(&fixture.remote_dir, &keys_object(&listed.keys), &keys);
+        tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
+        fixture.look();
+        assert!(
+            fixture.shared.asked.fetch(&key),
+            "a failed index retry must leave recovery possible"
+        );
+    }
+}
 use super::*;
 use crate::remote::{
     Listed, Manifest, Remote, STORE_FORMAT, keys_object, pack_file, pack_object, tests,
@@ -115,4 +205,85 @@ fn a_failed_lazy_refresh_preserves_the_previous_lookup() {
     fixture.restore_keys();
     fixture.look();
     assert!(fixture.shared.asked.saw(observed));
+}
+
+/// Freeze the manifest publication under the directory remote's actual CAS lock.
+/// A peer publishes after the keeper starts uploading, before its CAS can commit.
+/// No sleeps choose the ordering: the uploaded keys object is the barrier.
+#[test]
+fn publishing_cannot_acknowledge_a_peers_unpulled_pack() {
+    use ra_jit_store::Store;
+    use std::fs::File;
+
+    for lazy in [false, true] {
+        let fixture = Fixture::new(lazy);
+        let manifest = fixture.remote_dir.join(Manifest::at("recovery"));
+        std::fs::write(&manifest, b"").unwrap();
+        fixture.look();
+        let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+        assert!(fixture.shared.asked.saw(observed));
+
+        ra_jit_store::compiles_against("keeper-publication-regression");
+        let local = Store::owned(&fixture.shared.store).unwrap();
+        local.insert(&[41; 32], b"this worker's compiled entry");
+        let own_packs = local.seal_checked().unwrap();
+        assert_eq!(own_packs.len(), 1);
+        let own_bytes = local.pack(&own_packs[0]).unwrap();
+        let own_keys = ra_jit_store::pack_keys(&own_packs[0], &own_bytes).unwrap().concat();
+        let uploaded_keys = fixture.remote_dir.join(keys_object(&Digest::of(&own_keys)));
+        assert!(!uploaded_keys.exists());
+
+        let peer_store = Store::owned(&fixture._work.path().join("peer")).unwrap();
+        peer_store.insert(&[42; 32], b"a different worker's compiled entry");
+        let peer_packs = peer_store.seal_checked().unwrap();
+        let peer_pack = peer_store.pack(&peer_packs[0]).unwrap();
+        let peer_digest = Digest::of(&peer_pack);
+        let peer_keys = ra_jit_store::pack_keys(&peer_packs[0], &peer_pack).unwrap().concat();
+        let peer_keys_digest = Digest::of(&peer_keys);
+        tests::put(&fixture.remote_dir, &pack_object(&peer_digest), &peer_pack);
+        tests::put(&fixture.remote_dir, &keys_object(&peer_keys_digest), &peer_keys);
+        let lock = File::create(manifest.with_extension("lock")).unwrap();
+        lock.lock().unwrap();
+        fixture.shared.runtime.block_on(async {
+            let peer = async {
+                let uploaded = tokio::time::timeout(Duration::from_secs(10), async {
+                    while !uploaded_keys.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                if uploaded.is_ok() {
+                    let listed = Listed {
+                        size: peer_pack.len() as u64,
+                        keys: peer_keys_digest,
+                        format: STORE_FORMAT,
+                        packed: None,
+                    };
+                    std::fs::write(&manifest, Manifest([(peer_digest, listed)].into()).lines())
+                        .unwrap();
+                }
+                // Always release the lock before asserting, including on a timeout.
+                lock.unlock().unwrap();
+                uploaded.expect("the publisher never uploaded its keys");
+            };
+            futures_util::future::join(fixture.shared.send(), peer).await;
+        });
+        let published = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+        assert!(observed != published);
+        assert!(fixture.shared.asked.saw(observed), "a write is not an installed lookup");
+        assert!(!fixture.shared.asked.saw(published));
+        fixture.look();
+        assert!(fixture.shared.asked.saw(published));
+        if lazy {
+            let lookup = fixture.shared.asked.lazy.read().unwrap();
+            assert!(
+                lookup.as_ref().unwrap().packs.iter().any(|(digest, _, _)| *digest == peer_digest)
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(fixture.shared.store.join(pack_file(&peer_digest))).unwrap(),
+                peer_pack,
+            );
+        }
+    }
 }
