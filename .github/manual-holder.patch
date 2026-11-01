@@ -1,0 +1,438 @@
+diff --git a/.github/workflows/holder-leases.yaml b/.github/workflows/holder-leases.yaml
+index 503b76aa9..6fd30ad16 100644
+--- a/.github/workflows/holder-leases.yaml
++++ b/.github/workflows/holder-leases.yaml
+@@ -26,6 +26,6 @@ jobs:
+           rustup toolchain install 1.99.0 --profile minimal -c rustfmt
+           rustup default 1.99.0
+       - name: Exercise the actual holder protocol
+-        run: cargo test --locked -p blaze-dist --test holder
++        run: cargo test --locked -p blaze-dist --all-targets
+       - name: Format
+         run: cargo fmt --all -- --check
+diff --git a/crates/blaze-dist/src/holder.rs b/crates/blaze-dist/src/holder.rs
+index 3a7ae1e53..9f95413e3 100644
+--- a/crates/blaze-dist/src/holder.rs
++++ b/crates/blaze-dist/src/holder.rs
+@@ -230,6 +230,9 @@ impl Holder {
+     /// Starts: heartbeats from now, while the front end loads; [`Event::Loaded`] joins. No
+     /// executor waits for the lead to load, and a lead that is loading is not a lost one.
+     pub fn start(&mut self, now: Millis, out: &mut Vec<Effect>) {
++        if self.is_stopped() {
++            return;
++        }
+         self.next_beat = now;
+         self.tick(now, out);
+     }
+@@ -271,8 +274,26 @@ impl Holder {
+             Event::Reply { id, reply: Reply::Events(answer) } => {
+                 if Some(id) == self.beat {
+                     self.beat = None;
+-                    if answer == Ok(WorkersEventsAnswer::CANCEL) {
+-                        self.stop(StopWhy::Cancelled, out);
++                    match answer {
++                        Ok(WorkersEventsAnswer::CANCEL) => self.stop(StopWhy::Cancelled, out),
++                        Err(error) => {
++                            let refusal = Refusal::of(&error);
++                            if matches!(
++                                refusal,
++                                Some(
++                                    Refusal::AttemptMoved
++                                        | Refusal::Ended
++                                        | Refusal::NoExecution
++                                        | Refusal::FrontEndDiffers
++                                        | Refusal::NotHolder
++                                )
++                            ) {
++                                self.refused(refusal, &error, out);
++                            }
++                            // A transient heartbeat failure is not a new lease or
++                            // permission to discard the current compilation.
++                        }
++                        _ => {}
+                     }
+                 }
+             }
+@@ -289,7 +310,7 @@ impl Holder {
+ 
+     fn tick(&mut self, now: Millis, out: &mut Vec<Effect>) {
+         if now >= self.next_beat {
+-            self.next_beat = now + self.config.heartbeat_ms;
++            self.next_beat = now.saturating_add(self.config.heartbeat_ms);
+             // A slow or lost heartbeat response must not become obsolete merely
+             // because another heartbeat interval passed. Retry the same local
+             // request id until its reply arrives: a late CANCEL must still fence
+@@ -310,7 +331,7 @@ impl Holder {
+             out.push(Effect::Send { id, call });
+         }
+         if let Some(outstanding) = &mut self.outstanding
+-            && now >= outstanding.sent_at + self.config.retry_ms
++            && now >= outstanding.sent_at.saturating_add(self.config.retry_ms)
+         {
+             // Sent again unchanged: a join, a lease and a result are all answered alike twice.
+             outstanding.sent_at = now;
+@@ -338,7 +359,7 @@ impl Holder {
+             (Phase::Joining, Reply::Join(Err(error))) => match Refusal::of(&error) {
+                 Some(Refusal::NotYet) => {
+                     let wait = error.retry_after_ms.unwrap_or(self.config.retry_ms);
+-                    self.phase = Phase::Idle { until: now + wait, then_join: true };
++                    self.phase = Phase::Idle { until: now.saturating_add(wait), then_join: true };
+                 }
+                 Some(Refusal::FrontEndDiffers) => self.stop(StopWhy::FrontEndDiffers, out),
+                 other => self.refused(other, &error, out),
+@@ -346,7 +367,10 @@ impl Holder {
+             (Phase::Leasing, Reply::Lease(Ok(answer))) => match answer.grant {
+                 Some(grant) => self.plan(grant, out),
+                 None => {
+-                    self.phase = Phase::Idle { until: now + self.config.idle_ms, then_join: false };
++                    self.phase = Phase::Idle {
++                        until: now.saturating_add(self.config.idle_ms),
++                        then_join: false,
++                    };
+                 }
+             },
+             (Phase::Leasing, Reply::Lease(Err(error))) => match Refusal::of(&error) {
+@@ -410,6 +434,11 @@ impl Holder {
+             return self
+                 .stop(StopWhy::Protocol(format!("a grant of another lease: {grant:?}")), out);
+         }
++        let valid_roots = Ranges::from_wire(&grant.roots)
++            .is_some_and(|roots| roots.iter().all(|(_, end)| end <= self.roots.count));
++        if !valid_roots {
++            return self.stop(StopWhy::Protocol("grant has invalid root ranges".into()), out);
++        }
+         let mut compile = Vec::new();
+         let mut lost = BTreeMap::new();
+         for name in grant.names.iter() {
+@@ -441,6 +470,26 @@ impl Holder {
+         if batch.generation != grant.lease.generation {
+             return;
+         }
++        if let Err(why) = compiled_shape(grant, lost, &batch) {
++            // Never silently drop extra compiler results or their discoveries.
++            // They have already been retained locally, even though no result may
++            // be sent to the coordinator for this malformed batch.
++            let held: BTreeSet<_> = self
++                .findings
++                .keys()
++                .copied()
++                .chain(
++                    batch
++                        .roots
++                        .iter()
++                        .chain(&batch.names)
++                        .flat_map(|item| item.found.iter().map(|found| found.name)),
++                )
++                .collect();
++            self.release(held, out);
++            self.stop(StopWhy::Protocol(why), out);
++            return;
++        }
+         let (grant, lost) = (grant.clone(), lost.clone());
+         let returned: BTreeSet<WorkName> = batch.returned_names.iter().copied().collect();
+         let mut compiled = batch.names.into_iter();
+@@ -549,3 +598,39 @@ impl Holder {
+         }
+     }
+ }
++
++/// Validate the compiler-to-holder boundary before consuming or reordering results.
++/// The coordinator independently validates the assembled wire result as well.
++fn compiled_shape(
++    grant: &Grant,
++    lost: &BTreeMap<WorkName, ItemResult>,
++    batch: &Compiled,
++) -> Result<(), String> {
++    let roots = Ranges::from_wire(&grant.roots).ok_or("invalid granted root ranges")?;
++    if !roots.contains_all(&batch.returned_roots) {
++        return Err("compiler returned roots outside its grant".into());
++    }
++    let roots_done = roots.minus(&batch.returned_roots).len();
++    if u64::try_from(batch.roots.len()).ok() != Some(roots_done) {
++        return Err("compiler omitted or added root results".into());
++    }
++    let returned: BTreeSet<_> = batch.returned_names.iter().copied().collect();
++    if returned.len() != batch.returned_names.len()
++        || returned
++            .iter()
++            .any(|name| !grant.names.as_slice().contains(name) || lost.contains_key(name))
++    {
++        return Err("compiler returned duplicate or unassigned names".into());
++    }
++    let expected: Vec<_> = grant
++        .names
++        .iter()
++        .filter(|name| !lost.contains_key(*name) && !returned.contains(*name))
++        .collect();
++    if expected.len() != batch.names.len()
++        || expected.iter().zip(&batch.names).any(|(name, item)| **name != item.name)
++    {
++        return Err("compiler name results do not match the assigned order".into());
++    }
++    Ok(())
++}
+diff --git a/crates/blaze-dist/tests/holder_invariants.rs b/crates/blaze-dist/tests/holder_invariants.rs
+new file mode 100644
+index 000000000..3968d4bfe
+--- /dev/null
++++ b/crates/blaze-dist/tests/holder_invariants.rs
+@@ -0,0 +1,259 @@
++//! Exercise real holder ownership, not only the coordinator's wire validation.
++
++use blaze_dist::holder::{Call, Compiled, Effect, Event, Holder, HolderConfig, Reply, StopWhy};
++use blaze_dist::{Ranges, Refusal};
++use blaze_wire::{
++    Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
++    RootSet, Set, WorkJoinAnswer, WorkLeaseAnswer, WorkName,
++};
++use std::collections::BTreeSet;
++
++const FIRST: WorkName = WorkName([1; 32]);
++const SECOND: WorkName = WorkName([2; 32]);
++const DISCOVERY: WorkName = WorkName([3; 32]);
++
++fn sent(effects: &[Effect]) -> u64 {
++    effects
++        .iter()
++        .find_map(|effect| match effect {
++            Effect::Send { id, .. } => Some(*id),
++            _ => None,
++        })
++        .unwrap()
++}
++
++fn fixture_with_grant(change: impl FnOnce(&mut Grant)) -> (Holder, Compiled) {
++    let roots =
++        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
++    let mut holder = Holder::new(
++        "helper",
++        ExecutionId(1),
++        Attempt(1),
++        roots.clone(),
++        Set::new(Vec::new()),
++        BTreeSet::from([FIRST, SECOND]),
++        HolderConfig::default(),
++    );
++    let mut effects = Vec::new();
++    holder.step(0, Event::Loaded, &mut effects);
++    let id = sent(&effects);
++    effects.clear();
++    holder.step(
++        1,
++        Event::Reply { id, reply: Reply::Join(Ok(WorkJoinAnswer { roots, fixed: true })) },
++        &mut effects,
++    );
++    let id = sent(&effects);
++    effects.clear();
++    let mut grant = Grant {
++        lease: Lease {
++            execution: ExecutionId(1),
++            attempt: Attempt(1),
++            holder: "helper".into(),
++            generation: 1,
++        },
++        roots: Set::new(vec![(0, 1)]),
++        names: Set::new(vec![FIRST, SECOND]),
++    };
++    change(&mut grant);
++    holder.step(
++        2,
++        Event::Reply { id, reply: Reply::Lease(Ok(WorkLeaseAnswer { grant: Some(grant) })) },
++        &mut effects,
++    );
++
++    if holder.is_stopped() {
++        assert!(effects.iter().all(|effect| !matches!(effect, Effect::Compile(_))));
++    } else {
++        assert!(effects.iter().any(|effect| matches!(effect, Effect::Compile(_))));
++    }
++
++    let item = |name: WorkName| ItemResult {
++        name,
++        outcome: ItemOutcome::Exported(EntryRef { entry: EntryKey(name.0) }),
++        found: Set::new(vec![Found { name: DISCOVERY, tuple: [4; 32] }]),
++        unnamed: Set::new(Vec::new()),
++    };
++    (
++        holder,
++        Compiled {
++            generation: 1,
++            roots: vec![item(WorkName([8; 32]))],
++            names: vec![item(FIRST), item(SECOND)],
++            packs: Vec::new(),
++            returned_roots: Ranges::new(),
++            returned_names: Vec::new(),
++        },
++    )
++}
++
++fn fixture() -> (Holder, Compiled) {
++    let pair = fixture_with_grant(|_| {});
++    assert!(!pair.0.is_stopped());
++    pair
++}
++
++#[test]
++fn malformed_grants_are_rejected_before_compilation() {
++    for ranges in [vec![(1, 0)], vec![(0, 0)], vec![(0, 2)], vec![(0, 1), (0, 2)]] {
++        let (holder, _) = fixture_with_grant(|grant| grant.roots = Set::new(ranges));
++        assert!(holder.is_stopped(), "invalid grant must not start compiler work");
++    }
++}
++
++fn refuses_batch(mutate: impl FnOnce(&mut Compiled)) {
++    let (mut holder, mut batch) = fixture();
++    mutate(&mut batch);
++    let mut effects = Vec::new();
++    holder.step(3, Event::Compiled(batch), &mut effects);
++    assert!(holder.is_stopped(), "malformed compiler output must not be reported");
++    assert!(effects.iter().any(|effect| matches!(effect, Effect::Stop(StopWhy::Protocol(_)))));
++    assert!(effects.iter().all(|effect| !matches!(effect, Effect::Send { .. })));
++    let released: Vec<_> = effects
++        .iter()
++        .flat_map(|effect| match effect {
++            Effect::Release(names) => names.as_slice(),
++            _ => &[],
++        })
++        .copied()
++        .collect();
++    assert_eq!(released, vec![DISCOVERY], "every retained discovery is released once");
++}
++
++#[test]
++fn extra_name_results_cannot_be_silently_dropped() {
++    refuses_batch(|batch| batch.names.push(batch.names[0].clone()));
++}
++
++#[test]
++fn missing_name_results_are_rejected_at_the_compiler_boundary() {
++    refuses_batch(|batch| {
++        batch.names.pop();
++    });
++}
++
++#[test]
++fn name_result_order_must_match_the_actual_compile_plan() {
++    refuses_batch(|batch| batch.names.swap(0, 1));
++}
++
++#[test]
++fn missing_root_results_are_not_published() {
++    refuses_batch(|batch| batch.roots.clear());
++}
++
++#[test]
++fn returned_roots_must_have_been_granted() {
++    refuses_batch(|batch| batch.returned_roots.insert(9, 10));
++}
++
++#[test]
++fn returned_names_are_unique_and_cannot_also_be_processed() {
++    refuses_batch(|batch| batch.returned_names.extend([FIRST, FIRST]));
++    refuses_batch(|batch| batch.returned_names.push(FIRST));
++    refuses_batch(|batch| batch.returned_names.push(WorkName([99; 32])));
++}
++
++#[test]
++fn valid_partial_batch_preserves_the_grant_order() {
++    let (mut holder, mut batch) = fixture();
++    batch.roots.clear();
++    batch.returned_roots.insert(0, 1);
++    batch.names.remove(0);
++    batch.returned_names.push(FIRST);
++    let mut effects = Vec::new();
++    holder.step(3, Event::Compiled(batch), &mut effects);
++    assert!(!holder.is_stopped());
++    let result = effects
++        .iter()
++        .find_map(|effect| match effect {
++            Effect::Send { call: Call::Result(result), .. } => Some(result),
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(result.items.len(), 1);
++    assert_eq!(result.items[0].name, SECOND);
++    assert_eq!(result.returned_names, Set::new(vec![FIRST]));
++}
++
++#[test]
++fn fatal_heartbeat_refusals_fence_and_release_unacknowledged_results() {
++    for refusal in [
++        Refusal::AttemptMoved,
++        Refusal::Ended,
++        Refusal::NoExecution,
++        Refusal::NotHolder,
++        Refusal::FrontEndDiffers,
++    ] {
++        let (mut holder, batch) = fixture();
++        let mut effects = Vec::new();
++        holder.step(3, Event::Compiled(batch), &mut effects);
++        effects.clear();
++        holder.step(4, Event::Tick, &mut effects);
++        let beat = sent(&effects);
++        effects.clear();
++        holder.step(
++            5,
++            Event::Reply { id: beat, reply: Reply::Events(Err(refusal.to_wire(None))) },
++            &mut effects,
++        );
++        assert!(holder.is_stopped(), "{refusal:?} must fence the worker");
++        assert!(
++            effects.iter().any(
++                |effect| matches!(effect, Effect::Release(names) if names == &vec![DISCOVERY])
++            )
++        );
++        effects.clear();
++        holder.start(6, &mut effects);
++        assert!(effects.is_empty(), "start must not resurrect a fenced holder");
++    }
++}
++
++#[test]
++fn transient_heartbeat_refusal_keeps_the_current_batch() {
++    let (mut holder, batch) = fixture();
++    let mut effects = Vec::new();
++    holder.step(3, Event::Tick, &mut effects);
++    let beat = sent(&effects);
++    effects.clear();
++    holder.step(
++        4,
++        Event::Reply { id: beat, reply: Reply::Events(Err(Refusal::Busy.to_wire(Some(20)))) },
++        &mut effects,
++    );
++    assert!(!holder.is_stopped());
++    holder.step(5, Event::Compiled(batch), &mut effects);
++    assert!(
++        effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Result(_), .. }))
++    );
++}
++
++#[test]
++fn retry_after_cannot_overflow_into_an_immediate_retry() {
++    let roots =
++        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
++    let mut holder = Holder::new(
++        "helper",
++        ExecutionId(1),
++        Attempt(1),
++        roots,
++        Set::new(Vec::new()),
++        BTreeSet::new(),
++        HolderConfig::default(),
++    );
++    let mut effects = Vec::new();
++    holder.step(1, Event::Loaded, &mut effects);
++    let id = sent(&effects);
++    effects.clear();
++    holder.step(
++        2,
++        Event::Reply { id, reply: Reply::Join(Err(Refusal::NotYet.to_wire(Some(u64::MAX)))) },
++        &mut effects,
++    );
++    holder.step(3, Event::Tick, &mut effects);
++    assert!(
++        effects.iter().all(|effect| !matches!(effect, Effect::Send { call: Call::Join(_), .. }))
++    );
++    holder.step(u64::MAX - 1, Event::Tick, &mut effects);
++    assert!(!holder.is_stopped());
++}
