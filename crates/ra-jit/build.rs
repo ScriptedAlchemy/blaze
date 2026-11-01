@@ -51,6 +51,12 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
     };
     field(b"blaze-source-identity-v2");
     for path in &files {
+        // Directory watches cover the alias spelling, but an external file
+        // symlink can change without any modification to that spelling.
+        // Watch its resolved referent so Cargo reruns the identity calculation.
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            println!("cargo:rerun-if-changed={}", std::fs::canonicalize(path)?.display());
+        }
         let bytes = std::fs::read(path)?;
         let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
         // Normalize separators, not characters in names: on Unix a backslash is
