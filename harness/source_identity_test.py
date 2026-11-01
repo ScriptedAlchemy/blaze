@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real, separately compiled ra-jit build script on source trees."""
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -172,8 +173,15 @@ class SourceIdentityTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "Unix source path fixture")
     def test_non_unicode_source_paths_are_not_lossily_collapsed(self):
         path = os.fsencode(self.root / "vendor") + b"/bad-\xff.rs"
-        with open(path, "wb") as out:
-            out.write(b"fn source() {}")
+        try:
+            with open(path, "wb") as out:
+                out.write(b"fn source() {}")
+        except OSError as error:
+            # macOS rejects non-UTF-8 filenames before the compiler can inspect them.
+            # Only skip that unsupported fixture, not a real permission or I/O failure.
+            if error.errno == errno.EILSEQ:
+                self.skipTest("filesystem refuses non-UTF-8 filenames")
+            raise
         self.assertIsNone(self.identity())
 
     @unittest.skipUnless(os.name == "posix", "backslash is a Unix filename character")
