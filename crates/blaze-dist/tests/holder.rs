@@ -181,13 +181,8 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
 /// the configured heartbeat period.
 #[test]
 fn late_cancellation_of_a_retried_heartbeat_stops_the_holder() {
-    let roots = RootSet {
-        spec: [1; 32],
-        roots: [2; 32],
-        count: 1,
-        index: [3; 32],
-        inputs: [4; 32],
-    };
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
         "helper",
         ExecutionId(1),
@@ -219,13 +214,8 @@ fn late_cancellation_of_a_retried_heartbeat_stops_the_holder() {
 
 #[test]
 fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id() {
-    let roots = RootSet {
-        spec: [1; 32],
-        roots: [2; 32],
-        count: 1,
-        index: [3; 32],
-        inputs: [4; 32],
-    };
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
         "helper",
         ExecutionId(1),
@@ -268,13 +258,8 @@ fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id()
 
 #[test]
 fn heartbeat_resend_does_not_grow_independent_pending_heartbeats() {
-    let roots = RootSet {
-        spec: [1; 32],
-        roots: [2; 32],
-        count: 1,
-        index: [3; 32],
-        inputs: [4; 32],
-    };
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
     let mut holder = Holder::new(
         "helper",
         ExecutionId(1),
@@ -290,10 +275,13 @@ fn heartbeat_resend_does_not_grow_independent_pending_heartbeats() {
     for at in [5, 10, 15, 20, 25, 30] {
         effects.clear();
         holder.step(at, Event::Tick, &mut effects);
-        let beats: Vec<_> = effects.iter().filter_map(|effect| match effect {
-            Effect::Send { id, call: Call::Events(_) } => Some(*id),
-            _ => None,
-        }).collect();
+        let beats: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send { id, call: Call::Events(_) } => Some(*id),
+                _ => None,
+            })
+            .collect();
         assert_eq!(beats, vec![first]);
     }
 }
