@@ -51,6 +51,11 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
     };
     field(b"blaze-source-identity-v3");
     for path in &files {
+        // An external source alias can change independently of the symlink.
+        // Watch its physical referent to invalidate the compiler identity.
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            println!("cargo:rerun-if-changed={}", std::fs::canonicalize(path)?.display());
+        }
         let bytes = std::fs::read(path)?;
         let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
         // Normalize separators, not characters in names: on Unix a backslash is
