@@ -1,0 +1,45 @@
+name: Manual repair workspace
+on:
+  push:
+    branches: [repair/manual-workspace-20261101]
+    paths: [.github/workflows/manual-workspace.yaml]
+permissions:
+  contents: read
+jobs:
+  workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Exact source refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/manual-workspace"
+          mkdir -p "$out"
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          git for-each-ref --format='%(refname) %(objectname)' > "$out/refs.txt"
+          git bundle create "$out/current.bundle" --all '^972fbe245765fe54032cc153757485d960c935a4'
+      - name: Download pinned test tools and locked public dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal -c rustfmt
+          rustup default 1.99.0
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+          out="$RUNNER_TEMP/manual-workspace"
+          rustc -vV > "$out/toolchain.txt"
+          toolchain=$(rustc --print sysroot)
+          tar -I 'zstd -3 -T2' -cf "$out/rust-toolchain.tar.zst" -C "$toolchain" .
+          # Only public registry/git source data: no credentials, config or tokens.
+          tar -I 'zstd -3 -T2' -cf "$out/cargo-dependencies.tar.zst" -C "$HOME/.cargo" registry git
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: manual-repair-workspace
+          path: ${{ runner.temp }}/manual-workspace
+          retention-days: 1
+          if-no-files-found: error
