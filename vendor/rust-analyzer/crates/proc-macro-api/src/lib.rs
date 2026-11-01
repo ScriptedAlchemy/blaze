@@ -147,13 +147,15 @@ fn generation_env<'a>(
     vars.into_iter().filter(|(key, value)| std::env::var_os(key) != *value).collect()
 }
 
-/// The digest of the environment a server at `path` started with `env` has: each variable of
-/// the very map it is started with ([`process::child_environment`]), in the order of its
-/// name. A macro reads any of them as it reads rustc's, so an expansion kept under one is not
+/// The digest of the environment a server started with `env` has: each variable of the map
+/// the request asked for ([`process::requested_environment`]), in the order of its name. A
+/// macro reads any of them as it reads rustc's, so an expansion kept under one is not
 /// another's, and a handle of a server with one is not a handle of a server with another.
-fn server_environment(path: &AbsPath, env: &GenerationEnv) -> [u8; 32] {
+/// Where the server is on this machine is not in it: on Windows the server is started with
+/// its toolchain's `bin` ahead of `PATH`, and two machines whose requests agree name the same.
+fn server_environment(env: &GenerationEnv) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let vars = process::child_environment(path, env.iter().map(|(name, value)| (name, value)));
+    let vars = process::requested_environment(env.iter().map(|(name, value)| (name, value)));
     let mut hash = Sha256::new();
     hash.update(b"proc-macro server environment 2");
     hash.update((vars.len() as u64).to_le_bytes());
@@ -336,7 +338,7 @@ impl ProcMacroClient {
                     version.as_ref(),
                 )?);
             }
-            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(&path, vars)))
+            Ok(ProcMacroServerPool::new(workers).with_environment(server_environment(vars)))
         };
         let pool = factory(&vars)?;
         Ok(ProcMacroClient {

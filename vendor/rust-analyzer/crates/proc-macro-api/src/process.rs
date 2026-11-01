@@ -410,11 +410,11 @@ impl Process {
     }
 }
 
-/// Every variable a server at `path` started with `extra_env` over this process's has, a
-/// `None` removing one, with what the launcher sets for itself: the one map a server is
-/// started with and its environment is named by ([`crate::ProcMacro::environment_identity`]).
-pub(crate) fn child_environment<'a>(
-    path: &AbsPath,
+/// Every variable a server started with `extra_env` over this process's has, a `None`
+/// removing one, with what the launcher sets for itself: what a macro can read, and what a
+/// server's environment is named by ([`crate::ProcMacro::environment_identity`]). Not where
+/// the server is: that is this machine's, and a request's name must be the same on another.
+pub(crate) fn requested_environment<'a>(
     extra_env: impl IntoIterator<
         Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
     >,
@@ -428,6 +428,20 @@ pub(crate) fn child_environment<'a>(
         };
     }
     vars.insert("RUST_ANALYZER_INTERNALS_DO_NOT_USE".into(), "this is unstable".into());
+    vars
+}
+
+/// The map a server at `path` is started with: [`requested_environment`], and on Windows the
+/// toolchain's `bin` ahead of `PATH`, where the server's DLLs are. A macro reads `PATH` as the
+/// request had it in every other way, and the environment's name leaves this machine's
+/// toolchain path out.
+pub(crate) fn child_environment<'a>(
+    path: &AbsPath,
+    extra_env: impl IntoIterator<
+        Item = (impl AsRef<std::ffi::OsStr>, &'a Option<impl 'a + AsRef<std::ffi::OsStr>>),
+    >,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut vars = requested_environment(extra_env);
     if cfg!(windows) {
         let mut path_var = std::ffi::OsString::new();
         path_var.push(path.parent().unwrap().parent().unwrap());

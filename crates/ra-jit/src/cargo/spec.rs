@@ -45,6 +45,25 @@ pub(crate) fn runtime_environment(
     runtime::described_environment(project)
 }
 
+/// Only the replay creates this directory, under its fresh job directory. The existing
+/// std-unit key distinguishes library graphs, cfgs, target and debug settings; the job
+/// fixes the compiler, sysroot and backend. Never consult an ambient store for these units.
+pub(crate) fn std_unit_cache(project: &Path, key: &[u8; 32]) -> anyhow::Result<Option<PathBuf>> {
+    if project.extension().is_none_or(|extension| extension != "json") {
+        return Ok(None);
+    }
+    let project = crate::compiler_json::read(project)?;
+    let Some(bound) = project.get("blaze_spec_std_units") else { return Ok(None) };
+    ensure!(
+        project["compiler_mode"] == true && bound["version"] == 1,
+        "unknown replay standard library transport"
+    );
+    let directory = Path::new(bound["directory"].as_str().context("no replay std directory")?);
+    let directory = crate::compiler_json::physical_path(&project, directory)?;
+    ensure!(directory.is_absolute() && directory.is_dir(), "invalid replay std directory");
+    Ok(Some(directory.join(hex(key))))
+}
+
 /// The owned JSON compiler's global debug/link decisions, explicitly supplied by a
 /// validated replay rather than inferred from its caller's environment.
 pub(crate) fn project_profile(project: &Path) -> anyhow::Result<Option<crate::plan::Whole>> {
@@ -385,6 +404,8 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     let compiler_home = job.path().join("compiler-home");
     std::fs::create_dir(&compiler_home)?;
     let compiler_env = compiler_environment(&prepared, &compiler_home, &executor)?;
+    let std_units = job.path().join("std-units");
+    std::fs::create_dir(&std_units)?;
     let has_macros = prepared
         .resolved
         .graph
@@ -401,14 +422,11 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         };
     prepared.validate_sources(&store)?;
     let mut bindings = prepared.native_closure(&blaze_spec::platform::System)?;
-    for (name, path) in
-        [("source", prepared.root.as_path()), ("toolchain/sysroot", sysroot.as_path())]
-    {
-        bindings.roots.push(blaze_spec::native::Root {
-            name: name.into(),
-            tree: blaze_spec::native_tree::Tree::capture(path)?,
-        });
-    }
+    bindings.roots.push(blaze_spec::native::Root {
+        name: "source".into(),
+        tree: blaze_spec::native_tree::Tree::capture(&prepared.root)?,
+    });
+    bindings.roots.extend(toolchain_native_inputs(&sysroot)?.roots);
     prepared.validate_sources(&store)?;
     bindings.roots.push(blaze_spec::native::Root {
         name: "runtime/compiler".into(),
@@ -451,6 +469,9 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
     )?;
     let SourceRef::Root(source) = &given.source else { bail!("replay requires a source snapshot") };
     for program in &mut programs {
+        program.project["blaze_spec_std_units"] = serde_json::json!({
+            "version": 1, "directory": crate::compiler_json::path(&std_units),
+        });
         crate::dep_info::ensure_replay_key(&mut program.project)?;
         source_naming(program, &prepared)?;
         program.project[blaze_wire::native::BINDINGS_FIELD] =
@@ -764,6 +785,22 @@ fn execute_inner(
     Ok(failed)
 }
 
+fn toolchain_native_inputs(sysroot: &Path) -> anyhow::Result<blaze_spec::native::Closure> {
+    let mut inputs = blaze_spec::native::Closure::default();
+    // The compiler reads std sources, native libraries and installed toolchain records.
+    // Nix's composed sysroot also carries the complete Rust HTML documentation; binding
+    // that tree makes unrelated pages inputs to every producer and every native link.
+    for (name, relative) in
+        [("libraries", "lib"), ("version", "share/doc/rust/html/version_info.html")]
+    {
+        inputs.roots.push(blaze_spec::native::Root {
+            name: format!("toolchain/{name}"),
+            tree: blaze_spec::native_tree::Tree::capture(&sysroot.join(relative))?,
+        });
+    }
+    Ok(inputs)
+}
+
 /// Fixed implementation policy plus the request's recorded values. A replay caller's
 /// backend, rustflags, producer toggles, wrappers and arbitrary variables are never inherited.
 fn compiler_environment(
@@ -808,8 +845,9 @@ fn compiler_environment(
     }
     // Memory budgets and the watchdog label are service policy, not compiler inputs.
     // They never enter per-crate env and cannot select a different code generator.
+    // The ambient cache is not service policy: even std's individual functions must
+    // originate in this replay. Only its private std-unit directory is shared.
     for name in [
-        "RA_JIT_CACHE",
         "RA_JIT_MEMORY_MAX",
         "RA_JIT_WORKER_MEMORY",
         "RA_JIT_MEMORY_RESERVE",
@@ -1087,7 +1125,86 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
+    fn std_units_are_shared_only_inside_one_replay_and_for_the_same_key() {
+        let work = tempfile::tempdir().unwrap();
+        let first = work.path().join("first");
+        let second = work.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let project = work.path().join("rust-project.json");
+        let mut description = serde_json::json!({"compiler_mode": true, "crates": []});
+        crate::compiler_json::write(&project, &description).unwrap();
+        assert!(std_unit_cache(&project, &[1; 32]).unwrap().is_none());
+        assert!(std_unit_cache(Path::new("lib.rs"), &[1; 32]).unwrap().is_none());
+        description["blaze_spec_std_units"] = serde_json::json!({
+            "version": 1, "directory": crate::compiler_json::path(&first),
+        });
+        crate::compiler_json::write(&project, &description).unwrap();
+        let unit = std_unit_cache(&project, &[1; 32]).unwrap().unwrap();
+        std::fs::write(&unit, b"this replay's std").unwrap();
+        assert_eq!(
+            std::fs::read(std_unit_cache(&project, &[1; 32]).unwrap().unwrap()).unwrap(),
+            b"this replay's std"
+        );
+        assert!(!std_unit_cache(&project, &[2; 32]).unwrap().unwrap().exists());
+        description["blaze_spec_std_units"]["directory"] = crate::compiler_json::path(&second);
+        crate::compiler_json::write(&project, &description).unwrap();
+        assert!(!std_unit_cache(&project, &[1; 32]).unwrap().unwrap().exists());
+        for bound in [
+            serde_json::json!({"version": 2, "directory": first}),
+            serde_json::json!({"version": 1, "directory": "relative"}),
+            serde_json::json!({"version": 1, "directory": work.path().join("missing")}),
+            serde_json::json!({"version": 1}),
+        ] {
+            description["blaze_spec_std_units"] = bound;
+            crate::compiler_json::write(&project, &description).unwrap();
+            assert!(std_unit_cache(&project, &[1; 32]).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replay_std_unit_directory_preserves_native_paths() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let work = tempfile::tempdir().unwrap();
+        let directory = work.path().join(OsString::from_vec(b"std-\xff".to_vec()));
+        std::fs::create_dir(&directory).unwrap();
+        let project = work.path().join("rust-project.json");
+        let description = serde_json::json!({"compiler_mode": true, "crates": [],
+            "blaze_spec_std_units": {"version": 1, "directory": crate::compiler_json::path(&directory)}});
+        crate::compiler_json::write(&project, &description).unwrap();
+        assert_eq!(
+            std_unit_cache(&project, &[3; 32]).unwrap().unwrap(),
+            directory.join(hex(&[3; 32]))
+        );
+    }
+
+    #[test]
+    fn toolchain_native_inputs_bind_libraries_and_records_without_unrelated_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("lib/rustlib/src/rust/library/core/src/lib.rs");
+        let native = dir.path().join("lib/rustlib/aarch64-apple-darwin/lib/libstd.dylib");
+        let info = dir.path().join("share/doc/rust/html/version_info.html");
+        let docs = dir.path().join("share/doc/rust/html/core/index.html");
+        for path in [&library, &native, &info, &docs] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"before").unwrap();
+        }
+        let inputs = toolchain_native_inputs(dir.path()).unwrap();
+        inputs.validate().unwrap();
+        std::fs::write(&docs, b"unrelated documentation changed").unwrap();
+        inputs.validate().expect("Rust HTML documentation is not a compiler or linker input");
+        for path in [&library, &native, &info] {
+            std::fs::write(path, b"changed").unwrap();
+            assert!(inputs.validate().is_err(), "{} must be authenticated", path.display());
+            std::fs::write(path, b"before").unwrap();
+            inputs.validate().unwrap();
+        }
+    }
+
+    // APFS rejects these filename bytes before source admission can be exercised.
+    #[test]
+    #[cfg(target_os = "linux")]
     fn saved_input_admission_preserves_native_source_and_store_paths() {
         use std::os::unix::ffi::OsStringExt as _;
 
