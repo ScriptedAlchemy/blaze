@@ -22,9 +22,9 @@ jobs:
       - uses: ./.github/actions/toolchain
       - name: Compile the actual build script
         shell: bash
-        run: rustc --edition=2021 crates/ra-jit/build.rs -o "$RUNNER_TEMP/source-identity-build${{ runner.os == 'Windows' && '.exe" || "" }}"
+        run: rustc --edition=2021 crates/ra-jit/build.rs -o "$RUNNER_TEMP/source-identity-build${{ runner.os == 'Windows' && '.exe' || '' }}"
       - name: Exercise source identity regressions
         shell: bash
         env:
-          BLAZE_BUILD_SCRIPT: ${{ runner.temp }}/source-identity-build${{ runner.os == 'Windows' && '.exe" || "" }}
+          BLAZE_BUILD_SCRIPT: ${{ runner.temp }}/source-identity-build${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python3 harness/source_identity_test.py -v
