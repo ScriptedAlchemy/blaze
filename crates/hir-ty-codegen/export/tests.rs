@@ -223,7 +223,15 @@ fn allocator_only_unit_uses_its_explicit_source_graph() {
             let object = object::File::parse(bytes.as_slice()).unwrap();
             let names: Vec<_> = object
                 .symbols()
-                .filter_map(|symbol| Some((symbol.name().ok()?.to_owned(), symbol.is_undefined())))
+                .filter_map(|symbol| {
+                    let name = symbol.name().ok()?;
+                    let name = if object.format() == object::BinaryFormat::MachO {
+                        name.strip_prefix('_').unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    Some((name.to_owned(), symbol.is_undefined()))
+                })
                 .collect();
             for name in [
                 "__rust_alloc",
