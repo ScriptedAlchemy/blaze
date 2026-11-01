@@ -29,6 +29,15 @@ a Cargo first build. [Program builds](cargo.md#program-builds) defines the selec
 remaining compatibility gaps, including compiler probes that the owned checker cannot yet
 accept. This default is not proof that all programs, tests, doctests or platforms work.
 
+A library of crate type `cdylib`, `staticlib` or `dylib` is not built by any owned path yet: the
+ordinary `build`, `run` and `test` and saved replay share the owned executor's preflight
+(`crates/blaze-spec/src/execution.rs`), which refuses it before compiling, also beside a binary
+cargo would build with it (`crate-type = ["cdylib", "rlib"]` and a `src/main.rs`). That is a gap in
+being a superset of Rust, not a limit of replay. The preflight refuses the extern options
+`noprelude`, `public` and `nounused` too, but stable cargo sets none of them (`-Zbuild-std` and the
+`public-dependency` feature do), and blaze's own unit graph never does, so no program stable Rust
+1.99.0 builds reaches that refusal.
+
 The remaining wrapper and non-program paths still contain compiler handoffs. [Today](#today)
 and the dated measurements below record that work and earlier behavior; their Cargo-first
 counts do not describe the new default program route. Each handoff is a bug with an issue
