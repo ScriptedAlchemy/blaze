@@ -26,6 +26,6 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal -c rustfmt
           rustup default 1.99.0
       - name: Exercise the actual holder protocol
-        run: cargo test --locked -p blaze-dist --test holder
+        run: cargo test --locked -p blaze-dist --test holder --test holder_boundary
       - name: Format
         run: cargo fmt --all -- --check
