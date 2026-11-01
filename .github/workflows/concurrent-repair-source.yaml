@@ -1,0 +1,31 @@
+name: Concurrent repair source snapshot
+on:
+  push:
+    branches: [verify/concurrent-repairs-20261101]
+    paths: [.github/workflows/concurrent-repair-source.yaml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Export the exact repair base and newer parent branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/concurrent-source"
+          mkdir -p "$out"
+          git update-ref refs/heads/repair-base 8cf8a9c79679741e84434eb6bc740cc2447b0c17
+          git update-ref refs/heads/current-c2 "$(git rev-parse origin/dist/c2-buildspec)"
+          git update-ref refs/heads/current-ci "$(git rev-parse origin/ci-redesign)"
+          git bundle create "$out/source.bundle" refs/heads/repair-base refs/heads/current-c2 refs/heads/current-ci ^972fbe245765fe54032cc153757485d960c935a4
+          git show-ref --heads > "$out/refs.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: concurrent-repair-source
+          path: ${{ runner.temp }}/concurrent-source
+          retention-days: 3
+          if-no-files-found: error
