@@ -1612,7 +1612,10 @@ def elf_facts(data):
                 info, _, shndx = struct.unpack_from("<BBH", data, offset + entsize * n + 4)
                 if shndx != 0 and (info & 0xF) not in (3, 4):  # not STT_SECTION, STT_FILE
                     defined += 1
-        elif named.startswith((b".debug_", b".zdebug_")):
+        elif named.startswith((b".debug_", b".zdebug_")) and not flags & 0x2:
+            # Not the allocated `.debug_gdb_scripts` rustc puts in every ELF program (SHF_ALLOC):
+            # it is loaded with the program and no strip, the linker's `--strip-all` included,
+            # takes it out, so cargo's own `strip = "symbols"` binary keeps it.
             body = data[offset:offset + size]
             if flags & 0x800 and struct.unpack_from("<I", body, 0)[0] == 1:  # SHF_COMPRESSED, zlib
                 body = zlib.decompress(body[24:])
