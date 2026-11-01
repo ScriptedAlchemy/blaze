@@ -181,16 +181,28 @@ fn review_a_batch_finishing_after_cancellation_releases_its_findings() {
 /// the configured heartbeat period.
 #[test]
 fn late_cancellation_of_a_retried_heartbeat_stops_the_holder() {
-    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let roots = RootSet {
+        spec: [1; 32],
+        roots: [2; 32],
+        count: 1,
+        index: [3; 32],
+        inputs: [4; 32],
+    };
     let mut holder = Holder::new(
-        "helper", ExecutionId(1), Attempt(1), roots,
-        Set::new(Vec::new()), BTreeSet::new(),
+        "helper",
+        ExecutionId(1),
+        Attempt(1),
+        roots,
+        Set::new(Vec::new()),
+        BTreeSet::new(),
         HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
     );
     let mut effects = Vec::new();
     holder.start(0, &mut effects);
     let first = sent(&effects);
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Events(_), .. })));
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::Send { call: Call::Events(_), .. }))
+    );
     effects.clear();
 
     holder.step(5, Event::Tick, &mut effects);
@@ -207,10 +219,20 @@ fn late_cancellation_of_a_retried_heartbeat_stops_the_holder() {
 
 #[test]
 fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id() {
-    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let roots = RootSet {
+        spec: [1; 32],
+        roots: [2; 32],
+        count: 1,
+        index: [3; 32],
+        inputs: [4; 32],
+    };
     let mut holder = Holder::new(
-        "helper", ExecutionId(1), Attempt(1), roots,
-        Set::new(Vec::new()), BTreeSet::new(),
+        "helper",
+        ExecutionId(1),
+        Attempt(1),
+        roots,
+        Set::new(Vec::new()),
+        BTreeSet::new(),
         HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
     );
     let mut effects = Vec::new();
@@ -246,10 +268,20 @@ fn heartbeat_acknowledgement_allows_a_fresh_request_without_reusing_the_old_id()
 
 #[test]
 fn heartbeat_resend_does_not_grow_independent_pending_heartbeats() {
-    let roots = RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+    let roots = RootSet {
+        spec: [1; 32],
+        roots: [2; 32],
+        count: 1,
+        index: [3; 32],
+        inputs: [4; 32],
+    };
     let mut holder = Holder::new(
-        "helper", ExecutionId(1), Attempt(1), roots,
-        Set::new(Vec::new()), BTreeSet::new(),
+        "helper",
+        ExecutionId(1),
+        Attempt(1),
+        roots,
+        Set::new(Vec::new()),
+        BTreeSet::new(),
         HolderConfig { heartbeat_ms: 5, retry_ms: 20, idle_ms: 2 },
     );
     let mut effects = Vec::new();
