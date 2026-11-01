@@ -3096,9 +3096,12 @@ still needs the runtime gates below, not evidence that every native toolchain is
 A profile's `strip` is the linked root's, and replay strips as rustc 1.99 does, with the link the
 ordinary build shares (`link.rs`): an ELF link is told `--strip-debug` or `--strip-all`, and what
 Apple's linker wrote is stripped afterwards by the toolchain's `rust-objcopy` (`--strip-debug`,
-`--strip-all`, a shared library `--discard-all`). Preflight still reports unsupported output types
-and special extern options, and incompatible per-unit debug/split settings before compilation.
-Those are remaining execution limits, not completed Rust compatibility.
+`--strip-all`, a shared library `--discard-all`). Units of one program may be built with different
+debug info (`[profile.dev.package.x] debug = 0`): each crate's code is described as its own
+`-Cdebuginfo` says, as rustc compiles each crate with its own, and where it is kept
+(`split-debuginfo`) is the linked root's. Preflight still reports unsupported output types and
+special extern options before compilation. Those are remaining execution limits, not completed
+Rust compatibility.
 
 The private version-2 deterministic CBOR trace carries input paths and keyed identities of
 observed environment values, distinguishing absence, empty text and native non-Unicode values.

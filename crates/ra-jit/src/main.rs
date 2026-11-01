@@ -414,8 +414,10 @@ struct Resolver<'a> {
     /// The checkout that the packages which are the same in both are read from.
     base: Option<PathBuf>,
     contents: &'a content::Contents,
-    /// What the code has a debugger told.
+    /// What the code has a debugger told: of the code no crate's own setting covers, and how.
     debug: plan::Described,
+    /// What each crate of the program asks a debugger be told of its code.
+    crate_debug: Arc<CrateDebug>,
     /// The object the entries a debugger reads are kept in, when they are kept apart from
     /// the program.
     apart: Option<PathBuf>,
@@ -455,6 +457,7 @@ struct ResolverParts<'a> {
     base: Option<PathBuf>,
     contents: &'a content::Contents,
     debug: plan::Described,
+    crate_debug: Arc<CrateDebug>,
     apart: Option<PathBuf>,
     listed: &'a Listed,
     shared_paths: SharedPaths,
@@ -476,6 +479,7 @@ impl<'a> Resolver<'a> {
             base: self.base.clone(),
             contents: self.contents,
             debug: self.debug,
+            crate_debug: self.crate_debug.clone(),
             apart: self.apart.clone(),
             listed: self.listed,
             shared_paths: self.shared_paths.clone(),
@@ -502,6 +506,7 @@ impl<'a> ResolverParts<'a> {
             base,
             contents,
             debug,
+            crate_debug,
             apart,
             listed,
             shared_paths,
@@ -521,6 +526,7 @@ impl<'a> ResolverParts<'a> {
             base,
             contents,
             debug,
+            crate_debug,
             apart,
             listed,
             shared_paths,
@@ -533,6 +539,46 @@ impl<'a> ResolverParts<'a> {
             programs,
             library,
         }
+    }
+}
+
+/// What each crate of a program asks a debugger be told of its code: rustc compiles each crate
+/// with its own `-C debuginfo`, and `[profile.dev.package.x] debug = 0` is that crate's alone.
+struct CrateDebug {
+    /// The crates whose flags say, and what: the others are told what the build's own code is.
+    own: FxHashMap<ide_db::base_db::Crate, plan::Level>,
+    /// The most any code of the program is told, which the object is written to tell.
+    most: plan::Level,
+}
+
+impl CrateDebug {
+    fn of(db: &RootDatabase, args: &Args) -> CrateDebug {
+        let mut debug = CrateDebug { own: FxHashMap::default(), most: args.debug.level };
+        // A program that strips what a debugger reads is told nothing of any of it, and the
+        // override for measuring tells of all its code alike.
+        if args.strip != link::Strip::None || std::env::var_os("RA_JIT_DEBUGINFO").is_some() {
+            return debug;
+        }
+        let mut pending: Vec<ide_db::base_db::Crate> = args
+            .crates()
+            .filter_map(|it| crates_named(db, it, args).ok())
+            .flatten()
+            .map(Into::into)
+            .collect();
+        let mut seen = FxHashSet::default();
+        while let Some(krate) = pending.pop() {
+            let data = krate.data(db);
+            // A proc macro is built apart, for the host, with its own description.
+            if !seen.insert(krate) || data.target_kind.is_proc_macro() {
+                continue;
+            }
+            if let Some(level) = plan::debuginfo_of(&data.codegen_flags) {
+                debug.own.insert(krate, level);
+                debug.most = debug.most.max(level);
+            }
+            pending.extend(data.dependencies.iter().map(|it| it.crate_id));
+        }
+        debug
     }
 }
 
@@ -679,6 +725,7 @@ impl<'a> Resolver<'a> {
         let linked = args.splice.as_deref().filter(|_| over_rustc || onto).and_then(rustc_symbols);
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
+        let crate_debug = Arc::new(CrateDebug::of(db, args));
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
         let named = (root.clone(), base.clone());
         hir_ty_codegen::name_sources(move |db, file| {
@@ -700,6 +747,7 @@ impl<'a> Resolver<'a> {
             base,
             contents,
             debug,
+            crate_debug,
             apart,
             listed,
             shared_paths: Default::default(),
@@ -1394,11 +1442,20 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn debug_directory(&self) -> Option<String> {
-        (self.debug.level != plan::Level::Nothing).then(|| self.root.to_string_lossy().into_owned())
+        (self.crate_debug.most != plan::Level::Nothing)
+            .then(|| self.root.to_string_lossy().into_owned())
     }
 
     fn describes_variables(&self) -> bool {
-        self.debug.level == plan::Level::Full
+        self.crate_debug.most == plan::Level::Full
+    }
+
+    fn tells(&self) -> hir_ty_codegen::Told {
+        self.debug.level.told()
+    }
+
+    fn tells_of(&self, krate: ide_db::base_db::Crate) -> hir_ty_codegen::Told {
+        self.crate_debug.own.get(&krate).copied().unwrap_or(self.debug.level).told()
     }
 
     fn keeps_frame_pointers(&self) -> bool {

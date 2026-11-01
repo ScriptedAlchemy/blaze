@@ -860,6 +860,13 @@ def profiles_cases():
              lexpect=[("program", "bin", "top"), ("line", r"^@@bin top answer=3$"), ("exit", 0),
                       ("stripped", "top")],
              check=only_field("strip", 2, lambda u: True, "every unit's profile")),
+        # `debug = 0` for one package is that crate's alone: rustc compiles each crate with its own
+        # `-C debuginfo`, so dep_a's code is described to no debugger and dep_b's still is.
+        Case("pkg-debug0", "run", "[profile.dev.package.dep_a] debug = 0", expect="accepted",
+             edits=profile_edit("[profile.dev.package.dep_a]\ndebug = 0\n"), local=True,
+             lexpect=[("program", "bin", "top"), ("line", r"^@@bin top answer=3$"), ("exit", 0),
+                      ("symbols", "top"), ("described", "top", "dep_b"), ("not-described", "top", "dep_a")],
+             check=only_field("debug", 0, lambda u: u.package == "dep_a", "the override")),
         # cargo reads CARGO_PROFILE_<NAME>_<KEY> as the same setting.
         Case("env-opt1", "build", "CARGO_PROFILE_DEV_OPT_LEVEL=1 is [profile.dev] opt-level = 1", expect="changed",
              env={"CARGO_PROFILE_DEV_OPT_LEVEL": "1"}, touches=["profile"]),
@@ -3700,6 +3707,7 @@ def self_test(args):
                 ("run-in-checkout", ["envcfg"], True, "foreign checkout changed"),
                 ("spec-run-drops-no-run", ["basic/no-run"], True, "spec run"),
                 ("replay-unstripped", ["profiles/strip-symbols"], True, "wanted them stripped"),
+                ("debug-whole-program", ["profiles/pkg-debug0"], True, "wanted none of it"),
                 ("unit-features", ["basic/base"], False, "features")]
         for bug, only, local, wanted in bugs:
             if bug == "unit-features" and not cargo:
