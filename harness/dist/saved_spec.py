@@ -453,12 +453,12 @@ def owned_shared_cache(runner, blaze, work, env):
 
 
 def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_env, hostile_env, hostile, only=frozenset(GROUPS)):
-    def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True):
+    def roundtrip(name, project, command, capture_env=env, reference_env=oracle_env, check_stdout=True, replay_timeout=None):
         expected, _ = runner.run(name + "-reference", [real / "bin/cargo", *command, "--locked", "--offline"], reference_env, project, guarded=False)
         saved = bundle / (name + ".cbor")
         runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved, *command], capture_env, project)
         shutil.rmtree(project)
-        actual, _ = runner.run(name + "-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile)
+        actual, _ = runner.run(name + "-replay", [blaze, "cargo", "spec", "--run", saved], hostile_env, hostile, timeout=replay_timeout)
         if check_stdout:
             assert actual == expected, (name, actual, expected)
         return saved, expected, actual
@@ -583,7 +583,11 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
 
       project = work / "workspace-doctests"
       workspace_libraries(project)
-      _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
+      # A replayed doctest is compiled by a compiler of its own that builds the standard library
+      # again (RA_JIT_STD_FROM=off): about 6 minutes each under Cranelift, more under LLVM, so
+      # the two here outlast the row timeout under LLVM. Three times the timeout, until the
+      # replay's doctests share the standard library the replay already built.
+      _, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False, replay_timeout=runner.timeout * 3)
       from buildspec import parse_run
       assert parse_run(actual) == parse_run(expected), (actual, expected)
       assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
@@ -620,7 +624,8 @@ class Runner:
         self.memory_mib, self.timeout = memory_mib, timeout
         self.rows = []
 
-    def run(self, name, command, env, cwd, expected=0, contains=None, guarded=True, private_input=None):
+    def run(self, name, command, env, cwd, expected=0, contains=None, guarded=True, private_input=None, timeout=None):
+        timeout = timeout or self.timeout
         label = "saved-spec-" + uuid.uuid4().hex
         env = dict(env, RA_JIT_RUN_ID=label) if guarded else dict(env)
         started = time.monotonic()
@@ -654,7 +659,7 @@ class Runner:
             watch.start()
         timed_out = False
         try:
-            out, err = child.communicate(input=private_input, timeout=self.timeout)
+            out, err = child.communicate(input=private_input, timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             if watch:
