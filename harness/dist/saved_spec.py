@@ -989,8 +989,10 @@ def main():
             runner.run(name + "-save", [blaze, "cargo", "spec", "--out", saved,
                        "check" if name == "check-invalid" else "build", *selected], env, project)
             # The type error by rustc's code: blaze writes E0308's message as rust-analyzer has
-            # it ("expected u32, found bool"), not rustc's headline "mismatched types".
-            reason = {"check-invalid": "error[E0308]", "external-include": "outside the immutable source snapshot"}[name]
+            # it ("expected u32, found bool"), not rustc's headline "mismatched types". The
+            # include outside the snapshot is refused as the replay says it: a compiler read
+            # outside the authenticated source and producer inputs.
+            reason = {"check-invalid": "error[E0308]", "external-include": "outside authenticated source and producer inputs"}[name]
             runner.run(name + "-refusal", [blaze, "cargo", "spec", "--run", saved],
                        env, hostile, expected=None, contains=reason)
             assert not list(Path(str(saved) + ".outputs").glob("replay-*/result.json")), name
