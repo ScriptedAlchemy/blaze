@@ -213,11 +213,17 @@ pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> 
     let stdout = own::answer(&rustc, &args, stdin, &var);
     match stdout {
         Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
-        None => Err(io::Error::other(format!(
-            "owned compiler query has no model: {:?} {args:?} (toolchain {rustc:?}); \
-             rustc was not executed; Cargo was not executed",
-            command.get_program()
-        ))),
+        None => {
+            let records = match own::gap(&rustc) {
+                Some(gap) => format!("; the toolchain's records: {gap}"),
+                None => String::new(),
+            };
+            Err(io::Error::other(format!(
+                "owned compiler query has no model: {:?} {args:?} (toolchain {rustc:?}){records}; \
+                 rustc was not executed; Cargo was not executed",
+                command.get_program()
+            )))
+        }
     }
 }
 
@@ -1118,6 +1124,33 @@ pub(crate) mod tests {
         let rustc = dir.join("bin/rustc");
         std::fs::write(&rustc, "this compiler must not execute").unwrap();
         rustc
+    }
+
+    #[test]
+    fn a_toolchain_without_its_records_names_the_record_it_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = synthetic_toolchain(dir.path());
+        assert_eq!(own::gap(&rustc), None);
+        let rustlib = dir.path().join("lib/rustlib");
+        // No channel manifest and no docs page: the release has no record.
+        std::fs::remove_file(rustlib.join("multirust-channel-manifest.toml")).unwrap();
+        let gap = own::gap(&rustc).unwrap();
+        assert!(gap.contains("multirust-channel-manifest.toml"), "{gap}");
+        assert!(gap.contains("share/doc/rust/html/version_info.html"), "{gap}");
+        // No rustup manifest and no host component with rust-lld: the host has no record.
+        std::fs::remove_file(rustlib.join("manifest-rustc-aarch64-apple-darwin")).unwrap();
+        std::fs::create_dir_all(rustlib.join("src/rust")).unwrap();
+        let gap = own::gap(&rustc).unwrap();
+        assert!(gap.contains("manifest-rustc-<host>") && gap.contains("rust-lld"), "{gap}");
+        assert!(gap.contains("\"src\""), "{gap}");
+        // The query's refusal carries it.
+        let mut command = Command::new(&rustc);
+        command.arg("--version");
+        let error = answer(&mut command, &[]).unwrap_err().to_string();
+        assert!(
+            error.contains("has no model") && error.contains("manifest-rustc-<host>"),
+            "{error}"
+        );
     }
 
     #[test]
