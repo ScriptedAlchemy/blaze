@@ -284,7 +284,7 @@ fn run_build(mut ra_jit: Command, private: &[u8], dir: &Path) -> Result<String, 
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
-        if let Some(at) = said.find("error:") {
+        if let Some(at) = said.find("error:").into_iter().chain(said.find("Error:")).min() {
             return Err(format!("ra-jit did not build it ({}):\n{}", built.status, &said[at..]));
         }
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
@@ -1233,6 +1233,24 @@ mod tests {
         assert!(Asked { args: &optimized, cwd }.cfg().is_empty());
         let told = args(&["-C", "opt-level=3", "-Cdebug-assertions=on"]);
         assert_eq!(Asked { args: &told, cwd }.cfg(), ["debug_assertions"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_producer_failure_keeps_its_error_context_and_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fails = Command::new("sh");
+        fails.args([
+            "-c",
+            "printf '%s\\n' 'progress' 'Error: loading /source/toolchain' '' 'Caused by:' '    No such file or directory (os error 2)' >&2; exit 1",
+        ]);
+        let failed = run_build(fails, b"", dir.path()).unwrap_err();
+        assert!(failed.contains("Error: loading /source/toolchain"), "{failed}");
+        assert!(
+            failed.contains("Caused by:\n    No such file or directory (os error 2)"),
+            "{failed}"
+        );
+        assert!(!failed.contains("progress"), "{failed}");
     }
 
     /// A producer build that ends before it reads its project is reported with what it

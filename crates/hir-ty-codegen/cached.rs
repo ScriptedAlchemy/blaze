@@ -395,9 +395,10 @@ impl LlvmEntry {
     }
 }
 
-/// What a debugger is told of a function, which the entry of it kept has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Told {
+/// What a debugger is told of a function, which the entry of it kept has. Each tells what the
+/// one before it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Told {
     Nothing,
     /// Its lines alone: no variables, nor the scopes that hold them.
     Lines,
@@ -433,7 +434,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 12");
+        field(b"ra-jit entry 13");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());

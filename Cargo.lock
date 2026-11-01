@@ -3617,10 +3617,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit-bench"
+name = "ra-jit-bench-codegen"
 version = "0.1.0"
 dependencies = [
  "hir-ty-codegen",
+ "ra-jit-store",
+ "tango-bench",
+]
+
+[[package]]
+name = "ra-jit-bench-store"
+version = "0.1.0"
+dependencies = [
  "ra-jit-store",
  "tango-bench",
 ]

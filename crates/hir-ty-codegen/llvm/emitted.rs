@@ -1004,6 +1004,13 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         let (len, encoding) =
             (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
+        // x86-64's modes have different register and stack fields. Its DWARF frame
+        // describes those rules; the compact encoding still belongs to the producer.
+        if self.file.architecture() != Architecture::Aarch64 {
+            return self
+                .unwind()
+                .map(|frame| frame.map(|frame| frame.with_compact_encoding(encoding)));
+        }
         let mut rows = Vec::new();
         // How far below the frame the saved pairs start.
         let mut at = match encoding & MODE {
@@ -1032,7 +1039,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 at -= 16;
             }
         }
-        Ok(Some(FunctionUnwind::from_rows(FrameRows { len, rows }, self.landing_pads()?)))
+        Ok(Some(
+            FunctionUnwind::from_rows(FrameRows { len, rows }, self.landing_pads()?)
+                .with_compact_encoding(encoding),
+        ))
     }
 
     const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");

@@ -20,11 +20,27 @@ Validation ran on ubuntu-main, Linux x86_64, Rust/Cargo 1.99.0, with independent
   response files, scripts, thin archives and mutation rejection (0.14 seconds
   after 16.24 seconds compilation).
 
-The ordinary Ubuntu System probe remains a failed capability gate: the complete
-compiler search tree reaches `/etc/ssl/private` through a directory symlink and
-unprivileged reading returns PermissionDenied. The failure is propagated; it was
-not excluded from acceptance or converted to an empty tree. The other 16 platform
-cases passed in that run. Pinned Nix is a separate passing environment.
+The ordinary Ubuntu System probe is now a passing capability gate. The complete compiler
+search tree reaches `/etc/ssl/private` through `/usr/lib/ssl/private`, a directory
+symlink, and an unprivileged `0700` listing of it is denied. That denial is an explicit
+observation in the captured tree, not an error, an omission or an empty directory: the
+tree binds the name, the directory type and every symlink reaching it, records its
+members as unknown rather than absent, and contributes a stable `unreadable` entry to
+the tree digest. Admission admits every read outside it — a toolchain that never
+descends into it is admitted — and refuses a later read of anything below it by name as
+an unbound native input. The other 16 platform cases pass in that run. The whole
+31-case platform suite, the System probe included, also passes as an unprivileged user
+in a Debian bookworm container with the same `/usr/lib/ssl/private -> /etc/ssl/private`
+`0700` layout. Pinned Nix is a separate passing environment. The tree digest and
+native-bindings CBOR versions stay `1`: a tree that was capturable before hashes byte
+for byte as it did, the new kind tag is disjoint, and a tree that contained the denial
+had no saved identity to preserve.
+
+A capture/admission pair covers the shape directly: a `0000` directory reached through
+a symlink is captured, digested twice alike, re-rooted from an overlapping capture
+alike, round-tripped through the bindings codec, admitted outside, refused by name
+below, and seen to become stale once its members can be read. It skips under a process
+that may read the directory (root) with a message saying so.
 
 This receipt does not certify complete C2 saved execution. The combined producer
 adapter, authenticated native context installation, full original local/macOS
