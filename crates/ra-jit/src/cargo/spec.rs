@@ -422,14 +422,11 @@ fn replay(file: &Path) -> anyhow::Result<i32> {
         };
     prepared.validate_sources(&store)?;
     let mut bindings = prepared.native_closure(&blaze_spec::platform::System)?;
-    for (name, path) in
-        [("source", prepared.root.as_path()), ("toolchain/sysroot", sysroot.as_path())]
-    {
-        bindings.roots.push(blaze_spec::native::Root {
-            name: name.into(),
-            tree: blaze_spec::native_tree::Tree::capture(path)?,
-        });
-    }
+    bindings.roots.push(blaze_spec::native::Root {
+        name: "source".into(),
+        tree: blaze_spec::native_tree::Tree::capture(&prepared.root)?,
+    });
+    bindings.roots.extend(toolchain_native_inputs(&sysroot)?.roots);
     prepared.validate_sources(&store)?;
     bindings.roots.push(blaze_spec::native::Root {
         name: "runtime/compiler".into(),
@@ -786,6 +783,22 @@ fn execute_inner(
         super::run::test_summary(&tests.asked, left, always_run);
     }
     Ok(failed)
+}
+
+fn toolchain_native_inputs(sysroot: &Path) -> anyhow::Result<blaze_spec::native::Closure> {
+    let mut inputs = blaze_spec::native::Closure::default();
+    // The compiler reads std sources, native libraries and installed toolchain records.
+    // Nix's composed sysroot also carries the complete Rust HTML documentation; binding
+    // that tree makes unrelated pages inputs to every producer and every native link.
+    for (name, relative) in
+        [("libraries", "lib"), ("version", "share/doc/rust/html/version_info.html")]
+    {
+        inputs.roots.push(blaze_spec::native::Root {
+            name: format!("toolchain/{name}"),
+            tree: blaze_spec::native_tree::Tree::capture(&sysroot.join(relative))?,
+        });
+    }
+    Ok(inputs)
 }
 
 /// Fixed implementation policy plus the request's recorded values. A replay caller's
@@ -1167,7 +1180,31 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    fn toolchain_native_inputs_bind_libraries_and_records_without_unrelated_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("lib/rustlib/src/rust/library/core/src/lib.rs");
+        let native = dir.path().join("lib/rustlib/aarch64-apple-darwin/lib/libstd.dylib");
+        let info = dir.path().join("share/doc/rust/html/version_info.html");
+        let docs = dir.path().join("share/doc/rust/html/core/index.html");
+        for path in [&library, &native, &info, &docs] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"before").unwrap();
+        }
+        let inputs = toolchain_native_inputs(dir.path()).unwrap();
+        inputs.validate().unwrap();
+        std::fs::write(&docs, b"unrelated documentation changed").unwrap();
+        inputs.validate().expect("Rust HTML documentation is not a compiler or linker input");
+        for path in [&library, &native, &info] {
+            std::fs::write(path, b"changed").unwrap();
+            assert!(inputs.validate().is_err(), "{} must be authenticated", path.display());
+            std::fs::write(path, b"before").unwrap();
+            inputs.validate().unwrap();
+        }
+    }
+
+    // APFS rejects these filename bytes before source admission can be exercised.
+    #[test]
+    #[cfg(target_os = "linux")]
     fn saved_input_admission_preserves_native_source_and_store_paths() {
         use std::os::unix::ffi::OsStringExt as _;
 
