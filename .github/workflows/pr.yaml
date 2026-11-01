@@ -24,8 +24,8 @@
 name: pr
 
 on:
+  # Stacked PRs must be validated against their actual target branch.
   pull_request:
-    branches: [dist/main, dist/c4-keys]
   push:
     branches: [dist/main, dist/c4-keys]
   schedule:
@@ -42,8 +42,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Retire obsolete PR builds, not integration pushes awaiting full acceptance.
+  group: pr-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
