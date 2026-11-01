@@ -3099,9 +3099,10 @@ Apple's linker wrote is stripped afterwards by the toolchain's `rust-objcopy` (`
 `--strip-all`, a shared library `--discard-all`). Units of one program may be built with different
 debug info (`[profile.dev.package.x] debug = 0`): each crate's code is described as its own
 `-Cdebuginfo` says, as rustc compiles each crate with its own, and where it is kept
-(`split-debuginfo`) is the linked root's. Preflight still reports unsupported output types and
-special extern options before compilation. Those are remaining execution limits, not completed
-Rust compatibility.
+(`split-debuginfo`) is the linked root's. Preflight still refuses `cdylib`, `staticlib` and `dylib`
+outputs before compilation, as every owned build does today ([no-rustc.md](no-rustc.md)): a gap
+of the owned compiler, not of replay. It refuses the special extern options `noprelude`,
+`public` and `nounused` too, which stable cargo never sets.
 
 The private version-2 deterministic CBOR trace carries input paths and keyed identities of
 observed environment values, distinguishing absence, empty text and native non-Unicode values.
