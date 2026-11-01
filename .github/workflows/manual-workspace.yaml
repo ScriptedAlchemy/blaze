@@ -5,9 +5,12 @@ on:
     paths: [.github/workflows/manual-workspace.yaml]
 permissions:
   contents: read
+concurrency:
+  group: manual-repair-workspace
+  cancel-in-progress: true
 jobs:
   workspace:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -27,15 +30,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.99.0 --profile minimal -c rustfmt
+          rustup toolchain install 1.99.0 --profile minimal
           rustup default 1.99.0
           cargo fetch --locked --target x86_64-unknown-linux-gnu
+          rustup toolchain install 1.99.0-x86_64-unknown-linux-gnu --profile minimal -c rustfmt --force-non-host
           out="$RUNNER_TEMP/manual-workspace"
-          rustc -vV > "$out/toolchain.txt"
-          toolchain=$(rustc --print sysroot)
+          toolchain="$HOME/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu"
+          test -x "$toolchain/bin/rustc"
           tar -I 'zstd -3 -T2' -cf "$out/rust-toolchain.tar.zst" -C "$toolchain" .
-          # Only public registry/git source data: no credentials, config or tokens.
-          tar -I 'zstd -3 -T2' -cf "$out/cargo-dependencies.tar.zst" -C "$HOME/.cargo" registry git
+          # No credentials, configuration, executables or runner environment.
+          paths=(registry)
+          if [ -d "$HOME/.cargo/git" ]; then paths+=(git); fi
+          tar -I 'zstd -3 -T2' -cf "$out/cargo-dependencies.tar.zst" -C "$HOME/.cargo" "${paths[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
