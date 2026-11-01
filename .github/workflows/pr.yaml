@@ -71,6 +71,7 @@ jobs:
           python3 -I .github/scripts/test_changes.py
           python3 -I .github/scripts/test_bundle_integrity.py
           python3 -I .github/scripts/test_bundle_transport.py
+          python3 -I .github/scripts/test_bundle_build.py
           python3 -I .github/scripts/test_bench_pair.py
           python3 -I .github/scripts/test_bench_verdict.py
       - id: areas

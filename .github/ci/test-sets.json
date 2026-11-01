@@ -72,15 +72,34 @@
     "platforms": ["linux-x64"],
     "build": ["-p", "ra-jit", "--bin", "ra-jit"]
   },
-  "bench-head": {
+  "bench-store-head": {
     "platforms": ["linux-x64"],
-    "bench": ["-p", "ra-jit-bench", "--bench", "store"],
+    "bench": ["-p", "ra-jit-bench-store", "--bench", "store"],
+    "rustflags": ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"],
+    "remap-paths": true,
     "source": "head"
   },
-  "bench-base": {
+  "bench-store-base": {
     "platforms": ["linux-x64"],
-    "bench": ["-p", "ra-jit-bench", "--bench", "store"],
+    "bench": ["-p", "ra-jit-bench-store", "--bench", "store"],
+    "rustflags": ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"],
+    "remap-paths": true,
     "source": "base",
-    "requires": "crates/ra-jit-bench"
+    "requires": {"package": "ra-jit-bench-store", "bench": "store"}
+  },
+  "bench-codegen-head": {
+    "platforms": ["linux-x64"],
+    "bench": ["-p", "ra-jit-bench-codegen", "--bench", "codegen"],
+    "rustflags": ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"],
+    "remap-paths": true,
+    "source": "head"
+  },
+  "bench-codegen-base": {
+    "platforms": ["linux-x64"],
+    "bench": ["-p", "ra-jit-bench-codegen", "--bench", "codegen"],
+    "rustflags": ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"],
+    "remap-paths": true,
+    "source": "base",
+    "requires": {"package": "ra-jit-bench-codegen", "bench": "codegen"}
   }
 }
