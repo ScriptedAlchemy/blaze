@@ -98,6 +98,14 @@ jobs:
             rustc -vV
             cargo -V
             nix develop .#bench --command llvm-config --version
+            # The toolchain the harness's stand-ins copy, and the records blaze reads its
+            # release from (crates/ra-jit/src/answers/own.rs): where the shell's rustc is,
+            # its sysroot, what lib/rustlib holds, and whether the docs' version page is there.
+            nix develop .#bench --command sh -c '
+              command -v rustc; sysroot=$(rustc --print sysroot); echo "sysroot $sysroot"
+              ls -la "$sysroot/lib/rustlib" 2>&1
+              ls -la "$sysroot/lib/rustlib"/*/bin 2>&1
+              ls -la "$sysroot/share/doc/rust/html/version_info.html" 2>&1'
           } > "$RUNNER_TEMP/c2-evidence/identity.txt"
       - name: Validate complete native platform and immutable input contracts
         run: nix develop .#bench --command cargo test --locked -p blaze-wire -p blaze-spec -- --test-threads=2
