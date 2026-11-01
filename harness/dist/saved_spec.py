@@ -584,6 +584,12 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
     if "doctests" in only:
       project = work / "workspace-doctests"
       workspace_libraries(project)
+      # The worker's cache as the cases before left it: the replay's compilers must not read
+      # or write it, whether or not it is there.
+      def cache_listing():
+          cache = work / "worker-cache"
+          return sorted((str(p.relative_to(cache)), p.stat().st_size, p.stat().st_mtime_ns) for p in cache.rglob("*") if p.is_file()) if cache.exists() else None
+      cache_before = cache_listing()
       saved, expected, actual = roundtrip("workspace-doctests", project, ["test", "--workspace", "--doc", *profile], check_stdout=False)
       # Both doctest compilers must consume the one raw unit built by this replay,
       # even though the worker environment supplies an outside compiler cache.
@@ -593,7 +599,7 @@ def required_saved_cases(runner, args, blaze, real, work, bundle, env, oracle_en
       assert len(jobs) == 1, jobs
       units = list((jobs[0] / "std-units").iterdir())
       assert len(units) == 1, units
-      assert not (work / "worker-cache").exists(), "saved replay inherited worker cache policy"
+      assert cache_listing() == cache_before, "saved replay used the worker's cache"
       from buildspec import parse_run
       assert parse_run(actual) == parse_run(expected), (actual, expected)
       assert sum(row[1] for row in parse_run(actual)["totals"]) == 2, actual
