@@ -1,6 +1,6 @@
-//! What the microbenchmarks of `crates/ra-jit-bench` measure: the keys a function is kept
-//! under, the records of a pack and the store's reads. Not for anything else; the names here
-//! may change with the benchmarks.
+//! What the microbenchmarks of `crates/ra-jit-bench-store` measure: the keys a function is kept
+//! under, the records of a pack and the store's reads; `crates/ra-jit-bench-codegen` takes its
+//! keys from here too. Not for anything else; the names here may change with the benchmarks.
 
 use std::{
     path::PathBuf,

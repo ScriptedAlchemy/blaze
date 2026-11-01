@@ -414,8 +414,11 @@ out right, it fails the run until it is taken off the list:
 
 The other workflows: `bench-readme.yaml` measures real projects on each platform's dedicated
 benchmark machine and commits the tables and the README's numbers to main. It runs a platform only once the
-repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). `bench.yaml` (the store's
-microbenchmarks, two minutes) runs on pull requests and pushes too. `claims.yaml` (all of
+repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)). `bench.yaml` (tango
+microbenchmarks of the store and the code generator, two minutes) runs on pull requests and
+pushes too: each benchmark binary is a package that links only what it measures, a binary a
+change leaves byte-identical to its base's is not judged, and one that differs fails only on a
+slowdown over 10% twice in a row while its base against itself stays under. `claims.yaml` (all of
 rustc's `tests/ui`, both backends, and the scoreboard) and `nix-live.yaml` (the flake, the demo
 and live edits, 40 minutes; also on a change to the flake, `nix/` or the dependencies) run
 nightly and open an issue when they fail, like ra-jit.yaml's full tier. `fork-sync.yaml` runs

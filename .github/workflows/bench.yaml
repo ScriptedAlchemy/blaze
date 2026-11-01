@@ -1,3 +1,23 @@
+# Microbenchmarks of ra-jit's hot paths, run by tango in pairs. Each benchmark binary is a
+# package of its own that links only what it measures (BENCHES below): the store's benchmarks
+# (crates/ra-jit-bench-store) link the store and tango and nothing else, the code generator's
+# (crates/ra-jit-bench-codegen) the compiler.
+#
+# On a pull request each binary of the change runs against the same binary of its base,
+# interleaved on one runner, so that the runner's own drift cancels out. Both are built in one
+# checkout, with every function and loop head on the same alignment.
+#
+# A binary whose bytes are the base's is not run, and passes: the change left everything it
+# links alone. It cannot be measured instead, because what no flag pins (the layout of data,
+# heap and pages) still moves a binary that is relinked: on PR #18 the store's benchmark, with
+# ra-jit-store untouched but the compiler it then linked changed, measured `store/get_hit` 22%
+# and 11% slower on an Intel Xeon runner, and the same two binaries passed on an AMD EPYC one.
+# A binary that differs fails the run only when a benchmark is slower beyond doubt (tango's
+# z-score) and by more than NOISE percent twice in a row, and the base against itself (the
+# control) stays under NOISE: a runner that moves the same binary by as much cannot tell the
+# change's effect apart.
+#
+# On main, and for a binary its base does not have, they are run alone, for the times.
 name: bench
 on:
   push:
@@ -18,6 +38,10 @@ env:
   # Seconds each benchmark runs for, and the slowdown in percent below which it is noise.
   TIME: 3
   NOISE: 10
+  # The benchmark binaries, as package:bench. A package lists only what its benchmarks measure,
+  # since cargo folds every dependency's hash into the binary's symbols: a benchmark of a crate
+  # with other dependencies goes in a package of its own, never beside these.
+  BENCHES: ra-jit-bench-store:store ra-jit-bench-codegen:codegen
 
 defaults:
   run:
@@ -34,33 +58,42 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
-      # Both builds place every function and loop head on the same alignment. The benchmark
-      # links hir-ty-codegen, so a change there moves the addresses of the store's code the
-      # benchmarks measure without touching it, and on x86 a hot loop that lands differently
+      # Both builds place every function and loop head on the same alignment. A binary that is
+      # rebuilt has its code at other addresses, and on x86 a hot loop that lands differently
       # runs tens of percent slower: `store/has_miss` was +47% on four runs of a change that
       # left ra-jit-store alone, and flat in a paired run on another machine. With the
-      # alignment pinned, a difference is the code's.
+      # alignment pinned, a difference in the code's placement is not one in its speed.
       - run: echo 'RUSTFLAGS=-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5' >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench-aligned
-      # The base first, in the same checkout, so that the change's build reuses whatever of
-      # it the change did not touch. A base without the benchmarks has nothing to pair with.
-      - name: Build the base
-        if: github.event_name == 'pull_request'
+      # The base first, in the same checkout, so that the change's build reuses whatever of it
+      # the change did not touch: a binary whose closure the change left alone comes out as the
+      # same bytes. A base without a benchmark has nothing to pair it with.
+      - name: Build
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git checkout -q --detach ${{ github.event.pull_request.base.sha }}
-          if [ -d crates/ra-jit-bench ]; then
-            cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-              | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-              | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
+          mkdir -p "$RUNNER_TEMP/bin"
+          # The binary of package $1's bench $2, copied to $3, if this checkout has it.
+          build() {
+            cargo metadata --format-version 1 --no-deps \
+              | jq -e --arg p "$1" --arg b "$2" \
+                  'any(.packages[]; .name == $p and any(.targets[]; .name == $b and (.kind | index("bench"))))' \
+                  > /dev/null || { echo "$1 has no bench $2 here"; return 0; }
+            cargo bench -p "$1" --bench "$2" --no-run --message-format=json \
+              | jq -r --arg b "$2" 'select(.executable != null and .target.name == $b) | .executable' \
+              | xargs -I{} cp {} "$3"
+          }
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git checkout -q --detach "$BASE_SHA"
+            for pair in $BENCHES; do build "${pair%%:*}" "${pair#*:}" "$RUNNER_TEMP/bin/${pair#*:}-base"; done
+            git checkout -q --detach "$GITHUB_SHA"
           fi
-          git checkout -q --detach ${{ github.sha }}
-      - name: Build the change
-        run: |
-          cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
-            | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-            | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
+          for pair in $BENCHES; do build "${pair%%:*}" "${pair#*:}" "$RUNNER_TEMP/bin/${pair#*:}-head"; done
+          for pair in $BENCHES; do
+            [ -x "$RUNNER_TEMP/bin/${pair#*:}-head" ] || { echo "::error::the change has no bench ${pair#*:} in ${pair%%:*}"; exit 1; }
+          done
       - name: Record benchmark context
         if: github.event_name == 'pull_request'
         env:
@@ -73,52 +106,69 @@ jobs:
             cargo --version
             uname -a
             lscpu
-            sha256sum "$RUNNER_TEMP"/bench-*
+            (cd "$RUNNER_TEMP/bin" && sha256sum -- *)
           } > "$RUNNER_TEMP/tango/context.txt"
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
-          [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
-          attempt=0
-          compare() {
-            attempt=$((attempt + 1))
-            "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" \
-              -t "$TIME" --noise-threshold "$NOISE" -o -v \
-              --dump "$RUNNER_TEMP/tango/compare-$attempt" | tee -a "$RUNNER_TEMP/bench.txt"
-          }
-          # The base against itself: what the runner alone makes of the same code. A slowdown
-          # the change shows twice is judged only where this stays under the threshold; a runner
-          # that moves the same binary by more than that cannot tell the change's effect apart.
-          control() {
-            "$RUNNER_TEMP/bench-base" --color never compare "$RUNNER_TEMP/bench-base" \
-              -t "$TIME" --noise-threshold "$NOISE" -o -v \
-              --dump "$RUNNER_TEMP/tango/control" | tee -a "$RUNNER_TEMP/bench.txt"
-          }
-          { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          status=0
-          compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
-          if [ "$status" != 0 ]; then
-            echo "The base against itself, to tell the runner's noise from the change's:" | tee -a "$RUNNER_TEMP/bench.txt"
-            if ! control; then
-              echo "::warning::the runner is too noisy to judge: the base against itself moved over ${NOISE}%; the comparison is not judged (its tables are in the summary)"
-              status=0
+          # Bench $1, change against base, twice if the first shows a slowdown, then the base
+          # against itself. Its tables and tango's dumps go in $RUNNER_TEMP/tango/$1.
+          judge() {
+            local bench=$1 out=$RUNNER_TEMP/tango/$1 attempt=0 status=0
+            local base=$RUNNER_TEMP/bin/$1-base head=$RUNNER_TEMP/bin/$1-head
+            mkdir -p "$out"
+            compare() {
+              attempt=$((attempt + 1))
+              "$head" --color never compare "$base" -t "$TIME" --noise-threshold "$NOISE" -o -v \
+                --dump "$out/compare-$attempt" | tee -a "$out/bench.txt"
+            }
+            # The base against itself: what the runner alone makes of the same code. A slowdown
+            # the change shows twice is judged only where this stays under the threshold; a
+            # runner that moves the same binary by more than that cannot tell the change's
+            # effect apart.
+            control() {
+              "$base" --color never compare "$base" -t "$TIME" --noise-threshold "$NOISE" -o -v \
+                --dump "$out/control" | tee -a "$out/bench.txt"
+            }
+            compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$out/bench.txt"; compare || status=$?; }
+            if [ "$status" != 0 ]; then
+              echo "The base against itself, to tell the runner's noise from the change's:" | tee -a "$out/bench.txt"
+              if ! control; then
+                echo "::warning::$bench: the runner is too noisy to judge: the base against itself moved over ${NOISE}%; the comparison is not judged (its tables are in the summary)"
+                status=0
+              fi
             fi
-          fi
-          { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$status" = 0 ] || echo "::error::both benchmark comparisons report a slowdown over ${NOISE}% while the base against itself stays under"
+            { echo "### tango: $bench, change against base"; echo '```'; cat "$out/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            [ "$status" = 0 ] || echo "::error::$bench: both comparisons report a slowdown over ${NOISE}% while the base against itself stays under"
+            return "$status"
+          }
+          status=0
+          for pair in $BENCHES; do
+            bench=${pair#*:}
+            if [ ! -x "$RUNNER_TEMP/bin/$bench-base" ]; then
+              echo "$bench: the base has no such benchmark, nothing to compare (its times are below)"
+            elif cmp -s "$RUNNER_TEMP/bin/$bench-base" "$RUNNER_TEMP/bin/$bench-head"; then
+              echo "$bench: unchanged by this change: not judged"
+              { echo "### tango: $bench"; echo "unchanged by this change: not judged (its bytes are the base's)"; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              judge "$bench" || status=1
+            fi
+          done
           exit "$status"
-      # On main, and on a pull request whose base has no benchmarks.
+      # On main, and for a benchmark whose base does not have it.
       - name: Times
         run: |
-          [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
-          "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
-          { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          for pair in $BENCHES; do
+            bench=${pair#*:}
+            [ ! -x "$RUNNER_TEMP/bin/$bench-base" ] || continue
+            mkdir -p "$RUNNER_TEMP/tango/$bench"
+            "$RUNNER_TEMP/bin/$bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/tango/$bench/times.txt"
+            { echo "### tango: $bench"; echo '```'; cat "$RUNNER_TEMP/tango/$bench/times.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Keep paired benchmark evidence
         if: always() && github.event_name == 'pull_request'
         uses: actions/upload-artifact@v6
         with:
           name: tango-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/tango
-            ${{ runner.temp }}/bench.txt
+          path: ${{ runner.temp }}/tango
           retention-days: 7
