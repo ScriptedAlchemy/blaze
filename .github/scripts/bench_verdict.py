@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Judge the paired tango runs of the `tango` job; run no benchmark and compile nothing.
 
-The job runs tango three ways on one runner: bench-base against a copy of itself (the A/A
-control), then bench-head against bench-base, once and once more if that one reported a
-slowdown. Tango's own exit status says only that some benchmark was slower in a run. The verdict
+One verdict per benchmark binary (`--bench`, a pair of bench_pair.py's). A pair whose two
+executables are the same bytes is not run, and its verdict is
+
+  unchanged      the head's binary is the base's (bench_pair.py's `identical`, read from its
+                 pairs.json): not judged, and passed (exit 0); a pair whose digests differ is an
+                 error here (exit 1).
+
+For a pair that differs the job runs tango three ways on one runner: the base against a copy of
+itself (the A/A control), then the head against the base, once and once more if that one reported
+a slowdown. Tango's own exit status says only that some benchmark was slower in a run. The verdict
 here is that of `bench.yaml`'s header comment:
 
   environmental  the A/A control, the same binary against itself, shows a benchmark over the
@@ -20,6 +27,7 @@ and significant, which tango marks `*` (its exit status is the same test). The t
 tango's `-v` form (`--color never`).
 """
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -64,8 +72,9 @@ def show(slowed):
     )
 
 
-def cpu_line(text):
-    """The runner's CPU and the pair's digests, as the job's `cpu.txt` has them."""
+def cpu_line(text, bench=None):
+    """The runner's CPU and the pair's digests (those of `bench`'s pair alone, `<bench>-head` and
+    `<bench>-base`, when it is given), as the job's `cpu.txt` has them."""
     model = count = None
     digests = []
     for line in text.splitlines():
@@ -75,7 +84,9 @@ def cpu_line(text):
             count = line.split(":", 1)[1].strip()
         elif re.match(r"^[0-9a-f]{64}\s", line):
             digest, path = line.split(None, 1)
-            digests.append(f"{Path(path.strip()).name} {digest[:12]}")
+            name = Path(path.strip()).name
+            if bench is None or name in (f"{bench}-head", f"{bench}-base"):
+                digests.append(f"{name} {digest[:12]}")
     cpu = f"{model or 'unknown CPU'} ({count or '?'} CPUs)"
     return cpu + ("; " + ", ".join(digests) if digests else "")
 
@@ -93,9 +104,9 @@ def judge(aa, attempts, cpu="", aa_seconds=None, exit_codes=None, aa_exit_code=N
         lines.append(f"runner: {cpu}")
     took = f", {aa_seconds} s" if aa_seconds is not None else ""
     if means(aa):
-        lines.append(f"A/A control (bench-base against a copy of itself{took}): over the threshold: {show(aa_slow)}")
+        lines.append(f"A/A control (the base against a copy of itself{took}): over the threshold: {show(aa_slow)}")
     else:
-        lines.append(f"A/A control (bench-base against a copy of itself{took}): measured nothing")
+        lines.append(f"A/A control (the base against a copy of itself{took}): measured nothing")
     for number, (ok, slowed) in enumerate(zip(parsed, slows), 1):
         lines.append(f"comparison {number}: " + (f"over the threshold: {show(slowed)}" if ok else "measured nothing"))
 
@@ -131,18 +142,46 @@ def judge(aa, attempts, cpu="", aa_seconds=None, exit_codes=None, aa_exit_code=N
     return verdict, "\n".join(lines), status
 
 
+UNCHANGED = "unchanged by this change: not judged (its bytes are the base's)"
+
+
+def unchanged(row, cpu=""):
+    """The verdict of a pair bench_pair.py found identical, from its row of pairs.json."""
+    lines = [f"runner: {cpu}"] if cpu else []
+    if row.get("state") == "identical" and row.get("head") and row.get("head") == row.get("base"):
+        lines.insert(0, "tango verdict: unchanged")
+        lines.append(f"{row['bench']}: {UNCHANGED}, sha256 {row['head']}")
+        return "unchanged", "\n".join(lines), 0
+    lines.insert(0, "tango verdict: error")
+    lines.append(f"{row.get('bench')}: not an identical pair (head {row.get('head')}, base {row.get('base')}),"
+                 " so it is judged, not passed unrun")
+    return "error", "\n".join(lines), 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--aa", required=True, help="tango's output of bench-base against its copy")
+    parser.add_argument("--bench", help="the pair's benchmark: its digests alone, from the cpu file")
+    parser.add_argument("--unchanged", metavar="PAIRS_JSON",
+                        help="bench_pair.py's pairs.json: give --bench's pair the verdict `unchanged`")
+    parser.add_argument("--aa", help="tango's output of the base against its copy")
     parser.add_argument("--aa-seconds", type=int, help="how long the A/A control took")
     parser.add_argument("--cpu-file", help="the job's cpu.txt")
     parser.add_argument("--exit-code", type=int, action="append", help="one exit status per comparison")
     parser.add_argument("--aa-exit-code", type=int, help="the A/A process exit status")
-    parser.add_argument("attempts", nargs="+", help="tango's output of each comparison, in order")
+    parser.add_argument("attempts", nargs="*", help="tango's output of each comparison, in order")
     args = parser.parse_args(argv)
     cpu = ""
     if args.cpu_file and Path(args.cpu_file).is_file():
-        cpu = cpu_line(Path(args.cpu_file).read_text())
+        cpu = cpu_line(Path(args.cpu_file).read_text(), args.bench)
+    if args.unchanged:
+        if args.aa or args.attempts or not args.bench:
+            parser.error("--unchanged takes --bench and no tango output")
+        rows = [row for row in json.loads(Path(args.unchanged).read_text()) if row.get("bench") == args.bench]
+        _, report, status = unchanged(rows[0] if len(rows) == 1 else {"bench": args.bench}, cpu)
+        print(report)
+        return status
+    if not args.aa or not args.attempts:
+        parser.error("--aa and at least one comparison are required")
     _, report, status = judge(
         Path(args.aa).read_text(), [Path(it).read_text() for it in args.attempts], cpu, args.aa_seconds,
         args.exit_code, args.aa_exit_code

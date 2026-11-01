@@ -1,0 +1,26 @@
+[package]
+name = "ra-jit-bench-store"
+description = "Microbenchmarks of ra-jit's store, run by tango in pairs: a change against its base"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Only the store and tango, so that a change that leaves the store alone builds this benchmark
+# into the same bytes as its base did, and .github/workflows/bench.yaml has nothing to judge.
+# Anything else listed here, even unused, folds its hash into the symbols of this binary and
+# moves the store's code: the benchmark of a crate that needs more goes in a package of its own,
+# as `ra-jit-bench-codegen`.
+[dev-dependencies]
+ra-jit-store.workspace = true
+tango-bench = "0.9"
+
+[[bench]]
+name = "store"
+harness = false
+
+[lints]
+workspace = true

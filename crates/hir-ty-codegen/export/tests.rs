@@ -223,7 +223,15 @@ fn allocator_only_unit_uses_its_explicit_source_graph() {
             let object = object::File::parse(bytes.as_slice()).unwrap();
             let names: Vec<_> = object
                 .symbols()
-                .filter_map(|symbol| Some((symbol.name().ok()?.to_owned(), symbol.is_undefined())))
+                .filter_map(|symbol| {
+                    let name = symbol.name().ok()?;
+                    let name = if object.format() == object::BinaryFormat::MachO {
+                        name.strip_prefix('_').unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    Some((name.to_owned(), symbol.is_undefined()))
+                })
                 .collect();
             for name in [
                 "__rust_alloc",
@@ -1299,4 +1307,151 @@ int main(void) { printf("%d %d\n", case_root(), case_vtable_root()); }
     });
     std::fs::remove_dir_all(one).unwrap();
     std::fs::remove_dir_all(two).unwrap();
+}
+
+const TWO_CRATES: &str = r#"
+//- minicore: sized
+//- /dep/lib.rs crate:dep
+pub fn plain() -> i32 { 3 }
+//- /src/lib.rs crate:case deps:dep
+pub fn root() -> i32 { let x = dep::plain(); x + 1 }
+"#;
+
+/// The fixture's resolver for a program whose crate `quiet` is built with `debug = 0` and the
+/// rest with full debug info, as `[profile.dev.package.quiet] debug = 0` builds it.
+struct Quiet<'a> {
+    inner: Symbols<'a>,
+    quiet: &'static str,
+}
+
+impl SymbolResolver for Quiet<'_> {
+    fn function(&self, func: FunctionId) -> Option<String> {
+        self.inner.function(func)
+    }
+    fn static_(&self, id: StaticId) -> Option<String> {
+        self.inner.static_(id)
+    }
+    fn path(&self, path: &str) -> Option<String> {
+        self.inner.path(path)
+    }
+    fn item(&self, item: hir_def::ModuleDefId) -> Option<String> {
+        self.inner.item(item)
+    }
+    fn source_path(&self, file: base_db::FileId) -> Option<String> {
+        self.inner.source_path(file)
+    }
+    fn stable_crate_id(&self, krate: Crate) -> Option<u64> {
+        self.inner.stable_crate_id(krate)
+    }
+    fn content_id(&self, krate: Crate) -> Option<ContentId> {
+        self.inner.content_id(krate)
+    }
+    fn rustc_built(&self, krate: Crate) -> bool {
+        self.inner.rustc_built(krate)
+    }
+    fn nothing_of_rustc(&self) -> bool {
+        true
+    }
+    fn describes_variables(&self) -> bool {
+        self.inner.describes_variables()
+    }
+    fn debug_directory(&self) -> Option<String> {
+        self.inner.debug_directory()
+    }
+    fn tells_of(&self, krate: Crate) -> Told {
+        let named = krate.extra_data(self.inner.db).display_name.as_ref();
+        if named.is_some_and(|it| it.canonical_name().as_str() == self.quiet) {
+            Told::Nothing
+        } else {
+            self.tells()
+        }
+    }
+}
+
+/// Each function is described as the crate its code is written in is built, as rustc
+/// compiles each crate with its own `-C debuginfo`: the code of a crate built with
+/// `debug = 0` is told of to no debugger in a program whose own code is fully described, and
+/// what a debugger is told of a crate's code is in the names the store keeps it under when it
+/// is not what the build's own is, so no entry is found for a build that describes it
+/// otherwise.
+#[test]
+fn a_crate_built_without_debug_info_is_described_to_no_debugger() {
+    store::compiles_against("1.99.0");
+    let db = RootDatabase::with_files(TWO_CRATES);
+    hir::attach_db(&db, || {
+        let crates = base_db::all_crates(&db);
+        let named = |name: &str| {
+            *crates
+                .iter()
+                .find(|it| {
+                    it.extra_data(&db)
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|it| it.canonical_name().as_str() == name)
+                })
+                .unwrap()
+        };
+        let function = |krate: Crate, name: &str| {
+            let map = hir_def::nameres::crate_def_map(&db, krate);
+            map.modules(&db)
+                .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+                .find_map(|def| match def {
+                    hir_def::ModuleDefId::FunctionId(id)
+                        if FunctionSignature::of(&db, id).name.as_str() == name =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let roots = [function(named("case"), "root"), function(named("dep"), "plain")];
+        let described = |quiet: &'static str| {
+            let symbols = Quiet { inner: Symbols { db: &db, debug: true }, quiet };
+            assert_eq!(told_of(&symbols, None), Told::Variables);
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                crates.iter().copied(),
+                &roots,
+                policy(true),
+            )
+            .unwrap();
+            let directory = scratch("per-crate-debug");
+            let store = store::Store::owned(&directory).unwrap();
+            let requests = roots.map(LocalRequest::root).to_vec();
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, 2);
+            let entries: Vec<_> = batch
+                .receipt
+                .entries
+                .iter()
+                .map(|it| {
+                    let entry = cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap();
+                    (entry.label.clone(), it.work.name.clone(), entry.debug.is_some(), it.key)
+                })
+                .collect();
+            drop(store);
+            std::fs::remove_dir_all(directory).unwrap();
+            entries
+        };
+        let alike = described("nothing is quiet");
+        let quiet = described("dep");
+        let of = |entries: &[(String, String, bool, [u8; store::KEY])], label: &str| {
+            entries.iter().find(|it| it.0 == label).unwrap().clone()
+        };
+        // Built alike, both are described, under the names they always had.
+        assert!(of(&alike, "root").2 && of(&alike, "plain").2);
+        assert!(!of(&alike, "plain").1.contains(".d"), "{}", of(&alike, "plain").1);
+        // `dep` built with `debug = 0`: its code is told of to no debugger, and the program's
+        // own code still is, under the same name and key as before.
+        assert!(of(&quiet, "root").2);
+        assert!(!of(&quiet, "plain").2);
+        assert_eq!(of(&quiet, "root").1, of(&alike, "root").1);
+        assert_eq!(of(&quiet, "root").3, of(&alike, "root").3);
+        // What is told of `dep` is in the names of its code, so the store never gives one
+        // build's description of it to the other.
+        assert!(of(&quiet, "plain").1.contains(".d0:"), "{}", of(&quiet, "plain").1);
+        assert_ne!(of(&quiet, "plain").3, of(&alike, "plain").3);
+    });
 }

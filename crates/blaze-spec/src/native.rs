@@ -325,17 +325,19 @@ impl Observation {
             hex(&mut out, &b.digest);
             let _ = write!(
                 out,
-                "\n  counts missing/directory/file/cycle/link expected {}/{}/{}/{}/{} actual {}/{}/{}/{}/{}\n  changed",
+                "\n  counts missing/directory/file/cycle/unreadable/link expected {}/{}/{}/{}/{}/{} actual {}/{}/{}/{}/{}/{}\n  changed",
                 a.counts[0],
                 a.counts[1],
                 a.counts[2],
                 a.counts[3],
                 a.counts[4],
+                a.counts[5],
                 b.counts[0],
                 b.counts[1],
                 b.counts[2],
                 b.counts[3],
-                b.counts[4]
+                b.counts[4],
+                b.counts[5]
             );
             if a.membership != b.membership {
                 out.push_str(" membership");
@@ -411,6 +413,11 @@ fn walk_captured(
     for component in suffix.components() {
         if entry.kind == Kind::Missing {
             return Lookup::Bound(missing());
+        }
+        if entry.kind == Kind::Unreadable {
+            // The members of an unreadable directory are unknown: nothing below it is
+            // bound, and nothing below it is a missing candidate.
+            return Lookup::Rejected;
         }
         if entry.kind != Kind::Directory {
             return Lookup::Rejected;

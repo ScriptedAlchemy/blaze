@@ -96,8 +96,20 @@ command alone has.
   executables are listed by name.
 - `source: base` builds the set from the pull request's base commit (a detached worktree, a
   target directory of its own) with the same shell, toolchain and environment as the head, and
-  records the base's identity. `requires: <path>` makes a set `absent`, with its reason, when the
-  path does not exist in its source.
+  records the base's identity. `requires: {"package": <name>, "bench": <target>}` (or `bin`,
+  `example`, `test`, or the package alone) makes a set `absent`, with the reason "the base has no
+  package <name> with bench target <target>", when `cargo metadata --no-deps` of its source does
+  not list that target: read from cargo, not from a directory, so that a base whose benchmark of
+  the same name lives in another package (`crates/ra-jit-bench`, before the split) is absent.
+- `rustflags: [...]` is the whole of rustc's flags for the set (`CARGO_ENCODED_RUSTFLAGS`); the
+  build refuses a job that sets RUSTFLAGS as well, rather than replace it silently.
+  `remap-paths: true` adds `--remap-path-prefix` of the set's checkout to `/source` and of its
+  target directory to `/target`, so that the same source builds the same bytes in the head's
+  checkout and the base's worktree: without it the codegen benchmark's two builds of one commit
+  differed on macOS (cranelift-codegen's OUT_DIR is in panic locations), with it they are one
+  binary.
+  Neither enters `-C metadata`, so the remaps, which differ by side, rename no symbol. Both are
+  recorded in the set's entry.
 
 **Verifying** (`.github/actions/bundle`): the job fails unless sha256(`bundle.json`) is the
 build job's output, `source.tree`, `source.flake` and `source.cargo_lock` are the checkout's,
@@ -137,12 +149,33 @@ recorded process replays, including package/target/features, filters and thread 
 The metadata example is also produced centrally. Both server tests and saved-source replay
 verify the bundle before execution; `server` rejects failures, cancellations and skips.
 
-The benchmark producer compiles **both benchmark executables**, rather than a complete
-base ra-jit. The consumer checks the PR base identity and equal Cargo arguments, verifies
-the executable pins, and compares the pair on one runner. The existing 3-second samples,
-10% threshold and retry on a slowdown are unchanged, and the retry confirms the same benchmark
-(below). A missing base is a failure unless
-the producer explicitly records that the base lacks `crates/ra-jit-bench`.
+The benchmark producer compiles **each benchmark executable for the head and for the base**,
+rather than a complete base ra-jit. Each benchmark is a package that links only what it
+measures, `ra-jit-bench-store` (bench `store`: the store and tango alone) and
+`ra-jit-bench-codegen` (bench `codegen`, `key/entry`: the compiler), and each side of each is a
+set of its own (`bench-store-head`, `bench-store-base`, `bench-codegen-head`,
+`bench-codegen-base`), one cargo command, with the alignment pin as its `rustflags` and
+`remap-paths`. The consumer (`bench_pair.py`) takes the pairs from the checkout's
+test-sets.json, checks the PR base identity and that both sides were built with test-sets.json's
+arguments and flags, verifies the executable pins, and records both digests
+(`tango/pairs.json`):
+
+- **Identical bytes are not judged.** A pair whose two executables have the same sha256 is not run
+  and passes, "unchanged by this change: not judged (its bytes are the base's)": the change left
+  everything the benchmark links alone. It cannot be measured instead. On PR #18 at 63530fc3 (run
+  41276848562, an Intel Xeon 6975P-C) `store/get_hit` was +21.9% and then +11.2% with the A/A
+  control flat, while the same two binaries (identical sha256 in `context.txt`) passed at a0ab2409
+  (run 41266194244, an AMD EPYC 7763), with ra-jit-store untouched by the branch: the control does
+  not catch the data, heap and page layout of a relinked binary, which no flag pins. The store's
+  benchmark then linked hir-ty-codegen, which the branch changed; since the split it does not,
+  and its binary was byte-identical across four builds including a hir-ty-codegen edit and a fresh
+  target directory, and across two checkouts on Linux and macOS.
+- **Bytes that differ are judged** as below: the A/A control, then the comparison, and a second
+  one on a slowdown, with the 3-second samples and the 10% threshold, the retry confirming the same
+  benchmark. Each binary's tables, dumps and verdict are kept under `tango/<bench>/`.
+- **A base without the package** runs the head alone, for the times, as on main. A missing base is
+  a failure unless the producer explicitly records the base's set `absent` for its `requires`,
+  which a base from before the split (`crates/ra-jit-bench`) is for both packages.
 
 **What `tango` failed on, and how it now judges (2026-10-30).** PR18's `tango` failed repeatedly
 on `store/has_miss` at +48%. A perf writer fetched the pair from seven runs: the `bench-base` and
@@ -166,7 +199,7 @@ The job now does three things (`.github/scripts/bench_verdict.py`, tested by
   of comparisons (a second one only after a slowdown) are unchanged; the job fails only when a
   benchmark is over the threshold in both. A slowdown that moves to another benchmark, or does not
   come back, is "noise" and passes.
-- **An A/A control first.** `bench-base` is compared with a copy of itself on the same runner. If a
+- **An A/A control first.** The base's binary is compared with a copy of itself on the same runner. If a
   benchmark is over the threshold there, the runner cannot tell a slowdown from itself, the verdict
   is "environmental", the comparison with the base is reported with the numbers and not counted
   (a warning, exit 0), and everything is still uploaded. It adds 18 s to the job (six benchmarks
@@ -174,10 +207,11 @@ The job now does three things (`.github/scripts/bench_verdict.py`, tested by
   other, which is what the failure was: it does not catch one whose head-only process is slow
   while the control's two are not, so the CPU record below is how that is told.
 - **The CPU beside every verdict.** `lscpu`'s model name and count, `/proc/cpuinfo`'s flags and
-  both binaries' sha256 are in the step summary, at the top of `bench.txt` and in the
-  `tango-<run>-<attempt>` artifact (`tango/cpu.txt`, with `aa.txt`, `compare-N.txt`,
-  `verdict.txt` and the raw samples), on pass and on fail; the verdict's first lines name the CPU
-  and the digests. Open: whether every failure lands on Zen 3.
+  every binary's sha256 are in the step summary and in the `tango-<run>-<attempt>` artifact
+  (`tango/cpu.txt`, `context.txt` and `pairs.json`, and per benchmark `tango/<bench>/` with
+  `aa.txt`, `compare-N.txt`, `verdict.txt`, `bench.txt` and the raw samples, or `times.txt`), on
+  pass and on fail; each verdict's first lines name the CPU and its pair's digests. Not every
+  failure lands on Zen 3: #18's at 63530fc3 above ran on an Intel Xeon 6975P-C.
 
 The control reproduced the failure with no code involved. In the first dispatched run of the job
 (41136287813, `pr.yaml` by hand, base and head of this change), on an AMD EPYC 7763 (4 CPUs),
@@ -255,8 +289,10 @@ remains separate from that budget. Its opt-in and every existing Nix gate remain
 The redesigned server consumer also runs a negative control on the actual downloaded
 bundle: it flips one byte in a server test executable, requires `bundle.py test` to
 reject its digest before execution, restores the byte in `finally`, then runs the
-unchanged test selections. The benchmark consumer runs nine provenance rejection tests
-before preparing its pair. These are normal CI tests of rejection, so they do not need
+unchanged test selections. The benchmark consumer runs its provenance rejection tests
+(`test_bench_pair.py`) and verdict tests (`test_bench_verdict.py`) before preparing its pairs;
+`test_bundle_build.py`, in the changes job, covers which base sets the producer records absent
+and the flags of each side. These are normal CI tests of rejection, so they do not need
 a broken shared-branch push that would cancel the other lanes' measurements.
 
 ### Distributed protocol consumer (fable)
