@@ -130,7 +130,7 @@ pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArgume
 pub mod tier;
 
 pub use patch::{OutOfDate, Stale, StaleSteps};
-/// For `crates/ra-jit-bench` alone.
+/// For `crates/ra-jit-bench-codegen` alone.
 #[doc(hidden)]
 pub mod bench {
     use ra_jit_store::KEY;

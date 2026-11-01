@@ -371,7 +371,7 @@ fn an_unchanged_library_loaded_for_another_environment_is_served_with_it() {
 fn a_server_environment_is_named_by_every_variable_it_has() {
     let os = |it: &str| std::ffi::OsString::from(it);
     let server = paths::AbsPathBuf::assert_utf8(std::env::temp_dir().join("server"));
-    let named = |env: &crate::GenerationEnv| crate::server_environment(&server, env);
+    let named = |env: &crate::GenerationEnv| crate::server_environment(env);
     let set = |value: &str| vec![(os("PR15_PRIVATE"), Some(os(value))), (os("PR15_OTHER"), None)];
     let first = named(&set("old-private-value"));
     let reordered = set("old-private-value").into_iter().rev().collect();
@@ -395,6 +395,22 @@ fn a_server_environment_is_named_by_every_variable_it_has() {
     assert_eq!(child.get(&os("RUST_ANALYZER_INTERNALS_DO_NOT_USE")), Some(&os("this is unstable")));
     assert_eq!(child.get(&os("PR15_PRIVATE")), Some(&os("old-private-value")));
     assert!(!child.contains_key(&os("PR15_OTHER")));
+    // Where the server is on this machine is not in its name: a server elsewhere is started
+    // with the same map but for the toolchain `bin` Windows puts ahead of `PATH`, and that
+    // is left out of what is named.
+    let elsewhere = paths::AbsPathBuf::assert_utf8(std::env::temp_dir().join("other/bin/server"));
+    let mut there = crate::process::child_environment(
+        &elsewhere,
+        set("old-private-value").iter().map(|(k, v)| (k, v)),
+    );
+    let mut here = child.clone();
+    for map in [&mut there, &mut here] {
+        map.remove(&os("PATH"));
+    }
+    assert_eq!(there, here);
+    let requested =
+        crate::process::requested_environment(set("old-private-value").iter().map(|(k, v)| (k, v)));
+    assert_eq!(requested.get(&os("PATH")), std::env::var_os("PATH").as_ref());
 }
 
 #[test]
