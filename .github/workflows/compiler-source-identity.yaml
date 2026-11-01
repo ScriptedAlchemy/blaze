@@ -1,0 +1,30 @@
+name: compiler source identity
+on:
+  pull_request:
+    paths:
+      - 'crates/ra-jit/build.rs'
+      - 'harness/source_identity_test.py'
+      - '.github/workflows/compiler-source-identity.yaml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-identity:
+    name: source identity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/toolchain
+      - name: Compile the actual build script
+        shell: bash
+        run: rustc --edition=2021 crates/ra-jit/build.rs -o "$RUNNER_TEMP/source-identity-build.exe"
+      - name: Exercise source identity regressions
+        shell: bash
+        env:
+          BLAZE_BUILD_SCRIPT: ${{ runner.temp }}/source-identity-build.exe
+        run: python3 harness/source_identity_test.py -v
