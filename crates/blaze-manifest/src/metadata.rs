@@ -148,7 +148,7 @@ pub fn export<'a, R>(
 pub fn root_manifest(manifest_path: Option<&Path>, ctx: &Context) -> anyhow::Result<PathBuf> {
     let cwd = ctx.config.cwd();
     let Some(manifest_path) = manifest_path else {
-        return find_root_manifest_for_wd(cwd);
+        return find_root_manifest_for_wd(cwd, ctx.config.discovery_root());
     };
     let path = normalize_path(&cwd.join(manifest_path));
     if !path.exists() {
@@ -178,9 +178,10 @@ fn is_embedded(path: &Path) -> bool {
     ext == Some(std::ffi::OsStr::new("rs")) || ext.is_none()
 }
 
-fn find_root_manifest_for_wd(cwd: &Path) -> anyhow::Result<PathBuf> {
+/// `stop` is a replay's snapshot root, above which nothing is read.
+fn find_root_manifest_for_wd(cwd: &Path, stop: Option<&Path>) -> anyhow::Result<PathBuf> {
     let mut invalid_cargo_toml_path_exists = false;
-    for current in ancestors(cwd, None) {
+    for current in ancestors(cwd, stop) {
         let manifest = current.join("Cargo.toml");
         if manifest.exists() {
             return Ok(manifest);

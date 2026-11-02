@@ -12,7 +12,7 @@
 //! tag, an unknown key, an oversize item. [`validate_as`] also refuses a key the schema type does
 //! not have. Nothing canonicalizes a bad message: a client that encodes wrong finds out.
 //!
-//! **Digests** are `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`, where
+//! **Digests** are `sha256("blaze/" ‖ name ‖ "/v4" ‖ 0x00 ‖ canonical CBOR of the value)`, where
 //! `name` is the type's name; [`digest_of`] writes it. The domain separation means the bytes of a
 //! `WorkKey` and of a `JobContentInput` never collide even when their encodings do.
 //!
@@ -50,7 +50,7 @@ use sha2::{Digest as _, Sha256};
 pub type Digest = [u8; 32];
 
 /// The version of the schema this crate speaks. A change that adds a field is a new version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 4;
 
 /// The word every digest's input starts with.
 const DIGEST_PREFIX: &str = "blaze/";
@@ -59,9 +59,9 @@ const DIGEST_PREFIX: &str = "blaze/";
 const SIGNATURE_PREFIX: &str = "blaze/sig/";
 
 /// The version word of every digest and signature's input.
-const DOMAIN_VERSION: &str = "/v1";
+const DOMAIN_VERSION: &str = "/v4";
 
-/// The bytes a digest of `value` is taken over: `"blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ CBOR`.
+/// The bytes a digest of `value` is taken over: `"blaze/" ‖ name ‖ "/v4" ‖ 0x00 ‖ CBOR`.
 pub fn digest_input<T: Wire + Named>(value: &T) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(DIGEST_PREFIX.as_bytes());

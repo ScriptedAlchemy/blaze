@@ -93,6 +93,16 @@ fn choose() -> Result<Chosen, String> {
             Err(_) => {}
         }
     } else if named {
+        if version.is_none() {
+            // Nothing to compare: say what kept the release from being read.
+            return Err(format!(
+                "`RUSTC` names {}, whose release blaze cannot read from the toolchain's records: \
+                 {}; blaze builds with Rust {ours}, the release it compiles, and without `RUSTC` \
+                 it builds with {ours}",
+                Path::new(&rustc).display(),
+                why_unknown(&rustc)
+            ));
+        }
         return Err(format!(
             "`RUSTC` names rustc {shown}, and blaze builds with Rust {ours}, the release it \
              compiles: without `RUSTC` it builds with {ours} (`BLAZE_OTHER_TOOLCHAIN=1` builds \
@@ -188,6 +198,14 @@ fn version_of(rustc: &OsStr) -> Option<String> {
     rustc_says(rustc, &["--version"])?.split_whitespace().nth(1).map(str::to_owned)
 }
 
+/// Why `rustc`'s release could not be read: the gap the owned answers name.
+fn why_unknown(rustc: &OsStr) -> String {
+    match super::state::rustc_says_or_why(rustc, &["--version"]) {
+        Ok(said) => format!("its `--version` says {said:?}, which names no release"),
+        Err(why) => why,
+    }
+}
+
 fn sysroot_of(rustc: &OsStr) -> PathBuf {
     PathBuf::from(rustc_says(rustc, &["--print=sysroot"]).unwrap_or_default())
 }
@@ -251,6 +269,15 @@ fn with_library(sysroot: &Path, release: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A `RUSTC` whose release blaze cannot read is refused with the reason, not with "of no
+    /// release it says": here, a path that is not there.
+    #[test]
+    fn an_unreadable_rustc_is_refused_with_why() {
+        let why = why_unknown(OsStr::new("/nonexistent/toolchain/bin/rustc"));
+        assert!(why.contains("/nonexistent/toolchain/bin/rustc"), "{why}");
+        assert!(!why.contains("of no release it says"), "{why}");
+    }
+
     #[test]
     fn settled_compiler_drives_resolution_behind_packaged_proxies() {
         const CHILD: &str = "BLAZE_TEST_SETTLED_RESOLUTION";
@@ -259,6 +286,7 @@ mod tests {
             assert_eq!(matches!(chosen, Chosen::Given(_)), branch == "given");
             let cwd = std::env::current_dir().unwrap();
             let json = blaze_metadata::metadata(&blaze_metadata::Asked {
+                cargo_home: None,
                 cwd: &cwd,
                 env: std::env::vars().collect(),
                 manifest_path: None,

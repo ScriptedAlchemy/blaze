@@ -1,0 +1,67 @@
+# The bundle's own check and the checks that depend on the platform alone, once per platform
+# rather than once per area or lane (docs/reports/CI-fork.md): it takes the bundle as every
+# check does, verifies it, checks that the owned macro runtime is the one bootstrapped by this
+# bundle's ra-jit, verifies execution tracing and audit integrity (norustc_test.py), and runs
+# the native platform and immutable input contract tests (blaze-wire, blaze-spec) from it.
+# Area checks do not repeat these.
+name: bundle check
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+        required: true
+      os:
+        type: string
+        required: true
+      bundle-sha256:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: bundle (${{ inputs.platform }})
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      # The Nix store paths the binaries link against; the cache is the build job's, read only.
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+          shell: bench
+          cache: nix
+          cache-save: false
+      - uses: ./.github/actions/bundle
+        with:
+          platform: ${{ inputs.platform }}
+          sha256: ${{ inputs.bundle-sha256 }}
+      - name: Verify bundle extraction and executable integrity boundaries
+        run: python3 -I .github/scripts/test_bundle_integrity.py
+      - name: The owned macro runtime is this ra-jit's
+        run: |
+          python3 -I -c '
+          import json, sys
+          sys.path.insert(0, "harness/dist")
+          from owned_macro_server import runtime_record
+          record = runtime_record(sys.argv[1], sys.argv[2])
+          print(json.dumps(record, indent=1))
+          assert record["bootstrap_compiler_matches"], "the runtime was bootstrapped by another ra-jit"
+          ' "$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv" "$GITHUB_WORKSPACE/target/release/ra-jit"
+      - name: Verify execution tracing and audit integrity
+        run: nix develop .#bench --command python3 -I -B harness/norustc_test.py
+      # PR18's macOS lanes took 34 to 45 minutes over this step with the compile in it; the
+      # timeout above has room for the tests alone at that.
+      - name: Native platform and immutable input contracts
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test c2-contracts -- --test-threads=2

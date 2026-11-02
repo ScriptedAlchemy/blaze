@@ -2,7 +2,7 @@
 //! which compares it with cargo's.
 //!
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
-//!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen]
+//!                 [--all-features] [--no-default-features] [--offline] [--locked | --frozen] [--unit-graph]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
 //!                  [--programs [--bin NAME | --example NAME]]] [--rust-release VERSION]
 //!
@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
     let (mut packages, mut excludes) = (Vec::new(), Vec::new());
     let (mut listed, mut bin, mut example) = (false, None, None);
+    let mut unit_graph = false;
     let mut rust_release: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +53,10 @@ fn main() -> Result<()> {
             "--workspace" => workspace = true,
             "--dev-units" => dev_units = true,
             "--programs" => listed = true,
+            "--unit-graph" => {
+                unit_graph = true;
+                build = true;
+            }
             "--bin" => bin = Some(value()?),
             "--example" => example = Some(value()?),
             "--rust-release" => rust_release = Some(value()?),
@@ -71,6 +76,7 @@ fn main() -> Result<()> {
     }
     let cwd = std::env::current_dir()?;
     let asked = Asked {
+        cargo_home: None,
         cwd: &cwd,
         env: std::env::vars().collect(),
         manifest_path: manifest_path.as_deref(),
@@ -90,7 +96,16 @@ fn main() -> Result<()> {
         store: None,
         rust_release: Some(&|_, _, _| rust_release.clone()),
     };
-    if listed {
+    if unit_graph {
+        use blaze_metadata::units::{Command, TargetFilter, UnitsAsked};
+        let graph = blaze_metadata::units::unit_graph(&UnitsAsked {
+            asked: &asked,
+            command: Command::Build,
+            targets: &TargetFilter::default(),
+            profile: None,
+        })?;
+        println!("{}", graph.to_cargo_json());
+    } else if listed {
         let targets = Targets { bin: bin.as_deref(), example: example.as_deref() };
         println!("{}", serde_json::to_string(&programs(&asked, targets)?.1)?);
     } else {

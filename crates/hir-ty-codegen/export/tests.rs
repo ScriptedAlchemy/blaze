@@ -159,6 +159,235 @@ fn fixture() -> (RootDatabase, Vec<FunctionId>, Crate) {
     (db, roots, krate)
 }
 
+#[test]
+fn allocator_only_unit_uses_its_explicit_source_graph() {
+    const TEST: &str = "export::tests::allocator_only_unit_uses_its_explicit_source_graph";
+    const CHILD: &str = "BLAZE_ALLOCATOR_ONLY_CHILD";
+    // A whole-program compile installs process-wide backend policy. Keep it apart
+    // from export tests that compare their context with a fresh compiler process.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use object::{Object as _, ObjectSymbol as _};
+    for custom in [false, true] {
+        let source = format!(
+            "//- minicore: sized\n//- /lib.rs crate:case\n\
+             #![feature(lang_items)]\n\
+             #[lang = \"owned_box\"] pub struct Box<T>(T);\n{}",
+            if custom {
+                "#[export_name = \"__ra_jit_global_alloc\"]\n\
+                 pub extern \"C\" fn __ra_jit_global_alloc() -> usize { 0 }\n"
+            } else {
+                ""
+            },
+        );
+        let (db, _) = RootDatabase::with_single_file(&source);
+        let root = *base_db::all_crates(&db)
+            .iter()
+            .find(|krate| krate.data(&db).origin.is_local())
+            .unwrap();
+        hir::attach_db(&db, || {
+            assert_eq!(uses_global_allocator(&db, &[root]), custom);
+            let symbols = Symbols { db: &db, debug: false };
+            let roots = Roots {
+                entries: &[],
+                on_demand: &[],
+                start: None,
+                allocator: Some(root),
+                shared: false,
+                whole: true,
+                kept: &[],
+                offered: &[],
+            };
+            let unit = CodegenUnit::compile(
+                &db,
+                &symbols,
+                roots,
+                &FxHashSet::default(),
+                &mut Rejections::default(),
+            )
+            .unwrap();
+            assert!(unit.skipped.is_empty());
+            let bytes = unit.object.unwrap();
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let names: Vec<_> = object
+                .symbols()
+                .filter_map(|symbol| {
+                    let name = symbol.name().ok()?;
+                    let name = if object.format() == object::BinaryFormat::MachO {
+                        name.strip_prefix('_').unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    Some((name.to_owned(), symbol.is_undefined()))
+                })
+                .collect();
+            for name in [
+                "__rust_alloc",
+                "__rust_dealloc",
+                "__rust_realloc",
+                "__rust_alloc_zeroed",
+                "__rust_alloc_error_handler",
+                "__rust_no_alloc_shim_is_unstable_v2",
+            ] {
+                assert!(names.contains(&(name.into(), false)), "{names:?}");
+            }
+            let target = if custom { "__ra_jit_global_alloc" } else { "__rdl_alloc" };
+            assert!(names.contains(&(target.into(), true)), "{names:?}");
+        });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_file_and_debug_paths_rebind_in_another_checkout() {
+    struct Located<'a> {
+        symbols: Symbols<'a>,
+        root: &'a str,
+    }
+    impl Located<'_> {
+        fn file(&self) -> String {
+            Path::new(self.root)
+                .parent()
+                .unwrap()
+                .join("shared/src/lib.rs")
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }
+    }
+    impl SymbolResolver for Located<'_> {
+        fn function(&self, func: FunctionId) -> Option<String> {
+            self.symbols.function(func)
+        }
+        fn static_(&self, id: StaticId) -> Option<String> {
+            self.symbols.static_(id)
+        }
+        fn path(&self, path: &str) -> Option<String> {
+            self.symbols.path(path)
+        }
+        fn item(&self, item: hir_def::ModuleDefId) -> Option<String> {
+            self.symbols.item(item)
+        }
+        fn source_path(&self, _: base_db::FileId) -> Option<String> {
+            Some(self.file())
+        }
+        fn stable_crate_id(&self, krate: Crate) -> Option<u64> {
+            self.symbols.stable_crate_id(krate)
+        }
+        fn content_id(&self, krate: Crate) -> Option<ContentId> {
+            self.symbols.content_id(krate)
+        }
+        fn rustc_built(&self, _: Crate) -> bool {
+            false
+        }
+        fn nothing_of_rustc(&self) -> bool {
+            true
+        }
+        fn debug_directory(&self) -> Option<String> {
+            Some(self.root.to_owned())
+        }
+        fn checkout(&self) -> Option<String> {
+            Some(self.root.to_owned())
+        }
+    }
+    store::compiles_against("1.99.0");
+    let (source_db, source_roots, _) = fixture();
+    let (target_db, target_roots, _) = fixture();
+    let source = Located {
+        symbols: Symbols { db: &source_db, debug: true },
+        root: "/home/producer/repo/workspace",
+    };
+    let target = Located {
+        symbols: Symbols { db: &target_db, debug: true },
+        root: "/srv/deeper/consumer/repo/workspace",
+    };
+    let requested = |db: &RootDatabase, roots: &[FunctionId]| {
+        roots
+            .iter()
+            .copied()
+            .find(|it| FunctionSignature::of(db, *it).name.as_str() == "source_path")
+            .unwrap()
+    };
+    let directory = scratch("checkout-export");
+    let store = store::Store::owned(&directory).unwrap();
+    let receipt = hir::attach_db(&source_db, || {
+        let context = ExportContext::resolved(
+            &source_db,
+            &source,
+            base_db::all_crates(&source_db).iter().copied(),
+            &source_roots,
+            policy(true),
+        )
+        .unwrap();
+        let batch = compile_batch(
+            &context,
+            context.digest(),
+            &[LocalRequest::root(requested(&source_db, &source_roots))],
+            &store,
+        )
+        .unwrap();
+        require_exported(&batch, 1);
+        batch.receipt
+    });
+    let exported = &receipt.entries[0];
+    let stored = store.get_installed(&exported.key).unwrap();
+    assert!(cached::holds(&stored, "/checkout/../shared/src/lib.rs"));
+    assert!(!cached::holds(&stored, &source.file()));
+    let staging = scratch("checkout-import");
+    let local_directory = scratch("checkout-local");
+    hir::attach_db(&target_db, || {
+        let context = ExportContext::resolved(
+            &target_db,
+            &target,
+            base_db::all_crates(&target_db).iter().copied(),
+            &target_roots,
+            policy(true),
+        )
+        .unwrap();
+        assert_eq!(context.digest(), receipt.context);
+        let local_store = store::Store::owned(&local_directory).unwrap();
+        let local = compile_batch(
+            &context,
+            context.digest(),
+            &[LocalRequest::root(requested(&target_db, &target_roots))],
+            &local_store,
+        )
+        .unwrap();
+        require_exported(&local, 1);
+        assert_eq!(local.receipt.entries[0].entry_digest, exported.entry_digest);
+        assert_eq!(local_store.get_installed(&exported.key).unwrap(), stored);
+
+        let imported = import_batch(&context, &receipt, &staging, |name| store.pack(name)).unwrap();
+        let entry = imported.entries(&context).unwrap().get(&exported.work.name).unwrap();
+        assert!(entry.debug.as_ref().unwrap().files.contains(&target.file()));
+        assert!(entry.datas.iter().any(|it| matches!(it, cached::CachedData::Text(parts)
+        if parts == &[
+            cached::CachedTextPart::Text("literal:".into()),
+            cached::CachedTextPart::FilePath(target.file()),
+            cached::CachedTextPart::Text(":tail".into()),
+        ])));
+        let rebound = imported.rebound_entry_bytes(&context, &exported.key).unwrap();
+        assert_eq!(entry.encode().unwrap(), rebound);
+        assert!(!cached::holds(&rebound, &source.file()));
+    });
+    drop(store);
+    for path in [directory, local_directory, staging] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
@@ -1078,4 +1307,151 @@ int main(void) { printf("%d %d\n", case_root(), case_vtable_root()); }
     });
     std::fs::remove_dir_all(one).unwrap();
     std::fs::remove_dir_all(two).unwrap();
+}
+
+const TWO_CRATES: &str = r#"
+//- minicore: sized
+//- /dep/lib.rs crate:dep
+pub fn plain() -> i32 { 3 }
+//- /src/lib.rs crate:case deps:dep
+pub fn root() -> i32 { let x = dep::plain(); x + 1 }
+"#;
+
+/// The fixture's resolver for a program whose crate `quiet` is built with `debug = 0` and the
+/// rest with full debug info, as `[profile.dev.package.quiet] debug = 0` builds it.
+struct Quiet<'a> {
+    inner: Symbols<'a>,
+    quiet: &'static str,
+}
+
+impl SymbolResolver for Quiet<'_> {
+    fn function(&self, func: FunctionId) -> Option<String> {
+        self.inner.function(func)
+    }
+    fn static_(&self, id: StaticId) -> Option<String> {
+        self.inner.static_(id)
+    }
+    fn path(&self, path: &str) -> Option<String> {
+        self.inner.path(path)
+    }
+    fn item(&self, item: hir_def::ModuleDefId) -> Option<String> {
+        self.inner.item(item)
+    }
+    fn source_path(&self, file: base_db::FileId) -> Option<String> {
+        self.inner.source_path(file)
+    }
+    fn stable_crate_id(&self, krate: Crate) -> Option<u64> {
+        self.inner.stable_crate_id(krate)
+    }
+    fn content_id(&self, krate: Crate) -> Option<ContentId> {
+        self.inner.content_id(krate)
+    }
+    fn rustc_built(&self, krate: Crate) -> bool {
+        self.inner.rustc_built(krate)
+    }
+    fn nothing_of_rustc(&self) -> bool {
+        true
+    }
+    fn describes_variables(&self) -> bool {
+        self.inner.describes_variables()
+    }
+    fn debug_directory(&self) -> Option<String> {
+        self.inner.debug_directory()
+    }
+    fn tells_of(&self, krate: Crate) -> Told {
+        let named = krate.extra_data(self.inner.db).display_name.as_ref();
+        if named.is_some_and(|it| it.canonical_name().as_str() == self.quiet) {
+            Told::Nothing
+        } else {
+            self.tells()
+        }
+    }
+}
+
+/// Each function is described as the crate its code is written in is built, as rustc
+/// compiles each crate with its own `-C debuginfo`: the code of a crate built with
+/// `debug = 0` is told of to no debugger in a program whose own code is fully described, and
+/// what a debugger is told of a crate's code is in the names the store keeps it under when it
+/// is not what the build's own is, so no entry is found for a build that describes it
+/// otherwise.
+#[test]
+fn a_crate_built_without_debug_info_is_described_to_no_debugger() {
+    store::compiles_against("1.99.0");
+    let db = RootDatabase::with_files(TWO_CRATES);
+    hir::attach_db(&db, || {
+        let crates = base_db::all_crates(&db);
+        let named = |name: &str| {
+            *crates
+                .iter()
+                .find(|it| {
+                    it.extra_data(&db)
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|it| it.canonical_name().as_str() == name)
+                })
+                .unwrap()
+        };
+        let function = |krate: Crate, name: &str| {
+            let map = hir_def::nameres::crate_def_map(&db, krate);
+            map.modules(&db)
+                .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+                .find_map(|def| match def {
+                    hir_def::ModuleDefId::FunctionId(id)
+                        if FunctionSignature::of(&db, id).name.as_str() == name =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let roots = [function(named("case"), "root"), function(named("dep"), "plain")];
+        let described = |quiet: &'static str| {
+            let symbols = Quiet { inner: Symbols { db: &db, debug: true }, quiet };
+            assert_eq!(told_of(&symbols, None), Told::Variables);
+            let context = ExportContext::resolved(
+                &db,
+                &symbols,
+                crates.iter().copied(),
+                &roots,
+                policy(true),
+            )
+            .unwrap();
+            let directory = scratch("per-crate-debug");
+            let store = store::Store::owned(&directory).unwrap();
+            let requests = roots.map(LocalRequest::root).to_vec();
+            let batch = compile_batch(&context, context.digest(), &requests, &store).unwrap();
+            require_exported(&batch, 2);
+            let entries: Vec<_> = batch
+                .receipt
+                .entries
+                .iter()
+                .map(|it| {
+                    let entry = cached::Entry::decode(&store.get(&it.key).unwrap()).unwrap();
+                    (entry.label.clone(), it.work.name.clone(), entry.debug.is_some(), it.key)
+                })
+                .collect();
+            drop(store);
+            std::fs::remove_dir_all(directory).unwrap();
+            entries
+        };
+        let alike = described("nothing is quiet");
+        let quiet = described("dep");
+        let of = |entries: &[(String, String, bool, [u8; store::KEY])], label: &str| {
+            entries.iter().find(|it| it.0 == label).unwrap().clone()
+        };
+        // Built alike, both are described, under the names they always had.
+        assert!(of(&alike, "root").2 && of(&alike, "plain").2);
+        assert!(!of(&alike, "plain").1.contains(".d"), "{}", of(&alike, "plain").1);
+        // `dep` built with `debug = 0`: its code is told of to no debugger, and the program's
+        // own code still is, under the same name and key as before.
+        assert!(of(&quiet, "root").2);
+        assert!(!of(&quiet, "plain").2);
+        assert_eq!(of(&quiet, "root").1, of(&alike, "root").1);
+        assert_eq!(of(&quiet, "root").3, of(&alike, "root").3);
+        // What is told of `dep` is in the names of its code, so the store never gives one
+        // build's description of it to the other.
+        assert!(of(&quiet, "plain").1.contains(".d0:"), "{}", of(&quiet, "plain").1);
+        assert_ne!(of(&quiet, "plain").3, of(&alike, "plain").3);
+    });
 }

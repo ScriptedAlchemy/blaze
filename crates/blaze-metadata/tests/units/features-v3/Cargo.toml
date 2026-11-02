@@ -1,0 +1,4 @@
+[workspace]
+members = ["app", "shared", "macros"]
+exclude = ["optional-dep", "leaf"]
+resolver = "3"

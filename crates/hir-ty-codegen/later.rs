@@ -75,9 +75,9 @@ pub(super) struct Keeper<'k, 'db> {
     pub(super) root_names: &'k FxHashMap<StableName, Option<FunctionId>>,
     pub(super) own_crates: &'k FxHashSet<Crate>,
     pub(super) told: &'k ToldTypes,
-    /// Whether a debugger is told of the functions, and of their variables.
-    pub(super) debug: bool,
-    pub(super) variables: bool,
+    /// What the object tells a debugger of any function: each is told what the crate its code
+    /// is written in is built to tell ([`super::told_of`]), as much as this.
+    pub(super) debug: cached::Told,
     /// The program the entries are of (see [`cached::Entry::key`]): `Some(None)` for a
     /// program with code of rustc's that has no identity, whose entries are not kept.
     pub(super) program: Option<Option<[u8; 32]>>,
@@ -113,6 +113,22 @@ impl<'db> Keeper<'_, 'db> {
         Made { debug, kept }
     }
 
+    /// What a debugger is told of the function `of` is: what the crate its code is written in
+    /// is built to tell, as rustc compiles each crate with its own `-C debuginfo`.
+    fn tells(&self, of: &Of) -> cached::Told {
+        let krate = match of {
+            Of::Root { func, .. } => Some(func.krate(self.db)),
+            Of::Instance { instance, .. } => super::written_in(self.db, instance.def),
+        };
+        super::told_of(self.symbols, krate).min(self.debug)
+    }
+
+    /// What the store keeps entries under: what is told of the code no crate's own setting
+    /// covers. A crate told otherwise has that in the names of its code ([`stable`]).
+    fn kept_told(&self) -> cached::Told {
+        super::told_of(self.symbols, None).min(self.debug)
+    }
+
     pub(super) fn describe_function(
         &mut self,
         of: &Of,
@@ -121,6 +137,10 @@ impl<'db> Keeper<'_, 'db> {
         tiered: bool,
     ) -> Option<FunctionDebug> {
         let db = self.db;
+        let told = self.tells(of);
+        if told == cached::Told::Nothing {
+            return None;
+        }
         let (debug, declared, rows) = match of {
             Of::Root { func, symbol } => {
                 let name = hir_ty::mir::type_name::rustc_debug_function(db, *func, &[])
@@ -128,7 +148,7 @@ impl<'db> Keeper<'_, 'db> {
                 let declared = self.debug_declaration_at(*func);
                 let rows = match unit_rows {
                     Some(rows) => Some(rows),
-                    None => (self.debug && !tiered).then(|| root_rows(db, *func)),
+                    None => (!tiered).then(|| root_rows(db, *func)),
                 };
                 (FunctionDebug::new(name, symbol.clone()), declared, rows)
             }
@@ -154,13 +174,12 @@ impl<'db> Keeper<'_, 'db> {
                 let known = known.unwrap_or_else(|| name.clone());
                 let rows = match unit_rows {
                     Some(rows) => Some(rows),
-                    None => (self.debug && !tiered)
-                        .then(|| instance_rows(db, instance.clone(), env.clone())),
+                    None => (!tiered).then(|| instance_rows(db, instance.clone(), env.clone())),
                 };
                 (FunctionDebug::new(known, name), declared, rows)
             }
         };
-        self.describe(compiled, rows, debug, declared)
+        self.describe(compiled, rows, debug, declared, told)
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
@@ -210,9 +229,6 @@ impl<'db> Keeper<'_, 'db> {
     /// block where it stands, and a shim where the function it stands in for is declared, as
     /// rustc has it.
     fn written_at(&mut self, instance: &Instance, krate: Crate) -> Option<(String, u32, u32)> {
-        if !self.debug {
-            return None;
-        }
         let db = self.db;
         let lang_items = DbInterner::new_with(db, krate).lang_items();
         let ty = || instance.args.as_ref().as_slice().first().and_then(|arg| arg.ty());
@@ -256,14 +272,16 @@ impl<'db> Keeper<'_, 'db> {
     }
 
     /// What a debugger is told of the compiled function: what it is called, as `debug` has
-    /// it, and which line each of its instructions is of, as `rows` have it. `None` when no
-    /// debugger is told anything, which is when there are no `rows`.
+    /// it, which line each of its instructions is of, as `rows` have it, and its variables
+    /// when `told` says so. `None` when no debugger is told anything, which is when there are
+    /// no `rows`.
     fn describe(
         &mut self,
         compiled: &CompiledFunction,
         rows: Option<&Vec<Row>>,
         mut debug: FunctionDebug,
         declared: Option<(String, u32, u32)>,
+        told: cached::Told,
     ) -> Option<FunctionDebug> {
         let rows = rows?;
         let start = stdx::time::Instant::now();
@@ -285,8 +303,7 @@ impl<'db> Keeper<'_, 'db> {
         }
         if let Some((owner, _)) = &compiled.source
             && let Some((env, variables)) = &compiled.variables
-            && self.debug
-            && self.variables
+            && told == cached::Told::Variables
         {
             let places = &compiled.code.slots;
             let db = self.db;
@@ -329,8 +346,7 @@ impl<'db> Keeper<'_, 'db> {
             self.kept.unnamed += 1;
             return None;
         };
-        let told = cached::Told::of(debug.is_some(), self.variables);
-        let key = cached::Entry::key(&name, told, self.program.flatten().as_ref())?;
+        let key = cached::Entry::key(&name, self.kept_told(), self.program.flatten().as_ref())?;
         let check = std::env::var_os("RA_JIT_CACHE_CHECK");
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
         if check.is_none() && store.has(&key) {

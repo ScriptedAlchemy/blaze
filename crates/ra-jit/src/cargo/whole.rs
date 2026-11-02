@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -23,9 +24,7 @@ use super::{
     daemon::{Checkout, Reply, Request, WorkerConfig},
     plan::Plan as Linked,
     run, say,
-    state::{
-        as_built, configured_env, library_path, place, repository, run_env, sysroot_libraries,
-    },
+    state::{as_built, configured_env, place, repository},
 };
 
 /// How many of the functions blaze could not compile a failed build names.
@@ -41,6 +40,12 @@ pub(super) fn asked_for(asked: &Invocation) -> bool {
         && (!flags.selects_targets || named)
         && !flags.cargos_plan
         && flags.targets.len() <= 1
+}
+
+/// Selected remotes use a one-shot compiler so publication finishes before the command
+/// returns. Other whole builds retain the daemon's warm state.
+pub(super) fn by_daemon(asked: &Invocation, env: &BTreeMap<String, OsString>) -> bool {
+    asked_for(asked) && !super::cache_service::selected(env)
 }
 
 /// A program of the build, as cargo plans it.
@@ -67,11 +72,13 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     let root = metadata.workspace_root.as_std_path();
     let project = programs.first().map(|it| super::state::package_dir(&it.package));
     let project = project.as_deref().unwrap_or(root);
-    let config = config_of(asked, &cwd, root, project);
+    let config = config_of(asked, &cwd, root, project)?;
     // One directory per build of the checkout, as the daemon names it: the features, the
     // profile, the target and the variables that change what is compiled are all in that
     // name, so the program one build links is never the one another places.
-    let dir = prepare_dir(&config, metadata.target_directory.as_std_path())?;
+    let target = metadata.target_directory.as_std_path();
+    lay_out(target, programs.iter().map(|it| &*it.executable))?;
+    let dir = prepare_dir(&config, target)?;
     for program in &programs {
         let package = &program.package;
         let at = super::state::package_dir(package);
@@ -81,10 +88,13 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
             &format!("{} v{} ({})", package.name, package.version, at.display()),
         );
     }
-    if let Err(why) = whole(asked, &cwd, &metadata, &config, &programs, &dir) {
-        say::error(&why);
-        return Ok(Some(FAILED));
-    }
+    let runtime = match whole(asked, &cwd, &metadata, &config, &programs, &dir) {
+        Ok(runtime) => runtime,
+        Err(why) => {
+            say::error(&why);
+            return Ok(Some(FAILED));
+        }
+    };
     let took = started.elapsed().as_secs_f64();
     let profile = asked.profile();
     let finished = format!("`{profile}` profile [ra-jit] target(s) in {took:.2}s");
@@ -92,7 +102,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<Option<i32>> {
     if asked.subcommand != Subcommand::Run {
         return Ok(Some(0));
     }
-    ran(asked, &cwd, &programs).map(Some)
+    ran(asked, &cwd, &programs, &runtime).map(Some)
 }
 
 /// Has the daemon build `programs` whole into `dir`, and puts each where cargo would. A
@@ -105,20 +115,41 @@ fn whole(
     config: &WorkerConfig,
     programs: &[Program],
     dir: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<super::runtime_context::Context>, String> {
     let checkout = checkout(asked, cwd, metadata, config, programs, dir);
-    let reply = client::ask(Request::Build(super::asking(&checkout)), Start::IfMissing)
+    let compiler = std::env::current_exe().map_err(|it| format!("finding owned compiler: {it}"))?;
+    let cargo = super::runtime_context::cargo_frontend(&compiler, &dir.join("cargo-frontend"))
         .map_err(|it| format!("{it:#}"))?;
-    let built = match reply {
-        Some(Reply::Synced { programs, .. }) => programs,
+    let mut request = super::asking(&checkout);
+    request.env.remove("CARGO");
+    let env = request
+        .native_env
+        .take()
+        .unwrap_or_default()
+        .over([("CARGO".into(), cargo.into_os_string())]);
+    request.env =
+        env.unicode().iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+    request.native_env = Some(env);
+    let reply =
+        client::ask(Request::Build(request), Start::IfMissing).map_err(|it| format!("{it:#}"))?;
+    let (built, runtime) = match reply {
+        Some(Reply::Synced { programs, runtime, .. }) => (programs, runtime),
         Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, &checkout, &reason)),
         None => return Err(client::why_none()),
         Some(other) => return Err(format!("the daemon answered {other:?}")),
     };
-    for ((program, plan), built) in std::iter::zip(programs, &checkout.programs).zip(built) {
+    if built.len() != programs.len() {
+        return Err("the whole-build reply has no matching program results".into());
+    }
+    for (program, built) in programs.iter().zip(&built) {
         if let Err(why) = built {
-            return Err(format!("could not build `{}`: {}", program.name, why.why()));
+            return Err(format!("could not build `{}`: {}", program.name, why.clone().why()));
         }
+    }
+    if runtime.len() != programs.len() || runtime.iter().any(Option::is_none) {
+        return Err("the whole-build reply has no matching runtime contexts".into());
+    }
+    for ((program, plan), context) in programs.iter().zip(&checkout.programs).zip(&runtime) {
         let _unwritten = crate::splice::unwritten(&plan.binary);
         let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
         if !stand_ins.is_empty() {
@@ -141,26 +172,53 @@ fn whole(
             std::fs::create_dir_all(parent)
                 .map_err(|it| format!("creating {}: {it}", parent.display()))?;
         }
-        place(&plan.binary, &program.executable)
-            .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+        // The daemon's executable keeps its symbols for the edits spliced into it: what the
+        // profile strips is taken out of cargo's copy, as rustc's link takes it out.
+        let strip = crate::link::noted_strip(&plan.binary).map_err(|it| format!("{it:#}"))?;
+        if strip == crate::link::Strip::None {
+            place(&plan.binary, &program.executable)
+                .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
+        } else {
+            let sysroot = context.as_ref().and_then(|it| it.sysroot());
+            crate::link::place_stripped(&plan.binary, &program.executable, strip, sysroot)
+                .map_err(|it| format!("{it:#}"))?;
+        }
     }
-    Ok(())
+    runtime
+        .into_iter()
+        .map(|context| context.ok_or_else(|| "whole build omitted its runtime context".into()))
+        .collect()
 }
 
 /// The worker configuration of a whole build asked in `cwd`, of the workspace at `root` whose
 /// program is in `project`. The invocation directory selects the members and resolves a
 /// relative manifest path; the workspace root names the repository and project separately.
-fn config_of(asked: &Invocation, cwd: &Path, root: &Path, project: &Path) -> WorkerConfig {
+fn config_of(
+    asked: &Invocation,
+    cwd: &Path,
+    root: &Path,
+    project: &Path,
+) -> anyhow::Result<WorkerConfig> {
+    let caller = crate::process::native()
+        .vars()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .collect();
+    let mut cache = BTreeMap::new();
+    super::cache_service::configure(&mut cache, &caller, cwd)?;
+    let cache_env = (!cache.is_empty()).then(|| {
+        crate::process::Native::of(cache.into_iter().map(|(name, value)| (name.into(), value)))
+    });
     let asked_in =
         asked.flags.manifest_path.as_ref().map_or_else(|| cwd.to_owned(), |it| cwd.join(it));
-    WorkerConfig {
+    Ok(WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
         cfg_test: false,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
+        cache_env,
         whole: true,
-    }
+    })
 }
 
 /// The daemon's checkout of a whole build of `programs`, each linked into `dir`.
@@ -309,7 +367,12 @@ fn without_hashes(name: &str) -> String {
 }
 
 /// Runs the program `asked` names, as `cargo run` does.
-fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i32> {
+fn ran(
+    asked: &Invocation,
+    cwd: &Path,
+    programs: &[Program],
+    runtime: &[super::runtime_context::Context],
+) -> anyhow::Result<i32> {
     let named = asked.flags.bin.as_ref().or(asked.flags.example.as_ref());
     let mut chosen: Vec<&Program> =
         programs.iter().filter(|it| named.is_none_or(|name| it.name == *name)).collect();
@@ -330,17 +393,62 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
         program.executable.strip_prefix(cwd).unwrap_or(&program.executable).display().to_string();
     let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
     say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
+    let at = programs.iter().position(|candidate| std::ptr::eq(candidate, program)).unwrap();
+    let mut inherited: BTreeMap<_, _> = std::env::vars_os().collect();
     for it in configured_env(cwd) {
-        if it.force || std::env::var_os(&it.name).is_none() {
-            command.env(&it.name, &it.value);
+        if it.force || !inherited.contains_key(std::ffi::OsStr::new(&it.name)) {
+            inherited.insert(it.name.into(), it.value.into());
         }
     }
-    command.args(asked.program_args()).envs(run_env(&program.package, &[]));
-    command.envs(library_path(&program.executable, sysroot_libraries().as_deref()));
+    let profile = profile_of(&program.executable).context("program has no profile directory")?;
+    let environment = runtime[at].environment(profile, &crate::process::Native::of(inherited))?;
+    let mut command = Command::new(&program.executable);
+    command.env_clear().envs(environment.vars()).args(asked.program_args());
     as_built(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
     Ok(run::exit_code(status))
+}
+
+/// The directory of cargo's profile that `executable` is in: `debug` of `debug/app` and of
+/// `debug/examples/app`.
+fn profile_of(executable: &Path) -> Option<&Path> {
+    let directory = executable.parent()?;
+    let under = directory.file_name().is_some_and(|name| name == "examples" || name == "deps");
+    if under { directory.parent() } else { Some(directory) }
+}
+
+/// What cargo's `CACHEDIR.TAG` says, which marks the target directory as a build's to
+/// backups, to cargo's and blaze's walks of a package's files and to blaze's own.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+    # This file is a cache directory tag created by cargo.\n\
+    # For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// Lays out `target` and the directory of each profile `executables` are placed in as cargo's
+/// build does (`Layout::prepare`): a target directory blaze makes is tagged, and a
+/// profile's has `deps`, `build`, `examples`, `incremental` and `.fingerprint`. A program is
+/// placed where cargo has it, so what reads cargo's layout finds it in a profile it knows.
+fn lay_out<'a>(
+    target: &Path,
+    executables: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::create_dir(target) {
+        Ok(()) => std::fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG)
+            .with_context(|| format!("tagging {}", target.display()))?,
+        Err(it) if it.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(it) => return Err(it).with_context(|| format!("creating {}", target.display())),
+    }
+    for executable in executables {
+        let Some(profile) = profile_of(executable) else { continue };
+        for dir in ["deps", "build", "examples", "incremental", ".fingerprint"] {
+            let dir = profile.join(dir);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The directory a whole build of `config`, under `target`, links its programs in: one per
@@ -447,12 +555,103 @@ mod tests {
             Asked::Build(invocation) => *invocation,
             other => panic!("{other:?}"),
         };
-        config_of(&asked, cwd, root, project)
+        config_of(&asked, cwd, root, project).unwrap()
     }
 
-    /// The file a whole build of `args` links its program into, before it places it where
-    /// cargo has it. Two builds whose program differs in what it compiles must not share it:
-    /// the one of the second would be placed from a file the first linked.
+    #[test]
+    fn cache_controls_follow_the_request_directory_without_changing_source_values() {
+        let source = crate::process::Native::of([
+            ("RA_JIT_CACHE".into(), "../writer-store".into()),
+            ("RA_JIT_REMOTE".into(), "../../owned-remote".into()),
+            ("RA_JIT_PROJECT".into(), "owned-cache".into()),
+            ("RA_JIT_REMOTE_UNSIGNED".into(), "1".into()),
+            ("UNRELATED_SECRET".into(), "private-value".into()),
+        ]);
+        let _scope = crate::process::enter_native(source.clone());
+        let cwd = Path::new("/checkout/member/request");
+        let config = config_in("", cwd, Path::new("/checkout"), Path::new("/checkout/member"));
+        let controls: BTreeMap<_, _> = config.cache_env.as_ref().unwrap().vars().collect();
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_CACHE")], cwd.join("../writer-store"));
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_REMOTE")], cwd.join("../../owned-remote"));
+        assert!(!controls.contains_key(std::ffi::OsStr::new("UNRELATED_SECRET")));
+        assert!(!config.env.contains_key("RA_JIT_REMOTE"));
+        assert_eq!(crate::process::native(), source);
+        let mut readonly = config.clone();
+        readonly.cache_env = Some(
+            config
+                .cache_env
+                .as_ref()
+                .unwrap()
+                .over([("RA_JIT_REMOTE_READONLY".into(), "1".into())]),
+        );
+        assert_ne!(readonly.id(), config.id());
+    }
+
+    #[test]
+    fn inactive_cache_controls_do_not_change_worker_identity() {
+        let base = {
+            let _scope = crate::process::enter_native(crate::process::Native::default());
+            config("")
+        };
+        let _scope = crate::process::enter_native(crate::process::Native::of([
+            ("RA_JIT_CACHE".into(), "off".into()),
+            ("RA_JIT_REMOTE".into(), "not-selected".into()),
+        ]));
+        let disabled = config("");
+        assert!(disabled.cache_env.is_none());
+        assert_eq!(base.id(), disabled.id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_cache_paths_survive_worker_configuration_transport() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = std::ffi::OsString::from_vec(b"store-\xff".to_vec());
+        let _scope = crate::process::enter_native(crate::process::Native::of([(
+            "RA_JIT_CACHE".into(),
+            path.clone(),
+        )]));
+        let config = config("");
+        let decoded: WorkerConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let controls: BTreeMap<_, _> = decoded.cache_env.unwrap().vars().collect();
+        assert_eq!(controls[std::ffi::OsStr::new("RA_JIT_CACHE")], Path::new("/ws").join(path));
+    }
+
+    #[test]
+    fn a_build_with_its_own_cache_service_is_not_the_daemons() {
+        let invocation = |subcommand: &str| match Asked::parse(vec![
+            subcommand.to_owned(),
+            "--manifest-path".to_owned(),
+            "../Cargo.toml".to_owned(),
+        ]) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, OsString> {
+            pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).into())).collect()
+        };
+        let service = env(&[
+            ("RA_JIT_CACHE", "../writer-store"),
+            ("RA_JIT_REMOTE", "../../owned-remote"),
+            ("RA_JIT_PROJECT", "owned-cache"),
+            ("RA_JIT_REMOTE_LAZY", "1"),
+        ]);
+        for subcommand in ["run", "build"] {
+            let asked = invocation(subcommand);
+            assert!(!by_daemon(&asked, &service), "{subcommand} with its own store and remote");
+            // Without a remote, or with the store off, nothing is published: the daemon's.
+            assert!(by_daemon(&asked, &env(&[])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_CACHE", "../writer-store")])));
+            assert!(by_daemon(&asked, &env(&[("RA_JIT_REMOTE", "../../owned-remote")])));
+            let off = env(&[("RA_JIT_CACHE", "off"), ("RA_JIT_REMOTE", "../../owned-remote")]);
+            assert!(by_daemon(&asked, &off));
+            let empty = env(&[("RA_JIT_CACHE", "../writer-store"), ("RA_JIT_REMOTE", "")]);
+            assert!(by_daemon(&asked, &empty));
+        }
+    }
+
+    /// Two builds with different compiler settings must not publish from the same file.
     #[test]
     fn a_build_links_into_a_directory_of_its_own() {
         let target = Path::new("/ws/target");
@@ -554,6 +753,78 @@ mod tests {
                 .unwrap();
             assert_eq!(node.features, [expected], "asked in {} with {manifest:?}", cwd.display());
         }
+    }
+
+    /// `build` at the root of a virtual workspace builds what cargo's unit graph has as its
+    /// roots, the libraries `a` and `b` and the program `c`, and puts `c` at `debug/c` in a
+    /// profile directory laid out as cargo's: what reads cargo's layout (a harness, a tool
+    /// that looks in `deps`) finds the program there, as after `cargo build`.
+    #[test]
+    fn a_workspace_build_places_its_program_in_cargos_layout() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        let package = |name: &str, deps: &str| {
+            format!("[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2021'\n{deps}")
+        };
+        let lock = "# This file is automatically @generated by Cargo.\n\
+                    # It is not intended for manual editing.\n\
+                    version = 4\n\n\
+                    [[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"b\",\n]\n\n\
+                    [[package]]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+                    [[package]]\nname = \"c\"\nversion = \"0.1.0\"\ndependencies = [\n \"a\",\n]\n";
+        for (file, source) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nresolver = '2'\nmembers = ['crates/a', 'crates/b', 'crates/c']\n"
+                    .to_owned(),
+            ),
+            ("Cargo.lock", lock.to_owned()),
+            ("crates/a/Cargo.toml", package("a", "[dependencies]\nb = { path = '../b' }\n")),
+            ("crates/a/src/lib.rs", "pub fn a() -> u32 { b::b() + 1 }".to_owned()),
+            ("crates/b/Cargo.toml", package("b", "")),
+            ("crates/b/src/lib.rs", "pub fn b() -> u32 { 1 }".to_owned()),
+            ("crates/c/Cargo.toml", package("c", "[dependencies]\na = { path = '../a' }\n")),
+            ("crates/c/src/main.rs", "fn main() { println!(\"{}\", a::a()); }".to_owned()),
+        ] {
+            let file = root.join(file);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, source).unwrap();
+        }
+        let asked = match Asked::parse(vec!["build".to_owned()]) {
+            Asked::Build(invocation) => *invocation,
+            other => panic!("{other:?}"),
+        };
+        let planned_in = |cwd: &Path| {
+            let metadata = super::super::metadata::no_deps_in(cwd, None, &[], Vec::new()).unwrap();
+            let programs = planned(&asked, cwd, &metadata).unwrap();
+            (metadata, programs)
+        };
+        // In a member that is a library, the build is of that member: no program.
+        let (_, programs) = planned_in(&root.join("crates/a"));
+        assert!(
+            programs.is_empty(),
+            "{:?}",
+            programs.iter().map(|it| &it.name).collect::<Vec<_>>()
+        );
+
+        let (metadata, programs) = planned_in(root);
+        let target = metadata.target_directory.as_std_path();
+        let debug = target.join("debug");
+        let placed: Vec<_> = programs.iter().map(|it| (&*it.name, &*it.executable)).collect();
+        assert_eq!(placed, [("c", &*debug.join(format!("c{}", std::env::consts::EXE_SUFFIX)))]);
+        assert!(!target.exists());
+        lay_out(target, programs.iter().map(|it| &*it.executable)).unwrap();
+        for dir in ["deps", "build", "examples", "incremental", ".fingerprint"] {
+            assert!(debug.join(dir).is_dir(), "no {dir}");
+        }
+        assert_eq!(std::fs::read_to_string(target.join("CACHEDIR.TAG")).unwrap(), CACHEDIR_TAG);
+        // A target directory that was there before is cargo's or the user's to tag.
+        let made = tempfile::tempdir().unwrap();
+        let example = made.path().join("x86_64-unknown-linux-gnu/release/examples/demo");
+        lay_out(made.path(), [&*example]).unwrap();
+        assert!(!made.path().join("CACHEDIR.TAG").exists());
+        assert!(made.path().join("x86_64-unknown-linux-gnu/release/deps").is_dir());
+        assert!(!example.parent().unwrap().join("deps").exists());
     }
 
     #[cfg(unix)]

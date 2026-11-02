@@ -1,41 +1,219 @@
+# The distributed protocol's checks on one platform, from the build bundle of the commit under
+# test (docs/reports/CI-fork.md): never an entry point of its own. `pr.yaml` builds ra-jit once
+# per platform and calls this workflow once per platform with the bundle's digest and the list of
+# C2 lanes to run; every job takes the bundle through `.github/actions/bundle`, which verifies it
+# against that digest, the checkout and this runner before it lays a file out, and none runs
+# `cargo build` or compiles a test. The checks that depend on the platform alone (tracing
+# integrity, the platform contracts, that the owned runtime is this ra-jit's) are
+# bundle-check.yaml's, once per platform; the `C2 runtime (<os>)` aggregates in pr.yaml require
+# them beside the lanes here.
+#
+# A C2 lane job runs a list of lanes (the list is pr.yaml's, per platform and tier): on a pull
+# request, Linux alone, the seven packed into three jobs; in the full tier (nightly, by hand, a
+# push to an integration branch) one per job on Linux and packed into four on macOS, within the
+# fork's 5 concurrent macOS jobs. A lane is a fixture group of harness/dist/buildspec.py (the
+# local command differential against cargo) or a saved-spec execution under one backend.
 name: distributed protocol regressions
 
 on:
-  pull_request:
-    branches: [dist/main]
-    paths:
-      - crates/blaze-dist/**
-      - crates/blaze-dist-local/**
-      - crates/blaze-wire/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/blaze-dist-review.yaml
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      platform:
+        description: linux-x64 or macos-arm64
+        type: string
+        required: true
+      os:
+        description: the runner label of that platform
+        type: string
+        required: true
+      bundle-sha256:
+        description: sha256 of this platform's bundle.json, from pr.yaml's build job
+        type: string
+        required: true
+      lanes:
+        description: 'a JSON list; each entry the lanes one job runs, space separated ("basic", "commands nested")'
+        type: string
+        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: dist-review-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+env:
+  RUST_BACKTRACE: "0"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   protocol:
-    runs-on: ubuntu-24.04
+    name: protocol
+    if: inputs.platform == 'linux-x64'
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
       BLAZE_DIST_SEEDS: "10000"
-      RUST_BACKTRACE: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt
-      - name: Check protocol formatting
-        run: cargo fmt -p blaze-dist -p blaze-dist-local -- --check
-      - name: Test the actual protocol and wire crates
-        run: cargo test --locked -p blaze-dist -p blaze-dist-local -p blaze-wire -- --test-threads=2
+          llvm: build
+          shell: bench
+          cache: nix
+          cache-save: false
+      - name: Check protocol and build-spec formatting
+        run: cargo fmt -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-spec -- --check
+      - uses: ./.github/actions/bundle
+        with:
+          platform: ${{ inputs.platform }}
+          sha256: ${{ inputs.bundle-sha256 }}
+      - name: Test protocol, wire, and immutable build specifications
+        run: nix develop .#bench --command python3 -I .github/scripts/bundle.py test dist -- --test-threads=2
+      - name: Check complete C2 fixture and group coverage
+        run: nix develop .#bench --command python3 -I -B harness/dist/buildspec.py --self-test
+
+  c2-runtime:
+    name: C2 runtime (${{ inputs.os }}, ${{ matrix.lanes }})
+    strategy:
+      fail-fast: false
+      matrix:
+        lanes: ${{ fromJSON(inputs.lanes) }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      # The Nix store paths the bundle's binaries link against; the cache is the build job's, read only.
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+          shell: bench
+          cache: nix
+          cache-save: false
+      - name: Record exact source, host, and pinned compilers
+        run: |
+          mkdir -p "$RUNNER_TEMP/c2-evidence"
+          {
+            git rev-parse HEAD
+            uname -a
+            rustc -vV
+            cargo -V
+            nix develop .#bench --command llvm-config --version
+            # The toolchain the harness's stand-ins copy, and the records blaze reads its
+            # release from (crates/ra-jit/src/answers/own.rs): where the shell's rustc is,
+            # its sysroot, what lib/rustlib holds, and whether the docs' version page is there.
+            nix develop .#bench --command sh -c '
+              command -v rustc; sysroot=$(rustc --print sysroot); echo "sysroot $sysroot"
+              ls -la "$sysroot/lib/rustlib" 2>&1
+              ls -la "$sysroot/lib/rustlib"/*/bin 2>&1
+              ls -la "$sysroot/share/doc/rust/html/version_info.html" 2>&1'
+          } > "$RUNNER_TEMP/c2-evidence/identity.txt"
+      # The release ra-jit lands in target/release and the owned macro runtime in
+      # $RUNNER_TEMP/owned-runtime, where the build job made them; each lane checks the runtime
+      # against its bootstrap receipt (image-pins.json) and the compiler's digest, as before.
+      - id: bundle
+        uses: ./.github/actions/bundle
+        with:
+          platform: ${{ inputs.platform }}
+          sha256: ${{ inputs.bundle-sha256 }}
+      - name: Keep the bundle's manifest with the evidence
+        id: evidence
+        env:
+          C2_LANES: ${{ matrix.lanes }}
+        run: |
+          cp "$CI_BUNDLE_JSON" "$RUNNER_TEMP/c2-evidence/bundle.json"
+          "$GITHUB_WORKSPACE/target/release/ra-jit" --version
+          echo "name=${C2_LANES// /-}" >> "$GITHUB_OUTPUT"
+      # ra-jit takes every BLAZE_<NAME> of its environment as its own setting RA_JIT_<NAME>, and
+      # `cargo spec` refuses a setting it does not know: one such variable in the job's environment
+      # refused every spec arm of every lane once (CI-fork.md). The harnesses set their own inside
+      # the processes they start; the job's environment must carry none.
+      - name: No blaze setting in the job's environment
+        run: |
+          if env | grep -E '^(BLAZE|RA_JIT)_'; then
+            echo "::error::the job's environment carries a blaze setting; ra-jit would take it and refuse every spec"
+            exit 1
+          fi
+          echo "no BLAZE_* or RA_JIT_* in the environment"
+      - name: Verify target-salted Nix run-path controls
+        run: python3 -I harness/dist/test_saved_spec_nix_rpath.py
+      - name: C2 lanes (${{ matrix.lanes }})
+        if: ${{ !cancelled() && steps.bundle.outcome == 'success' }}
+        env:
+          C2_LANES: ${{ matrix.lanes }}
+        run: |
+          # Every lane of the job runs, a failed one is tailed and recorded, and the step fails at
+          # the end: the shell runs with -e, so a lane's status is taken with `|| code=$?`.
+          set -uo pipefail
+          blaze="$GITHUB_WORKSPACE/target/release/ra-jit"
+          server="$RUNNER_TEMP/owned-runtime/blaze-proc-macro-srv"
+          evidence="$RUNNER_TEMP/c2-evidence"
+          failed=""
+          rows="$evidence/lanes.md"
+          {
+            echo "### C2 lanes (${{ inputs.os }})"
+            echo
+            echo '| lane | result | seconds |'
+            echo '|---|---|---|'
+          } > "$rows"
+          for lane in $C2_LANES; do
+            echo "::group::lane $lane"
+            started=$(date +%s)
+            code=0
+            case "$lane" in
+              saved-cranelift|saved-llvm)
+                # Saved execution with compiler subprocesses blocked, under one backend.
+                backend=${lane#saved-}
+                log="$evidence/$backend.log"
+                nix develop .#bench --command python3 -I harness/dist/saved_spec.py \
+                  --blaze "$blaze" --work "$RUNNER_TEMP/c2-$backend" --memory-mib 8192 --timeout 1200 \
+                  --owned-server "$server" --backend "$backend" > "$log" 2>&1 || code=$?
+                ;;
+              *)
+                # Original C2 generation and local command differential, one fixture group.
+                log="$evidence/local-$lane.log"
+                nix develop .#bench --command python3 -I harness/dist/buildspec.py \
+                  --bin "$blaze" --work "$RUNNER_TEMP/c2-local-$lane" --memory-mib 8192 --timeout 1200 --shared-store \
+                  --owned-server "$server" --ci-group "$lane" --json "$evidence/local-$lane.json" \
+                  > "$log" 2>&1 || code=$?
+                ;;
+            esac
+            seconds=$(( $(date +%s) - started ))
+            if [ "$code" = 0 ]; then
+              result=pass
+            else
+              result="FAIL ($code)"
+              failed="$failed $lane"
+              echo "--- last 40 lines of $log"
+              tail -40 "$log" || true
+            fi
+            echo "lane $lane: $result in ${seconds}s"
+            echo "| $lane | $result | $seconds |" >> "$rows"
+            echo "::endgroup::"
+            [ "$code" = 0 ] || echo "::error::C2 lane $lane failed (exit $code); its log is in the evidence artifact"
+          done
+          cat "$rows" >> "$GITHUB_STEP_SUMMARY"
+          test -z "$failed"
+      - name: Keep C2 runtime and tool audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: c2-runtime-${{ inputs.os }}-${{ steps.evidence.outputs.name || matrix.lanes }}
+          path: |
+            ${{ runner.temp }}/c2-evidence
+            ${{ runner.temp }}/c2-local-*/*.exec
+            ${{ runner.temp }}/c2-local-*/product-tools.log
+            ${{ runner.temp }}/c2-cranelift/results.json
+            ${{ runner.temp }}/c2-cranelift/*.exec
+            ${{ runner.temp }}/c2-cranelift/*.log
+            ${{ runner.temp }}/c2-llvm/results.json
+            ${{ runner.temp }}/c2-llvm/*.exec
+            ${{ runner.temp }}/c2-llvm/*.log
+            ${{ runner.temp }}/c2-cranelift/bundle/no-run.cbor.outputs
+            ${{ runner.temp }}/c2-llvm/bundle/no-run.cbor.outputs
+          if-no-files-found: warn

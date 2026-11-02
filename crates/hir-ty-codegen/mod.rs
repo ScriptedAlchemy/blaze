@@ -87,8 +87,8 @@ use hir_ty::mir::{
     MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
     StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
     location::{
-        ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
-        location_of, written_call, written_range,
+        ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
+        written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
     overflow::{body_written_checked, crate_checks_overflow},
@@ -100,6 +100,7 @@ pub mod budget;
 use backend::Step;
 pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
+pub use cached::Told;
 mod debuginfo;
 pub use debuginfo::Sidecar;
 pub mod export;
@@ -130,7 +131,7 @@ pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArgume
 pub mod tier;
 
 pub use patch::{OutOfDate, Stale, StaleSteps};
-/// For `crates/ra-jit-bench` alone.
+/// For `crates/ra-jit-bench-codegen` alone.
 #[doc(hidden)]
 pub mod bench {
     use ra_jit_store::KEY;
@@ -287,6 +288,19 @@ pub trait SymbolResolver {
     /// alone.
     fn describes_variables(&self) -> bool {
         true
+    }
+    /// What a debugger is told of the code no crate's own setting covers: the shims, and the
+    /// crates the build gives no `-C debuginfo` of their own. By default all of the build's,
+    /// as [`Self::debug_directory`] and [`Self::describes_variables`] say.
+    fn tells(&self) -> Told {
+        Told::of(self.debug_directory().is_some(), self.describes_variables())
+    }
+    /// What a debugger is told of the code written in `krate`, as that crate is built: rustc
+    /// compiles each crate with its own `-C debuginfo`, and a program links crates built with
+    /// different ones (`[profile.dev.package.x] debug = 0`). Never more than the build tells
+    /// ([`Self::debug_directory`], [`Self::describes_variables`]).
+    fn tells_of(&self, _krate: Crate) -> Told {
+        self.tells()
     }
     /// Whether the object is split into parts that a linker reads apart, so that each unit
     /// of its description is best in sections of its own, beside the functions it describes.
@@ -629,8 +643,8 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
-    /// The crate whose independently linked executable needs allocator shims, even when
-    /// `#![no_main]` supplies the C entry point instead of Rust's start function.
+    /// The crate whose independently linked output needs allocator shims, even when
+    /// `#![no_main]` supplies the C entry point or this unit contains only those shims.
     pub allocator: Option<Crate>,
     /// The object is linked into a shared library of its own, which has the allocator shim
     /// a program's `start` otherwise brings.
@@ -705,7 +719,7 @@ impl CodegenUnit {
                 false => OwnStatics::new(
                     db,
                     symbols,
-                    all().map(|root| root.krate(db)).collect(),
+                    all().map(|root| root.krate(db)).chain(roots.allocator).collect(),
                     known.theirs.clone(),
                     known.unknown.clone(),
                     !roots.on_demand.is_empty(),
@@ -829,7 +843,7 @@ impl CodegenUnit {
         let mut own_statics = OwnStatics::new(
             db,
             symbols,
-            all().map(|root| root.krate(db)).collect(),
+            all().map(|root| root.krate(db)).chain(roots.allocator).collect(),
             std::mem::take(theirs),
             std::mem::take(unknown),
             !roots.on_demand.is_empty(),
@@ -2763,6 +2777,37 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     code
 }
 
+/// The crate whose `-C debuginfo` says what a debugger is told of an instance of `def`: the one
+/// its code is written in, as rustc compiles a crate's functions with that crate's setting, and
+/// as the instance's stable name is spelled. A shim of no function's code is the build's own.
+fn written_in(db: &dyn HirDatabase, def: InstanceDef) -> Option<Crate> {
+    let owner = |owner: InferBodyId<'_>| match owner {
+        InferBodyId::DefWithBodyId(owner) => Some(owner.krate(db)),
+        _ => None,
+    };
+    match def {
+        InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
+        InstanceDef::Closure(id) => owner(InternedClosureId::from_id(id).loc(db).owner),
+        InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+            owner(InternedCoroutineId::from_id(id).loc(db).owner)
+        }
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => None,
+    }
+}
+
+/// What a debugger is told of the code written in `krate`, or of the build's own code with
+/// none, as much as the build tells of any of it.
+fn told_of(symbols: &dyn SymbolResolver, krate: Option<Crate>) -> Told {
+    let told = match krate {
+        Some(krate) => symbols.tells_of(krate),
+        None => symbols.tells(),
+    };
+    told.min(Told::of(symbols.debug_directory().is_some(), symbols.describes_variables()))
+}
+
 /// The instance a non-generic function is compiled as under its own symbol.
 fn root_instance(db: &dyn HirDatabase, func: FunctionId) -> Instance {
     Instance {
@@ -4431,6 +4476,13 @@ fn declares_global_allocator(db: &dyn HirDatabase, krate: Crate) -> bool {
     })
 }
 
+/// Whether the linked source graph supplies a custom global allocator.
+pub fn uses_global_allocator(db: &dyn HirDatabase, roots: &[Crate]) -> bool {
+    linked_crates(db, roots.iter().copied())
+        .into_iter()
+        .any(|krate| declares_global_allocator(db, krate))
+}
+
 /// The symbol a static of an `extern` block links to.
 fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -5070,7 +5122,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             )
             .map(|context| debuginfo::Describer::new(context, elf))
         });
-        let debugged = cached::Told::of(debug.is_some(), symbols.describes_variables());
+        // The store keeps an entry under what a debugger is told of the code no crate's own
+        // setting covers; a crate told otherwise has that in the names of its code.
+        let debugged = told_of(symbols, None)
+            .min(cached::Told::of(debug.is_some(), symbols.describes_variables()));
         let described = start.elapsed();
         let mixed = settled::Mixed::of(db, symbols, &own_statics.crates);
         let mixed_at = start.elapsed();
@@ -5488,7 +5543,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if !program.contains(&boxed.krate(db)) {
             return Ok(());
         }
-        let declared = program.into_iter().any(|it| declares_global_allocator(db, it));
+        let declared = uses_global_allocator(db, &program.into_iter().collect::<Vec<_>>());
         let to = |default, declared_one| if declared { declared_one } else { default };
         let entries = [
             ("__rust_alloc", to("__rdl_alloc", "__ra_jit_global_alloc"), 2, true),
@@ -5977,8 +6032,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             root_names: &self.root_names,
             own_crates: &self.own_statics.crates,
             told: &self.told,
-            debug: self.debug.is_some(),
-            variables: self.symbols.describes_variables(),
+            debug: cached::Told::of(self.debug.is_some(), self.symbols.describes_variables()),
             program,
             own: self.base.is_none() && program != Some(None) && !self.symbols.onto_rustcs(),
             markable,
@@ -6031,7 +6085,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let (declarations, type_ids, root_names) =
                 (self.module.declarations(), &self.type_ids, &self.root_names);
             let program = self.mixed.as_ref().map(|it| it.key);
-            let (debug, told) = (self.debug.is_some(), &self.told);
+            let debug = cached::Told::of(self.debug.is_some(), self.symbols.describes_variables());
+            let told = &self.told;
             // Each thread names what it makes with names of its own, which it asks the same
             // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
@@ -6052,7 +6107,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     own_crates: owned,
                     told,
                     debug,
-                    variables: symbols.describes_variables(),
                     program,
                     own: program != Some(None) && !symbols.onto_rustcs(),
                     markable: true,

@@ -62,14 +62,29 @@ impl Toolchain {
     /// From rustup's records in the sysroot: the release of rustc and the host it runs on.
     /// rustc finds its sysroot by where its library is, which is beside it.
     fn of(rustc: &Path) -> Option<Toolchain> {
-        let sysroot = rustc.parent()?.parent()?.to_owned();
+        Toolchain::read(rustc).ok()
+    }
+
+    /// From rustup's records in the sysroot: the release of rustc and the host it runs on,
+    /// or the first record missing. rustc finds its sysroot by where its library is, which is
+    /// beside it.
+    fn read(rustc: &Path) -> Result<Toolchain, String> {
+        let sysroot = rustc
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("{} has no sysroot above it", rustc.display()))?
+            .to_owned();
         let lib = sysroot.join("lib");
         if !is_compiler(rustc) {
-            return None;
+            return Err(format!(
+                "no librustc_driver-* in {}: not a compiler's sysroot",
+                lib.display()
+            ));
         }
         let rustlib = lib.join("rustlib");
-        let entries =
-            std::fs::read_dir(&rustlib).ok()?.collect::<std::io::Result<Vec<_>>>().ok()?;
+        let entries = std::fs::read_dir(&rustlib)
+            .and_then(|it| it.collect::<std::io::Result<Vec<_>>>())
+            .map_err(|error| format!("{}: {error}", rustlib.display()))?;
         let mut hosts: Vec<_> = entries
             .iter()
             .filter_map(|it| {
@@ -88,32 +103,67 @@ impl Toolchain {
                 .filter_map(|it| it.file_name().into_string().ok())
                 .collect();
         }
-        let [host] = hosts.as_slice() else { return None };
-        let host = host.clone();
-        let release = match std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml"))
-        {
-            Ok(manifest) => {
-                let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
-                let (version, _) = rest.split_once('"')?;
-                releases().iter().find(|it| it.version == version)?
+        let host = match hosts.as_slice() {
+            [host] => host.clone(),
+            [] => {
+                let names: Vec<_> = entries
+                    .iter()
+                    .map(|it| it.file_name().to_string_lossy().into_owned())
+                    .collect();
+                return Err(format!(
+                    "{} has no manifest-rustc-<host> and no <host>/bin/rust-lld among {names:?}",
+                    rustlib.display()
+                ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let info =
-                    std::fs::read_to_string(sysroot.join("share/doc/rust/html/version_info.html"))
-                        .ok()?;
-                releases().iter().find(|it| {
-                    let Some((version, revision)) = it.version.split_once(" (") else {
-                        return false;
-                    };
-                    let Some((commit, _)) = revision.split_once(' ') else { return false };
-                    info.contains(&format!("Rust</a> {version}</span>"))
-                        && info.contains(&format!(">{commit}</a>"))
+            many => {
+                return Err(format!("{} names more than one host: {many:?}", rustlib.display()));
+            }
+        };
+        let channel = rustlib.join("multirust-channel-manifest.toml");
+        let release = match std::fs::read_to_string(&channel) {
+            Ok(manifest) => {
+                let version = manifest
+                    .split_once("\n[pkg.rustc]\nversion = \"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(version, _)| version)
+                    .ok_or_else(|| format!("{} names no [pkg.rustc] version", channel.display()))?;
+                releases().iter().find(|it| it.version == version).ok_or_else(|| {
+                    format!(
+                        "{} names rustc {version:?}, a release blaze does not model",
+                        channel.display()
+                    )
                 })?
             }
-            Err(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let page = sysroot.join("share/doc/rust/html/version_info.html");
+                let info = std::fs::read_to_string(&page).map_err(|error| {
+                    format!(
+                        "neither {} nor {} (the rust-docs component's page naming the release): {error}",
+                        channel.display(),
+                        page.display()
+                    )
+                })?;
+                releases()
+                    .iter()
+                    .find(|it| {
+                        let Some((version, revision)) = it.version.split_once(" (") else {
+                            return false;
+                        };
+                        let Some((commit, _)) = revision.split_once(' ') else { return false };
+                        info.contains(&format!("Rust</a> {version}</span>"))
+                            && info.contains(&format!(">{commit}</a>"))
+                    })
+                    .ok_or_else(|| format!("{} names no release blaze models", page.display()))?
+            }
+            Err(error) => return Err(format!("{}: {error}", channel.display())),
         };
-        Some(Toolchain { sysroot, host, release })
+        Ok(Toolchain { sysroot, host, release })
     }
+}
+
+/// Why `rustc` is of no toolchain ra-jit can tell: the record it lacks, named; None when it is.
+pub(super) fn gap(rustc: &Path) -> Option<String> {
+    Toolchain::read(rustc).err()
 }
 
 /// How cfgs follow from `-C` and `--cfg`.
@@ -366,11 +416,36 @@ pub(super) fn cargo_version(rustc: &Path) -> Option<Vec<u8>> {
     .ok()?;
     let (_, rest) = manifest.split_once("\n[pkg.cargo]\nversion = \"")?;
     let (version, _) = rest.split_once('"')?;
-    // Cargo's package version (0.100.0) differs from its release version (1.99.0).
-    // The channel's rustc release supplies that prefix; Cargo supplies its own commit/date.
-    let release = toolchain.release.version.split_whitespace().next()?;
-    let (_, commit) = version.split_once(' ')?;
-    Some(format!("cargo {release} {commit}\n").into_bytes())
+    // Cargo 5f94df4789 src/version.rs maps the library's 0.N.P to the CLI's
+    // 1.(N-1).P. Use Cargo's own package facts even if rustc has another release.
+    let (package, commit) = version.split_once(' ')?;
+    let mut parts = package.split('.');
+    let major = parts.next()?.parse::<u8>().ok()?;
+    let minor = parts.next()?.parse::<u8>().ok()?.checked_sub(1)?;
+    let patch = parts.next()?.parse::<u8>().ok()?;
+    if major != 0 || parts.next().is_some() {
+        return None;
+    }
+    let commit = commit.strip_prefix('(')?.strip_suffix(')')?;
+    let (revision, date) = commit.split_once(' ')?;
+    if !(7..=40).contains(&revision.len()) || !revision.bytes().all(|it| it.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?;
+    let month = date_parts.next()?;
+    let day = date_parts.next()?;
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !year.bytes().all(|it| it.is_ascii_digit())
+        || !(1..=12).contains(&month.parse::<u8>().ok()?)
+        || !(1..=31).contains(&day.parse::<u8>().ok()?)
+        || date_parts.next().is_some()
+    {
+        return None;
+    }
+    Some(format!("cargo 1.{minor}.{patch} ({commit})\n").into_bytes())
 }
 
 fn cfgs(target: &Target, given: &Given<'_>, nightly: bool) -> Option<Vec<String>> {

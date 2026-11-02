@@ -15,6 +15,9 @@ would speed up is still there and still unconditional, so this fails when:
     job that is conditional or allowed to fail (except `live-edits`, which the file already
     marked not required before this change);
   - a step that is not the cache carries a truthy `continue-on-error:`;
+  - a Nix consumer allocates the fork's shared 10 GB Actions cache (reserved for
+    the central bundle producer): a cache action, or the toolchain action's `cache:`
+    without `cache-save: false` (a read-only restore of the producer's entry is fine);
   - a cache step's `if:` is not exactly the supported opt-in predicate, or its
     `continue-on-error:` is not literally `true`, or a cache step is not gated at all.
 
@@ -61,6 +64,12 @@ EXPECTED = [
     ("demo", "xvfb-run"),
     ("live-edits", "python3 harness/live_e2e.py"),
 ]
+# The central producer alone owns the fork's bounded Actions-cache allocation.
+# FlakeHub is an external service and remains subject to its explicit opt-in below.
+ACTIONS_CACHE_ACTIONS = (
+    "actions/cache", "nix-community/cache-nix-action", "Swatinem/rust-cache",
+    "mozilla-actions/sccache-action", "DeterminateSystems/magic-nix-cache-action",
+)
 CACHE_ACTIONS = ("DeterminateSystems/flakehub-cache-action", "DeterminateSystems/magic-nix-cache-action")
 # The one opt-in predicate the cache may carry. Anything else -- `always() || ...`, a bare
 # identifier, a different variable -- runs the cache without the opt-in and is refused.
@@ -388,6 +397,16 @@ def check(text: str) -> list[str]:
             problems.append(f"{job}: the job may fail but runs required work")
     for job, j in jobs.items():
         for s in j["steps"]:
+            uses = (step_value(s, "uses") or "").strip("\"'")
+            action = uses.split("@", 1)[0]
+            if any(action == name or action.startswith(name + "/") for name in ACTIONS_CACHE_ACTIONS):
+                problems.append(f"{job}: {uses} spends the fork's Actions-cache budget outside the bundle producer")
+            if action.endswith("/.github/actions/toolchain") and (step_value(s, "cache") or "").strip("\"' "):
+                # A bundle consumer restores the producer's entry read-only: `cache-save` must be
+                # literally false. Anything else (absent, true, an expression) could write.
+                save = (step_value(s, "cache-save") or "").strip().strip("\"'").lower()
+                if save != "false":
+                    problems.append(f"{job}: toolchain cache allocation belongs to the bundle producer (cache-save is {save or 'unset'!r}, not false)")
             if not step_is_cache(s) and truthy(step_value(s, "continue-on-error")):
                 problems.append(f"{job}: {step_name(s)!r} carries continue-on-error but is not a cache step")
     for job, j in jobs.items():

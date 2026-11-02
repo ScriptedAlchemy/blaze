@@ -114,7 +114,14 @@ fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyh
         std::iter::once(sysroot.join("bin")).chain(std::env::split_paths(&path)),
     )?;
     let mut ra_jit = std::process::Command::new(std::env::current_exe()?);
-    ra_jit.arg(dir).arg("--own-target").args(["--profile", profile, "--crate", "src/main.rs"]);
+    ra_jit.arg(dir).args([
+        "--own-target",
+        "--cargo-project",
+        "--profile",
+        profile,
+        "--crate",
+        "src/main.rs",
+    ]);
     ra_jit.arg("--out").arg(dir.join(format!("{profile}.o")));
     ra_jit.arg("--exe").arg(dir.join(format!("hello-{profile}")));
     ra_jit.env("PATH", path).env("RA_JIT_CACHE", store).env("RA_JIT_STD_FROM", "off");

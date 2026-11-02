@@ -1,0 +1,310 @@
+{
+ "runs": [
+  {
+   "args": [
+    "build"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bins"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "tool"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--example",
+    "demo"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "integration"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bench",
+    "speed"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "check"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bins"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bin",
+    "tool"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--example",
+    "demo"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--test",
+    "integration"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bench",
+    "speed"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "test"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--release"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bins"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bin",
+    "tool"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--example",
+    "demo"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--test",
+    "integration"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bench",
+    "speed"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--lib",
+    "--bins"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "tool",
+    "--example",
+    "demo"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "integration",
+    "--test",
+    "second"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "dev"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--profile",
+    "test"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--profile",
+    "test",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--no-run"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--release",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "nonexistent"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "nonexistent"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "to*"
+   ]
+  }
+ ]
+}

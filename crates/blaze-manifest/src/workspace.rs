@@ -36,7 +36,7 @@ fn find_workspace_root_with_loader(
 ) -> anyhow::Result<Option<PathBuf>> {
     {
         let roots = ctx.ws_roots.borrow();
-        for current in manifest_path.ancestors().skip(1) {
+        for current in ancestors(manifest_path, ctx.config.discovery_root()).skip(1) {
             if let Some(ws_config) = roots.get(current)
                 && !ws_config.is_excluded(manifest_path)
             {
@@ -66,14 +66,15 @@ fn find_workspace_root_with_loader(
 }
 
 /// The `Cargo.toml` files above `manifest_path`, nearest first, stopping at `target/package`
-/// and after `CARGO_HOME`.
+/// and after `CARGO_HOME`. A replay stops after its snapshot root as well: a manifest above the
+/// directory a worker materialized the snapshot in is neither read nor able to claim it.
 fn find_root_iter<'a>(
     manifest_path: &'a Path,
     ctx: &'a Context,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     let home = ctx.config.home();
     let mut last: Option<&Path> = None;
-    ancestors(manifest_path, None)
+    ancestors(manifest_path, ctx.config.discovery_root())
         .skip(2)
         .map(move |curr| {
             let window = (curr, last);

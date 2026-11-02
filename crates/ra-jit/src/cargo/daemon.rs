@@ -227,6 +227,8 @@ pub(crate) enum Reply {
     /// did not build it.
     Synced {
         programs: Vec<Result<String, NotBuilt>>,
+        #[serde(default)]
+        runtime: Vec<Option<super::runtime_context::Context>>,
         /// The daemon's steps, for the client's trace. The worker's are in its `ok` lines.
         #[serde(default)]
         spans: Vec<crate::trace::Span>,
@@ -307,6 +309,9 @@ pub(crate) struct WorkerConfig {
     pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
+    /// Anchored compiler service controls, separate from source environment reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_env: Option<crate::process::Native>,
     /// Whether its programs are built whole, with nothing of rustc's ([`Plan::whole`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) whole: bool,
@@ -325,7 +330,8 @@ impl WorkerConfig {
     /// What a worker's command line says of the workspace under `root` and of `crates` of
     /// it: all that loading it and compiling its functions reads.
     fn args(&self, root: &Path, crates: &[PathBuf]) -> Vec<OsString> {
-        let mut args: Vec<OsString> = vec![root.join(&self.project).into(), "--own-target".into()];
+        let mut args: Vec<OsString> =
+            vec![root.join(&self.project).into(), "--own-target".into(), "--cargo-project".into()];
         args.extend(self.selection.flags().into_iter().map(Into::into));
         if self.cfg_test {
             args.push("--cfg-test".into());
@@ -408,8 +414,9 @@ impl Checkout {
             true => (String::new(), plan.binary.display().to_string()),
             false => (plan.binary.display().to_string(), String::new()),
         };
+        let request = if plan.whole { "sync-runtime-v1" } else { "sync" };
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{}\t{}\t{splice}\t{exe}",
+            "{request}\t{}\t{}\t{}\t{}\t{}\t{splice}\t{exe}",
             self.project().display(),
             crates,
             plan.object.display(),
@@ -566,6 +573,7 @@ impl Worker {
             .clone()
             .unwrap_or_else(crate::process::Native::own)
             .over(config.env.iter().map(|(k, v)| (k.into(), v.into())))
+            .over(config.cache_env.iter().flat_map(crate::process::Native::vars))
             .over([(ENDS_WITH_INPUT.into(), "1".into())]);
         let asked = checkout.native_env.as_ref().unwrap_or(&env);
         let told = spare.and_then(|it| {
@@ -594,7 +602,10 @@ impl Worker {
                 };
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-                command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command
+                    .envs(&config.env)
+                    .envs(config.cache_env.iter().flat_map(crate::process::Native::vars))
+                    .env(ENDS_WITH_INPUT, "1");
                 command.env(LOAD_BUILD, build.to_string());
                 command.env(LOAD_ENV, "stdin");
                 command.current_dir(&checkout.root);
@@ -860,9 +871,23 @@ impl Worker {
             let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
             asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
         });
-        match asked.into_iter().collect::<anyhow::Result<Vec<_>>>() {
-            Ok(programs) => {
-                Reply::Synced { programs, spans: spans.into_inner().unwrap_or_default() }
+        let answered = asked
+            .into_iter()
+            .map(|asked| {
+                let answer = asked?;
+                match answer {
+                    Ok(reply) => {
+                        let (reply, runtime) = super::runtime_context::split_reply(&reply)?;
+                        Ok((Ok(reply), runtime))
+                    }
+                    Err(why) => Ok((Err(why), None)),
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+        match answered {
+            Ok(answers) => {
+                let (programs, runtime) = answers.into_iter().unzip();
+                Reply::Synced { programs, runtime, spans: spans.into_inner().unwrap_or_default() }
             }
             // The worker is gone or stuck, which says nothing of the checkout: the next
             // build that has nothing to compile has it loaded again.
@@ -1434,7 +1459,11 @@ impl Daemon {
             Warmth::Failed(reason, _) => Reply::Cold { reason },
             Warmth::Broken(said, _) => {
                 let programs = checkout.programs.iter().map(|_| Err(NotBuilt::Error(said.clone())));
-                Reply::Synced { programs: programs.collect(), spans: Vec::new() }
+                Reply::Synced {
+                    programs: programs.collect(),
+                    runtime: Vec::new(),
+                    spans: Vec::new(),
+                }
             }
         }
     }
@@ -1860,6 +1889,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cargo_workers_keep_their_package_origin_without_an_asked_in_manifest() {
+        let root = Path::new("/checkout");
+        for asked_in in [None, Some(PathBuf::from("/workspace/Cargo.toml"))] {
+            let config = WorkerConfig {
+                repository: root.join(".git"),
+                project: PathBuf::from("member"),
+                cfg_test: false,
+                selection: crate::plan::Selection { asked_in, ..Default::default() },
+                env: BTreeMap::new(),
+                cache_env: None,
+                whole: true,
+            };
+            let mut args = config.args(root, &[root.join("member/src/main.rs")]);
+            assert_eq!(args[0], root.join("member"));
+            args.extend(["--out".into(), "main.o".into()]);
+            let args =
+                crate::Args::parse(args.into_iter().map(|arg| arg.into_string().unwrap())).unwrap();
+            assert_eq!(args.project_origin, crate::project_input::LoadOrigin::CargoPackage);
+            assert_eq!(args.project, root.join("member"));
+            assert_eq!(args.selection.asked_in, config.selection.asked_in);
+        }
+    }
+
+    #[test]
     fn the_workers_asked_longest_ago_are_stopped_for_the_rest_to_fit() {
         let now = Instant::now();
         let held = |bytes: u64, ago: u64, busy: bool| Held {
@@ -2174,6 +2227,7 @@ mod tests {
                 cfg_test: false,
                 selection: crate::plan::Selection::default(),
                 env: BTreeMap::new(),
+                cache_env: None,
                 whole: true,
             },
             root: dir.clone(),

@@ -1,0 +1,75 @@
+{
+  "_doc": "Which checks a change runs (pr.yaml, job changes): an area runs when a changed file matches one of its `paths` and none of its `ignore` (fnmatch, where * crosses /). Changes to the CI itself, and the full tier, run every area. `macos` marks an area with macOS checks in the fast tier; the full tier builds macOS anyway (the dist area's macOS C2 groups are the full tier's alone). The area that owns a check owns its entry. Contract: docs/reports/CI-fork.md. Runtime consumers include all compiler crates and vendored dependencies, excluding benchmark, fuzz, and browser-only tooling.",
+  "ci": {
+    "paths": [
+      ".github/workflows/pr.yaml",
+      ".github/workflows/bundle.yaml",
+      ".github/workflows/bundle-check.yaml",
+      ".github/actions/bundle/*",
+      ".github/actions/toolchain/*",
+      ".github/scripts/bundle.py",
+      ".github/scripts/changes.py",
+      ".github/ci/*",
+      ".github/scripts/test_changes.py",
+      ".github/scripts/test_bundle*.py"
+    ]
+  },
+  "dist": {
+    "paths": [
+      "crates/**",
+      "vendor/**",
+      "harness/dist/**",
+      "harness/norustc.py",
+      "harness/norustc_test.py",
+      "Cargo.toml",
+      "Cargo.lock",
+      "flake.nix",
+      "flake.lock",
+      "nix/**",
+      ".github/actions/toolchain/**",
+      ".github/workflows/blaze-dist-review.yaml"
+    ],
+    "ignore": [
+      "crates/ra-jit-bench-store/**",
+      "crates/ra-jit-bench-codegen/**",
+      "crates/ra-jit-fuzz/**",
+      "crates/ra-jit-wasm/**"
+    ]
+  },
+  "serve": {
+    "paths": [
+      "crates/**",
+      "vendor/**",
+      "harness/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      ".github/workflows/blaze-serve-review.yaml"
+    ],
+    "ignore": [
+      "crates/ra-jit-bench-store/**",
+      "crates/ra-jit-bench-codegen/**",
+      "crates/ra-jit-fuzz/**",
+      "crates/ra-jit-wasm/**"
+    ]
+  },
+  "bench": {
+    "paths": [
+      "*"
+    ],
+    "ignore": [
+      "site/*",
+      "*.md",
+      "harness/*"
+    ]
+  },
+  "nix": {
+    "paths": [
+      "flake.nix",
+      "flake.lock",
+      "nix/**",
+      "Cargo.lock",
+      "**/Cargo.toml",
+      ".github/workflows/nix-live.yaml"
+    ]
+  }
+}

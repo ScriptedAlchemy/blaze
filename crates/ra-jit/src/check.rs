@@ -85,8 +85,15 @@ pub(crate) fn source(args: Args, bootstrap: bool) -> anyhow::Result<bool> {
     crate::process_wide();
     let config = crate::cargo_config(&args);
     let load = crate::LoadCargoConfig { load_out_dirs_from_check: false, ..crate::load_config() };
-    let (mut db, vfs, _) =
-        crate::load(&[&args.project], &config, load, args.selection.clone(), None, None)?;
+    let (mut db, vfs, _) = crate::load(
+        &[&args.project],
+        &config,
+        load,
+        args.selection.clone(),
+        None,
+        None,
+        args.project_origin,
+    )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let crates = crate::crates_named(&db, &args.krate, &args)?;
     anyhow::ensure!(crates.len() == 1, "the source probe must identify one crate");
@@ -198,6 +205,43 @@ const INFERRED: [&str; 25] = [
 /// proc macro did, which run as they were built.
 pub(crate) const RELOAD: &str = "reload";
 
+/// Check an authenticated source description once, preserving the same diagnostics
+/// as the daemon checker and the compiler's complete replay input trace.
+pub(crate) fn once(args: crate::Args, trace: &Path) -> anyhow::Result<()> {
+    crate::process_wide();
+    let read_from = SystemTime::now();
+    let (mut db, vfs, checkouts) = crate::load(
+        &[&args.project],
+        &crate::cargo_config(&args),
+        crate::load_config(),
+        args.selection.clone(),
+        None,
+        None,
+        args.project_origin,
+    )?;
+    ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    let Parts { root, lints_capped, .. } = checkouts.parts(&args.project)?;
+    let members = ide_db::base_db::all_crates(&db)
+        .iter()
+        .copied()
+        .filter(|&krate| !hir::Crate::from(krate).origin(&db).is_lang())
+        .collect();
+    let mut checker =
+        Checker::new(&db, &vfs, &checkouts, &members, &[], read_from, root, lints_capped);
+    checker.checked = members
+        .iter()
+        .flat_map(|&krate| hir::Crate::from(krate).modules(&db))
+        .map(|module| module.definition_source_file_id(&db).original_file(&db).file_id(&db))
+        .collect();
+    checker.checked.sort_unstable();
+    checker.checked.dedup();
+    let verdict = checker.verdict(&db);
+    anyhow::ensure!(verdict == "ok", "{verdict}");
+    crate::write_inputs(&db, &args, &vfs, &args.out, trace)?;
+    std::fs::write(&args.out, b"{\"checked\":true}\n")?;
+    Ok(())
+}
+
 /// Loads the workspace of `args` and answers the check requests on its socket.
 pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.clone().context("--check needs --socket")?;
@@ -206,8 +250,15 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let cargo_config = crate::cargo_config(&args);
     let projects = [args.project.as_path()];
     let selection = args.selection.clone();
-    let (mut db, vfs, checkouts) =
-        crate::load(&projects, &cargo_config, crate::load_config(), selection, None, None)?;
+    let (mut db, vfs, checkouts) = crate::load(
+        &projects,
+        &cargo_config,
+        crate::load_config(),
+        selection,
+        None,
+        None,
+        args.project_origin,
+    )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
     let excludes = &args.selection.excludes;

@@ -1,0 +1,55 @@
+# Writes the sccache directory the toolchain action restored, once a job's builds are done, and
+# deletes the entries it supersedes on the same ref, so that a ref keeps one entry per prefix
+# rather than one per push (the fork's 10 GB cache, docs/reports/CI-fork.md). The job needs
+# `actions: write` for the deletion; without it the entry is still saved.
+name: toolchain-save
+description: save sccache's directory and drop this ref's older entries
+inputs:
+  rustc-wrapper:
+    description: the toolchain action's rustc-wrapper output (empty if setup did not complete)
+    default: ""
+  key:
+    description: the toolchain action's sccache-key output
+    required: true
+  scope:
+    description: the toolchain action's sccache-scope output
+    required: true
+  hit:
+    description: the toolchain action's sccache-hit output
+    required: true
+  token:
+    description: a token with actions write
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - if: always() && inputs.hit != 'true'
+      id: prepare
+      shell: bash
+      env:
+        WRAPPER: ${{ inputs.rustc-wrapper }}
+        KEY: ${{ inputs.key }}
+        SCOPE: ${{ inputs.scope }}
+      run: |
+        if [ -z "$KEY" ] || [ -z "$SCOPE" ] || [ ! -x "$WRAPPER" ] || [ ! -d ~/.cache/toolchain-sccache ]; then
+          echo "No sccache directory ready to save (toolchain setup may have been skipped)"
+          exit 0
+        fi
+        "$WRAPPER" --show-stats || true
+        "$WRAPPER" --stop-server > /dev/null || true
+        du -sh ~/.cache/toolchain-sccache
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+    - if: always() && steps.prepare.outputs.ready == 'true'
+      id: save
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/toolchain-sccache
+        key: ${{ inputs.key }}
+    - if: always() && steps.prepare.outputs.ready == 'true' && steps.save.outcome == 'success'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        KEY: ${{ inputs.key }}
+        SCOPE: ${{ inputs.scope }}
+        REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+      run: python3 "$GITHUB_ACTION_PATH/prune.py"

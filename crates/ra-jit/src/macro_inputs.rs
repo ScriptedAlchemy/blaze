@@ -89,6 +89,7 @@ impl ArtifactInputs {
         let manifest = project.join("Cargo.toml");
         let producer_env = crate::cargo::producer_env_in(&env);
         let asked = blaze_metadata::Asked {
+            cargo_home: None,
             cwd: project,
             env,
             manifest_path: Some(&manifest),
@@ -446,6 +447,7 @@ mod tests {
             }
             let manifest = root.join("Cargo.toml");
             let asked = blaze_metadata::Asked {
+                cargo_home: None,
                 cwd: &root,
                 env: env.clone(),
                 manifest_path: Some(&manifest),

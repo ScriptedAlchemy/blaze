@@ -1,0 +1,272 @@
+# The one entry point for a pull request's checks (docs/reports/CI-fork.md):
+#
+#   changes  which areas the diff touches (.github/ci/areas.json)
+#   build    the bundle, once per platform (bundle.yaml): release ra-jit, the owned macro runtime,
+#            the prebuilt test sets and bundle.json; macOS only when an area with macOS checks runs
+#   checks   each area a workflow_call workflow that verifies and consumes the bundle and never
+#            compiles: bundle-check.yaml, then each area's own (serve, dist, bench)
+#   ci       whether everything that ran passed
+#
+# Two tiers, as ra-jit.yaml has them. The **fast tier** is a pull request's: the areas the diff
+# touches, and the C2 runtime groups on Linux alone, packed into three jobs. The **full tier**
+# runs nightly, by hand (`-f tier=full`) and on a push to the integration branches dist/main and
+# dist/c4-keys: every area, and the C2 groups on Linux (one per job) and macOS (packed into four
+# jobs); when it fails it opens an issue, or adds to the one still open
+# (.github/actions/nightly-issue). macOS C2 coverage is the full tier's, not a pull request's: an
+# owner-accepted trade-off for the fork's five macOS runners.
+#
+# A push to any other branch starts nothing: a branch with a pull request already runs on the
+# `pull_request` event, and a second run for the same commit on the `push` event doubled the
+# load on the fork's twenty runners. A branch without one runs by hand (`workflow_dispatch`).
+#
+# Workflows called from here run in this run, so they download the bundle artifacts directly;
+# the digest each consumer verifies comes from the build job's outputs, a channel of its own.
+name: pr
+
+on:
+  # Stacked PRs must be validated against their actual target branch.
+  pull_request:
+  push:
+    branches: [dist/main, dist/c4-keys]
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "fast or full"
+        default: full
+        type: choice
+        options: [full, fast]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Retire obsolete PR builds, not integration pushes awaiting full acceptance.
+  group: pr-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tier: ${{ steps.tier.outputs.tier }}
+      code: ${{ steps.areas.outputs.code }}
+      macos: ${{ steps.areas.outputs.macos }}
+      dist: ${{ steps.areas.outputs.dist }}
+      serve: ${{ steps.areas.outputs.serve }}
+      bench: ${{ steps.areas.outputs.bench }}
+      nix: ${{ steps.areas.outputs.nix }}
+    steps:
+      - uses: actions/checkout@v7
+      # The full tier: nightly, by hand unless asked for the fast one, and a push to an
+      # integration branch. Everything else is the fast tier.
+      - id: tier
+        env:
+          TIER: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/dist/main' || github.ref == 'refs/heads/dist/c4-keys'))) && 'full' || inputs.tier || 'fast' }}
+        run: echo "tier=$TIER" | tee -a "$GITHUB_OUTPUT"
+      - name: Check CI helper contracts before compiling
+        run: |
+          python3 -I .github/scripts/test_changes.py
+          python3 -I .github/scripts/test_bundle_integrity.py
+          python3 -I .github/scripts/test_bundle_transport.py
+          python3 -I .github/scripts/test_bundle_build.py
+          python3 -I .github/scripts/test_bench_pair.py
+          python3 -I .github/scripts/test_bench_verdict.py
+      - id: areas
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TIER: ${{ steps.tier.outputs.tier }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          files=
+          # The full tier runs every area; an empty list of files means all of them.
+          if [ "$TIER" != full ]; then
+            case "$EVENT" in
+              pull_request|push)
+                files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD") || files=;;
+            esac
+          fi
+          echo "$files" | python3 -I .github/scripts/changes.py --compare-json | tee -a "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: build linux-x64
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/bundle.yaml
+    with:
+      platform: linux-x64
+      os: ubuntu-24.04
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      cache-write: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/dist/') }}
+
+  build-macos:
+    name: build macos-arm64
+    needs: changes
+    if: needs.changes.outputs.macos == 'true' || needs.changes.outputs.tier == 'full'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/bundle.yaml
+    with:
+      platform: macos-arm64
+      os: macos-15
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      cache-write: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/dist/') }}
+
+  bundle-linux:
+    name: check linux-x64
+    needs: build-linux
+    uses: ./.github/workflows/bundle-check.yaml
+    with:
+      platform: linux-x64
+      os: ubuntu-24.04
+      bundle-sha256: ${{ needs.build-linux.outputs.sha256 }}
+
+  bundle-macos:
+    name: check macos-arm64
+    needs: build-macos
+    uses: ./.github/workflows/bundle-check.yaml
+    with:
+      platform: macos-arm64
+      os: macos-15
+      bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
+
+  serve:
+    name: serve
+    needs: [changes, build-linux, bundle-linux]
+    if: needs.changes.outputs.serve == 'true'
+    uses: ./.github/workflows/blaze-serve-review.yaml
+    with:
+      bundle-linux-x64-sha256: ${{ needs.build-linux.outputs.sha256 }}
+
+  # Reusable job names gain a caller prefix; retain the original required context.
+  server:
+    name: server
+    needs: [changes, serve]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          SELECTED: ${{ needs.changes.outputs.serve }}
+          RESULT: ${{ needs.serve.result }}
+        run: |
+          test "$CHANGES" = success
+          if [ "$SELECTED" = true ]; then
+            test "$RESULT" = success
+          else
+            test "$SELECTED" = false
+            test "$RESULT" = skipped
+          fi
+
+  # The distributed protocol's checks, in tiers. The fast tier (a pull request) runs the C2
+  # groups on Linux alone, packed into three jobs: the longest group, `basic`, took 93 min to a
+  # failure on PR18 and `commands` 65, so one job for all seven would run 4 to 5 hours, and three
+  # is the fewest where no job is longer than the longest group (basic | commands nested |
+  # profiles-native workspace saved-cranelift saved-llvm). The full tier runs every group on
+  # Linux, one per job, and on macOS packed into four, which with the bundle check is the fork's
+  # five concurrent macOS jobs.
+  dist-linux:
+    name: dist linux-x64
+    needs: [changes, build-linux]
+    if: needs.changes.outputs.dist == 'true'
+    uses: ./.github/workflows/blaze-dist-review.yaml
+    with:
+      platform: linux-x64
+      os: ubuntu-24.04
+      bundle-sha256: ${{ needs.build-linux.outputs.sha256 }}
+      lanes: ${{ needs.changes.outputs.tier == 'full' && '["basic", "workspace", "commands", "profiles-native", "nested", "saved-cranelift", "saved-llvm"]' || '["basic", "commands nested", "profiles-native workspace saved-cranelift saved-llvm"]' }}
+
+  dist-macos:
+    name: dist macos-arm64
+    needs: [changes, build-macos]
+    if: needs.changes.outputs.dist == 'true' && needs.changes.outputs.tier == 'full'
+    uses: ./.github/workflows/blaze-dist-review.yaml
+    with:
+      platform: macos-arm64
+      os: macos-15
+      bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
+      lanes: '["basic", "profiles-native", "commands", "workspace nested saved-cranelift saved-llvm"]'
+
+  # The required context `C2 runtime` (it replaces `C2 runtime (ubuntu-24.04)` and
+  # `C2 runtime (macos-15)`: a pull request no longer reports macOS). It passes when every C2
+  # group of the tier and the platform checks (bundle-check.yaml) of its platforms passed, or
+  # the dist area was not selected.
+  c2:
+    name: C2 runtime
+    needs: [changes, bundle-linux, bundle-macos, dist-linux, dist-macos]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          TIER: ${{ needs.changes.outputs.tier }}
+          SELECTED: ${{ needs.changes.outputs.dist }}
+          LINUX_PLATFORM: ${{ needs.bundle-linux.result }}
+          LINUX: ${{ needs.dist-linux.result }}
+          MACOS_PLATFORM: ${{ needs.bundle-macos.result }}
+          MACOS: ${{ needs.dist-macos.result }}
+        run: |
+          echo "tier $TIER, dist selected: $SELECTED; linux $LINUX_PLATFORM/$LINUX, macos $MACOS_PLATFORM/$MACOS"
+          test "$CHANGES" = success
+          if [ "$SELECTED" = true ]; then
+            test "$LINUX_PLATFORM" = success
+            test "$LINUX" = success
+            if [ "$TIER" = full ]; then
+              test "$MACOS_PLATFORM" = success
+              test "$MACOS" = success
+            else
+              test "$MACOS" = skipped
+            fi
+          else
+            test "$SELECTED" = false
+            test "$LINUX" = skipped
+            test "$MACOS" = skipped
+          fi
+
+  bench:
+    name: bench
+    needs: [changes, build-linux]
+    if: needs.changes.outputs.bench == 'true'
+    uses: ./.github/workflows/bench.yaml
+    with:
+      bundle-linux-x64-sha256: ${{ needs.build-linux.outputs.sha256 }}
+
+  ci:
+    name: ci
+    needs: [changes, build-linux, build-macos, bundle-linux, bundle-macos, serve, server, dist-linux, dist-macos, c2, bench]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
+          ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
+
+  # A failed full tier, as an issue: nightly, and on a push to an integration branch (a merge
+  # whose checks nobody is watching). While one is open, each later failure is a comment on it.
+  nightly:
+    name: full tier issue
+    needs: [changes, ci]
+    if: always() && needs.changes.outputs.tier == 'full' && github.event_name != 'workflow_dispatch' && needs.ci.result != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/nightly-issue
+        with:
+          title: Full tier of pr.yaml failed

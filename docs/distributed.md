@@ -454,7 +454,7 @@ variant. A tuple is an array of its elements in order. A `Vec` marked **set** is
 of each element's encoding and has no duplicates; any other `Vec` keeps its order. Strings are
 UTF-8, at most the lengths `Hello` answers with.
 
-A digest of a value is `sha256("blaze/" ‖ name ‖ "/v1" ‖ 0x00 ‖ canonical CBOR of the value)`,
+A digest of a value is `sha256("blaze/" ‖ name ‖ "/v4" ‖ 0x00 ‖ canonical CBOR of the value)`,
 where `name` is the type's name below. A signature is Ed25519 over the same bytes with `sig/` in
 front of the name. One value signs less than its whole encoding: a `CrateRecord`'s signature is
 over the six-field map of its fields 0 to 5, under the same `sig/CrateRecord` domain, so a record
@@ -476,13 +476,19 @@ struct CrateKey(Digest);
 
 /// What the native side of a build is: everything outside blaze that changes what is linked
 /// or how a program runs. An executor serves a job only on an equal platform.
-struct ExecPlatform {               // 0..=5
+struct ExecPlatform {               // 0..=9
     triple: String,                 // 0, the blaze binary's target: no cross builds
     os: String,                     // 1, "macos 26.6.2", "linux 6.8"
     sdk: Option<(String, String, String)>, // 2, macOS: SDK name, version, deployment target
     libc: Option<(String, String)>, // 3, Linux: name and version, or the declared sysroot
     linker: (String, String, Digest), // 4, what links: name, version, digest of its executable
     cpu: String,                    // 5, target CPU and features codegen assumes
+    cc: Option<(String, String, Digest)>,  // 6, the C compiler a build script runs, as the `cc` crate
+                                    //    resolves it: name, version, digest of its executable
+    cxx: Option<(String, String, Digest)>, // 7, the C++ compiler, the same way
+    ar: Option<(String, String, Digest)>,  // 8, the archiver, the same way
+    native_root: Option<Digest>,    // 9, the SDK (macOS) or the sysroot (Linux) by what is in it:
+                                    //    a digest of the files that name its contents (C2 says which)
 }
 
 /// Which tree a job builds: a commit the server verified (section 2), or #271's root.
@@ -493,21 +499,66 @@ enum SourceRef {
 
 /// A build after cargo's configuration, workspace, feature and profile resolution: what
 /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
-struct BuildSpec {                  // 0..=11
+struct BuildSpec {                  // 0..=12, schema version 4
     source: SourceRef,              // 0
     lock: Digest,                   // 1, sha256 of Cargo.lock
     units: Vec<UnitSpec>,           // 2, the resolved unit graph, in the canonical unit order
     asked: Vec<u32>,                // 3, set: indexes of the units the command named
     profile: ProfileSpec,           // 4
     platform: Digest,               // 5, ExecPlatform's digest
-    rustflags: Vec<String>,         // 6, resolved from RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS
+    rustflags: Vec<InputText>,      // 6, message-bounded flags, unchanged text encoding
                                     //    and config, only flags blaze honours
-    config_env: Vec<(String, String)>, // 7, set: [env] of .cargo/config.toml, resolved
-    script_env: Vec<(String, String)>, // 8, set: variables build scripts may read, fixed
-    cwd: String,                    // 9, relative to the workspace root
+    config_env: Vec<(String, ConfigEnvValue)>, // 7, set, tagged resolved configuration values (v2)
+    script_env: Vec<(String, ConfigEnvValue)>, // 8, set: fixed variables, native values preserved (v4)
+    cwd: SourcePath,                // 9, relative to the workspace root, lossless byte components
     command: Command,               // 10
     toolchain: StoreIdentity,       // 11
+    workspace_manifest: SourcePath, // 12, selected root manifest relative to SourceRef's root
 }
+
+```rust
+struct SourcePath(String);          // schema 3: escaped byte-component logical path
+enum ConfigEnvValue {
+    Literal(EnvText),              // 0, [0, text], message-bounded NUL-free env value
+    WorkspaceRelative(SourcePath), // 1, [1, path], joined to the selected workspace on the worker
+    Native(NativeValue),            // 2, [2, bytes], NUL-free Unix environment bytes (v4)
+}
+struct InputText(String);           // same CBOR text, budget Limits.request, not identifier limit
+struct EnvText(String);             // same CBOR text budget, environment-specific NUL exclusion
+struct NativeValue(Vec<u8>);        // CBOR bytes, budget Limits.request, no NUL
+```
+
+Native env values must be non-UTF-8; valid UTF-8 has the single Literal encoding.
+EnvText excludes NUL, and env maps reject empty/`=`/NUL names and repeated names.
+script_env is original ambient input only and cannot contain WorkspaceRelative;
+configured values stay origin-tagged in config_env. Only the local native probe
+receives their materialized absolute paths, which never replace portable wire tags.
+
+Schema 3 `SourcePath` losslessly escapes native component bytes. ASCII letters,
+digits, `-`, `_`, `.` are literal; every other byte is uppercase `%HH`. `/`
+separates components and `.` denotes the root. Percent, colon, literal Unix
+backslash, Unicode and non-UTF-8 Unix bytes are reversible, not refused layouts.
+Empty/dot/parent components, decoded slash/NUL, noncanonical escapes (including
+escaped safe bytes) and absolute logical paths are malformed. Native conversion
+must preserve one normal component; a host that cannot represent a component
+reports a conversion error rather than silently reinterpret it. `cwd` is this
+validated type at generation and decode; its workspace-relative meaning is unchanged.
+`workspace_manifest` must end in the decoded basename `Cargo.toml`.
+SourcePath text uses the negotiated message budget (default 16 MiB), not the
+ordinary 4 KiB string budget. Escaping may triple native bytes. Typed validation
+uses a bounded canonical structural pass then per-field budgets; bytes-only
+validation retains ordinary string bounds and cannot identify path fields.
+Generation validates the wire budget before creating a schedulable identity.
+Git API contexts must supply their materialized repository root; only an intentionally
+workspace-rooted Root snapshot permits an omitted source root.
+Schema 2 replaces field 7's schema-1 string values with these explicit enum tags;
+the old string encoding is rejected, never guessed from the text. Ambient overrides
+of non-forced `[env]` entries are literals. A config-relative value is normalized
+against the config file's origin and represented relative to the selected workspace.
+Materialization consumes the serialized tag, not an out-of-band list of names.
+The selected workspace is the parent of that manifest; replay first locates it
+under the materialized source root, then joins `cwd` there and revalidates with
+the explicit saved manifest. No repository-root fallback or project-name inference.
 
 /// The canonical unit order: units sorted by the bytes of the canonical CBOR of each unit
 /// without field 5. Every field but `deps` together identifies a unit (its dependencies follow
@@ -517,7 +568,7 @@ struct UnitSpec {                   // 0..=8
     target: (u8, String),           // 1, kind (0 lib, 1 bin, 2 test, 3 example, 4 bench,
                                     //    5 build script, 6 proc macro) and name
     features: Vec<String>,          // 2, set: after unification
-    cfg: Vec<String>,               // 3, set: every cfg the unit is built with
+    cfg: Vec<InputText>,            // 3, set: message-bounded cfg derived from flags
     edition: u16,                   // 4
     deps: Vec<(u32, String)>,       // 5, set: unit index and the name it is used under
     test: bool,                     // 6, cfg(test)
@@ -526,7 +577,7 @@ struct UnitSpec {                   // 0..=8
                                     //    build-override (review B M4)
 }
 
-struct ProfileSpec {                // 0..=9
+struct ProfileSpec {                // 0..=11
     name: String,                   // 0
     opt_level: u8,                  // 1, 0..=3; s and z refused until blaze has them
     debug: u8,                      // 2, 0 none, 1 line tables, 2 full
@@ -537,6 +588,8 @@ struct ProfileSpec {                // 0..=9
     split_debuginfo: u8,            // 7, 0 off, 1 packed, 2 unpacked
     backend: u8,                    // 8, blaze's codegen backend: 0 Cranelift, 1 LLVM
     mir_opt: u8,                    // 9, blaze's MIR optimisation level (cli.rs:66-102)
+    backend_opt: u8,                // 10, LLVM's passes, 0..=3; 0 under Cranelift, which it does not change
+    backend_emit: u8,               // 11, LLVM's code selection, 0 optimized, 1 fast; 0 under Cranelift
 }                                   // lto other than off: refused (release stays on Bazel)
 
 enum LocalPolicy { Never, Fallback, Race }  // 0, 1, 2
@@ -550,16 +603,20 @@ enum Command {
 
 /// What a test run is asked to do. A timeout is not here: it schedules, and goes in the job
 /// request (section 8), never in a key (re-review A N7).
-struct RunSpec {                    // 0..=8
-    filters: Vec<String>,           // 0
-    exact: bool,                    // 1
-    skip: Vec<String>,              // 2
-    ignored: u8,                    // 3, 0 not ignored, 1 only ignored, 2 include ignored
+struct RunSpec {                    // 0..=9
+    filters: Vec<String>,           // 0, cargo test's TESTNAME words, in order
+    exact: bool,                    // 1, read out of harness_args
+    skip: Vec<String>,              // 2, read out of harness_args
+    ignored: u8,                    // 3, 0 not ignored, 1 only ignored, 2 include ignored; read out of
+                                    //    harness_args
     no_run: bool,                   // 4
     no_fail_fast: bool,             // 5
-    test_threads: Option<u32>,      // 6
-    harness_args: Vec<String>,      // 7, after `--`; a custom harness gets exactly these
+    test_threads: Option<u32>,      // 6, read out of harness_args
+    harness_args: Vec<String>,      // 7, every word after `--`, as typed and in order, so that a custom
+                                    //    harness gets exactly these (and for `Run`, the program's
+                                    //    arguments before `--` too); 1 to 3 and 6 are read out of them
     env: Vec<(String, String)>,     // 8, set: the environment a test program is given
+    doc: u8,                        // 9, doc tests: 0 none, 1 with the unit tests, 2 only these
 }
 
 /// The part of a BuildSpec a warm front end depends on: what an executor or an image
@@ -823,6 +880,34 @@ What the server keeps on its own disk:
 | `remap/<ns>/<crate_key>` | `CrateKey`, generation | the compacted generation that holds every live entry of it | append, by the collector |
 | `epochs` | namespace | current epoch | by the operator only |
 | `jobs`, `executors`, `work` | execution id, executor id | requests, leases, events, reservations, the work set | in memory, with a log |
+
+### Native link plans for object artifacts
+
+An object result names its Rust object, supporting runtime (`.std.a` or `.std.o`),
+and `native_link`. The latter is the JSON rendering of the compiler's `link.cbor`
+record, produced while its source graph, native unit settings and producer leases
+are still live. Its deterministic CBOR shape is
+`[1, encoding, target, mode, before, after]`: `target` is the emitted target triple,
+`mode` is `0` for an executable consumer or `1` for a shared-library consumer, and
+`before` and `after` are ordered arrays of native argument byte vectors. Encoding is
+`unix-bytes`, `windows-utf16le` or the host's `utf8` fallback. Decoders reject a
+foreign encoding, unknown version/mode, empty target or invalid process argument.
+The JSON rendering spells modes `executable` and `shared` and retains argument
+bytes as integer arrays.
+
+A C executable consumer places its caller, Rust objects and supporting runtimes
+between the executable plan's `before` and `after` arguments. Requirements come
+from the same source `#[link]` attributes, producer directives and target rules as
+an owned executable link; consumers do not maintain a second system-library list.
+Split ELF runtime archives carry an index for ordinary archive extraction, including
+TLS symbol types on cross-member references. A library's default allocator shim is
+an independently extractable member of that same support archive, so several Rust
+objects can share one default shim and its references back into std resolve through
+ordinary archive extraction. A custom allocator's shims stay with its source object;
+the native consumer does not replace them with a default allocator.
+The compiler admits the exact native arguments against bound source, producer and
+platform inputs and finishes that validation before publishing the record. Process environments remain in memory;
+they are not part of the native link record.
 
 ## 0. Phase 0: blaze builds tracedecay
 
@@ -1306,7 +1391,7 @@ exercised here, **unverified**):
 
 - **Signed records.** The server signs `CrateRecord` fields 0 to 5 with its Ed25519 key; clients
   pin the key (`RA_JIT_REMOTE_TRUST`, `signed.rs`). The signed bytes are the six-field map of
-  those fields, without field 6, under the `sig/CrateRecord/v1` domain the schema gives every
+  those fields, without field 6, under the `sig/CrateRecord/v4` domain the schema gives every
   signature; a client checks them the same way. The namespace is in the signed bytes, so a
   `Pr` record is not a `Main` record.
 - **The epoch** (REAPI's `salt`, research 7.8). Each namespace has a current epoch, answered in
@@ -2307,6 +2392,12 @@ Each tier has a default, a command and a harness check (the owner's requirement,
   most items in a batch, longest string (4 KiB). A decoder refuses unknown keys within a version;
   a change that adds a field is a new version; the server keeps the version before for one blaze
   release.
+  The current wire crate speaks schema 4 with native environment values and `/v4`
+  typed digest/signature domains. Unchanged structural types may decode old bytes:
+  version negotiation and digest/signature domains gate their schema identity.
+  Changed types reject incompatible layouts/paths; a retained prior-version endpoint
+  needs its separately pinned codec. HTTP `/v1` routes
+  and `blaze/req/v1` authentication framing remain unchanged.
 - **Errors** are one shape on every call: `{0: code, 1: message, 2: retry_after_ms or null}`, with
   HTTP status from the code's class. Codes: 1 malformed (400), 2 version (400), 3 unauthenticated
   (401), 4 not allowed (403), 5 not found (404), 6 conflict, a generation or attempt moved (409),
@@ -2536,7 +2627,7 @@ struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
     version: String,                 // 1
     target: (u8, String),            // 2
     features: Vec<String>,           // 3, set
-    cfg: Vec<String>,                // 4, set
+    cfg: Vec<InputText>,             // 4, set
     edition: u16,                    // 5
     deps: Vec<(u32, String)>,        // 6, set
     test: bool,                      // 7
@@ -2544,21 +2635,23 @@ struct FrontEndUnit {                // 0..=9, a UnitSpec without its source id
     profile: ProfileSpec,            // 9
 }
 
-struct FrontEndKeyInput {            // 0..=4
+struct FrontEndKeyInput {            // 0..=5
     units: Vec<FrontEndUnit>,        // 0, in the canonical unit order
     lock: Digest,                    // 1
-    cfg_rustflags: Vec<String>,      // 2, set: the rustflags that set cfg
+    cfg_rustflags: Vec<InputText>,   // 2, set: the rustflags that set cfg
     toolchain: StoreIdentity,        // 3
     triple: String,                  // 4
+    workspace_manifest: SourcePath, // 5
 }
 
-struct ConfigKeyInput {              // 0..=5
+struct ConfigKeyInput {              // 0..=6
     kind: u8,                        // 0, Command's discriminant
     asked: Vec<(String, String)>,    // 1, set: package name and target name
     profiles: Vec<ProfileSpec>,      // 2, each asked unit's, in the canonical unit order
     platform: Digest,                // 3
-    rustflags: Vec<String>,          // 4, set
+    rustflags: Vec<InputText>,       // 4, set
     toolchain: StoreIdentity,        // 5
+    workspace_manifest: SourcePath, // 6
 }
 
 struct JobContentInput {             // 0..=1
@@ -2942,6 +3035,98 @@ name; whether the deployment target changes a function's code is recorded. From 
   under two compilers gives two platform digests and two `JobContent`s.
 
 Verify: `cargo test -p blaze-wire && python3 -I harness/dist/buildspec.py`. Where: Mac.
+
+The graph tests compare all 317 recorded Cargo unit graphs. The graph keeps proc-macro
+doctest libraries under their host/build profile, and a normal check and test check of the
+same library or binary remain distinct.
+The host debuginfo-sharing probe uses Cargo's explicit target kind, including for proc macros,
+so a build-only unit cannot match itself and incorrectly retain the runtime debug level.
+A custom test harness receives `cfg(test)` without acquiring the libtest harness. CLI checks
+and Rust unit tests do not establish local execution acceptance or the macOS gate.
+
+The CLI now saves the actual source inputs, including dirty and untracked files, selected
+path/registry/Git dependency trees, configuration reads and relative symlink targets. A canonical
+locked-source index belongs to that snapshot: changing which captured package directory a locked
+source names changes the source identity. The original invocation is a separate CBOR replay recipe,
+so equivalent command spellings retain the same `BuildSpec` and `JobContent`. Its record is a blob
+of the store like the sources, named by the BLAKE3 of its canonical CBOR, and the saved file names
+it by that digest beside the spec: replay authenticates the record's bytes before reading any field
+of it, so one edited in place, or another put where it was, is refused by name. The selected manifest,
+config-file operands, native values and source-relative working directory survive relocation.
+Replay authenticates the snapshot, resolves from its captured package trees offline, compares the
+complete spec, and verifies the execution platform before creating compiler descriptions.
+The snapshot manifest has its own budget, 4,194,304 entries in 256 MiB (the wire's message and batch
+budgets would refuse a tree of 70,000 files); a larger tree is refused at capture by name.
+An empty external Cargo home does not affect source identity. A Cargo home beside or above the
+workspace (its configuration, registry and Git trees) is kept in the snapshot under
+`.blaze-cargo-home/`, so the layout root is made of the workspace and its path dependencies only:
+the same project with its home in another place, or below other directories, has the same spec.
+The configuration files resolution read are part of the replay record (version 2), in precedence
+order, and every reading of the configuration during replay, the executor's included, is made from
+exactly those through `Config::from_image`, with no discovery: a Cargo home that was an ancestor's
+`.cargo` to the requester keeps its place, though the snapshot mounts it, and no file above the
+directory a worker materializes the snapshot in is read. The search for the workspace root and for
+the current manifest stop at that directory too, so a `Cargo.toml` above it, broken or claiming the
+snapshot with a `[workspace]`, changes nothing. Path dependencies outside the workspace still keep their relative topology below the common
+source root, so a workspace and a sibling path dependency under different parents differ. (Mac and
+Linux unit tests; the layout independence of path dependencies is not normalized.)
+
+`ra-jit cargo spec --out FILE build|run|test ...` writes to `FILE`, in canonical CBOR, the
+BuildSpec and the digest of its replay record, and the immutable blobs, the record among them, to
+`FILE.inputs/`. Copy both to replay elsewhere with
+`ra-jit cargo spec --run FILE`. Successful artifacts and a `result.json` are retained under
+`FILE.outputs/`. The original checkout is not needed. Each compiler description carries authoritative
+cfgs, environment, dependency renames, target kinds and profiles; the loader cannot add analyzer cfgs
+or substitute ambient compiler settings. Replay starts the owned compiler directly with compiler
+query fallback, Cargo producer loading, external proc-macro servers and shared publication disabled.
+
+The connected executor plans executables, standalone library objects, frontend checks,
+unit/integration tests and doctests. `test --no-run` builds the test executables without
+running implicit doctests. Its owned producer scheduler builds scripts and proc-macro images
+in dependency order, applies their cfg/environment/native directives, and retains producer
+generation leases through compilation and input admission. Proc-macro expansion requires an
+explicitly pinned owned runtime. The compiler does not discover producers through Cargo or
+select an external toolchain server.
+
+Native bindings retain observed tools, SDK/sysroot/search trees, source inputs and producer
+outputs. `ExecPlatform.native_root` identifies that captured closure. Linking must admit its
+actual reads against the bindings, including symlink referents and recorded absences; an
+unbound input fails admission. This is an implemented boundary whose full platform coverage
+still needs the runtime gates below, not evidence that every native toolchain is supported.
+A profile's `strip` is the linked root's, and replay strips as rustc 1.99 does, with the link the
+ordinary build shares (`link.rs`): an ELF link is told `--strip-debug` or `--strip-all`, and what
+Apple's linker wrote is stripped afterwards by the toolchain's `rust-objcopy` (`--strip-debug`,
+`--strip-all`, a shared library `--discard-all`). Units of one program may be built with different
+debug info (`[profile.dev.package.x] debug = 0`): each crate's code is described as its own
+`-Cdebuginfo` says, as rustc compiles each crate with its own, and where it is kept
+(`split-debuginfo`) is the linked root's. Preflight still refuses `cdylib`, `staticlib` and `dylib`
+outputs before compilation, as every owned build does today ([no-rustc.md](no-rustc.md)): a gap
+of the owned compiler, not of replay. It refuses the special extern options `noprelude`,
+`public` and `nounused` too, which stable cargo never sets.
+
+The private version-2 deterministic CBOR trace carries input paths and keyed identities of
+observed environment values, distinguishing absence, empty text and native non-Unicode values.
+Compiler descriptions carry per-canonical-unit native settings over stdin; public project files
+redact those settings. Admission uses the environments of described source units and validates
+file bytes against the authenticated snapshot or owned producer bindings before advertising or
+running artifacts. This is admission after compilation, not a filesystem sandbox. An unset read
+is accepted only when the saved requester-presence information and effective source environment
+justify absence. Invalid Unicode read through `env!` or `option_env!` is a language diagnostic;
+an unread non-Unicode value does not itself reject a build.
+
+A program that `run` or `test` starts gets the environment Cargo gives one, not an empty one: the
+worker's `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ`, `TERM`, `LANG` and `LC_*`; the
+spec's configuration and script values; Cargo's package variables (`CARGO_MANIFEST_DIR`,
+`CARGO_MANIFEST_PATH`, `CARGO_PKG_*`), whose paths are in the replayed tree; and `CARGO`, naming the
+toolchain's cargo. The worker's other variables do not reach it. The runtime extends the platform's
+dynamic-library search path with admitted producer libraries, profile directories and the selected
+sysroot library directory through the same loader-path helper used by ordinary Cargo requests.
+
+`harness/dist/saved_spec.py` exercises the actual binary against a Cargo reference with product
+compiler tools blocked, including removal of the original tree and hostile worker configuration.
+Its result, the broader `buildspec.py` differential, native closure coverage, other platforms and
+the original complete C2 acceptance remain separate gates. C2 acceptance remains open until those
+gates pass.
 
 **C3 The server, today's layout.** Goal: `ra-jit serve --cache DIR --listen ADDR` with `hello`,
 blobs with `Range`, `missing` from an existence set, verification on write, and today's

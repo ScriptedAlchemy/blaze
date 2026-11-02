@@ -1,0 +1,224 @@
+//! Locked local Git repositories and raw path dependencies exercise actual fetching/resolution.
+use blaze_metadata::units::{Command, TargetFilter, UnitsAsked, unit_graph};
+use blaze_metadata::{Asked, Build, TargetPlatform};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+struct Scratch(PathBuf);
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("blaze-native-resolver-{name}-{}", std::process::id()));
+        assert!(!path.exists(), "unique test scratch must not overwrite other work");
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+    fn write(&self, path: &str, text: &str) {
+        let p = self.0.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+fn graph(root: &Path, home: &Path) -> blaze_metadata::units::UnitGraph {
+    try_graph(root, home).unwrap()
+}
+
+fn try_graph(root: &Path, home: &Path) -> anyhow::Result<blaze_metadata::units::UnitGraph> {
+    let env = BTreeMap::from([
+        ("CARGO_HOME".into(), home.to_str().unwrap().into()),
+        ("PATH".into(), std::env::var("PATH").unwrap_or("/usr/bin:/bin".into())),
+    ]);
+    let build = Build { packages: &[], workspace: false, excludes: &[], dev_units: false };
+    let asked = Asked {
+        locked: true,
+        cargo_home: Some(home.into()),
+        cwd: root,
+        env: env.into_iter().collect(),
+        manifest_path: None,
+        config: &[],
+        features: &[],
+        all_features: false,
+        no_default_features: false,
+        build: Some(build),
+        platform: Some(TargetPlatform { triple: "x86_64-unknown-linux-gnu", cfg: &[] }),
+        offline: false,
+        store: None,
+        rust_release: None,
+    };
+    unit_graph(&UnitsAsked {
+        asked: &asked,
+        command: Command::Build,
+        targets: &TargetFilter::default(),
+        profile: None,
+    })
+}
+
+#[test]
+fn locked_resolution_accepts_equivalent_toml_but_rejects_changed_edges() {
+    let scratch = Scratch::new("compact-lock");
+    scratch.write(
+        "Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ndep={path='dep'}\n",
+    );
+    scratch.write("src/main.rs", "fn main() { dep::value(); }\n");
+    scratch.write("dep/Cargo.toml", "[package]\nname='dep'\nversion='0.1.0'\nedition='2021'\n");
+    scratch.write("dep/src/lib.rs", "pub fn value() {}\n");
+    // Cargo --locked accepts this ordering, compact array and missing generated header.
+    let text = "version = 4\n[[package]]\nname='dep'\nversion='0.1.0'\n[[package]]\nname='app'\nversion='0.1.0'\ndependencies=['dep']\n";
+    scratch.write("Cargo.lock", text);
+    let home = scratch.0.join("home");
+    let made = try_graph(&scratch.0, &home).unwrap();
+    assert_eq!(made.lock, text.as_bytes());
+    assert_eq!(std::fs::read_to_string(scratch.0.join("Cargo.lock")).unwrap(), text);
+    assert!(made.units.iter().any(|unit| unit.package.name == "dep"));
+
+    let changed = text.replace("dependencies=['dep']\n", "");
+    scratch.write("Cargo.lock", &changed);
+    let error = try_graph(&scratch.0, &home).unwrap_err();
+    assert!(format!("{error:#}").contains("cannot update the lock file"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(scratch.0.join("Cargo.lock")).unwrap(), changed);
+}
+
+#[test]
+fn locked_git_sibling_dependency_retains_exact_revision() {
+    let scratch = Scratch::new("git");
+    scratch.write("repo/Cargo.toml", "[workspace]\nmembers=['a','b']\nresolver='2'\n");
+    scratch.write(
+        "repo/a/Cargo.toml",
+        "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nb={path='../b'}\n",
+    );
+    scratch.write("repo/a/src/lib.rs", "pub fn a()->u8{b::b()}\n");
+    scratch.write("repo/b/Cargo.toml", "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n");
+    scratch.write("repo/b/src/lib.rs", "pub fn b()->u8{1}\n");
+    let repo = scratch.0.join("repo");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["checkout", "-qb", "fixture"]);
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "siblings",
+        ],
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"]);
+    let url = url::Url::from_file_path(&repo).unwrap().to_string();
+    for (label, query, manifest_ref) in [
+        ("branch", "branch=fixture", "branch='fixture'".to_owned()),
+        ("rev", "rev=fixture", "rev='fixture'".to_owned()),
+    ] {
+        let source = format!("git+{url}?{query}#{commit}");
+        scratch.write(&format!("{label}/Cargo.toml"),&format!("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\na={{git='{url}',{manifest_ref}}}\n"));
+        scratch.write(&format!("{label}/src/lib.rs"), "pub fn f()->u8{a::a()}\n");
+        scratch.write(&format!("{label}/Cargo.lock"),&format!("# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\nsource = \"{source}\"\ndependencies = [\n \"b\",\n]\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"a\",\n]\n\n[[package]]\nname = \"b\"\nversion = \"0.1.0\"\nsource = \"{source}\"\n"));
+        let root = scratch.0.join(label);
+        let got = graph(&root, &scratch.0.join(format!("home-{label}")));
+        for name in ["a", "b"] {
+            let unit = got.units.iter().find(|u| u.package.name == name).unwrap();
+            assert_eq!(unit.package.source, source);
+        }
+        let a = got.units.iter().find(|u| u.package.name == "a").unwrap();
+        let b =
+            &got.units[a.dependencies.iter().find(|d| d.extern_crate_name == "b").unwrap().index];
+        assert_eq!(b.package.name, "b");
+        let pinned = blaze_resolve::SourceId::from_url(&source).unwrap();
+        let unpinned =
+            blaze_resolve::SourceId::from_url(source.split('#').next().unwrap()).unwrap();
+        assert_eq!(pinned, unpinned, "ordinary equality intentionally ignores precise");
+        assert!(!pinned.full_eq(unpinned), "full equality must retain exact revision");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn raw_path_dependency_source_roundtrip_and_resolution() {
+    use std::os::unix::ffi::OsStringExt;
+    let scratch = Scratch::new("rawdep");
+    let raw = scratch.0.join(std::ffi::OsString::from_vec(b"tree-\xff".to_vec()));
+    std::fs::create_dir_all(raw.join("a/src")).unwrap();
+    std::fs::create_dir_all(raw.join("b/src")).unwrap();
+    std::fs::write(raw.join("a/Cargo.toml"),"[package]\nname='rawapp'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[dependencies]\nrawdep={path='../b'}\n").unwrap();
+    std::fs::write(raw.join("a/src/lib.rs"), "").unwrap();
+    std::fs::write(
+        raw.join("b/Cargo.toml"),
+        "[package]\nname='rawdep'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(raw.join("b/src/lib.rs"), "").unwrap();
+    std::fs::write(raw.join("a/Cargo.lock"),"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"rawapp\"\nversion = \"0.1.0\"\ndependencies = [\n \"rawdep\",\n]\n\n[[package]]\nname = \"rawdep\"\nversion = \"0.1.0\"\n").unwrap();
+    let source = blaze_resolve::SourceId::for_path(&raw.join("b")).unwrap();
+    assert_eq!(source.url().to_file_path().unwrap(), raw.join("b"));
+    assert!(source.as_url().to_string().contains("%FF"));
+    assert!(
+        source.full_eq(blaze_resolve::SourceId::from_url(&source.as_url().to_string()).unwrap())
+    );
+    let got = graph(&raw.join("a"), &scratch.0.join("home"));
+    let app = got.units.iter().find(|u| u.package.name == "rawapp").unwrap();
+    let dep = &got.units
+        [app.dependencies.iter().find(|d| d.extern_crate_name == "rawdep").unwrap().index];
+    assert_eq!(dep.package.manifest_dir, raw.join("b"));
+    assert_eq!(dep.package.name, "rawdep");
+}
+
+#[test]
+fn native_resolution_keeps_manifest_lock_and_config_source_bytes() {
+    let scratch = Scratch::new("sources");
+    scratch.write(
+        "Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ndep={path='dep'}\n",
+    );
+    scratch.write("src/lib.rs", "");
+    scratch.write("dep/Cargo.toml", "[package]\nname='dep'\nversion='0.1.0'\n");
+    scratch.write("dep/src/lib.rs", "");
+    scratch.write(".cargo/config.toml", "[build]\njobs=1\n");
+    scratch.write(
+        "Cargo.lock",
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+    );
+    let inputs = ["Cargo.toml", "Cargo.lock", "dep/Cargo.toml", ".cargo/config.toml"].map(|file| {
+        let path = scratch.0.join(file);
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    let asked = Asked {
+        locked: false,
+        cargo_home: Some(scratch.0.join("home")),
+        cwd: &scratch.0,
+        env: vec![("__CARGO_TEST_ROOT".to_owned(), scratch.0.to_str().unwrap().to_owned())],
+        manifest_path: None,
+        config: &[],
+        features: &[],
+        all_features: false,
+        no_default_features: false,
+        build: None,
+        platform: None,
+        offline: true,
+        store: None,
+        rust_release: None,
+    };
+    let (json, sources) = blaze_metadata::metadata_with_sources(&asked).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(metadata["packages"].as_array().unwrap().len(), 2);
+    for (path, bytes) in inputs {
+        let read: Vec<_> = sources.iter().filter(|(seen, _)| seen == &path).collect();
+        assert!(!read.is_empty(), "{} was not recorded", path.display());
+        assert!(read.iter().all(|(_, seen)| *seen == bytes));
+    }
+}

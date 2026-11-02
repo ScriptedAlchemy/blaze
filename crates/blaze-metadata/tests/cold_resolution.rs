@@ -116,6 +116,7 @@ impl Fixture {
     ) -> anyhow::Result<(Value, Vec<(PathBuf, Vec<u8>)>)> {
         let release = release.map(str::to_owned);
         let asked = Asked {
+            cargo_home: None,
             cwd: &self.0,
             env: vec![("CARGO_HOME".into(), self.0.join("home").to_str().unwrap().into())],
             manifest_path: None,

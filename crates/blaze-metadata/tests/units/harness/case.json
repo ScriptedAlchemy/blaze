@@ -1,0 +1,511 @@
+{
+ "runs": [
+  {
+   "args": [
+    "build"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--features",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--all-targets",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--tests",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "custom"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "plain"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "needs"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--test",
+    "needs",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bin",
+    "gated",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--example",
+    "ex-gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--example",
+    "ex-gated",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--examples",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--benches",
+    "-F",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bench",
+    "b2"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--bench",
+    "b1"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "check"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--features",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--all-targets",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--tests",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--test",
+    "custom"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--test",
+    "plain"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--test",
+    "needs"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--test",
+    "needs",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bin",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bin",
+    "gated",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--example",
+    "ex-gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--example",
+    "ex-gated",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--examples",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--benches",
+    "-F",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bench",
+    "b2"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--bench",
+    "b1"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "test"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--features",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--all-targets",
+    "--all-features"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--tests"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--tests",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--test",
+    "custom"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--test",
+    "plain"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--test",
+    "needs"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--test",
+    "needs",
+    "--features",
+    "gated,dep/feat"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bin",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bin",
+    "gated",
+    "--features",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--example",
+    "ex-gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--example",
+    "ex-gated",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--examples"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--examples",
+    "-F",
+    "gated"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--benches"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--benches",
+    "-F",
+    "other"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bench",
+    "b2"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--bench",
+    "b1"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--lib"
+   ]
+  }
+ ]
+}

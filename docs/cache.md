@@ -289,6 +289,28 @@ push. A daemon killed with SIGKILL pushes nothing on its way out; the next push 
 `RA_JIT_REMOTE` needs the local store (`RA_JIT_CACHE` not `off`): the remote fills and
 reads it.
 
+The owned `cargo build`, `run` and `test` path uses an explicitly selected store and remote
+for its final compiler processes. Set both `RA_JIT_CACHE` and `RA_JIT_REMOTE`; the isolated
+executor's default remains cache-off. Relative store, directory-remote and signing-key paths
+are resolved from the command's working directory before compiler children change directories.
+The compiler pulls before compilation and publishes sealed packs after a successful one-shot
+build. A `build` or `run` that sets both uses one-shot compilation to finish publication
+before returning and starts no daemon. Whole builds using only a local store retain the
+daemon and resolve the store path against the request directory. Cache limits, project, lazy/read-only
+mode and manifest trust/signing policy are applied to these compiler processes after producer
+preparation. This forwarding does not alter the saved BuildSpec or the source environment
+already recorded in producer descriptions.
+
+An explicitly selected S3 transport receives the caller's `AWS_*` SDK configuration and
+credential-provider settings. Explicit config, credential and token-file paths work without
+changing the compiler's isolated `HOME`; profile or SSO lookup that depends on the caller's
+home directory is not inherited. Set explicit file locations or use an environment/role
+provider supported by the existing SDK. Explicit TLS certificate locations are also retained
+for network transports. Saved BuildSpec replay keeps its existing boundary: the worker can
+choose a local store, but its ambient remote, signing policy and credentials are not adopted.
+Producer images retain their existing local cache behavior; this does not make producer
+actions or compilation run on a remote worker.
+
 ### The server
 
 `ra-jit serve` shares today's cache layout over HTTP/1.1. It is unit C3 of

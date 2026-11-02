@@ -9,6 +9,226 @@ use crate::cbor::Wire;
 use crate::{Digest, Named, Set};
 use crate::{wire_enum, wire_struct};
 
+/// Message-bounded free-form input text, unlike ordinary 4 KiB identifiers.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputText(pub String);
+impl From<String> for InputText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl PartialEq<str> for InputText {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+impl std::ops::Deref for InputText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+impl Wire for InputText {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        Ok(Self(r.path_text()?.to_owned()))
+    }
+}
+impl Named for InputText {
+    const NAME: &'static str = "InputText";
+}
+impl crate::vectors::Sample for InputText {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(String::sample(g))
+    }
+}
+
+/// Message-bounded environment text, with NUL excluded before materialization.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnvText(pub String);
+impl From<String> for EnvText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl Wire for EnvText {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        let text = r.path_text()?;
+        if text.contains('\0') {
+            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at });
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+impl Named for EnvText {
+    const NAME: &'static str = "EnvText";
+}
+impl crate::vectors::Sample for EnvText {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(String::sample(g))
+    }
+}
+
+/// A lossless logical path: `/` separates byte components and `.` denotes the root.
+/// Component bytes outside ASCII letters, digits, `-`, `_`, `.` use uppercase `%HH`.
+/// Escapes of safe bytes, empty/dot/parent components, decoded slash and NUL are invalid.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourcePath(String);
+
+impl SourcePath {
+    /// Validates a portable source-relative path without canonicalizing malformed input.
+    pub fn new(path: String) -> Result<Self, crate::Error> {
+        if path != "." {
+            if path.is_empty() {
+                return Err(path_error());
+            }
+            for part in path.split('/') {
+                let bytes = decode_component(part)?;
+                if encode_component(&bytes) != part {
+                    return Err(path_error());
+                }
+            }
+        }
+        Ok(Self(path))
+    }
+
+    /// Encode a normalized native relative path without Unicode replacement or path guessing.
+    pub fn from_native(path: &std::path::Path) -> Result<Self, crate::Error> {
+        let mut parts = Vec::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::Normal(name) => {
+                    #[cfg(unix)]
+                    let bytes = {
+                        use std::os::unix::ffi::OsStrExt;
+                        name.as_bytes()
+                    };
+                    #[cfg(not(unix))]
+                    let bytes = name.to_str().ok_or_else(path_error)?.as_bytes();
+                    parts.push(encode_component(bytes));
+                }
+                std::path::Component::CurDir => {}
+                _ => return Err(path_error()),
+            }
+        }
+        Self::new(if parts.is_empty() { ".".to_owned() } else { parts.join("/") })
+    }
+
+    /// Decode logical components to native ones. Unix preserves every valid filename byte.
+    /// Other hosts report an explicit conversion error for byte names they cannot represent.
+    pub fn to_native(&self) -> Result<std::path::PathBuf, crate::Error> {
+        if self.0 == "." {
+            return Ok(std::path::PathBuf::from("."));
+        }
+        let mut path = std::path::PathBuf::new();
+        for component in self.0.split('/') {
+            let bytes = decode_component(component)?;
+            #[cfg(unix)]
+            let name = {
+                use std::os::unix::ffi::OsStringExt;
+                std::ffi::OsString::from_vec(bytes)
+            };
+            #[cfg(not(unix))]
+            let name =
+                std::ffi::OsString::from(String::from_utf8(bytes).map_err(|_| path_error())?);
+            // Native conversion must not reinterpret a component as an absolute/traversal path.
+            if std::path::Path::new(&name).components().count() != 1
+                || !matches!(
+                    std::path::Path::new(&name).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(path_error());
+            }
+            path.push(name);
+        }
+        Ok(path)
+    }
+
+    /// Whether the final decoded component names Cargo's required root manifest.
+    pub fn is_cargo_manifest(&self) -> bool {
+        self.0.rsplit('/').next() == Some("Cargo.toml")
+    }
+
+    /// The canonical escaped logical path, never an absolute checkout path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn path_error() -> crate::Error {
+    crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 }
+}
+fn safe_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+fn encode_component(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for &byte in bytes {
+        if safe_byte(byte) {
+            text.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(text, "%{byte:02X}");
+        }
+    }
+    text
+}
+fn decode_component(text: &str) -> Result<Vec<u8>, crate::Error> {
+    let mut bytes = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let byte = text.as_bytes()[at];
+        if byte == b'%' {
+            let hex = text.get(at + 1..at + 3).ok_or_else(path_error)?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| path_error())?;
+            if safe_byte(byte) || matches!(byte, 0 | b'/') {
+                return Err(path_error());
+            }
+            bytes.push(byte);
+            at += 3;
+        } else {
+            if !safe_byte(byte) {
+                return Err(path_error());
+            }
+            bytes.push(byte);
+            at += 1;
+        }
+    }
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(path_error());
+    }
+    Ok(bytes)
+}
+
+impl Wire for SourcePath {
+    fn encode(&self, e: &mut crate::Encoder) {
+        self.0.encode(e);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        Self::new(r.path_text()?.to_owned()).map_err(|mut error| {
+            error.at = at;
+            error
+        })
+    }
+}
+
+impl Named for SourcePath {
+    const NAME: &'static str = "SourcePath";
+}
+impl crate::vectors::Sample for SourcePath {
+    fn sample(g: &mut crate::vectors::Gen) -> Self {
+        Self(format!("workspace-{}/Cargo.toml", g.below(100)))
+    }
+}
+
 wire_struct! {
     /// What the native side of a build is: everything outside blaze that changes what is linked or
     /// how a program runs. An executor serves a job only on an equal platform.
@@ -19,6 +239,10 @@ wire_struct! {
         3 => libc: Option<(String, String)>,
         4 => linker: (String, String, Digest),
         5 => cpu: String,
+        6 => cc: Option<(String, String, Digest)>,
+        7 => cxx: Option<(String, String, Digest)>,
+        8 => ar: Option<(String, String, Digest)>,
+        9 => native_root: Option<Digest>,
     }
 }
 
@@ -50,18 +274,178 @@ wire_struct! {
     /// A build after cargo's configuration, workspace, feature and profile resolution: what
     /// `cargo blaze <command>` would do, with nothing left to the worker's environment.
     BuildSpec {
+        validate validate_build_paths,
+        sample sample_build_env,
         0 => source: SourceRef,
         1 => lock: Digest,
         2 => units: Vec<UnitSpec>,
         3 => asked: Set<u32>,
         4 => profile: ProfileSpec,
         5 => platform: Digest,
-        6 => rustflags: Vec<String>,
-        7 => config_env: Set<(String, String)>,
-        8 => script_env: Set<(String, String)>,
-        9 => cwd: String,
+        6 => rustflags: Vec<InputText>,
+        7 => config_env: Set<(String, ConfigEnvValue)>,
+        8 => script_env: Set<(String, ConfigEnvValue)>,
+        9 => cwd: SourcePath,
         10 => command: Command,
         11 => toolchain: StoreIdentity,
+        12 => workspace_manifest: SourcePath,
+    }
+}
+
+fn validate_build_paths(spec: &BuildSpec) -> Result<(), crate::Error> {
+    validate_tagged_env(&spec.config_env, false)?;
+    validate_tagged_env(&spec.script_env, true)?;
+    if !spec.workspace_manifest.is_cargo_manifest() {
+        return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at: 0 });
+    }
+    Ok(())
+}
+
+fn sample_build_env(spec: &mut BuildSpec) {
+    spec.config_env = Set::new(
+        spec.config_env
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (format!("CONFIG_{i}"), v.clone()))
+            .collect(),
+    );
+    spec.script_env = Set::new(
+        spec.script_env
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                (
+                    format!("SCRIPT_{i}"),
+                    match v {
+                        ConfigEnvValue::WorkspaceRelative(path) => {
+                            ConfigEnvValue::Literal(path.as_str().to_owned().into())
+                        }
+                        value => value.clone(),
+                    },
+                )
+            })
+            .collect(),
+    );
+}
+
+fn validate_env_name(name: &str) -> Result<(), crate::Error> {
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(path_error());
+    }
+    Ok(())
+}
+fn validate_tagged_env(
+    env: &Set<(String, ConfigEnvValue)>,
+    ambient: bool,
+) -> Result<(), crate::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in env.iter() {
+        validate_env_name(name)?;
+        if !seen.insert(name) {
+            return Err(path_error());
+        }
+        if ambient && matches!(value, ConfigEnvValue::WorkspaceRelative(_)) {
+            return Err(path_error());
+        }
+        if matches!(value,ConfigEnvValue::Literal(text) if text.0.contains('\0')) {
+            return Err(path_error());
+        }
+    }
+    Ok(())
+}
+fn validate_text_env(env: &Set<(String, String)>) -> Result<(), crate::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in env.iter() {
+        validate_env_name(name)?;
+        if value.contains('\0') || !seen.insert(name) {
+            return Err(path_error());
+        }
+    }
+    Ok(())
+}
+
+wire_enum! {
+    /// Schema 2 preserves whether configuration text is literal or a workspace-relative path.
+    ConfigEnvValue {
+        Literal => 0 (EnvText),
+        WorkspaceRelative => 1 (SourcePath),
+        Native => 2 (NativeValue),
+    }
+}
+
+impl ConfigEnvValue {
+    /// Render the value for a worker at the selected workspace, without guessing from its text.
+    pub fn materialize(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<std::ffi::OsString, crate::Error> {
+        match self {
+            Self::Literal(value) => {
+                if value.0.contains('\0') {
+                    return Err(path_error());
+                }
+                Ok(value.0.clone().into())
+            }
+            Self::WorkspaceRelative(path) => Ok(workspace.join(path.to_native()?).into_os_string()),
+            Self::Native(bytes) => {
+                if bytes.0.contains(&0) || std::str::from_utf8(&bytes.0).is_ok() {
+                    return Err(path_error());
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+                    Ok(std::ffi::OsString::from_vec(bytes.0.clone()))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(std::ffi::OsString::from(
+                        String::from_utf8(bytes.0.clone()).map_err(|_| path_error())?,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Its logical text, for diagnostics; this alone does not preserve its semantics.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Literal(value) => &value.0,
+            Self::WorkspaceRelative(path) => path.as_str(),
+            Self::Native(_) => "<native bytes>",
+        }
+    }
+
+    /// Keep UTF-8's existing text encoding, and encode other native Unix values as bytes.
+    pub fn from_native(value: &std::ffi::OsStr) -> Self {
+        if let Some(text) = value.to_str() {
+            return Self::Literal(EnvText(text.to_owned()));
+        }
+        Self::Native(NativeValue(value.as_encoded_bytes().to_vec()))
+    }
+}
+
+/// Message-bounded, NUL-free native Unix environment bytes. Not an arbitrary blob.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeValue(pub Vec<u8>);
+impl Wire for NativeValue {
+    fn encode(&self, e: &mut crate::Encoder) {
+        e.bytes(&self.0);
+    }
+    fn decode(r: &mut crate::Reader<'_>) -> Result<Self, crate::Error> {
+        let at = r.position();
+        let bytes = r.input_bytes()?;
+        if bytes.contains(&0) || std::str::from_utf8(bytes).is_ok() {
+            return Err(crate::Error { kind: crate::ErrorKind::InvalidPath, at });
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+}
+impl Named for NativeValue {
+    const NAME: &'static str = "NativeValue";
+}
+impl crate::vectors::Sample for NativeValue {
+    fn sample(g: &mut crate::Gen) -> Self {
+        Self(vec![b'n', 0x80 + (g.below(128) as u8)])
     }
 }
 
@@ -71,7 +455,7 @@ wire_struct! {
         0 => package: (String, String, Digest),
         1 => target: (u8, String),
         2 => features: Set<String>,
-        3 => cfg: Set<String>,
+        3 => cfg: Set<InputText>,
         4 => edition: u16,
         5 => deps: Set<(u32, String)>,
         6 => test: bool,
@@ -93,6 +477,8 @@ wire_struct! {
         7 => split_debuginfo: u8,
         8 => backend: u8,
         9 => mir_opt: u8,
+        10 => backend_opt: u8,
+        11 => backend_emit: u8,
     }
 }
 
@@ -118,6 +504,8 @@ wire_enum! {
 wire_struct! {
     /// What a test run is asked to do. A timeout schedules, and is in the job request, not here.
     RunSpec {
+        validate validate_run_env,
+        sample sample_run_env,
         0 => filters: Vec<String>,
         1 => exact: bool,
         2 => skip: Vec<String>,
@@ -127,7 +515,17 @@ wire_struct! {
         6 => test_threads: Option<u32>,
         7 => harness_args: Vec<String>,
         8 => env: Set<(String, String)>,
+        9 => doc: u8,
     }
+}
+
+fn validate_run_env(run: &RunSpec) -> Result<(), crate::Error> {
+    validate_text_env(&run.env)
+}
+fn sample_run_env(run: &mut RunSpec) {
+    run.env = Set::new(
+        run.env.iter().enumerate().map(|(i, (_, v))| (format!("ENV_{i}"), v.clone())).collect(),
+    );
 }
 
 wire_enum! {
@@ -185,7 +583,7 @@ impl CrateRecord {
     }
 
     /// The signature of this record under `key`: Ed25519 over
-    /// `"blaze/sig/CrateRecord/v1" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
+    /// `"blaze/sig/CrateRecord/v4" ‖ 0x00 ‖ `[`signed_bytes`](CrateRecord::signed_bytes), the
     /// domain separation every other signature of the schema uses.
     pub fn sign(&self, key: &ed25519_dalek::SigningKey) -> [u8; 64] {
         use ed25519_dalek::Signer as _;
@@ -445,6 +843,8 @@ wire_struct! {
 wire_struct! {
     /// What a test program needs to run on a machine that did not build it, by digest.
     RuntimeBundle {
+        validate validate_runtime_env,
+        sample sample_runtime_env,
         0 => program: Digest,
         1 => programs: Set<(String, Digest)>,
         2 => libraries: Set<(String, Digest)>,
@@ -452,6 +852,15 @@ wire_struct! {
         4 => cwd: String,
         5 => env: Set<(String, String)>,
     }
+}
+
+fn validate_runtime_env(bundle: &RuntimeBundle) -> Result<(), crate::Error> {
+    validate_text_env(&bundle.env)
+}
+fn sample_runtime_env(bundle: &mut RuntimeBundle) {
+    bundle.env = Set::new(
+        bundle.env.iter().enumerate().map(|(i, (_, v))| (format!("ENV_{i}"), v.clone())).collect(),
+    );
 }
 
 wire_struct! {
@@ -591,7 +1000,7 @@ wire_struct! {
         1 => version: String,
         2 => target: (u8, String),
         3 => features: Set<String>,
-        4 => cfg: Set<String>,
+        4 => cfg: Set<InputText>,
         5 => edition: u16,
         6 => deps: Set<(u32, String)>,
         7 => test: bool,
@@ -605,9 +1014,10 @@ wire_struct! {
     FrontEndKeyInput {
         0 => units: Vec<FrontEndUnit>,
         1 => lock: Digest,
-        2 => cfg_rustflags: Set<String>,
+        2 => cfg_rustflags: Set<InputText>,
         3 => toolchain: StoreIdentity,
         4 => triple: String,
+        5 => workspace_manifest: SourcePath,
     }
 }
 
@@ -618,8 +1028,9 @@ wire_struct! {
         1 => asked: Set<(String, String)>,
         2 => profiles: Vec<ProfileSpec>,
         3 => platform: Digest,
-        4 => rustflags: Set<String>,
+        4 => rustflags: Set<InputText>,
         5 => toolchain: StoreIdentity,
+        6 => workspace_manifest: SourcePath,
     }
 }
 

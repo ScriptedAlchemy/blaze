@@ -51,6 +51,9 @@ struct Described {
     compiled_macro: bool,
     /// The dep-info of the library rustc compiled of it, and the directory its paths are from.
     inputs: Option<(PathBuf, PathBuf)>,
+    /// The directory the build script of its package wrote to, which its `OUT_DIR` need not
+    /// name: a script renames the variable with `cargo:rustc-env=OUT_DIR=...`.
+    out_dir: Option<PathBuf>,
 }
 
 /// What a build makes of the first crate of its description.
@@ -203,6 +206,7 @@ fn compile_in(
         proc_macro: None,
         compiled_macro: made.proc_macro,
         inputs: None,
+        out_dir: None,
     };
     crates.push(first);
     let mut linked = BTreeMap::new();
@@ -264,26 +268,28 @@ fn build(
     let private: Value = serde_json::from_str(described).map_err(|it| it.to_string())?;
     let private = crate::compiler_json::write(&project, &private).map_err(|it| it.to_string())?;
     let executable = std::env::current_exe().map_err(|it| it.to_string())?;
-    let mut ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
+    let ra_jit = build_command(&executable, &project, dir, made, store, shipped, asked);
+    let said = run_build(ra_jit, &private, dir)?;
+    complete(&said)?;
+    Ok(said)
+}
+
+/// Runs the build `ra_jit`, sending it the private project `private`: what it said, or why
+/// it did not build, in its own words when it stopped before reading the project.
+fn run_build(mut ra_jit: Command, private: &[u8], dir: &Path) -> Result<String, String> {
     ra_jit.env("RA_JIT_PROJECT_STDIN", "1").stdin(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = ra_jit.spawn().map_err(|it| format!("ra-jit did not run: {it}"))?;
-    let sent = child.stdin.take().ok_or("project pipe")?.write_all(&private);
-    if let Err(error) = sent {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("sending owned project: {error}"));
-    }
-    let built = child.wait_with_output().map_err(|it| format!("waiting for ra-jit: {it}"))?;
+    let child = ra_jit.spawn().map_err(|it| format!("ra-jit did not run: {it}"))?;
+    let built = crate::child::feed(child, private)
+        .map_err(|it| format!("sending ra-jit the owned project: {it}"))?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
-        if let Some(at) = said.find("error:") {
+        if let Some(at) = said.find("error:").into_iter().chain(said.find("Error:")).min() {
             return Err(format!("ra-jit did not build it ({}):\n{}", built.status, &said[at..]));
         }
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
         return Err(format!("ra-jit did not build it ({}): {last}", built.status));
     }
-    complete(&said)?;
     Ok(said)
 }
 
@@ -320,11 +326,29 @@ fn build_command(
     if made.proc_macro {
         ra_jit.args(["--crate", "proc_macro", "--shared"]);
     }
+    // Replay has already selected the backend and compiler policy from the
+    // saved request. The executor's ambient settings must not replace them.
+    let replay = asked.is_some_and(|(env, _)| {
+        env.iter().any(|(name, value)| name == "RA_JIT_SPEC_REPLAY" && value == "1")
+    });
+    let setting = |name: &str| {
+        if replay {
+            asked.and_then(|(env, _)| {
+                env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+            })
+        } else {
+            std::env::var_os(name)
+        }
+    };
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
     let not_the_builds = |text: &str| {
         let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO"
+        cargos
+            || text.starts_with("RUSTC_")
+            || text.starts_with("RA_JIT_")
+            || text.starts_with("BLAZE_")
+            || text == "CARGO"
     };
     if let Some((env, inputs)) = asked {
         ra_jit.env_clear();
@@ -341,13 +365,28 @@ fn build_command(
         }
     }
     for kept in ["RA_JIT_MEMORY_MAX", "RA_JIT_OWN_BASE_MEMORY", "RA_JIT_SPARE", "RA_JIT_RUN_ID"] {
-        if let Some(value) = std::env::var_os(kept).filter(|_| asked.is_some()) {
+        if let Some(value) = setting(kept).filter(|_| asked.is_some()) {
             ra_jit.env(kept, value);
         }
     }
     for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
-        if let Some(value) = std::env::var_os(kept) {
+        if let Some(value) = setting(kept) {
             ra_jit.env(kept, value);
+        }
+    }
+    if replay {
+        for kept in [
+            "RA_JIT_SPEC_REPLAY",
+            "RA_JIT_OPT",
+            "RA_JIT_EMIT",
+            "RA_JIT_MIR_OPT",
+            "RA_JIT_WORKER_MEMORY",
+            "RA_JIT_MEMORY_RESERVE",
+            "RA_JIT_PRESSURE_GRACE_SECS",
+        ] {
+            if let Some(value) = setting(kept) {
+                ra_jit.env(kept, value);
+            }
         }
     }
     if let Some(store) = store {
@@ -386,6 +425,7 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
         proc_macro: None,
         compiled_macro: false,
         inputs: None,
+        out_dir: None,
     };
     let exe = dir.join("build-script-build");
     let made = Made { name: SCRIPT, proc_macro: false, dep_info: exe.with_extension("d"), exe };
@@ -423,6 +463,11 @@ pub(crate) fn planned_description(sysroot: &Path, crates: Vec<Planned>) -> Strin
     planned_source_description(sysroot, crates, false)
 }
 
+pub(crate) struct SourceNaming<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) members: &'a [bool],
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SourceMode<'a> {
     Legacy,
@@ -436,11 +481,12 @@ pub(crate) enum SourceMode<'a> {
         units: Option<&'a BTreeMap<u32, blaze_wire::native::Unit>>,
         runtime: Option<&'a Value>,
         bindings: Option<&'a Value>,
+        naming: Option<&'a SourceNaming<'a>>,
     },
 }
 
 pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<String, String> {
-    let (profile, native, runtime, bindings) = match mode {
+    let (profile, native, runtime, bindings, naming) = match mode {
         SourceMode::Legacy => return Ok(described),
         SourceMode::Cargo { root, members, env } => {
             if !root.is_absolute() {
@@ -471,17 +517,17 @@ pub(crate) fn with_mode(described: String, mode: SourceMode<'_>) -> Result<Strin
                 );
                 source["is_workspace_member"] = json!(members[at]);
             }
-            compiler_context(&mut project, None, Some(&units), None, None)?;
+            compiler_context(&mut project, None, Some(&units), None, None, None)?;
             project["blaze_compiler_source_root"] =
                 json!({"version": 1, "unit": 0, "path": crate::compiler_json::path(root)});
             return serde_json::to_string(&project).map_err(|it| it.to_string());
         }
-        SourceMode::Captured { profile, units, runtime, bindings } => {
-            (profile, units, runtime, bindings)
+        SourceMode::Captured { profile, units, runtime, bindings, naming } => {
+            (profile, units, runtime, bindings, naming)
         }
     };
     let mut project: Value = serde_json::from_str(&described).map_err(|it| it.to_string())?;
-    compiler_context(&mut project, profile, native, runtime, bindings)?;
+    compiler_context(&mut project, profile, native, runtime, bindings, naming)?;
     crate::dep_info::ensure_replay_key(&mut project).map_err(|error| error.to_string())?;
     serde_json::to_string(&project).map_err(|it| it.to_string())
 }
@@ -492,8 +538,16 @@ fn compiler_context(
     native: Option<&BTreeMap<u32, blaze_wire::native::Unit>>,
     runtime: Option<&Value>,
     bindings: Option<&Value>,
+    naming: Option<&SourceNaming<'_>>,
 ) -> Result<(), String> {
     project["compiler_mode"] = Value::Bool(true);
+    if let Some(naming) = naming {
+        if !naming.root.is_absolute() {
+            return Err("compiler source naming root is not absolute".into());
+        }
+        project["blaze_compiler_source_root"] =
+            json!({"version": 1, "unit":0, "path": crate::compiler_json::path(naming.root)});
+    }
     if let Some(runtime) = runtime {
         project["blaze_owned_proc_macro_server"] = runtime.clone();
     }
@@ -507,6 +561,10 @@ fn compiler_context(
         project["crates"].as_array_mut().ok_or("captured source crates")?.iter_mut().enumerate()
     {
         let kind = if at == 0 && source["is_proc_macro"] != true { "bin" } else { "lib" };
+        if let Some(naming) = naming {
+            source["is_workspace_member"] =
+                (*naming.members.get(at).ok_or("missing compiler source membership")?).into();
+        }
         if let Some(native) = native {
             let id = u32::try_from(at).map_err(|_| "too many captured compiler units")?;
             let unit = native.get(&id).ok_or("missing captured compiler context")?;
@@ -615,6 +673,7 @@ fn planned_source_description(sysroot: &Path, crates: Vec<Planned>, macro_root: 
             proc_macro: it.proc_macro,
             compiled_macro: macro_root && at == 0,
             inputs: None,
+            out_dir: it.out_dir,
         })
         .collect();
     source_description(sysroot, &crates, true)
@@ -696,6 +755,7 @@ fn add(
         proc_macro: library.is_none().then(|| path.to_owned()),
         compiled_macro: false,
         inputs: Some((info, record.cwd.clone())),
+        out_dir: None,
     });
     // A proc macro's libraries are described too, though the library of it is what
     // expands: what the store keeps of the script is keyed by them.
@@ -722,6 +782,7 @@ fn described(krate: &Described, member: bool, native: bool) -> Value {
         "is_workspace_member": member,
         "is_proc_macro": krate.proc_macro.is_some() || krate.compiled_macro,
         "proc_macro_dylib_path": krate.proc_macro.as_deref().map(path),
+        "blaze_build_script_out_dir": krate.out_dir.as_deref().map(path),
     })
 }
 
@@ -808,6 +869,7 @@ mod tests {
                 units: Some(&native),
                 runtime: None,
                 bindings: None,
+                naming: None,
             },
         )
         .unwrap();
@@ -844,6 +906,31 @@ mod tests {
         }
     }
 
+    /// The description names where a script wrote apart from its crate's `OUT_DIR`, which
+    /// the script renames with `cargo:rustc-env`; the link finds what it printed by the former.
+    #[test]
+    fn a_planned_crate_describes_its_script_out_dir_apart_from_the_variable() {
+        let source = |name: &str, out_dir: Option<PathBuf>| Planned {
+            out_dir,
+            workspace_member: false,
+            name: name.into(),
+            root: std::env::temp_dir().join(format!("{name}.rs")),
+            edition: "2021".into(),
+            cfg: Vec::new(),
+            codegen_flags: Vec::new(),
+            env: [("OUT_DIR".to_owned(), "/native-script-marker".to_owned())].into(),
+            deps: Vec::new(),
+            proc_macro: None,
+        };
+        let out = std::env::temp_dir().join("build/native-0123/out");
+        let crates = vec![source("build_script_build", None), source("native", Some(out.clone()))];
+        let plain: Value =
+            serde_json::from_str(&planned_description(Path::new("/sysroot"), crates)).unwrap();
+        assert_eq!(plain["crates"][0]["blaze_build_script_out_dir"], Value::Null);
+        assert_eq!(plain["crates"][1]["blaze_build_script_out_dir"], json!(out));
+        assert_eq!(plain["crates"][1]["env"]["OUT_DIR"], "/native-script-marker");
+    }
+
     #[test]
     fn captured_descriptions_preserve_authoritative_cfg_and_target_kinds() {
         let source = |name: &str, deps| Planned {
@@ -870,6 +957,7 @@ mod tests {
                     units: None,
                     runtime: None,
                     bindings: None,
+                    naming: None,
                 },
             )
             .unwrap(),
@@ -884,13 +972,49 @@ mod tests {
         let captured: Value = serde_json::from_str(
             &with_mode(
                 macro_graph,
-                SourceMode::Captured { profile: None, units: None, runtime: None, bindings: None },
+                SourceMode::Captured {
+                    profile: None,
+                    units: None,
+                    runtime: None,
+                    bindings: None,
+                    naming: None,
+                },
             )
             .unwrap(),
         )
         .unwrap();
         assert_eq!(captured["crates"][0]["build"]["target_kind"], "lib");
         assert_eq!(captured["crates"][0]["is_proc_macro"], true);
+    }
+
+    #[test]
+    fn captured_source_naming_preserves_workspace_and_external_producer_paths() {
+        let naming =
+            SourceNaming { root: Path::new("/original/workspace"), members: &[true, false] };
+        let project = json!({"crates": [
+            {"display_name": "build_script_build", "root_module": "/original/workspace/app/build.rs", "is_proc_macro": false},
+            {"display_name": "helper", "root_module": "/registry/helper/src/lib.rs", "is_proc_macro": false},
+        ]});
+        let described = with_mode(
+            project.to_string(),
+            SourceMode::Captured {
+                profile: None,
+                units: None,
+                runtime: None,
+                bindings: None,
+                naming: Some(&naming),
+            },
+        )
+        .unwrap();
+        let project: Value = serde_json::from_str(&described).unwrap();
+        assert_eq!(
+            project["blaze_compiler_source_root"],
+            json!({"version":1,"unit":0,"path":"/original/workspace"})
+        );
+        assert_eq!(project["crates"][0]["root_module"], "/original/workspace/app/build.rs");
+        assert_eq!(project["crates"][0]["is_workspace_member"], true);
+        assert_eq!(project["crates"][1]["is_workspace_member"], false);
+        assert_eq!(project["crates"][1]["root_module"], "/registry/helper/src/lib.rs");
     }
 
     #[test]
@@ -1024,6 +1148,68 @@ mod tests {
     }
 
     #[test]
+    fn saved_producer_command_keeps_the_captured_compiler_policy() {
+        let dir = Path::new("/producer");
+        let made = Made {
+            name: "derive",
+            proc_macro: true,
+            exe: dir.join("libderive.dylib"),
+            dep_info: dir.join("derive.d"),
+        };
+        // Both backends must be read from this snapshot, not from the process
+        // running this test. No global environment mutation is needed.
+        for backend in ["cranelift", "llvm"] {
+            let policy = [
+                ("RA_JIT_SPEC_REPLAY", "1"),
+                ("RA_JIT_BACKEND", backend),
+                ("RA_JIT_OPT", "2"),
+                ("RA_JIT_EMIT", "fast"),
+                ("RA_JIT_MIR_OPT", "0"),
+                ("RA_JIT_STD_FROM", "off"),
+                ("RA_JIT_PROC_MACRO_SERVER", "0"),
+                ("RA_JIT_MEMORY_MAX", "8192M"),
+                ("RA_JIT_OWN_BASE_MEMORY", "6144M"),
+                ("RA_JIT_WORKER_MEMORY", "4096M"),
+                ("RA_JIT_MEMORY_RESERVE", "256M"),
+                ("RA_JIT_PRESSURE_GRACE_SECS", "30"),
+                ("RA_JIT_SPARE", "0"),
+                ("RA_JIT_RUN_ID", "saved-producer"),
+            ];
+            let mut env: Vec<(OsString, OsString)> =
+                policy.iter().map(|(name, value)| ((*name).into(), (*value).into())).collect();
+            // BLAZE aliases are command controls, not a second source of replay
+            // policy. They must not shadow the selected RA_JIT values at startup.
+            env.push(("BLAZE_BACKEND".into(), "invalid".into()));
+            env.push(("BLAZE_OPT".into(), "invalid".into()));
+            env.push(("PATH".into(), "/tools".into()));
+            let command = build_command(
+                Path::new("/blaze/ra-jit"),
+                &dir.join("rust-project.json"),
+                dir,
+                &made,
+                None,
+                true,
+                Some((&env, &dir.join("producer.inputs"))),
+            );
+            let actual = command.get_envs().collect::<BTreeMap<_, _>>();
+            for (name, value) in policy {
+                assert_eq!(
+                    actual.get(OsStr::new(name)).copied().flatten(),
+                    Some(OsStr::new(value)),
+                    "{name} for {backend}"
+                );
+            }
+            for name in ["RA_JIT_HOME", "BLAZE_BACKEND", "BLAZE_OPT"] {
+                assert!(actual.get(OsStr::new(name)).copied().flatten().is_none(), "{name}");
+            }
+            assert_eq!(
+                actual.get(OsStr::new("PATH")).copied().flatten(),
+                Some(OsStr::new("/tools"))
+            );
+        }
+    }
+
+    #[test]
     fn a_variable_read_as_rustc_would_read_it() {
         let info = crate::dep_info::DepInfo {
             files: Vec::new(),
@@ -1047,5 +1233,59 @@ mod tests {
         assert!(Asked { args: &optimized, cwd }.cfg().is_empty());
         let told = args(&["-C", "opt-level=3", "-Cdebug-assertions=on"]);
         assert_eq!(Asked { args: &told, cwd }.cfg(), ["debug_assertions"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_producer_failure_keeps_its_error_context_and_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fails = Command::new("sh");
+        fails.args([
+            "-c",
+            "printf '%s\\n' 'progress' 'Error: loading /source/toolchain' '' 'Caused by:' '    No such file or directory (os error 2)' >&2; exit 1",
+        ]);
+        let failed = run_build(fails, b"", dir.path()).unwrap_err();
+        assert!(failed.contains("Error: loading /source/toolchain"), "{failed}");
+        assert!(
+            failed.contains("Caused by:\n    No such file or directory (os error 2)"),
+            "{failed}"
+        );
+        assert!(!failed.contains("progress"), "{failed}");
+    }
+
+    /// A producer build that ends before it reads its project is reported with what it
+    /// said, even under `SIGPIPE`'s default action (`end_with_reader`), instead of ending
+    /// the process with the signal. The test binary is that process, run apart with the
+    /// variable.
+    #[test]
+    #[cfg(unix)]
+    fn a_build_that_stops_reading_is_reported_not_a_signal() {
+        const PARENT: &str = "BLAZE_TEST_BUILD_STOPS_READING";
+        if std::env::var_os(PARENT).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cargo::own_script::tests::a_build_that_stops_reading_is_reported_not_a_signal",
+                    "--nocapture",
+                ])
+                .env(PARENT, "1")
+                .env("RUST_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(said.contains("1 passed; 0 failed"), "{said}");
+            return;
+        }
+        crate::end_with_reader();
+        let dir = std::env::temp_dir().join(format!("blaze-stops-reading-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut stops = Command::new("sh");
+        stops.args(["-c", "echo 'error: no proc_macro crate for saved_producer_mac' >&2; exit 1"]);
+        // More than a pipe holds, so the write cannot finish before the child is gone.
+        let failed = run_build(stops, &vec![b' '; 8 << 20], &dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failed.starts_with("ra-jit did not build it (exit status: 1)"), "{failed}");
+        assert!(failed.contains("error: no proc_macro crate for saved_producer_mac"), "{failed}");
     }
 }

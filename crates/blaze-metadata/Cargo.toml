@@ -13,6 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# A developer-only Cargo oracle lives with the harnesses, outside the compiler code.
+[[example]]
+name = "units_expected"
+path = "../../harness/dist/units_expected.rs"
+
 [dependencies]
 anyhow.workspace = true
 rustc-hash.workspace = true
@@ -20,6 +25,8 @@ blaze-manifest.workspace = true
 blaze-registry = { path = "../blaze-registry" }
 blaze-resolve = { path = "../blaze-resolve" }
 cargo-util-schemas = "=0.14.3"
+# The package patterns of `-p` and `--exclude` and the target patterns of `--bin` and the like.
+glob = "0.3.3"
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -1,0 +1,321 @@
+{
+ "runs": [
+  {
+   "args": [
+    "build"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "a"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "a",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--exclude",
+    "a",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--exclude",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--all"
+   ]
+  },
+  {
+   "args": [
+    "check"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "a"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "-p",
+    "a",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--workspace",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--workspace",
+    "--exclude",
+    "a",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--workspace",
+    "--exclude",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "check",
+    "--all"
+   ]
+  },
+  {
+   "args": [
+    "test"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "a"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "a",
+    "-p",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace",
+    "--exclude",
+    "a",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--workspace",
+    "--exclude",
+    "b"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "--all"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "a@0.1.0"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "a*"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "[ab]"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "-p",
+    "a"
+   ]
+  },
+  {
+   "args": [
+    "test",
+    "-p",
+    "c",
+    "--all-targets"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "c",
+    "--lib"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "c",
+    "--bin",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "nonexistent"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--exclude",
+    "c"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--exclude",
+    "nonexistent"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "--workspace",
+    "--exclude",
+    "z*"
+   ]
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "a",
+    "--release"
+   ]
+  }
+ ]
+}

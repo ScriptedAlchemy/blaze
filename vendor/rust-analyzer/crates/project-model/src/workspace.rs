@@ -1184,6 +1184,7 @@ fn project_json_to_crate_graph(
                     target,
                     codegen_flags,
                     blaze_native_unit,
+                    blaze_build_script_out_dir,
                     env,
                     invalid_env,
                     crate_attrs,
@@ -1289,6 +1290,10 @@ fn project_json_to_crate_graph(
                 );
                 crate_graph.set_codegen_flags(crate_graph_crate_id, codegen_flags.clone());
                 crate_graph.set_native_unit(crate_graph_crate_id, *blaze_native_unit);
+                crate_graph.set_build_script_out_dir(
+                    crate_graph_crate_id,
+                    blaze_build_script_out_dir.clone(),
+                );
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),
@@ -1832,6 +1837,10 @@ fn add_target_crate_root(
         kind,
         proc_macro_cwd,
         crate_ws_data,
+    );
+    crate_graph.set_build_script_out_dir(
+        crate_id,
+        build_data.and_then(|(output, _)| output.out_dir.clone()),
     );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
         let proc_macro = match build_data {
