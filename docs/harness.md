@@ -456,10 +456,10 @@ protocol tests replay the `dist` set, and the C2 groups (`buildspec.py`'s fixtur
 `saved_spec.py` under each backend) run against the bundle's release CLI and owned macro
 runtime. `pr.yaml` has two tiers, like ra-jit.yaml: a pull request (or `gh workflow run pr.yaml
 --ref <branch> -f tier=fast` on a branch without one; a push to any other branch starts nothing)
-runs the **fast tier**, the C2 groups on Linux alone, packed into three jobs;
+runs the **fast tier**, the C2 groups on Linux alone, packed into five jobs;
 the **full tier**, nightly, by hand (`gh workflow run pr.yaml --ref <branch> -f tier=full`)
 and on a push to `dist/main` or `dist/c4-keys`, runs every area and every C2 group on Linux
-(one per job) and macOS (packed into four jobs), and opens an issue when it fails, or adds to
+(one per job) and macOS (six jobs), and opens an issue when it fails, or adds to
 the one still open. macOS C2 coverage is therefore nightly and on push, not per pull request:
 an owner-accepted trade-off for the fork's five macOS runners. `bundle-check.yaml` carries the
 tracing-integrity and platform-contract checks once per platform, and the required context
@@ -526,9 +526,10 @@ a fixture group by its own name (`ws`, `harness`...), `--ci-group` one of the fi
 
 **Tiers.** A pull request into `dist/main` or `dist/c4-keys` that touches the dist area's paths
 (`.github/ci/areas.json`) runs the **fast tier**: all seven groups on Linux alone, packed into
-three jobs, `C2 runtime (ubuntu-24.04, basic)`, `(…, commands nested)` and `(…, profiles-native
-workspace saved-cranelift saved-llvm)`. The **full tier** runs every group on Linux, one per
-job, and on macOS packed into four jobs: nightly, on a push to `dist/main` or `dist/c4-keys`, and
+five jobs, `C2 runtime (ubuntu-24.04, basic)`, `(…, commands nested)`, `(…, profiles-native
+workspace)`, `(…, saved-cranelift)` and `(…, saved-llvm)`. The **full tier** runs every group
+on Linux, one per job, and on macOS in six jobs (`workspace nested` shares one; macOS C2 jobs
+get 360 minutes, Linux 180): nightly, on a push to `dist/main` or `dist/c4-keys`, and
 by hand on any branch:
 
     gh workflow run pr.yaml -R ScriptedAlchemy/blaze --ref <branch> -f tier=full

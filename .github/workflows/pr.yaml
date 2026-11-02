@@ -178,9 +178,9 @@ jobs:
   # (workspace and nested together, the shortest two). Packing workspace, nested,
   # saved-cranelift and saved-llvm into one macOS job hit the 180-minute limit on
   # dist/main at 0b9258609 midway through saved-cranelift; macOS runs these lanes 1.4
-  # to 2.4 times slower than Linux, where saved-llvm alone takes 130 minutes. Six
-  # jobs and the bundle check exceed the fork's five concurrent macOS runners, so one
-  # queues: slower, but every lane gets a verdict.
+  # to 2.5 times slower than Linux, where saved-llvm alone takes 130 minutes. Six
+  # jobs and the bundle check exceed the fork's five concurrent macOS runners, so two
+  # queue; the longest lanes are listed first so they start first.
   dist-linux:
     name: dist linux-x64
     needs: [changes, build-linux]
@@ -201,7 +201,7 @@ jobs:
       platform: macos-arm64
       os: macos-15
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
-      lanes: '["basic", "profiles-native", "commands", "workspace nested", "saved-cranelift", "saved-llvm"]'
+      lanes: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
 
   # The required context `C2 runtime` (it replaces `C2 runtime (ubuntu-24.04)` and
   # `C2 runtime (macos-15)`: a pull request no longer reports macOS). It passes when every C2
