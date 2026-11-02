@@ -1305,6 +1305,9 @@ struct Lazy {
     runtime: Arc<Runtime>,
     /// Each pack and whether it arrived, once it was asked for.
     packs: Vec<(Digest, Listed, OnceLock<bool>)>,
+    // Packs omitted from the demand index because they were already installed.
+    // Eviction of one must invalidate that decision even when the manifest stays put.
+    present: Vec<(Digest, u64)>,
     holder: FxHashMap<[u8; 32], u32>,
 }
 
@@ -1315,7 +1318,16 @@ impl Lazy {
         let (store, remote) = (&shared.store, &shared.remote);
         let local = local_packs(&claim(store, false).await?)?;
         let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
-        let (missing, _) = manifest.missing(&local);
+        let present: Vec<_> = manifest
+            .0
+            .iter()
+            .filter(|(pack, listed)| {
+                local.contains(pack) && local_pack_is_present(store, pack, listed.size)
+            })
+            .map(|(pack, listed)| (*pack, listed.size))
+            .collect();
+        let installed = present.iter().map(|(pack, _)| *pack).collect();
+        let (missing, _) = manifest.missing(&installed);
         // A pack the store may not hold is not one to fetch, and the keys of them all are
         // kept in memory: no more of them than one object may be.
         let limit = limit_for(store).map_err(anyhow::Error::msg)?.unwrap_or(u64::MAX);
@@ -1338,6 +1350,7 @@ impl Lazy {
             remote: remote.clone(),
             runtime: shared.runtime.clone(),
             packs: Vec::new(),
+            present,
             holder: FxHashMap::default(),
         };
         let mut failed = 0;
@@ -1365,12 +1378,23 @@ impl Lazy {
         }
     }
 
+    /// A failed download or a locally removed/truncated pack needs a fresh lookup.
+    /// The keeper calls this at its existing throttled boundary, not on every cache hit.
+    fn needs_refresh(&self) -> bool {
+        self.present.iter().any(|(pack, size)| !local_pack_is_present(&self.store, pack, *size))
+            || self.packs.iter().any(|(pack, listed, arrived)| match arrived.get() {
+                Some(false) => true,
+                Some(true) => !local_pack_is_present(&self.store, pack, listed.size),
+                None => false,
+            })
+    }
+
     /// Whether the pack that holds `key` is in the store now. Called by the threads that
     /// compile, which wait here for the pack: the first to ask fetches it.
     fn fetch(&self, key: &[u8; 32]) -> bool {
         let Some(&at) = self.holder.get(key) else { return false };
         let (pack, listed, arrived) = &self.packs[at as usize];
-        *arrived.get_or_init(|| {
+        let fetched = *arrived.get_or_init(|| {
             let fetched =
                 self.runtime.block_on(fetch_pack(&self.remote, &self.store, pack, listed));
             match fetched {
@@ -1384,8 +1408,16 @@ impl Lazy {
                     false
                 }
             }
-        })
+        });
+        fetched && local_pack_is_present(&self.store, pack, listed.size)
     }
+}
+
+fn local_pack_is_present(store: &Path, pack: &Digest, size: u64) -> bool {
+    // The transfer layer still verifies the content hash; this is only a cheap
+    // presence check. The store rejects and removes same-sized corrupt contents.
+    std::fs::symlink_metadata(store.join(pack_file(pack)))
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == size)
 }
 
 #[cfg(test)]
