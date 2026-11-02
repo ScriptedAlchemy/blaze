@@ -410,6 +410,13 @@ impl Holder {
             return self
                 .stop(StopWhy::Protocol(format!("a grant of another lease: {grant:?}")), out);
         }
+        // Validate before handing indexes to a compiler. The wire set is sorted,
+        // but sorting alone does not exclude reversed, overlapping or foreign roots.
+        let valid_roots = Ranges::from_wire(&grant.roots)
+            .is_some_and(|ranges| ranges.iter().all(|(_, end)| end <= self.roots.count));
+        if !valid_roots {
+            return self.stop(StopWhy::Protocol("invalid granted root ranges".into()), out);
+        }
         let mut compile = Vec::new();
         let mut lost = BTreeMap::new();
         for name in grant.names.iter() {
@@ -443,6 +450,32 @@ impl Holder {
         }
         let (grant, lost) = (grant.clone(), lost.clone());
         let returned: BTreeSet<WorkName> = batch.returned_names.iter().copied().collect();
+        let granted_roots = Ranges::from_wire(&grant.roots).expect("validated root ranges");
+        let valid_returns = returned.len() == batch.returned_names.len()
+            && returned.iter().all(|name| {
+                !lost.contains_key(name) && grant.names.iter().any(|granted| granted == name)
+            })
+            && granted_roots.contains_all(&batch.returned_roots);
+        let expected_names =
+            grant.names.iter().filter(|name| !lost.contains_key(name) && !returned.contains(name));
+        let valid_items = valid_returns
+            && batch.roots.len() as u64 == granted_roots.len() - batch.returned_roots.len()
+            && batch.names.iter().map(|item| &item.name).eq(expected_names);
+        if !valid_items {
+            // An extra result used to disappear in the zip below. It may carry
+            // compiler-retained discoveries even though no valid report names it.
+            // Stop the holder and release all of that batch before publishing anything.
+            self.release(
+                batch
+                    .roots
+                    .iter()
+                    .chain(&batch.names)
+                    .flat_map(|item| item.found.iter().map(|found| found.name)),
+                out,
+            );
+            return self
+                .stop(StopWhy::Protocol("compiler batch does not cover its grant".into()), out);
+        }
         let mut compiled = batch.names.into_iter();
         let root_items = batch.roots.len();
         let mut items = batch.roots;
