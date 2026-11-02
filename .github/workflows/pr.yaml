@@ -8,7 +8,7 @@
 #   ci       whether everything that ran passed
 #
 # Two tiers, as ra-jit.yaml has them. The **fast tier** is a pull request's: the areas the diff
-# touches, and the C2 runtime groups on Linux alone, packed into three jobs. The **full tier**
+# touches, and the C2 runtime groups on Linux alone, packed into five jobs. The **full tier**
 # runs nightly, by hand (`-f tier=full`) and on a push to the integration branches dist/main and
 # dist/c4-keys: every area, and the C2 groups on Linux (one per job) and macOS (packed into four
 # jobs); when it fails it opens an issue, or adds to the one still open
@@ -169,12 +169,13 @@ jobs:
           fi
 
   # The distributed protocol's checks, in tiers. The fast tier (a pull request) runs the C2
-  # groups on Linux alone, packed into three jobs: the longest group, `basic`, took 93 min to a
-  # failure on PR18 and `commands` 65, so one job for all seven would run 4 to 5 hours, and three
-  # is the fewest where no job is longer than the longest group (basic | commands nested |
-  # profiles-native workspace saved-cranelift saved-llvm). The full tier runs every group on
-  # Linux, one per job, and on macOS packed into four, which with the bundle check is the fork's
-  # five concurrent macOS jobs.
+  # groups on Linux alone, packed into five jobs: basic | commands nested |
+  # profiles-native workspace | saved-cranelift | saved-llvm. The former four-lane
+  # group exceeded the 180-minute job limit on #39 and #50 after its first three
+  # lanes passed, cancelling saved-llvm without a test verdict. Keep all seven lanes
+  # and the same assertions, but give the costly saved backends independent budgets.
+  # The full tier runs every group on Linux, one per job, and on macOS packed into
+  # four, which with the bundle check is the fork's five concurrent macOS jobs.
   dist-linux:
     name: dist linux-x64
     needs: [changes, build-linux]
@@ -184,7 +185,7 @@ jobs:
       platform: linux-x64
       os: ubuntu-24.04
       bundle-sha256: ${{ needs.build-linux.outputs.sha256 }}
-      lanes: ${{ needs.changes.outputs.tier == 'full' && '["basic", "workspace", "commands", "profiles-native", "nested", "saved-cranelift", "saved-llvm"]' || '["basic", "commands nested", "profiles-native workspace saved-cranelift saved-llvm"]' }}
+      lanes: ${{ needs.changes.outputs.tier == 'full' && '["basic", "workspace", "commands", "profiles-native", "nested", "saved-cranelift", "saved-llvm"]' || '["basic", "commands nested", "profiles-native workspace", "saved-cranelift", "saved-llvm"]' }}
 
   dist-macos:
     name: dist macos-arm64
