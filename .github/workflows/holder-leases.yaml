@@ -4,12 +4,20 @@ on:
     paths:
       - crates/blaze-dist/src/**
       - crates/blaze-dist/tests/**
+      - crates/blaze-dist/Cargo.toml
+      - crates/blaze-wire/**
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/holder-leases.yaml
   push:
     branches: [dist/main]
     paths:
       - crates/blaze-dist/src/**
       - crates/blaze-dist/tests/**
+      - crates/blaze-dist/Cargo.toml
+      - crates/blaze-wire/**
+      - Cargo.toml
+      - Cargo.lock
   workflow_dispatch:
 permissions:
   contents: read

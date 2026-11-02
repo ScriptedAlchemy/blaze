@@ -9,9 +9,8 @@
 # them beside the lanes here.
 #
 # A C2 lane job runs a list of lanes (the list is pr.yaml's, per platform and tier): on a pull
-# request, Linux alone, the seven packed into three jobs; in the full tier (nightly, by hand, a
-# push to an integration branch) one per job on Linux and packed into four on macOS, within the
-# fork's 5 concurrent macOS jobs. A lane is a fixture group of harness/dist/buildspec.py (the
+# request, Linux alone, the seven in five jobs; in the full tier (nightly, by hand, a push to an
+# integration branch) one per job on Linux and six jobs on macOS (workspace and nested together). A lane is a fixture group of harness/dist/buildspec.py (the
 # local command differential against cargo) or a saved-spec execution under one backend.
 name: distributed protocol regressions
 
@@ -80,7 +79,9 @@ jobs:
       matrix:
         lanes: ${{ fromJSON(inputs.lanes) }}
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 180
+    # At macOS's measured slowdown (up to 2.5x Linux) saved-llvm alone takes about 330
+    # minutes and saved-cranelift past 180; 360 is a hosted runner's ceiling.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 360 || 180 }}
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
