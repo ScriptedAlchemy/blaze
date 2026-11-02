@@ -2,6 +2,10 @@
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
 //! (`expected.json`, written by `harness/resolve.py --fixtures`).
 
+#[path = "support/paths.rs"]
+#[allow(dead_code)]
+mod fixture_paths;
+
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::diagnostic::ManifestDiagnostic;
@@ -76,8 +80,7 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
         anyhow::Ok(String::from_utf8(out)?)
     })();
-    let root = root.display().to_string();
-    let home = home.canonicalize().unwrap().display().to_string();
+    let home = home.canonicalize().unwrap();
     let text = match result {
         Ok(json) => json,
         Err(err) => {
@@ -90,7 +93,7 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             String::from_utf8(out).unwrap()
         }
     };
-    text.replace(&root, "$ROOT").replace(&home, "$CARGO_HOME") + "\n"
+    fixture_paths::normalize(&text, &root, &home) + "\n"
 }
 
 #[test]

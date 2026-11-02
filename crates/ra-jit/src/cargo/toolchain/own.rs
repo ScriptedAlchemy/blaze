@@ -629,8 +629,8 @@ mod tests {
             "rustc-9.9.9-test-host",
             "rustc",
             &[
-                ("bin/rustc", "#!/bin/sh\n"),
-                ("bin/cargo", "#!/bin/sh\n"),
+                (&format!("bin/rustc{}", std::env::consts::EXE_SUFFIX), "#!/bin/sh\n"),
+                (&format!("bin/cargo{}", std::env::consts::EXE_SUFFIX), "#!/bin/sh\n"),
                 ("lib/librustc_driver-0.so", ""),
                 ("share/doc/rust/README.md", "read me\n"),
             ],
@@ -671,7 +671,10 @@ mod tests {
         assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-src\n");
         assert_eq!(
             read("lib/rustlib/manifest-rustc-test-host"),
-            "file:bin/rustc\nfile:bin/cargo\nfile:lib/librustc_driver-0.so\nfile:share/doc/rust/README.md\n"
+            format!(
+                "file:bin/rustc{exe}\nfile:bin/cargo{exe}\nfile:lib/librustc_driver-0.so\nfile:share/doc/rust/README.md\n",
+                exe = std::env::consts::EXE_SUFFIX
+            )
         );
         assert_eq!(
             read("lib/rustlib/manifest-rust-src"),

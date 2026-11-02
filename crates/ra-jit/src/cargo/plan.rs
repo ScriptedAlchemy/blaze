@@ -616,7 +616,13 @@ pub(crate) fn reached_only(cmd: &str) -> Option<String> {
         reached.is_file().then_some((response.display().to_string(), reached))
     })?;
     let response = format!("@{response}");
-    cmd.contains(&response).then(|| cmd.replacen(&response, &format!("@{}", reached.display()), 1))
+    let replacement = format!("@{}", reached.display());
+    let quoted = shlex::try_quote(&response).ok()?;
+    if cmd.contains(quoted.as_ref()) {
+        return Some(cmd.replacen(quoted.as_ref(), &shlex::try_quote(&replacement).ok()?, 1));
+    }
+    let quoted = format!("\"{response}\"");
+    cmd.contains(&quoted).then(|| cmd.replacen(&quoted, &format!("\"{replacement}\""), 1))
 }
 
 /// The file the link of the Apple executable at `binary` reads the room after its load
@@ -896,7 +902,8 @@ mod tests {
     /// keeps it, for a link that fails on what only that code uses.
     #[test]
     fn the_line_without_what_nothing_reaches_is_kept_too() {
-        let dir = std::env::temp_dir().join(format!("ra-jit-plan-reached-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ra jit plan's reached-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (response, binary) = (dir.join("link.args"), dir.join("bin"));
         let line = r#""cc" "/t/a.1.rcgu.o" "-Wl,--gc-sections" "-o" "/t/a-1""#;
