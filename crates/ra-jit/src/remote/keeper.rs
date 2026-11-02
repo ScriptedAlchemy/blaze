@@ -221,7 +221,7 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
             Either::Right(_) => libc::SIGINT,
         }
     };
-    _ = steps.send(Step::End(by));
+    request_end(steps, by, LAST_PUSH).await;
 }
 
 /// On Windows a process is told to end by an event of its console: Ctrl-C, Ctrl-Break, which
@@ -242,7 +242,18 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
     let (interrupted, broken, closed) =
         (pin!(interrupted.recv()), pin!(broken.recv()), pin!(closed.recv()));
     select(select(interrupted, broken), closed).await;
-    _ = steps.send(Step::End(CONTROL_C_EXIT));
+    request_end(steps, CONTROL_C_EXIT, LAST_PUSH).await;
+}
+
+// The signal watcher owns the deadline from receipt of the signal. A prior
+// push may still occupy the serial keeper, so timing only Step::End is too late.
+// The keeper can finish publication and exit first; this task is its backstop.
+async fn request_end(steps: UnboundedSender<Step>, signal: i32, grace: Duration) {
+    if steps.send(Step::End(signal)).is_ok() {
+        tokio::time::sleep(grace).await;
+        eprintln!("remote: shutdown exceeded its {grace:?} publication grace period");
+    }
+    end_by(signal)
 }
 
 /// How Windows ends a process that waits for none of those events.
@@ -269,3 +280,7 @@ fn end_by(status: i32) -> ! {
 #[cfg(test)]
 #[path = "keeper/recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "keeper/shutdown_tests.rs"]
+mod shutdown_tests;
