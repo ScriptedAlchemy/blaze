@@ -4,6 +4,7 @@ name: Remote keeper recovery regressions
 on:
   pull_request:
     paths:
+      - crates/ra-jit/src/remote.rs
       - crates/ra-jit/src/remote/keeper.rs
       - crates/ra-jit/src/remote/keeper/recovery_tests.rs
       - .github/workflows/remote-keeper-recovery.yaml
