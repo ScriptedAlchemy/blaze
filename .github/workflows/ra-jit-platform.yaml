@@ -87,6 +87,7 @@ jobs:
       # Caches are written by main alone: a pull request reads main's and writes none.
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mozilla-actions/sccache-action@v0.0.9
@@ -114,6 +115,7 @@ jobs:
           llvm: build
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mozilla-actions/sccache-action@v0.0.9
