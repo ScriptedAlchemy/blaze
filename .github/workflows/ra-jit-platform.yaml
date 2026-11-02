@@ -6,6 +6,14 @@ name: ra-jit platform
 on:
   workflow_call:
     inputs:
+      source-repository:
+        description: Source checkout when called from a private CI repository
+        type: string
+        default: ""
+      source-ref:
+        description: Exact source commit when called from a private CI repository
+        type: string
+        default: ""
       platform:
         description: the name of the platform in artifacts and job names
         type: string
@@ -71,6 +79,10 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
       # Caches are written by main alone: a pull request reads main's and writes none.
       - uses: Swatinem/rust-cache@v2
@@ -93,6 +105,10 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: build
@@ -148,11 +164,15 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
           # What `buildmodel.py` builds for besides the host.
-          targets: ${{ matrix.part == 'buildmodel' && inputs.os == 'ubuntu-24.04' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
+          targets: ${{ matrix.part == 'buildmodel' && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
       - name: Linux tools
         if: runner.os == 'Linux' && (matrix.part == 'core' || matrix.part == 'quick-1' || (matrix.part == 'buildmodel' && runner.arch == 'X64'))
         uses: ./.github/actions/apt
@@ -221,6 +241,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -246,6 +270,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -290,6 +318,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -330,6 +362,10 @@ jobs:
       RA_JIT_EMIT: fast
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -382,6 +418,10 @@ jobs:
       RA_JIT_EMIT: fast
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
@@ -412,6 +452,10 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
