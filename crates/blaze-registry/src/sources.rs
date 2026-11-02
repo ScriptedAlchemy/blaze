@@ -489,9 +489,10 @@ mod tests {
                 ("x", def(|it| it.directory = Some(std::env::temp_dir().join("a")))),
                 ("y", def(|it| it.directory = Some(std::env::temp_dir().join("a")))),
             ]))
-            .starts_with(
-                "source `y` defines source dir /a, but that source is already defined by `x`"
-            )
+            .starts_with(&format!(
+                "source `y` defines source dir {}, but that source is already defined by `x`",
+                std::env::temp_dir().join("a").display()
+            ))
         );
     }
 }
