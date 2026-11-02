@@ -10,8 +10,8 @@
 # Two tiers, as ra-jit.yaml has them. The **fast tier** is a pull request's: the areas the diff
 # touches, and the C2 runtime groups on Linux alone, packed into five jobs. The **full tier**
 # runs nightly, by hand (`-f tier=full`) and on a push to the integration branches dist/main and
-# dist/c4-keys: every area, and the C2 groups on Linux (one per job) and macOS (packed into four
-# jobs); when it fails it opens an issue, or adds to the one still open
+# dist/c4-keys: every area, and the C2 groups on Linux (one per job) and macOS (six jobs); when
+# it fails it opens an issue, or adds to the one still open
 # (.github/actions/nightly-issue). macOS C2 coverage is the full tier's, not a pull request's: an
 # owner-accepted trade-off for the fork's five macOS runners.
 #
@@ -174,8 +174,13 @@ jobs:
   # group exceeded the 180-minute job limit on #39 and #50 after its first three
   # lanes passed, cancelling saved-llvm without a test verdict. Keep all seven lanes
   # and the same assertions, but give the costly saved backends independent budgets.
-  # The full tier runs every group on Linux, one per job, and on macOS packed into
-  # four, which with the bundle check is the fork's five concurrent macOS jobs.
+  # The full tier runs every group on Linux, one per job, and on macOS in six jobs
+  # (workspace and nested together, the shortest two). Packing workspace, nested,
+  # saved-cranelift and saved-llvm into one macOS job hit the 180-minute limit on
+  # dist/main at 0b9258609 midway through saved-cranelift; macOS runs these lanes 1.4
+  # to 2.4 times slower than Linux, where saved-llvm alone takes 130 minutes. Six
+  # jobs and the bundle check exceed the fork's five concurrent macOS runners, so one
+  # queues: slower, but every lane gets a verdict.
   dist-linux:
     name: dist linux-x64
     needs: [changes, build-linux]
@@ -196,7 +201,7 @@ jobs:
       platform: macos-arm64
       os: macos-15
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
-      lanes: '["basic", "profiles-native", "commands", "workspace nested saved-cranelift saved-llvm"]'
+      lanes: '["basic", "profiles-native", "commands", "workspace nested", "saved-cranelift", "saved-llvm"]'
 
   # The required context `C2 runtime` (it replaces `C2 runtime (ubuntu-24.04)` and
   # `C2 runtime (macos-15)`: a pull request no longer reports macOS). It passes when every C2

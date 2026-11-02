@@ -80,7 +80,9 @@ jobs:
       matrix:
         lanes: ${{ fromJSON(inputs.lanes) }}
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 180
+    # macOS runs saved-llvm alone past 180 minutes at its measured slowdown; 360 is a
+    # hosted runner's ceiling.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 360 || 180 }}
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
