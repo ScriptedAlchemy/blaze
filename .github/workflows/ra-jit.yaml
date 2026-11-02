@@ -50,10 +50,14 @@ jobs:
   # was at before it. Anything that cannot be told counts as code.
   changes:
     name: changes
+    permissions:
+      contents: read
+      statuses: write
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       tier: ${{ steps.files.outputs.tier }}
+      private-linux: ${{ steps.private.outputs.enabled }}
     steps:
       - id: files
         env:
@@ -83,6 +87,31 @@ jobs:
           [ "$code" = true ] || TIER=none
           echo "tier=$TIER" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Route owner Linux tests to isolated CI
+        id: private
+        if: >-
+          vars.PRIVATE_LINUX_CI == 'true' && github.actor_id == '25274700' &&
+          github.triggering_actor == 'ScriptedAlchemy' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TIER: ${{ steps.files.outputs.tier }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          state=success
+          description='Hosted Linux CI selected'
+          enabled=false
+          if [[ "$TIER" != none ]]; then
+            state=pending
+            description="Requested private-linux:$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$TIER"
+            enabled=true
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" \
+            -f state="$state" -f context='Private Linux CI' -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
   fmt:
     name: fmt, harness imports
     runs-on: ubuntu-24.04
@@ -103,7 +132,7 @@ jobs:
   linux-x64:
     name: linux x64
     needs: changes
-    if: needs.changes.outputs.tier != 'none'
+    if: needs.changes.outputs.tier != 'none' && needs.changes.outputs.private-linux != 'true'
     uses: ./.github/workflows/ra-jit-platform.yaml
     with:
       platform: linux-x64
