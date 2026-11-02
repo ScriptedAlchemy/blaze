@@ -134,12 +134,12 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
       - run: sccache --show-stats
-      # The four binaries run each other from next to themselves. A tar keeps them executable.
+      # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          tar -cf ra-jit.tar ra-jit$exe cargo-ra-jit$exe ra-jit-rustc$exe ra-jit-rustc-first$exe
+          tar -cf ra-jit.tar blaze$exe cargo-blaze$exe ra-jit$exe cargo-ra-jit$exe ra-jit-rustc$exe ra-jit-rustc-first$exe
       - uses: actions/upload-artifact@v7
         with:
           name: ra-jit-${{ inputs.platform }}
