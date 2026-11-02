@@ -2,7 +2,7 @@
 //! and written back byte for byte, and cargo's `tests/testsuite/lockfile_compat.rs` (MIT or
 //! Apache-2.0) ported, with the resolve the resolver would hand over built by hand.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use blaze_resolve::lockfile::{self, Locked, PathDeps};
@@ -14,7 +14,7 @@ const CKSUM: &str = "8e1b9346248cf3391ead604c4407258d327c28e37209f6d561275981651
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn path_source(name: &str, version: &str) -> SourceId {
-    SourceId::for_path(&PathBuf::from(format!("/ws/{name}-{version}"))).unwrap()
+    SourceId::from_url(&format!("path+file:///ws/{name}-{version}")).unwrap()
 }
 
 /// Each entry without a source stands for a path package of its own directory.
