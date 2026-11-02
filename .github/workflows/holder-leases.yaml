@@ -1,0 +1,31 @@
+name: Holder lease and heartbeat regressions
+on:
+  pull_request:
+    paths:
+      - crates/blaze-dist/src/**
+      - crates/blaze-dist/tests/**
+      - .github/workflows/holder-leases.yaml
+  push:
+    branches: [dist/main]
+    paths:
+      - crates/blaze-dist/src/**
+      - crates/blaze-dist/tests/**
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  holder:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal -c rustfmt
+          rustup default 1.99.0
+      - name: Exercise the actual holder protocol
+        run: cargo test --locked -p blaze-dist --test holder
+      - name: Format
+        run: cargo fmt --all -- --check
