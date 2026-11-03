@@ -1,0 +1,41 @@
+# The shutdown behavior is platform-specific. A Linux-only passing test cannot
+# certify macOS signal handling or Windows console-exit behavior.
+name: Remote keeper shutdown regressions
+on:
+  pull_request:
+    paths:
+      - crates/ra-jit/src/remote/keeper.rs
+      - crates/ra-jit/src/remote/keeper/shutdown_tests.rs
+      - .github/workflows/remote-keeper-shutdown.yaml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: remote-keeper-shutdown-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  shutdown:
+    name: shutdown (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: remote-keeper-shutdown
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Verify signal shutdown, closed receiver and blocked prior push
+        shell: bash
+        run: cargo test --locked -p ra-jit --bin ra-jit remote::keeper::shutdown_tests -- --nocapture
