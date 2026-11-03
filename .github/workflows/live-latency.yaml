@@ -1,8 +1,8 @@
 # Save-to-running latency of live edits on macOS arm64, step by step (harness/live_latency.py).
-# Runs on a push to a live-latency* branch, by hand, and every night on main. A run on main adds
-# a line to docs/benchmarks/history/macos-arm64-live.jsonl (the site's /bench page charts it)
-# and checks it against the runs before it (harness/benchhistory.py): a median past its noise
-# band opens or comments on an issue labelled bench-regression and fails the run.
+# Runs on a push to a live-latency* branch, by hand, and every night on main. A main run
+# proposes its measurements in a pull request, never pushes to protected main. Once merged,
+# docs/benchmarks/history/macos-arm64-live.jsonl feeds the site's /bench chart. The run
+# checks medians against prior history and reports out-of-band regressions.
 name: live edit latency
 on:
   push:
@@ -30,10 +30,7 @@ env:
   CARGO_NET_RETRY: 10
 
 permissions:
-  contents: write
-  issues: write
-  # To start the site's deploy after the history commit: a push by GITHUB_TOKEN starts no workflow.
-  actions: write
+  contents: read
 
 jobs:
   latency:
@@ -88,13 +85,16 @@ jobs:
     # The programs that did run are recorded even when another failed.
     if: always() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
         with:
-          # The ruleset on main refuses a push from the workflow's own token: this one is allowed
-          # past it (docs/harness.md, "CI").
+          # Use the existing bot token when available; publishing never targets main directly.
           token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v4
         with:
@@ -114,22 +114,8 @@ jobs:
             echo "regressed=true" >> "$GITHUB_OUTPUT"
           fi
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
-      - name: Commit to main
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/benchmarks/history/macos-arm64-live.jsonl
-          git commit -q -m "bench: live latency for ${GITHUB_SHA::10} [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the history commit does not apply to main"; exit 1; }
-            if git push -q origin HEAD:main; then
-              gh workflow run site.yaml --ref main
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
+      - name: Propose benchmark history for merge
+        run: bash .github/scripts/publish_live_history.sh
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |
