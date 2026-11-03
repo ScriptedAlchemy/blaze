@@ -13,6 +13,10 @@ on:
       source-ref:
         type: string
         required: true
+      runner-label:
+        description: Additional label binding private jobs to their source run
+        type: string
+        default: ""
       os:
         type: string
         required: true
@@ -34,6 +38,7 @@ jobs:
     with:
       platform: macos-arm64
       os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
       source-repository: ${{ inputs.source-repository }}
       source-ref: ${{ inputs.source-ref }}
       cache-write: true
@@ -43,6 +48,7 @@ jobs:
     with:
       platform: macos-arm64
       os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
       source-repository: ${{ inputs.source-repository }}
       source-ref: ${{ inputs.source-ref }}
       bundle-sha256: ${{ needs.build.outputs.sha256 }}
@@ -53,6 +59,7 @@ jobs:
     with:
       platform: macos-arm64
       os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
       source-repository: ${{ inputs.source-repository }}
       source-ref: ${{ inputs.source-ref }}
       bundle-sha256: ${{ needs.build.outputs.sha256 }}

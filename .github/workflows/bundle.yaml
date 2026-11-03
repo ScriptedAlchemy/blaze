@@ -23,6 +23,10 @@ on:
       platform:
         type: string
         required: true
+      runner-label:
+        description: Additional label binding private jobs to their source run
+        type: string
+        default: ""
       os:
         type: string
         required: true
@@ -56,7 +60,7 @@ defaults:
 jobs:
   build:
     name: build (${{ inputs.platform }})
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
     timeout-minutes: 150
     outputs:
       sha256: ${{ steps.pack.outputs.sha256 }}
