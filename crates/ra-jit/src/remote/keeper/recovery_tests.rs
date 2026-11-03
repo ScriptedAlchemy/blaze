@@ -55,51 +55,39 @@ mod lazy_download_tests {
     }
 
     #[test]
-    fn a_previously_fetched_pack_can_be_fetched_again_after_eviction() {
-        let (fixture, key, pack, digest) = lazy_pack_fixture();
-        tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
-        assert!(fixture.shared.asked.fetch(&key));
-        let path = fixture.shared.store.join(pack_file(&digest));
-        std::fs::remove_file(&path).unwrap();
-        assert!(!fixture.shared.asked.fetch(&key), "an evicted pack is not still installed");
-        fixture.look();
-        assert!(fixture.shared.asked.fetch(&key), "an unchanged manifest must permit refetch");
-        assert_eq!(std::fs::read(path).unwrap(), pack);
-    }
-
-    #[test]
-    fn eviction_of_a_pack_omitted_from_the_lazy_index_is_detected() {
-        let (fixture, key, pack, digest) = lazy_pack_fixture();
-        tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
-        assert!(fixture.shared.asked.fetch(&key));
-        // A successful refresh omits packs already here from its demand-download index.
-        fixture.shared.asked.see(None);
-        fixture.look();
-        assert!(fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().packs.is_empty());
-        let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
-        let path = fixture.shared.store.join(pack_file(&digest));
-        std::fs::remove_file(&path).unwrap();
-        assert!(!fixture.shared.asked.fetch(&key));
-        fixture.look();
-        assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);
-        assert!(
-            fixture.shared.asked.fetch(&key),
-            "an initially local pack must remain recoverable"
-        );
-        assert_eq!(std::fs::read(path).unwrap(), pack);
-    }
-
-    #[test]
-    fn a_truncated_local_pack_is_not_a_successful_lazy_hit() {
-        let (fixture, key, pack, digest) = lazy_pack_fixture();
-        tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
-        assert!(fixture.shared.asked.fetch(&key));
-        let path = fixture.shared.store.join(pack_file(&digest));
-        std::fs::write(&path, &pack[..8]).unwrap();
-        assert!(!fixture.shared.asked.fetch(&key), "a partial file is not an installed pack");
-        fixture.look();
-        assert!(fixture.shared.asked.fetch(&key));
-        assert_eq!(std::fs::read(path).unwrap(), pack);
+    fn locally_lost_lazy_packs_recover_without_a_manifest_change() {
+        for omitted_from_lookup in [false, true] {
+            for truncated in [false, true] {
+                let (fixture, key, pack, digest) = lazy_pack_fixture();
+                tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
+                assert!(fixture.shared.asked.fetch(&key));
+                if omitted_from_lookup {
+                    // A fresh lookup omits packs that were already installed.
+                    fixture.shared.asked.see(None);
+                    fixture.look();
+                    let lookup = fixture.shared.asked.lazy.read().unwrap();
+                    assert!(lookup.as_ref().unwrap().packs.is_empty());
+                }
+                let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+                let path = fixture.shared.store.join(pack_file(&digest));
+                if truncated {
+                    std::fs::write(&path, &pack[..8]).unwrap();
+                } else {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                assert!(
+                    !fixture.shared.asked.fetch(&key),
+                    "lost pack reported present: omitted={omitted_from_lookup}, truncated={truncated}"
+                );
+                fixture.look();
+                assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);
+                assert!(
+                    fixture.shared.asked.fetch(&key),
+                    "refetch failed: omitted={omitted_from_lookup}, truncated={truncated}"
+                );
+                assert_eq!(std::fs::read(path).unwrap(), pack);
+            }
+        }
     }
 
     #[test]
