@@ -14,9 +14,19 @@ name: bundle
 on:
   workflow_call:
     inputs:
+      source-repository:
+        type: string
+        default: ""
+      source-ref:
+        type: string
+        default: ""
       platform:
         type: string
         required: true
+      runner-label:
+        description: Additional label binding private jobs to their source run
+        type: string
+        default: ""
       os:
         type: string
         required: true
@@ -50,12 +60,16 @@ defaults:
 jobs:
   build:
     name: build (${{ inputs.platform }})
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ fromJSON(inputs.runner-label != '' && format('["{0}","{1}"]', inputs.os, inputs.runner-label) || format('["{0}"]', inputs.os)) }}
     timeout-minutes: 150
     outputs:
       sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       - name: Verify cache retention and complete CLI dispatch before setup
         run: |
           python3 -I .github/scripts/test_cache_prune.py

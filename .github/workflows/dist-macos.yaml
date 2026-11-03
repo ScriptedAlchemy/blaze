@@ -1,0 +1,66 @@
+# The macOS share of a full dist tier, as one placement: the bundle built on `os`, its platform
+# checks, and the C2 lanes given. When hosted macOS is selected pr.yaml runs the same jobs
+# inline; for the private pool, ci-runner-orchestrator's project-dist-macos.yml runs this, and its
+# controller spills lanes to hosted macOS through dist-macos-hosted.yaml. Each placement builds
+# and verifies its own bundle.
+name: dist macOS
+on:
+  workflow_call:
+    inputs:
+      source-repository:
+        type: string
+        required: true
+      source-ref:
+        type: string
+        required: true
+      runner-label:
+        description: Additional label binding private jobs to their source run
+        type: string
+        default: ""
+      os:
+        type: string
+        required: true
+      tier:
+        type: string
+        default: full
+      # The C2 lanes this placement runs, as blaze-dist-review.yaml takes them. The controller of
+      # the private pool splits the six between the private Mac and hosted macOS
+      # (dist-macos-hosted.yaml); a caller that passes nothing runs all six.
+      lanes:
+        type: string
+        default: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
+permissions:
+  contents: read
+  actions: write
+jobs:
+  build:
+    uses: ./.github/workflows/bundle.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      cache-write: true
+  bundle:
+    needs: build
+    uses: ./.github/workflows/bundle-check.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      bundle-sha256: ${{ needs.build.outputs.sha256 }}
+  dist:
+    needs: build
+    if: inputs.tier == 'full'
+    uses: ./.github/workflows/blaze-dist-review.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      runner-label: ${{ inputs.runner-label }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      bundle-sha256: ${{ needs.build.outputs.sha256 }}
+      lanes: ${{ inputs.lanes }}
