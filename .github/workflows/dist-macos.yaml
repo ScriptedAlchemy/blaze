@@ -1,3 +1,8 @@
+# The macOS share of a full dist tier, as one placement: the bundle built on `os`, its platform
+# checks, and the C2 lanes given. When hosted macOS is selected pr.yaml runs the same jobs
+# inline; for the private pool, ci-runner-orchestrator's project-dist-macos.yml runs this, and its
+# controller spills lanes to hosted macOS through dist-macos-hosted.yaml. Each placement builds
+# and verifies its own bundle.
 name: dist macOS
 on:
   workflow_call:
@@ -14,6 +19,12 @@ on:
       tier:
         type: string
         default: full
+      # The C2 lanes this placement runs, as blaze-dist-review.yaml takes them. The controller of
+      # the private pool splits the six between the private Mac and hosted macOS
+      # (dist-macos-hosted.yaml); a caller that passes nothing runs all six.
+      lanes:
+        type: string
+        default: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
 permissions:
   contents: read
   actions: write
@@ -45,4 +56,4 @@ jobs:
       source-repository: ${{ inputs.source-repository }}
       source-ref: ${{ inputs.source-ref }}
       bundle-sha256: ${{ needs.build.outputs.sha256 }}
-      lanes: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
+      lanes: ${{ inputs.lanes }}
