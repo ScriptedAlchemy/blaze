@@ -2,11 +2,12 @@
 # of a workflow is open, each later failed night is a comment on it instead of another issue.
 # The job that uses it needs `issues: write`.
 #
-# A job cancelled before any runner took it (no runner name: the hosted pool had no machine for
-# it) is listed apart, as capacity rather than a failure, with a note that the gates waiting on
-# it fail with it. A repository with issues turned off (the fork) gets the same report in the
-# job summary and a warning, and the job passes: there is nowhere to file it, and failing would
-# only turn one red mark into two.
+# A cancelled job with no runner name is listed separately from jobs that ran.
+# This may indicate a runner-capacity problem, but it can also happen when a
+# workflow is cancelled by a user or concurrency rules before assignment.
+# Dependent gates may fail with the cancellation. A repository with issues turned
+# off (the fork) gets the same report in its job summary and a warning; the
+# reporting step passes rather than adding another failed job.
 name: nightly issue
 description: Open or add to the issue of a failed nightly run
 inputs:
@@ -30,7 +31,7 @@ runs:
         while IFS=$'\t' read -r kind name url; do
           [ -n "$kind" ] || continue
           if [ "$kind" = unplaced ]; then
-            unplaced+="- [$name]($url): cancelled before any runner took it"$'\n'
+            unplaced+="- [$name]($url): cancelled with no runner assigned"$'\n'
           else
             failed+="- [$name]($url): $kind"$'\n'
           fi
@@ -38,7 +39,7 @@ runs:
         note=
         if [ -n "$unplaced" ]; then
           note=$(printf '%s\n\n%s\n' \
-            "Runner capacity: these jobs never ran, so they say nothing about the code. A gate that waits on one of them (\`C2 runtime\`, \`ci\`) fails with it." \
+            "Unassigned cancellations (possible runner capacity): these jobs have no recorded runner. That alone does not establish the reason; check the run for capacity, concurrency or manual cancellation. Dependent gates (\`C2 runtime\`, \`ci\`) may fail as a consequence." \
             "$unplaced")
         fi
         body=$(printf '%s at %s (%s):\n\n%s\n\n%s\n' "$RUN" "${GITHUB_SHA:0:10}" "$(date -u +%F)" \
