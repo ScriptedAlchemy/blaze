@@ -48,6 +48,13 @@ esac
                 files.append(target.read_text() if target.exists() else "")
             return proc, *files
 
+    def test_workflow_uses_bot_identity_for_pr_checks(self):
+        workflow = (Path(__file__).resolve().parents[1] / "workflows/live-latency.yaml").read_text()
+        history = workflow.split("\n  history:\n", 1)[1]
+        identity = "secrets.RA_JIT_BOT_TOKEN || github.token"
+        self.assertIn("GH_TOKEN: ${{ " + identity + " }}", history)
+        self.assertIn("token: ${{ " + identity + " }}", history)
+
     def test_new_run_pushes_only_a_pr_branch(self):
         result, git, gh, summary = self.run_publisher()
         self.assertEqual(result.returncode, 0, result.stderr)
