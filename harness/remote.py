@@ -1087,7 +1087,6 @@ def guarded(top, remote):
 def poisoned(top, remote, a, crates, target, workspace, address, bucket, expected):
     """A remote that holds other code under the keys of A's."""
     print(f"{remote.name}: a remote that lies", flush=True)
-    objects = bucket.objects()
     manifest = bucket.get("manifests/default").decode()
     listed = [line.split() for line in manifest.splitlines() if not line.startswith("signed")]
 
@@ -1098,17 +1097,19 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
         return m
 
     # 1. The pack A sent, changed in place: its name no longer fits.
-    pack = "packs/" + listed[0][0] + ".pack"
-    data = bucket.get(pack)
+    compressed = len(listed[0]) == 6
+    pack = "packs/" + listed[0][0] + (".pack.zst" if compressed else ".pack")
+    original = bucket.get(pack)
+    data = unpacked(original) if compressed else original
     records = records_of(data)
     changed = pack_of([(key, value[:-1] + bytes([value[-1] ^ 0x55]) if value else value) for key, value in records])
-    bucket.put(pack, changed)
+    bucket.put(pack, packed(changed) if compressed else changed)
     b = machine("changed")
     log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
     check("code changed under A's name: rejected, B compiles its own and prints the same",
           "rejected " + pack in log and compiled(log) > 0 and b.run() == expected and listed[0][0] + ".pack" not in b.packs(),
           f"{compiled(log)} compiled")
-    bucket.put(pack, data)
+    bucket.put(pack, original)
 
     # 2. The same with the manifest rewritten to name the changed pack by its own hash: every
     #    hash fits. Only a signature tells this list from A's.
