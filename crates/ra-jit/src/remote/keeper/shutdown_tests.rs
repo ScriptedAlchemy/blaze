@@ -1,7 +1,12 @@
 //! A signal cannot wait behind an earlier remote operation before its grace period begins.
 use super::*;
+use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::{net::UnixStream, process::ExitStatusExt};
 use std::process::{Command, Stdio};
 
 const CHILD: &str = "BLAZE_REMOTE_SHUTDOWN_CHILD";
@@ -46,12 +51,16 @@ fn shutdown_child() {
 }
 
 fn exits_by_requested_signal(mode: &str) {
+    exits_with_stderr(mode, Stdio::inherit());
+}
+
+fn exits_with_stderr(mode: &str, stderr: Stdio) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "remote::keeper::shutdown_tests::shutdown_child", "--nocapture"])
         .env(CHILD, mode)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -85,4 +94,32 @@ fn a_dead_keeper_cannot_swallow_the_shutdown_signal() {
 #[test]
 fn a_responsive_keeper_can_finish_before_the_signal_deadline() {
     exits_by_requested_signal("graceful");
+}
+
+#[test]
+fn an_unwritable_stderr_cannot_swallow_the_signal_deadline() {
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    let read_only = File::open(sink.path()).unwrap();
+    exits_with_stderr("blocked", Stdio::from(read_only));
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_backpressure_cannot_delay_the_signal_deadline() {
+    let (mut writer, _reader) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[0; 4096]) {
+            Ok(0) => panic!("stderr fixture unexpectedly stopped accepting bytes"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("filling stderr fixture: {error}"),
+        }
+    }
+    // Nothing drains the receiver while the child runs. An attempted diagnostic
+    // write would block, so a deadline that depends on stderr cannot pass.
+    writer.set_nonblocking(false).unwrap();
+    let descriptor: OwnedFd = writer.into();
+    exits_with_stderr("blocked", Stdio::from(descriptor));
 }

@@ -251,8 +251,9 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
 async fn request_end(steps: UnboundedSender<Step>, signal: i32, grace: Duration) {
     if steps.send(Step::End(signal)).is_ok() {
         tokio::time::sleep(grace).await;
-        eprintln!("remote: shutdown exceeded its {grace:?} publication grace period");
     }
+    // The deadline must not wait for stderr or panic when its sink has failed.
+    // The keeper may report publication failures; the backstop only terminates.
     end_by(signal)
 }
 
