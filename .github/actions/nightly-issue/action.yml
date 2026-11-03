@@ -27,7 +27,8 @@ runs:
         jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
           --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
                 | [(if .conclusion == "cancelled" and ((.runner_name // "") == "") then "unplaced" else .conclusion end), .name, .html_url] | @tsv')
-        failed= unplaced=
+        failed=''
+        unplaced=''
         while IFS=$'\t' read -r kind name url; do
           [ -n "$kind" ] || continue
           if [ "$kind" = unplaced ]; then
