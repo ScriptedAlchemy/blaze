@@ -130,6 +130,11 @@ jobs:
       - run: python3 harness/imports.py
       # No new place in ra-jit's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
+      # A workflow a pull request runs may not ask for a self-hosted runner: on a public
+      # repository a fork writes that workflow, and with it the `runs-on`
+      # (harness/check_runner_labels.py), and this runs its cases too.
+      - run: python3 harness/check_runner_labels.py
+      - run: python3 -m unittest discover --start-directory harness --pattern 'test_*.py'
       # vendor/ too: the forks' rustfmt.toml files are read for their code, and a fork's own
       # edits are held to them like ra-jit's.
       - run: cargo fmt --all -- --check

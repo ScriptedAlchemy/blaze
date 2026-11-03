@@ -4,7 +4,7 @@
     benchplatforms.py matrix [--bun]
 
 Every benchmark of the README is a matrix over PLATFORMS, in this order. Each platform is one
-machine of its own, a self-hosted runner whose labels are `labels`: its numbers are comparable
+machine of its own, a self-hosted runner whose one label is `label`: its numbers are comparable
 with each other and with its own history, not with another platform's. A result says which
 platform it is by its host (`platform()`); benchreport.py stores it as
 docs/benchmarks/<slug>.json (runtime-<slug>.json, bun-<slug>.json, ...) and writes every README
@@ -19,12 +19,17 @@ BENCH_RUNNER=true, the variable before there were platforms, means Linux x86-64.
 """
 import json, os, sys
 
-# slug, name, the runner's labels, and where the work goes: a short path on macOS, where the
+# slug, name, the runner's label, and where the work goes: a short path on macOS, where the
 # daemon's socket path has to fit in 104 bytes.
+#
+# A platform's runner is registered with its label alone and no default labels
+# (harness/benchrunner.sh, `--no-default-labels`): a job that asks for `self-hosted`, or for the
+# machine's own OS and architecture, must not reach a benchmark machine, since on a public
+# repository a fork's pull request writes the `runs-on` of the workflow it runs.
 PLATFORMS = [
-    dict(slug="macos-arm64", name="macOS arm64", labels=["self-hosted", "macOS", "ARM64", "bench-macos"], work="/tmp/ra-jit-bench"),
-    dict(slug="linux-aarch64", name="Linux aarch64", labels=["self-hosted", "linux", "ARM64", "bench-arm64"], work=""),
-    dict(slug="linux-x86-64", name="Linux x86-64", labels=["self-hosted", "linux", "x64", "bench-x86"], work=""),
+    dict(slug="macos-arm64", name="macOS arm64", label="bench-macos", work="/tmp/ra-jit-bench"),
+    dict(slug="linux-aarch64", name="Linux aarch64", label="bench-arm64", work=""),
+    dict(slug="linux-x86-64", name="Linux x86-64", label="bench-x86", work=""),
 ]
 NAMES = [p["name"] for p in PLATFORMS]
 
