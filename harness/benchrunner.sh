@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
-# benchrunner.sh: makes this machine the self-hosted runner of indexable-inc/blaze that the
-# bench-readme and bench-bun workflows run one platform on (harness/benchplatforms.py):
+# benchrunner.sh: makes this machine the self-hosted runner of indexable-inc/blaze (or of
+# BENCH_REPOSITORY) that the bench-readme and bench-bun workflows run one platform on
+# (harness/benchplatforms.py):
 #
-#   linux-x86-64    labels self-hosted, linux, x64, bench-x86
-#   linux-aarch64   labels self-hosted, linux, ARM64, bench-arm64
-#   macos-arm64     labels self-hosted, macOS, ARM64, bench-macos
+#   linux-x86-64    label bench-x86
+#   linux-aarch64   label bench-arm64
+#   macos-arm64     label bench-macos
+#
+# Only the platform's label, and no default labels (--no-default-labels): a job of a fork's pull
+# request that asks for `self-hosted`, `linux`, `x64` or `ARM64` must not reach this machine.
+# The platform's jobs ask for its label through the matrix of harness/benchplatforms.py.
+#
+# Before registering, the repository is checked against the GitHub API: a public repository (this
+# one is) hands a fork's pull request workflow the choice of `runs-on`, and GitHub's fork-PR
+# approval is then the only thing between that workflow and this machine. So a public repository
+# must have approval for all external contributors (`all_external_contributors`, Settings →
+# Actions → "Fork pull request workflows"); anything else stops here. The check reads the API as
+# this machine's `gh` (gh auth login), or with GH_TOKEN/GITHUB_TOKEN, and needs to read the
+# repository's Actions settings. BENCH_ALLOW_PUBLIC_REPOSITORY=1 skips the check: do that only
+# after verifying by hand that the repository is private or approves every external contributor.
+# BENCH_REPOSITORY (default indexable-inc/blaze) is the repository, for the check and for the URL
+# the runner is registered to; the registration token must come from that repository too.
 #
 #   scp harness/benchrunner.sh HOST:
 #   gh api -X POST repos/indexable-inc/blaze/actions/runners/registration-token --jq .token \
@@ -30,8 +46,58 @@ case "$platform/$(uname -s)/$(uname -m)" in
   macos-arm64/Darwin/arm64) label=bench-macos arch=osx-arm64 ;;
   *) echo "this machine is $(uname -s) $(uname -m), not $platform" >&2; exit 1 ;;
 esac
+repo=${BENCH_REPOSITORY:-indexable-inc/blaze}
 read -r token
 [ -n "$token" ] || { echo "no registration token on stdin" >&2; exit 1; }
+
+stop() { echo "benchrunner: $*" >&2; exit 1; }
+
+# The GitHub API as this machine's gh (gh auth login), or with GH_TOKEN/GITHUB_TOKEN, else
+# anonymously, which is enough for a public repository's own metadata but not for its Actions
+# policies: the preflight needs either.
+api() { # api PATH
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh api "$1"
+  elif [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+    curl -fsSL -H "Accept: application/vnd.github+json" \
+      -H "Authorization: Bearer ${GH_TOKEN:-$GITHUB_TOKEN}" "https://api.github.com/$1"
+  else
+    curl -fsSL -H "Accept: application/vnd.github+json" "https://api.github.com/$1"
+  fi
+}
+
+# A string field of the API's flat JSON.
+field() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
+
+# The check that makes a public repository safe to register to: on a public repository a fork's
+# pull request runs the workflow from the pull request, `runs-on` and all, and GitHub's fork-PR
+# approval is then the only thing that keeps that workflow off this machine. A repository is
+# safe when it is private, or when it approves every external contributor's workflow before it
+# runs. Anything this cannot read stops here, rather than register on a guess.
+preflight() {
+  hint="Run this where gh is signed in (gh auth login) or with GH_TOKEN/GITHUB_TOKEN that can read the repository's Actions settings. Nothing was registered. BENCH_ALLOW_PUBLIC_REPOSITORY=1 overrides this, after checking by hand."
+  if [ "${BENCH_ALLOW_PUBLIC_REPOSITORY:-}" = 1 ]; then
+    echo "benchrunner: BENCH_ALLOW_PUBLIC_REPOSITORY=1: not checking that $repo keeps a fork's pull request off this machine" >&2
+    return
+  fi
+  repository=$(api "repos/$repo" 2>/dev/null) || repository=
+  visibility=$(printf '%s' "$repository" | field visibility)
+  case "$visibility" in
+    private | internal)
+      echo "benchrunner: $repo is $visibility: a fork's pull request cannot run a workflow on this machine" >&2
+      return
+      ;;
+    public) ;;
+    *) stop "cannot read $repo from the GitHub API, so cannot tell whether a fork's pull request could run a workflow on this machine. $hint" ;;
+  esac
+  policy=$(api "repos/$repo/actions/permissions/fork-pr-contributor-approval" 2>/dev/null) || policy=
+  policy=$(printf '%s' "$policy" | field approval_policy)
+  [ -n "$policy" ] || stop "cannot read $repo's fork-PR approval policy, and it is public, so cannot tell whether a fork's pull request could run its own workflow, and so choose this machine. $hint"
+  [ "$policy" = all_external_contributors ] || stop "$repo is public and its fork-PR approval policy is '$policy', not all_external_contributors: a fork's pull request could run its own workflow, and so choose this machine, before anyone approves it. On a public repository the only safe setting is Settings -> Actions -> 'Require approval for all external contributors'. $hint"
+  echo "benchrunner: $repo is public and requires approval from every external contributor, so a fork's pull request cannot choose this machine" >&2
+}
+preflight
+
 dir=$HOME/actions-runner
 version=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 mkdir -p "$dir"
@@ -42,8 +108,10 @@ if [ ! -x ./run.sh ] || [ "$(cat .version 2>/dev/null)" != "$version" ]; then
 fi
 # The runner is .NET: without ICU on the host it has to be told to do without.
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-./config.sh --unattended --replace --url https://github.com/indexable-inc/blaze --token "$token" \
-  --name "$(hostname -s)" --labels "$label" --work _work
+# Only the platform's label, and no default labels: an unlabelled job, or one that asks for
+# `self-hosted` or the machine's own OS and architecture, must not match a benchmark machine.
+./config.sh --unattended --replace --url "https://github.com/$repo" --token "$token" \
+  --name "$(hostname -s)" --no-default-labels --labels "$label" --work _work
 cat > .env <<EOF
 RA_JIT_BENCH_MACHINE=$machine
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1

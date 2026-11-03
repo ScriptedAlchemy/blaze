@@ -1,10 +1,10 @@
 # The benchmark tables of docs/benchmarks.md and the README's numbers, measured on real projects, as a matrix over
 # the platforms of harness/benchplatforms.py: macOS arm64, Linux aarch64 and Linux x86-64. Each
 # runs on its own dedicated benchmark machine (a self-hosted runner labelled bench-macos,
-# bench-arm64 or bench-x86; docs/benchmarks.md "The machines"), never on a shared GitHub runner:
-# their neighbours make the numbers noise. A platform runs only once its runner is registered (the
-# repository variable BENCH_RUNNERS names it); the others are skipped and the README keeps their
-# last numbers, with their date and commit.
+# bench-arm64 or bench-x86, and nothing else; docs/benchmarks.md "The machines"), never on a
+# shared GitHub runner: their neighbours make the numbers noise. A platform runs only once its
+# runner is registered (the repository variable BENCH_RUNNERS names it); the others are skipped
+# and the README keeps their last numbers, with their date and commit.
 # Every run of a platform adds a line to docs/benchmarks/history/<platform>.jsonl, which the
 # site's /bench page charts, and checks it against the runs before it on the same machine
 # (harness/benchhistory.py): a median beyond its noise band opens an issue labelled
@@ -35,11 +35,12 @@ concurrency:
   group: bench-readme
   cancel-in-progress: false
 
+# The workflow's own token only reads. The jobs on the benchmark machines get nothing more: a
+# machine that builds what a pull request's code says has no business holding a write token. The
+# publish job, on a GitHub-hosted runner, takes the writes it commits and opens the regression
+# issue with.
 permissions:
-  contents: write
-  issues: write
-  # To start the site's deploy after the history commit: a push by GITHUB_TOKEN starts no workflow.
-  actions: write
+  contents: read
 
 defaults:
   run:
@@ -65,11 +66,15 @@ jobs:
     needs: platforms
     # Until a machine is registered a run would wait for it for a day and then be cancelled: the
     # matrix has only the platforms BENCH_RUNNERS names.
-    if: needs.platforms.outputs.any == 'true'
+    if: >-
+      needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
-    runs-on: ${{ matrix.labels }}
+    runs-on: ${{ matrix.label }}
+    permissions:
+      contents: read
     timeout-minutes: 420
     env:
       # Outside the checkout: the checkout is cleaned each run, these are kept between runs so
@@ -131,8 +136,15 @@ jobs:
   publish:
     name: README, history and regressions
     needs: [platforms, bench]
-    if: always() && needs.platforms.outputs.any == 'true'
+    if: >-
+      always() && needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      # To start the site's deploy after the history commit: a push by GITHUB_TOKEN starts no workflow.
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

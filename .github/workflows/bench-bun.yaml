@@ -24,8 +24,10 @@ concurrency:
   group: bench-readme
   cancel-in-progress: false
 
+# The workflow's own token only reads; the jobs on the benchmark machines get nothing more, and
+# the publish job, on a GitHub-hosted runner, takes the write it commits with.
 permissions:
-  contents: write
+  contents: read
 
 defaults:
   run:
@@ -49,11 +51,15 @@ jobs:
   bench:
     name: bench (bun, ${{ matrix.name }})
     needs: platforms
-    if: needs.platforms.outputs.any == 'true'
+    if: >-
+      needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
-    runs-on: ${{ matrix.labels }}
+    runs-on: ${{ matrix.label }}
+    permissions:
+      contents: read
     timeout-minutes: 360
     env:
       # Kept between runs, outside the checkout, as bench-readme's: ra-jit builds
@@ -102,8 +108,12 @@ jobs:
   publish:
     name: README
     needs: [platforms, bench]
-    if: always() && needs.platforms.outputs.any == 'true'
+    if: >-
+      always() && needs.platforms.outputs.any == 'true' &&
+      github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
