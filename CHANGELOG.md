@@ -866,6 +866,8 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- Remote lazy-cache packs can be fetched again after local eviction or truncation even if the remote manifest is unchanged; failed demand fetches retry at the keeper's existing refresh interval.
+
 - The daemon runs a build script again as cargo does, in the `OUT_DIR` cargo left, and
   compares the lines cargo reads, not every byte it printed. A script that keeps what it built
   in `OUT_DIR` and runs a tool that talks, as tracedecay's CLI embeds a frontend, ran the tool

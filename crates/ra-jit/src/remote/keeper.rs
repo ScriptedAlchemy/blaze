@@ -73,14 +73,9 @@ impl Asked {
         self.seen.lock().is_ok_and(|seen| *seen == manifest)
     }
 
-    /// A failed demand fetch is coalesced for the current lookup, not forever.
-    /// Rebuild it on the keeper's next throttled look even when the manifest is unchanged.
-    fn failed_fetch(&self) -> bool {
-        self.lazy.read().is_ok_and(|lazy| {
-            lazy.as_ref().is_some_and(|lazy| {
-                lazy.packs.iter().any(|(_, _, arrived)| arrived.get() == Some(&false))
-            })
-        })
+    /// A failed download or lost local pack invalidates the current lookup.
+    fn needs_refresh(&self) -> bool {
+        self.lazy.read().is_ok_and(|lazy| lazy.as_ref().is_some_and(|lazy| lazy.needs_refresh()))
     }
 
     /// Notes what the manifest is, and says whether that is not what it was.
@@ -158,12 +153,12 @@ impl Shared {
         }
     }
 
-    /// Pulls if the manifest is not what it was when it was last pulled from.
+    /// Refreshes changed manifests and invalidated lazy lookups.
     async fn look(&self) {
         self.remote.traffic.try_again();
         let start = Instant::now();
         let now = self.manifest_now().await;
-        if now.is_some() && (!self.asked.saw(now) || self.asked.failed_fetch()) {
+        if now.is_some() && (!self.asked.saw(now) || self.asked.needs_refresh()) {
             eprintln!("remote: refreshing the manifest of `{}`", self.project);
             let done = self.pull_and_remember(now).await;
             self.report(done, start);

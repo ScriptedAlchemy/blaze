@@ -55,6 +55,117 @@ mod lazy_download_tests {
     }
 
     #[test]
+    fn locally_lost_lazy_packs_recover_without_a_manifest_change() {
+        for omitted_from_lookup in [false, true] {
+            for truncated in [false, true] {
+                let (fixture, key, pack, digest) = lazy_pack_fixture();
+                tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
+                assert!(fixture.shared.asked.fetch(&key));
+                if omitted_from_lookup {
+                    // A fresh lookup omits packs that were already installed.
+                    fixture.shared.asked.see(None);
+                    fixture.look();
+                    let lookup = fixture.shared.asked.lazy.read().unwrap();
+                    assert!(lookup.as_ref().unwrap().packs.is_empty());
+                }
+                let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+                let path = fixture.shared.store.join(pack_file(&digest));
+                if truncated {
+                    std::fs::write(&path, &pack[..8]).unwrap();
+                } else {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                assert!(
+                    !fixture.shared.asked.fetch(&key),
+                    "lost pack reported present: omitted={omitted_from_lookup}, truncated={truncated}"
+                );
+                fixture.look();
+                assert!(fixture.shared.runtime.block_on(fixture.shared.manifest_now()) == observed);
+                assert!(
+                    fixture.shared.asked.fetch(&key),
+                    "refetch failed: omitted={omitted_from_lookup}, truncated={truncated}"
+                );
+                assert_eq!(std::fs::read(path).unwrap(), pack);
+            }
+        }
+    }
+
+    #[test]
+    fn an_incomplete_key_list_preserves_the_lookup_and_remains_retryable() {
+        for length in [1, 31, 33] {
+            let (fixture, key, pack, digest) = lazy_pack_fixture();
+            assert!(pack.len() > length);
+            let manifest = Manifest::at("recovery");
+            let valid = std::fs::read(fixture.remote_dir.join(&manifest)).unwrap();
+            let before = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+            let mut keys = key.to_vec();
+            keys.resize(length, 99);
+            let keys_digest = Digest::of(&keys);
+            tests::put(&fixture.remote_dir, &keys_object(&keys_digest), &keys);
+            let listed = Listed {
+                size: pack.len() as u64,
+                keys: keys_digest,
+                format: STORE_FORMAT,
+                packed: None,
+            };
+            tests::put(
+                &fixture.remote_dir,
+                &manifest,
+                Manifest([(digest, listed)].into()).lines().as_bytes(),
+            );
+            let observed = fixture.shared.runtime.block_on(fixture.shared.manifest_now());
+            let done = fixture.shared.runtime.block_on(fixture.shared.pull_and_remember(observed));
+            assert!(done.is_err(), "a {length}-byte key list is not complete");
+            let after = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
+            assert!(Arc::ptr_eq(&before, &after), "a failed refresh retains its working lookup");
+            assert!(!fixture.shared.asked.saw(observed));
+            assert!(!fixture.shared.store.join(pack_file(&digest)).exists());
+            tests::put(&fixture.remote_dir, &manifest, &valid);
+            tests::put(&fixture.remote_dir, &pack_object(&digest), &pack);
+            fixture.look();
+            assert!(fixture.shared.asked.fetch(&key));
+            assert_eq!(std::fs::read(fixture.shared.store.join(pack_file(&digest))).unwrap(), pack);
+        }
+    }
+
+    #[test]
+    fn incomplete_key_lists_cannot_prove_a_missing_pack_is_already_cached() {
+        let fixture = Fixture::new(false);
+        ra_jit_store::compiles_against("keeper-key-framing-regression");
+        let local = ra_jit_store::Store::owned(&fixture.shared.store).unwrap();
+        let key = [72; 32];
+        local.insert(&key, b"an existing compiled entry");
+        let key = local.disk_key(&key);
+        assert_eq!(local.seal_checked().unwrap().len(), 1);
+        let dir = ra_jit_store::StoreDir::at(&fixture.shared.store);
+        assert!(dir.keys().unwrap().contains(&key));
+        let pack = Digest::of(b"a pack not installed locally");
+        for length in [0, 1, 31, 33, 32] {
+            let mut keys = key.to_vec();
+            keys.resize(length, 99);
+            let keys_digest = Digest::of(&keys);
+            tests::put(&fixture.remote_dir, &keys_object(&keys_digest), &keys);
+            let listed = Listed { size: 64, keys: keys_digest, format: STORE_FORMAT, packed: None };
+            let (missing, present) = fixture
+                .shared
+                .runtime
+                .block_on(crate::remote::lacking(
+                    &fixture.shared.remote,
+                    ra_jit_store::StoreDir::at(&fixture.shared.store),
+                    vec![(pack, listed)],
+                ))
+                .unwrap();
+            if length == 32 {
+                assert!(missing.is_empty(), "a complete known key can still avoid a transfer");
+                assert_eq!(present, 1);
+            } else {
+                assert_eq!(missing.len(), 1, "{length} bytes cannot prove complete coverage");
+                assert_eq!(present, 0);
+            }
+        }
+    }
+
+    #[test]
     fn an_unrequested_lazy_pack_does_not_force_a_new_index() {
         let (fixture, _, _, _) = lazy_pack_fixture();
         let before = fixture.shared.asked.lazy.read().unwrap().as_ref().unwrap().clone();
