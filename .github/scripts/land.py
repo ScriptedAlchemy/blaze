@@ -19,9 +19,30 @@ So land.py killed, or run in the background by a tool that ends its process grou
 waiting going. `land.py --wait` (this branch's pull request) or `land.py --wait N` follows it
 again, and starts it again if it is gone; running land.py again on the same branch does too.
 """
-import json, os, signal, subprocess, sys, time
+import json, os, re, signal, subprocess, sys, time
+from functools import lru_cache
 
-REPO = "indexable-inc/blaze"
+def repo_from_remote(remote):
+    """Read the target from origin instead of silently targeting upstream."""
+    for prefix in ("git@github.com:", "https://github.com/", "ssh://git@github.com/"):
+        if remote.startswith(prefix):
+            path = remote[len(prefix):].rstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", path):
+                return path
+            break
+    raise ValueError(f"expected a GitHub origin remote, got {remote!r}")
+
+
+@lru_cache(maxsize=1)
+def repository():
+    try:
+        return repo_from_remote(run("git", "remote", "get-url", "origin"))
+    except ValueError as error:
+        sys.exit(f"land.py: {error}")
+
+
 POLL = 20
 GIVE_UP = 3 * 3600
 # A `gh` call that fails this many times in a row (the network, GitHub) ends the waiting.
@@ -48,16 +69,17 @@ def gh(*args):
 
 
 def state(number):
-    query = """query($number: Int!) { repository(owner: "indexable-inc", name: "blaze") {
-      pullRequest(number: $number) { state mergeable isInMergeQueue url headRefName
-        mergeQueueEntry { position state } autoMergeRequest { enabledAt } mergeCommit { oid } } } }"""
+    owner, name = repository().split("/", 1)
+    query = f"""query($number: Int!) {{ repository(owner: "{owner}", name: "{name}") {{
+      pullRequest(number: $number) {{ state mergeable isInMergeQueue url headRefName
+        mergeQueueEntry {{ position state }} autoMergeRequest {{ enabledAt }} mergeCommit {{ oid }} }} }} }}"""
     out = gh("api", "graphql", "-f", f"query={query}", "-F", f"number={number}")
     return json.loads(out)["data"]["repository"]["pullRequest"]
 
 
 def failed_checks(number):
     # `gh pr checks` exits non-zero while checks fail or are pending; its output is still the list.
-    out = run("gh", "pr", "checks", str(number), "--repo", REPO, "--required", "--json", "name,bucket,link", check=False)
+    out = run("gh", "pr", "checks", str(number), "--repo", repository(), "--required", "--json", "name,bucket,link", check=False)
     try:
         return [c for c in json.loads(out or "[]") if c["bucket"] == "fail"]
     except json.JSONDecodeError:
@@ -67,7 +89,7 @@ def failed_checks(number):
 def queue_runs(number):
     """The merge-queue runs of this pull request that failed, newest first."""
     try:
-        out = gh("run", "list", "--repo", REPO, "--workflow", "ra-jit.yaml", "--event", "merge_group",
+        out = gh("run", "list", "--repo", repository(), "--workflow", "ra-jit.yaml", "--event", "merge_group",
                  "--limit", "40", "--json", "headBranch,conclusion,url")
     except GhFailed:
         return []
@@ -211,7 +233,7 @@ def main():
         if len(sys.argv) > 2:
             return follow(int(sys.argv[2]))
         branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
-        found = json.loads(run("gh", "pr", "list", "--repo", REPO, "--head", branch, "--state", "all",
+        found = json.loads(run("gh", "pr", "list", "--repo", repository(), "--head", branch, "--state", "all",
                                "--limit", "1", "--json", "number"))
         if not found:
             sys.exit(f"land.py: {branch} has no pull request")
@@ -233,16 +255,16 @@ def main():
     if pushed.returncode:
         sys.exit(f"land.py: origin's {branch} has commits this one does not (git pull, or push it yourself):\n{pushed.stderr.strip()}")
 
-    found = json.loads(run("gh", "pr", "list", "--repo", REPO, "--head", branch, "--state", "open", "--json", "number,url"))
+    found = json.loads(run("gh", "pr", "list", "--repo", repository(), "--head", branch, "--state", "open", "--json", "number,url"))
     if found:
         number, url = found[0]["number"], found[0]["url"]
     else:
         body = run("git", "log", "--no-merges", "--format=- %s", "origin/main..HEAD")
-        url = run("gh", "pr", "create", "--repo", REPO, "--base", "main", "--head", branch,
+        url = run("gh", "pr", "create", "--repo", repository(), "--base", "main", "--head", branch,
                   "--title", f"Merge {branch}: {what}", "--body", body)
         number = int(url.rstrip("/").rsplit("/", 1)[1])
     print(f"{url}")
-    queued = subprocess.run(["gh", "pr", "merge", str(number), "--repo", REPO, "--merge", "--auto"],
+    queued = subprocess.run(["gh", "pr", "merge", str(number), "--repo", repository(), "--merge", "--auto"],
                             capture_output=True, text=True)
     # Run again on a pull request already in the queue, `gh pr merge` may refuse; the queue has it.
     try:
