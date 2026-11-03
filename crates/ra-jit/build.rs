@@ -51,8 +51,9 @@ fn source_identity(root: &Path) -> std::io::Result<String> {
     };
     field(b"blaze-source-identity-v3");
     for path in &files {
-        // An external source alias can change independently of the symlink.
-        // Watch its physical referent to invalidate the compiler identity.
+        // File aliases are hashed under their logical source-tree spelling, but
+        // a referent outside the tree can change without touching the symlink.
+        // Explicitly watch the physical referent to refresh the compiler identity.
         if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
             println!("cargo:rerun-if-changed={}", std::fs::canonicalize(path)?.display());
         }

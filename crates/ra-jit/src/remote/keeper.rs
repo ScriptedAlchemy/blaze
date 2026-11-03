@@ -22,7 +22,7 @@ use super::{Digest, Lazy, Shared, collect::parse_age, push};
 const PUSH_EVERY: Duration = Duration::from_secs(5 * 60);
 /// The manifest is read no more often than this, however many builds lack something.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
-/// How long the push of a daemon that was told to end may take before it ends anyway.
+/// Shutdown grace period, measured from signal receipt.
 const LAST_PUSH: Duration = Duration::from_secs(60);
 
 /// `RA_JIT_REMOTE_PUSH_EVERY`: a count and `s`, `m`, `h` or `d`, or `off`.
@@ -73,9 +73,8 @@ impl Asked {
         self.seen.lock().is_ok_and(|seen| *seen == manifest)
     }
 
-    /// Failed downloads and evicted packs are coalesced for one lookup, not forever.
-    /// Rebuild at the existing throttled boundary, including packs initially here.
-    fn failed_fetch(&self) -> bool {
+    /// A failed download or lost local pack invalidates the current lookup.
+    fn needs_refresh(&self) -> bool {
         self.lazy.read().is_ok_and(|lazy| lazy.as_ref().is_some_and(|lazy| lazy.needs_refresh()))
     }
 
@@ -145,21 +144,20 @@ impl Shared {
                 }
                 Step::Push => self.send().await,
                 Step::End(signal) => {
-                    if tokio::time::timeout(LAST_PUSH, self.send()).await.is_err() {
-                        eprintln!("remote: the last push took over {LAST_PUSH:?} and was left");
-                    }
+                    // request_end owns the deadline; publication may finish sooner.
+                    self.send().await;
                     end_by(signal);
                 }
             }
         }
     }
 
-    /// Pulls if the manifest is not what it was when it was last pulled from.
+    /// Refreshes changed manifests and invalidated lazy lookups.
     async fn look(&self) {
         self.remote.traffic.try_again();
         let start = Instant::now();
         let now = self.manifest_now().await;
-        if now.is_some() && (!self.asked.saw(now) || self.asked.failed_fetch()) {
+        if now.is_some() && (!self.asked.saw(now) || self.asked.needs_refresh()) {
             eprintln!("remote: refreshing the manifest of `{}`", self.project);
             let done = self.pull_and_remember(now).await;
             self.report(done, start);
@@ -245,15 +243,12 @@ async fn told_to_end(steps: UnboundedSender<Step>) {
     request_end(steps, CONTROL_C_EXIT, LAST_PUSH).await;
 }
 
-// The signal watcher owns the deadline from receipt of the signal. A prior
-// push may still occupy the serial keeper, so timing only Step::End is too late.
-// The keeper can finish publication and exit first; this task is its backstop.
-async fn request_end(steps: UnboundedSender<Step>, signal: i32, grace: Duration) {
+// Keep the deadline outside the serial keeper: an earlier push may block its queue.
+async fn request_end(steps: UnboundedSender<Step>, signal: i32, grace: Duration) -> ! {
     if steps.send(Step::End(signal)).is_ok() {
         tokio::time::sleep(grace).await;
     }
-    // The deadline must not wait for stderr or panic when its sink has failed.
-    // The keeper may report publication failures; the backstop only terminates.
+    // Logging here could block termination on stderr backpressure.
     end_by(signal)
 }
 
