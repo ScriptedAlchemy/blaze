@@ -927,6 +927,7 @@ async fn lacking(
         }
         let all_here = keys.is_ok_and(|keys| {
             !keys.is_empty()
+                && keys.chunks_exact(32).remainder().is_empty()
                 && keys
                     .chunks_exact(32)
                     .all(|key| <&[u8; 32]>::try_from(key).is_ok_and(|key| here.contains(key)))
@@ -1339,6 +1340,10 @@ impl Lazy {
             let most = listed.keys_max(remote);
             let keys =
                 remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await?;
+            anyhow::ensure!(
+                keys.chunks_exact(32).remainder().is_empty(),
+                "{pack}.pack key list contains an incomplete cache key"
+            );
             held.take(keys.len() as u64)?;
             Ok((pack, listed, keys))
         }))
