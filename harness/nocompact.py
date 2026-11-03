@@ -82,12 +82,23 @@ def links(home):
     return lines
 
 
+def symbol_address(listed, name):
+    """Find one ra-jit function, not rustc's separate jump or another same-named symbol.
+
+    ra-jit's private names use either ra-jit/ra_jit, with an optional n before the number.
+    Both spellings are recognized by the tier reporter too.
+    """
+    found = re.findall(
+        rf"^([0-9a-fA-F]+) [ts] _ra[-_]jit::{re.escape(name)}::n?\d+$", listed, re.M
+    )
+    return "0x" + found[0] if len(found) == 1 else None
+
+
 def address_of(program, name):
     """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
     of it (rustc's is a jump there)."""
     listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    found = re.findall(rf"^([0-9a-f]+) [ts] _ra-jit::{name}::\d+$", listed, re.M)
-    return "0x" + found[0] if found else None
+    return symbol_address(listed, name)
 
 
 def sections(program):
