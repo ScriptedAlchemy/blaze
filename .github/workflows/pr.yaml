@@ -22,6 +22,10 @@
 # Workflows called from here run in this run, so they download the bundle artifacts directly;
 # the digest each consumer verifies comes from the build job's outputs, a channel of its own.
 name: pr
+run-name: >-
+  pr ${{ github.ref_name }}
+  ${{ vars.PRIVATE_DIST_MACOS_CI == 'true' && github.actor_id == '25274700' && github.triggering_actor == 'ScriptedAlchemy' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '[private-dist-macos]' || '' }}
+  [tier=${{ github.event_name == 'push' && 'full' || inputs.tier || 'fast' }}]
 
 on:
   # Stacked PRs must be validated against their actual target branch.
@@ -52,6 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
+      private-macos: ${{ vars.PRIVATE_DIST_MACOS_CI == 'true' && github.actor_id == '25274700' && github.triggering_actor == 'ScriptedAlchemy' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
       tier: ${{ steps.tier.outputs.tier }}
       code: ${{ steps.areas.outputs.code }}
       macos: ${{ steps.areas.outputs.macos }}
@@ -110,7 +115,7 @@ jobs:
   build-macos:
     name: build macos-arm64
     needs: changes
-    if: needs.changes.outputs.macos == 'true' || needs.changes.outputs.tier == 'full'
+    if: needs.changes.outputs.private-macos != 'true' && (needs.changes.outputs.macos == 'true' || needs.changes.outputs.tier == 'full')
     permissions:
       contents: read
       actions: write
@@ -195,7 +200,7 @@ jobs:
   dist-macos:
     name: dist macos-arm64
     needs: [changes, build-macos]
-    if: needs.changes.outputs.dist == 'true' && needs.changes.outputs.tier == 'full'
+    if: needs.changes.outputs.private-macos != 'true' && needs.changes.outputs.dist == 'true' && needs.changes.outputs.tier == 'full'
     uses: ./.github/workflows/blaze-dist-review.yaml
     with:
       platform: macos-arm64
@@ -220,6 +225,7 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.dist }}
           LINUX_PLATFORM: ${{ needs.bundle-linux.result }}
           LINUX: ${{ needs.dist-linux.result }}
+          PRIVATE_MACOS: ${{ needs.changes.outputs.private-macos }}
           MACOS_PLATFORM: ${{ needs.bundle-macos.result }}
           MACOS: ${{ needs.dist-macos.result }}
         run: |
@@ -228,7 +234,11 @@ jobs:
           if [ "$SELECTED" = true ]; then
             test "$LINUX_PLATFORM" = success
             test "$LINUX" = success
-            if [ "$TIER" = full ]; then
+            if [ "$PRIVATE_MACOS" = true ]; then
+              test "$MACOS_PLATFORM" = skipped
+              test "$MACOS" = skipped
+              echo 'macOS acceptance is enforced by the required Private dist macOS CI status.'
+            elif [ "$TIER" = full ]; then
               test "$MACOS_PLATFORM" = success
               test "$MACOS" = success
             else

@@ -9,6 +9,12 @@ name: bundle check
 on:
   workflow_call:
     inputs:
+      source-repository:
+        type: string
+        default: ""
+      source-ref:
+        type: string
+        default: ""
       platform:
         type: string
         required: true
@@ -36,6 +42,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source-repository || github.repository }}
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
       # The Nix store paths the binaries link against; the cache is the build job's, read only.
       - uses: ./.github/actions/toolchain
         with:

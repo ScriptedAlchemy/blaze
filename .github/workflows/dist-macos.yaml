@@ -1,0 +1,48 @@
+name: dist macOS
+on:
+  workflow_call:
+    inputs:
+      source-repository:
+        type: string
+        required: true
+      source-ref:
+        type: string
+        required: true
+      os:
+        type: string
+        required: true
+      tier:
+        type: string
+        default: full
+permissions:
+  contents: read
+  actions: write
+jobs:
+  build:
+    uses: ./.github/workflows/bundle.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      cache-write: true
+  bundle:
+    needs: build
+    uses: ./.github/workflows/bundle-check.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      bundle-sha256: ${{ needs.build.outputs.sha256 }}
+  dist:
+    needs: build
+    if: inputs.tier == 'full'
+    uses: ./.github/workflows/blaze-dist-review.yaml
+    with:
+      platform: macos-arm64
+      os: ${{ inputs.os }}
+      source-repository: ${{ inputs.source-repository }}
+      source-ref: ${{ inputs.source-ref }}
+      bundle-sha256: ${{ needs.build.outputs.sha256 }}
+      lanes: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'

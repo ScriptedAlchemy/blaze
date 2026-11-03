@@ -371,3 +371,14 @@ After: pending completed runs of `pr.yaml` on this branch. Negative control: pen
 ## Measured after
 
 (filled in from the runs on ScriptedAlchemy/blaze#32)
+
+### Private macOS integration capacity
+
+Owner pushes and manual runs can set `PRIVATE_DIST_MACOS_CI=true` to delegate
+macOS to the private CI controller. It validates both actor identities and the
+exact source revision, builds the same bundle, verifies it, and runs all six
+full-tier C2 lanes. The source run retains its hosted Linux checks.
+`Private dist macOS CI` is a required integration-branch status alongside `ci`
+and `C2 runtime`; a green hosted summary alone does not accept delegated macOS
+work. Pull requests from other authors and scheduled runs retain hosted macOS.
+The private guest accepts one job at a time and shares no host directories.
