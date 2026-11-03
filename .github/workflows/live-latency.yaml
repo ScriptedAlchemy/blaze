@@ -90,7 +90,9 @@ jobs:
       pull-requests: write
       issues: write
     env:
-      GH_TOKEN: ${{ github.token }}
+      # Use the same bot identity for gh PR creation as for checkout/push.
+      # The GITHUB_TOKEN fallback can leave new pull-request checks awaiting approval.
+      GH_TOKEN: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
     steps:
       - uses: actions/checkout@v6
         with:
