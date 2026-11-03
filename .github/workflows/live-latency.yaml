@@ -119,13 +119,20 @@ jobs:
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |
-          gh label create bench-regression --color B60205 --description "A benchmark median moved past its noise band" --force
-          open=$(gh issue list --label bench-regression --state open --json number --jq '.[0].number // empty')
-          if [ -n "$open" ]; then
-            gh issue comment "$open" --body-file "$RUNNER_TEMP/regressions.md"
+          available=$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)
+          if [ "$available" = true ]; then
+            gh label create bench-regression --color B60205 --description "A benchmark median moved past its noise band" --force
+            open=$(gh issue list --label bench-regression --state open --json number --jq '.[0].number // empty')
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body-file "$RUNNER_TEMP/regressions.md"
+            else
+              gh issue create --title "Live-edit latency regression at ${GITHUB_SHA::10}" --label bench-regression \
+                --body-file "$RUNNER_TEMP/regressions.md"
+            fi
+          elif [ "$available" = false ]; then
+            echo "::warning::Issues disabled for $GITHUB_REPOSITORY; regression details remain in the run summary"
           else
-            gh issue create --title "Live-edit latency regression at ${GITHUB_SHA::10}" --label bench-regression \
-              --body-file "$RUNNER_TEMP/regressions.md"
+            echo "::warning::Unexpected Issues availability: $available; regression details remain in the run summary"
           fi
           echo "::error::live-edit latency regressed beyond its noise band: see the run summary"
           exit 1

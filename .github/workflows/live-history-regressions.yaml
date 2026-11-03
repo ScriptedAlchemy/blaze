@@ -5,6 +5,7 @@ on:
       - .github/workflows/live-latency.yaml
       - .github/scripts/publish_live_history.sh
       - .github/scripts/test_publish_live_history.py
+      - .github/scripts/test_live_regression_issue.py
       - .github/workflows/live-history-regressions.yaml
   workflow_dispatch:
 permissions:
@@ -19,3 +20,5 @@ jobs:
           persist-credentials: false
       - name: Verify protected-main-safe publication and retries
         run: python3 -m unittest discover -s .github/scripts -p test_publish_live_history.py -v
+      - name: Verify reporting when GitHub Issues are disabled
+        run: python3 -m unittest discover -s .github/scripts -p test_live_regression_issue.py -v
