@@ -792,7 +792,6 @@ fn seeded_ids_differ_between_daemon_epochs() {
     assert_ne!(first_id([9; 32]), ExecutionId(1));
 }
 
-
 /// Four idle builders and two independent runnable builds: the scheduler assigns
 /// two leads and offers one helper to each before taking a second for either.
 /// An eager inner loop used to give both spare builders to the first build.
@@ -804,10 +803,13 @@ fn idle_helpers_are_shared_round_robin_between_running_builds() {
         admission.add_builder(0, "machine", reservation()).unwrap();
     }
     let mut jobs = Jobs::new(admission, ExecutionConfig::default());
-    let a = jobs.submit(0, &request(7), reservation(), &mut Vec::new()).unwrap().execution;
-    let b = jobs.submit(0, &request(8), reservation(), &mut Vec::new()).unwrap().execution;
-    assert_ne!(a, b);
+    // Every effect counts, submits included: a submit ticks admission before
+    // it enqueues, so the first build's helper is assigned inside the second
+    // submit, not in the tick below.
     let mut out = Vec::new();
+    let a = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
+    let b = jobs.submit(0, &request(8), reservation(), &mut out).unwrap().execution;
+    assert_ne!(a, b);
     jobs.tick(0, &mut out);
     assert_eq!(jobs.execution(a).unwrap().state(), ExecState::Running);
     assert_eq!(jobs.execution(b).unwrap().state(), ExecState::Running);
