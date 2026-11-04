@@ -2050,7 +2050,7 @@ fn unrelated_evicted_pack_does_not_mask_a_valid_cache_hit() {
     assert_eq!(names.len(), 2, "the fixture needs independent sealed packs");
     let first_keys = store::pack_keys(&names[0], &store.pack(&names[0]).unwrap()).unwrap();
     let second_keys = store::pack_keys(&names[1], &store.pack(&names[1]).unwrap()).unwrap();
-    let needed = keys.iter().copied().find(|key| second_keys.contains(&store.disk_key(key))).unwrap();
+    let needed = keys.into_iter().find(|key| second_keys.contains(&store.disk_key(key))).unwrap();
     assert!(!first_keys.contains(&store.disk_key(&needed)));
 
     let mut visited = Vec::new();
