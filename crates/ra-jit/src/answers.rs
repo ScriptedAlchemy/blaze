@@ -28,21 +28,18 @@ pub(crate) use own::{host_tuple, target_cfg};
 
 /// Build-script probes name this launcher rather than a compiler outside blaze.
 /// Unknown compile operations fail visibly; no wrapper fallback is reachable.
-pub(crate) fn producer_launcher(path: &Path) -> io::Result<()> {
+pub(crate) fn producer_launcher(path: &Path, sysroot: &Path) -> io::Result<()> {
+    if !sysroot.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the source toolchain of a producer probe must be absolute",
+        ));
+    }
     let exe = std::env::current_exe()?;
     #[cfg(unix)]
     {
-        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
-        let mut script = b"#!/bin/sh\nexec '".to_vec();
-        for &byte in exe.as_os_str().as_bytes() {
-            if byte == b'\'' {
-                script.extend_from_slice(b"'\\''");
-            } else {
-                script.push(byte);
-            }
-        }
-        script.extend_from_slice(b"' producer-rustc \"$@\"\n");
-        std::fs::write(path, script)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, producer_shell_script(&exe, sysroot))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
@@ -51,6 +48,34 @@ pub(crate) fn producer_launcher(path: &Path) -> io::Result<()> {
         let _ = (path, exe);
         Err(io::Error::other("the owned producer probe launcher is not implemented on this host"))
     }
+}
+
+/// Escape bytes inside a POSIX single-quoted argument. No input is evaluated by the shell.
+#[cfg(unix)]
+fn quoted_shell_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut quoted = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte == b'\'' {
+            quoted.extend_from_slice(b"'\\''");
+        } else {
+            quoted.push(byte);
+        }
+    }
+    quoted
+}
+
+#[cfg(unix)]
+fn producer_shell_script(exe: &Path, sysroot: &Path) -> Vec<u8> {
+    // A build-script runner may replace or remove RUSTUP_TOOLCHAIN. Pin the
+    // producer's selected absolute source toolchain in the launcher itself,
+    // rather than relying on the child process's inherited environment.
+    let mut script = b"#!/bin/sh\nRUSTUP_TOOLCHAIN='".to_vec();
+    script.extend_from_slice(&quoted_shell_path(sysroot));
+    script.extend_from_slice(b"' exec '");
+    script.extend_from_slice(&quoted_shell_path(exe));
+    script.extend_from_slice(b"' producer-rustc \"$@\"\n");
+    script
 }
 
 pub(crate) fn producer_probe(args: Vec<OsString>) -> anyhow::Result<()> {
@@ -642,17 +667,15 @@ fn toolchain_rustc(
     if let Some(fallback) = packaged_launcher(&real) {
         return selected(Some(fallback));
     }
-    if is_producer_launcher(&real) {
-        // A producer's RUSTC: the compiler it reaches is blaze, and the facts are those of the
-        // source toolchain the producer names explicitly beside it.
-        let selected = var("RUSTUP_TOOLCHAIN").map(PathBuf::from).filter(|it| it.is_absolute());
-        let rustc = selected
-            .map(|it| it.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX)));
-        return rustc.and_then(|it| std::fs::canonicalize(it).ok()).ok_or_else(|| {
+    if let Some(sysroot) = producer_source_toolchain(&real) {
+        // The trusted launcher carries its own absolute source toolchain. The
+        // build-script runner's environment is not authoritative for this probe.
+        let rustc = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+        return std::fs::canonicalize(&rustc).map_err(|error| {
             format!(
-                "blaze's probe launcher {} names no installed source toolchain by an absolute \
-                 RUSTUP_TOOLCHAIN",
-                found.display()
+                "blaze's probe launcher {} has no installed source toolchain at {}: {error}",
+                found.display(),
+                rustc.display()
             )
         });
     }
@@ -673,44 +696,45 @@ fn is_rustup_proxy(found: &Path, real: &Path) -> bool {
         || is_copy_of(real, &rustup)
 }
 
-/// Whether `launcher` is the probe launcher [`producer_launcher`] writes for this executable:
-/// that script, byte for byte, exec'ing this very executable's `producer-rustc`.
-fn is_producer_launcher(launcher: &Path) -> bool {
+/// Recognize only the complete launcher produced here for this executable.
+/// Its embedded source-toolchain path is the one the launcher actually passes
+/// to the owned probe, not an untrusted build-script environment variable.
+fn producer_source_toolchain(launcher: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::ffi::OsStringExt as _;
         const MOST: u64 = 64 * 1024;
-        let Ok(exe) = std::env::current_exe() else { return false };
-        if !std::fs::metadata(launcher).is_ok_and(|it| it.len() <= MOST) {
-            return false;
+        let exe = std::env::current_exe().ok()?;
+        if std::fs::metadata(launcher).ok()?.len() > MOST {
+            return None;
         }
-        let Ok(bytes) = std::fs::read(launcher) else { return false };
-        let Some(quoted) = bytes
-            .strip_prefix(b"#!/bin/sh\nexec '")
-            .and_then(|it| it.strip_suffix(b"' producer-rustc \"$@\"\n"))
-        else {
-            return false;
-        };
-        let (mut target, mut at) = (Vec::new(), 0);
-        // The path is single-quoted, an apostrophe in it written '\''.
+        let bytes = std::fs::read(launcher).ok()?;
+        let mut suffix = b"' exec '".to_vec();
+        suffix.extend_from_slice(&quoted_shell_path(&exe));
+        suffix.extend_from_slice(b"' producer-rustc \"$@\"\n");
+        let quoted = bytes
+            .strip_prefix(b"#!/bin/sh\nRUSTUP_TOOLCHAIN='")?
+            .strip_suffix(&suffix)?;
+        let mut source = Vec::with_capacity(quoted.len());
+        let mut at = 0;
         while at < quoted.len() {
             if quoted[at..].starts_with(b"'\\''") {
-                target.push(b'\'');
+                source.push(b'\'');
                 at += 4;
             } else if quoted[at] == b'\'' {
-                return false;
+                return None;
             } else {
-                target.push(quoted[at]);
+                source.push(quoted[at]);
                 at += 1;
             }
         }
-        let target = Path::new(OsStr::from_bytes(&target));
-        same_file::is_same_file(target, &exe).unwrap_or(false)
+        let path = PathBuf::from(OsString::from_vec(source));
+        (path.is_absolute() && quoted_shell_path(&path) == quoted).then_some(path)
     }
     #[cfg(not(unix))]
     {
         let _ = launcher;
-        false
+        None
     }
 }
 
@@ -1575,7 +1599,10 @@ pub(crate) mod tests {
         // remain in the explicitly selected installation, not beside CARGO.
         command.env("RUSTUP_TOOLCHAIN", &toolchain);
         let launcher = dir.path().join("owned-probe-launcher");
-        producer_launcher(&launcher).unwrap();
+        producer_launcher(&launcher, &toolchain).unwrap();
+        command.env_remove("RUSTUP_TOOLCHAIN");
+        assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
+        command.env("RUSTUP_TOOLCHAIN", dir.path().join("unrelated"));
         assert_eq!(cargo_query(&mut command, launcher.as_os_str()).unwrap().stdout, version.stdout);
         // Anything else named as RUSTC is a wrapper blaze does not model, whatever the
         // toolchain beside it says: refused by name, and never run.
@@ -1590,6 +1617,46 @@ pub(crate) mod tests {
             let named = format!("{} is a wrapper blaze does not model", launcher.display());
             assert!(error.contains(&named) && error.contains("Cargo was not executed"), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn producer_launcher_pins_absolute_toolchain_across_a_clean_child_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = dir.path().join("toolchain's location");
+        let launcher = dir.path().join("producer launcher");
+        producer_launcher(&launcher, &sysroot).unwrap();
+        assert_eq!(producer_source_toolchain(&launcher), Some(sysroot.clone()));
+        assert!(producer_launcher(&launcher, Path::new("relative")).is_err());
+
+        // Exercise the generated POSIX shell, including an apostrophe in the
+        // source path, without running the actual compiler from a unit test.
+        let mocked = dir.path().join("mock 'compiler");
+        std::fs::write(
+            &mocked,
+            b"#!/bin/sh\nprintf '%s\\n' \"$RUSTUP_TOOLCHAIN\" \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mock_launcher = dir.path().join("mock launcher");
+        std::fs::write(&mock_launcher, producer_shell_script(&mocked, &sysroot)).unwrap();
+        let output = Command::new("sh")
+            .arg(&mock_launcher)
+            .arg("a requested probe")
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("{}\nproducer-rustc\na requested probe\n", sysroot.display()).as_bytes()
+        );
+
+        let mut tampered = std::fs::read(&launcher).unwrap();
+        tampered.extend_from_slice(b"echo injected\n");
+        std::fs::write(&launcher, tampered).unwrap();
+        assert_eq!(producer_source_toolchain(&launcher), None);
     }
 
     #[test]
