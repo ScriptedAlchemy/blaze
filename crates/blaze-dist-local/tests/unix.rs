@@ -1115,6 +1115,144 @@ fn production_cli_server_owns_and_removes_its_actual_socket() {
     assert!(!path.exists());
 }
 
+/// No builder ever runs the job: the subscriber's own deadline ends it
+/// `TimedOut`, which is no verdict, so `Fallback` builds locally and `Never`
+/// fails. This is the requester half of local-owned fallback; the owned
+/// build it then runs is the caller's, of the same admitted spec.
+#[test]
+fn await_terminal_builds_locally_when_the_deadline_times_out() {
+    let f = Fixture::new(false, Config::default());
+    let mut c = f.client();
+    let b = submit(&mut c, 1000);
+    f.at(1001);
+    assert_eq!(
+        c.await_terminal(
+            &b,
+            &LocalPolicy::Fallback,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+        LocalAction::BuildLocally
+    );
+    assert_eq!(
+        c.await_terminal(
+            &b,
+            &LocalPolicy::Never,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+        LocalAction::Fail
+    );
+}
+
+/// The coordinator process is gone: under `Fallback` the requester builds
+/// locally instead of erroring; under `Never` the IO failure is its answer.
+#[test]
+fn await_terminal_builds_locally_when_the_coordinator_is_gone() {
+    for policy in [LocalPolicy::Fallback, LocalPolicy::Never] {
+        let mut f = Fixture::new(true, Config::default());
+        let mut c = f.client();
+        let b = submit(&mut c, 1_000_000);
+        f.stop();
+        let action =
+            c.await_terminal(&b, &policy, Duration::from_millis(1), Duration::from_secs(10));
+        match policy {
+            LocalPolicy::Fallback => {
+                assert_eq!(action.unwrap(), LocalAction::BuildLocally);
+            }
+            _ => assert!(action.is_err(), "{action:?}"),
+        }
+    }
+}
+
+/// A reported verdict is taken under `Fallback` too: fallback is for jobs
+/// the remote never decided, never a second opinion on one it did.
+#[test]
+fn await_terminal_takes_a_reported_verdict_under_fallback() {
+    let f = Fixture::new(true, Config::default());
+    let mut c = f.client();
+    let b = submit(&mut c, 1_000_000);
+    let content = b.subscription.content;
+    let execution = b.subscription.execution;
+    let join = Join {
+        content,
+        executor: f.executor.clone(),
+        request: WorkJoinRequest {
+            execution,
+            attempt: b.attempt,
+            roots: RootSet {
+                spec: [1; 32],
+                roots: [2; 32],
+                count: 1,
+                index: [3; 32],
+                inputs: [4; 32],
+            },
+            rejected: Set::new(Vec::new()),
+        },
+    };
+    assert!(matches!(c.call(Command::Join(join)).unwrap(), Answer::Join(_)));
+    let Answer::Lease(answer) = c
+        .call(Command::Lease(Lease {
+            content,
+            executor: f.executor.clone(),
+            request: WorkLeaseRequest { execution, attempt: b.attempt },
+        }))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let grant = answer.grant.unwrap();
+    assert!(matches!(
+        c.call(Command::Result(BatchSubmission {
+            content,
+            executor: f.executor.clone(),
+            request: BatchResult {
+                lease: grant.lease.clone(),
+                seq: 1,
+                items: vec![ItemResult {
+                    name: WorkName([9; 32]),
+                    outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
+                    found: Set::new(Vec::new()),
+                    unnamed: Set::new(Vec::new()),
+                }],
+                packs: Vec::new(),
+                returned_roots: Set::new(Vec::new()),
+                returned_names: Set::new(Vec::new()),
+            },
+        }))
+        .unwrap(),
+        Answer::Result(_)
+    ));
+    assert!(matches!(
+        c.call(Command::WorkerEvents(WorkerEvents {
+            content,
+            executor: f.executor.clone(),
+            request: WorkersEventsRequest {
+                execution,
+                attempt: b.attempt,
+                events: vec![JobEvent::Done(DoneEvent {
+                    outcome: Outcome::Passed,
+                    counters: Vec::new(),
+                })],
+            },
+        }))
+        .unwrap(),
+        Answer::WorkerEvents(_)
+    ));
+    assert_eq!(
+        c.await_terminal(
+            &b,
+            &LocalPolicy::Fallback,
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+        LocalAction::Take
+    );
+}
+
 fn two_roots() -> RootSet {
     RootSet { spec: [1; 32], roots: [2; 32], count: 2, index: [3; 32], inputs: [4; 32] }
 }
