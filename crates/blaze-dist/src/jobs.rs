@@ -1129,7 +1129,14 @@ impl Jobs {
     /// waits for a lead on the same platform, idle executors stay leads-in-waiting, so
     /// one wide build cannot starve the queue behind it.
     fn offer_helpers(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect)>) {
-        let ids: Vec<ExecutionId> = self
+        // At most one helper per execution per tick, fewest executors first.
+        // Rounds within one tick still hoard: `submit` ticks before it enqueues,
+        // so a second build is not yet waiting when the first is admitted, and
+        // rounds would hand the first build every spare builder (the second
+        // then has no lead at all). One per tick keeps spares reaching builds
+        // admitted moments later, and over ticks an alone build still gathers
+        // every idle executor.
+        let mut ids: Vec<(usize, ExecutionId)> = self
             .executions
             .values()
             .filter(|e| {
@@ -1138,42 +1145,31 @@ impl Jobs {
                     && e.lead().is_some()
                     && e.work().is_some_and(|w| !w.is_done())
             })
-            .map(|e| e.id)
+            .map(|e| (e.executors().count(), e.id))
             .collect();
-        // One offer per running execution per round. The previous nested loop gave
-        // every idle builder to the oldest execution before another running build
-        // could get even one helper, despite both having runnable work.
-        loop {
-            let mut offered = false;
-            for &id in &ids {
-                let Some((platform, need)) = self.platforms.get(&id).cloned() else {
-                    continue;
-                };
-                if self.admission.waiting(&platform) > 0 {
-                    continue;
-                }
-                let e = &self.executions[&id];
-                if e.work().is_none_or(|w| w.is_done()) {
-                    continue;
-                }
-                let namespace = e.namespace.clone();
-                let except: Vec<String> =
-                    e.executors().map(str::to_owned).chain(e.lost.iter().cloned()).collect();
-                let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
-                else {
-                    continue;
-                };
-                let e = self.executions.get_mut(&id).expect("present");
-                let Ok(attempt) = e.add_helper(now, &helper) else { continue };
-                let assignment = e.assignment();
-                self.admission.take(&helper, id, attempt);
-                self.assignments.insert(helper.clone(), (assignment, false));
-                out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
-                offered = true;
+        ids.sort();
+        for (_, id) in ids {
+            let Some((platform, need)) = self.platforms.get(&id).cloned() else { continue };
+            if self.admission.waiting(&platform) > 0 {
+                continue;
             }
-            if !offered {
-                break;
+            let e = &self.executions[&id];
+            if e.work().is_none_or(|w| w.is_done()) {
+                continue;
             }
+            let namespace = e.namespace.clone();
+            let except: Vec<String> =
+                e.executors().map(str::to_owned).chain(e.lost.iter().cloned()).collect();
+            let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
+            else {
+                continue;
+            };
+            let e = self.executions.get_mut(&id).expect("present");
+            let Ok(attempt) = e.add_helper(now, &helper) else { continue };
+            let assignment = e.assignment();
+            self.admission.take(&helper, id, attempt);
+            self.assignments.insert(helper.clone(), (assignment, false));
+            out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
         }
     }
 
