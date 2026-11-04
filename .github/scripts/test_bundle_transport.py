@@ -20,7 +20,8 @@ class BundleTransportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # Match roots(), including macOS's /var -> /private/var alias.
+        self.root = Path(self.tmp.name).resolve()
         self.ws, self.temp = self.root / "workspace", self.root / "temp"
         self.ws.mkdir()
         self.temp.mkdir()
