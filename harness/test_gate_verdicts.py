@@ -60,34 +60,35 @@ class UnitVerdictTests(unittest.TestCase):
     def test_known_failures_do_not_hide_later_compiler_error(self):
         diagnostic = json.dumps({"reason": "compiler-message", "message": {
             "level": "error", "message": "cannot find value production_regression"}})
-        result = errors(cargo_build() + suite() + diagnostic + "\n" + cargo_build(False))
+        result = errors(cargo_build() + suite("ok") + diagnostic + "\n", status=0)
         self.assertTrue(any("production_regression" in item for item in result))
 
     def test_known_failure_does_not_hide_unstructured_cargo_error(self):
-        self.assertTrue(errors(cargo_build() + suite() + "error: could not compile `other`\n"))
+        self.assertTrue(errors(cargo_build() + suite("ok") +
+                               "error: could not compile `other`\n", status=0))
 
     def test_signal_and_infrastructure_exit_are_not_assertion_failure(self):
-        for status in (-11, -9, 137, 1, 0):
+        for status in (-11, -9, 137, 1, 101):
             with self.subTest(status=status):
-                self.assertTrue(errors(cargo_build() + suite(), status))
+                self.assertTrue(errors(cargo_build() + suite("ok"), status))
 
     def test_child_signal_after_a_valid_summary_is_rejected(self):
-        self.assertTrue(errors(cargo_build() + suite() +
-                               "  process didn't exit successfully: test (signal: 6, SIGABRT)\n"))
+        self.assertTrue(errors(cargo_build() + suite("ok") +
+                               "  process didn't exit successfully: test (signal: 6, SIGABRT)\n", status=0))
 
     def test_failure_without_complete_summary_is_rejected(self):
-        text = cargo_build() + suite().split("test result:")[0]
-        self.assertTrue(errors(text))
-        self.assertTrue(errors(text + suite("ok", "other", "second")))
+        text = cargo_build() + suite("ok").split("test result:")[0]
+        self.assertTrue(errors(text, status=0))
+        self.assertTrue(errors(text + suite("ok", "other", "second"), status=0))
 
     def test_wrong_or_duplicate_summary_data_is_rejected(self):
-        self.assertTrue(errors(cargo_build() + suite().replace("0 passed; 1 failed", "2 passed; 1 failed")))
-        self.assertTrue(errors(cargo_build() + suite().replace("test known ... FAILED\n",
-                                                        "test known ... FAILED\ntest known ... FAILED\n")))
+        self.assertTrue(errors(cargo_build() + suite("ok").replace("1 passed; 0 failed", "2 passed; 0 failed"), status=0))
+        self.assertTrue(errors(cargo_build() + suite("ok").replace("test known ... ok\n",
+                                                        "test known ... ok\ntest known ... ok\n"), status=0))
 
     def test_missing_or_failed_build_record_is_not_a_green_run(self):
-        self.assertTrue(errors(suite()))
-        self.assertTrue(errors(cargo_build(False) + suite()))
+        self.assertTrue(errors(suite("ok"), status=0))
+        self.assertTrue(errors(cargo_build(False) + suite("ok"), status=0))
 
     def test_empty_run_is_rejected(self):
         self.assertTrue(errors(cargo_build(), status=0))
@@ -115,13 +116,13 @@ class UnitVerdictTests(unittest.TestCase):
                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
         self.assertFalse(errors(text, status=0))
 
-    def test_cli_rejects_a_compile_failure_after_assertion_failures(self):
+    def test_cli_rejects_a_compile_failure_after_passing_tests(self):
         # Test the script's exit status, not just the parser in isolation.
-        text = cargo_build() + suite()
+        text = cargo_build() + suite("ok")
         text += "error: could not compile `ra-jit` (bin test) due to 1 previous error\n"
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / "cargo"
-            cargo.write_text(f"#!{sys.executable}\nimport sys\nprint({text!r})\nsys.exit(101)\n")
+            cargo.write_text(f"#!{sys.executable}\nimport sys\nprint({text!r})\nsys.exit(0)\n")
             cargo.chmod(0o755)
             result = subprocess.run([sys.executable, "-I", str(HERE / "unittests.py")],
                                     env={**os.environ, "PATH": directory + os.pathsep + os.environ.get("PATH", "")},
