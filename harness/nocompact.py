@@ -39,9 +39,12 @@ unsafe extern "C" {
     fn _dyld_get_image_vmaddr_slide(image: u32) -> isize;
 }
 
-// Keep the edit target materialized independently of `main`: probe its frame,
-// not an inlined copy in its caller.
+// Give the patched root an unambiguous exported Mach-O name. Blaze uses the
+// linker's symbol for compiled roots, not the ra-jit:: names of callees.
+// The splicer retargets that symbol's address; its frame is what we probe.
+// Never inline this function into `main`.
 #[inline(never)]
+#[unsafe(export_name = "ncu_answer")]
 fn answer() -> u32 {
     1
 }
@@ -88,32 +91,27 @@ def links(home):
 
 
 def symbol_address(listed, name):
-    """Find one ra-jit function, not rustc's separate jump or another same-named symbol.
+    """Find exactly one exported root's Mach-O address, not a private callee.
 
-    ra-jit's private names use either ra-jit/ra_jit, may include a qualified
-    crate/module path, and have an optional n before the number. Resolve only
-    an unambiguous exact final function name, never an arbitrary nearby symbol.
+    Blaze exports non-generic roots under their linked symbol, and the
+    splicer updates that symbol's address when replacing the function.
     """
     found = re.findall(
-        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_ra[-_]jit::(?:[A-Za-z0-9_$]+::)*{re.escape(name)}::n?\d+$",
+        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_{re.escape(name)}$",
         listed, re.M
     )
     return "0x" + found[0] if len(found) == 1 else None
 
 
 def address_of(program, name):
-    """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
-    of it (rustc's is a jump there)."""
+    """The exported root address, rewritten by the splicer after an edit."""
     found = subprocess.run(["nm", program], capture_output=True, text=True)
     if found.returncode:
         raise SystemExit(f"nm failed for {program}: {found.stderr.strip()[-1000:]}")
     at = symbol_address(found.stdout, name)
     if at is None:
         lines = found.stdout.splitlines()
-        named = [line for line in lines if f"::{name}::" in line]
-        # Constant data labels can crowd every useful name out of the first 24
-        # diagnostics. Show the relevant name rows first; failing that, the
-        # actual private code symbols instead of .Lra-jit.const.*.
+        named = [line for line in lines if name in line]
         code = [line for line in lines
                 if re.search(r"[ \t]+[tTsS][ \t]+_ra[-_]jit::", line)]
         sample = named if named else code
@@ -140,13 +138,13 @@ def edit(ws, env, home, program, step, want):
     """Builds, runs the program and says what is wrong with it, or "ok"."""
     seen = len(links(home))
     said = build(ws, env, step)
-    at = address_of(program, "answer")
+    at = address_of(program, "ncu_answer")
     ran = subprocess.run([program, at or "0"], capture_output=True, text=True, timeout=60)
     made = links(home)[seen:]
     how = made[-1] if made else "no link"
     verdict = "ok"
     if at is None:
-        verdict = "NO SYMBOL OF `answer`"
+        verdict = "NO SYMBOL OF `ncu_answer`"
     elif ran.returncode != 0 or ran.stdout.strip() != f"{want} framed":
         verdict = f"PRINTED {ran.stdout.strip()!r} (exit {ran.returncode}), NOT {want} framed"
     elif "[ra-jit]" not in said:
@@ -159,7 +157,7 @@ def edit(ws, env, home, program, step, want):
 
 def expanded_source(source, count=MANY):
     """Grow the frame section without moving answer's no-inline attribute to a new function."""
-    target = "#[inline(never)]\nfn answer() -> u32 {\n"
+    target = "#[inline(never)]\n#[unsafe(export_name = \"ncu_answer\")]\nfn answer() -> u32 {\n"
     if source.count(target) != 1:
         raise ValueError("no unique no-inline answer in the fixture")
     many = "".join(f"fn f{i}() -> u32 {{\n    {i}\n}}\n\n" for i in range(count))
