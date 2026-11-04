@@ -130,7 +130,8 @@
     {
       "job": "ubuntu-24.04-arm",
       "url": "https://github.com/ScriptedAlchemy/blaze/actions/runs/41921616928/job/126896068453",
-      "failure": "The fork nightly SHA256SUMS release asset returns HTTP 404."
+      "failure": "The fork nightly SHA256SUMS release asset returns HTTP 404.",
+      "remediation": "Pull-request installer jobs now build a native candidate archive for their target and pass it only to install and upgrade steps. Scheduled, manual, push, and release events still verify published assets. Native CI execution is pending."
     },
     {
       "job": "this commit's build",
@@ -146,5 +147,23 @@
       "python3.13 harness/imports.py: 147/147 scripts import.",
       "git diff --check: passed."
     ]
+  },
+  "installer_candidate_change": {
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-apple-darwin"
+    ],
+    "linux_proc_macro_server": "Built with --server by blaze; no compiler fallback is added.",
+    "archive_contract": "blaze-commit-<target>.tar.gz containing blaze-commit-<target>/, consumed through install.sh BLAZE_ARCHIVE.",
+    "existing_checks": "Install, in-place upgrade, toolchain, hello-world execution, and missing-version checks remain.",
+    "validation": [
+      "actionlint .github/workflows/install.yaml: passed.",
+      "shellcheck -s sh install.sh: passed.",
+      "python3.13 harness/check_runner_labels.py: passed.",
+      "python3.13 -B .github/scripts/test_build_release.py: all cases passed.",
+      "git diff --check: passed."
+    ],
+    "native_execution": "Pending CI; lint success is not an installation verdict."
   }
 }
