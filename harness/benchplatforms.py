@@ -3,33 +3,18 @@
 
     benchplatforms.py matrix [--bun]
 
-Every benchmark of the README is a matrix over PLATFORMS, in this order. Each platform is one
-machine of its own, a self-hosted runner whose one label is `label`: its numbers are comparable
-with each other and with its own history, not with another platform's. A result says which
-platform it is by its host (`platform()`); benchreport.py stores it as
-docs/benchmarks/<slug>.json (runtime-<slug>.json, bun-<slug>.json, ...) and writes every README
-table from the newest stored result of each platform, so a platform that did not run this time
-keeps its last numbers, with their date and commit.
-
-`matrix` prints, for the bench-readme and bench-bun workflows, `matrix=` (the platforms whose
-runner is registered, as a strategy matrix) and `any=true|false` to $GITHUB_OUTPUT, or to stdout
-without it. A runner is registered when the repository variable BENCH_RUNNERS (passed in the
-environment) names its slug, comma-separated: `linux-x86-64,linux-aarch64,macos-arm64`.
-BENCH_RUNNER=true, the variable before there were platforms, means Linux x86-64.
+Benchmarks use standard GitHub-hosted runners. BENCH_RUNNERS selects platform slugs
+(comma-separated); no selection leaves these optional measurements disabled.
+BENCH_RUNNER=true retains the legacy Linux x86-64 selection. Hosted measurements
+are noisy and must not be compared directly with dedicated-machine baselines.
 """
 import json, os, sys
 
-# slug, name, the runner's label, and where the work goes: a short path on macOS, where the
-# daemon's socket path has to fit in 104 bytes.
-#
-# A platform's runner is registered with its label alone and no default labels
-# (harness/benchrunner.sh, `--no-default-labels`): a job that asks for `self-hosted`, or for the
-# machine's own OS and architecture, must not reach a benchmark machine, since on a public
-# repository a fork's pull request writes the `runs-on` of the workflow it runs.
+# Short macOS work paths keep daemon sockets within the 104-byte limit.
 PLATFORMS = [
-    dict(slug="macos-arm64", name="macOS arm64", label="bench-macos", work="/tmp/ra-jit-bench"),
-    dict(slug="linux-aarch64", name="Linux aarch64", label="bench-arm64", work=""),
-    dict(slug="linux-x86-64", name="Linux x86-64", label="bench-x86", work=""),
+    dict(slug="macos-arm64", name="macOS arm64", label="macos-15", work="/tmp/ra-jit-bench"),
+    dict(slug="linux-aarch64", name="Linux aarch64", label="ubuntu-24.04-arm", work=""),
+    dict(slug="linux-x86-64", name="Linux x86-64", label="ubuntu-24.04", work=""),
 ]
 NAMES = [p["name"] for p in PLATFORMS]
 
@@ -68,7 +53,7 @@ def main():
         f.write("\n".join(lines) + "\n")
     skipped = [p["name"] for p in PLATFORMS if p not in found]
     if skipped:
-        print(f"not registered, so not run (the README keeps their last numbers): {', '.join(skipped)}", file=sys.stderr)
+        print(f"not selected, so not run (the README keeps their last numbers): {', '.join(skipped)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
