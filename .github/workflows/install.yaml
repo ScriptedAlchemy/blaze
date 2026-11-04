@@ -6,6 +6,8 @@ name: install
 # container with no Rust at all, which runs `blaze run` in a project written by hand. On a
 # change to the script, on each release once it is published, weekly (a release's assets or
 # GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
+# Pull requests install their own native candidate archives, so testing an installer change
+# does not require the repository to have published a release already.
 on:
   push:
     branches: [main]
@@ -41,11 +43,14 @@ jobs:
   install:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 90 || 20 }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-26, target: aarch64-apple-darwin }
     env:
       # Forks have no release assets. Test the published upstream distribution;
       # archive/no-rust below independently tests this commit's binaries.
@@ -54,11 +59,28 @@ jobs:
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
       - uses: actions/checkout@v7
+      - name: Build this pull request's native installer archive
+        id: candidate
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rust-src
+          export RUSTUP_TOOLCHAIN=1.99.0
+          install_target="${{ matrix.target }}"
+          install_name="blaze-commit-$install_target"
+          release_args=(--target "$install_target" --out "$install_name")
+          if [ "$RUNNER_OS" = Linux ]; then release_args+=(--server); fi
+          python3 .github/scripts/build_release.py "${release_args[@]}"
+          install_archive="$RUNNER_TEMP/$install_name.tar.gz"
+          tar czf "$install_archive" "$install_name"
+          echo "path=$install_archive" >> "$GITHUB_OUTPUT"
       # Here and not in the job's env, which has no runner context.
       - name: a CARGO_HOME of its own
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
       # Piped, as the README has it: no terminal, nothing asked. dash is Ubuntu's /bin/sh.
       - name: install
+        env:
+          BLAZE_ARCHIVE: ${{ steps.candidate.outputs.path }}
         run: sh < install.sh
       - name: what it installed runs
         run: |
@@ -78,6 +100,8 @@ jobs:
             rustup component list --toolchain 1.99.0 --installed | grep -q '^rust-src'
           fi
       - name: again, which upgrades in place
+        env:
+          BLAZE_ARCHIVE: ${{ steps.candidate.outputs.path }}
         run: sh install.sh --verbose
       - name: blaze in a new project
         run: |
