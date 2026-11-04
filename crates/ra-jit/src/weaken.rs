@@ -524,7 +524,7 @@ mod tests {
         let ran = lld("ld.lld")
             .expect("an ld.lld")
             .args(["-e", "entry"])
-            .args(crate::cargo::plan::whole_link_args(false, out).unwrap())
+            .args(crate::cargo::plan::whole_link_args(false, out, &[]).unwrap())
             .args(objects)
             .arg("-o")
             .arg(out)

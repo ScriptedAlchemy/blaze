@@ -475,7 +475,7 @@ fn command_of(
     }
     args.extend(line.after.iter().cloned());
     if let CommandPurpose::WholeLink = purpose {
-        let splices = crate::cargo::plan::whole_link_args(line.apple, exe)
+        let splices = crate::cargo::plan::whole_link_args(line.apple, exe, &args)
             .with_context(|| format!("writing what the link of {} asks for", exe.display()))?;
         args.extend(splices.into_iter().map(OsString::from));
     }

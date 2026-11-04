@@ -682,11 +682,16 @@ fn headerpad_at_least(binary: &Path, asked: Option<u64>) -> std::io::Result<Path
 /// defines weak before each link ([`crate::weaken::replaced`]), rather than tell the linker
 /// to keep the first definition of any name: that would take two definitions in a library
 /// of the program, which rustc's link refuses, for one.
-pub(crate) fn whole_link_args(apple: bool, binary: &Path) -> std::io::Result<Vec<String>> {
+pub(crate) fn whole_link_args(
+    apple: bool,
+    binary: &Path,
+    args: &[std::ffi::OsString],
+) -> std::io::Result<Vec<String>> {
     if !apple {
         return Ok(Vec::new());
     }
-    let file = headerpad_at_least(binary, None)?;
+    let asked = args.iter().filter_map(|arg| arg.to_str().and_then(headerpad_in)).last();
+    let file = headerpad_at_least(binary, asked)?;
     Ok(vec![NO_FIXUP_CHAINS.to_owned(), format!("@{}", file.display())])
 }
 
@@ -898,10 +903,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ra-jit-plan-whole-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("bin");
-        assert_eq!(whole_link_args(false, &binary).unwrap(), Vec::<String>::new());
-        let apple = whole_link_args(true, &binary).unwrap();
+        assert_eq!(whole_link_args(false, &binary, &[]).unwrap(), Vec::<String>::new());
+        let apple = whole_link_args(true, &binary, &[]).unwrap();
         assert_eq!(apple[0], NO_FIXUP_CHAINS);
         assert!(apple.iter().all(|it| !it.contains("multiple-definition")), "{apple:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_whole_build_preserves_explicit_headerpad_and_learned_growth() {
+        let dir =
+            std::env::temp_dir().join(format!("ra-jit-plan-explicit-pad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("bin");
+        let args = ["-Wl,-headerpad,0x800", "-Wl,-headerpad,100"].map(std::ffi::OsString::from);
+        whole_link_args(true, &binary, &args).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(0x100));
+        write_headerpad(&binary, 0x8000).unwrap();
+        whole_link_args(true, &binary, &args).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(0x8000));
+        std::fs::remove_file(headerpad_file(&binary)).unwrap();
+        whole_link_args(true, &binary, &[]).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(HEADERPAD));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
