@@ -160,7 +160,16 @@ def expanded_source(source, count=MANY):
     target = "#[inline(never)]\n#[unsafe(export_name = \"ncu_answer\")]\nfn answer() -> u32 {\n"
     if source.count(target) != 1:
         raise ValueError("no unique no-inline answer in the fixture")
-    many = "".join(f"fn f{i}() -> u32 {{\n    {i}\n}}\n\n" for i in range(count))
+    # Trivial constant-returning leaves can have no frame descriptors on arm64.
+    # Keep 1000 reachable functions with a genuine non-tail indirect call, so
+    # their unwind frames (not merely their symbols) force __eh_frame to grow.
+    many = "".join(
+        f"#[inline(never)]\nfn f{i}() -> u32 {{\n"
+        "    let call = std::hint::black_box(answer as fn() -> u32);\n"
+        f"    call().wrapping_add({i})\n"
+        "}\n\n"
+        for i in range(count)
+    )
     named = "".join(f"    std::hint::black_box(f{i} as fn() -> u32);\n" for i in range(count))
     return source.replace(target, many + target + named, 1)
 
@@ -209,7 +218,8 @@ def main():
         verdict, how = edit(ws, env, home, program, f"{MANY} functions added", EDITS + 1)
         at = starts(program)
         if verdict == "ok" and not at.get("__eh_frame", 0) < at.get("__text", 0):
-            verdict = "FRAMES NOT MOVED"
+            verdict = (f"FRAMES NOT MOVED (__eh_frame={at.get('__eh_frame')!r}, "
+                       f"__text={at.get('__text')!r})")
         wrong += verdict != "ok"
         print(f"{f'{MANY} functions added':30} {verdict:12} {how[:110]}", flush=True)
     finally:
