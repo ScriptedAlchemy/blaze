@@ -532,6 +532,49 @@ fn real_queries_export_roots_generics_consts_bounds_closure_paths_and_debug() {
             assert_eq!(via_closure.entry_bytes(&helper.key), store.get(&helper.key));
             drop(via_closure);
             std::fs::remove_dir_all(closure_dir).unwrap();
+            if debug {
+                // The helper is reachable through root but absent from the receipt.
+                // A sealed pack can contain a value under a debug-type key whose
+                // actual bytes do not have that key's semantic digest. Only closure
+                // admission, not the receipt-entry validator, can catch it.
+                let bad_type = [0x77; 32];
+                let mut changed_helper =
+                    cached::Entry::decode(&store.get(&helper.key).unwrap()).unwrap();
+                changed_helper.debug.as_mut().unwrap().stored_types.push(bad_type);
+                let corrupted_dir = scratch("transitive-debug-type");
+                let corrupted_store = store::Store::owned(&corrupted_dir).unwrap();
+                for exported in &batch.receipt.entries {
+                    let bytes = if exported.key == helper.key {
+                        changed_helper.encode().unwrap()
+                    } else {
+                        store.get(&exported.key).unwrap()
+                    };
+                    corrupted_store.insert(&exported.key, &bytes);
+                    let entry = cached::Entry::decode(&bytes).unwrap();
+                    if let Some(debug) = &entry.debug {
+                        for key in &debug.stored_types {
+                            let value = if *key == bad_type {
+                                b"not a debug type".to_vec()
+                            } else {
+                                store.get(key).unwrap()
+                            };
+                            corrupted_store.insert(key, &value);
+                        }
+                    }
+                }
+                let mut corrupted = incomplete.clone();
+                corrupted.packs = corrupted_store.seal_checked().unwrap();
+                let refused_dir = scratch("transitive-debug-type-refused");
+                let refused = import_batch(&context, &corrupted, &refused_dir, |name| {
+                    corrupted_store.pack(name)
+                })
+                .err()
+                .expect("corrupt transitive debug blob was admitted");
+                assert!(refused.contains("closure debug type digest mismatch"), "{refused}");
+                assert!(!refused_dir.exists());
+                drop(corrupted_store);
+                std::fs::remove_dir_all(corrupted_dir).unwrap();
+            }
             let partial_dir = scratch("root-closure-partial");
             let partial = store::Store::owned(&partial_dir).unwrap();
             for entry in &incomplete.entries {
