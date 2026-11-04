@@ -89,7 +89,8 @@ def symbol_address(listed, name):
     Both spellings are recognized by the tier reporter too.
     """
     found = re.findall(
-        rf"^([0-9a-fA-F]+) [ts] _ra[-_]jit::{re.escape(name)}::n?\d+$", listed, re.M
+        rf"^([0-9a-fA-F]+)[ \t]+[tTsS][ \t]+_ra[-_]jit::{re.escape(name)}::n?\d+$",
+        listed, re.M
     )
     return "0x" + found[0] if len(found) == 1 else None
 
@@ -97,8 +98,18 @@ def symbol_address(listed, name):
 def address_of(program, name):
     """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
     of it (rustc's is a jump there)."""
-    listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    return symbol_address(listed, name)
+    found = subprocess.run(["nm", program], capture_output=True, text=True)
+    if found.returncode:
+        raise SystemExit(f"nm failed for {program}: {found.stderr.strip()[-1000:]}")
+    at = symbol_address(found.stdout, name)
+    if at is None:
+        lines = found.stdout.splitlines()
+        candidates = [line for line in lines if "ra-jit" in line or "ra_jit" in line
+                      or f"::{name}" in line]
+        print(f"no unique {name} symbol in {program} ({len(lines)} nm rows, "
+              f"{len(candidates)} candidate rows):\n" + "\n".join(candidates[:24]), file=sys.stderr)
+    return at
+
 
 
 def sections(program):

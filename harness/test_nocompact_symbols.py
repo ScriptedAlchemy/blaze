@@ -2,10 +2,14 @@
 """Check nocompact's Mach-O symbol lookup without requiring macOS or an ra-jit build."""
 import sys
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from subprocess import CompletedProcess
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nocompact import symbol_address
+from nocompact import address_of, symbol_address
 
 
 class Symbols(unittest.TestCase):
@@ -14,6 +18,28 @@ class Symbols(unittest.TestCase):
                      "_ra-jit::answer::n12", "_ra_jit::answer::n12"):
             with self.subTest(name=name):
                 self.assertEqual(symbol_address(f"0000f0af t {name}\n", "answer"), "0x0000f0af")
+
+    def test_global_text_and_tab_separated_nm_symbols(self):
+        for kind in ("T", "S", "t", "s"):
+            with self.subTest(kind=kind):
+                self.assertEqual(symbol_address(f"00aBcd09\t{kind}\t_ra_jit::answer::n7\n",
+                                                "answer"), "0x00aBcd09")
+
+    def test_nm_error_is_not_reported_as_missing_symbol(self):
+        failed = CompletedProcess(["nm", "program"], 1, "", "malformed object")
+        with mock.patch("nocompact.subprocess.run", return_value=failed):
+            with self.assertRaisesRegex(SystemExit, "malformed object"):
+                address_of("program", "answer")
+
+    def test_missing_symbol_reports_actual_nm_candidates(self):
+        listing = "0000f0af T _ra_jit::unexpected::n7\n"
+        completed = CompletedProcess(["nm", "program"], 0, listing, "")
+        diagnostic = StringIO()
+        with mock.patch("nocompact.subprocess.run", return_value=completed):
+            with redirect_stderr(diagnostic):
+                self.assertIsNone(address_of("program", "answer"))
+        self.assertIn("_ra_jit::unexpected::n7", diagnostic.getvalue())
+        self.assertIn("1 nm rows", diagnostic.getvalue())
 
     def test_does_not_use_a_different_function(self):
         self.assertIsNone(symbol_address("0000f0af t _ra_jit::another::n12\n", "answer"))
