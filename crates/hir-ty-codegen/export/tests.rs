@@ -1816,7 +1816,7 @@ fn merged_receipt_checks_duplicates_in_its_first_batch() {
     let merged = dist::merged_receipt(&[first.clone(), first.clone()]).unwrap();
     assert_eq!(merged.entries.len(), 1);
     assert_eq!(merged.entries[0].entry_digest, entry.entry_digest);
-    assert_eq!(merged.packs, ["pack-one"]);
+    assert_eq!(merged.packs, vec!["pack-one".to_owned()]);
 
     // The same key with conflicting bytes in the FIRST batch must be refused,
     // not silently overwritten when that batch seeds the deduplication map.
