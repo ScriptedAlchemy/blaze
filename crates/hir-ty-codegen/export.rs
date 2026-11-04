@@ -824,9 +824,17 @@ pub(super) fn admitted_closure(
         }
         if let Some(debug) = &entry.debug {
             for types in &debug.stored_types {
-                if store.get_installed(types).is_none() {
-                    return Err("receipt closure lacks a debug type blob".into());
+                // A reachable entry may be absent from receipt.entries (FromStore).
+                // validate_receipt checks only listed entries, so transitive blobs
+                // must be checked here too, not merely found by their store key.
+                let bytes =
+                    store.get_installed(types).ok_or("receipt closure lacks a debug type blob")?;
+                if digest_types(&bytes) != *types {
+                    return Err("receipt closure debug type digest mismatch".into());
                 }
+                let set: Vec<debuginfo::DebugType> =
+                    postcard::from_bytes(&bytes).map_err(|e| e.to_string())?;
+                validate_types(&set)?;
             }
         }
         for function in &entry.funcs {
