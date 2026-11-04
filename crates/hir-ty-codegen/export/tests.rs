@@ -2136,6 +2136,18 @@ fn merged_receipt_checks_duplicates_in_its_first_batch() {
     conflict.entries[1].entry_digest[0] ^= 1;
     assert!(dist::merged_receipt(&[conflict]).unwrap_err().contains("two different digests"));
 
+    // Equal digests are not enough: the name, home and tuple bind the result
+    // to a particular request. Deduplicating by key must not hide a forged
+    // second identity from the downstream receipt validator.
+    let mut different_work = first.clone();
+    different_work.entries[1].work.name.push_str("-other");
+    let error = dist::merged_receipt(&[different_work]).unwrap_err();
+    assert!(error.contains("two different work identities"));
+    let mut different_home = first.clone();
+    different_home.entries[0].work.home[0] ^= 1;
+    let error = dist::merged_receipt(&[first.clone(), different_home]).unwrap_err();
+    assert!(error.contains("two different work identities"));
+
     // Mismatched later batches and later conflicting duplicates are refused too.
     let mut different_context = first.clone();
     different_context.context[0] ^= 1;
