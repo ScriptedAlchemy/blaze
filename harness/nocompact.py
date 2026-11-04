@@ -39,6 +39,9 @@ unsafe extern "C" {
     fn _dyld_get_image_vmaddr_slide(image: u32) -> isize;
 }
 
+// Keep the edit target materialized independently of `main`: probe its frame,
+// not an inlined copy in its caller.
+#[inline(never)]
 fn answer() -> u32 {
     1
 }
@@ -55,7 +58,9 @@ fn has_frame(at: &str) -> bool {
 
 fn main() {
     let framed = std::env::args().nth(1).map(|at| has_frame(&at));
-    println!("{} {}", answer(), framed.map_or("unasked", |it| if it { "framed" } else { "unframed" }));
+    // The opaque function pointer keeps the edited function address-taken.
+    let call = std::hint::black_box(answer as fn() -> u32);
+    println!("{} {}", call(), framed.map_or("unasked", |it| if it { "framed" } else { "unframed" }));
 }
 """,
 }
