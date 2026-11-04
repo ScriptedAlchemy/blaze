@@ -47,7 +47,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
     env:
-      BLAZE_REPO: ${{ github.repository }}
+      # Forks have no release assets. Test the published upstream distribution;
+      # archive/no-rust below independently tests this commit's binaries.
+      BLAZE_REPO: indexable-inc/blaze
       # A release the workflow was started for, or the one just published.
       BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
     steps:
