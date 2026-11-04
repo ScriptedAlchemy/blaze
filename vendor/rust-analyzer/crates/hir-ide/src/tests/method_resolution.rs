@@ -2343,3 +2343,37 @@ impl S {
 "#,
     );
 }
+
+#[test]
+fn dependency_macros_can_write_impls_inside_functions() {
+    check_types(
+        r#"
+//- /main.rs crate:main deps:dep
+use dep::Trait;
+struct Direct;
+struct Generated;
+fn holder() { dep::make_impl!(Direct); }
+macro_rules! make_holder { () => { fn generated_holder() { dep::make_impl!(Generated); } }; }
+make_holder!();
+fn outside() {
+    Direct.inherent();
+  //^^^^^^^^^^^^^^^^^ u16
+    Direct.from_trait();
+  //^^^^^^^^^^^^^^^^^^^ u32
+    Generated.inherent();
+  //^^^^^^^^^^^^^^^^^^^^ u16
+    Generated.from_trait();
+  //^^^^^^^^^^^^^^^^^^^^^^ u32
+}
+//- /dep.rs crate:dep
+pub trait Trait { fn from_trait(&self) -> u32; }
+#[macro_export]
+macro_rules! make_impl {
+    ($ty:ty) => {
+        impl $crate::Trait for $ty { fn from_trait(&self) -> u32 { 1 } }
+        impl $ty { fn inherent(&self) -> u16 { 2 } }
+    };
+}
+"#,
+    );
+}

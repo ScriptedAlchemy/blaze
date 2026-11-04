@@ -637,13 +637,13 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 /// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
 /// name, and those are looked into in every crate. A function can hold one as well, of a type
 /// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
-/// a workspace crate's functions are all looked into. Lowering every body of every dependency
-/// for this is too much, so a dependency's function is looked into when lexing its file finds
-/// an impl in it (bincode's `deserialize_enum` holds its `EnumAccess` for `&mut Deserializer`).
+/// a function without an impl or macro call needs no body lowering. Local macro calls are
+/// conservative: a dependency's proc macro can write an impl even when its definition is
+/// unavailable to the lexer.
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
     let local = krate.data(db).origin.is_local();
-    let holds = |it: FunctionId| local || holds_impl(db, krate, it);
+    let holds = |it: FunctionId| holds_impl(db, krate, it);
     let declared = scope.declarations().filter_map(|def| match def {
         ModuleDefId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
         ModuleDefId::StaticId(it) if local => Some(DefWithBodyId::from(it)),
@@ -660,12 +660,22 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
     holders
 }
 
+/// The item's block identities, independent of the expressions in them. Keeping this query
+/// between a body and the crate indexes prevents an ordinary body edit from rebuilding both
+/// indexes, as rustc separates collection of item details from body checking:
+/// https://doc.rust-lang.org/nightly/nightly-rustc/src/rustc_hir_analysis/collect.rs.html
+#[salsa::tracked(returns(deref))]
+fn impl_holder_blocks(db: &dyn HirDatabase, owner: DefWithBodyId) -> Box<[hir_def::BlockId]> {
+    Body::of(db, owner).blocks(db).map(|(block, _)| block).collect()
+}
+
 /// Whether an impl of [`impls_in_bodies`] is in the text of `function`, or a call of one of
-/// `krate`'s [`macros_writing_impls`]. The file is parsed for the function's range only when its
-/// lexing found one.
+/// `krate`'s [`macros_writing_impls`]. Local crates retain every macro call as a possible
+/// producer. The file is parsed for the function's range only when lexing found a candidate.
+#[salsa::tracked(returns(copy))]
 fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool {
     let ast_id = function.loc(db).id;
-    let Some(file) = ast_id.file_id.file_id() else { return false };
+    let Some(file) = ast_id.file_id.file_id() else { return true };
     let at = impls_in_bodies(db, file);
     if at.is_empty() {
         return false;
@@ -673,7 +683,8 @@ fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool 
     let range = ast_id.file_id.ast_id_map(db).get(ast_id.value).text_range();
     at.iter().any(|(it, call)| {
         range.contains(*it)
-            && call.as_ref().is_none_or(|name| macros_writing_impls(db, krate).contains(name))
+            && (krate.data(db).origin.is_local()
+                || call.as_ref().is_none_or(|name| macros_writing_impls(db, krate).contains(name)))
     })
 }
 
@@ -991,8 +1002,8 @@ impl<'db> InherentImpls<'db> {
                 }
 
                 for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
-                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, map);
+                    for &block in impl_holder_blocks(db, owner) {
+                        collect(db, block_def_map(db, block), map);
                     }
                 }
             }
@@ -1179,8 +1190,8 @@ impl<'db> TraitImpls<'db> {
                 }
 
                 for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
-                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, lang_items, map);
+                    for &block in impl_holder_blocks(db, owner) {
+                        collect(db, block_def_map(db, block), lang_items, map);
                     }
                 }
             }
