@@ -300,9 +300,15 @@ def proc_macro_server(ra_jit, out):
                    RA_JIT_STD_FROM="off", RA_JIT_PROC_MACRO_SERVER="0", RUST_BACKTRACE="0")
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
-        built = run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
-                     "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env,
-                    capture_output=True, text=True)
+        try:
+            built = run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
+                         "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env,
+                        capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            sys.stdout.write(error.stdout or "")
+            sys.stderr.write(error.stderr or "")
+            exe.unlink(missing_ok=True)
+            raise
         sys.stdout.write(built.stdout)
         sys.stderr.write(built.stderr)
         missing = re.findall(r"^linked .* in \S+, (\d+) functions in it ra-jit could not compile$",

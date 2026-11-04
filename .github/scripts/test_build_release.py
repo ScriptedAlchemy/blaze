@@ -271,6 +271,27 @@ def main() -> int:
             note(f"server bootstrap disables all prior expansion servers {counts}",
                  compile_image.call_args.kwargs["env"]["RA_JIT_PROC_MACRO_SERVER"] == "0")
 
+        out = tmp / "bootstrap-failed"
+        out.mkdir()
+        executable = out / b.SERVER_BIN
+        executable.write_bytes(b"partial bootstrap image")
+        failure = subprocess.CalledProcessError(7, ["ra-jit"],
+                                               output="bootstrap started\n",
+                                               stderr="error: owned compilation failed\n")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(b, "run", side_effect=failure), \
+                patch.object(b.subprocess, "run") as check_version, \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                b.proc_macro_server(tmp / "ra-jit", out)
+                raised = None
+            except subprocess.CalledProcessError as error:
+                raised = error
+        note("failed server bootstrap preserves its diagnostic streams and exit status",
+             raised is failure and stdout.getvalue() == failure.stdout
+             and stderr.getvalue() == failure.stderr and not check_version.called)
+        note("failed server bootstrap removes its partial executable", not executable.exists())
+
     if FAILED:
         for f in FAILED:
             print(f"FAIL {f}", file=sys.stderr)
