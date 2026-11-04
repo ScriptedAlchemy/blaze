@@ -295,7 +295,6 @@ impl Worker<'_, '_> {
     }
 }
 
-
 /// The worker is a holder driver's batch compiler: the existing exporter,
 /// driven by the holder protocol, with no second pipeline. The trait is the
 /// holder's own, so this crate needs no carrier dependency (the local
