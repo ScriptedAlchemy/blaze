@@ -17,10 +17,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      # Privileged workflow: NEVER check out a PR head or execute its artifacts.
+      # Privileged workflow: a stacked PR's base may itself be an unreviewed
+      # PR branch. Execute cleanup only from the protected integration branch,
+      # never from either ref supplied by a pull_request_target event.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: dist/main
           persist-credentials: false
       - name: Cancel only obsolete runs belonging to this PR
         env:

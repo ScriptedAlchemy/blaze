@@ -130,11 +130,12 @@ class WorkflowTests(TestCase):
                     self.assertIn("\nconcurrency:", text)
                     self.assertIn("cancel-in-progress:", text)
 
-    def test_privileged_cleanup_checks_out_only_base(self):
+    def test_privileged_cleanup_uses_only_protected_integration(self):
         text = (Path(__file__).resolve().parents[1] / "workflows"
                 / "cancel-pr-runs.yaml").read_text()
         self.assertIn("pull_request_target:", text)
-        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", text)
+        self.assertIn("ref: dist/main", text)
+        self.assertNotIn("github.event.pull_request.base.", text)
         self.assertNotIn("pull_request.head", text)
         self.assertIn("persist-credentials: false", text)
 
