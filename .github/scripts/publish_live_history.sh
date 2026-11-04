@@ -13,6 +13,12 @@ branch="bench/live-latency-${GITHUB_RUN_ID}"
 if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
   echo "Preserving the existing history branch $branch"
 else
+  status=$?
+  # Exit 2 means no match; authentication, network and server failures are not absence.
+  if [ "$status" -ne 2 ]; then
+    echo "Cannot verify whether $branch exists (git ls-remote exit $status)" >&2
+    exit "$status"
+  fi
   git switch -c "$branch"
   git commit -q -m "bench: live latency for ${GITHUB_SHA::10}"
   git push -q origin "HEAD:refs/heads/$branch"

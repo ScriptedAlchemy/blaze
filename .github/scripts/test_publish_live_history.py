@@ -9,7 +9,7 @@ SCRIPT = Path(__file__).with_name("publish_live_history.sh").read_text()
 
 
 class HistoryPublication(unittest.TestCase):
-    def run_publisher(self, *, existing_branch=False, existing_pr=False, clean=False, push_fail=False):
+    def run_publisher(self, *, existing_branch=False, existing_pr=False, clean=False, push_fail=False, lookup_fail=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             git = root / "git"
@@ -17,7 +17,9 @@ class HistoryPublication(unittest.TestCase):
 printf '%s\\n' "$*" >> "$MOCK_GIT_CALLS"
 case "$1:$2" in
   diff:--cached) [ "$MOCK_CLEAN" = 1 ] ;;
-  ls-remote:--exit-code) [ "$MOCK_BRANCH_EXISTS" = 1 ] ;;
+  ls-remote:--exit-code)
+    if [ "$MOCK_LOOKUP_FAIL" = 1 ]; then exit 128; fi
+    [ "$MOCK_BRANCH_EXISTS" = 1 ] || exit 2 ;;
   push:-q) [ "$MOCK_PUSH_FAIL" != 1 ] ;;
   *) exit 0 ;;
 esac
@@ -38,6 +40,7 @@ esac
                        MOCK_BRANCH_EXISTS="1" if existing_branch else "0",
                        MOCK_PR_EXISTS="1" if existing_pr else "0",
                        MOCK_PUSH_FAIL="1" if push_fail else "0",
+                       MOCK_LOOKUP_FAIL="1" if lookup_fail else "0",
                        GITHUB_REPOSITORY="ScriptedAlchemy/blaze", GITHUB_RUN_ID="77",
                        GITHUB_SHA="abcdef12345678", GITHUB_SERVER_URL="https://github.com",
                        GITHUB_STEP_SUMMARY=str(root / "summary"))
@@ -75,6 +78,14 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("push ", git)
         self.assertIn("pr create", gh)
+
+    def test_lookup_failure_does_not_publish_or_treat_branch_as_missing(self):
+        result, git, gh, _ = self.run_publisher(lookup_fail=True)
+        self.assertEqual(result.returncode, 128)
+        self.assertIn("Cannot verify whether", result.stderr)
+        self.assertNotIn("switch -c", git)
+        self.assertNotIn("push ", git)
+        self.assertNotIn("pr create", gh)
 
     def test_push_rejection_does_not_create_pr(self):
         result, git, gh, _ = self.run_publisher(push_fail=True)
