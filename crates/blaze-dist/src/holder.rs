@@ -14,13 +14,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_wire::{
-    Attempt, BatchResult, Digest, ExecutionId, Grant, ItemOutcome, ItemResult, PackRef, RootSet,
-    Set, Why, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer, WorkLeaseRequest,
-    WorkName, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
+    Attempt, BatchResult, Digest, ErrorCode, ExecutionId, Grant, ItemOutcome, ItemResult, PackRef,
+    RootSet, Set, Why, WireError, WorkJoinAnswer, WorkJoinRequest, WorkLeaseAnswer,
+    WorkLeaseRequest, WorkName, WorkResultAnswer, WorkersEventsAnswer, WorkersEventsRequest,
 };
 
 use crate::work::{LOST_FINDING, UNKNOWN_NAME};
 use crate::{Millis, Ranges, Refusal};
+
+/// A `Busy` answer, whether the core's (`busy:`) or a carrier bound's bare code.
+fn busy(error: &WireError) -> bool {
+    Refusal::of(error) == Some(Refusal::Busy) || error.code() == Some(ErrorCode::Busy)
+}
 
 /// The holder's timings, on its own clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,8 +276,21 @@ impl Holder {
             Event::Reply { id, reply: Reply::Events(answer) } => {
                 if Some(id) == self.beat {
                     self.beat = None;
-                    if answer == Ok(WorkersEventsAnswer::CANCEL) {
-                        self.stop(StopWhy::Cancelled, out);
+                    match &answer {
+                        Ok(WorkersEventsAnswer::CANCEL) => self.stop(StopWhy::Cancelled, out),
+                        // A heartbeat refused for a moved attempt, an ended execution or
+                        // a dropped holder fences this executor now, not at its next
+                        // work call: it stops compiling for an attempt that is gone.
+                        Err(error) => match Refusal::of(error) {
+                            Some(
+                                refusal @ (Refusal::AttemptMoved
+                                | Refusal::Ended
+                                | Refusal::NoExecution
+                                | Refusal::NotHolder),
+                            ) => self.refused(Some(refusal), error, out),
+                            _ => {}
+                        },
+                        _ => {}
                     }
                 }
             }
@@ -340,6 +358,12 @@ impl Holder {
                     let wait = error.retry_after_ms.unwrap_or(self.config.retry_ms);
                     self.phase = Phase::Idle { until: now + wait, then_join: true };
                 }
+                // A carrier bound (grant retention, session capacity) is a wait, not a
+                // protocol fault: honoring it keeps a correct holder in the execution.
+                _ if busy(&error) => {
+                    let wait = error.retry_after_ms.unwrap_or(self.config.retry_ms);
+                    self.phase = Phase::Idle { until: now + wait, then_join: true };
+                }
                 Some(Refusal::FrontEndDiffers) => self.stop(StopWhy::FrontEndDiffers, out),
                 other => self.refused(other, &error, out),
             },
@@ -351,6 +375,10 @@ impl Holder {
             },
             (Phase::Leasing, Reply::Lease(Err(error))) => match Refusal::of(&error) {
                 Some(Refusal::NotJoined) => self.rejoin(now, out),
+                _ if busy(&error) => {
+                    let wait = error.retry_after_ms.unwrap_or(self.config.retry_ms);
+                    self.phase = Phase::Idle { until: now + wait, then_join: false };
+                }
                 other => self.refused(other, &error, out),
             },
             (Phase::Reporting { result, root_items }, Reply::Result(Ok(answer))) => {

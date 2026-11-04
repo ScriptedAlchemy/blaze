@@ -137,6 +137,14 @@ pub enum Effect {
     },
     /// The work set's log.
     Work(work::Effect),
+    /// An idle executor was assigned to this execution as a helper of its current
+    /// attempt: the agent starts its holder, which joins under `assignment.attempt`.
+    HelperAssigned {
+        /// The executor to start.
+        executor: String,
+        /// The attempt it helps.
+        assignment: AssignmentToken,
+    },
 }
 
 /// One execution of a `JobContent`.
@@ -789,6 +797,17 @@ impl Jobs {
         }
     }
 
+    /// Seed the execution and subscriber counters from a daemon instance identity, so a
+    /// restarted daemon never reissues an id a surviving executor still names: a stale
+    /// `BatchResult` of the old daemon then meets `NoExecution`, not a live lease of a
+    /// resubmitted job. Ids only ever move forward from the seed.
+    pub fn seed_ids(&mut self, epoch: &Digest) {
+        let executions = u64::from_be_bytes(epoch[..8].try_into().expect("digest")) % (1 << 62);
+        let subscribers = u64::from_be_bytes(epoch[8..16].try_into().expect("digest")) % (1 << 62);
+        self.next_execution = self.next_execution.max(executions + 1);
+        self.next_subscriber = self.next_subscriber.max(subscribers + 1);
+    }
+
     /// The registry's compile bounds, for a carrier's frame-size preflight.
     pub fn config(&self) -> &ExecutionConfig {
         &self.config
@@ -1098,6 +1117,52 @@ impl Jobs {
             }
             self.after(now, admitted.execution, log, out);
         }
+        self.offer_helpers(now, out);
+    }
+
+    /// Offer idle executors to running executions as helpers of their current attempt:
+    /// section 4's claim that one build's batches are granted from one work set to every
+    /// executor that joined it. Non-blocking, as `add_helper` is: a lead never waits for
+    /// a helper, and an execution whose compile phase is done takes none. While a job
+    /// waits for a lead on the same platform, idle executors stay leads-in-waiting, so
+    /// one wide build cannot starve the queue behind it.
+    fn offer_helpers(&mut self, now: Millis, out: &mut Vec<(ExecutionId, Effect)>) {
+        let ids: Vec<ExecutionId> = self
+            .executions
+            .values()
+            .filter(|e| {
+                matches!(e.state(), ExecState::Running)
+                    && e.config.completion == CompletionMode::WorkProtocol
+                    && e.lead().is_some()
+                    && e.work().is_some_and(|w| !w.is_done())
+            })
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            loop {
+                let Some((platform, need)) = self.platforms.get(&id).cloned() else { break };
+                if self.admission.waiting(&platform) > 0 {
+                    break;
+                }
+                let e = &self.executions[&id];
+                if e.work().is_none_or(|w| w.is_done()) {
+                    break;
+                }
+                let namespace = e.namespace.clone();
+                let except: Vec<String> =
+                    e.executors().map(str::to_owned).chain(e.lost.iter().cloned()).collect();
+                let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
+                else {
+                    break;
+                };
+                let e = self.executions.get_mut(&id).expect("present");
+                let Ok(attempt) = e.add_helper(now, &helper) else { break };
+                let assignment = e.assignment();
+                self.admission.take(&helper, id, attempt);
+                self.assignments.insert(helper.clone(), (assignment, false));
+                out.push((id, Effect::HelperAssigned { executor: helper, assignment }));
+            }
+        }
     }
 
     fn track_stop(&mut self, effect: &Effect) {
@@ -1122,13 +1187,29 @@ impl Jobs {
                 let except: Vec<String> = e.lost.iter().cloned().collect();
                 let (platform, need) = self.platforms[&id].clone();
                 let namespace = e.namespace.clone();
+                // Helpers heard from inside the lead-loss window keep helping under the
+                // new attempt, and one of them leads first: it already holds this
+                // execution's front end. Only with none heard does admission's idle
+                // pool supply the lead, as the simulator's reassignment does.
+                let heard = e.heard_recently(now);
+                let lead = heard
+                    .first()
+                    .cloned()
+                    .or_else(|| self.admission.idle_for(&namespace, &platform, &need, &except));
                 let mut more = Vec::new();
                 let e = self.executions.get_mut(&id).expect("present");
-                match self.admission.idle_for(&namespace, &platform, &need, &except) {
+                match lead {
                     Some(lead) => {
-                        if e.assign(now, &lead, &[], &mut more).is_ok() {
+                        let helpers: Vec<String> =
+                            heard.iter().filter(|h| *h != &lead).cloned().collect();
+                        if e.assign(now, &lead, &helpers, &mut more).is_ok() {
+                            let assignment = e.assignment();
                             self.admission.take(&lead, id, e.attempt());
-                            self.assignments.insert(lead, (e.assignment(), false));
+                            self.assignments.insert(lead, (assignment, false));
+                            for helper in helpers {
+                                self.admission.take(&helper, id, e.attempt());
+                                self.assignments.insert(helper, (assignment, false));
+                            }
                         }
                     }
                     None => e.end(now, Outcome::Lost, EndWhy::NoLead, &mut more),

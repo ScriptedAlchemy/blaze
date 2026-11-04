@@ -7,9 +7,10 @@ use blaze_dist::jobs::{
 };
 use blaze_dist::work::EndWhy;
 use blaze_wire::{
-    Attempt, BuildSpec, Command, Digest, DoneEvent, ExecutionId, JobContent, JobEvent, JobRequest,
-    LocalPolicy, Namespace, Outcome, PrNamespace, ProfileSpec, RefusedEvent, Reservation, RootRef,
-    Set, SourcePath, SourceRef, StoreIdentity, WorkersEventsRequest,
+    Attempt, BatchResult, BuildSpec, Command, Digest, DoneEvent, ExecutionId, ItemOutcome,
+    ItemResult, JobContent, JobEvent, JobRequest, LocalPolicy, Namespace, Outcome, PrNamespace,
+    ProfileSpec, RefusedEvent, Reservation, RootRef, RootSet, Set, SourcePath, SourceRef,
+    StoreIdentity, Why, WorkJoinRequest, WorkLeaseRequest, WorkName, WorkersEventsRequest,
 };
 
 fn execution() -> Execution {
@@ -687,6 +688,108 @@ fn promoted_permanently_stalled_helper_is_cancelled_at_deadline_without_coverage
     assert!(out.contains(&Effect::Kill { executor: "healthy".to_owned(), assignment: current }));
     assert!(!out.iter().any(|fx| matches!(fx, Effect::Work(blaze_dist::work::Effect::Done))));
     assert_eq!(e.result(52, "stuck", &late, &mut out), Err(blaze_dist::Refusal::Ended));
+}
+
+/// Two builders on one machine: the registry admits one as lead and offers the other
+/// to the same execution as a helper, and both take disjoint grants of one work set.
+/// Before `offer_helpers`, `Jobs` assigned with no helpers and `member` refused the
+/// second worker's join, so no build could ever split.
+#[test]
+fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
+    let mut admission = Admission::new(AdmissionConfig::default());
+    admission.add_machine("machine", [1; 32], Reservation { memory: 16, cpus: 16, disk: 16 });
+    let lead = admission.add_builder(0, "machine", reservation()).unwrap();
+    let helper = admission.add_builder(0, "machine", reservation()).unwrap();
+    let config = ExecutionConfig {
+        work: blaze_dist::work::WorkConfig { grant_roots: 1, ..Default::default() },
+        ..Default::default()
+    };
+    let mut jobs = Jobs::new(admission, config);
+    let mut out = Vec::new();
+    let id = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
+    out.clear();
+    jobs.tick(0, &mut out);
+    let assigned: Vec<_> = out
+        .iter()
+        .filter_map(|(_, effect)| match effect {
+            Effect::HelperAssigned { executor, assignment } => {
+                Some((executor.clone(), *assignment))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assigned.len(), 1, "{out:?}");
+    assert_eq!(assigned[0].0, helper);
+    assert_eq!(assigned[0].1.execution, id);
+    let attempt = jobs.execution(id).unwrap().attempt();
+    assert_eq!(assigned[0].1.attempt, attempt);
+    assert_eq!(jobs.execution(id).unwrap().lead(), Some(lead.as_str()));
+
+    let roots =
+        RootSet { spec: [1; 32], roots: [2; 32], count: 2, index: [3; 32], inputs: [4; 32] };
+    let join = |jobs: &mut Jobs, who: &str| {
+        jobs.join(
+            0,
+            who,
+            &WorkJoinRequest {
+                execution: id,
+                attempt,
+                roots: roots.clone(),
+                rejected: Set::new(Vec::new()),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap()
+    };
+    join(&mut jobs, &lead);
+    join(&mut jobs, &helper);
+    let lease = |jobs: &mut Jobs, who: &str| {
+        jobs.lease(0, who, &WorkLeaseRequest { execution: id, attempt }, &mut Vec::new())
+            .unwrap()
+            .grant
+            .unwrap()
+    };
+    let first = lease(&mut jobs, &lead);
+    let second = lease(&mut jobs, &helper);
+    assert_eq!(first.roots.iter().copied().collect::<Vec<_>>(), vec![(0, 1)]);
+    assert_eq!(second.roots.iter().copied().collect::<Vec<_>>(), vec![(1, 2)]);
+    for (who, grant, tag) in [(&lead, &first, 9u8), (&helper, &second, 10u8)] {
+        jobs.result(
+            0,
+            who,
+            &BatchResult {
+                lease: grant.lease.clone(),
+                seq: 1,
+                items: vec![ItemResult {
+                    name: WorkName([tag; 32]),
+                    outcome: ItemOutcome::Local(Why { why: "fixture".to_owned() }),
+                    found: Set::new(Vec::new()),
+                    unnamed: Set::new(Vec::new()),
+                }],
+                packs: Vec::new(),
+                returned_roots: Set::new(Vec::new()),
+                returned_names: Set::new(Vec::new()),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+    }
+    assert!(jobs.execution(id).unwrap().work().unwrap().is_done());
+}
+
+/// Execution ids seeded from a daemon epoch: two daemons never issue the same first
+/// id, and the same epoch is deterministic. A restarted daemon must not hand a
+/// resubmitted job the id a surviving executor's lease still names.
+#[test]
+fn seeded_ids_differ_between_daemon_epochs() {
+    let first_id = |epoch: Digest| {
+        let (mut jobs, _) = registry();
+        jobs.seed_ids(&epoch);
+        submit(&mut jobs, 1)
+    };
+    assert_eq!(first_id([9; 32]), first_id([9; 32]));
+    assert_ne!(first_id([9; 32]), first_id([7; 32]));
+    assert_ne!(first_id([9; 32]), ExecutionId(1));
 }
 
 fn spec(platform: Digest, i: u64) -> BuildSpec {
