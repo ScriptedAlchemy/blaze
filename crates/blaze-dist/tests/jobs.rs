@@ -792,6 +792,38 @@ fn seeded_ids_differ_between_daemon_epochs() {
     assert_ne!(first_id([9; 32]), ExecutionId(1));
 }
 
+
+/// Four idle builders and two independent runnable builds: the scheduler assigns
+/// two leads and offers one helper to each before taking a second for either.
+/// An eager inner loop used to give both spare builders to the first build.
+#[test]
+fn idle_helpers_are_shared_round_robin_between_running_builds() {
+    let mut admission = Admission::new(AdmissionConfig::default());
+    admission.add_machine("machine", [1; 32], Reservation { memory: 32, cpus: 32, disk: 32 });
+    for _ in 0..4 {
+        admission.add_builder(0, "machine", reservation()).unwrap();
+    }
+    let mut jobs = Jobs::new(admission, ExecutionConfig::default());
+    let a = jobs.submit(0, &request(7), reservation(), &mut Vec::new()).unwrap().execution;
+    let b = jobs.submit(0, &request(8), reservation(), &mut Vec::new()).unwrap().execution;
+    assert_ne!(a, b);
+    let mut out = Vec::new();
+    jobs.tick(0, &mut out);
+    assert_eq!(jobs.execution(a).unwrap().state(), ExecState::Running);
+    assert_eq!(jobs.execution(b).unwrap().state(), ExecState::Running);
+    let helpers: Vec<_> = out
+        .iter()
+        .filter_map(|(execution, effect)| match effect {
+            Effect::HelperAssigned { executor, .. } => Some((*execution, executor.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(helpers.len(), 2, "{out:?}");
+    assert_eq!(helpers.iter().filter(|(id, _)| *id == a).count(), 1, "{out:?}");
+    assert_eq!(helpers.iter().filter(|(id, _)| *id == b).count(), 1, "{out:?}");
+    assert_ne!(helpers[0].1, helpers[1].1);
+}
+
 fn spec(platform: Digest, i: u64) -> BuildSpec {
     let profile = ProfileSpec {
         name: "dev".to_owned(),
