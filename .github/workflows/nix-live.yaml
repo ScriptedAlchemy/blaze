@@ -111,7 +111,7 @@ jobs:
 
   nix-darwin:
     name: nix build (aarch64-darwin)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -154,7 +154,7 @@ jobs:
 
   live-edits:
     name: live edits (macOS arm64)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,
     # which has been the least steady thing in the repository. Whatever it says is still shown.

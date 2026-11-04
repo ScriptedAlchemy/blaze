@@ -121,7 +121,7 @@ jobs:
     uses: ./.github/workflows/bundle.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       base-sha: ${{ github.event.pull_request.base.sha }}
       cache-write: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/dist/') }}
 
@@ -140,7 +140,7 @@ jobs:
     uses: ./.github/workflows/bundle-check.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
 
   serve:
@@ -203,7 +203,7 @@ jobs:
     uses: ./.github/workflows/blaze-dist-review.yaml
     with:
       platform: macos-arm64
-      os: macos-15
+      os: macos-26
       bundle-sha256: ${{ needs.build-macos.outputs.sha256 }}
       lanes: '["saved-llvm", "saved-cranelift", "basic", "profiles-native", "commands", "workspace nested"]'
 
