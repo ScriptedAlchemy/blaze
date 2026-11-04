@@ -1,5 +1,7 @@
 //! Object-free export of the compiler's local requests. No Salsa identity is an artifact.
 
+pub mod dist;
+
 #[cfg(test)]
 mod tests;
 

@@ -45,6 +45,9 @@ stdx.workspace = true
 syntax.workspace = true
 
 ra-jit-store.workspace = true
+blaze-wire.workspace = true
+blaze-dist = { path = "../blaze-dist" }
+blaze-dist-local = { path = "../blaze-dist-local" }
 
 cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
 cranelift-frontend = "0.136"

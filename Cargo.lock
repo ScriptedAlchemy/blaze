@@ -2103,6 +2103,9 @@ name = "hir-ty-codegen"
 version = "0.1.0"
 dependencies = [
  "base-db",
+ "blaze-dist",
+ "blaze-dist-local",
+ "blaze-wire",
  "cfg",
  "cranelift-codegen",
  "cranelift-frontend",
