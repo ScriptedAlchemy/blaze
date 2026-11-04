@@ -1,0 +1,29 @@
+# Concurrency is the first line of defence. Cleanup also force-cancels stuck
+# superseded runs across workflows, even when path filters skip the new head.
+name: cancel obsolete pull request runs
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, closed]
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write
+concurrency:
+  group: cancel-pr-runs-${{ github.event.pull_request.number }}
+  # Let each cleanup finish. It rereads live PR state instead of trusting events.
+  cancel-in-progress: false
+jobs:
+  cancel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Privileged workflow: NEVER check out a PR head or execute its artifacts.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Cancel only obsolete runs belonging to this PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 -I .github/scripts/cancel_pr_runs.py

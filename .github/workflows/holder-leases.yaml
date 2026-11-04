@@ -21,6 +21,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: holder-leases-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   holder:
     runs-on: ubuntu-24.04-arm
